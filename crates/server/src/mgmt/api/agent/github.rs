@@ -30,7 +30,7 @@ use crate::mgmt::api::ApiState;
 use super::dto::{GithubApprovedBody, GithubDispatchBody, GithubRepoQuery, GithubRunsQuery};
 
 /// 隧道探测结果的内存缓存有效期（5 分钟；`?refresh=true` 强制重探）。
-const REPO_PROBE_TTL: Duration = Duration::from_secs(300);
+const REPO_PROBE_TTL: Duration = Duration::from_mins(5);
 
 /// 探测缓存条目。
 struct RepoCacheEntry {
@@ -228,17 +228,14 @@ async fn load_github_ctx(
         }
         Err(resp) => return Err(resp),
     };
-    let (owner, repo) = match resolve_owner_repo(agent, &ws, false).await {
-        Some(x) => x,
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "无法确定 GitHub 仓库：请在 workspace 设置 github_owner/github_repo，或确认客户端在线且工作区为 git 仓库",
-                })),
-            )
-                .into_response());
-        }
+    let Some((owner, repo)) = resolve_owner_repo(agent, &ws, false).await else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "无法确定 GitHub 仓库：请在 workspace 设置 github_owner/github_repo，或确认客户端在线且工作区为 git 仓库",
+            })),
+        )
+            .into_response());
     };
     Ok(GithubCtx {
         client: GitHubClient::new(agent.github_base_url(), &token),
@@ -495,7 +492,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
         });
-        let base = format!("http://{}", addr);
+        let base = format!("http://{addr}");
         if let Some(agent) = state.server_state.agent_state.take() {
             state.server_state.agent_state = Some(agent.with_github_base_url(base.clone()));
         }

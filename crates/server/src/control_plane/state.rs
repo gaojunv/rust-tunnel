@@ -163,7 +163,7 @@ impl ProxyPortsState {
             .iter()
             .filter_map(|(port, info)| match info {
                 ServerPortInfo::Trojan { .. } => Some(*port),
-                _ => None,
+                ServerPortInfo::Shadowsocks { .. } => None,
             })
             .collect()
     }
@@ -204,7 +204,7 @@ impl ProxyPortsState {
             .iter()
             .filter_map(|(port, info)| match info {
                 ServerPortInfo::Shadowsocks { .. } => Some(*port),
-                _ => None,
+                ServerPortInfo::Trojan { .. } => None,
             })
             .collect()
     }
@@ -256,6 +256,7 @@ impl Default for ServerState {
 
 impl ServerState {
     /// Create a new server state without database (for backwards compatibility)
+    #[must_use]
     pub fn new() -> Self {
         let mut state = Self {
             proxy_ports: ProxyPortsState::default(),
@@ -294,6 +295,7 @@ impl ServerState {
     }
 
     /// Create a new server state with database
+    #[must_use]
     pub fn with_db(db: Database) -> Self {
         let registry = ClientRegistry::new(db.clone());
         let mut state = Self {
@@ -392,11 +394,13 @@ impl ServerState {
     }
 
     /// 查询端口信息。
+    #[must_use]
     pub async fn get_port(&self, port: u16) -> Option<ServerPortInfo> {
         self.proxy_ports.get_port(port).await
     }
 
     /// 注销端口。
+    #[must_use]
     pub async fn unregister_port(&self, port: u16) -> bool {
         self.proxy_ports.unregister_port(port).await
     }
@@ -449,7 +453,8 @@ impl ServerState {
     // tunnel-forward clients are now managed via ClientRegistry.
 
     /// Get all tunnel-forward clients (deprecated, returns empty)
-    pub async fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
+    #[must_use]
+    pub fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
         Vec::new()
     }
 
@@ -501,11 +506,13 @@ impl ServerState {
     }
 
     /// Get a reference to the database (if available)
+    #[must_use]
     pub fn get_db(&self) -> Option<&Database> {
         self.db.as_ref()
     }
 
     /// Get database reference (if available)
+    #[must_use]
     pub fn db(&self) -> Option<&Database> {
         self.db.as_ref()
     }
@@ -565,16 +572,16 @@ impl rust_tunnel_protocols::PortRegistry for ServerState {
         ServerState::get_connection_count_for_port(self, remote_port).await
     }
     async fn increment_ss_connections(&self, port: u16) {
-        ServerState::increment_ss_connections(self, port).await
+        ServerState::increment_ss_connections(self, port).await;
     }
     async fn decrement_ss_connections(&self, port: u16) {
-        ServerState::decrement_ss_connections(self, port).await
+        ServerState::decrement_ss_connections(self, port).await;
     }
     async fn increment_trojan_connections(&self, port: u16) {
-        ServerState::increment_trojan_connections(self, port).await
+        ServerState::increment_trojan_connections(self, port).await;
     }
     async fn decrement_trojan_connections(&self, port: u16) {
-        ServerState::decrement_trojan_connections(self, port).await
+        ServerState::decrement_trojan_connections(self, port).await;
     }
 }
 

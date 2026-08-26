@@ -14,12 +14,12 @@ pub async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<Shado
     // Get all SS ports
     let ss_ports = state.server_state.get_shadowsocks_ports().await;
 
-    let (port, cipher) = if !ss_ports.is_empty() {
+    let (port, cipher) = if ss_ports.is_empty() {
+        (None, None)
+    } else {
         // For now, return the first SS port info with default cipher
         // In future multi-port support, this would return all
         (Some(ss_ports[0]), Some("aes-256-gcm".to_string()))
-    } else {
-        (None, None)
     };
 
     Json(ShadowsocksConfig {
@@ -37,21 +37,19 @@ pub async fn update_shadowsocks_config(
 ) -> impl IntoResponse {
     let enabled = payload["enabled"].as_bool().unwrap_or(false);
     let port = match payload["port"].as_u64() {
-        Some(p) if p > 0 && p <= 65535 => p as u16,
+        Some(p) if p > 0 && p <= 65535 => u16::try_from(p).unwrap_or(u16::MAX),
         _ => {
             return (StatusCode::BAD_REQUEST, "Invalid or missing port").into_response();
         }
     };
-    let cipher = match payload["cipher"].as_str() {
-        Some(c @ "aes-256-gcm") | Some(c @ "chacha20-ietf-poly1305") => c,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Invalid cipher. Supported: aes-256-gcm, chacha20-ietf-poly1305",
-            )
-                .into_response();
-        }
+    let Some(c @ ("aes-256-gcm" | "chacha20-ietf-poly1305")) = payload["cipher"].as_str() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid cipher. Supported: aes-256-gcm, chacha20-ietf-poly1305",
+        )
+            .into_response();
     };
+    let cipher = c;
     let password = match payload["password"].as_str() {
         Some(p) if !p.is_empty() => p,
         _ => {
@@ -67,7 +65,7 @@ pub async fn update_shadowsocks_config(
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response();
         }
@@ -106,12 +104,12 @@ pub async fn update_shadowsocks_config(
             let ss_cipher = cipher.to_string();
             let ss_password = password.to_string();
             tokio::spawn(async move {
-                let stats = state_clone.stats_collector.clone();
+                let collector = state_clone.stats_collector.clone();
                 let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
                     std::sync::Arc::new(state_clone);
                 if let Err(e) = crate::listener::start_shadowsocks_listener_with_abort(
                     registry,
-                    stats,
+                    collector,
                     ss_port,
                     ss_cipher,
                     ss_password,
@@ -119,7 +117,7 @@ pub async fn update_shadowsocks_config(
                 )
                 .await
                 {
-                    tracing::error!("SS listener error: {}", e);
+                    tracing::error!("SS listener error: {e}");
                 }
             });
         }

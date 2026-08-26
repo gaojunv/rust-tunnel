@@ -12,12 +12,21 @@ use std::path::Path;
 
 impl ServerConfig {
     /// 从进程参数与环境加载完整配置（CLI 解析 + 三级合并 + 校验）。
+    ///
+    /// # Errors
+    /// 当 `from_cli` 合并或校验失败时返回错误字符串。
     pub fn load() -> Result<Self, String> {
         let cli = ServerCli::parse();
         Self::from_cli(cli)
     }
 
     /// 以给定的 CLI 快照为最高优先级合并配置，校验 Shadowsocks/Trojan/DNS/ACME 约束后返回。
+    ///
+    /// # Errors
+    /// - 配置文件不存在或解析失败
+    /// - `ss_enabled`/`trojan_enabled`/`dns_enabled`/`acme_enabled` 相关必填字段缺失或取值非法
+    /// - `dns_bind` 不是合法 `SocketAddr`
+    #[allow(clippy::too_many_lines, reason = "三级配置顺序编排（默认值→TOML→环境变量→CLI）外加四类校验，共享大量局部状态，拆分反而降低可读性")]
     pub fn from_cli(cli: ServerCli) -> Result<Self, String> {
         let mut config = Self::default();
 
@@ -27,7 +36,7 @@ impl ServerConfig {
                 let file_config: ServerConfigFile = Figment::new()
                     .merge(Toml::file(config_path))
                     .extract()
-                    .map_err(|e| format!("Failed to parse config file: {}", e))?;
+                    .map_err(|e| format!("Failed to parse config file: {e}"))?;
 
                 if let Some(v) = file_config.control_addr {
                     config.control_addr = v;
@@ -141,7 +150,7 @@ impl ServerConfig {
                     config.acme_tos_agreed = v;
                 }
             } else {
-                return Err(format!("Config file not found: {}", config_path));
+                return Err(format!("Config file not found: {config_path}"));
             }
         }
 
@@ -416,8 +425,7 @@ impl ServerConfig {
             };
             if cipher != "aes-256-gcm" && cipher != "chacha20-ietf-poly1305" {
                 return Err(format!(
-                    "Unsupported cipher: {}. Supported: aes-256-gcm, chacha20-ietf-poly1305",
-                    cipher
+                    "Unsupported cipher: {cipher}. Supported: aes-256-gcm, chacha20-ietf-poly1305"
                 ));
             }
         }
@@ -444,7 +452,7 @@ impl ServerConfig {
             config
                 .dns_bind
                 .parse::<std::net::SocketAddr>()
-                .map_err(|e| format!("Invalid dns_bind '{}': {}", config.dns_bind, e))?;
+                .map_err(|e| format!("Invalid dns_bind '{}': {e}", config.dns_bind))?;
         }
 
         // Validate ACME configuration

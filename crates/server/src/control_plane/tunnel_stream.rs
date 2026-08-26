@@ -99,12 +99,7 @@ impl AsyncRead for ClientTunnelStream {
     ) -> Poll<std::io::Result<()>> {
         let filled_before = buf.filled().len();
         // Drain leftover from a previous partial read first.
-        let result = if !self.read_remainder.is_empty() {
-            let n = std::cmp::min(self.read_remainder.len(), buf.remaining());
-            buf.put_slice(&self.read_remainder[..n]);
-            self.read_remainder.drain(..n);
-            Poll::Ready(Ok(()))
-        } else {
+        let result = if self.read_remainder.is_empty() {
             match self.inbound.poll_recv(cx) {
                 Poll::Ready(Some(mut bytes)) => {
                     let n = std::cmp::min(bytes.len(), buf.remaining());
@@ -119,6 +114,11 @@ impl AsyncRead for ClientTunnelStream {
                 Poll::Ready(None) => Poll::Ready(Ok(())),
                 Poll::Pending => Poll::Pending,
             }
+        } else {
+            let n = std::cmp::min(self.read_remainder.len(), buf.remaining());
+            buf.put_slice(&self.read_remainder[..n]);
+            self.read_remainder.drain(..n);
+            Poll::Ready(Ok(()))
         };
         // 客户端 → 服务器方向的字节（bytes_in）
         if let Poll::Ready(Ok(())) = &result {
@@ -161,13 +161,13 @@ impl AsyncWrite for ClientTunnelStream {
                 this.record_bytes_out(chunk_len as u64);
                 return Poll::Ready(Ok(chunk_len));
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::TrySendError::Closed(())) => {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "control channel closed",
                 )));
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(())) => {
                 // Fall through to the async reserve path for back-pressure.
             }
         }

@@ -16,9 +16,8 @@ use rust_tunnel_common::DnsRecord;
 
 /// `GET /api/dns/records`：列出所有 DNS 记录。
 pub async fn get_dns_records(State(state): State<ApiState>) -> impl IntoResponse {
-    let dns_registry = match &state.server_state.dns_registry {
-        Some(r) => r,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response(),
+    let Some(dns_registry) = &state.server_state.dns_registry else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response();
     };
 
     let records = dns_registry.list_records().await;
@@ -30,10 +29,10 @@ pub async fn get_dns_records(State(state): State<ApiState>) -> impl IntoResponse
             value: match r {
                 DnsRecord::TunnelA {
                     target_ip, port, ..
-                } => format!("{} (port {})", target_ip, port),
+                } => format!("{target_ip} (port {port})"),
                 DnsRecord::MeshA { target_ip, .. } => target_ip.clone(),
-                DnsRecord::TunnelSrv { target, port, .. } => format!("{}:{}", target, port),
-                DnsRecord::MeshSrv { target, port, .. } => format!("{}:{}", target, port),
+                DnsRecord::TunnelSrv { target, port, .. }
+                | DnsRecord::MeshSrv { target, port, .. } => format!("{target}:{port}"),
                 DnsRecord::Txt { text, .. } => text.clone(),
             },
         })
@@ -48,9 +47,8 @@ pub async fn add_dns_record(
     State(state): State<ApiState>,
     Json(body): Json<super::dto::AddDnsRecordRequest>,
 ) -> impl IntoResponse {
-    let dns_registry = match &state.server_state.dns_registry {
-        Some(r) => r,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response(),
+    let Some(dns_registry) = &state.server_state.dns_registry else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response();
     };
 
     let record = match body.record_type.as_str() {
@@ -72,9 +70,8 @@ pub async fn delete_dns_record(
     State(state): State<ApiState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let dns_registry = match &state.server_state.dns_registry {
-        Some(r) => r,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response(),
+    let Some(dns_registry) = &state.server_state.dns_registry else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response();
     };
 
     dns_registry.remove_record(&name).await;
@@ -99,7 +96,7 @@ pub async fn update_dns_config(
         if let Err(e) = db.save_dns_config(tunnel_domain, mesh_domain).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response();
         }

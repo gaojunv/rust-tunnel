@@ -31,6 +31,12 @@ pub struct ClientView {
 }
 
 /// 查询全部客户端（合并 DB 与在线表）。
+///
+/// # Errors
+///
+/// 当底层数据库查询 `list_clients` 失败时返回 `Err`。
+/// 单条客户端的 `rules_referencing_client` 失败不会中断整体查询，
+/// 该客户端的 `referenced_by_rules` 计为 0。
 pub async fn list_clients_impl(reg: &ClientRegistry) -> Result<Vec<ClientView>, String> {
     let db = reg.db();
     let db_rows = db.list_clients().await.map_err(|e| e.to_string())?;
@@ -44,8 +50,7 @@ pub async fn list_clients_impl(reg: &ClientRegistry) -> Result<Vec<ClientView>, 
         let refs = db
             .rules_referencing_client(&r.name)
             .await
-            .map(|v| v.len() as u32)
-            .unwrap_or(0);
+            .map_or(0, |v| u32::try_from(v.len()).unwrap_or(u32::MAX));
         out.push(ClientView {
             name: r.name,
             hostname: r.hostname,
@@ -62,6 +67,12 @@ pub async fn list_clients_impl(reg: &ClientRegistry) -> Result<Vec<ClientView>, 
 }
 
 /// 删除客户端（带引用检查，踢在线连接）。
+///
+/// # Errors
+///
+/// - 当 `rules_referencing_client` 查询失败时返回 `Err`。
+/// - 当 `delete_client` 持久化失败时返回 `Err`。
+/// - 当客户端仍被反代规则引用时返回 `Err`（含 `referenced` 文案，调用方映射为 409）。
 pub async fn delete_client_impl(reg: &ClientRegistry, name: &str) -> Result<(), String> {
     let db = reg.db();
     let refs = db
@@ -123,7 +134,7 @@ pub async fn patch_client_note(
         }
     };
     match db.update_client_note(&name, body.note.as_deref()).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -144,7 +155,7 @@ pub async fn delete_client(
         }
     };
     match delete_client_impl(&reg, &name).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) if e.contains("referenced") => (StatusCode::CONFLICT, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -174,6 +185,7 @@ pub async fn kick_client(
 
 #[cfg(test)]
 mod tests {
+    use rust_tunnel_common::ControlMessage;
     use super::*;
     use crate::control_plane::client_registry::ClientRegistry;
     use crate::db::Database;
@@ -261,7 +273,6 @@ mod tests {
         delete_client_impl(&reg, "home-nas").await.unwrap();
 
         // Should receive Disconnect
-        use rust_tunnel_common::ControlMessage;
         let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .unwrap()

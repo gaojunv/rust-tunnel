@@ -144,7 +144,14 @@ pub async fn resolve_chain_or_reject(
 /// - RAG 仅在 `rag` feature 下生效；检索失败/无命中时静默降级（`enhance` 永不 Err）。
 /// - compat 改写仅在 provider 开启 `compat_tool_history` 时生效。
 /// - 两类改写后都把结构化 messages 回写到 raw_body（透传基底的 messages 必须同步）。
-#[cfg_attr(not(feature = "rag"), allow(unused_variables))]
+#[cfg_attr(
+    not(feature = "rag"),
+    allow(
+        unused_variables,
+        clippy::unused_async,
+        reason = "唯一的 await 在 rag 门控块内；签名必须保持 async 使调用方在两种构型下写法一致"
+    )
+)]
 pub async fn inject_rag_and_compat(
     state: &LlmState,
     db: Option<&Database>,

@@ -2,9 +2,9 @@
 //!
 //! token 数一律来自上游 `usage` 字段，网关不做本地估算，与上游计费口径一致。
 //! - 非流式：完整响应 JSON，直接读 `usage`。
-//! - 流式：`usage` 只在末尾 chunk 出现，用 [`UsageSseScanner`] 边转发边扫描。
+//! - 流式：`usage` 只在末尾 chunk 出现，用 [`crate::usage::UsageSseScanner`] 边转发边扫描。
 //!
-//! 缓存字段各厂商命名不同，[`extract_usage`] 做多字段兜底。
+//! 缓存字段各厂商命名不同，[`crate::usage::extract_usage`] 做多字段兜底。
 
 use axum::body::Body;
 use axum::http::StatusCode;

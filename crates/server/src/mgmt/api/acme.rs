@@ -71,16 +71,13 @@ pub async fn request_acme_certificate(
     Json(req): Json<CertificateRequest>,
 ) -> impl IntoResponse {
     let client_guard = state.server_state.acme.client.read().await;
-    let client = match client_guard.as_ref() {
-        Some(c) => c.clone(),
-        None => {
-            tracing::error!("ACME certificate request failed: ACME client not initialized");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "ACME is not enabled" })),
-            )
-                .into_response();
-        }
+    let Some(client) = client_guard.as_ref().cloned() else {
+        tracing::error!("ACME certificate request failed: ACME client not initialized");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "ACME is not enabled" })),
+        )
+            .into_response();
     };
     drop(client_guard);
 
@@ -475,6 +472,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    #[allow(clippy::large_futures, reason = "测试中构造的 ACME 状态机体积大但仅在测试路径执行一次，boxing 无收益")]
     async fn test_update_acme_config_initializes_client() {
         // Create a server state with in-memory database
         let db = Database::new(":memory:").await.unwrap();
@@ -529,6 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::large_futures, reason = "测试中构造的 ACME 状态机体积大但仅在测试路径执行一次，boxing 无收益")]
     async fn test_update_acme_config_disabled_does_not_init_client() {
         // Create a server state with in-memory database
         let db = Database::new(":memory:").await.unwrap();
@@ -570,6 +569,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::large_futures, reason = "测试中构造的 ACME 状态机体积大但仅在测试路径执行一次，boxing 无收益")]
     async fn test_get_acme_status_reflects_config_update() {
         // Create a server state with in-memory database
         let db = Database::new(":memory:").await.unwrap();

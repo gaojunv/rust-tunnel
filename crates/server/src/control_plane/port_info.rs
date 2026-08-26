@@ -53,6 +53,7 @@ pub enum PortInfo {
 
 impl PortInfo {
     /// 返回端口类型。
+    #[must_use]
     pub fn port_type(&self) -> PortType {
         match self {
             PortInfo::Shadowsocks { .. } => PortType::Shadowsocks,
@@ -61,10 +62,10 @@ impl PortInfo {
     }
 
     /// 返回监听端口号。
+    #[must_use]
     pub fn port(&self) -> u16 {
         match self {
-            PortInfo::Shadowsocks { port, .. } => *port,
-            PortInfo::Trojan { port, .. } => *port,
+            PortInfo::Shadowsocks { port, .. } | PortInfo::Trojan { port, .. } => *port,
         }
     }
 }

@@ -186,7 +186,10 @@ mod tests {
         let turn = parse_llm_turn(&body).unwrap();
         match turn {
             LlmTurn::Text(t) => assert_eq!(t, "我来帮你看看"),
-            LlmTurn::ToolCalls(_) => panic!("expected Text, got ToolCalls"),
+            LlmTurn::ToolCalls(calls) => {
+                let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                panic!("expected Text, got ToolCalls{names:?}");
+            }
         }
     }
 
@@ -214,7 +217,7 @@ mod tests {
                 assert_eq!(calls[0].name, "shell");
                 assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
             }
-            LlmTurn::Text(_) => panic!("expected ToolCalls, got Text"),
+            LlmTurn::Text(t) => panic!("expected ToolCalls, got Text({t:?})"),
         }
     }
 

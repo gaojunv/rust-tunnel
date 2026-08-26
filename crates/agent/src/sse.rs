@@ -49,7 +49,7 @@ pub enum SseFeed {
     },
     /// 该行无产出（role delta、空行、注释、畸形行跳过）
     None,
-    /// [DONE]
+    /// `[DONE]`
     Done,
     /// 聚合字节超限（MAX_STREAM_BYTES）：调用方应终止流并报错，
     /// 不落库半截消息。
@@ -125,7 +125,7 @@ impl SseAggregator {
         true
     }
 
-    /// 是否收到过 `data:` 前缀行（含畸形行与 [DONE]）。
+    /// 是否收到过 `data:` 前缀行（含畸形行与 `[DONE]`）。
     #[must_use]
     pub fn saw_data(&self) -> bool {
         self.saw_data

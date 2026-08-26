@@ -370,8 +370,8 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
 ///   上游 chunk → 按 SSE 行提取 delta.content → TagScanner 增量解析
 ///   Text 事件 → 立即包装为 OpenAI chunk 发出
 ///   ToolCall 事件 → 暂存
-///   finish_reason / [DONE] → 先发暂存的 tool_calls chunk（最后一个带
-///   finish_reason="tool_calls"），再发 usage chunk，最后 [DONE]。
+///   finish_reason / `[DONE]` → 先发暂存的 tool_calls chunk（最后一个带
+///   finish_reason="tool_calls"），再发 usage chunk，最后 `[DONE]`。
 pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
     use bytes::Bytes;
     use futures_util::StreamExt;

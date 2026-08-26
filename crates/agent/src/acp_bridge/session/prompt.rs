@@ -29,7 +29,7 @@ impl AcpBridge {
     /// `initialize` + 会话建立（`session/resume` 或 `session/new`），把
     /// `ConnectionTo<Agent>` 与 ACP session id 写回会话条目；随后 main_fn 挂起
     /// 等待 incoming EOF（保持连接存活，直到进程退出/会话被杀）。通知
-    /// （`session/update`）经 [`map_update`] 映射后推会话条目当前的 ws_tx——
+    /// （`session/update`）经 [`crate::acp_events::map_update`] 映射后推会话条目当前的 ws_tx——
     /// 处理器每次事件动态解析，重连自动切到新连接；权限请求
     /// （`session/request_permission`）走审批回调。
     ///
@@ -50,7 +50,7 @@ impl AcpBridge {
     /// 通知无需按 session id 过滤。
     ///
     /// 发送 `session/prompt` 后立即返回；回合内的 `session/update` 通知经
-    /// [`map_update`] 推送会话条目当前的 ws_tx，`PromptResponse` 到达时终态回调
+    /// [`crate::acp_events::map_update`] 推送会话条目当前的 ws_tx，`PromptResponse` 到达时终态回调
     /// 处理。回合进行中重复 prompt 报错（`busy` 守卫；ACP 单连接不支持并发回合）
     /// ——用户路径请用 [`Self::submit_prompt`]（进行中自动排队）。
     ///

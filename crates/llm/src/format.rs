@@ -2,7 +2,7 @@
 //!
 //! 上游四个提供商均为 OpenAI 兼容格式；当客户端使用 Anthropic Messages API
 //! 时，网关在响应侧把 OpenAI 格式转回 Anthropic 格式（非流式整体转换，
-//! 流式逐 chunk 转换，见 [`AnthropicSseTranslator`]）。
+//! 流式逐 chunk 转换，见 [`crate::format::AnthropicSseTranslator`]）。
 
 use axum::body::Body;
 use axum::http::StatusCode;

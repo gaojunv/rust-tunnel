@@ -1,7 +1,7 @@
 //! LLM Gateway 分流抽象（由装配层注入，解耦 protocols → llm 依赖）。
 //!
 //! 反向代理的 shared listener 在 Host 匹配到 LLM Gateway 域名时，把请求
-//! 交给 [`LlmDispatcher`] 处理；不命中则继续走普通反代。
+//! 交给 [`crate::reverse_proxy::llm_dispatch::LlmDispatcher`] 处理；不命中则继续走普通反代。
 //! 装配层（`llm` 模块）实现该 trait 并注入 `ReverseProxyState`。
 
 use std::pin::Pin;

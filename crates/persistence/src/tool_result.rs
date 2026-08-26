@@ -9,7 +9,7 @@
 //! 存量旧行是纯文本，所有读取方（session load 重放、distill/compact 渲染）必须
 //! 向后兼容：JSON 解析失败 / 非对象 / 缺 string text → 走旧路径原样使用。
 //!
-//! 落库语义（[`tool_result_persist_content`]）：status 为 running/completed（或缺省）
+//! 落库语义（[`crate::tool_result::tool_result_persist_content`]）：status 为 running/completed（或缺省）
 //! 且 text/diffs/locations 全空的中间态是「空占位」，传 "" 让 upsert 不覆盖已落库
 //! 的真实结果；其余情况（含 failed 等异常终态）落结构化 JSON——即使 text 为空，
 //! 异常终态也必须落库，前端才能把卡片打叉。

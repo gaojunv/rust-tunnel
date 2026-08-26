@@ -1,8 +1,8 @@
 //! 统一出站 HTTP 客户端工厂。
 //!
 //! 所有 reqwest 构造点共享一套默认值：UA / connect timeout / TCP keepalive /
-//! 连接池上限，慢端点在 [`builder()`] 起点上覆盖整体超时。panic 语义单点收敛
-//! 在 [`build()`]：reqwest 构建失败仅当 TLS 后端初始化失败（构造期 fatal，
+//! 连接池上限，慢端点在 [`crate::http_client::builder()`] 起点上覆盖整体超时。panic 语义单点收敛
+//! 在 [`crate::http_client::build()`]：reqwest 构建失败仅当 TLS 后端初始化失败（构造期 fatal，
 //! 无法恢复），各调用点不再各自 `expect`/`#[expect]`。
 
 use std::time::Duration;

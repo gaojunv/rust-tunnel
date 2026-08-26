@@ -21,16 +21,19 @@ use super::dto::{AgentWsQuery, NotificationsWsQuery, TerminalWsQuery};
 /// 心跳流量同时保活 NAT/代理的空闲映射（典型空闲超时 60s+，25s 足够密集）。
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
 
+/// WS 推送超时：慢客户端（TCP 零窗口）会让 `Sink::send` 无限阻塞，`push_task`
+/// 不再 drain `event_rx`，进而冻结 runner/ACP 等所有生产方。5 秒足够覆盖正常抖动。
+const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 应用层心跳帧：前端看门狗以「任意帧到达」判定连接存活（含本帧）。
 fn heartbeat_frame() -> serde_json::Value {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     serde_json::json!({"type": "heartbeat", "ts": ts})
 }
 
-/// GET /api/agent/ws?session_id=xxx&token=<jwt>
+/// GET `/api/agent/ws?session_id=xxx&token=<jwt>`
 /// Public route; JWT validated from query param (browser WebSocket can't set headers).
 pub async fn agent_ws(
     State(state): State<ApiState>,
@@ -47,7 +50,7 @@ pub async fn agent_ws(
         .into_response()
 }
 
-/// GET /api/agent/notifications/ws?token=<jwt>
+/// GET `/api/agent/notifications/ws?token=<jwt>`
 /// Public route; JWT validated from query param（同 `agent_ws`）。全局工作台通知：
 /// 订阅 `AgentState` 的通知广播，任务完成/出错/需用户干预时向浏览器推送
 /// [`crate::agent::notify::AgentNotification`] 帧（标签闪动 + 系统通知用）。
@@ -85,10 +88,7 @@ async fn handle_notifications_socket(state: ApiState, socket: WebSocket) {
                 // 广播 sender 关闭/Lagged 时 recv 返回 Err：保持原 `while let Ok`
                 // 的退出语义（任何 Err 即 return），不顺手改。
                 let Ok(n) = n else { return };
-                let text = match serde_json::to_string(&n) {
-                    Ok(t) => t,
-                    Err(_) => continue, // 序列化失败理论上不可达，跳过不中断
-                };
+                let Ok(text) = serde_json::to_string(&n) else { continue };
                 if ws_sink.send(Message::Text(text)).await.is_err() {
                     return; // 对端断开
                 }
@@ -328,8 +328,7 @@ async fn bridge_terminal(
                             match agent.registry.open_tunnel(&workspace.client_id, &target).await {
                                 Ok(mut resize_tunnel) => {
                                     let resize_frame = format!(
-                                        "{{\"resize_for\":\"{}\",\"rows\":{},\"cols\":{}}}\n",
-                                        terminal_id, rows, cols
+                                        "{{\"resize_for\":\"{terminal_id}\",\"rows\":{rows},\"cols\":{cols}}}\n",
                                     );
                                     if let Err(e) = resize_tunnel.write_all(resize_frame.as_bytes()).await {
                                         tracing::warn!("terminal ws: resize tunnel write failed: {e}");
@@ -481,6 +480,7 @@ enum WsFrame {
     Other,
 }
 
+#[allow(clippy::too_many_lines, reason = "WebSocket 帧类型扁平派发：7 个变体共享同一 JSON 解析与校验路径，拆分会把相关校验散到多个签名、反而降低可读性")]
 fn parse_ws_frame(msg: Message) -> WsFrame {
     let Message::Text(text) = msg else {
         return WsFrame::Other;
@@ -682,6 +682,7 @@ async fn inject_refs(
     crate::agent::runner::compose_user_message(content, &ref_files)
 }
 
+#[allow(clippy::too_many_lines, reason = "WebSocket 连接生命周期编排：pending/ACP 分派/runner 回合/turn select 顺序编排，拆分会把共享状态散到多个签名")]
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
@@ -701,12 +702,6 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // 消费，64 槽 channel 就不会填满，runner 永不阻塞。所有发送方 drop 后
     // recv() 返回 None，任务自然结束；外层循环退出后仍由 push_task.abort() 兜底。
     //
-    // ws_sink.send 必须加超时：慢客户端（TCP 零窗口、对端存活但不读）会让
-    // send 无限阻塞 → push_task 不再 drain event_rx（64 槽）→ 所有生产方
-    // send().await 阻塞 → runner 回合、ACP 通知/审批、stdio pump 一并冻结。
-    // 完全断线能自愈（send 返回 Err），但"慢而不死"的客户端会永久停摆该会话。
-    // 5 秒超时足够覆盖正常网络抖动；超时即视为 sink 死亡，后续事件只 drain 不发。
-    const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     // 通知广播：本连接所属 workspace 在此解析一次（session 缺失/读库失败为 None，
     // 跳过通知）。出站帧（runner 与 ACP 的 done/error、审批/elicitation 请求）唯
     // 一流经 push_task，在此翻译成全局通知广播——未查看该会话的标签页经
@@ -749,14 +744,11 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     }
                     let send_result =
                         tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Text(text))).await;
-                    match send_result {
-                        Ok(Ok(())) => {} // 发送成功
-                        Ok(Err(_)) | Err(_) => {
-                            // 发送失败或超时：标记 sink 死亡，后续事件继续 drain 但不再发
-                            sink_alive = false;
-                            // sink 已死，主循环应立即 teardown，不必等下一次心跳。
-                            dead_notify_clone.notify_one();
-                        }
+                    if !matches!(send_result, Ok(Ok(()))) {
+                        // 发送失败或超时：标记 sink 死亡，后续事件继续 drain 但不再发
+                        sink_alive = false;
+                        // sink 已死，主循环应立即 teardown，不必等下一次心跳。
+                        dead_notify_clone.notify_one();
                     }
                 }
                 _ = hb.tick() => {
@@ -843,12 +835,12 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         } else {
             let msg = tokio::select! {
                 msg = ws_stream.next() => match msg {
-                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
                     Some(Ok(m)) => m,
                 },
                 // push_task 判定 sink 死亡（半开连接/慢客户端）：无需等对端 close，
                 // 直接 teardown——释放会话锁、detach ACP ws_tx、abort push_task。
-                _ = dead_notify.notified() => break,
+                () = dead_notify.notified() => break,
             };
             match parse_ws_frame(msg) {
                 WsFrame::UserMessage { content, refs } => (content, refs),
@@ -956,12 +948,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     // Runner 路径审批模式切换：更新 workspace.approval_mode（DB）+ 当前连接 rt（内存态）。
                     // rt 在首次 user_message 时才创建；若尚无 rt，仅更新 DB（下一条消息时 load 读取）。
                     if let Some(agent) = state.server_state.agent_state.as_ref() {
-                        let ws = match load_workspace_for_session(&agent.db, &session_id).await {
-                            Ok(Some(ws)) => ws,
-                            _ => {
-                                let _ = event_tx.send(serde_json::json!({"type": "error", "message": "workspace not found"})).await;
-                                continue;
-                            }
+                        let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await else {
+                            let _ = event_tx.send(serde_json::json!({"type": "error", "message": "workspace not found"})).await;
+                            continue;
                         };
                         if let Err(e) = agent
                             .db
@@ -989,7 +978,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     }
                     // 同步当前连接的 rt（若已创建）
                     if let Some(rt) = rt_cache.as_mut() {
-                        rt.approval_mode = mode.clone();
+                        rt.approval_mode.clone_from(&mode);
                     }
                     let _ = event_tx
                         .send(serde_json::json!({"type": "mode_updated", "mode": &mode}))
@@ -1040,17 +1029,17 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             }
         };
 
-        let (agent, llm) = match (
-            state.server_state.agent_state.clone(),
-            state.server_state.llm_state.read().await.as_ref().cloned(),
-        ) {
-            (Some(a), Some(l)) => (a, l),
-            _ => {
-                let _ = event_tx
-                    .send(serde_json::json!({"type": "error", "message": "agent or LLM gateway not initialized"}))
-                    .await;
-                continue;
-            }
+        let Some(agent) = state.server_state.agent_state.clone() else {
+            let _ = event_tx
+                .send(serde_json::json!({"type": "error", "message": "agent or LLM gateway not initialized"}))
+                .await;
+            continue;
+        };
+        let Some(llm) = state.server_state.llm_state.read().await.as_ref().cloned() else {
+            let _ = event_tx
+                .send(serde_json::json!({"type": "error", "message": "agent or LLM gateway not initialized"}))
+                .await;
+            continue;
         };
 
         // 会话级互斥：同一 session 的并发连接（多标签页/重连叠旧连接）各自跑
@@ -1185,52 +1174,48 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 首个用户消息：从 DB 重建运行时；后续消息直接追加到内存 messages。
         // user 消息的落库与内存追加统一放在 refs 注入之后（见下），加载阶段
         // 不再写库——先落原始 content 再注入会造成 DB 与内存内容不一致。
-        let rt = match rt_cache.as_mut() {
-            Some(rt) => {
-                // 会话角色/模型「下一条消息生效」：PATCH/SetRole 仅落库，每条消息
-                // 从 DB 重读并覆盖 rt（含 @role 临时角色复位），无需重连 WS 即生效。
-                refresh_session_state(&agent.db, &session_id, &mut rt.model, &mut rt.active_role)
-                    .await;
-                refresh_approval_mode(&agent.db, &session_id, &mut rt.approval_mode).await;
-                rt
-            }
-            None => {
-                // 全局默认模型：session.model 为空时优先于「第一个可用模型」。
-                let default_model = agent
-                    .db
-                    .load_server_setting(DEFAULT_MODEL_KEY)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let mut loaded =
-                    match SessionRuntime::load(&agent.db, &session_id, &default_model).await {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            let _ = event_tx
-                                .send(serde_json::json!({"type": "error", "message": e}))
-                                .await;
-                            continue;
-                        }
-                    };
-                // 模型为空 → 取 LLM 网关第一个可用模型
-                if loaded.model.is_empty() {
-                    if let Ok(models) = crate::llm::router::list_available_models(&llm).await {
-                        if let Some(first) = models.first() {
-                            if let Some(name) = first.get("id").and_then(|v| v.as_str()) {
-                                loaded.model = name.to_string();
-                            }
-                        }
-                    }
-                    if loaded.model.is_empty() {
+        let rt = if let Some(rt) = rt_cache.as_mut() {
+            // 会话角色/模型「下一条消息生效」：PATCH/SetRole 仅落库，每条消息
+            // 从 DB 重读并覆盖 rt（含 @role 临时角色复位），无需重连 WS 即生效。
+            refresh_session_state(&agent.db, &session_id, &mut rt.model, &mut rt.active_role).await;
+            refresh_approval_mode(&agent.db, &session_id, &mut rt.approval_mode).await;
+            rt
+        } else {
+            // 全局默认模型：session.model 为空时优先于「第一个可用模型」。
+            let default_model = agent
+                .db
+                .load_server_setting(DEFAULT_MODEL_KEY)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let mut loaded =
+                match SessionRuntime::load(&agent.db, &session_id, &default_model).await {
+                    Ok(rt) => rt,
+                    Err(e) => {
                         let _ = event_tx
-                            .send(serde_json::json!({"type": "error", "message": "no LLM model configured"}))
+                            .send(serde_json::json!({"type": "error", "message": e}))
                             .await;
                         continue;
                     }
+                };
+            // 模型为空 → 取 LLM 网关第一个可用模型
+            if loaded.model.is_empty() {
+                if let Ok(models) = crate::llm::router::list_available_models(&llm).await {
+                    if let Some(first) = models.first() {
+                        if let Some(name) = first.get("id").and_then(|v| v.as_str()) {
+                            loaded.model = name.to_string();
+                        }
+                    }
                 }
-                rt_cache.insert(loaded)
+                if loaded.model.is_empty() {
+                    let _ = event_tx
+                        .send(serde_json::json!({"type": "error", "message": "no LLM model configured"}))
+                        .await;
+                    continue;
+                }
             }
+            rt_cache.insert(loaded)
         };
 
         // @role 前缀解析：content 以 @<name> 开头且 name 匹配可见角色（mode 含 primary/all）
@@ -1323,7 +1308,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 tokio::select! {
                     r = &mut turn => break TurnOutcome::Completed(r),
                     msg = ws_stream.next() => match msg {
-                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                        None | Some(Err(_) | Ok(Message::Close(_))) => {
                             // 断连：若有进行中的 exec，把取消信号下发到客户端，避免
                             // 内网机器上的命令失去监督仍在运行。
                             send_cancel_to_client(&agent, &cancel_workspace_id, &cancel_client_id, &event_tx).await;
@@ -1368,6 +1353,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             }
                             // 配置切换是 ACP 会话概念：本内层循环只跑自研 runner
                             // 路径（ACP 回合在外层循环处理），无会话配置可切换，忽略。
+                            #[allow(
+                                clippy::match_same_arms,
+                                reason = "与 ElicitationResponse/Other 同为空体但忽略理由不同（前者无会话配置可切、后者无 pending 表单），合并会丢失各自注释"
+                            )]
                             WsFrame::SetConfigOption { .. } => {}
                             // Runner 审批模式切换：回合内仅持久化 DB（rt 被 turn future 借用，
                             // 不可修改）；下一轮 LLM 调用从 rt.approval_mode 读取最新值
@@ -1391,14 +1380,13 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             // elicitation 仅 ACP 路径产生：runner 回合内不可能有
                             // pending 表单，忽略（resolve_elicitation 对未知 id
                             // 是 no-op，ACP 帧只在外层处理，保持最小改动）。
-                            WsFrame::ElicitationResponse { .. } => {}
-                            WsFrame::Other => {}
+                            WsFrame::ElicitationResponse { .. } | WsFrame::Other => {}
                         },
                     },
                     // 死连接：与 None/Err/Close 同款断连处理（turn 内先下发 exec
                     // 取消信号再丢弃 turn future），区别是触发方为 push_task 的
                     // 心跳判定而非对端帧——半开连接不会发 close，只能靠出站探活。
-                    _ = dead_notify.notified() => {
+                    () = dead_notify.notified() => {
                         send_cancel_to_client(&agent, &cancel_workspace_id, &cancel_client_id, &event_tx).await;
                         break TurnOutcome::Disconnected;
                     },
@@ -1658,7 +1646,7 @@ mod tests {
         // decline / cancel：无 content
         for action in ["decline", "cancel"] {
             let frame = parse_ws_frame(Message::Text(format!(
-                r#"{{"type":"elicitation_response","request_id":"r2","action":"{action}"}}"#
+                r#"{{"type":"elicitation_response","request_id":"r2","action":"{action}"}}"#,
             )));
             assert!(
                 matches!(
@@ -1782,7 +1770,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1826,7 +1814,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1876,7 +1864,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,

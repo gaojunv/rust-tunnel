@@ -4,12 +4,12 @@
 //! Responses API 时，由本模块完成请求/响应/流式的双向桥接。
 //!
 //! 六个转换能力（本批只写转换层+单测，不接 handler/路由）：
-//! - [`responses_request_to_chat`] — Responses 请求 → ChatCompletionRequest
-//! - [`chat_response_to_responses`] — Chat 响应 → Responses 响应（非流式）
-//! - [`ChatToResponsesSseTranslator`] — Chat chunk SSE → Responses SSE（流式）
-//! - [`chat_body_to_responses_body`] — Chat 请求体 → Responses 请求体
-//! - [`responses_response_to_chat`] — Responses 响应 → Chat 响应（非流式）
-//! - [`ResponsesToChatSseTranslator`] — Responses SSE → Chat chunk SSE（流式）
+//! - [`crate::responses::responses_request_to_chat`] — Responses 请求 → ChatCompletionRequest
+//! - [`crate::responses::chat_response_to_responses`] — Chat 响应 → Responses 响应（非流式）
+//! - [`crate::responses::ChatToResponsesSseTranslator`] — Chat chunk SSE → Responses SSE（流式）
+//! - [`crate::responses::chat_body_to_responses_body`] — Chat 请求体 → Responses 请求体
+//! - [`crate::responses::responses_response_to_chat`] — Responses 响应 → Chat 响应（非流式）
+//! - [`crate::responses::ResponsesToChatSseTranslator`] — Responses SSE → Chat chunk SSE（流式）
 
 use serde_json::{json, Value};
 

@@ -117,7 +117,7 @@ pub async fn create_proxy_rule(
     rule.cert_status = Some(cert_status.clone());
 
     if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
-        tracing::error!("Failed to save proxy rule: {}", e);
+        tracing::error!("Failed to save proxy rule: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save proxy rule" })),
@@ -137,7 +137,7 @@ pub async fn create_proxy_rule(
             .reconcile_http_listener(&rule.listen)
             .await
         {
-            tracing::warn!("Reconcile failed on create, rolling back: {}", e);
+            tracing::warn!("Reconcile failed on create, rolling back: {e}");
             let _ = state
                 .server_state
                 .proxy_state
@@ -147,14 +147,13 @@ pub async fn create_proxy_rule(
                 .remove(&id);
             if let Err(del_err) = state.server_state.proxy_state.delete_rule(&id).await {
                 tracing::error!(
-                    "Compensating delete failed after reconcile error: {}",
-                    del_err
+                    "Compensating delete failed after reconcile error: {del_err}"
                 );
             }
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": format!("{}", e),
+                    "error": format!("{e}"),
                     "conflicts": conflicts_from_error(&e),
                 })),
             )
@@ -171,7 +170,7 @@ pub async fn create_proxy_rule(
                 let domain = cert_status.covering_domain.clone();
                 tokio::spawn(async move {
                     if let Err(e) = mgr.request_acme_certificate(&domain).await {
-                        tracing::error!("ACME issuance failed for {}: {}", domain, e);
+                        tracing::error!("ACME issuance failed for {domain}: {e}");
                     }
                 });
             }
@@ -194,17 +193,17 @@ fn conflicts_from_error(e: &crate::reverse_proxy::error::ReconcileError) -> Vec<
             ..
         } => vec![serde_json::json!({
             "rule_id": other_rule_id,
-            "reason": format!("domain {} already claimed", domain),
+            "reason": format!("domain {domain} already claimed"),
         })],
         E::TlsMismatch {
             existing_tls,
             new_tls,
             ..
         } => vec![serde_json::json!({
-            "reason": format!("tls mismatch: existing={} new={}", existing_tls, new_tls),
+            "reason": format!("tls mismatch: existing={existing_tls} new={new_tls}"),
         })],
         E::BindFailed { source, .. } => vec![serde_json::json!({
-            "reason": format!("bind failed: {}", source),
+            "reason": format!("bind failed: {source}"),
         })],
         E::NoCertManager { .. } => vec![serde_json::json!({
             "reason": "TLS enabled but no certificate manager configured",
@@ -214,6 +213,7 @@ fn conflicts_from_error(e: &crate::reverse_proxy::error::ReconcileError) -> Vec<
 
 // PUT /api/proxy/rules/:id — update a proxy rule
 /// 更新反代规则（PUT /api/proxy/rules/:id）。
+#[allow(clippy::too_many_lines, reason = "HTTP 规则更新需校验→持久化→新旧端口 reconcile→Trojan 模式同步→ACME 触发，顺序编排拆分会降低可读性")]
 pub async fn update_proxy_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -237,15 +237,12 @@ pub async fn update_proxy_rule(
         let rules = state.server_state.proxy_state.rules.lock().await;
         rules.get(&id).cloned()
     };
-    let previous = match previous {
-        Some(r) => r,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Rule not found" })),
-            )
-                .into_response();
-        }
+    let Some(previous) = previous else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Rule not found" })),
+        )
+            .into_response();
     };
 
     let mut rule = ProxyRule {
@@ -274,7 +271,7 @@ pub async fn update_proxy_rule(
     rule.cert_status = Some(cert_status.clone());
 
     if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
-        tracing::error!("Failed to save proxy rule: {}", e);
+        tracing::error!("Failed to save proxy rule: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save proxy rule" })),
@@ -297,7 +294,7 @@ pub async fn update_proxy_rule(
             .reconcile_http_listener(&new_listen)
             .await
         {
-            tracing::warn!("Reconcile failed on update, rolling back: {}", e);
+            tracing::warn!("Reconcile failed on update, rolling back: {e}");
             {
                 let mut rules = state.server_state.proxy_state.rules.lock().await;
                 rules.insert(id.clone(), previous.clone());
@@ -314,13 +311,13 @@ pub async fn update_proxy_rule(
                     .reconcile_http_listener(port)
                     .await
                 {
-                    tracing::error!("Rollback reconcile failed for {}: {}", port, rb);
+                    tracing::error!("Rollback reconcile failed for {port}: {rb}");
                 }
             }
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": format!("{}", e),
+                    "error": format!("{e}"),
                     "conflicts": conflicts_from_error(&e),
                 })),
             )
@@ -334,7 +331,7 @@ pub async fn update_proxy_rule(
             .reconcile_http_listener(&old_listen)
             .await
         {
-            tracing::warn!("Old-port reconcile failed after update: {}", e);
+            tracing::warn!("Old-port reconcile failed after update: {e}");
         }
     }
 
@@ -347,7 +344,7 @@ pub async fn update_proxy_rule(
                 let domain = cert_status.covering_domain.clone();
                 tokio::spawn(async move {
                     if let Err(e) = mgr.request_acme_certificate(&domain).await {
-                        tracing::error!("ACME issuance failed for {}: {}", domain, e);
+                        tracing::error!("ACME issuance failed for {domain}: {e}");
                     }
                 });
             }
@@ -363,19 +360,16 @@ pub async fn delete_proxy_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let deleted = {
+    let deleted_opt = {
         let mut rules = state.server_state.proxy_state.rules.lock().await;
         rules.remove(&id)
     };
-    let deleted = match deleted {
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Rule not found" })),
-            )
-                .into_response();
-        }
-        Some(r) => r,
+    let Some(deleted) = deleted_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Rule not found" })),
+        )
+            .into_response();
     };
 
     if deleted.rule_type != crate::reverse_proxy::RuleType::Http
@@ -391,7 +385,7 @@ pub async fn delete_proxy_rule(
     }
 
     if let Err(e) = state.server_state.proxy_state.delete_rule(&id).await {
-        tracing::error!("Failed to delete proxy rule from database: {}", e);
+        tracing::error!("Failed to delete proxy rule from database: {e}");
     }
 
     if deleted.rule_type == crate::reverse_proxy::RuleType::Http
@@ -403,7 +397,7 @@ pub async fn delete_proxy_rule(
             .reconcile_http_listener(&deleted.listen)
             .await
         {
-            tracing::warn!("Reconcile failed on delete: {}", e);
+            tracing::warn!("Reconcile failed on delete: {e}");
         }
     }
 
@@ -426,9 +420,13 @@ pub async fn update_reverse_proxy_config(
     State(state): State<ApiState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let max_conn = payload["max_connections"].as_u64().unwrap_or(10000) as u32;
+    let max_conn = payload["max_connections"]
+        .as_u64()
+        .map_or(10000, |v| u32::try_from(v).unwrap_or(u32::MAX));
     let timeout = payload["connection_timeout_secs"].as_u64().unwrap_or(30);
-    let buffer = payload["buffer_size"].as_u64().unwrap_or(8192) as usize;
+    let buffer = payload["buffer_size"]
+        .as_u64()
+        .map_or(8192, |v| usize::try_from(v).unwrap_or(usize::MAX));
 
     // Save to DB
     if let Some(db) = state.server_state.db() {
@@ -438,7 +436,7 @@ pub async fn update_reverse_proxy_config(
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response();
         }

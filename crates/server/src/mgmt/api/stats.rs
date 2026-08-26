@@ -52,7 +52,7 @@ pub async fn get_stats_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid start: {}", e)})),
+                Json(serde_json::json!({"error": format!("Invalid start: {e}")})),
             )
                 .into_response()
         }
@@ -62,7 +62,7 @@ pub async fn get_stats_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid end: {}", e)})),
+                Json(serde_json::json!({"error": format!("Invalid end: {e}")})),
             )
                 .into_response()
         }
@@ -76,15 +76,12 @@ pub async fn get_stats_query(
     }
     let entity_types = params.entity_type.unwrap_or_default();
     let entity_ids = params.entity_id.unwrap_or_default();
-    let db = match state.server_state.get_db() {
-        Some(db) => db,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "No DB"})),
-            )
-                .into_response()
-        }
+    let Some(db) = state.server_state.get_db() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "No DB"})),
+        )
+            .into_response();
     };
     match db
         .query_stats_snapshots(&entity_types, &entity_ids, start, end)
@@ -114,11 +111,8 @@ pub async fn sse_stats_stream(
     if state.auth_config.is_enabled() {
         let token = params.token.as_deref().unwrap_or("");
 
-        let is_valid = if !token.is_empty() {
-            crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok()
-        } else {
-            false
-        };
+        let is_valid =
+            !token.is_empty() && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok();
 
         if !is_valid {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
@@ -140,7 +134,7 @@ pub async fn sse_stats_stream(
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                     yield Ok::<_, std::convert::Infallible>(
-                        axum::response::sse::Event::default().event("sync").data(format!(r#"{{"lagged":{}}}"#, n)),
+                        axum::response::sse::Event::default().event("sync").data(format!(r#"{{"lagged":{n}}}"#)),
                     );
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,

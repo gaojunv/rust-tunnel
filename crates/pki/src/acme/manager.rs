@@ -71,7 +71,7 @@ impl CertificateManager {
     /// Create a new certificate manager
     ///
     /// Initializes the manager with the given certificate directory.
-    /// Certificates are not loaded from disk until [`load_from_storage`] is called.
+    /// Certificates are not loaded from disk until [`Self::load_from_storage`] is called.
     #[must_use]
     pub fn new(cert_dir: &str) -> Self {
         let storage = CertificateStorage::new(cert_dir);

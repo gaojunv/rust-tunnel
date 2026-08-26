@@ -22,6 +22,11 @@ pub struct ServerAuthView {
 }
 
 /// 读取服务端已持久化的客户端接入 token。
+///
+/// # Errors
+///
+/// - 当 `Database::load_server_auth` 查询失败时返回 `Err`。
+/// - 当数据库中不存在 `server_auth` 行时返回 `Err`（`server_auth row missing`）。
 pub async fn get_impl(db: &Database) -> Result<ServerAuthView, String> {
     let token = db
         .load_server_auth()
@@ -35,6 +40,10 @@ pub async fn get_impl(db: &Database) -> Result<ServerAuthView, String> {
 }
 
 /// 随机生成新的客户端接入 token 并持久化。
+///
+/// # Errors
+///
+/// 当 `Database::save_server_auth` 持久化失败时返回 `Err`。
 pub async fn rotate_impl(db: &Database) -> Result<String, String> {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -46,6 +55,11 @@ pub async fn rotate_impl(db: &Database) -> Result<String, String> {
 }
 
 /// 写入指定的客户端接入 token（空串拒绝）。
+///
+/// # Errors
+///
+/// - 当 `token` 去除空白后为空时返回 `Err`（`token cannot be empty`）。
+/// - 当 `Database::save_server_auth` 持久化失败时返回 `Err`。
 pub async fn set_impl(db: &Database, token: &str) -> Result<(), String> {
     if token.trim().is_empty() {
         return Err("token cannot be empty".into());
@@ -106,7 +120,7 @@ pub async fn put_auth(
         }
     };
     match set_impl(&db, &body.token).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
 }

@@ -15,6 +15,7 @@ impl Default for MeshRouter {
 
 impl MeshRouter {
     /// 创建空路由表。
+    #[must_use]
     pub fn new() -> Self {
         Self {
             networks: HashMap::new(),
@@ -82,6 +83,7 @@ impl MeshRouter {
     }
 
     /// 获取 mesh 的所有成员。
+    #[must_use]
     pub fn get_members(&self, mesh_id: &str) -> Vec<&MeshRoute> {
         self.networks
             .get(mesh_id)
@@ -90,6 +92,7 @@ impl MeshRouter {
     }
 
     /// 查询客户端所属的所有 mesh。
+    #[must_use]
     pub fn get_client_meshes(&self, client_name: &str) -> Vec<String> {
         self.networks
             .iter()
@@ -99,6 +102,7 @@ impl MeshRouter {
     }
 
     /// 查询 mesh 中指定客户端的路由。
+    #[must_use]
     pub fn get_member(&self, mesh_id: &str, client_name: &str) -> Option<&MeshRoute> {
         self.networks.get(mesh_id)?.get(client_name)
     }
@@ -113,6 +117,7 @@ impl MeshRouter {
     }
 
     /// 列出所有 mesh 网络 ID。
+    #[must_use]
     pub fn list_networks(&self) -> Vec<String> {
         self.networks.keys().cloned().collect()
     }

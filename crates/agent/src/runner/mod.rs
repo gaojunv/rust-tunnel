@@ -1,9 +1,9 @@
 //! 自研 agent 回合循环：LLM 调用 → 隧道工具执行 → 结果回灌（未配置 agent_type
 //! 的 workspace 的回退运行时路径；ACP 为主路径）。
 //!
-//! 子模块：[`prompt`] 用户消息组装、[`parse`] LLM 响应解析、[`version_gate`]
-//! 客户端版本门控、[`tool_result_text`] 工具结果文本化、[`blocks`] 系统提示词
-//! 块操作、[`tool_calls`] 工具调用处理、[`turn`] 回合主循环、[`exec_group`] /
+//! 子模块：`prompt` 用户消息组装、`parse` LLM 响应解析、`version_gate`
+//! 客户端版本门控、`tool_result_text` 工具结果文本化、`blocks` 系统提示词
+//! 块操作、`tool_calls` 工具调用处理、`turn` 回合主循环、[`exec_group`] /
 //! [`subagent`] 只读并发组与子代理。
 
 use std::sync::Arc;

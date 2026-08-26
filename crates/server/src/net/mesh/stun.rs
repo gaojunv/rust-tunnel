@@ -9,12 +9,18 @@ pub struct StunServer {
 
 impl StunServer {
     /// 绑定 UDP 地址创建 STUN 服务端。
+    ///
+    /// # Errors
+    /// 当 UDP 绑定失败时返回错误。
     pub async fn bind(addr: &str) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         Ok(Self { socket })
     }
 
     /// 运行 STUN 服务循环（永不返回）。
+    ///
+    /// # Errors
+    /// 当收发 UDP 失败时返回错误。
     pub async fn run(self) -> anyhow::Result<()> {
         let mut buf = [0u8; 1500];
         loop {
@@ -68,7 +74,8 @@ impl StunServer {
         // Message type: Binding Success Response (0x0101)
         response.extend_from_slice(&0x0101u16.to_be_bytes());
         // Message length
-        response.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+        let attr_len = u16::try_from(attr.len()).unwrap_or(u16::MAX);
+        response.extend_from_slice(&attr_len.to_be_bytes());
         // Magic cookie
         response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         // Transaction ID (copied from request)

@@ -9,8 +9,9 @@ license = "MIT"
 members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/server", "crates/stats"]
 
 [workspace.lints.clippy]
-# 企业级 lint 基线：pedantic 组先 warn 基线运行，批次 9 清零后转 deny
-pedantic = { level = "warn", priority = -1 }
+# 企业级 lint 基线：pedantic 组已在批次 9/10 全仓清零，转 deny 硬门禁。
+# 新增违反必须就地修正，或加 `#[expect(lint, reason = "中文理由")]` 显式豁免。
+pedantic = { level = "deny", priority = -1 }
 # doc_markdown 对中文注释误报率极高（863 条），自动修复会破坏中文文档
 doc_markdown = "allow"
 # panic 风险关键项（restriction 组）：生产代码 deny 硬门禁，测试经各 crate
@@ -24,8 +25,8 @@ panic = "deny"
 unwrap_in_result = "deny"
 
 [workspace.lints.rust]
-# 文档缺口显性化（批次 9 渐进补全）
-missing_docs = "warn" # 现状 80% 缺失，先不开启警告洪泛
+# 全部 pub API 文档已在批次 9e/10 补齐，转 deny 防回退
+missing_docs = "deny"
 
 [workspace.dependencies]
 # Async runtime

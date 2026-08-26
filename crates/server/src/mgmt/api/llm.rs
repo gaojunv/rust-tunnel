@@ -115,7 +115,7 @@ pub async fn update_gateway_config(
         tracing::error!("Failed to persist LLM gateway rule: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to persist gateway config: {}", e),
+            format!("Failed to persist gateway config: {e}"),
         )
             .into_response();
     }
@@ -151,9 +151,8 @@ pub async fn update_gateway_config(
 
 /// 列出全部 LLM Provider（GET /api/llm/providers）。
 pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
 
     let records = match db.llm_list_providers().await {
@@ -161,7 +160,7 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -211,9 +210,8 @@ pub async fn create_provider(
     State(state): State<ApiState>,
     Json(body): Json<ProviderRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
 
     if body.name.is_empty() {
@@ -223,7 +221,7 @@ pub async fn create_provider(
     if !is_valid_provider_type(&body.provider_type) {
         return (
             StatusCode::BAD_REQUEST,
-            format!("invalid provider_type. valid: {:?}", VALID_PROVIDER_TYPES),
+            format!("invalid provider_type. valid: {VALID_PROVIDER_TYPES:?}"),
         )
             .into_response();
     }
@@ -261,7 +259,7 @@ pub async fn create_provider(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -281,9 +279,8 @@ pub async fn update_provider(
     Path(id): Path<String>,
     Json(body): Json<ProviderRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
 
     let existing = match db.llm_get_provider(&id).await {
@@ -292,7 +289,7 @@ pub async fn update_provider(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -301,7 +298,7 @@ pub async fn update_provider(
     if !is_valid_provider_type(&body.provider_type) {
         return (
             StatusCode::BAD_REQUEST,
-            format!("invalid provider_type. valid: {:?}", VALID_PROVIDER_TYPES),
+            format!("invalid provider_type. valid: {VALID_PROVIDER_TYPES:?}"),
         )
             .into_response();
     }
@@ -349,7 +346,7 @@ pub async fn update_provider(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -365,15 +362,14 @@ pub async fn toggle_provider(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let enabled = body["enabled"].as_bool().unwrap_or(false);
     if let Err(e) = db.llm_toggle_provider(&id, enabled).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -386,14 +382,13 @@ pub async fn delete_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if let Err(e) = db.llm_delete_provider(&id).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -408,16 +403,15 @@ pub async fn list_provider_models(
     State(state): State<ApiState>,
     Path(provider_id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let records = match db.llm_list_models_for_provider(&provider_id).await {
         Ok(r) => r,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -441,16 +435,15 @@ pub async fn list_provider_models(
 
 /// 列出全部模型（GET /api/llm/models）。
 pub async fn list_all_models(State(state): State<ApiState>) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let records = match db.llm_list_models().await {
         Ok(r) => r,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -478,9 +471,8 @@ pub async fn add_model(
     Path(provider_id): Path<String>,
     Json(body): Json<ModelRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let id = uuid::Uuid::new_v4().to_string();
     let tags = serde_json::to_string(&body.tags.unwrap_or_default()).unwrap_or_default();
@@ -500,7 +492,7 @@ pub async fn add_model(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -520,9 +512,8 @@ pub async fn update_model(
     Path(id): Path<String>,
     Json(body): Json<ModelRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let tags = serde_json::to_string(&body.tags.unwrap_or_default()).unwrap_or_default();
     let alias = body.alias.unwrap_or_default();
@@ -539,7 +530,7 @@ pub async fn update_model(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -552,14 +543,13 @@ pub async fn delete_model(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if let Err(e) = db.llm_delete_model(&id).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -571,16 +561,15 @@ pub async fn delete_model(
 
 /// 列出全部 API Key（GET /api/llm/api-keys）。
 pub async fn list_api_keys(State(state): State<ApiState>) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let records = match db.llm_list_api_keys().await {
         Ok(r) => r,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -613,7 +602,7 @@ async fn ensure_kb_exists(
         Ok(None) => Err((StatusCode::BAD_REQUEST, "kb not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )),
     }
 }
@@ -623,9 +612,8 @@ pub async fn create_api_key(
     State(state): State<ApiState>,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
 
     // 指定 kb_id 时先校验知识库存在（不存在 → 400）
@@ -642,7 +630,7 @@ pub async fn create_api_key(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -662,9 +650,8 @@ pub async fn toggle_api_key(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
 
     // 先校验、后变更：kb_id 的类型与存在性校验前置到 enabled toggle 之前，
@@ -688,7 +675,7 @@ pub async fn toggle_api_key(
         if let Err(e) = db.llm_toggle_api_key(&id, enabled).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response();
         }
@@ -699,7 +686,7 @@ pub async fn toggle_api_key(
         if let Err(e) = db.llm_set_api_key_kb(&id, new_kb_id).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response();
         }
@@ -713,14 +700,13 @@ pub async fn delete_api_key(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if let Err(e) = db.llm_delete_api_key(&id).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -779,9 +765,8 @@ pub async fn get_usage_summary(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let (start, end) = match resolve_range(&params) {
         Ok(r) => r,
@@ -791,7 +776,7 @@ pub async fn get_usage_summary(
         Ok(s) => Json(serde_json::json!({"summary": s})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response(),
     }
@@ -802,9 +787,8 @@ pub async fn get_usage_aggregate(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let (start, end) = match resolve_range(&params) {
         Ok(r) => r,
@@ -822,7 +806,7 @@ pub async fn get_usage_aggregate(
         Ok(rows) => Json(serde_json::json!({"group_by": group_by, "rows": rows})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response(),
     }
@@ -833,9 +817,8 @@ pub async fn get_usage_logs(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let (start, end) = match resolve_range(&params) {
         Ok(r) => r,
@@ -856,7 +839,7 @@ pub async fn get_usage_logs(
         }
         (Err(e), _) | (_, Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response(),
     }
@@ -890,16 +873,15 @@ async fn llm_invalidate(state: &ApiState) {
 /// GET /api/llm/model-groups
 /// 列出全部模型组（GET /api/llm/model-groups）。
 pub async fn list_model_groups(State(state): State<ApiState>) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let groups = match db.llm_list_model_groups().await {
         Ok(g) => g,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -925,9 +907,8 @@ pub async fn create_model_group(
     State(state): State<ApiState>,
     Json(body): Json<ModelGroupRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if body.name.is_empty() {
         return (StatusCode::BAD_REQUEST, "name is required").into_response();
@@ -944,7 +925,7 @@ pub async fn create_model_group(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -956,7 +937,7 @@ pub async fn create_model_group(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -974,9 +955,8 @@ pub async fn get_model_group(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let group = match db.llm_get_model_group(&id).await {
         Ok(Some(g)) => g,
@@ -984,7 +964,7 @@ pub async fn get_model_group(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -994,7 +974,7 @@ pub async fn get_model_group(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -1048,9 +1028,8 @@ pub async fn update_model_group(
     Path(id): Path<String>,
     Json(body): Json<ModelGroupRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     let group = match db.llm_get_model_group(&id).await {
         Ok(Some(g)) => g,
@@ -1058,7 +1037,7 @@ pub async fn update_model_group(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -1078,7 +1057,7 @@ pub async fn update_model_group(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -1087,7 +1066,7 @@ pub async fn update_model_group(
     if let Err(e) = db.llm_update_model_group(&id, &body.name, enabled).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -1102,9 +1081,8 @@ pub async fn delete_model_group(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     match db.llm_get_model_group(&id).await {
         Ok(Some(_)) => {}
@@ -1112,7 +1090,7 @@ pub async fn delete_model_group(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -1120,7 +1098,7 @@ pub async fn delete_model_group(
     if let Err(e) = db.llm_delete_model_group(&id).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -1135,9 +1113,8 @@ pub async fn replace_group_members(
     Path(id): Path<String>,
     Json(body): Json<ReplaceMembersRequest>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     match db.llm_get_model_group(&id).await {
         Ok(Some(_)) => {}
@@ -1145,7 +1122,7 @@ pub async fn replace_group_members(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }
@@ -1166,12 +1143,12 @@ pub async fn replace_group_members(
         .members
         .iter()
         .enumerate()
-        .map(|(i, m)| (m.model_id.clone(), (i + 1) as i32))
+        .map(|(i, m)| (m.model_id.clone(), i32::try_from(i + 1).unwrap_or(i32::MAX)))
         .collect();
     if let Err(e) = db.llm_replace_group_members(&id, &normalized).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
+            format!("DB error: {e}"),
         )
             .into_response();
     }
@@ -1185,9 +1162,8 @@ pub async fn reset_group_breaker(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = match state.server_state.db() {
-        Some(db) => db,
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    let Some(db) = state.server_state.db() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     match db.llm_get_model_group(&id).await {
         Ok(Some(_)) => {}
@@ -1195,7 +1171,7 @@ pub async fn reset_group_breaker(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response()
         }

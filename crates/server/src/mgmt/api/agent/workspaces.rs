@@ -184,6 +184,7 @@ pub async fn get_workspace(
 }
 
 /// `PUT /api/agent/workspaces/:id`：更新工作区。
+#[allow(clippy::too_many_lines, reason="校验与归一化编排集中于单一 handler，拆分会分散校验逻辑降低可读性")]
 pub async fn update_workspace(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -612,7 +613,7 @@ fn parse_stashes(content: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// GET /api/agent/workspaces/:id/fs/tree?path=<rel>
+/// GET `/api/agent/workspaces/:id/fs/tree?path=<rel>`
 /// FilesPanel 目录树数据源：ListDir 输出（目录以 '/' 结尾）解析为结构化 JSON。
 pub async fn get_fs_tree(
     State(state): State<ApiState>,
@@ -645,7 +646,7 @@ pub async fn get_fs_tree(
     Json(serde_json::json!({ "entries": entries })).into_response()
 }
 
-/// GET /api/agent/workspaces/:id/fs/file?path=<rel>
+/// GET `/api/agent/workspaces/:id/fs/file?path=<rel>`
 /// FilesPanel 文件预览：返回内容与截断标记（客户端 100KB 截断惯例 `[truncated]`）。
 pub async fn get_fs_file(
     State(state): State<ApiState>,
@@ -737,7 +738,7 @@ pub async fn get_git_status(
     Json(serde_json::json!({ "status": stdout, "stderr": stderr })).into_response()
 }
 
-/// GET /api/agent/workspaces/:id/git/diff?path=<rel>&cached=true
+/// GET `/api/agent/workspaces/:id/git/diff?path=<rel>&cached=true`
 /// GitPanel 文件 diff：path 为空时返回整个工作区 diff；`cached=true` 取 staged diff
 /// （走 GitExec，要求客户端 ≥0.5.0；非 cached 保留旧 GitDiff 路径兼容老客户端）。
 pub async fn get_git_diff(
@@ -822,7 +823,7 @@ pub async fn get_git_log(
     Json(serde_json::json!({ "commits": parse_commits(&content) })).into_response()
 }
 
-/// GET /api/agent/workspaces/:id/git/show?rev=<rev>
+/// GET `/api/agent/workspaces/:id/git/show?rev=<rev>`
 /// 提交详情：{diff: <文本>}（git show 原文，含提交元信息 + diff）。
 pub async fn get_git_show(
     State(state): State<ApiState>,
@@ -1068,7 +1069,7 @@ fn shell_escape_q(q: &str) -> String {
     format!("'{}'", q.replace('\'', r"'\''"))
 }
 
-/// GET /api/agent/workspaces/:id/files?q=<前缀>&limit=<n>
+/// GET `/api/agent/workspaces/:id/files?q=<前缀>&limit=<n>`
 /// @补全数据源：经隧道在沙箱内 find+grep 过滤文件路径。Windows 客户端无 find/grep
 /// 时 grep 报错 → 返回空列表（前端降级手输路径），不视为错误。
 pub async fn list_workspace_files(
@@ -1090,15 +1091,11 @@ pub async fn list_workspace_files(
     let limit = params.limit.unwrap_or(20).clamp(1, 50);
     let q = params.q.trim();
     let cmd = if q.is_empty() {
-        format!(
-            "find . -path ./.git -prune -o -type f -print | head -{}",
-            limit
-        )
+        format!("find . -path ./.git -prune -o -type f -print | head -{limit}")
     } else {
         format!(
-            "find . -path ./.git -prune -o -type f -print | grep -i -F -- {} | head -{}",
+            "find . -path ./.git -prune -o -type f -print | grep -i -F -- {} | head -{limit}",
             shell_escape_q(q),
-            limit
         )
     };
     let result = crate::agent::executor::exec_on_client(
@@ -1125,6 +1122,7 @@ pub async fn list_workspace_files(
 }
 
 #[cfg(test)]
+#[allow(clippy::large_futures, reason = "测试中 handler future 较大但仅在单测路径构造一次，boxing 需单独性能评估")]
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
@@ -1322,7 +1320,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1421,9 +1419,9 @@ mod tests {
                 llm_model_id: None,
                 agent_config_overrides: None,
                 claude_tier_models: None,
-                github_token: Some("".into()), // 空串归一化 → 未配置
-                github_owner: Some("".into()),
-                github_repo: Some("".into()),
+                github_token: Some(String::new()), // 空串归一化 → 未配置
+                github_owner: Some(String::new()),
+                github_repo: Some(String::new()),
             }),
         )
         .await
@@ -1449,7 +1447,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1475,8 +1473,8 @@ mod tests {
                 llm_model_id: None,
                 agent_config_overrides: None,
                 claude_tier_models: None,
-                github_token: Some("".into()),
-                github_owner: Some("".into()),
+                github_token: Some(String::new()),
+                github_owner: Some(String::new()),
                 github_repo: None,
             }),
         )
@@ -1553,7 +1551,7 @@ mod tests {
                 system_prompt: None,
                 approval_mode: None,
                 agent_type: None,
-                agent_path: Some("".into()),
+                agent_path: Some(String::new()),
                 llm_model_id: None,
                 agent_config_overrides: None,
                 claude_tier_models: None,
@@ -1599,7 +1597,7 @@ mod tests {
                 root_path: "/p".into(),
                 system_prompt: None,
                 approval_mode: None,
-                agent_type: Some("".into()),
+                agent_type: Some(String::new()),
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
@@ -2144,7 +2142,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2249,7 +2247,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2351,7 +2349,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2380,7 +2378,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2434,7 +2432,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2495,8 +2493,8 @@ mod tests {
     #[test]
     fn test_shell_escape_q() {
         assert_eq!(shell_escape_q("main"), "'main'");
-        assert_eq!(shell_escape_q("it's"), r#"'it'\''s'"#);
-        assert_eq!(shell_escape_q("a';b|rm"), r#"'a'\'';b|rm'"#); // 单引号转义后特殊字符在引号内安全
+        assert_eq!(shell_escape_q("it's"), r"'it'\''s'");
+        assert_eq!(shell_escape_q("a';b|rm"), r"'a'\'';b|rm'"); // 单引号转义后特殊字符在引号内安全
     }
 
     // ── Git 面板（GitExec）─────────────────────────────────────────────────────
@@ -2526,7 +2524,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2559,7 +2557,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2585,7 +2583,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2637,7 +2635,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2721,7 +2719,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2779,7 +2777,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2817,7 +2815,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -2854,8 +2852,8 @@ mod tests {
     #[test]
     fn test_parse_commits() {
         let content = "\
-abc\0ab\0Alice\02026-08-14T10:00:00+08:00\0first commit\n\
-def\0de\0Bob\02026-08-13T09:00:00+08:00\0second commit\n";
+abc\x00ab\x00Alice\x002026-08-14T10:00:00+08:00\x00first commit\n\
+def\x00de\x00Bob\x002026-08-13T09:00:00+08:00\x00second commit\n";
         let out = parse_commits(content);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["hash"], "abc");

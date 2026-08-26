@@ -23,6 +23,7 @@ const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 // ── Log Viewer Endpoints ──────────────────────────────────────────
 
+/// SSE 日志流：按 `level`/`source` 过滤后推送 `log`/`sync`/`ping` 事件，未启用鉴权或 `?token=` 校验通过时建立订阅。
 pub async fn sse_log_stream(
     State(state): State<ApiState>,
     Query(params): Query<SseQuery>,
@@ -31,29 +32,23 @@ pub async fn sse_log_stream(
     if state.auth_config.is_enabled() {
         let token = params.token.as_deref().unwrap_or("");
 
-        let is_valid = if !token.is_empty() {
-            crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok()
-        } else {
-            false
-        };
+        let is_valid =
+            !token.is_empty() && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok();
 
         if !is_valid {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
 
-    let log_store = match &state.log_store {
-        Some(store) => store.clone(),
-        None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
-        }
+    let Some(log_store) = &state.log_store else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
     };
+    let log_store = log_store.clone();
 
     let min_level = params.level.as_deref().unwrap_or("info");
     let min_level_u8 = match min_level {
         "error" => 4u8,
         "warn" => 3,
-        "info" => 2,
         "debug" => 1,
         "trace" => 0,
         _ => 2,
@@ -67,7 +62,10 @@ pub async fn sse_log_stream(
                 Ok(Ok(entry)) => {
                     // Apply filters
                     let entry_level = match entry.level.as_str() {
-                        "TRACE" => 0, "DEBUG" => 1, "INFO" => 2, "WARN" => 3, "ERROR" => 4,
+                        "TRACE" => 0,
+                        "DEBUG" => 1,
+                        "WARN" => 3,
+                        "ERROR" => 4,
                         _ => 2,
                     };
                     if entry_level < min_level_u8 {
@@ -95,9 +93,7 @@ pub async fn sse_log_stream(
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                     yield Ok::<_, std::convert::Infallible>(
-                        Event::default()
-                            .event("sync")
-                            .data(format!(r#"{{"lagged":{}}}"#, n)),
+                        Event::default().event("sync").data(format!(r#"{{"lagged":{n}}}"#)),
                     );
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -118,15 +114,13 @@ pub async fn sse_log_stream(
         .into_response()
 }
 
+/// 日志查询：按 `level`/`source`/`search`/`before_id`/`limit` 分页返回日志条目，优先命中内存缓冲、不足时回补数据库。
 pub async fn get_logs(
     State(state): State<ApiState>,
     Query(params): Query<LogsQuery>,
 ) -> impl IntoResponse {
-    let log_store = match &state.log_store {
-        Some(store) => store,
-        None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
-        }
+    let Some(log_store) = &state.log_store else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
     };
 
     let limit = params.limit.unwrap_or(200).min(1000) as usize;
@@ -139,7 +133,7 @@ pub async fn get_logs(
                 params.level.as_deref(),
                 params.source.as_deref(),
                 params.search.as_deref(),
-                limit as u32,
+                u32::try_from(limit).unwrap_or(u32::MAX),
                 params.before_id,
             )
             .await;
@@ -171,7 +165,7 @@ pub async fn get_logs(
 
     // If in-memory buffer doesn't have enough entries, supplement from DB
     if mem_entries.len() < limit {
-        let db_limit = (limit - mem_entries.len()) as u32;
+        let db_limit = u32::try_from(limit - mem_entries.len()).unwrap_or(u32::MAX);
         let db_entries = log_store
             .query_db(
                 params.level.as_deref(),
@@ -229,19 +223,16 @@ pub async fn get_logs(
     Json(response).into_response()
 }
 
+/// 当前日志级别查询：返回动态日志级别字符串。
 pub async fn get_logs_level(State(state): State<ApiState>) -> impl IntoResponse {
-    let log_store = match &state.log_store {
-        Some(store) => store,
-        None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
-        }
+    let Some(log_store) = &state.log_store else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
     };
 
     let level_u8 = log_store.level.load(Ordering::Relaxed);
     let level_str = match level_u8 {
         0 => "trace",
         1 => "debug",
-        2 => "info",
         3 => "warn",
         4 => "error",
         _ => "info",
@@ -250,15 +241,13 @@ pub async fn get_logs_level(State(state): State<ApiState>) -> impl IntoResponse 
     Json(serde_json::json!({ "level": level_str })).into_response()
 }
 
+/// 日志级别更新：校验并持久化新级别，同时同步内存开关与动态配置。
 pub async fn put_logs_level(
     State(state): State<ApiState>,
     Json(body): Json<SetLevelRequest>,
 ) -> impl IntoResponse {
-    let log_store = match &state.log_store {
-        Some(store) => store,
-        None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
-        }
+    let Some(log_store) = &state.log_store else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
     };
 
     let level_u8 = match body.level.to_lowercase().as_str() {
@@ -295,6 +284,7 @@ pub async fn put_logs_level(
     Json(serde_json::json!({ "level": body.level.to_lowercase() })).into_response()
 }
 
+/// LLM 请求日志开关查询。
 pub async fn get_llm_logging(State(state): State<ApiState>) -> impl IntoResponse {
     let enabled = state
         .server_state
@@ -305,6 +295,7 @@ pub async fn get_llm_logging(State(state): State<ApiState>) -> impl IntoResponse
     Json(serde_json::json!({ "enabled": enabled })).into_response()
 }
 
+/// LLM 请求日志开关更新：同步动态配置、热路径 `AtomicBool` 与数据库持久化。
 pub async fn put_llm_logging(
     State(state): State<ApiState>,
     Json(body): Json<super::dto::SetLlmLoggingRequest>,
@@ -341,6 +332,7 @@ mod tests {
     use crate::auth::AuthConfig;
     use std::sync::Arc;
 
+    #[allow(clippy::large_futures, reason = "测试辅助 future 仅在单测中构造一次，boxing 无收益")]
     async fn get_enabled(state: ApiState) -> bool {
         let resp = get_llm_logging(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -360,11 +352,13 @@ mod tests {
         }
     }
 
+    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
     #[tokio::test]
     async fn test_get_llm_logging_default_true() {
         assert!(get_enabled(make_state()).await);
     }
 
+    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
     #[tokio::test]
     async fn test_put_llm_logging_toggles_and_persists() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
@@ -403,6 +397,7 @@ mod tests {
         assert_eq!(stored, "false");
     }
 
+    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
     #[tokio::test]
     async fn test_put_llm_logging_turns_back_on() {
         let state = make_state();
@@ -419,6 +414,7 @@ mod tests {
 
     /// 完整端到端 round-trip：PUT 关闭 → dynamic_config 同步 → DB 持久化 →
     /// 模拟服务重启（load_or_seed 回读）→ 重启后的 GET 仍为 false。
+    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
     #[tokio::test]
     async fn test_llm_logging_round_trip_survives_restart() {
         let db = crate::db::Database::new(":memory:").await.unwrap();

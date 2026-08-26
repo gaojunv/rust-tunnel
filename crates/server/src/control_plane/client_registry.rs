@@ -100,6 +100,7 @@ pub struct ClientRegistry {
 
 impl ClientRegistry {
     /// 创建空注册表。
+    #[must_use]
     pub fn new(db: Database) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
@@ -280,14 +281,11 @@ impl ClientRegistry {
         };
 
         // Handle oneshot cancellation
-        let outcome = match outcome {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "open_result channel dropped",
-                ));
-            }
+        let Ok(outcome) = outcome else {
+            return Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "open_result channel dropped",
+            ));
         };
 
         match outcome {

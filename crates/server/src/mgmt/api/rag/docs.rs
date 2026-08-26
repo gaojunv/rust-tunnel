@@ -90,7 +90,11 @@ pub(crate) async fn reindex_kb_doc(
     // 清旧索引：先向量后 SQLite（向量删除失败仅 warn，DB 是源）。
     if let Err(e) = rt
         .store
-        .delete_by_doc(&kb.id, kb.emb_dimension as usize, &doc.id)
+        .delete_by_doc(
+            &kb.id,
+            usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
+            &doc.id,
+        )
         .await
     {
         tracing::warn!(kb_id = %kb.id, doc_id = %doc.id, error = %e, "rag reindex: store delete_by_doc failed");
@@ -115,6 +119,7 @@ pub(crate) async fn reindex_kb_doc(
     Ok(ReindexOutcome::Spawned)
 }
 
+/// `GET /api/llm/kb/:id/docs` 列出指定知识库下的全部文档。
 pub async fn list_docs(
     State(state): State<ApiState>,
     Path(kb_id): Path<String>,
@@ -140,6 +145,7 @@ pub async fn list_docs(
     Json(serde_json::json!({ "documents": docs })).into_response()
 }
 
+/// `GET /api/llm/kb/:id/docs/:doc_id` 获取单文档详情，校验归属后返回记录。
 pub async fn get_doc(
     State(state): State<ApiState>,
     Path((kb_id, doc_id)): Path<(String, String)>,
@@ -165,6 +171,7 @@ pub async fn get_doc(
 /// POST /api/llm/kb/:id/docs — multipart 上传文档（文本 ≤2MB、二进制 ≤20MB），
 /// 建 doc(pending) 后异步摄入并立即返回 doc 记录。摄入进度经
 /// `/api/llm/kb/events` SSE 推送。
+#[allow(clippy::too_many_lines, reason = "顺序编排：multipart 校验→落盘→入库→异步摄入，拆分会打散共享状态")]
 pub async fn upload_doc(
     State(state): State<ApiState>,
     Path(kb_id): Path<String>,
@@ -344,6 +351,7 @@ pub async fn upload_doc(
     }
 }
 
+/// `DELETE /api/llm/kb/:id/docs/:doc_id` 删除文档，先清向量再删库并清理原文文件。
 pub async fn delete_doc(
     State(state): State<ApiState>,
     Path((kb_id, doc_id)): Path<(String, String)>,
@@ -376,7 +384,11 @@ pub async fn delete_doc(
     // 残留向量可后续 GC，shard 维度不匹配时 delete_by_doc 也会安全降级。
     if let Err(e) = rt
         .store
-        .delete_by_doc(&kb_id, kb.emb_dimension as usize, &doc_id)
+        .delete_by_doc(
+            &kb_id,
+            usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
+            &doc_id,
+        )
         .await
     {
         tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, error = %e, "rag: store delete_by_doc failed");

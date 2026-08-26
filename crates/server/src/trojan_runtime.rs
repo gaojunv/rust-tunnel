@@ -27,12 +27,17 @@ const TROJAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_mill
 /// Trojan 证书来源（与 API 响应 `cert_source` 字段一一对应）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrojanCertSource {
+    /// ACME 精确匹配证书。
     AcmeExact,
+    /// ACME 通配符证书。
     AcmeWildcard,
+    /// 自签名回退证书。
     SelfSigned,
 }
 
 impl TrojanCertSource {
+    /// 返回证书来源标识字符串。
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AcmeExact => "acme_exact",
@@ -43,6 +48,9 @@ impl TrojanCertSource {
 }
 
 /// 解析 Trojan 使用的 TLS 配置：ACME 精确/通配优先，未命中回退自签名并告警。
+///
+/// # Errors
+/// 当自签名证书加载或 `ServerConfig` 构建失败时返回错误。
 pub async fn resolve_trojan_tls(
     cert_manager: Option<&Arc<CertificateManager>>,
     domain: &str,
@@ -102,7 +110,7 @@ pub fn spawn_trojan_cert_reload(
                 }
                 event = cert_rx.recv() => {
                     match event {
-                        Ok(CertEvent::Issued { domain }) | Ok(CertEvent::Renewed { domain }) => {
+                        Ok(CertEvent::Issued { domain } | CertEvent::Renewed { domain }) => {
                             let d = domain.to_ascii_lowercase();
                             let covers = d == trojan_domain
                                 || wildcard_for(&trojan_domain).as_deref() == Some(d.as_str());
@@ -143,6 +151,10 @@ pub fn spawn_trojan_cert_reload(
 /// 共享模式成立条件：`enabled && domain 非空 && trojan.port 上存在启用 TLS 的
 /// 反代 HTTP 规则`。共享模式下 Trojan 不 bind 端口、不 `register_trojan`，
 /// 只向 `ReverseProxyState` 注册 SNI 分流表项。
+///
+/// # Errors
+/// 当 `resolve_trojan_tls` 证书解析失败时返回错误字符串。
+#[allow(clippy::too_many_lines, reason = "Trojan 启动编排含五阶段顺序逻辑与共享/独立双分支，共享大量局部状态，拆分反而降低可读性")]
 pub async fn apply_trojan_config(
     state: &ServerState,
     cfg: &TrojanDynamicConfig,
@@ -159,7 +171,7 @@ pub async fn apply_trojan_config(
     tokio::time::sleep(TROJAN_RESTART_DELAY).await;
 
     if !cfg.enabled {
-        *state.proxy_ports.trojan_runtime.write().await = Default::default();
+        *state.proxy_ports.trojan_runtime.write().await = TrojanRuntimeStatus::default();
         return Ok(());
     }
 
@@ -188,7 +200,7 @@ pub async fn apply_trojan_config(
             "Trojan 端口 {} 仍被反代共享监听器 {} 占用，无法回退独立监听，Trojan 已停止",
             cfg.port, addr
         );
-        *state.proxy_ports.trojan_runtime.write().await = Default::default();
+        *state.proxy_ports.trojan_runtime.write().await = TrojanRuntimeStatus::default();
         return Ok(());
     }
 
@@ -227,51 +239,42 @@ pub async fn apply_trojan_config(
         rt.shared = shared_listen_addr.is_some();
     }
 
-    match shared_listen_addr {
-        Some(addr) => {
-            info!("Trojan 共享模式：SNI {} 复用反代监听 {}", domain_lc, addr);
-            state.proxy_state.set_trojan_sni(Some(TrojanSniEntry {
-                domain: domain_lc,
-                listen_addr: addr.clone(),
-                trojan_port: cfg.port,
-                password: cfg.password.clone(),
-                fallback: cfg.fallback.clone(),
-                tls_config_rx,
-                registry: std::sync::Arc::new(state.clone())
-                    as std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry>,
-                stats: state.stats_collector.clone(),
-            }));
-            // 确保共享监听器已按当前规则 reconcile（幂等，规则无变化时为热替换快路径）
-            if let Err(e) = state.proxy_state.reconcile_http_listener(&addr).await {
-                warn!("Trojan 共享模式 reconcile 失败: {}", e);
+    if let Some(addr) = shared_listen_addr {
+        info!("Trojan 共享模式：SNI {} 复用反代监听 {}", domain_lc, addr);
+        state.proxy_state.set_trojan_sni(Some(TrojanSniEntry {
+            domain: domain_lc,
+            listen_addr: addr.clone(),
+            trojan_port: cfg.port,
+            password: cfg.password.clone(),
+            fallback: cfg.fallback.clone(),
+            tls_config_rx,
+            registry: std::sync::Arc::new(state.clone())
+                as std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry>,
+            stats: state.stats_collector.clone(),
+        }));
+        // 确保共享监听器已按当前规则 reconcile（幂等，规则无变化时为热替换快路径）
+        if let Err(e) = state.proxy_state.reconcile_http_listener(&addr).await {
+            warn!("Trojan 共享模式 reconcile 失败: {}", e);
+        }
+        Ok(())
+    } else {
+        let state_clone = state.clone();
+        let port = cfg.port;
+        let password = cfg.password.clone();
+        let fallback = cfg.fallback.clone();
+        tokio::spawn(async move {
+            let collector = state_clone.stats_collector.clone();
+            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
+                std::sync::Arc::new(state_clone);
+            if let Err(e) = crate::listener::start_trojan_listener_with_abort(
+                registry, collector, port, password, fallback, tls_config_rx, abort_rx,
+            )
+            .await
+            {
+                tracing::error!("Trojan listener error: {}", e);
             }
-            Ok(())
-        }
-        None => {
-            let state_clone = state.clone();
-            let port = cfg.port;
-            let password = cfg.password.clone();
-            let fallback = cfg.fallback.clone();
-            tokio::spawn(async move {
-                let stats = state_clone.stats_collector.clone();
-                let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
-                    std::sync::Arc::new(state_clone);
-                if let Err(e) = crate::listener::start_trojan_listener_with_abort(
-                    registry,
-                    stats,
-                    port,
-                    password,
-                    fallback,
-                    tls_config_rx,
-                    abort_rx,
-                )
-                .await
-                {
-                    tracing::error!("Trojan listener error: {}", e);
-                }
-            });
-            Ok(())
-        }
+        });
+        Ok(())
     }
 }
 

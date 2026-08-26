@@ -1,7 +1,10 @@
 //! Mesh 网络管理：路由表、P2P 中继与客户端控制通道分发。
 
+/// Mesh 中继。
 pub mod relay;
+/// Mesh 路由表。
 pub mod router;
+/// STUN 服务。
 pub mod stun;
 
 use std::sync::Arc;
@@ -32,6 +35,7 @@ impl Default for MeshManager {
 
 impl MeshManager {
     /// 创建空 Mesh 管理器。
+    #[must_use]
     pub fn new() -> Self {
         Self {
             router: Arc::new(Mutex::new(MeshRouter::new())),

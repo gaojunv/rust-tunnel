@@ -311,9 +311,8 @@ pub async fn export_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let messages = match agent.db.agent_list_messages(&session_id).await {
-        Ok(m) => m,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let Ok(messages) = agent.db.agent_list_messages(&session_id).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let md = session_to_markdown(&session, &messages);
     let short: String = session.id.chars().take(8).collect();
@@ -334,6 +333,7 @@ pub async fn export_session(
 }
 
 /// 会话 → Markdown（导出 handler 与单测共用的纯函数）。
+#[allow(clippy::too_many_lines, reason = "Markdown 渲染：对 6 种消息 kind 的扁平派发 + 结构化字段分支，拆分会把相关渲染散到多个函数")]
 fn session_to_markdown(
     session: &crate::db::agent::AgentSessionRecord,
     messages: &[crate::db::agent::AgentMessageRecord],
@@ -403,8 +403,7 @@ fn session_to_markdown(
                     .as_deref()
                     .and_then(|tc| serde_json::from_str::<serde_json::Value>(tc).ok())
                     .and_then(|v| v.get(0).cloned())
-                    .map(|call| call["arguments"].clone())
-                    .unwrap_or(serde_json::Value::Null);
+                    .map_or(serde_json::Value::Null, |call| call["arguments"].clone());
                 let body = match &args {
                     serde_json::Value::String(s) => s.clone(),
                     other => serde_json::to_string_pretty(other).unwrap_or_default(),
@@ -492,7 +491,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -554,7 +553,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -665,7 +664,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -710,7 +709,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -765,6 +764,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端导出测试：建 workspace/session + 插入多类消息 + 断言 Markdown 全文，拆分会割裂被断言的固定夹具"
+    )]
     async fn test_export_session_markdown() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
@@ -775,7 +778,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -918,7 +921,7 @@ mod tests {
         // 空串清除 → 读回空串
         let resp = put_default_model(
             State(state.clone()),
-            Json(UpdateSessionModelRequest { model: "".into() }),
+            Json(UpdateSessionModelRequest { model: String::new() }),
         )
         .await
         .into_response();

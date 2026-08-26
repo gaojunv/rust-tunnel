@@ -48,24 +48,34 @@ const MEMORY_SSE_KEEPALIVE: Duration = Duration::from_secs(30);
 /// - 启用（`enabled` 置 1）前必须 emb 配置齐全。
 #[derive(Debug, Deserialize)]
 pub struct UpdateMemorySettingsRequest {
+    /// 是否启用记忆，`None` 表示沿用当前值。
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Embedding 服务地址，`None` 表示沿用当前值。
     #[serde(default)]
     pub emb_base_url: Option<String>,
+    /// Embedding API 密钥，空串表示沿用已存密文。
     #[serde(default)]
     pub emb_api_key: Option<String>,
+    /// Embedding 模型名，`None` 表示沿用当前值。
     #[serde(default)]
     pub emb_model: Option<String>,
+    /// 向量维度，正整数；`None` 表示沿用当前值。
     #[serde(default)]
     pub emb_dimension: Option<i64>,
+    /// 蒸馏所用模型名，`None` 表示沿用当前值。
     #[serde(default)]
     pub distill_model: Option<String>,
+    /// 检索召回条数，`None` 表示沿用当前值。
     #[serde(default)]
     pub top_k: Option<i64>,
+    /// 相似度阈值，`None` 表示沿用当前值。
     #[serde(default)]
     pub score_threshold: Option<f64>,
+    /// 置顶记忆注入的 token 预算，`None` 表示沿用当前值。
     #[serde(default)]
     pub inject_budget_tokens: Option<i64>,
+    /// 是否始终注入置顶记忆，`None` 表示沿用当前值。
     #[serde(default)]
     pub pin_always_inject: Option<bool>,
     /// Skill 库总闸（opt-in 默认关；开启不要求 embedding——Skill 蒸馏仅需 LLM）。
@@ -85,20 +95,28 @@ pub struct UpdateMemorySettingsRequest {
 /// GET /api/agent/memories 的 query 参数。`limit` 默认 50（handler 层 clamp 到 [1, 200]）。
 #[derive(Debug, Default, Deserialize)]
 pub struct ListMemoriesParams {
+    /// 作用域过滤（global/client/workspace），`None` 表示不过滤。
     #[serde(default)]
     pub scope: Option<String>,
+    /// 客户端 ID 过滤，`None` 表示不过滤。
     #[serde(default)]
     pub client_id: Option<String>,
+    /// 工作区 ID 过滤，`None` 表示不过滤。
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// 搜索关键字，对 content 模糊匹配，`None` 表示不过滤。
     #[serde(default)]
     pub q: Option<String>,
+    /// 是否仅查询置顶记忆，`None` 表示不过滤。
     #[serde(default)]
     pub pinned: Option<bool>,
+    /// 排序方式（recent/created/confidence/hits），`None` 表示默认排序。
     #[serde(default)]
     pub sort: Option<String>,
+    /// 分页条数，`None` 时 handler 默认 50。
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 分页偏移，`None` 时默认为 0。
     #[serde(default)]
     pub offset: Option<i64>,
 }
@@ -106,13 +124,18 @@ pub struct ListMemoriesParams {
 /// POST /api/agent/memories 请求体。`scope_type` 缺省/空串 → workspace。
 #[derive(Debug, Deserialize)]
 pub struct CreateMemoryRequest {
+    /// 记忆正文，必填且非空，长度不超过 2048 字符。
     pub content: String,
+    /// 作用域类型（global/client/workspace），缺省为空串时按 workspace 处理。
     #[serde(default)]
     pub scope_type: String,
+    /// 客户端 ID，scope 为 client/workspace 时按规则归一化。
     #[serde(default)]
     pub client_id: String,
+    /// 工作区 ID，scope 为 workspace 时按规则归一化。
     #[serde(default)]
     pub workspace_id: String,
+    /// 标签列表，每项非空且不超过 32 字符，总数不超过上限。
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -120,11 +143,15 @@ pub struct CreateMemoryRequest {
 /// PUT /api/agent/memories/:id 请求体。
 #[derive(Debug, Deserialize)]
 pub struct UpdateMemoryRequest {
+    /// 更新后的记忆正文，必填且需通过非空与长度校验。
     pub content: String,
+    /// 更新后的标签列表，缺省为空。
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 目标作用域类型，缺省/空串时沿用已有值。
     #[serde(default)]
     pub scope_type: String,
+    /// 置信度，取值 [0,1]，`None` 时默认 0.8。
     #[serde(default)]
     pub confidence: Option<f64>,
 }
@@ -256,7 +283,11 @@ async fn embed_memory(mem: &MemoryState, id: &str, content: &str) {
             };
             if let Err(e) = mem
                 .store
-                .upsert(MEMORY_KB_ID, dim as usize, vec![point])
+                .upsert(
+                    MEMORY_KB_ID,
+                    usize::try_from(dim).unwrap_or(usize::MAX),
+                    vec![point],
+                )
                 .await
             {
                 tracing::warn!(memory_id = id, error = %e, "memory vector upsert failed");
@@ -289,6 +320,7 @@ pub async fn get_settings(State(state): State<ApiState>) -> impl IntoResponse {
 ///   且 emb_api_key 非空（或已存有可用 key），否则 400；
 /// - `emb_dimension` 与已存值不同 → 409 拒绝直切（换 emb 模型需先清空重建）；
 /// - `emb_api_key` 空串 = 沿用已存密文。
+#[allow(clippy::too_many_lines, reason = "设置校验与部分更新的顺序编排共享大量局部状态，拆分会增加签名冗余")]
 pub async fn put_settings(
     State(state): State<ApiState>,
     Json(body): Json<UpdateMemorySettingsRequest>,
@@ -685,7 +717,11 @@ pub async fn delete_memory(
     if dim > 0 {
         if let Err(e) = mem
             .store
-            .delete_by_doc(MEMORY_KB_ID, dim as usize, &id)
+            .delete_by_doc(
+                MEMORY_KB_ID,
+                usize::try_from(dim).unwrap_or(usize::MAX),
+                &id,
+            )
             .await
         {
             tracing::warn!(memory_id = %id, error = %e, "memory vector delete failed");
@@ -1179,6 +1215,7 @@ mod tests {
 
     // ── memories CRUD ────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines, reason = "CRUD 全链路端到端用例，顺序编排大量断言与状态校验，拆分会割裂用例可读性")]
     #[tokio::test]
     async fn memories_crud_pin_and_clear() {
         let dir = tempfile::tempdir().unwrap();
@@ -1555,7 +1592,7 @@ mod tests {
             root_path: "/tmp".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,

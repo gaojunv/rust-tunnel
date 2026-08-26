@@ -67,8 +67,8 @@ impl Embedder {
         }
     }
 
-    /// 批量向量化，返回向量顺序与输入一致。超过 [`EMBED_BATCH_SIZE`] 时内部
-    /// 切多批逐个请求再拼接，对调用方透明；每批失败重试 [`EMBED_MAX_ATTEMPTS`]
+    /// 批量向量化，返回向量顺序与输入一致。超过 `EMBED_BATCH_SIZE` 时内部
+    /// 切多批逐个请求再拼接，对调用方透明；每批失败重试 `EMBED_MAX_ATTEMPTS`
     /// 次（500ms/1s 退避），仍失败才返回 `Err`。
     ///
     /// # Errors

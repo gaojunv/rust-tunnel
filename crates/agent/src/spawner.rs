@@ -39,7 +39,7 @@ pub fn agent_command(
 /// `options.baseURL ?? model.api.url`，覆盖了 AI SDK 的 env fallback；flag 层也无
 /// `OPENCODE_MODEL`），故 opencode 分支改用 `OPENCODE_CONFIG_CONTENT` 注入自定义
 /// provider `rust-tunnel`（baseURL 指向回环代理），把 LLM 流量引入隧道——见
-/// [`opencode_config_content`]。
+/// `opencode_config_content`。
 ///
 /// `available_models` 是服务端启用的网关模型 id 列表（仅 opencode 分支用于
 /// provider.models 枚举），其余 agent 传空切片。

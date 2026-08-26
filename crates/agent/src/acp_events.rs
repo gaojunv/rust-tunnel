@@ -24,7 +24,7 @@ use agent_client_protocol::schema::MaybeUndefined;
 /// - `config_option_update` → `{"type": "config_option_update", "options"}`
 ///
 /// 子 agent 归属（opt-in 的 "nested subagent transcripts" 约定，见
-/// https://github.com/zed-industries/claude-code-acp ）：事件 `_meta.claudeCode`
+/// <https://github.com/zed-industries/claude-code-acp> ）：事件 `_meta.claudeCode`
 /// 携带 `parentToolUseId`/`subagent` 时，tool_call / tool_result / assistant_chunk
 /// 帧额外输出 `parent_tool_call_id`（有值才输出）与 `is_subagent`（仅 true 时
 /// 输出），前端据此按父子关系分组渲染。无 `_meta` 的事件字段缺省，完全无感降级。

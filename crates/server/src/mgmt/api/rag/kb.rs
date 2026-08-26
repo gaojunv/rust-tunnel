@@ -124,6 +124,7 @@ async fn resolve_kb_embedding(
     Ok((s.emb_base_url, key, s.emb_model, s.emb_dimension))
 }
 
+/// `GET /api/llm/kb` 列出全部知识库，按创建时间正序（与 `rag_list_kbs` 的 `ORDER BY created_at` 一致），附带各库文档数。
 pub async fn list_kbs(State(state): State<ApiState>) -> impl IntoResponse {
     let rt = match rag_rt(&state).await {
         Ok(rt) => rt,
@@ -143,6 +144,7 @@ pub async fn list_kbs(State(state): State<ApiState>) -> impl IntoResponse {
     Json(serde_json::json!({ "knowledge_bases": kbs })).into_response()
 }
 
+/// `POST /api/llm/kb` 创建知识库，校验分块参数与 embedding 配置，加密密钥后落库。
 pub async fn create_kb(
     State(state): State<ApiState>,
     Json(body): Json<CreateKbRequest>,
@@ -184,12 +186,12 @@ pub async fn create_kb(
             emb_base_url: emb_base_url.clone(),
             emb_api_key: emb_api_key.clone(),
             emb_model: emb_model.clone(),
-            emb_dimension: emb_dimension,
-            top_k: top_k,
-            chunk_size: chunk_size,
-            chunk_overlap: chunk_overlap,
-            score_threshold: score_threshold,
-            enabled: enabled,
+            emb_dimension,
+            top_k,
+            chunk_size,
+            chunk_overlap,
+            score_threshold,
+            enabled,
         })
         .await
     {
@@ -203,6 +205,7 @@ pub async fn create_kb(
         .into_response()
 }
 
+/// `GET /api/llm/kb/:id` 获取单个知识库详情，附带文档数。
 pub async fn get_kb(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let rt = match rag_rt(&state).await {
         Ok(rt) => rt,
@@ -220,6 +223,8 @@ pub async fn get_kb(State(state): State<ApiState>, Path(id): Path<String>) -> im
     Json(kb_json(&kb, doc_count)).into_response()
 }
 
+/// `PUT /api/llm/kb/:id` 更新知识库元数据与检索参数，emb 配置变化时触发全量重建。
+#[allow(clippy::too_many_lines, reason = "顺序编排：参数校验→emb 合并→条件更新→全量重建，拆分会打散共享状态")]
 pub async fn update_kb(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -297,10 +302,10 @@ pub async fn update_kb(
                 &rust_tunnel_persistence::rag::RagUpdateKbParamsOpts {
                     name: body.name.clone(),
                     description: body.description.clone(),
-                    top_k: top_k,
-                    chunk_size: chunk_size,
-                    chunk_overlap: chunk_overlap,
-                    score_threshold: score_threshold,
+                    top_k,
+                    chunk_size,
+                    chunk_overlap,
+                    score_threshold,
                 },
             )
             .await
@@ -329,10 +334,10 @@ pub async fn update_kb(
             &rust_tunnel_persistence::rag::RagUpdateKbFullOpts {
                 name: body.name.clone(),
                 description: body.description.clone(),
-                top_k: top_k,
-                chunk_size: chunk_size,
-                chunk_overlap: chunk_overlap,
-                score_threshold: score_threshold,
+                top_k,
+                chunk_size,
+                chunk_overlap,
+                score_threshold,
                 emb_base_url: new_base.clone(),
                 emb_api_key: new_api_key_enc.clone(),
                 emb_model: new_model.clone(),
@@ -404,6 +409,7 @@ pub async fn update_kb(
     .into_response()
 }
 
+/// `PATCH /api/llm/kb/:id` 切换知识库启用状态，仅接受布尔 `enabled`。
 pub async fn patch_kb(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -434,6 +440,7 @@ pub async fn patch_kb(
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
+/// `DELETE /api/llm/kb/:id` 删除知识库，先软关再清理向量分片与原文文件。
 pub async fn delete_kb(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let rt = match rag_rt(&state).await {
         Ok(rt) => rt,

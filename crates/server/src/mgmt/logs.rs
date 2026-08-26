@@ -1,6 +1,7 @@
 //! 管理面日志收集与查询（环形缓冲 + broadcast + 批量落库 + tracing Layer）。
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -40,10 +41,48 @@ struct LogStoreInner {
     db_batch: Vec<LogEntry>,
 }
 
+/// `on_event` 中用于提取 tracing 字段的访问器（提到模块级以满足 `items_after_statements`）。
+struct FieldVisitor {
+    target: String,
+    message: String,
+}
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let name = field.name();
+        if name == "message" {
+            self.message = format!("{value:?}");
+            // Strip surrounding quotes if present
+            if self.message.starts_with('"') && self.message.ends_with('"') {
+                self.message = self.message[1..self.message.len() - 1].to_string();
+            }
+        } else {
+            // `%field`（display）和裸字段都走这里——必须拼进 message，
+            // 否则日志只剩字面量（"LLM request" 无字段的 bug 根因）
+            if !self.message.is_empty() {
+                self.message.push(' ');
+            }
+            let _ = write!(self.message, "{name}={value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            if !self.message.is_empty() {
+                self.message.push(' ');
+            }
+            let _ = write!(self.message, "{}={value}", field.name());
+        }
+    }
+}
+
 impl LogStore {
     /// Create a new LogStore, optionally backed by a database.
     /// Spawns a background task that drains `buffer_tx` into the ring buffer,
     /// broadcasts to SSE subscribers, and periodically flushes to DB.
+    #[must_use]
     pub fn new(db: Option<Database>) -> Self {
         let (tx, _rx) = broadcast::channel(256);
         let (buffer_tx, mut buffer_rx) = mpsc::unbounded_channel::<LogEntry>();
@@ -101,7 +140,7 @@ impl LogStore {
                                 let db = db.clone();
                                 drop(guard);
                                 if let Err(e) = db.insert_logs_batch(&batch).await {
-                                    tracing::warn!("Failed to flush logs to DB: {}", e);
+                                    tracing::warn!("Failed to flush logs to DB: {e}");
                                 }
                             }
                         }
@@ -114,6 +153,7 @@ impl LogStore {
     }
 
     /// Create a LogStore without database persistence
+    #[must_use]
     pub fn new_in_memory() -> Self {
         Self::new(None)
     }
@@ -138,12 +178,11 @@ impl LogStore {
         limit: usize,
     ) -> Vec<LogEntry> {
         let guard = self.inner.lock().await;
-        let min_level = match level.map(|l| l.to_lowercase()).as_deref() {
+        let min_level = match level.map(str::to_lowercase).as_deref() {
             Some("error") => 4,
             Some("warn") => 3,
             Some("info") => 2,
             Some("debug") => 1,
-            Some("trace") => 0,
             _ => 0,
         };
 
@@ -189,7 +228,7 @@ impl LogStore {
             match db.query_logs(level, source, search, limit, before_id).await {
                 Ok(rows) => rows,
                 Err(e) => {
-                    tracing::warn!("Failed to query logs from DB: {}", e);
+                    tracing::warn!("Failed to query logs from DB: {e}");
                     vec![]
                 }
             }
@@ -213,7 +252,6 @@ fn level_to_u8_str(level: &str) -> u8 {
     match level {
         "TRACE" => 0,
         "DEBUG" => 1,
-        "INFO" => 2,
         "WARN" => 3,
         "ERROR" => 4,
         _ => 2, // Default to INFO for unknown levels
@@ -230,6 +268,7 @@ pub struct LogLayer {
 
 impl LogLayer {
     /// 创建 `LogLayer`。
+    #[must_use]
     pub fn new(store: LogStore) -> Self {
         Self { store }
     }
@@ -257,46 +296,7 @@ where
         let metadata = event.metadata();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
-
-        // Use the visitor pattern to extract fields
-        struct FieldVisitor {
-            target: String,
-            message: String,
-        }
-
-        impl tracing::field::Visit for FieldVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                let name = field.name();
-                if name == "message" {
-                    self.message = format!("{:?}", value);
-                    // Strip surrounding quotes if present
-                    if self.message.starts_with('"') && self.message.ends_with('"') {
-                        self.message = self.message[1..self.message.len() - 1].to_string();
-                    }
-                } else {
-                    // `%field`（display）和裸字段都走这里——必须拼进 message，
-                    // 否则日志只剩字面量（"LLM request" 无字段的 bug 根因）
-                    if !self.message.is_empty() {
-                        self.message.push(' ');
-                    }
-                    self.message.push_str(&format!("{}={:?}", name, value));
-                }
-            }
-
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "message" {
-                    self.message = value.to_string();
-                } else {
-                    if !self.message.is_empty() {
-                        self.message.push(' ');
-                    }
-                    self.message
-                        .push_str(&format!("{}={}", field.name(), value));
-                }
-            }
-        }
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
 
         let mut visitor = FieldVisitor {
             target: metadata.target().to_string(),
@@ -419,7 +419,7 @@ mod tests {
                 level: "INFO".into(),
                 source: "server".into(),
                 target: "test".into(),
-                message: format!("msg {}", i),
+                message: format!("msg {i}"),
             });
         }
 

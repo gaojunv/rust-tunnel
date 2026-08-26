@@ -1,4 +1,8 @@
+//! 轻量权威 DNS 服务：tunnel/mesh 域解析与 UDP 服务。
+
+/// DNS 注册表。
 pub mod registry;
+/// DNS 区域内存表。
 pub mod zone;
 
 use std::net::SocketAddr;
@@ -18,17 +22,24 @@ pub struct DnsServer {
 }
 
 impl DnsServer {
+    /// 创建 DNS 服务端。
+    ///
+    /// # Errors
+    /// 当 `bind_addr` 无法解析为 `SocketAddr` 时返回错误。
     pub fn new(registry: DnsRegistry, bind_addr: &str) -> Result<Self, String> {
         let addr: SocketAddr = bind_addr
             .parse()
-            .map_err(|e| format!("Invalid DNS bind address '{}': {}", bind_addr, e))?;
+            .map_err(|e| format!("Invalid DNS bind address '{bind_addr}': {e}"))?;
         Ok(Self {
             registry,
             bind_addr: addr,
         })
     }
 
-    /// Start the DNS server, listening on UDP. Does not return.
+    /// 启动 DNS 服务端，监听 UDP（不返回）。
+    ///
+    /// # Errors
+    /// 当 UDP 绑定或后续 IO 失败时返回错误。
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let socket = UdpSocket::bind(self.bind_addr).await?;
         info!("DNS server listening on {}", self.bind_addr);
@@ -127,7 +138,7 @@ async fn handle_dns_query(registry: &DnsRegistry, data: &[u8]) -> Vec<u8> {
                     response_code = ResponseCode::NXDomain;
                 } else {
                     for (target, port) in &srvs {
-                        if let Ok(target_name) = Name::from_ascii(format!("{}.", target)) {
+                        if let Ok(target_name) = Name::from_ascii(format!("{target}.")) {
                             let mut record = Record::new();
                             record.set_name(question.name().clone());
                             record.set_record_type(RecordType::SRV);
@@ -164,7 +175,7 @@ fn encode_message(msg: &Message) -> Vec<u8> {
     if bytes.len() > 512 {
         bytes[..512].to_vec()
     } else {
-        bytes.to_vec()
+        bytes.clone()
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Codex 等使用 Responses API 的客户端直接对接网关，内部复用现有 pipeline
 //! （认证/路由/RAG/compat/故障转移/用量）。请求/响应/流式双向转换由
-//! [`super::responses`] 完成。
+//! [`crate::responses`] 完成。
 
 use axum::extract::State;
 use axum::http::HeaderMap;

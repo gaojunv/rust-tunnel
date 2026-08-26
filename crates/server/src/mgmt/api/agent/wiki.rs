@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sha2::Digest;
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "测试模块经 cfg(test) 引用 Arc，单测编译期需要，常规构建未直接使用")]
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -144,79 +144,111 @@ fn validate_wiki_name(name: &str) -> Result<(), (StatusCode, String)> {
 
 // ── Query DTO ────────────────────────────────────────────────────
 
+/// 列出 Wiki 容器的查询参数，对应 `GET /api/agent/wiki`。
 #[derive(Debug, Deserialize, Default)]
 pub struct ListWikisParams {
+    /// 作用域过滤：`global`/`client`/`workspace`，为空时不过滤。
     #[serde(default)]
     pub scope: Option<String>,
+    /// 关联客户端 id，为空时不过滤。
     #[serde(default)]
     pub client_id: Option<String>,
+    /// 关联工作区 id，为空时不过滤。
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// 关键词过滤，匹配名称或简介。
     #[serde(default)]
     pub q: Option<String>,
+    /// 状态过滤，为空时返回全部状态。
     #[serde(default)]
     pub status: Option<String>,
+    /// 返回条数，缺省 50，handler 层 clamp 到 1..=200。
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 偏移量，缺省 0，负数按 0 处理。
     #[serde(default)]
     pub offset: Option<i64>,
 }
 
+/// 创建 Wiki 容器的请求体，对应 `POST /api/agent/wiki`。
 #[derive(Debug, Deserialize)]
 pub struct CreateWikiRequest {
+    /// Wiki 名称，必填，trim 后 1..=64 字符。
     pub name: String,
+    /// 简介，缺省为空字符串，handler 层 trim 后落库。
     #[serde(default)]
     pub summary: String,
+    /// 作用域类型：`global`/`client`/`workspace`，空串时按 `workspace` 处理。
     #[serde(default)]
     pub scope_type: String,
+    /// 关联客户端 id，`scope_type=client` 时必填，其余作用域可为空。
     #[serde(default)]
     pub client_id: String,
+    /// 关联工作区 id，`scope_type=workspace` 时必填，其余作用域可为空。
     #[serde(default)]
     pub workspace_id: String,
 }
 
+/// 更新 Wiki 容器的请求体，对应 `PATCH /api/agent/wiki/:id`，字段缺省表示保持原值。
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateWikiRequest {
+    /// 新名称，为空时保持原值，传入时会校验长度 1..=64。
     #[serde(default)]
     pub name: Option<String>,
+    /// 新简介，为空时保持原值。
     #[serde(default)]
     pub summary: Option<String>,
 }
 
+/// 列出 Wiki 页面的查询参数，对应 `GET /api/agent/wiki/:id/pages`。
 #[derive(Debug, Deserialize, Default)]
 pub struct ListPagesParams {
+    /// 关键词过滤，匹配标题/摘要/内容。
     #[serde(default)]
     pub q: Option<String>,
+    /// ref 前缀过滤，如 `deploy/` 仅返回该目录下页面。
     #[serde(default)]
     pub ref_prefix: Option<String>,
+    /// 按锁定状态过滤，`Some(true)` 仅返回手工锁定页。
     #[serde(default)]
     pub locked: Option<bool>,
+    /// 返回条数，缺省 50，handler 层 clamp 到 1..=200。
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 偏移量，缺省 0，负数按 0 处理。
     #[serde(default)]
     pub offset: Option<i64>,
 }
 
+/// 创建或更新 Wiki 页面的请求体，对应 `PUT /api/agent/wiki/:id/pages/*ref`。
 #[derive(Debug, Deserialize)]
 pub struct PutPageRequest {
+    /// 页面引用，缺省时取路径参数中的 `*ref`。
     #[serde(rename = "ref")]
     pub page_ref: Option<String>,
+    /// 标题，最大 64 字符，handler 层校验。
     #[serde(default)]
     pub title: String,
+    /// 摘要，最大 200 字符，handler 层校验。
     #[serde(default)]
     pub summary: String,
+    /// 正文内容，必填，trim 后不能为空。
     pub content: String,
 }
 
+/// Wiki 搜索的查询参数，对应 `GET /api/agent/wiki/:id/search` 与 `/api/agent/wiki/search`。
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
+    /// 搜索关键词，必填，传给 `wiki_search` 做 FTS/LIKE 查询。
     pub q: String,
+    /// 返回条数，缺省 20，handler 层 clamp 到 1..=20。
     #[serde(default)]
     pub limit: Option<i64>,
 }
 
 // ── Handlers: 容器 ───────────────────────────────────────────────
 
+/// 列出 Wiki 容器，支持按作用域与关键词过滤并分页。
 pub async fn list_wikis(
     State(state): State<ApiState>,
     Query(params): Query<ListWikisParams>,
@@ -265,6 +297,7 @@ pub async fn list_wikis(
     Json(serde_json::json!({ "wikis": wikis, "total": total })).into_response()
 }
 
+/// 创建 Wiki 容器，校验名称与 `scope_type`，同作用域重名时返回 409。
 pub async fn create_wiki(
     State(state): State<ApiState>,
     Json(body): Json<CreateWikiRequest>,
@@ -316,6 +349,7 @@ pub async fn create_wiki(
     }
 }
 
+/// 按 id 查询单个 Wiki 容器，不存在时返回 404。
 pub async fn get_wiki(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let mem = match mem_runtime(&state) {
         Ok(m) => m,
@@ -328,6 +362,7 @@ pub async fn get_wiki(State(state): State<ApiState>, Path(id): Path<String>) -> 
     }
 }
 
+/// 更新 Wiki 容器的名称与简介，名称重名时返回 409。
 pub async fn update_wiki(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -363,6 +398,7 @@ pub async fn update_wiki(
     }
 }
 
+/// 删除 Wiki 容器及对应的落盘文档目录（目录清理为 best-effort）。
 pub async fn delete_wiki(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -398,6 +434,7 @@ pub async fn delete_wiki(
 
 // ── Handlers: 文档 ───────────────────────────────────────────────
 
+/// 列出指定 Wiki 下的全部文档。
 pub async fn list_docs(
     State(state): State<ApiState>,
     Path(wiki_id): Path<String>,
@@ -418,6 +455,7 @@ pub async fn list_docs(
     }
 }
 
+/// 删除指定 Wiki 下的单篇文档，跨容器 id 不匹配时按 404 处理。
 pub async fn delete_doc(
     State(state): State<ApiState>,
     Path((wiki_id, doc_id)): Path<(String, String)>,
@@ -438,6 +476,7 @@ pub async fn delete_doc(
     }
 }
 
+/// 重新触发单篇文档的摄入流程，处理中或文件缺失时返回 409。
 pub async fn reindex_doc(
     State(state): State<ApiState>,
     Path((wiki_id, doc_id)): Path<(String, String)>,
@@ -520,7 +559,7 @@ fn wiki_doc_source_path(
 }
 
 /// POST /api/agent/wiki/:id/docs — multipart 上传，落盘 pending（批 2 接摄入）。
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "multipart 解析、文件类型/大小/内容校验与落盘依次编排，拆分会割裂错误处理流程")]
 pub async fn upload_doc(
     State(state): State<ApiState>,
     Path(wiki_id): Path<String>,
@@ -665,6 +704,7 @@ pub async fn upload_doc(
 
 // ── Handlers: 页面 ───────────────────────────────────────────────
 
+/// 列出指定 Wiki 下的页面摘要，支持关键词与前缀过滤。
 pub async fn list_pages(
     State(state): State<ApiState>,
     Path(wiki_id): Path<String>,
@@ -699,6 +739,7 @@ pub async fn list_pages(
     }
 }
 
+/// 按标准化后的 `ref` 查询单页内容，非法 ref 返回 400。
 pub async fn get_page(
     State(state): State<ApiState>,
     Path((wiki_id, page_ref)): Path<(String, String)>,
@@ -718,6 +759,7 @@ pub async fn get_page(
     }
 }
 
+/// 创建或更新单页，写入时校验标题/摘要长度并标记为 `locked=1`。
 pub async fn put_page(
     State(state): State<ApiState>,
     Path((wiki_id, page_ref)): Path<(String, String)>,
@@ -766,6 +808,7 @@ pub async fn put_page(
     }
 }
 
+/// 按 `ref` 删除单页，不存在时返回 404。
 pub async fn delete_page(
     State(state): State<ApiState>,
     Path((wiki_id, page_ref)): Path<(String, String)>,
@@ -786,6 +829,7 @@ pub async fn delete_page(
 
 // ── Handlers: graph / search ────────────────────────────────────
 
+/// 查询指定 Wiki 的页面图谱（节点与边）。
 pub async fn get_graph(
     State(state): State<ApiState>,
     Path(wiki_id): Path<String>,
@@ -806,6 +850,7 @@ pub async fn get_graph(
     }
 }
 
+/// 在单个 Wiki 内做全文/模糊搜索，`limit` 限制为 1..=20。
 pub async fn search_wiki(
     State(state): State<ApiState>,
     Path(wiki_id): Path<String>,
@@ -825,6 +870,7 @@ pub async fn search_wiki(
     }
 }
 
+/// 跨全部 Wiki 容器搜索（批 1 暂不过滤可见性）。
 pub async fn search_all_wikis(
     State(state): State<ApiState>,
     Query(params): Query<SearchParams>,
@@ -843,6 +889,7 @@ pub async fn search_all_wikis(
 
 // ── SSE ──────────────────────────────────────────────────────────
 
+/// Wiki 事件的 SSE 订阅端点，未注入运行时时仅发送 `ping` 保活。
 pub async fn sse_wiki_events(
     State(state): State<ApiState>,
     Query(params): Query<SseQuery>,
@@ -889,6 +936,7 @@ pub async fn sse_wiki_events(
 
 // ── 路由 ─────────────────────────────────────────────────────────
 
+/// 构建 Wiki 受保护路由（需 JWT），挂载容器/文档/页面/图谱/搜索。
 pub fn protected_router() -> Router<ApiState> {
     Router::new()
         .route("/api/agent/wiki", get(list_wikis).post(create_wiki))
@@ -909,6 +957,7 @@ pub fn protected_router() -> Router<ApiState> {
         .route("/api/agent/wiki/search", get(search_all_wikis))
 }
 
+/// 构建 Wiki 公开路由，仅暴露 SSE 事件订阅。
 pub fn public_router() -> Router<ApiState> {
     Router::new().route("/api/agent/wiki/events", get(sse_wiki_events))
 }
@@ -997,6 +1046,7 @@ mod tests {
             .expect("build request")
     }
 
+    #[allow(clippy::too_many_lines, reason = "端到端覆盖 Wiki 容器/页面/搜索/配置回绕，步骤顺序编排较长，拆分会割裂断言上下文")]
     #[tokio::test]
     async fn wiki_container_crud_and_manual_page_and_search_and_settings() {
         let dir = tempfile::tempdir().unwrap();

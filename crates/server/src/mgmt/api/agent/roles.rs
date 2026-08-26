@@ -172,6 +172,7 @@ pub async fn get_role(
 ///
 /// # Errors
 /// 400 字段校验失败；403 内置角色改名；404 不存在；409 重名；503 未初始化；500 DB 错误。
+#[allow(clippy::too_many_lines, reason = "角色更新合并校验：字段回退/校验/唯一约束分散多阶段，顺序编排长但语义内聚，拆分反而割裂校验上下文")]
 pub async fn update_role(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -189,18 +190,15 @@ pub async fn update_role(
     let name = body
         .name
         .as_deref()
-        .map(str::trim)
-        .unwrap_or(&existing.name);
+        .map_or(existing.name.as_str(), str::trim);
     let description = body
         .description
         .as_deref()
-        .map(str::trim)
-        .unwrap_or(&existing.description);
+        .map_or(existing.description.as_str(), str::trim);
     let system_prompt = body
         .system_prompt
         .as_deref()
-        .map(str::trim)
-        .unwrap_or(&existing.system_prompt);
+        .map_or(existing.system_prompt.as_str(), str::trim);
     let mode = body
         .mode
         .as_deref()
@@ -248,7 +246,7 @@ pub async fn update_role(
     .map_err(ApiError::bad_request)?;
 
     // 内置角色不可改名
-    if existing.is_builtin != 0 && name != existing.name {
+    if existing.is_builtin != 0 && name != existing.name.as_str() {
         return Err(ApiError::forbidden("builtin role name cannot be changed"));
     }
 
@@ -256,7 +254,7 @@ pub async fn update_role(
         role_service::scope_coords(scope, base_client, base_workspace);
 
     // scope/name 变更时唯一约束校验
-    if name != existing.name
+    if name != existing.name.as_str()
         || scope_type != existing.scope_type
         || client_id != existing.client_id
         || workspace_id != existing.workspace_id

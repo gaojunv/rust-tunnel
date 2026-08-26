@@ -36,20 +36,28 @@ const VALID_SCOPES: [&str; 3] = ["global", "client", "workspace"];
 /// GET /api/agent/skills 的 query 参数。`limit` 默认 50（handler 层 clamp 到 [1, 200]）。
 #[derive(Debug, Default, Deserialize)]
 pub struct ListSkillsParams {
+    /// 作用域过滤（global/client/workspace），`None` 表示不过滤。
     #[serde(default)]
     pub scope: Option<String>,
+    /// 客户端 ID 过滤，`None` 表示不过滤。
     #[serde(default)]
     pub client_id: Option<String>,
+    /// 工作区 ID 过滤，`None` 表示不过滤。
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// 搜索关键字，对 name/description 模糊匹配，`None` 表示不过滤。
     #[serde(default)]
     pub q: Option<String>,
+    /// 是否仅查询启用/禁用技能，`None` 表示不过滤。
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// 排序方式，`None` 表示默认排序。
     #[serde(default)]
     pub sort: Option<String>,
+    /// 分页条数，`None` 时 handler 默认 50。
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 分页偏移，`None` 时默认为 0。
     #[serde(default)]
     pub offset: Option<i64>,
 }
@@ -59,16 +67,23 @@ pub struct ListSkillsParams {
 /// 固定 'manual'。
 #[derive(Debug, Deserialize)]
 pub struct CreateSkillRequest {
+    /// 技能名称，必填，长度不超过 64 字符。
     pub name: String,
+    /// 技能描述，缺省为空串，长度不超过 200 字符。
     #[serde(default)]
     pub description: String,
+    /// 技能正文（Markdown），必填，长度不超过 16KB。
     pub content: String,
+    /// 作用域类型（global/client/workspace），缺省空串时按 workspace 处理。
     #[serde(default)]
     pub scope_type: String,
+    /// 客户端 ID，scope 为 client/workspace 时按规则归一化。
     #[serde(default)]
     pub client_id: String,
+    /// 工作区 ID，scope 为 workspace 时按规则归一化。
     #[serde(default)]
     pub workspace_id: String,
+    /// 标签列表，每项非空且不超过 32 字符。
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -76,18 +91,25 @@ pub struct CreateSkillRequest {
 /// PUT /api/agent/skills/:id 请求体（部分更新：缺省字段沿用当前值）。
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateSkillRequest {
+    /// 更新后的技能名称，`None` 表示沿用当前值。
     #[serde(default)]
     pub name: Option<String>,
+    /// 更新后的技能描述，`None` 表示沿用当前值。
     #[serde(default)]
     pub description: Option<String>,
+    /// 更新后的技能正文，`None` 表示沿用当前值。
     #[serde(default)]
     pub content: Option<String>,
+    /// 目标作用域类型，`None` 表示沿用当前值。
     #[serde(default)]
     pub scope_type: Option<String>,
+    /// 目标客户端 ID，`None` 表示沿用当前值。
     #[serde(default)]
     pub client_id: Option<String>,
+    /// 目标工作区 ID，`None` 表示沿用当前值。
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// 更新后的标签列表，`None` 表示沿用已有标签。
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
@@ -347,18 +369,15 @@ pub async fn update_skill(
     let name = body
         .name
         .as_deref()
-        .map(str::trim)
-        .unwrap_or(&existing.name);
+        .map_or(existing.name.as_str(), str::trim);
     let content = body
         .content
         .as_deref()
-        .map(str::trim)
-        .unwrap_or(&existing.content);
+        .map_or(existing.content.as_str(), str::trim);
     let description = body
         .description
         .as_deref()
-        .map(str::trim)
-        .unwrap_or(&existing.description);
+        .map_or(existing.description.as_str(), str::trim);
     let scope = body
         .scope_type
         .as_deref()
@@ -555,6 +574,7 @@ mod tests {
             .expect("build request")
     }
 
+    #[allow(clippy::too_many_lines, reason = "CRUD 全链路端到端用例，顺序编排大量断言与状态校验，拆分会割裂用例可读性")]
     #[tokio::test]
     async fn skills_crud_toggle_and_validation() {
         let dir = tempfile::tempdir().unwrap();

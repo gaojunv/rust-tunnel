@@ -1,3 +1,4 @@
+//! rust-tunnel 服务端入口：控制面、API、DNS 与后台任务装配。
 use rust_tunnel_common::{
     create_server_config, init_logging_with_layer, init_logging_with_level, load_or_generate_cert,
     TunnelError, TunnelResult,
@@ -35,7 +36,7 @@ async fn disable_conflicting_rules_on_port(
         match err {
             E::DomainConflict { .. } => {
                 // Keep the oldest rule per domain, disable duplicates.
-                let mut seen_domains: std::collections::HashSet<String> = Default::default();
+                let mut seen_domains: std::collections::HashSet<String> = std::collections::HashSet::new();
                 let mut victims: Vec<String> = Vec::new();
                 for r in &on_port {
                     let clashes = r.domains.iter().any(|d| !seen_domains.insert(d.clone()));
@@ -108,6 +109,7 @@ async fn disable_conflicting_rules_on_port(
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines, reason = "服务端装配含 DB、ACME、DNS、反代、LLM、统计等长顺序编排，拆分会分散状态")]
 async fn main() -> TunnelResult<()> {
     let config = ServerConfig::load().map_err(std::io::Error::other)?;
     tracing::info!("Starting rust-tunnel server on {}", config.control_addr);
@@ -316,8 +318,8 @@ async fn main() -> TunnelResult<()> {
                         ) => {
                             proxy_state.refresh_all_cert_status(&mgr).await;
                         }
-                        Ok(rust_tunnel_server::acme::CertEvent::Error { .. }) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Ok(rust_tunnel_server::acme::CertEvent::Error { .. })
+                        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -602,12 +604,12 @@ async fn main() -> TunnelResult<()> {
                 }
 
                 tokio::spawn(async move {
-                    let stats = state_clone.stats_collector.clone();
+                    let collector = state_clone.stats_collector.clone();
                     let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
                         std::sync::Arc::new(state_clone);
                     if let Err(e) = listener::start_shadowsocks_listener_with_abort(
                         registry,
-                        stats,
+                        collector,
                         ss_port,
                         ss_cipher,
                         ss_password,
@@ -730,7 +732,7 @@ async fn main() -> TunnelResult<()> {
             // Remove logs older than 7 days
             let seven_days_ago = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_micros() as i64)
+                .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
                 - 7 * 24 * 3600 * 1_000_000i64;
             if let Err(e) = db_for_cleanup.cleanup_old_logs(seven_days_ago).await {
                 tracing::warn!("Failed to cleanup old logs: {}", e);

@@ -166,7 +166,7 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         // Insert test data directly
         let now = chrono::Utc::now();
-        let ts = now - chrono::Duration::seconds(now.second() as i64);
+        let ts = now - chrono::Duration::seconds(i64::from(now.second()));
         sqlx::query(
             "INSERT INTO stats_snapshots (entity_type, entity_id, timestamp, bytes_in, bytes_out, bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -216,7 +216,11 @@ pub struct ApiState {
     pub log_store: Option<crate::logs::LogStore>,
 }
 
-/// Create and run the API server
+/// 创建并运行管理面 HTTP 服务（含 TLS 时同时在 80 端口启动重定向服务）。
+///
+/// # Errors
+/// 当绑定 `api_addr` 或 80 端口监听失败，或 TLS 握手/HTTP 服务启动出错时返回 `std::io::Error`。
+#[allow(clippy::too_many_lines, reason = "路由装配按功能域顺序注册 30+ 组端点，含 TLS/非 TLS 双分支的监听与重定向，拆分会打散路由一览性")]
 pub async fn run_api_server(
     api_addr: String,
     server_state: ServerState,
@@ -604,96 +608,93 @@ pub async fn run_api_server(
 
     let app = app.layer(cors).with_state(state);
 
-    match tls_config {
-        Some(tls_config) => {
-            // Extract port 80 address from api_addr for HTTP redirect
-            let http_addr = {
-                let parts: Vec<&str> = api_addr.split(':').collect();
-                if parts.len() == 2 {
-                    format!("{}:80", parts[0])
-                } else {
-                    "0.0.0.0:80".to_string()
+    if let Some(tls_config) = tls_config {
+        // Extract port 80 address from api_addr for HTTP redirect
+        let http_addr = {
+            let parts: Vec<&str> = api_addr.split(':').collect();
+            if parts.len() == 2 {
+                format!("{}:80", parts[0])
+            } else {
+                "0.0.0.0:80".to_string()
+            }
+        };
+
+        // Start HTTP redirect server on port 80
+        let http_app =
+            axum::Router::new().fallback(|req: axum::http::Request<Body>| async move {
+                let uri = req.uri();
+                let host = uri.host().unwrap_or("localhost").to_string();
+                let path = format!(
+                    "https://{host}{}",
+                    uri.path_and_query().map_or("/", axum::http::uri::PathAndQuery::as_str),
+                );
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(axum::http::header::LOCATION, path)],
+                )
+                    .into_response()
+            });
+
+        tokio::spawn(async move {
+            let http_listener = match tokio::net::TcpListener::bind(&http_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to bind HTTP redirect server on {}: {}",
+                        http_addr,
+                        e
+                    );
+                    return;
+                }
+            };
+            tracing::info!("HTTP redirect server listening on {}", http_addr);
+            if let Err(e) = axum::serve(http_listener, http_app).await {
+                tracing::error!("HTTP redirect server error: {}", e);
+            }
+        });
+
+        // Start HTTPS server on api_addr
+        let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+        let listener = tokio::net::TcpListener::bind(&api_addr).await?;
+        tracing::info!("HTTPS API server listening on {}", api_addr);
+
+        loop {
+            let (tcp_stream, _remote_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("Failed to accept TLS connection: {}", e);
+                    continue;
                 }
             };
 
-            // Start HTTP redirect server on port 80
-            let http_app =
-                axum::Router::new().fallback(|req: axum::http::Request<Body>| async move {
-                    let uri = req.uri();
-                    let host = uri.host().unwrap_or("localhost").to_string();
-                    let path = format!(
-                        "https://{host}{}",
-                        uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
-                    );
-                    (
-                        StatusCode::MOVED_PERMANENTLY,
-                        [(axum::http::header::LOCATION, path)],
-                    )
-                        .into_response()
-                });
+            let tls_acceptor = tls_acceptor.clone();
+            let app = app.clone();
 
             tokio::spawn(async move {
-                let http_listener = match tokio::net::TcpListener::bind(&http_addr).await {
-                    Ok(l) => l,
+                let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                    Ok(s) => s,
                     Err(e) => {
-                        tracing::error!(
-                            "Failed to bind HTTP redirect server on {}: {}",
-                            http_addr,
-                            e
-                        );
+                        tracing::error!("TLS handshake failed: {}", e);
                         return;
                     }
                 };
-                tracing::info!("HTTP redirect server listening on {}", http_addr);
-                if let Err(e) = axum::serve(http_listener, http_app).await {
-                    tracing::error!("HTTP redirect server error: {}", e);
+
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let service = hyper_util::service::TowerToHyperService::new(app.into_service());
+
+                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await
+                {
+                    tracing::error!("HTTPS connection error: {}", e);
                 }
             });
-
-            // Start HTTPS server on api_addr
-            let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-            let listener = tokio::net::TcpListener::bind(&api_addr).await?;
-            tracing::info!("HTTPS API server listening on {}", api_addr);
-
-            loop {
-                let (tcp_stream, _remote_addr) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        tracing::error!("Failed to accept TLS connection: {}", e);
-                        continue;
-                    }
-                };
-
-                let tls_acceptor = tls_acceptor.clone();
-                let app = app.clone();
-
-                tokio::spawn(async move {
-                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("TLS handshake failed: {}", e);
-                            return;
-                        }
-                    };
-
-                    let io = hyper_util::rt::TokioIo::new(tls_stream);
-                    let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        tracing::error!("HTTPS connection error: {}", e);
-                    }
-                });
-            }
         }
-        None => {
-            // Plain HTTP — original behavior
-            let listener = tokio::net::TcpListener::bind(&api_addr).await?;
-            tracing::info!("API server listening on {}", api_addr);
-            axum::serve(listener, app).await?;
-            Ok(())
-        }
+    } else {
+        // Plain HTTP — original behavior
+        let listener = tokio::net::TcpListener::bind(&api_addr).await?;
+        tracing::info!("API server listening on {}", api_addr);
+        axum::serve(listener, app).await?;
+        Ok(())
     }
 }

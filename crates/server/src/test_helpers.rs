@@ -5,14 +5,21 @@
 //! 并为批次 3+ 拆 crate 后的测试迁移提供统一入口。
 
 use crate::db::Database;
+use tokio::io::AsyncWriteExt;
 
 /// 内存 SQLite 数据库（最常用，零文件系统依赖）。
+///
+/// # Panics
+/// 当内存数据库创建失败时 panic。
 pub async fn in_memory_db() -> Database {
     Database::new(":memory:").await.expect("in-memory db")
 }
 
 /// 文件-backed 数据库 + 临时目录（需跨连接持久化的测试用）。
 /// 返回 `(Database, TempDir)`——`TempDir` 随测试作用域 drop 自动清理。
+///
+/// # Panics
+/// 当临时目录或数据库创建失败时 panic。
 pub async fn file_db() -> (Database, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().join("test.db");
@@ -24,6 +31,9 @@ pub async fn file_db() -> (Database, tempfile::TempDir) {
 
 /// 种子：创建 workspace + session，返回 session id。
 /// 满足 `agent_sessions` → `agent_workspaces` 的外键约束。
+///
+/// # Panics
+/// 当 workspace 或 session 种子写入失败时 panic。
 pub async fn seed_workspace_and_session(db: &Database) -> String {
     db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
         id: "ws-test".to_owned(),
@@ -33,7 +43,7 @@ pub async fn seed_workspace_and_session(db: &Database) -> String {
         root_path: "/tmp".to_owned(),
         docker_image: None,
         docker_container_id: None,
-        agent_type: "".to_owned(),
+        agent_type: String::new(),
         agent_path: None,
         llm_model_id: None,
         agent_config_overrides: None,
@@ -44,10 +54,13 @@ pub async fn seed_workspace_and_session(db: &Database) -> String {
     db.agent_create_session("sess-test", "ws-test", None, None)
         .await
         .expect("seed session");
-    "sess-test".to_string()
+    String::from("sess-test")
 }
 
 /// 种子：仅创建 workspace（不建 session），返回 workspace id。
+///
+/// # Panics
+/// 当 workspace 种子写入失败时 panic。
 pub async fn seed_workspace(db: &Database) -> String {
     db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
         id: "ws-test".to_owned(),
@@ -57,7 +70,7 @@ pub async fn seed_workspace(db: &Database) -> String {
         root_path: "/tmp".to_owned(),
         docker_image: None,
         docker_container_id: None,
-        agent_type: "".to_owned(),
+        agent_type: String::new(),
         agent_path: None,
         llm_model_id: None,
         agent_config_overrides: None,
@@ -72,6 +85,9 @@ pub async fn seed_workspace(db: &Database) -> String {
 ///
 /// 返回 `(base_url, JoinHandle)`——`base_url` 可直接用于 `ProviderConfig.base_url`。
 /// `handler` 每个连接调用一次，接收原始请求字节，返回原始响应字节。
+///
+/// # Panics
+/// 当回环监听绑定或地址解析失败时 panic。
 pub async fn mock_upstream(
     handler: impl Fn(Vec<u8>) -> Vec<u8> + Send + 'static,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -111,7 +127,6 @@ pub async fn mock_upstream(
             }
             let response = handler(buf);
             let mut stream = stream;
-            use tokio::io::AsyncWriteExt;
             let _ = stream.write_all(&response).await;
         }
     });
@@ -120,6 +135,7 @@ pub async fn mock_upstream(
 
 /// 解析 mock 上游收到的原始 HTTP 请求 → (请求行, JSON body)。
 /// 从 `llm/upstream.rs` 提炼的公共 helper。
+#[must_use]
 pub fn parse_mock_request(buf: &[u8]) -> (String, serde_json::Value) {
     let text = String::from_utf8_lossy(buf);
     let mut parts = text.splitn(2, "\r\n\r\n");

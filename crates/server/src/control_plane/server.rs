@@ -14,11 +14,14 @@ use rust_tunnel_common::{
 
 use super::ServerState;
 
-/// Handle a single control connection from a client using the new
-/// ClientRegistry + v2 protocol (spec §3.2).
+/// 处理单个客户端控制连接（v2 协议，spec §3.2）。
 ///
-/// This replaces the old `handle_control_connection` which used port-based
-/// tunnel-forward registration.
+/// 替代旧的基于端口的 `handle_control_connection`。
+///
+/// # Errors
+/// 当控制通道读写或注册失败时返回 `TunnelError`。
+#[allow(clippy::match_same_arms, reason = "不同 ControlMessage 变体分发到不同处理逻辑，合并会降低可读性")]
+#[allow(clippy::too_many_lines, reason = "控制连接编排含注册、鉴权、读写循环与全量消息分发，共享大量局部状态，拆分反而降低可读性")]
 async fn handle_client_connection(
     reader: impl AsyncRead + Unpin + Send,
     writer: impl AsyncWrite + Unpin + Send + 'static,
@@ -109,10 +112,7 @@ async fn handle_client_connection(
     let cleanup_registry = registry.clone();
     let result: TunnelResult<()> = async {
         loop {
-            let msg = match ControlMessage::read_from_stream(&mut reader).await? {
-                Some(m) => m,
-                None => break,
-            };
+            let Some(msg) = ControlMessage::read_from_stream(&mut reader).await? else { break };
             match msg {
                 ControlMessage::Ping {
                     seq,
@@ -120,8 +120,10 @@ async fn handle_client_connection(
                 } => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_micros() as u64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| {
+                            let micros = d.as_micros();
+                            u64::try_from(micros).unwrap_or(u64::MAX)
+                        });
                     let _ = entry
                         .control_sender
                         .send(ControlMessage::Pong {
@@ -261,7 +263,11 @@ async fn handle_client_connection(
     result
 }
 
-/// Start the main server
+/// 启动控制面主服务（监听、TLS 握手与连接分发）。
+///
+/// # Errors
+/// 当监听绑定或 TLS 配置失败时返回 `TunnelError`。
+#[allow(clippy::match_same_arms, reason = "不同 ControlMessage 变体分发到不同处理逻辑，合并会降低可读性")]
 #[allow(clippy::too_many_lines)]
 pub async fn run_server(
     config: ServerConfig,

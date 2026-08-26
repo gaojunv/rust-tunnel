@@ -14,13 +14,15 @@ impl Default for DnsZone {
 }
 
 impl DnsZone {
+    /// 创建空 DNS 区域。
+    #[must_use]
     pub fn new() -> Self {
         Self {
             records: HashMap::new(),
         }
     }
 
-    /// Add a DNS record
+    /// 添加 DNS 记录。
     pub fn add_record(&mut self, record: DnsRecord) {
         let name = record.name().to_lowercase();
         self.records.entry(name).or_default().push(record);
@@ -30,8 +32,7 @@ impl DnsZone {
     pub fn remove_records(&mut self, name: &str) -> usize {
         self.records
             .remove(&name.to_lowercase())
-            .map(|v| v.len())
-            .unwrap_or(0)
+            .map_or(0, |v| v.len())
     }
 
     /// Remove records matching a predicate. Returns count removed.
@@ -49,7 +50,8 @@ impl DnsZone {
         count
     }
 
-    /// Get all records for a name
+    /// 获取指定名称的所有记录。
+    #[must_use]
     pub fn get_records(&self, name: &str) -> Vec<&DnsRecord> {
         self.records
             .get(&name.to_lowercase())
@@ -57,38 +59,40 @@ impl DnsZone {
             .unwrap_or_default()
     }
 
-    /// Get A records for a name (returns IP addresses)
+    /// 获取 A 记录（返回 IP 地址列表）。
+    #[must_use]
     pub fn get_a_records(&self, name: &str) -> Vec<String> {
         self.get_records(name)
             .iter()
             .filter_map(|r| match r {
-                DnsRecord::TunnelA { target_ip, .. } => Some(target_ip.clone()),
-                DnsRecord::MeshA { target_ip, .. } => Some(target_ip.clone()),
+                DnsRecord::TunnelA { target_ip, .. } | DnsRecord::MeshA { target_ip, .. } => Some(target_ip.clone()),
                 _ => None,
             })
             .collect()
     }
 
-    /// Get SRV records for a name (returns (target, port) pairs)
+    /// 获取 SRV 记录（返回目标与端口对）。
+    #[must_use]
     pub fn get_srv_records(&self, name: &str) -> Vec<(String, u16)> {
         self.get_records(name)
             .iter()
             .filter_map(|r| match r {
-                DnsRecord::TunnelSrv { target, port, .. } => Some((target.clone(), *port)),
-                DnsRecord::MeshSrv { target, port, .. } => Some((target.clone(), *port)),
+                DnsRecord::TunnelSrv { target, port, .. } | DnsRecord::MeshSrv { target, port, .. } => Some((target.clone(), *port)),
                 _ => None,
             })
             .collect()
     }
 
-    /// List all unique record names
+    /// 列出所有唯一记录名。
+    #[must_use]
     pub fn list_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.records.keys().cloned().collect();
         names.sort();
         names
     }
 
-    /// List all records (returns clones)
+    /// 列出所有记录（克隆返回）。
+    #[must_use]
     pub fn list_all(&self) -> Vec<DnsRecord> {
         self.records
             .values()

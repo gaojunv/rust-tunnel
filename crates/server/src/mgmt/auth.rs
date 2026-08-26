@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-/// JWT 有效期：24 小时（24*60*60 秒）。
-const JWT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+/// JWT 有效期：24 小时。
+const JWT_EXPIRY: Duration = Duration::from_hours(24);
 
 /// JWT claims
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -35,6 +35,7 @@ impl Default for Claims {
 
 impl Claims {
     /// 创建新的 `Claims`（有效期 24 小时）。
+    #[must_use]
     pub fn new() -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -42,8 +43,8 @@ impl Claims {
         let exp = now + JWT_EXPIRY; // 24 hours
         Self {
             sub: "admin".to_string(),
-            exp: exp.as_secs() as usize,
-            iat: now.as_secs() as usize,
+            exp: usize::try_from(exp.as_secs()).unwrap_or(usize::MAX),
+            iat: usize::try_from(now.as_secs()).unwrap_or(usize::MAX),
             jti: Uuid::new_v4().to_string(),
         }
     }
@@ -60,6 +61,7 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     /// 创建 `AuthConfig`（`jwt_secret` 缺省时随机生成）。
+    #[must_use]
     pub fn new(admin_password: Option<String>, jwt_secret: Option<String>) -> Self {
         let jwt_secret = jwt_secret.unwrap_or_else(|| Uuid::new_v4().to_string());
         Self {
@@ -68,12 +70,14 @@ impl AuthConfig {
         }
     }
 
-    /// Check if authentication is enabled
+    /// 是否启用鉴权（已设置管理员密码时为 true）。
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.admin_password.is_some()
     }
 
-    /// Verify password
+    /// 校验密码是否与配置的管理员密码一致（未启用鉴权时始终返回 true）。
+    #[must_use]
     pub fn verify_password(&self, password: &str) -> bool {
         match &self.admin_password {
             Some(expected) => password == expected,
@@ -82,7 +86,10 @@ impl AuthConfig {
     }
 }
 
-/// Create JWT token
+/// 创建 JWT 令牌。
+///
+/// # Errors
+/// 当 JWT 编码失败时返回错误（如密钥无效或序列化失败）。
 pub fn create_token(jwt_secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let claims = Claims::new();
     encode(
@@ -92,7 +99,10 @@ pub fn create_token(jwt_secret: &str) -> Result<String, jsonwebtoken::errors::Er
     )
 }
 
-/// Validate JWT token
+/// 校验 JWT 令牌。
+///
+/// # Errors
+/// 当令牌格式非法、签名不匹配或已过期时返回错误。
 pub fn validate_token(
     token: &str,
     jwt_secret: &str,

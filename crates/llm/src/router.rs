@@ -2,7 +2,7 @@ use crate::{LlmState, ProviderConfig};
 
 /// 模型上游协议类型。
 ///
-/// 与 [`agent::compact::context_limit_for`] 同为 per-model `extra_config` JSON 键；
+/// 与 `agent::compact::context_limit_for` 同为 per-model `extra_config` JSON 键；
 /// 本枚举读取 `upstream_protocol` 键，默认 `ChatCompletions`（零迁移成本）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamProtocol {

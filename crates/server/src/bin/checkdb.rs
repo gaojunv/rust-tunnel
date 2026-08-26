@@ -1,3 +1,4 @@
+//! 诊断工具：查询并汇总近 24 小时统计快照。
 use rust_tunnel_server::db::Database;
 
 #[tokio::main]

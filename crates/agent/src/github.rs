@@ -49,7 +49,7 @@ pub enum GitHubError {
 }
 
 /// GitHub REST API 客户端。每请求持有一个 token；构造后仅经
-/// [`Self::headers`] 注入 Authorization 头，`Debug` 打码 token。
+/// `Self::headers` 注入 Authorization 头，`Debug` 打码 token。
 pub struct GitHubClient {
     /// 内部 HTTP 客户端。
     client: reqwest::Client,

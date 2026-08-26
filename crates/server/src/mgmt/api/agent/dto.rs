@@ -234,12 +234,12 @@ pub struct GitApprovedBody {
 /// 写操作统一审批标记：`approved: true` 表示用户已在面板确认后重发。
 /// 面板所有 Git 写端点的请求体都携带该字段。
 macro_rules! git_write_body {
-    ($name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
+    ($(#[$meta:meta])* $name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
+        $(#[$meta])*
         #[derive(Debug, Deserialize)]
-        #[allow(missing_docs)]
         pub struct $name {
             $(
-                #[allow(missing_docs)]
+                #[allow(missing_docs, reason = "字段名即语义，含义由外层结构体文档概括")]
                 pub $field: $ty,
             )*
             #[serde(default)]
@@ -249,39 +249,57 @@ macro_rules! git_write_body {
     };
 }
 
-/// GitStageRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitStageRequest {
-    paths: Vec<String>,
-});
-/// GitUnstageRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitUnstageRequest {
-    paths: Vec<String>,
-});
-/// GitCommitRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitCommitRequest { message: String });
-/// GitCheckoutRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitCheckoutRequest {
-    branch: String,
-    create: Option<bool>,
-});
-/// GitBranchDeleteRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitBranchDeleteRequest {
-    branch: String,
-    force: Option<bool>,
-});
-/// GitRevertRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitRevertRequest { rev: String });
-/// GitResetRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitResetRequest {
-    rev: Option<String>,
-    mode: String,
-});
-/// GitStashPushRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitStashPushRequest {
-    message: Option<String>,
-});
-/// GitStashIndexRequest 请求体（Git 写操作，含 approved 审批标记）。
-git_write_body!(GitStashIndexRequest { index: usize });
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/stage` 请求体，批量暂存指定路径。
+    GitStageRequest {
+        paths: Vec<String>,
+    }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/unstage` 请求体，批量取消暂存。
+    GitUnstageRequest {
+        paths: Vec<String>,
+    }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/commit` 请求体，提交已暂存变更。
+    GitCommitRequest { message: String }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/checkout` 请求体，切换或创建分支。
+    GitCheckoutRequest {
+        branch: String,
+        create: Option<bool>,
+    }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/branch/delete` 请求体，删除分支。
+    GitBranchDeleteRequest {
+        branch: String,
+        force: Option<bool>,
+    }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/revert` 请求体，还原指定提交。
+    GitRevertRequest { rev: String }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/reset` 请求体，重置到指定提交/模式。
+    GitResetRequest {
+        rev: Option<String>,
+        mode: String,
+    }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/stash/push` 请求体，推入 stash。
+    GitStashPushRequest {
+        message: Option<String>,
+    }
+);
+git_write_body!(
+    /// `POST /api/agent/workspaces/:id/git/stash/apply|pop|drop` 请求体，按索引操作 stash。
+    GitStashIndexRequest { index: usize }
+);
 
 // ── GitHub Actions 面板 ───────────────────────────────────────
 

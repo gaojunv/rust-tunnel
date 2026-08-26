@@ -39,7 +39,7 @@ pub async fn update_trojan_config(
 ) -> impl IntoResponse {
     let enabled = payload["enabled"].as_bool().unwrap_or(false);
     let port = match payload["port"].as_u64() {
-        Some(p) if p > 0 && p <= 65535 => p as u16,
+        Some(p) if p > 0 && p <= 65535 => u16::try_from(p).unwrap_or(u16::MAX),
         _ => {
             return (StatusCode::BAD_REQUEST, "Invalid or missing port").into_response();
         }
@@ -73,7 +73,7 @@ pub async fn update_trojan_config(
     };
     if !domain.is_empty() {
         if let Err(e) = crate::trojan::validate_trojan_domain(&domain) {
-            return (StatusCode::BAD_REQUEST, format!("Invalid domain: {}", e)).into_response();
+            return (StatusCode::BAD_REQUEST, format!("Invalid domain: {e}")).into_response();
         }
     }
 
@@ -89,8 +89,7 @@ pub async fn update_trojan_config(
                 return (
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "Port {} is used by reverse proxy listener {} without TLS. Trojan requires TLS.",
-                        port, listen_addr
+                        "Port {port} is used by reverse proxy listener {listen_addr} without TLS. Trojan requires TLS."
                     ),
                 )
                     .into_response();
@@ -99,8 +98,7 @@ pub async fn update_trojan_config(
                 return (
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "Port {} is used by reverse proxy listener {}. Set a domain to share it via SNI.",
-                        port, listen_addr
+                        "Port {port} is used by reverse proxy listener {listen_addr}. Set a domain to share it via SNI."
                     ),
                 )
                     .into_response();
@@ -116,7 +114,7 @@ pub async fn update_trojan_config(
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
+                format!("DB error: {e}"),
             )
                 .into_response();
         }
@@ -140,7 +138,7 @@ pub async fn update_trojan_config(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to apply trojan config: {}", e),
+            format!("Failed to apply trojan config: {e}"),
         )
             .into_response();
     }

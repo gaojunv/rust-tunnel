@@ -20,6 +20,7 @@ impl Default for MeshRelay {
 
 impl MeshRelay {
     /// 创建空的中继表。
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tunnels: Arc::new(Mutex::new(HashMap::new())),
@@ -39,6 +40,9 @@ impl MeshRelay {
     }
 
     /// 将数据从 source 中继到 target。
+    ///
+    /// # Errors
+    /// 当目标客户端不存在或发送失败时返回 `TunnelError`。
     pub async fn relay_data(
         &self,
         source: &str,
@@ -48,7 +52,7 @@ impl MeshRelay {
         let tunnels = self.tunnels.lock().await;
         let tx = tunnels
             .get(target)
-            .ok_or_else(|| TunnelError::MeshRelay(format!("Target not found: {}", target)))?;
+            .ok_or_else(|| TunnelError::MeshRelay(format!("Target not found: {target}")))?;
 
         let msg = ControlMessage::MeshRelay {
             target_client: source.to_string(),
@@ -113,7 +117,7 @@ mod tests {
                 assert_eq!(target_client, "client-a");
                 assert_eq!(data, vec![1, 2, 3]);
             }
-            _ => panic!("Unexpected message: {:?}", msg),
+            _ => panic!("Unexpected message: {msg:?}"),
         }
     }
 }

@@ -15,6 +15,8 @@ pub struct DnsRegistry {
 }
 
 impl DnsRegistry {
+    /// 创建 DNS 注册表。
+    #[must_use]
     pub fn new(server_ip: String, tunnel_domain: String, mesh_domain: String) -> Self {
         Self {
             zone: Arc::new(Mutex::new(DnsZone::new())),
@@ -26,7 +28,7 @@ impl DnsRegistry {
 
     /// Register a tunnel port with a custom DNS name
     pub async fn register_tunnel(&self, dns_name: &str, port: u16, protocol: Option<&str>) {
-        let a_name = format!("{}.{}", dns_name, self.tunnel_domain);
+        let a_name = format!("{dns_name}.{}", self.tunnel_domain);
         let ip = self.server_ip.lock().await.clone();
         let mut zone = self.zone.lock().await;
 
@@ -40,7 +42,7 @@ impl DnsRegistry {
         });
 
         if let Some(proto) = protocol {
-            let srv_name = format!("_{}._tcp.{}.{}", proto, dns_name, self.tunnel_domain);
+            let srv_name = format!("_{proto}._tcp.{dns_name}.{}", self.tunnel_domain);
             zone.remove_records(&srv_name);
             zone.add_record(DnsRecord::TunnelSrv {
                 name: srv_name,
@@ -53,18 +55,18 @@ impl DnsRegistry {
     /// Auto-register tunnel port with default name "port-{port}"
     /// Returns the generated FQDN
     pub async fn register_tunnel_default(&self, port: u16, protocol: Option<&str>) -> String {
-        let dns_name = format!("port-{}", port);
+        let dns_name = format!("port-{port}");
         self.register_tunnel(&dns_name, port, protocol).await;
-        format!("{}.{}", dns_name, self.tunnel_domain)
+        format!("{dns_name}.{}", self.tunnel_domain)
     }
 
     /// Unregister all records for a tunnel by DNS name and port
     pub async fn unregister_tunnel(&self, dns_name: &str, port: u16) {
         let mut zone = self.zone.lock().await;
-        let a_name = format!("{}.{}", dns_name, self.tunnel_domain);
+        let a_name = format!("{dns_name}.{}", self.tunnel_domain);
         zone.remove_records(&a_name);
         // Also clean up default name for this port
-        let default_name = format!("port-{}.{}", port, self.tunnel_domain);
+        let default_name = format!("port-{port}.{}", self.tunnel_domain);
         if default_name != a_name {
             zone.remove_records(&default_name);
         }
@@ -79,10 +81,10 @@ impl DnsRegistry {
         target_ip: &str,
         port: u16,
     ) {
-        let name = format!("{}.{}.{}", service_name, mesh_id, self.mesh_domain);
+        let name = format!("{service_name}.{mesh_id}.{}", self.mesh_domain);
         let srv_name = format!(
-            "_{}._tcp.{}.{}.{}",
-            protocol, service_name, mesh_id, self.mesh_domain
+            "_{protocol}._tcp.{service_name}.{mesh_id}.{}",
+            self.mesh_domain
         );
         let mut zone = self.zone.lock().await;
 

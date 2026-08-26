@@ -5,7 +5,7 @@
 //! 数量级很小（几十个），但请求可能很密集，DB 往返很快成为瓶颈。
 //!
 //! 本模块提供一个惰性全量快照缓存：首次访问时从 DB 装载全部路由实体（此时解密 provider
-//! 的敏感字段），在管理 API 写入（provider/model/group CRUD）后通过 [`RouteCache::invalidate`]
+//! 的敏感字段），在管理 API 写入（provider/model/group CRUD）后通过 [`crate::route_cache::RouteCache::invalidate`]
 //! 失效，下一次访问自动重载。写入是低频操作，全量失效代价可忽略。
 
 use std::collections::HashMap;

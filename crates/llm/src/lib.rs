@@ -1,7 +1,7 @@
 //! LLM 网关：OpenAI / Anthropic / Responses 三协议入口、模型路由与故障转移、
 //! 熔断与确定性失败缓存、用量日志、compat 工具调用改写。
 //!
-//! RAG 注入经 `rag` feature 挂接 [`rust_tunnel_rag`]；本 crate 不依赖 server
+//! RAG 注入经 `rag` feature 挂接 `rust-tunnel-rag`；本 crate 不依赖 server
 //! 装配层类型（`DynamicConfig`/`ReverseProxyState`），接缝为 [`LlmGatewayRuleInput`]
 //! 与 [`LlmState::request_logging`] 原子开关。
 
@@ -124,7 +124,7 @@ impl LlmGatewayConfig {
 
     /// 收集所有已配置的域名（用于 ProxyRule.domains 持久化）。
     /// 始终返回两个元素：`[openai_domain, anthropic_domain]`，未配置的为空字符串。
-    /// `init_llm_state` 按位置索引还原（domains[0] → openai, domains[1] → anthropic）。
+    /// `init_llm_state` 按位置索引还原（`domains[0]` → openai, `domains[1]` → anthropic）。
     #[must_use]
     pub fn configured_domains(&self) -> Vec<String> {
         vec![
@@ -447,7 +447,7 @@ pub struct LlmState {
 
 impl LlmState {
     /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
-    /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录（仅 `rag` feature 启用时可用）。
+    /// 生产初始化请用 `Self::new_with_rag` 指定数据目录（仅 `rag` feature 启用时可用）。
     #[must_use]
     pub fn new(db: Option<Database>, cipher: Option<crate::crypto::LlmCipher>) -> Self {
         Self {

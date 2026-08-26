@@ -19,7 +19,7 @@ pub fn init_logging_with_level(default_level: &str) {
 
 /// Initialize logging with an additional custom layer (e.g., LogLayer for log capture).
 /// The extra_layer is registered alongside the default fmt layer and EnvFilter.
-/// The extra_layer is subscribed directly to [`Registry`] so the function bound
+/// The extra_layer is subscribed directly to [`tracing_subscriber::Registry`] so the function bound
 /// `L: Layer<Registry>` can be satisfied without knowing the concrete layered type.
 pub fn init_logging_with_layer<L>(default_level: &str, extra_layer: L)
 where
