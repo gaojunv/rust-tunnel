@@ -589,7 +589,8 @@ impl Database {
     }
 
     /// 可见容器 id 列表（scope 可见性，pages 侧；对齐旧 `wiki_visible_ids` 语义，
-    /// 过滤 `index_pages = 1` 以区分 vector 容器）。
+    /// 过滤 `index_pages = 1 AND enabled = 1`：vector-only 容器不在 pages 可见性中，
+    /// 停用容器也不该再被 agent 工具检索到）。
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn ks_visible_ids(
@@ -599,7 +600,7 @@ impl Database {
     ) -> Result<Vec<String>, sqlx::Error> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT id FROM knowledge_sources \
-             WHERE index_pages = 1 AND (scope_type = 'global' \
+             WHERE index_pages = 1 AND enabled = 1 AND (scope_type = 'global' \
              OR (scope_type = 'client' AND client_id = ?) \
              OR (scope_type = 'workspace' AND client_id = ? AND workspace_id = ?))",
         )
@@ -611,7 +612,8 @@ impl Database {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    /// 可见容器完整记录（`page_count DESC`，`index_pages = 1`）。
+    /// 可见容器完整记录（`page_count DESC`，`index_pages = 1 AND enabled = 1`）。
+    /// 停用容器不进 agent 的 `<wikis>` 清单——用户关掉的容器不该再被模型看见。
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn ks_visible_sources(
@@ -625,7 +627,7 @@ impl Database {
              emb_base_url, emb_api_key, emb_model, emb_dimension, top_k, chunk_size, chunk_overlap, \
              score_threshold, status, version, page_count, enabled, created_at, updated_at \
              FROM knowledge_sources \
-             WHERE index_pages = 1 AND (scope_type = 'global' \
+             WHERE index_pages = 1 AND enabled = 1 AND (scope_type = 'global' \
              OR (scope_type = 'client' AND client_id = ?) \
              OR (scope_type = 'workspace' AND client_id = ? AND workspace_id = ?)) \
              ORDER BY page_count DESC LIMIT ?",
@@ -1126,6 +1128,13 @@ mod tests {
             .unwrap();
         // vector 容器不应出现在 pages 可见性里
         db.ks_create(&vec_opts("v1", "vec-only")).await.unwrap();
+        // 停用的 pages 容器同样不可见：用户在 UI 关掉它，agent 就不该再看见
+        db.ks_create(&KsCreateOpts {
+            enabled: false,
+            ..pages_opts("d1", "disabled-wiki", "global", "", "")
+        })
+        .await
+        .unwrap();
 
         let ids = db.ks_visible_ids("c1", "w1").await.unwrap();
         assert!(ids.contains(&"g1".to_string()));
@@ -1133,6 +1142,7 @@ mod tests {
         assert!(ids.contains(&"w1".to_string()));
         assert!(!ids.contains(&"w2".to_string()));
         assert!(!ids.contains(&"v1".to_string()), "vector 容器不应在 pages 可见性中");
+        assert!(!ids.contains(&"d1".to_string()), "停用容器不应在 pages 可见性中");
 
         let vis = db.ks_visible_sources("c1", "w1", 10).await.unwrap();
         assert_eq!(vis.len(), 3);
