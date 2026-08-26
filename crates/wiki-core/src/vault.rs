@@ -334,7 +334,7 @@ mod tests {
         let scanner = VaultScanner::new(dir.path());
         let keys = scanner.scan();
         let mut strs: Vec<&str> = keys.iter().map(NoteKey::as_str).collect();
-        strs.sort();
+        strs.sort_unstable();
         assert_eq!(strs, vec!["docs/ok", "root"]);
     }
 
