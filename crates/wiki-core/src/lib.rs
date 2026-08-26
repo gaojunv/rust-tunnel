@@ -11,4 +11,26 @@
 /// Wiki `ref` 标识的规范化与校验（remote 绑定键，可选）。
 pub mod ref_id;
 
+/// 笔记 frontmatter（YAML 前置元数据）的解析与提取。
+pub mod frontmatter;
+
+/// `[[...]]` wiki 链接的解析与提取。
+pub mod link;
+
+/// Markdown 渲染与结构提取。
+pub mod markdown;
+
+/// 笔记领域模型：`NoteKey` 与 `Note`。
+pub mod note;
+
+/// Vault 目录扫描。
+pub mod vault;
+
+/// 链接图：入边 / 孤儿 / 断链推导。
+pub mod graph;
+
+/// 基于 tantivy 的全文检索（`search` feature 门控）。
+#[cfg(feature = "search")]
+pub mod search;
+
 pub use ref_id::{RefId, MAX_REF_LEN};
