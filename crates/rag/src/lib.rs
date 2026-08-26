@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod chunker;
+pub mod doc_store;
 pub mod embedder;
 pub mod extractor;
 pub mod ingest;

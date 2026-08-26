@@ -109,6 +109,21 @@ pub async fn query_kb(
     Json(serde_json::json!({ "chunks": chunks })).into_response()
 }
 
+/// 把统一的 `KbEvent` 映射回 KB SSE 的既有形态。
+///
+/// 统一流水线的事件多了 `kind` 字段，这里显式挑字段而非直接 serialize：前端的
+/// 契约是 `{doc_id, kb_id, status, chunk_count, error}`，多发字段虽无害，但把
+/// 转形写明能让批 5 统一前端时一眼看出该收敛什么。
+fn kb_event_json(ev: &crate::llm::rag::ingest::KbEvent) -> serde_json::Value {
+    serde_json::json!({
+        "doc_id": ev.doc_id,
+        "kb_id": ev.kb_id,
+        "status": ev.status,
+        "chunk_count": ev.chunk_count,
+        "error": ev.error,
+    })
+}
+
 /// GET /api/llm/kb/events — SSE 事件流（文档摄入状态）。token 走 query 参数认证
 /// （public 路由，参照 `/api/logs/stream`），keep-alive 30s。
 pub async fn sse_kb_events(
@@ -136,7 +151,11 @@ pub async fn sse_kb_events(
         loop {
             match tokio::time::timeout(SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(ev)) => {
-                    let json = serde_json::to_string(&ev).unwrap_or_default();
+                    // 统一 channel 承载两个索引的事件；本端点只关心向量索引。
+                    if ev.kind != crate::db::knowledge::IndexKind::Vector {
+                        continue;
+                    }
+                    let json = serde_json::to_string(&kb_event_json(&ev)).unwrap_or_default();
                     yield Ok::<_, std::convert::Infallible>(
                         Event::default().event("kb").data(json),
                     );

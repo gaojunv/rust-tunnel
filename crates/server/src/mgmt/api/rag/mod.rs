@@ -469,10 +469,10 @@ mod tests {
             .starts_with("sha256:"));
         let doc_id = body["id"].as_str().expect("doc id").to_string();
 
-        // §2.1 原文落盘：<data_dir>/rag_docs/<kb_id>/<doc_id>.md
+        // §2.1 原文落盘：<data_dir>/knowledge_docs/<kb_id>/<doc_id>.md（两索引共用）
         let source_path = dir
             .path()
-            .join("rag_docs")
+            .join("knowledge_docs")
             .join(&kb_id)
             .join(format!("{doc_id}.md"));
         assert!(
@@ -586,7 +586,7 @@ mod tests {
             "kb shard dir should be removed"
         );
         assert!(
-            !dir.path().join("rag_docs").join(&kb_id).exists(),
+            !dir.path().join("knowledge_docs").join(&kb_id).exists(),
             "kb doc source dir should be removed"
         );
         assert!(db.ks_get(&kb_id).await.unwrap().is_none());
@@ -888,7 +888,7 @@ mod tests {
         let doc_id = body["id"].as_str().expect("doc id").to_string();
         let source_path = dir
             .path()
-            .join("rag_docs")
+            .join("knowledge_docs")
             .join(&kb_id)
             .join(format!("{doc_id}.md"));
         assert!(
@@ -1100,7 +1100,7 @@ mod tests {
         );
         // 未留下任何 doc 记录/原文文件
         assert!(db.kdoc_list(&kb_id).await.unwrap().is_empty());
-        assert!(!dir.path().join("rag_docs").join(&kb_id).exists());
+        assert!(!dir.path().join("knowledge_docs").join(&kb_id).exists());
     }
 
     #[tokio::test]
@@ -1122,7 +1122,7 @@ mod tests {
             .unwrap();
         let source_path = dir
             .path()
-            .join("rag_docs")
+            .join("knowledge_docs")
             .join(&kb_id)
             .join(format!("{doc_id}.md"));
         tokio::fs::create_dir_all(source_path.parent().unwrap())

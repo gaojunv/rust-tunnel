@@ -10,7 +10,7 @@ use axum::{
 
 use crate::db::knowledge::{IndexKind, KnowledgeDocIndexRecord, KnowledgeDocRecord, KnowledgeSourceRecord};
 use crate::llm::rag::extractor::FileType;
-use crate::llm::rag::ingest::spawn_ingest;
+use crate::llm::rag::ingest::{spawn_ingest, IngestOpts};
 use crate::llm::rag::store::VectorStore;
 use crate::mgmt::api::ApiState;
 use sha2::Digest;
@@ -35,19 +35,16 @@ fn doc_json(doc: &KnowledgeDocRecord, idx: Option<&KnowledgeDocIndexRecord>) -> 
 }
 
 
-/// 文档原文落盘路径：`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`（保留真实扩展名，
-/// 二进制原文 reindex 时按 file_type 重新解析）。`pub(crate)` 供 `kb.rs` 全量重建路径引用。
+/// 文档原文落盘路径。薄包装 [`rust_tunnel_rag::doc_store::doc_source_path`]，
+/// 只为省掉调用点的 `rt.store.data_dir()` 样板；`pub(crate)` 供 `kb.rs` 全量
+/// 重建路径引用。
 pub(crate) fn doc_source_path(
     store: &VectorStore,
     kb_id: &str,
     doc_id: &str,
     ext: &str,
 ) -> std::path::PathBuf {
-    store
-        .data_dir()
-        .join("rag_docs")
-        .join(kb_id)
-        .join(format!("{doc_id}.{ext}"))
+    crate::llm::rag::doc_store::doc_source_path(store.data_dir(), kb_id, doc_id, ext)
 }
 
 /// `reindex_kb_doc` 的结果：全量重建路径据此统计，单文档端点据此映射 409。
@@ -124,17 +121,23 @@ pub(crate) async fn reindex_kb_doc(
 
     // 状态已是 pending（CAS 时置位），直接 spawn_ingest 走完整摄入
     // （与 upload 同路径：processing → ready/failed + SSE 事件）。
-    spawn_ingest(
-        rt.db.clone(),
-        rt.store.clone(),
-        rt.cipher.clone(),
-        kb.clone(),
-        doc.id.clone(),
+    spawn_ingest(IngestOpts {
+        db: rt.db.clone(),
+        store: rt.store.clone(),
+        cipher: rt.cipher.clone(),
+        source: kb.clone(),
+        doc_id: doc.id.clone(),
         source_path,
         file_type,
-        rt.tx.clone(),
-        sem,
-    );
+        tx: rt.tx.clone(),
+        vector_sem: sem,
+        pages_sem: None,
+        page_extractor: None,
+        // 本端点是「KB 页面」的重建入口，用户只请求了向量索引。容器若同时开了
+        // pages，从这里连带跑一遍 LLM 抽取就是用户没点过的账单。批 3 合并统一
+        // 路由后本入口消失，届时应改回 None（跑容器启用的全部索引）。
+        only: Some(IndexKind::Vector),
+    });
     Ok(ReindexOutcome::Spawned)
 }
 
@@ -344,17 +347,21 @@ pub async fn upload_doc(
 
     // 后台摄入：提取 → 分块 → embedding → 写向量 → 落库 → 发事件；
     // 调用方立即拿 doc(pending)。
-    spawn_ingest(
-        rt.db.clone(),
-        rt.store.clone(),
-        rt.cipher.clone(),
-        kb,
-        doc_id.clone(),
-        source_path.clone(),
+    spawn_ingest(IngestOpts {
+        db: rt.db.clone(),
+        store: rt.store.clone(),
+        cipher: rt.cipher.clone(),
+        source: kb,
+        doc_id: doc_id.clone(),
+        source_path: source_path.clone(),
         file_type,
-        rt.tx.clone(),
-        None,
-    );
+        tx: rt.tx.clone(),
+        vector_sem: None,
+        pages_sem: None,
+        page_extractor: None,
+        // 同 reindex：KB 上传入口只跑向量侧，理由见 `reindex_kb_doc`。
+        only: Some(IndexKind::Vector),
+    });
 
     match rt.db.kdoc_get(&doc_id).await {
         Ok(Some(doc)) => {
@@ -443,7 +450,7 @@ pub async fn delete_doc(
 
 /// POST `/api/llm/kb/:id/docs/:doc_id/reindex` — 重建单文档索引（规格 §5.2/§7）。
 ///
-/// 摄入时已把原文落盘（`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`，见 upload_doc），
+/// 摄入时已把原文落盘（`<data_dir>/knowledge_docs/<kb_id>/<doc_id>.<ext>`，见 upload_doc），
 /// 故可无损重建：清旧索引（向量 + SQLite 分块）→ 按 doc.file_type 重新提取走完整
 /// 摄入。换分块参数后也通过本端点重索引。原文文件缺失（老数据/手动删除）→ 409，
 /// 提示删除重传。

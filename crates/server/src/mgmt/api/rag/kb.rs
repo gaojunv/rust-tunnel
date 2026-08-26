@@ -355,7 +355,7 @@ pub async fn update_kb(
 
     // ── 全量重建：emb 配置已变，旧向量（维度固化在 shard）全部失效 ──
     // 顺序：软关挡新上传/检索 → 擦 shard（含缓存移除）→ 清 SQLite 分块 →
-    // 逐文档 reindex（复用单文档流程，原文在 rag_docs/ 无需重传）→ 恢复启停。
+    // 逐文档 reindex（复用单文档流程，原文在 knowledge_docs/ 无需重传）→ 恢复启停。
     // 并发取舍与 delete_kb 同源：擦 shard 瞬间若有编辑前已在途的摄入任务持有旧
     // EdgeShard，其 Drop flush 可能任务级 panic（管理面低频操作，可接受）。
     let was_enabled = existing.enabled != 0;
@@ -466,7 +466,7 @@ pub async fn delete_kb(State(state): State<ApiState>, Path(id): Path<String>) ->
         tracing::warn!(kb_id = %id, error = %e, "rag: store delete_kb failed");
     }
     // 清理该库全部原文文件（best-effort，失败仅 warn）
-    let source_dir = rt.store.data_dir().join("rag_docs").join(&id);
+    let source_dir = crate::llm::rag::doc_store::source_docs_dir(rt.store.data_dir(), &id);
     if source_dir.exists() {
         if let Err(e) = tokio::fs::remove_dir_all(&source_dir).await {
             tracing::warn!(kb_id = %id, error = %e, "rag: remove kb doc source dir failed");

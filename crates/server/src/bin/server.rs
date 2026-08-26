@@ -362,6 +362,26 @@ async fn main() -> TunnelResult<()> {
         )
         .await;
 
+    // 原文目录归一：整合前向量侧存 rag_docs/、pages 侧存 wiki_docs/，统一后
+    // 两个索引共用 knowledge_docs/。必须早于任何摄入/reindex——路径函数已只认
+    // 新目录，没搬过的老文档会被判为「原文缺失」。幂等，可重复启动。
+    #[cfg(feature = "rag")]
+    {
+        let data_dir = std::path::Path::new(&config.db_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let report = rust_tunnel_server::llm::rag::doc_store::migrate_legacy_doc_dirs(&data_dir).await;
+        if report != rust_tunnel_server::llm::rag::doc_store::MigrationReport::default() {
+            tracing::info!(
+                moved = report.moved,
+                skipped = report.skipped,
+                failed = report.failed,
+                "knowledge docs directory migration finished (empty legacy roots are left in place)"
+            );
+        }
+    }
+
     // RAG 启动对账：上次运行若在摄入中途崩溃/panic，doc 会永久卡在
     // pending/processing、前端无法恢复。启动时（API/控制面起服务前）统一
     // 复位为 failed，UI 可感知失败并让用户重试（reindex/上传走 CAS 抢占）。

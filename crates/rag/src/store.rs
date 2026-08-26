@@ -106,8 +106,8 @@ impl VectorStore {
         }
     }
 
-    /// 数据根目录：`rag/<kb_id>/` 存向量 shard，`rag_docs/<kb_id>/` 存文档原文
-    /// （管理 API 层读写原文用，见 `mgmt/api/rag.rs`）。
+    /// 数据根目录：`rag/<kb_id>/` 存向量 shard，`knowledge_docs/<kb_id>/` 存文档
+    /// 原文（两个索引共用，路径由 [`crate::doc_store`] 统一给出）。
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir

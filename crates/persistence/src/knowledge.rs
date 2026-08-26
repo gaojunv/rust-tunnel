@@ -7,7 +7,11 @@
 use super::Database;
 
 /// 索引种类，与 `knowledge_doc_index.kind` 的 DB 字符串一一对应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Serialize` 输出小写字符串（`"vector"` / `"pages"`），与 [`Self::as_str`]
+/// 及 DB 取值保持一致——摄入事件经 SSE 下发时依赖此形状。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum IndexKind {
     /// 向量索引（`vector`）。
     Vector,
