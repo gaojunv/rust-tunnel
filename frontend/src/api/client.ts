@@ -457,53 +457,83 @@ export async function getLlmUsageLogs(
 }
 
 // ── RAG Knowledge Base ──────────────────────────────────────────
+//
+// 后端已统一为 /api/knowledge（KB 向量索引与 Wiki 页面索引同容器双索引）。
+// 本节与下方 Wiki 段共用该端点：本节固定 index_kind=vector / index_vector=true，
+// Wiki 段固定 pages——旧调用方语义不变，批 5 前端整合时再收敛为一套。
+
+/** 统一文档视图：per-kind 状态挂在 vector/pages 子对象上（未启用为 null）。 */
+interface UnifiedDoc {
+  id: string;
+  source_id: string;
+  filename: string;
+  file_type: string;
+  content_hash: string;
+  created_at: string;
+  updated_at: string;
+  vector: { status: string; chunk_count: number; error?: string | null } | null;
+  pages: { status: string; page_count: number; error?: string | null } | null;
+}
+
+const toKbDoc = (d: UnifiedDoc): LlmKbDocument => ({
+  id: d.id,
+  kb_id: d.source_id,
+  filename: d.filename,
+  file_type: d.file_type,
+  content_hash: d.content_hash,
+  status: (d.vector?.status ?? 'pending') as LlmKbDocument['status'],
+  chunk_count: d.vector?.chunk_count ?? 0,
+  error: d.vector?.error ?? null,
+  created_at: d.created_at,
+  updated_at: d.updated_at,
+});
 
 export async function listLlmKbs(): Promise<LlmKnowledgeBase[]> {
-  const { data } = await api.get('/llm/kb');
-  return data.knowledge_bases;
+  const { data } = await api.get('/knowledge', { params: { index_kind: 'vector' } });
+  return data.sources;
 }
 
 export async function getLlmKb(id: string): Promise<LlmKnowledgeBase> {
-  const { data } = await api.get(`/llm/kb/${encodeURIComponent(id)}`);
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(id)}`);
   return data;
 }
 
 export async function createLlmKb(req: CreateLlmKbRequest): Promise<{ id: string }> {
-  const { data } = await api.post('/llm/kb', req);
+  const { data } = await api.post('/knowledge', { ...req, index_vector: true });
   return data;
 }
 
 export async function updateLlmKb(id: string, req: UpdateLlmKbRequest): Promise<void> {
-  await api.put(`/llm/kb/${encodeURIComponent(id)}`, req);
+  await api.put(`/knowledge/${encodeURIComponent(id)}`, req);
 }
 
 export async function toggleLlmKb(id: string, enabled: boolean): Promise<void> {
-  await api.patch(`/llm/kb/${encodeURIComponent(id)}`, { enabled });
+  await api.patch(`/knowledge/${encodeURIComponent(id)}`, { enabled });
 }
 
 export async function deleteLlmKb(id: string): Promise<void> {
-  await api.delete(`/llm/kb/${encodeURIComponent(id)}`);
+  await api.delete(`/knowledge/${encodeURIComponent(id)}`);
 }
 
 export async function listLlmKbDocs(kbId: string): Promise<LlmKbDocument[]> {
-  const { data } = await api.get(`/llm/kb/${encodeURIComponent(kbId)}/docs`);
-  return data.documents;
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(kbId)}/docs`);
+  return (data.documents as UnifiedDoc[]).map(toKbDoc);
 }
 
 export async function uploadKbDoc(kbId: string, file: File): Promise<LlmKbDocument> {
   const formData = new FormData();
   formData.append('file', file);
-  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/docs`, formData);
-  return data;
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(kbId)}/docs`, formData);
+  return toKbDoc(data as UnifiedDoc);
 }
 
 export async function deleteKbDoc(kbId: string, docId: string): Promise<void> {
-  await api.delete(`/llm/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}`);
+  await api.delete(`/knowledge/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}`);
 }
 
 export async function reindexKbDoc(kbId: string, docId: string): Promise<LlmKbDocument> {
-  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}/reindex`);
-  return data;
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}/reindex`);
+  return toKbDoc(data as UnifiedDoc);
 }
 
 export async function testEmbedding(req: {
@@ -513,12 +543,12 @@ export async function testEmbedding(req: {
   /** 编辑已有 KB 时传入：api_key 留空则用该 KB 已存密钥测试。 */
   kb_id?: string;
 }): Promise<TestEmbeddingResult> {
-  const { data } = await api.post('/llm/kb/test-embedding', req);
+  const { data } = await api.post('/knowledge/test-embedding', req);
   return data;
 }
 
 export async function queryKb(kbId: string, text: string): Promise<KbQueryResult> {
-  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/query`, { text });
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(kbId)}/query`, { text });
   return data;
 }
 
@@ -827,7 +857,7 @@ export interface WikiListParams {
 }
 
 export async function listWikis(params: WikiListParams = {}): Promise<import('../types').AgentWikisResponse> {
-  const clean: Record<string, string | number> = {};
+  const clean: Record<string, string | number> = { index_kind: 'pages' };
   if (params.scope) clean.scope = params.scope;
   if (params.client_id) clean.client_id = params.client_id;
   if (params.workspace_id) clean.workspace_id = params.workspace_id;
@@ -835,49 +865,61 @@ export async function listWikis(params: WikiListParams = {}): Promise<import('..
   if (params.status) clean.status = params.status;
   if (params.limit !== undefined) clean.limit = params.limit;
   if (params.offset !== undefined) clean.offset = params.offset;
-  const { data } = await api.get('/agent/wiki', { params: clean });
-  return { wikis: data.wikis ?? [], total: data.total ?? 0 };
+  const { data } = await api.get('/knowledge', { params: clean });
+  return { wikis: data.sources ?? [], total: data.total ?? 0 };
 }
 
 export async function createWiki(req: import('../types').CreateWikiRequest): Promise<import('../types').AgentWiki> {
-  const { data } = await api.post('/agent/wiki', req);
+  const { data } = await api.post('/knowledge', { ...req, index_pages: true });
   return data;
 }
 
 export async function getWiki(id: string): Promise<import('../types').AgentWiki> {
-  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(id)}`);
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(id)}`);
   return data;
 }
 
 export async function updateWiki(id: string, req: import('../types').UpdateWikiRequest): Promise<import('../types').AgentWiki> {
-  const { data } = await api.patch(`/agent/wiki/${encodeURIComponent(id)}`, req);
+  const { data } = await api.patch(`/knowledge/${encodeURIComponent(id)}`, req);
   return data;
 }
 
 export async function deleteWiki(id: string): Promise<void> {
-  await api.delete(`/agent/wiki/${encodeURIComponent(id)}`);
+  await api.delete(`/knowledge/${encodeURIComponent(id)}`);
 }
 
 // ── Wiki 文档 ──────────────────────────────────────────────────
 
+const toWikiDoc = (d: UnifiedDoc): import('../types').WikiDocument => ({
+  id: d.id,
+  wiki_id: d.source_id,
+  filename: d.filename,
+  file_type: d.file_type,
+  content_hash: d.content_hash,
+  status: (d.pages?.status ?? 'pending') as import('../types').WikiDocument['status'],
+  error: d.pages?.error ?? null,
+  created_at: d.created_at,
+  updated_at: d.updated_at,
+});
+
 export async function listWikiDocs(wikiId: string): Promise<import('../types').WikiDocsResponse> {
-  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/docs`);
-  return { documents: data.documents ?? [] };
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(wikiId)}/docs`);
+  return { documents: ((data.documents ?? []) as UnifiedDoc[]).map(toWikiDoc) };
 }
 
 export async function uploadWikiDoc(wikiId: string, file: File): Promise<import('../types').WikiDocument> {
   const formData = new FormData();
   formData.append('file', file);
-  const { data } = await api.post(`/agent/wiki/${encodeURIComponent(wikiId)}/docs`, formData);
-  return data;
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(wikiId)}/docs`, formData);
+  return toWikiDoc(data as UnifiedDoc);
 }
 
 export async function deleteWikiDoc(wikiId: string, docId: string): Promise<void> {
-  await api.delete(`/agent/wiki/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}`);
+  await api.delete(`/knowledge/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}`);
 }
 
 export async function reindexWikiDoc(wikiId: string, docId: string): Promise<{ status: string; id: string }> {
-  const { data } = await api.post(`/agent/wiki/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}/reindex`);
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}/reindex`);
   return data;
 }
 
@@ -893,12 +935,12 @@ export async function listWikiPages(
   if (params.locked !== undefined) clean.locked = params.locked ? 'true' : 'false';
   if (params.limit !== undefined) clean.limit = params.limit;
   if (params.offset !== undefined) clean.offset = params.offset;
-  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/pages`, { params: clean });
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(wikiId)}/pages`, { params: clean });
   return { pages: data.pages ?? [], total: data.total ?? 0 };
 }
 
 export async function getWikiPage(wikiId: string, ref: string): Promise<import('../types').WikiPage> {
-  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`);
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`);
   return data;
 }
 
@@ -907,12 +949,12 @@ export async function putWikiPage(
   ref: string,
   req: import('../types').PutWikiPageRequest,
 ): Promise<import('../types').WikiPage> {
-  const { data } = await api.put(`/agent/wiki/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`, req);
+  const { data } = await api.put(`/knowledge/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`, req);
   return data;
 }
 
 export async function deleteWikiPage(wikiId: string, ref: string): Promise<void> {
-  await api.delete(`/agent/wiki/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`);
+  await api.delete(`/knowledge/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`);
 }
 
 // ── Wiki 搜索 / 图谱 ───────────────────────────────────────────
@@ -922,17 +964,17 @@ export async function searchWiki(
   q: string,
   limit = 20,
 ): Promise<import('../types').WikiSearchResponse> {
-  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/search`, { params: { q, limit } });
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(wikiId)}/search`, { params: { q, limit } });
   return { hits: data.hits ?? [] };
 }
 
 export async function searchAllWikis(q: string, limit = 20): Promise<import('../types').WikiSearchResponse> {
-  const { data } = await api.get('/agent/wiki/search', { params: { q, limit } });
+  const { data } = await api.get('/knowledge/search', { params: { q, limit } });
   return { hits: data.hits ?? [] };
 }
 
 export async function getWikiGraph(wikiId: string): Promise<import('../types').WikiGraphData> {
-  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/graph`);
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(wikiId)}/graph`);
   return { nodes: data.nodes ?? [], edges: data.edges ?? [] };
 }
 

@@ -489,6 +489,7 @@ export interface KbQueryResult {
 export interface KbEvent {
   doc_id: string;
   kb_id: string;
+  kind: 'vector' | 'pages';
   status: KbDocStatus;
   chunk_count: number;
   error?: string | null;

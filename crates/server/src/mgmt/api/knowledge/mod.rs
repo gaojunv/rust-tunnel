@@ -1,22 +1,27 @@
-//! RAG 知识库管理 API（KB CRUD + docs + test-embedding + query + SSE 事件流）。
+//! 统一知识容器 API（双索引容器 + 文档 + 页面 + 检索 + SSE）。
 //!
-//! 路由挂在 `/api/llm/kb`，除 SSE 端点外均受 JWT 保护（SSE 的 token 走 query 参数，
-//! 参照 `/api/logs/stream`）。向量本体在 `qdrant-edge` shard，元数据与原文在 `SQLite`。
+//! 路由挂在 `/api/knowledge`，除 SSE 端点外均受 JWT 保护（SSE 的 token 走 query 参数，
+//! 参照 `/api/logs/stream`）。向量本体在 `qdrant-edge` shard，元数据、原文与页面在
+//! `SQLite`，两个索引（`vector` / `pages`）共享同一套容器与文档表。
 //!
-//! 子模块按 handler 聚类拆分：`kb`（知识库 CRUD）、`docs`（文档管理 + reindex）、
-//! `query_events`（test-embedding / query / SSE）、`dto`（请求体类型）。共享运行时
-//! 组件（`RagRuntime` / `rag_rt` / `llm_state`）与路由组装（`public_router` /
-//! `protected_router`）留在本模块。模块对外路径保持原 `crate::mgmt::api::rag::xxx`。
+//! - 旧 `rag`（`/api/llm/kb*`）与旧 `agent/wiki`（`/api/agent/wiki*`）已合并至此；
+//!   前端重定向由主会话另行处理，本模块只提供新路由。
+//! - `MULTIPART_BODY_LIMIT` 沿用旧 `rag` 的 `20MB + 64KB`，旧 Wiki 侧此前**没有**
+//!   `DefaultBodyLimit`（2MB 上传 bug 根源之一），统一后 pages 侧自动获得同样保护。
+//! - 运行时 `KnowledgeRuntime` 复用 `LlmState.rag_tx` 统一事件通道与 `WikiState.ingest_sem`
+//!   同一限流池（LLM 总并发 2，新建池等于翻倍）。
+//! - 子模块按 handler 聚类：`sources`（容器 CRUD）、`docs`（文档）、`pages`（页面/图谱/搜索）、
+//!   `query_events`（query / test-embedding / SSE）。
 
 mod docs;
-mod dto;
-mod kb;
+mod pages;
 mod query_events;
+mod sources;
 
-pub use docs::*;
-pub use dto::*;
-pub use kb::*;
-pub use query_events::*;
+pub use docs::{delete_doc, get_doc, list_docs, reindex_doc, upload_doc};
+pub use pages::{delete_page, get_graph, get_page, list_pages, put_page, search_all, search_knowledge};
+pub use query_events::{query_knowledge, sse_knowledge_events, test_embedding};
+pub use sources::{create_source, delete_source, get_source, list_sources, patch_source, update_source};
 
 use std::sync::Arc;
 
@@ -26,7 +31,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 use crate::db::Database;
 use crate::llm::crypto::LlmCipher;
@@ -36,52 +41,36 @@ use crate::llm::LlmState;
 use crate::mgmt::api::ApiState;
 
 /// multipart 请求体总长上限：取最大单文件上限（二进制 20MB）+ 开销。
-/// 字面量与 FileType::max_bytes 的二进制值保持一致（const 上下文无法调用
+/// 字面量与 `FileType::max_bytes` 的二进制值保持一致（const 上下文无法调用
 /// 非 const fn，故写字面量并注明对应关系）。
+/// 旧 Wiki 路由此前没有此层，2MB 以上文件会落入 axum 默认 2MB 限制；统一后
+/// pages 侧自动获得同样的 20MB 保护。
 pub(crate) const MULTIPART_BODY_LIMIT: usize = 20 * 1024 * 1024 + 64 * 1024;
 
-/// RAG 公开路由（SSE 事件流，`?token=` 认证）。仅 `rag` feature 启用时存在。
-/// 返回 `Router<ApiState>`（handler 均依赖 `ApiState`，与生产路由链类型一致）。
-pub fn public_router() -> Router<ApiState> {
-    axum::Router::new().route("/api/llm/kb/events", get(sse_kb_events))
-}
-
-/// RAG 受保护路由（需 JWT）。仅 `rag` feature 启用时存在。
-/// 返回 `Router<ApiState>`（handler 均依赖 `ApiState`，与生产路由链类型一致）。
-pub fn protected_router() -> Router<ApiState> {
-    axum::Router::new()
-        .route("/api/llm/kb", get(list_kbs).post(create_kb))
-        .route(
-            "/api/llm/kb/:id",
-            get(get_kb).put(update_kb).patch(patch_kb).delete(delete_kb),
-        )
-        .route("/api/llm/kb/:id/docs", get(list_docs).post(upload_doc))
-        .layer(DefaultBodyLimit::max(MULTIPART_BODY_LIMIT))
-        .route(
-            "/api/llm/kb/:id/docs/:doc_id",
-            get(get_doc).delete(delete_doc),
-        )
-        .route("/api/llm/kb/:id/docs/:doc_id/reindex", post(reindex_doc))
-        .route("/api/llm/kb/test-embedding", post(test_embedding))
-        .route("/api/llm/kb/:id/query", post(query_kb))
+/// 统一知识运行时（从 `LlmState` / `WikiState` 克隆，避免长持锁）。
+/// `pub(crate)`：`docs::reindex_source_doc` 等需此类型。
+pub(crate) struct KnowledgeRuntime {
+    pub(crate) db: Database,
+    pub(crate) store: VectorStore,
+    pub(crate) cipher: Option<LlmCipher>,
+    pub(crate) tx: broadcast::Sender<KbEvent>,
+    /// 完整 `LlmState`（pages 抽取器 `LlmPageExtractor::new(db, llm)` 需要）。
+    pub(crate) llm: LlmState,
+    /// pages 侧限流池：**复用** `WikiState.ingest_sem` 同一池（LLM 总并发 2），
+    /// 新建池等于把限额翻倍。
+    pub(crate) pages_sem: Arc<Semaphore>,
 }
 
 /// 取当前 LLM 运行时状态（未初始化时为 `None` → 请求失败）。
-async fn llm_state(state: &ApiState) -> Option<Arc<LlmState>> {
+pub(crate) async fn llm_state(state: &ApiState) -> Option<Arc<LlmState>> {
     state.server_state.llm_state.read().await.as_ref().cloned()
 }
 
-/// RAG handler 需要的运行时组件（从 `LlmState` 克隆，避免长持锁）。
-/// `pub(crate)`：`docs::reindex_kb_doc` 的签名对外暴露本类型。
-pub(crate) struct RagRuntime {
-    db: Database,
-    store: VectorStore,
-    cipher: Option<LlmCipher>,
-    tx: broadcast::Sender<KbEvent>,
-}
-
-/// 组装 RAG 运行时；LLM 网关未初始化 / 数据库缺失时返回可直出的错误。
-async fn rag_rt(state: &ApiState) -> Result<RagRuntime, (StatusCode, String)> {
+/// 组装统一知识运行时；LLM 未初始化 / 数据库缺失 / Wiki 未注入时返回可直出的错误。
+/// 错误形态沿用旧 `rag_rt`（503 / 500），`pages_sem` 复用 `wiki_runtime` 的同一池。
+pub(crate) async fn knowledge_rt(
+    state: &ApiState,
+) -> Result<KnowledgeRuntime, (StatusCode, String)> {
     let llm = llm_state(state).await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -92,12 +81,60 @@ async fn rag_rt(state: &ApiState) -> Result<RagRuntime, (StatusCode, String)> {
         .db
         .clone()
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no database".to_string()))?;
-    Ok(RagRuntime {
+    // 复用 Wiki 的 LLM 并发池（2），语义是「LLM 调用总并发 2」。
+    let wiki = crate::mgmt::api::agent::wiki_runtime(state)
+        .map_err(|(c, m)| (c, m))?;
+    Ok(KnowledgeRuntime {
         db,
         store: llm.rag_store.clone(),
         cipher: llm.cipher.clone(),
         tx: llm.rag_tx.clone(),
+        llm: (*llm).clone(),
+        pages_sem: wiki.ingest_sem.clone(),
     })
+}
+
+/// 公开路由（SSE 事件流，`?token=` 认证）。
+pub fn public_router() -> Router<ApiState> {
+    Router::new().route("/api/knowledge/events", get(sse_knowledge_events))
+}
+
+/// 受保护路由（需 JWT）。
+pub fn protected_router() -> Router<ApiState> {
+    // 仅 `/api/knowledge/:id/docs` 的 POST 需要放宽 body 限制（20MB + 开销），
+    // 其他路由保持 axum 默认 2MB。此处把该路由隔离到子 Router 再 merge，
+    // 避免把 20MB 放宽泄露到全量路由（旧 Wiki 无此层是 2MB bug 根源）。
+    let docs_router = Router::new()
+        .route("/api/knowledge/:id/docs", get(list_docs).post(upload_doc))
+        .layer(DefaultBodyLimit::max(MULTIPART_BODY_LIMIT));
+    Router::new()
+        .route("/api/knowledge", get(list_sources).post(create_source))
+        .route(
+            "/api/knowledge/:id",
+            get(get_source)
+                .put(update_source)
+                .patch(patch_source)
+                .delete(delete_source),
+        )
+        .route(
+            "/api/knowledge/:id/docs/:doc_id",
+            get(get_doc).delete(delete_doc),
+        )
+        .route(
+            "/api/knowledge/:id/docs/:doc_id/reindex",
+            post(reindex_doc),
+        )
+        .route("/api/knowledge/test-embedding", post(test_embedding))
+        .route("/api/knowledge/:id/query", post(query_knowledge))
+        .route("/api/knowledge/:id/pages", get(list_pages))
+        .route(
+            "/api/knowledge/:id/pages/*ref",
+            get(get_page).put(put_page).delete(delete_page),
+        )
+        .route("/api/knowledge/:id/graph", get(get_graph))
+        .route("/api/knowledge/:id/search", get(search_knowledge))
+        .route("/api/knowledge/search", get(search_all))
+        .merge(docs_router)
 }
 
 #[cfg(test)]
@@ -116,11 +153,11 @@ mod tests {
     use crate::control_plane::ServerState;
     use crate::db::Database;
 
-    /// 构造 ApiState：内存 DB + 指定 RAG 数据目录 + 固定测试主密钥（字段加密可用）。
-    /// `rag_dir` 的存活期必须覆盖返回的 state（`VectorStore` 的 `EdgeShard` Drop 会 flush）。
+    /// 构造 ApiState：内存 DB + 指定 RAG 数据目录 + 固定测试主密钥（字段加密可用），
+    /// 并注入 Wiki 运行时（`KnowledgeRuntime` 的 `pages_sem` 复用同一池）。
     async fn test_api_state(rag_dir: &std::path::Path) -> ApiState {
         let db = Database::new(":memory:").await.expect("in-memory db");
-        let server_state = ServerState::with_db(db);
+        let mut server_state = ServerState::with_db(db);
         server_state
             .init_llm_state(
                 server_state.db().cloned(),
@@ -131,6 +168,42 @@ mod tests {
                 )),
             )
             .await;
+        // 注入 Wiki 运行时（与生产 `bin/server.rs` 同路径：复用同一 DB/LLM，pages_sem=2）
+        {
+            let llm = server_state
+                .llm_state
+                .read()
+                .await
+                .as_ref()
+                .expect("llm state initialized")
+                .clone();
+            let db_clone = server_state.db().cloned().expect("db present");
+            let wiki = crate::agent::wiki::WikiState::new(db_clone, (*llm).clone());
+            let agent = server_state
+                .agent_state
+                .take()
+                .expect("agent state")
+                .with_wiki(wiki);
+            server_state.agent_state = Some(agent);
+        }
+        // 注入 Memory 运行时（wiki 测试中的 settings 依赖）
+        {
+            let llm = server_state
+                .llm_state
+                .read()
+                .await
+                .as_ref()
+                .expect("llm state initialized")
+                .clone();
+            let mem = crate::agent::memory::MemoryState::new(
+                server_state.db().cloned().expect("db present"),
+                llm.rag_store.clone(),
+                llm.cipher.clone(),
+                (*llm).clone(),
+            );
+            let agent = server_state.agent_state.take().expect("agent state").with_memory(mem);
+            server_state.agent_state = Some(agent);
+        }
         ApiState {
             server_state,
             auth_config: Arc::new(AuthConfig::new(None, None)),
@@ -138,39 +211,53 @@ mod tests {
         }
     }
 
-    /// 覆盖本模块全部路由的测试 `Router`（免 JWT，`auth_config` 关闭）。
-    /// 与生产 `run_api_server` 一致：SSE events 挂 public router，其余挂 protected，
-    /// 再 merge —— 静态段 `events` 与参数段 `:id` 的共存由此得到验证。
+    /// 覆盖本模块全部路由的测试 `Router`（免 JWT）。
     fn test_router(state: ApiState) -> Router {
-        let public = Router::new().route("/api/llm/kb/events", get(super::sse_kb_events));
+        let public = Router::new().route("/api/knowledge/events", get(super::sse_knowledge_events));
         let protected = Router::new()
-            .route("/api/llm/kb", get(super::list_kbs).post(super::create_kb))
+            .route("/api/knowledge", get(super::list_sources).post(super::create_source))
             .route(
-                "/api/llm/kb/:id",
-                get(super::get_kb)
-                    .put(super::update_kb)
-                    .patch(super::patch_kb)
-                    .delete(super::delete_kb),
+                "/api/knowledge/:id",
+                get(super::get_source)
+                    .put(super::update_source)
+                    .patch(super::patch_source)
+                    .delete(super::delete_source),
             )
             .route(
-                "/api/llm/kb/:id/docs",
+                "/api/knowledge/:id/docs",
                 get(super::list_docs).post(super::upload_doc),
             )
             .layer(DefaultBodyLimit::max(super::MULTIPART_BODY_LIMIT))
             .route(
-                "/api/llm/kb/:id/docs/:doc_id",
+                "/api/knowledge/:id/docs/:doc_id",
                 get(super::get_doc).delete(super::delete_doc),
             )
             .route(
-                "/api/llm/kb/:id/docs/:doc_id/reindex",
+                "/api/knowledge/:id/docs/:doc_id/reindex",
                 post(super::reindex_doc),
             )
-            .route("/api/llm/kb/test-embedding", post(super::test_embedding))
-            .route("/api/llm/kb/:id/query", post(super::query_kb));
+            .route("/api/knowledge/test-embedding", post(super::test_embedding))
+            .route("/api/knowledge/:id/query", post(super::query_knowledge))
+            .route("/api/knowledge/:id/pages", get(super::list_pages))
+            .route(
+                "/api/knowledge/:id/pages/*ref",
+                get(super::get_page).put(super::put_page).delete(super::delete_page),
+            )
+            .route("/api/knowledge/:id/graph", get(super::get_graph))
+            .route("/api/knowledge/:id/search", get(super::search_knowledge))
+            .route("/api/knowledge/search", get(super::search_all));
         public.merge(protected).with_state(state)
     }
 
-    /// oneshot 请求助手：返回 (status, json body)。
+    /// 仅用于 wiki SSE headers 测试的 Router（复用 knowledge 的 wiki 注入态）。
+    fn wiki_test_router(state: ApiState) -> Router {
+        super::protected_router()
+            .merge(super::public_router())
+            .merge(crate::mgmt::api::agent::memory::protected_router())
+            .merge(crate::mgmt::api::agent::memory::public_router())
+            .with_state(state)
+    }
+
     async fn call(app: &Router, req: Request<Body>) -> (HttpStatus, Value) {
         let resp = app.clone().oneshot(req).await.expect("router responds");
         let status = resp.status();
@@ -181,8 +268,6 @@ mod tests {
         (status, body)
     }
 
-    /// oneshot 请求助手：返回 (status, 原始响应文本)。错误响应多为纯文本，
-    /// 需要断言具体消息（如 "file too large"）时用这个。
     async fn call_raw(app: &Router, req: Request<Body>) -> (HttpStatus, String) {
         let resp = app.clone().oneshot(req).await.expect("router responds");
         let status = resp.status();
@@ -201,7 +286,6 @@ mod tests {
             .expect("build request")
     }
 
-    /// 组装 multipart 请求体（单文件字段）。
     fn multipart_body(boundary: &str, filename: &str, content: &str) -> String {
         format!(
             "--{boundary}\r\n\
@@ -212,7 +296,6 @@ mod tests {
         )
     }
 
-    /// 字节版 multipart 请求体（非 UTF-8 上传测试用）。
     fn multipart_body_bytes(boundary: &str, filename: &str, content: &[u8]) -> Vec<u8> {
         let mut v = format!(
             "--{boundary}\r\n\
@@ -225,7 +308,6 @@ mod tests {
         v
     }
 
-    /// 组装 multipart 上传请求（字节体，二进制 fixture 用）。
     fn multipart_upload_request(
         kb_id: &str,
         boundary: &str,
@@ -235,7 +317,7 @@ mod tests {
         let body = multipart_body_bytes(boundary, filename, content);
         Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -244,7 +326,6 @@ mod tests {
             .expect("build multipart request")
     }
 
-    /// 起一个返回固定维度向量的本地 embedding server，返回 `base_url`。
     async fn mock_embedding_server(dim: usize) -> String {
         use axum::extract::Json as J;
         use serde_json::Value as V;
@@ -274,14 +355,14 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// 创建知识库，返回 `kb_id`。
     async fn create_kb(app: &Router, base: &str) -> String {
         let req = json_request(
             Method::POST,
-            "/api/llm/kb".to_string(),
+            "/api/knowledge".to_string(),
             &json!({
                 "name": "测试知识库",
                 "description": "集成测试用",
+                "index_vector": true,
                 "emb_base_url": base,
                 "emb_api_key": "sk-test",
                 "emb_model": "test-model",
@@ -294,21 +375,26 @@ mod tests {
         body["id"].as_str().expect("kb id").to_string()
     }
 
-    /// 轮询 GET /docs/:id 直到 status=ready，返回 chunk_count（10s 上限）。
     async fn wait_doc_ready(app: &Router, kb_id: &str, doc_id: &str) -> i64 {
         for _ in 0..50 {
             let (status, body) = call(
                 app,
                 json_request(
                     Method::GET,
-                    format!("/api/llm/kb/{kb_id}/docs/{doc_id}"),
+                    format!("/api/knowledge/{kb_id}/docs/{doc_id}"),
                     &json!(null),
                 ),
             )
             .await;
             assert_eq!(status, HttpStatus::OK);
-            if body["status"] == json!("ready") {
-                return body["chunk_count"].as_i64().unwrap_or(0);
+            // 统一视图：vector 侧状态在 body["vector"]["status"]
+            let v_status = body.get("vector").and_then(|v| v.get("status")).and_then(|s| s.as_str()).unwrap_or("");
+            if v_status == "ready" {
+                return body
+                    .get("vector")
+                    .and_then(|v| v.get("chunk_count"))
+                    .and_then(|c| c.as_i64())
+                    .unwrap_or(0);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -324,13 +410,12 @@ mod tests {
 
         let req = json_request(
             Method::POST,
-            "/api/llm/kb/test-embedding".to_string(),
+            "/api/knowledge/test-embedding".to_string(),
             &json!({ "base_url": base, "api_key": "sk-test", "model": "test-model" }),
         );
         let (status, body) = call(&app, req).await;
         assert_eq!(status, HttpStatus::OK, "test-embedding: {body}");
         assert_eq!(body["dimension"].as_i64(), Some(8));
-        // latency_ms 为 u64 毫秒，仅需断言字段存在且为数字
         assert!(body["latency_ms"].is_u64());
     }
 
@@ -342,7 +427,7 @@ mod tests {
 
         let req = json_request(
             Method::POST,
-            "/api/llm/kb/test-embedding".to_string(),
+            "/api/knowledge/test-embedding".to_string(),
             &json!({ "base_url": "http://127.0.0.1:1", "api_key": "k", "model": "m" }),
         );
         let (status, _body) = call(&app, req).await;
@@ -356,7 +441,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_api_state(dir.path()).await;
 
-        // 订阅 SSE 端点同源事件通道（上传后应收到 processing → ready）
         let db = state.server_state.db().unwrap().clone();
         let tx = {
             let guard = state.server_state.llm_state.read().await;
@@ -365,11 +449,9 @@ mod tests {
         let mut rx = tx.subscribe();
         let app = test_router(state);
 
-        // POST /api/llm/kb → 201
         let kb_id = create_kb(&app, &base).await;
         assert!(!kb_id.is_empty());
 
-        // emb_api_key 落库已加密（固定测试主密钥 → 密文前缀）
         let stored = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert!(
             stored.emb_api_key.starts_with("enc:v1:"),
@@ -377,32 +459,29 @@ mod tests {
             stored.emb_api_key
         );
 
-        // GET /api/llm/kb → 列表含该 KB
         let (status, body) = call(
             &app,
-            json_request(Method::GET, "/api/llm/kb".to_string(), &json!(null)),
+            json_request(Method::GET, "/api/knowledge".to_string(), &json!(null)),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
-        let kbs = body["knowledge_bases"].as_array().unwrap();
+        let kbs = body["sources"].as_array().unwrap();
         assert!(kbs.iter().any(|k| k["id"] == json!(kb_id)));
 
-        // GET /api/llm/kb/:id → 200，密钥不回显
         let (status, body) = call(
             &app,
-            json_request(Method::GET, format!("/api/llm/kb/{kb_id}"), &json!(null)),
+            json_request(Method::GET, format!("/api/knowledge/{kb_id}"), &json!(null)),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
         assert_eq!(body["name"], json!("测试知识库"));
         assert_eq!(body["emb_api_key"], json!(""), "api key must not be echoed");
 
-        // PUT 更新参数（未携带 emb 字段 → emb 配置保持不变）
         let (status, body) = call(
             &app,
             json_request(
                 Method::PUT,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "name": "改名", "description": "d2", "top_k": 8, "chunk_size": 256, "chunk_overlap": 32, "score_threshold": 0.5 }),
             ),
         )
@@ -415,12 +494,11 @@ mod tests {
             "PUT 不带 emb 字段时配置不变"
         );
 
-        // PATCH 启停
         let (status, _body) = call(
             &app,
             json_request(
                 Method::PATCH,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "enabled": false }),
             ),
         )
@@ -431,14 +509,13 @@ mod tests {
             &app,
             json_request(
                 Method::PATCH,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "enabled": true }),
             ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
 
-        // POST /:id/docs（multipart .md）→ 201 doc pending
         let content =
             "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n"
                 .to_string();
@@ -446,7 +523,7 @@ mod tests {
         let upload_body = multipart_body(boundary, "guide.md", &content);
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -455,9 +532,7 @@ mod tests {
             .expect("build multipart request");
         let (status, body) = call(&app, req).await;
         assert_eq!(status, HttpStatus::CREATED, "upload doc: {body}");
-        // 立即返回的 doc 记录可能是 pending（摄入未开始）或 processing（后台任务很快）——
-        // 摄入 flip 到 processing 的竞态是合法行为，两种状态都接受。
-        let doc_status = body["status"].as_str().expect("doc status");
+        let doc_status = body["vector"]["status"].as_str().expect("doc status");
         assert!(
             doc_status == "pending" || doc_status == "processing",
             "doc status should be pending or processing, got {doc_status}"
@@ -469,7 +544,6 @@ mod tests {
             .starts_with("sha256:"));
         let doc_id = body["id"].as_str().expect("doc id").to_string();
 
-        // §2.1 原文落盘：<data_dir>/knowledge_docs/<kb_id>/<doc_id>.md（两索引共用）
         let source_path = dir
             .path()
             .join("knowledge_docs")
@@ -480,7 +554,6 @@ mod tests {
             "original doc file should be persisted on upload"
         );
 
-        // 等摄入事件与文档 ready
         let ev1 = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("first event timeout")
@@ -494,13 +567,13 @@ mod tests {
                 &app,
                 json_request(
                     Method::GET,
-                    format!("/api/llm/kb/{kb_id}/docs/{doc_id}"),
+                    format!("/api/knowledge/{kb_id}/docs/{doc_id}"),
                     &json!(null),
                 ),
             )
             .await;
             assert_eq!(status, HttpStatus::OK);
-            if body["status"] == json!("ready") {
+            if body["vector"]["status"] == json!("ready") {
                 doc_ready = true;
                 break;
             }
@@ -514,12 +587,11 @@ mod tests {
         assert_eq!(ev2.status, "ready");
         assert!(ev2.error.is_none());
 
-        // POST /:id/query {text} → 命中 chunk
         let (status, body) = call(
             &app,
             json_request(
                 Method::POST,
-                format!("/api/llm/kb/{kb_id}/query"),
+                format!("/api/knowledge/{kb_id}/query"),
                 &json!({ "text": "怎么安装?" }),
             ),
         )
@@ -529,12 +601,11 @@ mod tests {
         assert!(!chunks.is_empty(), "query should hit ingested chunks");
         assert!(chunks[0]["score"].as_f64().unwrap() >= 0.3);
 
-        // GET /:id/docs → 列表含该文档
         let (status, body) = call(
             &app,
             json_request(
                 Method::GET,
-                format!("/api/llm/kb/{kb_id}/docs"),
+                format!("/api/knowledge/{kb_id}/docs"),
                 &json!(null),
             ),
         )
@@ -542,12 +613,11 @@ mod tests {
         assert_eq!(status, HttpStatus::OK);
         assert_eq!(body["documents"].as_array().unwrap().len(), 1);
 
-        // DELETE /:id/docs/:doc_id → 200，随后 404
         let (status, _body) = call(
             &app,
             json_request(
                 Method::DELETE,
-                format!("/api/llm/kb/{kb_id}/docs/{doc_id}"),
+                format!("/api/knowledge/{kb_id}/docs/{doc_id}"),
                 &json!(null),
             ),
         )
@@ -557,7 +627,7 @@ mod tests {
             &app,
             json_request(
                 Method::GET,
-                format!("/api/llm/kb/{kb_id}/docs/{doc_id}"),
+                format!("/api/knowledge/{kb_id}/docs/{doc_id}"),
                 &json!(null),
             ),
         )
@@ -568,16 +638,15 @@ mod tests {
             "doc source file should be removed on delete"
         );
 
-        // DELETE /api/llm/kb/:id → 200，随后 404，store shard 目录删除
         let (status, _body) = call(
             &app,
-            json_request(Method::DELETE, format!("/api/llm/kb/{kb_id}"), &json!(null)),
+            json_request(Method::DELETE, format!("/api/knowledge/{kb_id}"), &json!(null)),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
         let (status, _body) = call(
             &app,
-            json_request(Method::GET, format!("/api/llm/kb/{kb_id}"), &json!(null)),
+            json_request(Method::GET, format!("/api/knowledge/{kb_id}"), &json!(null)),
         )
         .await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
@@ -600,11 +669,10 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // .exe → 400
         let boundary = "b-bad";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -614,13 +682,11 @@ mod tests {
         let (status, _body) = call(&app, req).await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
 
-        // >2MB → 400，且是自写的 "file too large" 消息（流式超限截断可达，
-        // 不依赖 DefaultBodyLimit 的通用错误）
         let big = "x".repeat(2 * 1024 * 1024 + 1);
         let boundary = "b-big";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -634,11 +700,10 @@ mod tests {
             "oversize should return custom message, got: {body_text}"
         );
 
-        // 无文件字段 → 400
         let boundary = "b-nofile";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -657,26 +722,23 @@ mod tests {
         let state = test_api_state(dir.path()).await;
         let app = test_router(state);
 
-        // name 为空 → 400
         let (status, _body) = call(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb".to_string(),
-                &json!({ "name": "", "emb_base_url": "http://x", "emb_model": "m", "emb_dimension": 8 }),
+                "/api/knowledge".to_string(),
+                &json!({ "name": "", "index_vector": true, "emb_base_url": "http://x", "emb_model": "m", "emb_dimension": 8 }),
             ),
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
 
-        // 部分提供 embedding（缺 dimension）→ 400（emb_* 现为可选，显式提供
-        // 任一即要求完整，见 resolve_kb_embedding）
         let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb".to_string(),
-                &json!({ "name": "n", "emb_base_url": "http://x", "emb_model": "m" }),
+                "/api/knowledge".to_string(),
+                &json!({ "name": "n", "index_vector": true, "emb_base_url": "http://x", "emb_model": "m" }),
             ),
         )
         .await;
@@ -686,13 +748,12 @@ mod tests {
             "缺 dimension 应提示 emb_dimension, got: {body_text}"
         );
 
-        // 完全不提供 embedding 且全局未配置 → 400，提示先配置共享 embedding
         let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb".to_string(),
-                &json!({ "name": "n" }),
+                "/api/knowledge".to_string(),
+                &json!({ "name": "n", "index_vector": true }),
             ),
         )
         .await;
@@ -702,23 +763,21 @@ mod tests {
             "缺 embedding 且全局未配置应 400, got: {body_text}"
         );
 
-        // chunk_overlap >= chunk_size → 400
         let (status, _body) = call(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb".to_string(),
-                &json!({ "name": "n", "emb_base_url": "http://x", "emb_model": "m", "emb_dimension": 8, "chunk_size": 128, "chunk_overlap": 200 }),
+                "/api/knowledge".to_string(),
+                &json!({ "name": "n", "index_vector": true, "emb_base_url": "http://x", "emb_model": "m", "emb_dimension": 8, "chunk_size": 128, "chunk_overlap": 200 }),
             ),
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
 
-        // 缺 KB → 404（docs 上传）
         let boundary = "b-404";
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/api/llm/kb/no-such-kb/docs")
+            .uri("/api/knowledge/no-such-kb/docs")
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -737,7 +796,6 @@ mod tests {
         let db = state.server_state.db().unwrap().clone();
         let app = test_router(state);
 
-        // 先配置全局共享 embedding（agent_memory_settings，明文 key 落库）
         let mut s = crate::db::memory::AgentMemorySettingsRecord::default_disabled();
         s.enabled = 1;
         s.emb_base_url = base.clone();
@@ -746,13 +804,12 @@ mod tests {
         s.emb_dimension = 8;
         db.memory_upsert_settings(&s).await.unwrap();
 
-        // POST 不带 emb_* → 201，embedding 回退全局
         let (status, body) = call(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb".to_string(),
-                &json!({ "name": "全局库", "top_k": 5 }),
+                "/api/knowledge".to_string(),
+                &json!({ "name": "全局库", "index_vector": true, "top_k": 5 }),
             ),
         )
         .await;
@@ -767,7 +824,6 @@ mod tests {
         assert_eq!(stored.emb_base_url, base);
         assert_eq!(stored.emb_model, "global-model");
         assert_eq!(stored.emb_dimension, 8);
-        // 全局 key 落库前已加密（固定测试主密钥 → 密文前缀）
         assert!(
             stored.emb_api_key.starts_with("enc:v1:"),
             "global api key should be encrypted, got: {}",
@@ -783,11 +839,10 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 非 UTF-8 字节序列（扩展名合法 .md）→ 400 "file must be UTF-8 text"
         let boundary = "b-utf8";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -814,7 +869,6 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 旧版 Office（.doc）→ 400，提示另存为 .docx
         let (status, body_text) = call_raw(
             &app,
             multipart_upload_request(&kb_id, "b-legacy", "legacy.doc", b"x"),
@@ -826,7 +880,6 @@ mod tests {
             "got: {body_text}"
         );
 
-        // 图片 → 400，提示 OCR 不可用
         let (status, body_text) = call_raw(
             &app,
             multipart_upload_request(&kb_id, "b-img", "photo.png", b"x"),
@@ -838,7 +891,6 @@ mod tests {
             "got: {body_text}"
         );
 
-        // .pdf 扩展名但内容不是 PDF → 400（probe 拦截，而非 ingest 期才失败）
         let (status, body_text) = call_raw(
             &app,
             multipart_upload_request(&kb_id, "b-pdf", "fake.pdf", b"not a pdf at all"),
@@ -847,7 +899,6 @@ mod tests {
         assert_eq!(status, HttpStatus::BAD_REQUEST);
         assert!(body_text.contains("not a PDF file"), "got: {body_text}");
 
-        // 无扩展名 → 400 通用消息
         let (status, body_text) = call_raw(
             &app,
             multipart_upload_request(&kb_id, "b-noext", "README", b"x"),
@@ -869,14 +920,13 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 上传 → 原文落盘
         let content =
             "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n"
                 .to_string();
         let boundary = "b-reindex";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -901,29 +951,26 @@ mod tests {
             "persisted source should match upload"
         );
 
-        // 首次摄入 → ready
         let first = wait_doc_ready(&app, &kb_id, &doc_id).await;
         assert!(first > 0);
         assert_eq!(db.rag_count_kb_chunks(&kb_id).await.unwrap(), first);
 
-        // reindex → 立即返回 pending/processing
         let (status, body) = call(
             &app,
             json_request(
                 Method::POST,
-                format!("/api/llm/kb/{kb_id}/docs/{doc_id}/reindex"),
+                format!("/api/knowledge/{kb_id}/docs/{doc_id}/reindex"),
                 &json!(null),
             ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK, "reindex: {body}");
-        let st = body["status"].as_str().unwrap_or("");
+        let st = body["vector"]["status"].as_str().unwrap_or("");
         assert!(
             st == "pending" || st == "processing",
             "reindex immediate status should be pending/processing, got {st}"
         );
 
-        // 重建完成 → ready，chunk 数一致；旧索引已清（无重复分块）
         let second = wait_doc_ready(&app, &kb_id, &doc_id).await;
         assert!(second > 0);
         assert_eq!(
@@ -936,12 +983,11 @@ mod tests {
             "old chunks must be removed before re-ingest"
         );
 
-        // 重建后可检索
         let (status, body) = call(
             &app,
             json_request(
                 Method::POST,
-                format!("/api/llm/kb/{kb_id}/query"),
+                format!("/api/knowledge/{kb_id}/query"),
                 &json!({ "text": "怎么安装?" }),
             ),
         )
@@ -960,12 +1006,12 @@ mod tests {
         let state = test_api_state(dir.path()).await;
         let app = test_router(state);
 
-        // 边界值 top_k=20 → 允许
         let req = json_request(
             Method::POST,
-            "/api/llm/kb".to_string(),
+            "/api/knowledge".to_string(),
             &json!({
                 "name": "边界库",
+                "index_vector": true,
                 "emb_base_url": base,
                 "emb_model": "m",
                 "emb_dimension": 8,
@@ -976,12 +1022,12 @@ mod tests {
         assert_eq!(status, HttpStatus::CREATED, "top_k=20 应允许: {body}");
         let kb_id = body["id"].as_str().expect("kb id").to_string();
 
-        // 超上限 top_k=21 → 400，消息为 "top_k must be 1-20"
         let req = json_request(
             Method::POST,
-            "/api/llm/kb".to_string(),
+            "/api/knowledge".to_string(),
             &json!({
                 "name": "超限库",
+                "index_vector": true,
                 "emb_base_url": base,
                 "emb_model": "m",
                 "emb_dimension": 8,
@@ -995,12 +1041,11 @@ mod tests {
             "错误消息应提示 1-20, got: {body_text}"
         );
 
-        // 更新路径同样受限于上限
         let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::PUT,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "name": "改名", "top_k": 21, "chunk_size": 512, "chunk_overlap": 64 }),
             ),
         )
@@ -1018,12 +1063,11 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 非布尔 → 400，且不得静默禁用 KB
         let (status, _body) = call(
             &app,
             json_request(
                 Method::PATCH,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "enabled": "yes" }),
             ),
         )
@@ -1042,10 +1086,9 @@ mod tests {
         let kb_id = create_kb(&app, &base).await;
         assert_eq!(db.ks_get(&kb_id).await.unwrap().unwrap().enabled, 1);
 
-        // 空体 {} → 400（不再静默禁用）
         let (status, _body) = call(
             &app,
-            json_request(Method::PATCH, format!("/api/llm/kb/{kb_id}"), &json!({})),
+            json_request(Method::PATCH, format!("/api/knowledge/{kb_id}"), &json!({})),
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
@@ -1055,12 +1098,11 @@ mod tests {
             "空 PATCH 不得把 KB 静默禁用"
         );
 
-        // 非布尔 → 400，状态不变
         let (status, _body) = call(
             &app,
             json_request(
                 Method::PATCH,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "enabled": 1 }),
             ),
         )
@@ -1078,14 +1120,12 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 软关 KB
         db.ks_set_enabled(&kb_id, false).await.unwrap();
 
-        // 上传 → 409 "knowledge base is disabled"（与 delete_kb 的软关配合）
         let boundary = "b-disabled";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -1098,7 +1138,6 @@ mod tests {
             body_text.contains("knowledge base is disabled"),
             "禁用 KB 上传应提示 disabled, got: {body_text}"
         );
-        // 未留下任何 doc 记录/原文文件
         assert!(db.kdoc_list(&kb_id).await.unwrap().is_empty());
         assert!(!dir.path().join("knowledge_docs").join(&kb_id).exists());
     }
@@ -1112,7 +1151,6 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 手工构造一个 status=processing 的 doc + 落盘原文（确定性，无时序竞态）
         let doc_id = uuid::Uuid::new_v4().to_string();
         db.kdoc_create(&doc_id, &kb_id, "busy.md", "md", "sha256:x")
             .await
@@ -1130,12 +1168,11 @@ mod tests {
             .unwrap();
         tokio::fs::write(&source_path, "# busy").await.unwrap();
 
-        // 在途 reindex → 409 "document is being processed, retry later"
         let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::POST,
-                format!("/api/llm/kb/{kb_id}/docs/{doc_id}/reindex"),
+                format!("/api/knowledge/{kb_id}/docs/{doc_id}/reindex"),
                 &json!(null),
             ),
         )
@@ -1145,7 +1182,6 @@ mod tests {
             body_text.contains("document is being processed, retry later"),
             "processing 中 reindex 应 409, got: {body_text}"
         );
-        // pending 同样拒绝
         db.kdoc_update_index_status(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector, "pending", 0, None)
             .await
             .unwrap();
@@ -1153,7 +1189,7 @@ mod tests {
             &app,
             json_request(
                 Method::POST,
-                format!("/api/llm/kb/{kb_id}/docs/{doc_id}/reindex"),
+                format!("/api/knowledge/{kb_id}/docs/{doc_id}/reindex"),
                 &json!(null),
             ),
         )
@@ -1161,14 +1197,13 @@ mod tests {
         assert_eq!(status, HttpStatus::CONFLICT);
     }
 
-    /// 上传一篇 guide.md 并等待 ready，返回 (doc_id, chunk_count)。
     async fn upload_guide_and_wait(app: &Router, kb_id: &str) -> (String, i64) {
         let content =
             "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n";
         let boundary = "b-emb";
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .uri(format!("/api/knowledge/{kb_id}/docs"))
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -1194,13 +1229,12 @@ mod tests {
         let (doc_id, first) = upload_guide_and_wait(&app, &kb_id).await;
         let before = db.ks_get(&kb_id).await.unwrap().unwrap();
 
-        // PUT 新 embedding（换 base_url 到 16 维 mock + 新 model + 新维度），api_key 留空
         let base16 = mock_embedding_server(16).await;
         let (status, body) = call(
             &app,
             json_request(
                 Method::PUT,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({
                     "name": "测试知识库",
                     "emb_base_url": base16,
@@ -1215,7 +1249,6 @@ mod tests {
         assert_eq!(body["reindexed"].as_i64(), Some(1), "应重建 1 篇文档");
         assert_eq!(body["missing_source"].as_i64(), Some(0));
 
-        // emb 已更新、密钥保留（留空 = 保持旧密文）、重建后恢复启用
         let after = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert_eq!(after.emb_base_url, base16);
         assert_eq!(after.emb_model, "new-model");
@@ -1226,16 +1259,14 @@ mod tests {
         );
         assert_eq!(after.enabled, 1, "重建完成后应恢复启用");
 
-        // 文档重建完成 → ready，chunk 数恢复（分块与维度无关）
         let second = wait_doc_ready(&app, &kb_id, &doc_id).await;
         assert_eq!(second, first, "重建后 chunk 数应一致");
 
-        // 新维度 shard 可检索
         let (status, body) = call(
             &app,
             json_request(
                 Method::POST,
-                format!("/api/llm/kb/{kb_id}/query"),
+                format!("/api/knowledge/{kb_id}/query"),
                 &json!({ "text": "怎么安装?" }),
             ),
         )
@@ -1258,12 +1289,11 @@ mod tests {
         let (doc_id, chunks) = upload_guide_and_wait(&app, &kb_id).await;
         let before = db.ks_get(&kb_id).await.unwrap().unwrap();
 
-        // 仅换 api_key → 只替换密文，不触发重建（无 reindexed 字段）
         let (status, body) = call(
             &app,
             json_request(
                 Method::PUT,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "name": "测试知识库", "emb_api_key": "sk-rotated" }),
             ),
         )
@@ -1280,7 +1310,6 @@ mod tests {
         assert_eq!(after.emb_model, before.emb_model);
         assert_eq!(after.emb_dimension, before.emb_dimension);
 
-        // 文档保持 ready、分块未被清
         let idx = db
             .kdoc_get_index(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector)
             .await
@@ -1298,12 +1327,11 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // 显式空 base_url → 400（显式空串只可能是误清空，好过静默保留）
         let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::PUT,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "name": "n", "emb_base_url": "" }),
             ),
         )
@@ -1311,12 +1339,11 @@ mod tests {
         assert_eq!(status, HttpStatus::BAD_REQUEST);
         assert!(body_text.contains("emb_base_url"), "got: {body_text}");
 
-        // dimension < 1 → 400
         let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::PUT,
-                format!("/api/llm/kb/{kb_id}"),
+                format!("/api/knowledge/{kb_id}"),
                 &json!({ "name": "n", "emb_dimension": 0 }),
             ),
         )
@@ -1333,12 +1360,11 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
 
-        // api_key 留空 + kb_id → 用 KB 已存密钥探测（编辑态拿不到旧密钥的场景）
         let (status, body) = call(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb/test-embedding".to_string(),
+                "/api/knowledge/test-embedding".to_string(),
                 &json!({ "base_url": base, "api_key": "", "model": "test-model", "kb_id": kb_id }),
             ),
         )
@@ -1346,16 +1372,192 @@ mod tests {
         assert_eq!(status, HttpStatus::OK, "test with kb_id: {body}");
         assert_eq!(body["dimension"].as_i64(), Some(8));
 
-        // 未知 kb_id → 404
         let (status, _body) = call(
             &app,
             json_request(
                 Method::POST,
-                "/api/llm/kb/test-embedding".to_string(),
+                "/api/knowledge/test-embedding".to_string(),
                 &json!({ "base_url": base, "api_key": "", "model": "m", "kb_id": "no-such-kb" }),
             ),
         )
         .await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
+    }
+
+    // ── Wiki 迁移测试（原 agent/wiki.rs） ──────────────────────────
+
+    #[tokio::test]
+    async fn wiki_container_crud_and_manual_page_and_search_and_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = wiki_test_router(test_api_state(dir.path()).await);
+
+        let (status, body) = call(
+            &app,
+            json_request(Method::POST, "/api/knowledge".to_string(), &json!({"name": "my-wiki","summary":"desc","scope_type":"workspace","client_id":"c1","workspace_id":"w1","index_pages": true})),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::CREATED, "create wiki: {body}");
+        let wiki_id = body["id"].as_str().unwrap().to_string();
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::GET,
+                "/api/knowledge?scope=workspace&workspace_id=w1&index_kind=pages".to_string(),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        // 统一 list 键名为 sources
+        assert_eq!(body["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(body["total"], json!(1));
+
+        let (status, _) = call(
+            &app,
+            json_request(
+                Method::GET,
+                format!("/api/knowledge/{wiki_id}"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/knowledge/{wiki_id}/pages/deploy/prod"),
+                &json!({"title":"部署","summary":"摘要","content":"内容 [[other/page]]"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "put page: {body}");
+        assert_eq!(body["ref"], json!("deploy/prod"));
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::GET,
+                format!("/api/knowledge/{wiki_id}/pages/deploy/prod"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["content"], json!("内容 [[other/page]]"));
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::GET,
+                format!("/api/knowledge/{wiki_id}/pages"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["pages"].as_array().unwrap().len(), 1);
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::GET,
+                format!("/api/knowledge/{wiki_id}/graph"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/knowledge/{wiki_id}/search?q=部署"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::OK, "search: {body}");
+        assert!(body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["ref"] == json!("deploy/prod")));
+
+        let (status, _) = call(
+            &app,
+            json_request(
+                Method::DELETE,
+                format!("/api/knowledge/{wiki_id}/pages/deploy/prod"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::GET,
+                "/api/agent/memory/settings".to_string(),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["wiki_enabled"], json!(true));
+        assert_eq!(body["wiki_list_max"], json!(20));
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/agent/memory/settings".to_string(),
+                &json!({"wiki_enabled": false, "wiki_list_max": 8}),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "put settings: {body}");
+        assert_eq!(body["wiki_enabled"], json!(false));
+        assert_eq!(body["wiki_list_max"], json!(8));
+
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/agent/memory/settings".to_string(),
+                &json!({"top_k": 16}),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(
+            body["wiki_enabled"],
+            json!(false),
+            "wiki_enabled 不应被重置"
+        );
+        assert_eq!(body["wiki_list_max"], json!(8), "wiki_list_max 不应被重置");
+    }
+
+    #[tokio::test]
+    async fn wiki_sse_events_stream_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = wiki_test_router(test_api_state(dir.path()).await);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/knowledge/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
     }
 }

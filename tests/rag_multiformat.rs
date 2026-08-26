@@ -18,7 +18,7 @@
 //! 的流式超限检查（400 "file too large"，即设计文档「超限 400」的语义）。
 
 // qdrant-edge 门控为可选 `rag` feature（默认关闭），默认 feature 下
-// /api/llm/kb* 路由不存在，本测试仅在 `rag` feature 下编译运行。
+// /api/knowledge* 路由不存在，本测试仅在 `rag` feature 下编译运行。
 #![cfg(feature = "rag")]
 
 #[path = "common/mod.rs"]
@@ -115,7 +115,7 @@ async fn upload_file(
     let boundary = format!("rt-boundary-{}", uuid::Uuid::new_v4());
     let body = multipart_body_bytes(&boundary, filename, content);
     let resp = reqwest::Client::new()
-        .post(format!("{api_base}/api/llm/kb/{kb_id}/docs"))
+        .post(format!("{api_base}/api/knowledge/{kb_id}/docs"))
         .header(
             reqwest::header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -133,10 +133,11 @@ async fn upload_file(
 async fn create_kb(api: &ApiClient, emb_base: &str) -> String {
     let (status, body) = api
         .post_json(
-            "/api/llm/kb",
+            "/api/knowledge",
             json!({
                 "name": "多格式摄入测试库",
                 "description": "integration test",
+                "index_vector": true,
                 "emb_base_url": emb_base,
                 "emb_api_key": "sk-test",
                 "emb_model": "test-model",
@@ -167,7 +168,7 @@ async fn docx_upload_reaches_ready() {
         let parsed: Value = serde_json::from_str(&body)
             .unwrap_or_else(|_| panic!("upload must return doc JSON, got: {body}"));
         let doc_id = parsed["id"].as_str().expect("doc id").to_string();
-        let st = parsed["status"].as_str().unwrap_or("");
+        let st = parsed.get("vector").and_then(|v| v.get("status")).and_then(|s| s.as_str()).unwrap_or("");
         assert!(
             st == "pending" || st == "processing",
             "initial doc status should be pending/processing, got {st}"
@@ -182,16 +183,17 @@ async fn docx_upload_reaches_ready() {
             let doc_id = doc_id.clone();
             async move {
                 let (code, body) = api
-                    .get_json(&format!("/api/llm/kb/{kb_id}/docs/{doc_id}"))
+                    .get_json(&format!("/api/knowledge/{kb_id}/docs/{doc_id}"))
                     .await;
                 if !code.is_success() {
                     return None;
                 }
-                let status = body["status"].as_str().unwrap_or("");
+                let v = body.get("vector");
+                let status = v.and_then(|x| x.get("status")).and_then(|s| s.as_str()).unwrap_or("");
                 if status == "ready" || status == "failed" {
                     Some((
                         status.to_string(),
-                        body["chunk_count"].as_i64().unwrap_or(0),
+                        v.and_then(|x| x.get("chunk_count")).and_then(|c| c.as_i64()).unwrap_or(0),
                     ))
                 } else {
                     None
@@ -206,7 +208,7 @@ async fn docx_upload_reaches_ready() {
 
         // 清理：删 KB 以释放向量 shard（EdgeShard Drop 会同步 flush；先删可避免
         // harness 析构时 tempdir 已被移除而 flush 失败触发任务级 panic）。
-        let del_status = api.delete_status(&format!("/api/llm/kb/{kb_id}")).await;
+        let del_status = api.delete_status(&format!("/api/knowledge/{kb_id}")).await;
         assert_eq!(del_status, StatusCode::OK, "delete kb cleanup");
     })
     .await;

@@ -36,9 +36,9 @@ pub mod logs;
 pub mod mesh;
 /// 用户偏好路由。
 pub mod preferences;
-/// RAG 知识库路由（仅 rag feature）。
+/// 统一知识容器路由（双索引容器 + 文档 + 页面 + 检索 + SSE，仅 rag feature）。
 #[cfg(feature = "rag")]
-pub mod rag;
+pub mod knowledge;
 /// 反向代理规则与配置路由。
 pub mod reverse_proxy;
 /// 服务端接入 Token 管理路由。
@@ -568,16 +568,13 @@ pub async fn run_api_server(
     // 路由，之后 merge 进来的路由不会被包裹（否则 /api/llm/kb* 会失去 JWT 保护）。
     #[cfg(feature = "rag")]
     {
-        public_routes = public_routes.merge(rag::public_router());
-        protected_routes = protected_routes.merge(rag::protected_router());
+        public_routes = public_routes.merge(knowledge::public_router());
+        protected_routes = protected_routes.merge(knowledge::protected_router());
         // AI 记忆体管理路由（settings / memories CRUD / clear / 手动蒸馏 / SSE）
         protected_routes = protected_routes.merge(agent::memory::protected_router());
         public_routes = public_routes.merge(agent::memory::public_router());
         // Skill 库管理路由（skills CRUD + toggle）
         protected_routes = protected_routes.merge(agent::skills::protected_router());
-        // Wiki 容器/文档/页面/搜索/图谱/SSE 路由
-        protected_routes = protected_routes.merge(agent::wiki::protected_router());
-        public_routes = public_routes.merge(agent::wiki::public_router());
     }
 
     // Only apply auth middleware if password is set

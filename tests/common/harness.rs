@@ -165,8 +165,12 @@ impl TestHarness {
                     llm.cipher.clone(),
                     (*llm).clone(),
                 );
+                let wiki = rust_tunnel_server::agent::wiki::WikiState::new(
+                    state.db().cloned().expect("db present"),
+                    (*llm).clone(),
+                );
                 if let Some(agent) = state.agent_state.take() {
-                    state.agent_state = Some(agent.with_memory(memory));
+                    state.agent_state = Some(agent.with_memory(memory).with_wiki(wiki));
                 }
             }
         }

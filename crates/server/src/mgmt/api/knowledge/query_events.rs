@@ -1,4 +1,5 @@
-//! RAG query / test-embedding / SSE 事件流 handlers。
+//! 检索 / test-embedding / SSE 事件流（从旧 `rag/query_events.rs` 搬运，仅改挂载路径与 SSE 透传）。
+
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -10,6 +11,7 @@ use axum::{
     },
     Json,
 };
+use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::auth::validate_token;
@@ -18,20 +20,27 @@ use crate::llm::rag::retriever;
 use crate::mgmt::api::dto::SseQuery;
 use crate::mgmt::api::ApiState;
 
-use super::dto::{QueryKbRequest, TestEmbeddingRequest};
-use super::{llm_state, rag_rt};
+use super::{knowledge_rt, llm_state};
 
-/// SSE 订阅等待与保活间隔：30s，超时发 ping 保活。
 const SSE_TIMEOUT: Duration = Duration::from_secs(30);
-/// SSE KeepAlive 间隔：30s，与订阅超时对齐。
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Deserialize)]
+pub struct TestEmbeddingRequest {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub kb_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryKnowledgeRequest {
+    pub text: String,
+}
+
 /// 探测 embedding 服务：向 `POST {base_url}/embeddings` 发一条探针文本，返回维度与耗时。
-/// 前端据此填写 KB 的 `emb_dimension`。
-///
-/// `kb_id` 可选（编辑 KB 场景）：提供时若请求 `api_key` 为空，则用该 KB 已存的密钥
-/// （后端不回显密钥，前端编辑态拿不到旧值，留空测试必须能复用已存密钥）；
-/// 请求带新密钥则以请求为准。`base_url`/`model` 始终以请求体为准（测的就是新值）。
 pub async fn test_embedding(
     State(state): State<ApiState>,
     Json(body): Json<TestEmbeddingRequest>,
@@ -44,18 +53,17 @@ pub async fn test_embedding(
     }
     let mut api_key = body.api_key.clone();
     if let Some(kb_id) = body.kb_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        let rt = match rag_rt(&state).await {
+        let rt = match knowledge_rt(&state).await {
             Ok(rt) => rt,
             Err(e) => return e.into_response(),
         };
         let Some(kb) = (match rt.db.ks_get(kb_id).await {
             Ok(r) => r,
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
-                    .into_response()
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
             }
         }) else {
-            return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
+            return (StatusCode::NOT_FOUND, "knowledge source not found").into_response();
         };
         if api_key.trim().is_empty() {
             api_key = crate::llm::crypto::decrypt_field(rt.cipher.as_ref(), &kb.emb_api_key)
@@ -67,33 +75,32 @@ pub async fn test_embedding(
     match embedder.embed_one("dimension probe").await {
         Ok(v) => {
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-            Json(serde_json::json!({ "dimension": v.len(), "latency_ms": latency_ms }))
-                .into_response()
+            Json(serde_json::json!({ "dimension": v.len(), "latency_ms": latency_ms })).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("embedding failed: {e}")).into_response(),
     }
 }
 
 /// 检索知识库：embedding 查询向量 → top-K → 阈值过滤，返回命中 chunk 及分数。
-pub async fn query_kb(
+pub async fn query_knowledge(
     State(state): State<ApiState>,
-    Path(kb_id): Path<String>,
-    Json(body): Json<QueryKbRequest>,
+    Path(source_id): Path<String>,
+    Json(body): Json<QueryKnowledgeRequest>,
 ) -> impl IntoResponse {
-    let rt = match rag_rt(&state).await {
+    let rt = match knowledge_rt(&state).await {
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
     if body.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "text is required").into_response();
     }
-    let Some(kb) = (match rt.db.ks_get(&kb_id).await {
+    let Some(kb) = (match rt.db.ks_get(&source_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     }) else {
-        return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
+        return (StatusCode::NOT_FOUND, "knowledge source not found").into_response();
     };
     let chunks = retriever::retrieve(&rt.db, &rt.store, rt.cipher.as_ref(), &kb, &body.text).await;
     let chunks: Vec<serde_json::Value> = chunks
@@ -109,24 +116,9 @@ pub async fn query_kb(
     Json(serde_json::json!({ "chunks": chunks })).into_response()
 }
 
-/// 把统一的 `KbEvent` 映射回 KB SSE 的既有形态。
-///
-/// 统一流水线的事件多了 `kind` 字段，这里显式挑字段而非直接 serialize：前端的
-/// 契约是 `{doc_id, kb_id, status, chunk_count, error}`，多发字段虽无害，但把
-/// 转形写明能让批 5 统一前端时一眼看出该收敛什么。
-fn kb_event_json(ev: &crate::llm::rag::ingest::KbEvent) -> serde_json::Value {
-    serde_json::json!({
-        "doc_id": ev.doc_id,
-        "kb_id": ev.kb_id,
-        "status": ev.status,
-        "chunk_count": ev.chunk_count,
-        "error": ev.error,
-    })
-}
-
-/// GET /api/llm/kb/events — SSE 事件流（文档摄入状态）。token 走 query 参数认证
-/// （public 路由，参照 `/api/logs/stream`），keep-alive 30s。
-pub async fn sse_kb_events(
+/// GET /api/knowledge/events — SSE 事件流（文档摄入状态，含 `kind` 字段透传 `KbEvent`）。
+/// token 走 query 参数认证（public 路由），keep-alive 30s，事件名 `knowledge`。
+pub async fn sse_knowledge_events(
     State(state): State<ApiState>,
     Query(params): Query<SseQuery>,
 ) -> impl IntoResponse {
@@ -151,13 +143,9 @@ pub async fn sse_kb_events(
         loop {
             match tokio::time::timeout(SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(ev)) => {
-                    // 统一 channel 承载两个索引的事件；本端点只关心向量索引。
-                    if ev.kind != crate::db::knowledge::IndexKind::Vector {
-                        continue;
-                    }
-                    let json = serde_json::to_string(&kb_event_json(&ev)).unwrap_or_default();
+                    let json = serde_json::to_string(&ev).unwrap_or_default();
                     yield Ok::<_, std::convert::Infallible>(
-                        Event::default().event("kb").data(json),
+                        Event::default().event("knowledge").data(json),
                     );
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
@@ -167,7 +155,6 @@ pub async fn sse_kb_events(
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
                 Err(_) => {
-                    // 超时 → ping 保活
                     yield Ok::<_, std::convert::Infallible>(
                         Event::default().event("ping").data(""),
                     );

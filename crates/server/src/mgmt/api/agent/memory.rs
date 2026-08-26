@@ -833,7 +833,7 @@ pub fn protected_router() -> Router<ApiState> {
         )
         .route(
             "/api/agent/memory/settings/test-embedding",
-            post(crate::mgmt::api::rag::test_embedding),
+            post(crate::mgmt::api::knowledge::test_embedding),
         )
         .route("/api/agent/memory/clear", post(clear_memory))
         .route(
@@ -925,7 +925,7 @@ mod tests {
             )
             .route(
                 "/api/agent/memory/settings/test-embedding",
-                post(crate::mgmt::api::rag::test_embedding),
+                post(crate::mgmt::api::knowledge::test_embedding),
             )
             .route("/api/agent/memory/clear", post(super::clear_memory))
             .route(

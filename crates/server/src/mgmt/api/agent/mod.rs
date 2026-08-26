@@ -12,8 +12,6 @@ pub mod roles;
 mod sessions;
 #[cfg(feature = "rag")]
 pub mod skills;
-#[cfg(feature = "rag")]
-pub mod wiki;
 mod workspaces;
 mod ws;
 
@@ -70,4 +68,27 @@ pub(crate) fn mem_runtime(
         ));
     };
     Ok(mem.clone())
+}
+
+/// 从 `ApiState` 取 Wiki 运行时；未注入（非 rag 构建 / 未初始化）→ 503。
+/// 与 `mem_runtime` 同模式，对齐 `MemoryState` 的挂载形态。
+/// 原定义在 `agent/wiki.rs`，批 3 合并后挪至此处供 `knowledge` 复用同一限流池
+/// （`pages_sem` 复用 `WikiState.ingest_sem`，新建池会把 LLM 总并发 2 翻倍）。
+#[cfg(feature = "rag")]
+pub(crate) fn wiki_runtime(
+    state: &crate::mgmt::api::ApiState,
+) -> Result<crate::agent::wiki::WikiState, (axum::http::StatusCode, String)> {
+    let Some(agent) = &state.server_state.agent_state else {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent workbench not initialized".into(),
+        ));
+    };
+    let Some(wiki) = &agent.wiki else {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "wiki runtime not initialized".into(),
+        ));
+    };
+    Ok(wiki.clone())
 }

@@ -71,25 +71,33 @@ describe('wikiStream', () => {
 
     expect(MockEventSource.instances).toHaveLength(1);
     expect(MockEventSource.instances[0].url).toBe(
-      '/api/agent/wiki/events?token=tok-1',
+      '/api/knowledge/events?token=tok-1',
     );
 
-    const ev: WikiEvent = {
+    // 统一 SSE 发 KbEvent（含 kind），stream 过滤 pages 映射回旧 WikiEvent 形状
+    const ev = {
+      doc_id: 'd1',
+      kb_id: 'w1',
+      kind: 'pages' as const,
+      status: 'processing',
+      chunk_count: 0,
+      error: null,
+    };
+    MockEventSource.instances[0].dispatch('knowledge', JSON.stringify(ev));
+    expect(onWiki).toHaveBeenCalledWith({
       wiki_id: 'w1',
       doc_id: 'd1',
       status: 'processing',
       page_count: 0,
       error: null,
-    };
-    MockEventSource.instances[0].dispatch('wiki', JSON.stringify(ev));
-    expect(onWiki).toHaveBeenCalledWith(ev);
+    });
 
     // sync(lagged) 通知回调
     MockEventSource.instances[0].dispatch('sync', JSON.stringify({ lagged: 4 }));
     expect(onSync).toHaveBeenCalledWith(4);
 
     // 解析失败的事件被忽略，不崩溃
-    MockEventSource.instances[0].dispatch('wiki', '{bad json');
+    MockEventSource.instances[0].dispatch('knowledge', '{bad json');
     expect(onWiki).toHaveBeenCalledTimes(1);
 
     unsub();
