@@ -34,12 +34,15 @@ import type {
   LlmUsageAggregateRow,
   LlmUsageLogsResponse,
   UsageGroupBy,
-  LlmKnowledgeBase,
-  LlmKbDocument,
   KbQueryResult,
-  CreateLlmKbRequest,
-  UpdateLlmKbRequest,
   TestEmbeddingResult,
+  KnowledgeSource,
+  KnowledgeSourcesResponse,
+  KnowledgeSourceListParams,
+  KnowledgeDoc,
+  KnowledgeIndexKind,
+  CreateKnowledgeSourceRequest,
+  UpdateKnowledgeSourceRequest,
   LlmModelGroup,
   LlmModelGroupDetail,
   AgentWorkspace,
@@ -456,99 +459,103 @@ export async function getLlmUsageLogs(
   return { logs: data.logs, total: data.total };
 }
 
-// ── RAG Knowledge Base ──────────────────────────────────────────
+// ── Knowledge Source（统一知识容器：向量索引 + 页面索引） ──────────
 //
-// 后端已统一为 /api/knowledge（KB 向量索引与 Wiki 页面索引同容器双索引）。
-// 本节与下方 Wiki 段共用该端点：本节固定 index_kind=vector / index_vector=true，
-// Wiki 段固定 pages——旧调用方语义不变，批 5 前端整合时再收敛为一套。
+// 后端 `/api/knowledge` 一套端点承载两种索引：`index_vector` 走 RAG 向量检索，
+// `index_pages` 走 LLM 抽取的 Wiki 页面。文档原文与 embedding 配置两侧共用，
+// per-kind 状态挂在文档的 `vector`/`pages` 子对象上（未启用为 null）。
 
-/** 统一文档视图：per-kind 状态挂在 vector/pages 子对象上（未启用为 null）。 */
-interface UnifiedDoc {
-  id: string;
-  source_id: string;
-  filename: string;
-  file_type: string;
-  content_hash: string;
-  created_at: string;
-  updated_at: string;
-  vector: { status: string; chunk_count: number; error?: string | null } | null;
-  pages: { status: string; page_count: number; error?: string | null } | null;
+export async function listKnowledgeSources(
+  params: KnowledgeSourceListParams = {},
+): Promise<KnowledgeSourcesResponse> {
+  const clean: Record<string, string | number> = {};
+  if (params.index_kind) clean.index_kind = params.index_kind;
+  if (params.scope) clean.scope = params.scope;
+  if (params.client_id) clean.client_id = params.client_id;
+  if (params.workspace_id) clean.workspace_id = params.workspace_id;
+  if (params.q) clean.q = params.q;
+  if (params.status) clean.status = params.status;
+  if (params.limit !== undefined) clean.limit = params.limit;
+  if (params.offset !== undefined) clean.offset = params.offset;
+  const { data } = await api.get('/knowledge', { params: clean });
+  return { sources: data.sources ?? [], total: data.total ?? 0 };
 }
 
-const toKbDoc = (d: UnifiedDoc): LlmKbDocument => ({
-  id: d.id,
-  kb_id: d.source_id,
-  filename: d.filename,
-  file_type: d.file_type,
-  content_hash: d.content_hash,
-  status: (d.vector?.status ?? 'pending') as LlmKbDocument['status'],
-  chunk_count: d.vector?.chunk_count ?? 0,
-  error: d.vector?.error ?? null,
-  created_at: d.created_at,
-  updated_at: d.updated_at,
-});
-
-export async function listLlmKbs(): Promise<LlmKnowledgeBase[]> {
-  const { data } = await api.get('/knowledge', { params: { index_kind: 'vector' } });
-  return data.sources;
-}
-
-export async function getLlmKb(id: string): Promise<LlmKnowledgeBase> {
+export async function getKnowledgeSource(id: string): Promise<KnowledgeSource> {
   const { data } = await api.get(`/knowledge/${encodeURIComponent(id)}`);
   return data;
 }
 
-export async function createLlmKb(req: CreateLlmKbRequest): Promise<{ id: string }> {
-  const { data } = await api.post('/knowledge', { ...req, index_vector: true });
+export async function createKnowledgeSource(
+  req: CreateKnowledgeSourceRequest,
+): Promise<KnowledgeSource> {
+  const { data } = await api.post('/knowledge', req);
   return data;
 }
 
-export async function updateLlmKb(id: string, req: UpdateLlmKbRequest): Promise<void> {
+/** 全量更新（缺省字段=保持不变）。索引开关与 emb 三元变化的重建语义由后端裁决。 */
+export async function updateKnowledgeSource(
+  id: string,
+  req: UpdateKnowledgeSourceRequest,
+): Promise<void> {
   await api.put(`/knowledge/${encodeURIComponent(id)}`, req);
 }
 
-export async function toggleLlmKb(id: string, enabled: boolean): Promise<void> {
+/** 总闸开关（PATCH 只认 `enabled`，其余字段走 PUT）。 */
+export async function toggleKnowledgeSource(id: string, enabled: boolean): Promise<void> {
   await api.patch(`/knowledge/${encodeURIComponent(id)}`, { enabled });
 }
 
-export async function deleteLlmKb(id: string): Promise<void> {
+export async function deleteKnowledgeSource(id: string): Promise<void> {
   await api.delete(`/knowledge/${encodeURIComponent(id)}`);
 }
 
-export async function listLlmKbDocs(kbId: string): Promise<LlmKbDocument[]> {
-  const { data } = await api.get(`/knowledge/${encodeURIComponent(kbId)}/docs`);
-  return (data.documents as UnifiedDoc[]).map(toKbDoc);
+// ── Knowledge 文档（两索引共用原文） ────────────────────────────
+
+export async function listKnowledgeDocs(sourceId: string): Promise<KnowledgeDoc[]> {
+  const { data } = await api.get(`/knowledge/${encodeURIComponent(sourceId)}/docs`);
+  return data.documents ?? [];
 }
 
-export async function uploadKbDoc(kbId: string, file: File): Promise<LlmKbDocument> {
+export async function uploadKnowledgeDoc(sourceId: string, file: File): Promise<KnowledgeDoc> {
   const formData = new FormData();
   formData.append('file', file);
-  const { data } = await api.post(`/knowledge/${encodeURIComponent(kbId)}/docs`, formData);
-  return toKbDoc(data as UnifiedDoc);
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(sourceId)}/docs`, formData);
+  return data;
 }
 
-export async function deleteKbDoc(kbId: string, docId: string): Promise<void> {
-  await api.delete(`/knowledge/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}`);
+export async function deleteKnowledgeDoc(sourceId: string, docId: string): Promise<void> {
+  await api.delete(`/knowledge/${encodeURIComponent(sourceId)}/docs/${encodeURIComponent(docId)}`);
 }
 
-export async function reindexKbDoc(kbId: string, docId: string): Promise<LlmKbDocument> {
-  const { data } = await api.post(`/knowledge/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}/reindex`);
-  return toKbDoc(data as UnifiedDoc);
+/** `kind` 缺省=重建容器启用的所有索引侧；指定则只重建那一侧。 */
+export async function reindexKnowledgeDoc(
+  sourceId: string,
+  docId: string,
+  kind?: KnowledgeIndexKind,
+): Promise<KnowledgeDoc> {
+  const { data } = await api.post(
+    `/knowledge/${encodeURIComponent(sourceId)}/docs/${encodeURIComponent(docId)}/reindex`,
+    null,
+    { params: kind ? { kind } : undefined },
+  );
+  return data;
 }
 
 export async function testEmbedding(req: {
   base_url: string;
   api_key: string;
   model: string;
-  /** 编辑已有 KB 时传入：api_key 留空则用该 KB 已存密钥测试。 */
+  /** 编辑已有容器时传入：api_key 留空则用该容器已存密钥测试。 */
   kb_id?: string;
 }): Promise<TestEmbeddingResult> {
   const { data } = await api.post('/knowledge/test-embedding', req);
   return data;
 }
 
-export async function queryKb(kbId: string, text: string): Promise<KbQueryResult> {
-  const { data } = await api.post(`/knowledge/${encodeURIComponent(kbId)}/query`, { text });
+/** 向量检索预览（仅 `index_vector` 容器可用）。 */
+export async function queryKnowledge(sourceId: string, text: string): Promise<KbQueryResult> {
+  const { data } = await api.post(`/knowledge/${encodeURIComponent(sourceId)}/query`, { text });
   return data;
 }
 
@@ -841,85 +848,6 @@ export async function deleteSkill(id: string): Promise<void> {
 
 export async function toggleSkill(id: string): Promise<AgentSkill> {
   const { data } = await api.post(`/agent/skills/${encodeURIComponent(id)}/toggle`);
-  return data;
-}
-
-// ── Wiki（批 4 完整） ──────────────────────────────────────────
-
-export interface WikiListParams {
-  scope?: string;
-  client_id?: string;
-  workspace_id?: string;
-  q?: string;
-  status?: string;
-  limit?: number;
-  offset?: number;
-}
-
-export async function listWikis(params: WikiListParams = {}): Promise<import('../types').AgentWikisResponse> {
-  const clean: Record<string, string | number> = { index_kind: 'pages' };
-  if (params.scope) clean.scope = params.scope;
-  if (params.client_id) clean.client_id = params.client_id;
-  if (params.workspace_id) clean.workspace_id = params.workspace_id;
-  if (params.q) clean.q = params.q;
-  if (params.status) clean.status = params.status;
-  if (params.limit !== undefined) clean.limit = params.limit;
-  if (params.offset !== undefined) clean.offset = params.offset;
-  const { data } = await api.get('/knowledge', { params: clean });
-  return { wikis: data.sources ?? [], total: data.total ?? 0 };
-}
-
-export async function createWiki(req: import('../types').CreateWikiRequest): Promise<import('../types').AgentWiki> {
-  const { data } = await api.post('/knowledge', { ...req, index_pages: true });
-  return data;
-}
-
-export async function getWiki(id: string): Promise<import('../types').AgentWiki> {
-  const { data } = await api.get(`/knowledge/${encodeURIComponent(id)}`);
-  return data;
-}
-
-export async function updateWiki(id: string, req: import('../types').UpdateWikiRequest): Promise<import('../types').AgentWiki> {
-  const { data } = await api.patch(`/knowledge/${encodeURIComponent(id)}`, req);
-  return data;
-}
-
-export async function deleteWiki(id: string): Promise<void> {
-  await api.delete(`/knowledge/${encodeURIComponent(id)}`);
-}
-
-// ── Wiki 文档 ──────────────────────────────────────────────────
-
-const toWikiDoc = (d: UnifiedDoc): import('../types').WikiDocument => ({
-  id: d.id,
-  wiki_id: d.source_id,
-  filename: d.filename,
-  file_type: d.file_type,
-  content_hash: d.content_hash,
-  status: (d.pages?.status ?? 'pending') as import('../types').WikiDocument['status'],
-  error: d.pages?.error ?? null,
-  created_at: d.created_at,
-  updated_at: d.updated_at,
-});
-
-export async function listWikiDocs(wikiId: string): Promise<import('../types').WikiDocsResponse> {
-  const { data } = await api.get(`/knowledge/${encodeURIComponent(wikiId)}/docs`);
-  return { documents: ((data.documents ?? []) as UnifiedDoc[]).map(toWikiDoc) };
-}
-
-export async function uploadWikiDoc(wikiId: string, file: File): Promise<import('../types').WikiDocument> {
-  const formData = new FormData();
-  formData.append('file', file);
-  const { data } = await api.post(`/knowledge/${encodeURIComponent(wikiId)}/docs`, formData);
-  return toWikiDoc(data as UnifiedDoc);
-}
-
-export async function deleteWikiDoc(wikiId: string, docId: string): Promise<void> {
-  await api.delete(`/knowledge/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}`);
-}
-
-export async function reindexWikiDoc(wikiId: string, docId: string): Promise<{ status: string; id: string }> {
-  const { data } = await api.post(`/knowledge/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}/reindex`);
   return data;
 }
 

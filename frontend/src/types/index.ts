@@ -444,6 +444,128 @@ export interface LlmModelGroupDetail {
 
 export type KbDocStatus = 'pending' | 'processing' | 'ready' | 'failed';
 
+// === Knowledge Source（统一知识容器：向量索引 + 页面索引双开关） ===
+
+/** 索引种类：`vector` = RAG 向量检索；`pages` = LLM 抽取的结构化 Wiki 页面。 */
+export type KnowledgeIndexKind = 'vector' | 'pages';
+
+/** 统一知识容器。两个索引开关独立，至少启用其一；两侧共用同一份原文文档与
+ *  embedding 配置（`emb_*` 仅在 `index_vector` 时生效）。 */
+export interface KnowledgeSource {
+  id: string;
+  name: string;
+  summary: string;
+  /** 与 `summary` 同值，KB 侧历史字段名（后端双写，便于旧调用方过渡）。 */
+  description: string;
+  index_vector: boolean;
+  index_pages: boolean;
+  scope_type: AgentMemoryScope;
+  client_id: string;
+  workspace_id: string;
+  emb_base_url: string;
+  /** 恒为空字符串（后端不回显密钥），是否已存密钥看 `has_api_key`。 */
+  emb_api_key: string;
+  has_api_key: boolean;
+  emb_model: string;
+  emb_dimension: number;
+  top_k: number;
+  chunk_size: number;
+  chunk_overlap: number;
+  score_threshold: number;
+  status: WikiStatus;
+  version: number;
+  page_count: number;
+  enabled: boolean;
+  doc_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeSourcesResponse {
+  sources: KnowledgeSource[];
+  total: number;
+}
+
+/** 索引侧的处理状态。`idle` = 该侧已启用但这篇文档还没建过索引（需手动重建）。 */
+export type KnowledgeIndexStatus = KbDocStatus | 'idle';
+
+/** 某一索引侧的处理状态。后端按侧只回各自的计数字段，故两个计数都是可选的。 */
+export interface KnowledgeDocIndexState {
+  status: KnowledgeIndexStatus;
+  /** 分块数，仅 vector 侧返回。 */
+  chunk_count?: number;
+  /** 页数，仅 pages 侧返回。 */
+  page_count?: number;
+  error?: string | null;
+}
+
+/** 统一文档视图：`null` 严格表示容器未启用该索引侧（已启用但未建索引会回 `status: 'idle'`）。 */
+export interface KnowledgeDoc {
+  id: string;
+  source_id: string;
+  filename: string;
+  file_type: string;
+  content_hash: string;
+  created_at: string;
+  updated_at: string;
+  vector: KnowledgeDocIndexState | null;
+  pages: KnowledgeDocIndexState | null;
+}
+
+export interface KnowledgeDocsResponse {
+  documents: KnowledgeDoc[];
+}
+
+export interface CreateKnowledgeSourceRequest {
+  name: string;
+  summary?: string;
+  index_vector?: boolean;
+  index_pages?: boolean;
+  scope_type?: AgentMemoryScope;
+  client_id?: string;
+  workspace_id?: string;
+  /** 不提供时后端回退到全局共享 embedding 配置。 */
+  emb_base_url?: string;
+  emb_api_key?: string;
+  emb_model?: string;
+  emb_dimension?: number;
+  top_k?: number;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  score_threshold?: number;
+  enabled?: boolean;
+}
+
+/** 缺省字段=保持不变。任一 `emb_base_url`/`emb_model`/`emb_dimension` 变化会触发
+ *  该容器全量重建向量索引（pages 侧不受影响）。 */
+export interface UpdateKnowledgeSourceRequest {
+  name: string;
+  summary?: string;
+  index_vector?: boolean;
+  index_pages?: boolean;
+  emb_base_url?: string;
+  /** 空=保留旧密钥。 */
+  emb_api_key?: string;
+  emb_model?: string;
+  emb_dimension?: number;
+  top_k?: number;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  score_threshold?: number;
+}
+
+export interface KnowledgeSourceListParams {
+  /** 只列启用了该索引的容器；缺省=全部。 */
+  index_kind?: KnowledgeIndexKind;
+  scope?: AgentMemoryScope;
+  client_id?: string;
+  workspace_id?: string;
+  q?: string;
+  status?: string;
+  limit?: number;
+  offset?: number;
+}
+
 export interface LlmKnowledgeBase {
   id: string;
   name: string;

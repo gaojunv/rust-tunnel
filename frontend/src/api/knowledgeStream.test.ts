@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { WikiEvent } from '@/types';
+import type { KbEvent } from '@/types';
 
 /** 可驱动的 EventSource 替身：记录实例、暴露 dispatch 触发自定义事件。 */
 class MockEventSource {
@@ -41,17 +41,34 @@ class MockEventSource {
  *  单例全新（内部 es/retryDelay/reconnectTimer 不跨用例泄漏）。 */
 async function loadStreamModule() {
   vi.resetModules();
-  const mod = await import('./wikiStream');
+  const mod = await import('./knowledgeStream');
   return mod;
 }
 
-const onWiki = vi.fn<(e: WikiEvent) => void>();
+const onEvent = vi.fn<(e: KbEvent) => void>();
 const onSync = vi.fn<(lagged: number) => void>();
+
+const vectorEv: KbEvent = {
+  doc_id: 'd1',
+  kb_id: 's1',
+  kind: 'vector',
+  status: 'ready',
+  chunk_count: 7,
+  error: null,
+};
+const pagesEv: KbEvent = {
+  doc_id: 'd1',
+  kb_id: 's1',
+  kind: 'pages',
+  status: 'processing',
+  chunk_count: 0,
+  error: null,
+};
 
 beforeEach(() => {
   MockEventSource.instances = [];
   vi.stubGlobal('EventSource', MockEventSource);
-  onWiki.mockReset();
+  onEvent.mockReset();
   onSync.mockReset();
 });
 
@@ -62,35 +79,22 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('wikiStream', () => {
-  it('connects once with token URL and delivers wiki events', async () => {
+describe('knowledgeStream', () => {
+  it('connects once with token URL and delivers both index kinds', async () => {
     localStorage.setItem('auth_token', 'tok-1');
-    const { wikiStream } = await loadStreamModule();
+    const { knowledgeStream } = await loadStreamModule();
 
-    const unsub = wikiStream.subscribe({ onWiki, onSync });
+    const unsub = knowledgeStream.subscribe({ onEvent, onSync });
 
     expect(MockEventSource.instances).toHaveLength(1);
-    expect(MockEventSource.instances[0].url).toBe(
-      '/api/knowledge/events?token=tok-1',
-    );
+    expect(MockEventSource.instances[0].url).toBe('/api/knowledge/events?token=tok-1');
 
-    // 统一 SSE 发 KbEvent（含 kind），stream 过滤 pages 映射回旧 WikiEvent 形状
-    const ev = {
-      doc_id: 'd1',
-      kb_id: 'w1',
-      kind: 'pages' as const,
-      status: 'processing',
-      chunk_count: 0,
-      error: null,
-    };
-    MockEventSource.instances[0].dispatch('knowledge', JSON.stringify(ev));
-    expect(onWiki).toHaveBeenCalledWith({
-      wiki_id: 'w1',
-      doc_id: 'd1',
-      status: 'processing',
-      page_count: 0,
-      error: null,
-    });
+    // 未指定 kind → 两侧事件都送达
+    MockEventSource.instances[0].dispatch('knowledge', JSON.stringify(vectorEv));
+    MockEventSource.instances[0].dispatch('knowledge', JSON.stringify(pagesEv));
+    expect(onEvent).toHaveBeenCalledTimes(2);
+    expect(onEvent).toHaveBeenNthCalledWith(1, vectorEv);
+    expect(onEvent).toHaveBeenNthCalledWith(2, pagesEv);
 
     // sync(lagged) 通知回调
     MockEventSource.instances[0].dispatch('sync', JSON.stringify({ lagged: 4 }));
@@ -98,14 +102,27 @@ describe('wikiStream', () => {
 
     // 解析失败的事件被忽略，不崩溃
     MockEventSource.instances[0].dispatch('knowledge', '{bad json');
-    expect(onWiki).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenCalledTimes(2);
+
+    unsub();
+  });
+
+  it('filters by kind when requested', async () => {
+    const { knowledgeStream } = await loadStreamModule();
+    const unsub = knowledgeStream.subscribe({ onEvent, kind: 'pages' });
+
+    MockEventSource.instances[0].dispatch('knowledge', JSON.stringify(vectorEv));
+    expect(onEvent).not.toHaveBeenCalled();
+
+    MockEventSource.instances[0].dispatch('knowledge', JSON.stringify(pagesEv));
+    expect(onEvent).toHaveBeenCalledExactlyOnceWith(pagesEv);
 
     unsub();
   });
 
   it('closes the EventSource when the last subscriber unsubscribes', async () => {
-    const { wikiStream } = await loadStreamModule();
-    const unsub = wikiStream.subscribe({ onWiki, onSync });
+    const { knowledgeStream } = await loadStreamModule();
+    const unsub = knowledgeStream.subscribe({ onEvent, onSync });
     expect(MockEventSource.instances).toHaveLength(1);
     unsub();
     expect(MockEventSource.instances[0].readyState).toBe(2); // CLOSED
@@ -113,8 +130,8 @@ describe('wikiStream', () => {
 
   it('reconnects with exponential backoff on error and resets on onopen', async () => {
     vi.useFakeTimers();
-    const { wikiStream } = await loadStreamModule();
-    wikiStream.subscribe({ onWiki, onSync });
+    const { knowledgeStream } = await loadStreamModule();
+    knowledgeStream.subscribe({ onEvent, onSync });
     expect(MockEventSource.instances).toHaveLength(1);
 
     // 连接建立成功 → 重置退避到初始值

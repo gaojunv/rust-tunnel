@@ -1,5 +1,5 @@
 // Shared SSE factory — extracts the identical reconnect skeleton from
-// kbStream.ts / wikiStream.ts (memoryStream.ts mirrors the same shape).
+// knowledgeStream.ts (memoryStream.ts mirrors the same shape).
 // Keeps: per-stream singleton via module scope, lazy connect, exponential
 // backoff (1s → 2s → … capped 30s), size===0 close, `?token=` auth query
 // (copied verbatim from the original streams).

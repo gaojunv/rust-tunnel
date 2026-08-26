@@ -18,7 +18,7 @@ import {
   useToggleLlmApiKey,
   useBindLlmApiKey,
   useDeleteLlmApiKey,
-  useLlmKbs,
+  useKnowledgeSources,
 } from '@/api/hooks';
 import { getApiErrorMessage } from '@/api/client';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -32,7 +32,9 @@ const NONE_KB = '__none__';
 export default function ApiKeyTable() {
   const { t } = useTranslation();
   const { data: keys, isLoading } = useLlmApiKeys();
-  const { data: kbs } = useLlmKbs();
+  // api-key 绑定的是向量检索容器（pages-only 容器无 embedding 语义）
+  const { data: kbData } = useKnowledgeSources({ index_kind: 'vector' });
+  const kbs = kbData?.sources;
   const createMutation = useCreateLlmApiKey();
   const toggleMutation = useToggleLlmApiKey();
   const bindMutation = useBindLlmApiKey();

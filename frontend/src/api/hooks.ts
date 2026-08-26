@@ -56,18 +56,18 @@ import {
   deleteLlmModelGroup,
   replaceGroupMembers,
   resetGroupBreaker,
-  listLlmKbs,
-  getLlmKb,
-  createLlmKb,
-  updateLlmKb,
-  toggleLlmKb,
-  deleteLlmKb,
-  listLlmKbDocs,
-  uploadKbDoc,
-  deleteKbDoc,
-  reindexKbDoc,
+  listKnowledgeSources,
+  getKnowledgeSource,
+  createKnowledgeSource,
+  updateKnowledgeSource,
+  toggleKnowledgeSource,
+  deleteKnowledgeSource,
+  listKnowledgeDocs,
+  uploadKnowledgeDoc,
+  deleteKnowledgeDoc,
+  reindexKnowledgeDoc,
   testEmbedding,
-  queryKb,
+  queryKnowledge,
   clientsApi,
   listAgentWorkspaces,
   getMemorySettings,
@@ -91,14 +91,6 @@ import {
   deleteRole,
   toggleRole,
   updateAgentSessionRole,
-  listWikis,
-  createWiki,
-  updateWiki,
-  deleteWiki,
-  listWikiDocs,
-  uploadWikiDoc,
-  deleteWikiDoc,
-  reindexWikiDoc,
   listWikiPages,
   getWikiPage,
   putWikiPage,
@@ -121,8 +113,10 @@ import type {
   CreateModelRequest,
   LlmGatewayConfig,
   UsageGroupBy,
-  CreateLlmKbRequest,
-  UpdateLlmKbRequest,
+  KnowledgeSourceListParams,
+  KnowledgeIndexKind,
+  CreateKnowledgeSourceRequest,
+  UpdateKnowledgeSourceRequest,
   MemorySettingsRequest,
   CreateMemoryRequest,
   UpdateMemoryRequest,
@@ -411,7 +405,7 @@ export function useUpdateDnsConfig() {
 
 import { statsStream } from './statsStream';
 import { memoryStream } from './memoryStream';
-import { wikiStream } from './wikiStream';
+import { knowledgeStream } from './knowledgeStream';
 import type { StatsSnapshot, StatsSummary } from '@/types';
 import { useEffect, useRef } from 'react';
 
@@ -691,95 +685,117 @@ export function useLlmUsageLogs(range: UsageRange, limit = 50, offset = 0) {
   });
 }
 
-// ── RAG Knowledge Base ──────────────────────────────────────
+// ── Knowledge Source（统一知识容器：向量 + 页面双索引） ──────────
 
-export function useLlmKbs() {
-  return useQuery({ queryKey: ['llm-kbs'], queryFn: () => listLlmKbs() });
+/** 容器列表。queryKey `['knowledge-sources', params]`（params 含 index_kind 过滤）。 */
+export function useKnowledgeSources(params: KnowledgeSourceListParams = {}) {
+  return useQuery({
+    queryKey: ['knowledge-sources', params],
+    queryFn: () => listKnowledgeSources(params),
+  });
 }
 
-export function useLlmKb(id: string) {
+export function useKnowledgeSource(id: string) {
   return useQuery({
-    queryKey: ['llm-kb', id],
-    queryFn: () => getLlmKb(id),
+    queryKey: ['knowledge-source', id],
+    queryFn: () => getKnowledgeSource(id),
     enabled: !!id,
   });
 }
 
-export function useCreateLlmKb() {
+export function useCreateKnowledgeSource() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (req: CreateLlmKbRequest) => createLlmKb(req),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-kbs'] }),
+    mutationFn: (req: CreateKnowledgeSourceRequest) => createKnowledgeSource(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['knowledge-sources'] }),
   });
 }
 
-export function useUpdateLlmKb() {
+export function useUpdateKnowledgeSource() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...req }: { id: string } & UpdateLlmKbRequest) => updateLlmKb(id, req),
+    mutationFn: ({ id, ...req }: { id: string } & UpdateKnowledgeSourceRequest) =>
+      updateKnowledgeSource(id, req),
     onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
-      qc.invalidateQueries({ queryKey: ['llm-kb', vars.id] });
+      qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
+      qc.invalidateQueries({ queryKey: ['knowledge-source', vars.id] });
+      // 索引开关变更会改变文档的 vector/pages 可见侧
+      qc.invalidateQueries({ queryKey: ['knowledge-docs', vars.id] });
     },
   });
 }
 
-export function useToggleLlmKb() {
+export function useToggleKnowledgeSource() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => toggleLlmKb(id, enabled),
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      toggleKnowledgeSource(id, enabled),
     onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
-      qc.invalidateQueries({ queryKey: ['llm-kb', vars.id] });
+      qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
+      qc.invalidateQueries({ queryKey: ['knowledge-source', vars.id] });
     },
   });
 }
 
-export function useDeleteLlmKb() {
+export function useDeleteKnowledgeSource() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => deleteLlmKb(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-kbs'] }),
+    mutationFn: (id: string) => deleteKnowledgeSource(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['knowledge-sources'] }),
   });
 }
 
-export function useLlmKbDocs(kbId: string) {
+/** 统一文档列表（per-kind 状态在 vector/pages 子对象）。queryKey `['knowledge-docs', sourceId]`。 */
+export function useKnowledgeDocs(sourceId: string) {
   return useQuery({
-    queryKey: ['llm-kb-docs', kbId],
-    queryFn: () => listLlmKbDocs(kbId),
-    enabled: !!kbId,
+    queryKey: ['knowledge-docs', sourceId],
+    queryFn: () => listKnowledgeDocs(sourceId),
+    enabled: !!sourceId,
   });
 }
 
-export function useUploadKbDoc() {
+export function useUploadKnowledgeDoc() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ kbId, file }: { kbId: string; file: File }) => uploadKbDoc(kbId, file),
+    mutationFn: ({ sourceId, file }: { sourceId: string; file: File }) =>
+      uploadKnowledgeDoc(sourceId, file),
     onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['llm-kb-docs', vars.kbId] });
-      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+      qc.invalidateQueries({ queryKey: ['knowledge-docs', vars.sourceId] });
+      qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
     },
   });
 }
 
-export function useDeleteKbDoc() {
+export function useDeleteKnowledgeDoc() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ kbId, docId }: { kbId: string; docId: string }) => deleteKbDoc(kbId, docId),
+    mutationFn: ({ sourceId, docId }: { sourceId: string; docId: string }) =>
+      deleteKnowledgeDoc(sourceId, docId),
     onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['llm-kb-docs', vars.kbId] });
-      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+      qc.invalidateQueries({ queryKey: ['knowledge-docs', vars.sourceId] });
+      qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
+      // pages 侧删文档会解除页面来源关联，页面列表需重拉
+      qc.invalidateQueries({ queryKey: ['agent-wiki-pages', vars.sourceId] });
     },
   });
 }
 
-export function useReindexKbDoc() {
+/** `kind` 缺省=重建所有启用侧。 */
+export function useReindexKnowledgeDoc() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ kbId, docId }: { kbId: string; docId: string }) => reindexKbDoc(kbId, docId),
+    mutationFn: ({
+      sourceId,
+      docId,
+      kind,
+    }: {
+      sourceId: string;
+      docId: string;
+      kind?: KnowledgeIndexKind;
+    }) => reindexKnowledgeDoc(sourceId, docId, kind),
     onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['llm-kb-docs', vars.kbId] });
-      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+      qc.invalidateQueries({ queryKey: ['knowledge-docs', vars.sourceId] });
+      qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
     },
   });
 }
@@ -791,9 +807,11 @@ export function useTestEmbedding() {
   });
 }
 
-export function useKbQuery() {
+/** 向量检索预览（仅 index_vector 容器）。 */
+export function useKnowledgeQuery() {
   return useMutation({
-    mutationFn: ({ kbId, text }: { kbId: string; text: string }) => queryKb(kbId, text),
+    mutationFn: ({ sourceId, text }: { sourceId: string; text: string }) =>
+      queryKnowledge(sourceId, text),
   });
 }
 
@@ -1013,84 +1031,10 @@ export function useUpdateSessionRole() {
   });
 }
 
-// ── Agent Wiki（批 4 完整） ───────────────────────────────────
-
-/** Wiki 容器列表查询参数（含 UI 过滤映射后的空值剔除）。queryKey `['agent-wikis', params]`。 */
-export function useWikis(params: import('./client').WikiListParams = {}) {
-  return useQuery({
-    queryKey: ['agent-wikis', params],
-    queryFn: () => listWikis(params),
-  });
-}
-
-export function useCreateWiki() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (req: import('../types').CreateWikiRequest) => createWiki(req),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
-  });
-}
-
-export function useUpdateWiki() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({ id, ...req }: { id: string } & import('../types').UpdateWikiRequest) => updateWiki(id, req),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
-      qc.invalidateQueries({ queryKey: ['agent-wiki', vars.id] });
-    },
-  });
-}
-
-export function useDeleteWiki() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => deleteWiki(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
-  });
-}
-
-/** Wiki 文档列表。queryKey `['agent-wiki-docs', wikiId]`。 */
-export function useWikiDocs(wikiId: string) {
-  return useQuery({
-    queryKey: ['agent-wiki-docs', wikiId],
-    queryFn: () => listWikiDocs(wikiId),
-    enabled: !!wikiId,
-  });
-}
-
-export function useUploadWikiDoc() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({ wikiId, file }: { wikiId: string; file: File }) => uploadWikiDoc(wikiId, file),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['agent-wiki-docs', vars.wikiId] });
-      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
-    },
-  });
-}
-
-export function useDeleteWikiDoc() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({ wikiId, docId }: { wikiId: string; docId: string }) => deleteWikiDoc(wikiId, docId),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['agent-wiki-docs', vars.wikiId] });
-      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
-    },
-  });
-}
-
-export function useReindexWikiDoc() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({ wikiId, docId }: { wikiId: string; docId: string }) => reindexWikiDoc(wikiId, docId),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['agent-wiki-docs', vars.wikiId] });
-      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
-    },
-  });
-}
+// ── Wiki 页面索引（容器与文档已统一到 Knowledge Source，此段只剩页面层） ──
+//
+// 「wiki 页面」是 pages 索引的领域术语，故页面/图谱/搜索层保留 Wiki 命名与
+// `wiki_id` 载荷字段；容器与文档一律走 useKnowledgeSource*/useKnowledgeDoc*。
 
 /** Wiki 页面列表（含过滤参数）。queryKey `['agent-wiki-pages', wikiId, params]`。 */
 export function useWikiPages(wikiId: string, params: import('../types').WikiPageListParams = {}) {
@@ -1164,25 +1108,20 @@ export function useSearchAllWikis(q: string) {
   });
 }
 
-/** 订阅 Wiki 摄入 SSE：doc 状态事件到达即失效文档列表 + 容器 + 图谱。
- *  事件不带逐条文档详情，无 KbDetail 的 override 通道（状态实时性靠文档列表 refetch）。
- *  返回订阅函数供 WikiDetail 做 override 细化（仿 useMemoryStream 前置用法）。 */
-export function useWikiStream() {
+/** 订阅统一知识摄入 SSE：任一索引侧的文档状态事件到达即失效文档列表 + 容器 +
+ *  图谱（pages 侧抽取会改变图谱）。事件粒度到 doc_id，但列表级失效已足够；
+ *  需要逐文档 override 的详情页自行 `knowledgeStream.subscribe`。 */
+export function useKnowledgeStream() {
   const qc = useQueryClient();
   useEffect(() => {
-    const unsub = wikiStream.subscribe({
-      onWiki: () => {
-        qc.invalidateQueries({ queryKey: ['agent-wiki-docs'] });
-        qc.invalidateQueries({ queryKey: ['agent-wikis'] });
-        qc.invalidateQueries({ queryKey: ['agent-wiki-graph'] });
-      },
-      onSync: () => {
-        // Lagged：广播槽溢出丢事件，强制重拉列表以获得完整状态
-        qc.invalidateQueries({ queryKey: ['agent-wiki-docs'] });
-        qc.invalidateQueries({ queryKey: ['agent-wikis'] });
-        qc.invalidateQueries({ queryKey: ['agent-wiki-graph'] });
-      },
-    });
+    const invalidateAll = () => {
+      qc.invalidateQueries({ queryKey: ['knowledge-docs'] });
+      qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki-graph'] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki-pages'] });
+    };
+    // Lagged 与常规事件同处理：广播槽溢出丢事件时同样只需重拉列表
+    const unsub = knowledgeStream.subscribe({ onEvent: invalidateAll, onSync: invalidateAll });
     return unsub;
   }, [qc]);
 }

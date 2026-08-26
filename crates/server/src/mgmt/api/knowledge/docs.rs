@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
+use serde::Deserialize;
 
 use crate::db::knowledge::{IndexKind, KnowledgeDocIndexRecord, KnowledgeDocRecord, KnowledgeSourceRecord};
 use crate::db::agent::normalize_db_datetime;
@@ -19,28 +20,43 @@ use sha2::Digest;
 
 use super::{knowledge_rt, KnowledgeRuntime};
 
+/// 单侧索引状态视图。
+///
+/// 未启用该侧 → `null`；已启用但还没有索引行（典型场景：容器后来才打开这一侧，
+/// 已有文档尚未重建）→ 合成 `idle`。这样前端契约无歧义：`null` 只表示未启用。
+fn index_json(
+    enabled: bool,
+    idx: Option<&KnowledgeDocIndexRecord>,
+    count_key: &str,
+) -> serde_json::Value {
+    if !enabled {
+        return serde_json::Value::Null;
+    }
+    let mut obj = serde_json::Map::new();
+    match idx {
+        Some(i) => {
+            obj.insert("status".into(), serde_json::json!(i.status));
+            obj.insert(count_key.to_string(), serde_json::json!(i.item_count));
+            obj.insert("error".into(), serde_json::json!(i.error));
+        }
+        None => {
+            obj.insert("status".into(), serde_json::json!("idle"));
+            obj.insert(count_key.to_string(), serde_json::json!(0));
+            obj.insert("error".into(), serde_json::Value::Null);
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// 统一文档视图：`vector` / `pages` 各自独立，`null` 表示容器未启用该索引。
 fn doc_json(
+    src: &KnowledgeSourceRecord,
     doc: &KnowledgeDocRecord,
     vec_idx: Option<&KnowledgeDocIndexRecord>,
     pages_idx: Option<&KnowledgeDocIndexRecord>,
 ) -> serde_json::Value {
-    let vector = match vec_idx {
-        Some(idx) => serde_json::json!({
-            "status": idx.status,
-            "chunk_count": idx.item_count,
-            "error": idx.error,
-        }),
-        None => serde_json::Value::Null,
-    };
-    let pages = match pages_idx {
-        Some(idx) => serde_json::json!({
-            "status": idx.status,
-            "page_count": idx.item_count,
-            "error": idx.error,
-        }),
-        None => serde_json::Value::Null,
-    };
+    let vector = index_json(src.index_vector != 0, vec_idx, "chunk_count");
+    let pages = index_json(src.index_pages != 0, pages_idx, "page_count");
     serde_json::json!({
         "id": doc.id,
         "source_id": doc.source_id,
@@ -169,7 +185,7 @@ pub async fn list_docs(
         } else {
             None
         };
-        out.push(doc_json(d, v_idx.as_ref(), p_idx.as_ref()));
+        out.push(doc_json(&src, d, v_idx.as_ref(), p_idx.as_ref()));
     }
     Json(serde_json::json!({ "documents": out })).into_response()
 }
@@ -207,7 +223,7 @@ pub async fn get_doc(
     } else {
         None
     };
-    Json(doc_json(&doc, v_idx.as_ref(), p_idx.as_ref())).into_response()
+    Json(doc_json(&src, &doc, v_idx.as_ref(), p_idx.as_ref())).into_response()
 }
 
 pub async fn upload_doc(
@@ -363,7 +379,7 @@ pub async fn upload_doc(
             } else {
                 None
             };
-            (StatusCode::CREATED, Json(doc_json(&doc, v_idx.as_ref(), p_idx.as_ref()))).into_response()
+            (StatusCode::CREATED, Json(doc_json(&source, &doc, v_idx.as_ref(), p_idx.as_ref()))).into_response()
         }
         _ => (
             StatusCode::CREATED,
@@ -426,10 +442,26 @@ pub async fn delete_doc(
     StatusCode::OK.into_response()
 }
 
+/// 可选：仅重建指定索引侧，缺省则重建容器启用的所有索引侧。
+#[derive(Debug, Default, Deserialize)]
+pub struct ReindexParams {
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
 pub async fn reindex_doc(
     State(state): State<ApiState>,
     Path((source_id, doc_id)): Path<(String, String)>,
+    Query(params): Query<ReindexParams>,
 ) -> impl IntoResponse {
+    let only = match params.kind.as_deref() {
+        None | Some("") => None,
+        Some("vector") => Some(IndexKind::Vector),
+        Some("pages") => Some(IndexKind::Pages),
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, "kind must be vector or pages").into_response();
+        }
+    };
     let rt = match knowledge_rt(&state).await {
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
@@ -450,26 +482,28 @@ pub async fn reindex_doc(
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     }
 
-    // 对容器启用的每个 kind 分别 CAS 抢占
+    // 对容器启用的每个 kind 分别 CAS 抢占（`only` 指定时只抢那一侧）
     let mut succeeded_kinds = Vec::new();
-    let mut enabled_count = 0;
-    if source.index_vector != 0 {
-        enabled_count += 1;
+    // 「既被 only 选中、又被容器启用」的侧数；为 0 说明这次请求无事可做
+    let mut requested_count = 0;
+    if source.index_vector != 0 && only != Some(IndexKind::Pages) {
+        requested_count += 1;
         match rt.db.kdoc_mark_pending_if_idle(&doc_id, IndexKind::Vector).await {
             Ok(true) => succeeded_kinds.push(IndexKind::Vector),
             Ok(false) => {}
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
         }
     }
-    if source.index_pages != 0 {
-        enabled_count += 1;
+    if source.index_pages != 0 && only != Some(IndexKind::Vector) {
+        requested_count += 1;
         match rt.db.kdoc_mark_pending_if_idle(&doc_id, IndexKind::Pages).await {
             Ok(true) => succeeded_kinds.push(IndexKind::Pages),
             Ok(false) => {}
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
         }
     }
-    if enabled_count == 0 {
+    if requested_count == 0 {
+        // only 指定了一侧但容器未启用该侧，与「两侧都没启用」同为参数错误
         return (StatusCode::BAD_REQUEST, "knowledge source has no index enabled").into_response();
     }
     if succeeded_kinds.is_empty() {
@@ -547,7 +581,7 @@ pub async fn reindex_doc(
         vector_sem: None,
         pages_sem: Some(rt.pages_sem.clone()),
         page_extractor: Some(extractor),
-        only: None,
+        only,
     });
 
     match rt.db.kdoc_get(&doc_id).await {
@@ -562,7 +596,7 @@ pub async fn reindex_doc(
             } else {
                 None
             };
-            (StatusCode::OK, Json(doc_json(&d, v_idx.as_ref(), p_idx.as_ref()))).into_response()
+            (StatusCode::OK, Json(doc_json(&source, &d, v_idx.as_ref(), p_idx.as_ref()))).into_response()
         }
         _ => (
             StatusCode::OK,

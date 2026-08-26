@@ -1,6 +1,6 @@
 // Global SSE singleton for AI memory distill/inject status.
 // Backend pushes MemoryEvent on the "memory" event name (plus "ping"
-// keep-alives which callers don't need). Mirrors kbStream.ts.
+// keep-alives which callers don't need). Mirrors knowledgeStream.ts.
 import type { MemoryEvent } from '@/types';
 
 type Callback = (e: MemoryEvent) => void;
