@@ -22,7 +22,7 @@ export default function AcmePage() {
         title={t('acme.title')}
         description={t('acme.description')}
       >
-        <Button className="shadow-glow" onClick={() => setRequestOpen(true)} disabled={!status?.enabled}>
+        <Button className="md:shadow-glow" onClick={() => setRequestOpen(true)} disabled={!status?.enabled}>
           <Plus className="mr-2 h-4 w-4" />
           {t('acme.requestCertificate')}
         </Button>

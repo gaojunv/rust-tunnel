@@ -118,6 +118,13 @@
       radial-gradient(ellipse 70% 50% at 85% 110%, hsl(262 83% 68% / 0.07), transparent);
     background-attachment: fixed;
   }
+
+  /* 移动端（< 768px，小屏省 GPU 合成层与绘制开销，大面积光晕在小屏上为视觉噪音）去掉环境辉光径向渐变 */
+  @media (max-width: 767px) {
+    html.dark body {
+      background-image: none;
+    }
+  }
 }
 
 /* Radix Select/Dialog 打开时通过 react-remove-scroll-bar 给 body 加
@@ -371,6 +378,34 @@ html body[data-scroll-locked] {
     .card-aurora:hover,
     .agent-input-running {
       animation: none;
+    }
+  }
+
+  /* 移动端（< 768px）去掉发光/光晕装饰：纯视觉效果，小屏上省 GPU/合成层开销且避免大面积光晕噪音；CSS 断点无 hydration 闪烁、集中一处便于维护 */
+  @media (max-width: 767px) {
+    /* 卡片极光光晕：去掉 box-shadow 与 hover 流转动画，保留边框与背景 */
+    .card-aurora,
+    .card-aurora:hover {
+      box-shadow: none !important;
+      animation: none !important;
+    }
+
+    /* Logo 呼吸外发光：去掉动画与阴影 */
+    .logo-glow-breathe {
+      box-shadow: none !important;
+      animation: none !important;
+    }
+
+    /* 极光光斑与页头底部流光线为整块装饰元素：直接隐藏最干净 */
+    .aurora-blob,
+    .header-light-flow {
+      display: none !important;
+    }
+
+    /* 光斑漂移动画：与上条互补，兜底隐藏后仍停动画 */
+    .animate-aurora,
+    .animate-aurora-alt {
+      animation: none !important;
     }
   }
 }
