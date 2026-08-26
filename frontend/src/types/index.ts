@@ -566,38 +566,6 @@ export interface KnowledgeSourceListParams {
   offset?: number;
 }
 
-export interface LlmKnowledgeBase {
-  id: string;
-  name: string;
-  description: string;
-  emb_base_url: string;
-  emb_api_key: string; // 恒为空字符串（后端不回显）
-  emb_model: string;
-  emb_dimension: number;
-  top_k: number;
-  chunk_size: number;
-  chunk_overlap: number;
-  score_threshold: number;
-  enabled: boolean;
-  doc_count?: number;
-  chunk_count?: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface LlmKbDocument {
-  id: string;
-  kb_id: string;
-  filename: string;
-  file_type: string;
-  content_hash: string;
-  status: KbDocStatus;
-  chunk_count: number;
-  error?: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface KbQueryHit {
   heading_path: string;
   content: string;
@@ -615,36 +583,6 @@ export interface KbEvent {
   status: KbDocStatus;
   chunk_count: number;
   error?: string | null;
-}
-
-export interface CreateLlmKbRequest {
-  name: string;
-  description: string;
-  /** 不提供时后端回退到全局共享 embedding 配置。 */
-  emb_base_url?: string;
-  emb_api_key?: string;
-  emb_model?: string;
-  emb_dimension?: number;
-  top_k?: number;
-  chunk_size?: number;
-  chunk_overlap?: number;
-  score_threshold?: number;
-  enabled?: boolean;
-}
-
-export interface UpdateLlmKbRequest {
-  name: string;
-  description: string;
-  /** 任一 base_url/model/dimension 变化会触发全量重建所有文档索引；缺省=保持不变。 */
-  emb_base_url?: string;
-  /** 空=保留旧密钥。 */
-  emb_api_key?: string;
-  emb_model?: string;
-  emb_dimension?: number;
-  top_k?: number;
-  chunk_size?: number;
-  chunk_overlap?: number;
-  score_threshold?: number;
 }
 
 export interface TestEmbeddingResult {
@@ -816,59 +754,10 @@ export interface UpdateSkillRequest {
   tags?: string[];
 }
 
-// === Wiki（批 4 完整） ===
+// === Wiki 页面层（容器/文档层已并入统一知识容器，见 KnowledgeSource） ===
 
 /** 容器/文档状态（对齐后端 CHECK 约束：draft/pending/processing/ready/failed）。 */
 export type WikiStatus = 'draft' | 'pending' | 'processing' | 'ready' | 'failed';
-
-export interface AgentWiki {
-  id: string;
-  name: string;
-  summary: string;
-  status: WikiStatus;
-  version: number;
-  page_count: number;
-  scope_type: AgentMemoryScope;
-  client_id: string;
-  workspace_id: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AgentWikisResponse {
-  wikis: AgentWiki[];
-  total: number;
-}
-
-export interface CreateWikiRequest {
-  name: string;
-  summary?: string;
-  scope_type?: AgentMemoryScope;
-  client_id?: string;
-  workspace_id?: string;
-}
-
-export interface UpdateWikiRequest {
-  name?: string;
-  summary?: string;
-}
-
-/** Wiki 原文文档（对应 `agent_wiki_docs` 表）。status: pending/processing/ready/failed。 */
-export interface WikiDocument {
-  id: string;
-  wiki_id: string;
-  filename: string;
-  file_type: string;
-  content_hash: string;
-  status: WikiStatus;
-  error?: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface WikiDocsResponse {
-  documents: WikiDocument[];
-}
 
 /** 页面摘要视图（不含 content，对应列表/图谱节点响应）。 */
 export interface WikiPageSummary {

@@ -60,7 +60,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `crates/client`（`rust-tunnel-client`）— 客户端 lib + bin
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
 - 依赖单向：`common ← client`、`common ← server`
-- **`rag` 为非默认 feature**（门控 qdrant-edge 与 `/api/llm/kb*`）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
+- **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
 ### 核心数据流
 1. 客户端通过控制通道（加密 TLS）向服务端注册，提供名称和密码
@@ -109,19 +109,19 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - **无全局状态管理库** — 状态通过 React Query + 组件本地状态管理
 - Vite 开发服务器将 `/api` 代理到 `localhost:3000`（服务器 API 端口）
 - 共享组件在 `frontend/src/components/shared/`：`ChartContainer`、`StatCard`、`TimeRangeSelector`、`MobileBottomNav`
-- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与 RAG 知识库管理（`KbPage`，含 `components/llm/kb/` 下的 `KbList`/`KbDetail`/`KbDialog`）；AI agent 工作台（`AgentPage`，含 `components/agent/`：会话列表、消息流、审批弹层、@文件引用、workspace 管理——含 ACP 引擎配置：agent_type/agent_path/llm_model_id）
+- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与统一知识容器（`KnowledgePage`，`components/knowledge/source/` 下的 `SourceSection`/`SourceList`/`SourceDetail`/`SourceDialog`/`SourceDocsTab`，页面层仍用 `components/knowledge/wiki/` 的 `WikiPagesTab`/`WikiGraph`/`WikiPageDialog`）；AI agent 工作台（`AgentPage`，含 `components/agent/`：会话列表、消息流、审批弹层、@文件引用、workspace 管理——含 ACP 引擎配置：agent_type/agent_path/llm_model_id）
 - TypeScript 类型定义集中 在 `frontend/src/types/index.ts`
 - API 客户端在 `frontend/src/api/client.ts`：Axios + JWT 拦截器
 
 ### 数据库 (SQLite)
 - 位置：`--db-path` 配置（默认 `./data/rust-tunnel.db`），WAL 模式
-- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`rag_knowledge_bases` / `rag_documents` / `rag_chunks`（RAG 知识库、文档与分块，向量本体存于 `<db_parent>/rag/<kb_id>/`，文档原文存于 `<db_parent>/rag_docs/<kb_id>/`；**向量本体仅随 `rag` feature 编译**）、`agent_workspaces` / `agent_sessions`（含 `role_id`） / `agent_messages` / `agent_roles`（多角色子代理定义）；模型 `extra_config` JSON 支持 `upstream_protocol: "responses"` 声明上游使用 Responses API（与 `agent_context_limit` 并列，缺省 `chat_completions`）
+- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`knowledge_sources`（统一知识容器，`index_vector`/`index_pages` 双索引开关，取代旧 `rag_knowledge_bases`/`agent_wikis`）/ `knowledge_docs`（文档）/ `knowledge_doc_index`（按 `(doc_id, kind)` 记录每侧索引进度）/ `knowledge_chunks`（向量分块）/ `knowledge_pages`（页面）/ `knowledge_page_edges`（页面链接图谱；向量本体存于 `<db_parent>/rag/<source_id>/`，文档原文存于 `<db_parent>/knowledge_docs/<source_id>/`；**向量索引仅随 `rag` feature 编译**）、`agent_workspaces` / `agent_sessions`（含 `role_id`） / `agent_messages` / `agent_roles`（多角色子代理定义）；模型 `extra_config` JSON 支持 `upstream_protocol: "responses"` 声明上游使用 Responses API（与 `agent_context_limit` 并列，缺省 `chat_completions`）
 
 ### API 端点
-- 公开：`POST /api/login`、`GET /api/health`、`GET /api/llm/kb/events`（SSE，`?token=` 认证）
+- 公开：`POST /api/login`、`GET /api/health`、`GET /api/knowledge/events`（SSE，`?token=` 认证）
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
 - LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`、`POST /v1/responses`（Responses API 入口，与 `/v1/chat/completions` 同域）
-- RAG 知识库（新）：`/api/llm/kb`（CRUD）、`/api/llm/kb/:id`、`/api/llm/kb/:id/docs`、`/api/llm/kb/:id/docs/:doc_id`（含 `/reindex`）、`/api/llm/kb/test-embedding`、`/api/llm/kb/:id/query`
+- 统一知识容器（新）：`/api/knowledge`（CRUD）、`/api/knowledge/:id`、`/api/knowledge/:id/docs`、`/api/knowledge/:id/docs/:doc_id`（含 `/reindex`）、`/api/knowledge/test-embedding`、`/api/knowledge/:id/query`（向量检索预览）、`/api/knowledge/:id/pages`、`/api/knowledge/:id/graph`、`/api/knowledge/:id/search`、`/api/knowledge/search`
 - AI agent（新）：`GET /api/agent/ws`（WebSocket 回合/事件流）、`/api/agent/workspaces`（CRUD，含 `/files`、`/sessions`）、`/api/agent/sessions/:id`（含 `/model`、`/archive`、`/messages`、`/role`）、`/api/agent/default-model`、`/api/agent/roles`（多角色子代理 CRUD，含 `:id/toggle`）
 - 完整列表见 `crates/server/src/mgmt/api/mod.rs`
 
