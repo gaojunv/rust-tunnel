@@ -10,36 +10,21 @@ use tokio::sync::Semaphore;
 use crate::db::Database;
 use crate::llm::LlmState;
 
-/// Wiki 摄入事件（与 `MemoryEvent` 同构，SSE 推给前端）。
-#[cfg(feature = "rag")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct WikiEvent {
-    /// 所属知识库标识。
-    pub wiki_id: String,
-    /// 所属文档标识。
-    pub doc_id: String,
-    /// 摄入状态。
-    pub status: String,
-    /// 已生成页数。
-    pub page_count: i64,
-    /// 失败原因（成功时 None）。
-    pub error: Option<String>,
-}
-
 /// Wiki 运行时：挂 `AgentState`（同 `MemoryState`），供 ingest/API/SSE 共享。
 ///
 /// 不触碰向量（零 `VectorStore` 依赖）；`LlmState` / `Database` 与 memory 共用
-/// 同一实例，`wiki_tx` 与 `MemoryState.events` 并列为独立广播。
+/// 同一实例。摄入事件**不另开广播**——统一摄入流水线只往 `LlmState.rag_tx` 发
+/// [`KbEvent`](rust_tunnel_rag::ingest::KbEvent)，两个索引共用一条 channel，
+/// 订阅方按 `kind` 分流；再挂一条 wiki 专属 channel 只会让 pages 事件到不了。
 #[cfg(feature = "rag")]
 #[derive(Clone)]
 pub struct WikiState {
-    /// 数据库连接。
+    /// 数据库句柄（与 memory 共用同一实例）。
     pub db: Database,
-    /// LLM 状态。
+    /// LLM 网关状态：既是 pages 抽取的调用入口，也持有摄入事件广播 `rag_tx`。
     pub llm: LlmState,
-    /// 摄入状态事件广播（订阅者即 `/api/agent/wiki/events`）。
-    pub events: tokio::sync::broadcast::Sender<WikiEvent>,
-    /// LLM 并发限流：`Semaphore(2)`（对齐计划与 RAG `Semaphore(4)` 语义）。
+    /// pages 侧 LLM 并发限流：`Semaphore(2)`。LLM 调用远比 embedding 重，
+    /// 故比向量侧更窄。
     pub ingest_sem: Arc<Semaphore>,
 }
 
@@ -55,23 +40,20 @@ impl std::fmt::Debug for WikiState {
 
 #[cfg(feature = "rag")]
 impl WikiState {
-    /// 创建 Wiki 运行时。
+    /// 建运行时。事件广播复用 `llm.rag_tx`，此处不再新建 channel。
     #[must_use]
     pub fn new(db: Database, llm: LlmState) -> Self {
-        // 容量 64：与 MemoryState / LlmState.rag_tx 一致，低频事件不阻塞调用方。
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
         Self {
             db,
             llm,
-            events,
             ingest_sem: Arc::new(Semaphore::new(2)),
         }
     }
 
-    /// 订阅摄入事件。
+    /// 订阅摄入事件。收到的是**两个索引**的事件流，调用方需按 `kind` 过滤。
     #[must_use]
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WikiEvent> {
-        self.events.subscribe()
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<rust_tunnel_rag::ingest::KbEvent> {
+        self.llm.rag_tx.subscribe()
     }
 }
 
@@ -411,15 +393,69 @@ mod tests {
             .await
             .is_none());
 
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "g1".into(), name: "global-wiki".into(), summary: "全局".into(), index_vector: false, index_pages: true, scope_type: "global".into(), client_id: "".into(), workspace_id: "".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1a".into(), name: "ws-wiki".into(), summary: "工作区".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w2".into(), name: "other-ws".into(), summary: "其他".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w2".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "g1".into(),
+            name: "global-wiki".into(),
+            summary: "全局".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "global".into(),
+            client_id: String::new(),
+            workspace_id: String::new(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "w1a".into(),
+            name: "ws-wiki".into(),
+            summary: "工作区".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "w1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "w2".into(),
+            name: "other-ws".into(),
+            summary: "其他".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "w2".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
         // page_count 影响排序
         db.wiki_upsert_page("g1", "p1", "t", "s", "c", false, None)
             .await
@@ -459,14 +495,31 @@ mod tests {
         assert_eq!(lines.len(), 1);
     }
 
-    // 参数校验与端到端检索的集成测试，断言分支多、准备数据多。
-    #[allow(clippy::too_many_lines, reason = "参数校验与端到端检索的集成测试，断言分支多、准备数据多")]
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "端到端断言路径多，单测直接铺开")]
     async fn search_param_validation_and_e2e() {
         let (db, wiki) = wiki_state().await;
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "my-wiki".into(), summary: "desc".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "w1".into(),
+            name: "my-wiki".into(),
+            summary: "desc".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "w1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
         db.wiki_upsert_page(
             "w1",
             "deploy/prod",
@@ -523,15 +576,69 @@ mod tests {
             .unwrap();
         assert!(out.contains("deploy/prod"));
 
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "g1".into(), name: "same-name".into(), summary: "全局".into(), index_vector: false, index_pages: true, scope_type: "global".into(), client_id: "".into(), workspace_id: "".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "c1w".into(), name: "same-name".into(), summary: "客户端".into(), index_vector: false, index_pages: true, scope_type: "client".into(), client_id: "c1".into(), workspace_id: "".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1b".into(), name: "same-name".into(), summary: "工作区".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "g1".into(),
+            name: "same-name".into(),
+            summary: "全局".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "global".into(),
+            client_id: String::new(),
+            workspace_id: String::new(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "c1w".into(),
+            name: "same-name".into(),
+            summary: "客户端".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "client".into(),
+            client_id: "c1".into(),
+            workspace_id: String::new(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "w1b".into(),
+            name: "same-name".into(),
+            summary: "工作区".into(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "w1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
         db.wiki_upsert_page("w1b", "ws/page", "ws", "s", "ws content", false, None)
             .await
             .unwrap();
@@ -583,9 +690,27 @@ mod tests {
     #[tokio::test]
     async fn read_param_validation_and_bump() {
         let (db, wiki) = wiki_state().await;
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "my-wiki".into(), summary: "".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
+        db.ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: "w1".into(),
+            name: "my-wiki".into(),
+            summary: String::new(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "w1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
         db.wiki_upsert_page("w1", "a/b", "A", "sum A", "content A", false, None)
             .await
             .unwrap();

@@ -252,6 +252,7 @@ async fn resolve_kb_embedding(
 
 // ── Handlers ─────────────────────────────────────────────────────────
 
+/// `GET /api/knowledge`：分页列出知识容器，支持 `scope`/`index_kind`/`enabled`/关键词过滤，返回 `sources` 与 `total`。
 pub async fn list_sources(
     State(state): State<ApiState>,
     Query(params): Query<ListSourcesParams>,
@@ -299,6 +300,7 @@ pub async fn list_sources(
     Json(serde_json::json!({ "sources": out, "total": total })).into_response()
 }
 
+/// `POST /api/knowledge`：创建知识容器，至少启用 `index_vector`/`index_pages` 之一；`index_vector` 启用时解析并加密 embedding 配置后落库。
 pub async fn create_source(
     State(state): State<ApiState>,
     Json(body): Json<CreateSourceRequest>,
@@ -399,7 +401,11 @@ pub async fn create_source(
     }
 }
 
-pub async fn get_source(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+/// `GET /api/knowledge/:id`：查询单个知识容器的统一视图（含文档计数），不存在时返回 404。
+pub async fn get_source(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     let rt = match knowledge_rt(&state).await {
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
@@ -416,6 +422,12 @@ pub async fn get_source(State(state): State<ApiState>, Path(id): Path<String>) -
     Json(source_json(&src, doc_count)).into_response()
 }
 
+/// `PUT /api/knowledge/:id`：全量更新容器（名称/简介/检索参数/`index_vector`/`index_pages` 双开关及 embedding），仅向量启用且 `emb_base_url`/`emb_model`/`emb_dimension` 三元变化时触发全量重建。
+/// 重建前先持久化新配置并置 `enabled=false`，清空向量 shard 与 `knowledge_chunks` 后并发重建全部文档；开关变更或仅换 `emb_api_key` 不重建（`index_pages` 0→1 后已有文档需手动 reindex）。
+#[expect(
+    clippy::too_many_lines,
+    reason = "全量更新与条件重建同体：embedding 三元变化判定、落库、置 enabled=false、清 shard/分块与并发重建共享同一份新旧配置对比结果，拆分会让重建触发条件与实际重建脱节"
+)]
 pub async fn update_source(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -623,6 +635,7 @@ pub async fn update_source(
     .into_response()
 }
 
+/// `PATCH /api/knowledge/:id`：仅切换 `enabled` 可见性开关（`enabled` 布尔必填），与 `PUT` 全量更新语义不同；不改名、不改双索引开关、不触 embedding，永不触发重建。
 pub async fn patch_source(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -651,6 +664,7 @@ pub async fn patch_source(
     Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
+/// `DELETE /api/knowledge/:id`：删除知识容器，级联清理向量 shard 与 `knowledge_docs/<id>/` 原文目录后删除库记录；`pages-only` 容器的 shard 删除为安全 no-op。
 pub async fn delete_source(
     State(state): State<ApiState>,
     Path(id): Path<String>,

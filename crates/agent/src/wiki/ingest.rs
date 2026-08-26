@@ -1,32 +1,11 @@
-//! Wiki 文档摄入后台任务：提取 → 分块 → LLM 结构化抽取 → 落库 → 事件。
+//! Wiki 页面抽取器：LLM 结构化抽取能力的唯一承载。
 //!
-//! 放置在 `agent/wiki` 而非 `llm/rag`：Wiki 是 agent 工作台的第四类资产
-//! （与 memory/skill 同级，挂 `AgentState`），摄入产出是结构化页面+图谱边+FTS，
-//! 而非向量 shard；复用 `llm/rag/extractor` 与 `chunker` 仅为文本提取/分块能力，
-//! 不触碰 `VectorStore`。放在 `agent/wiki` 使依赖单向，与 `agent/memory/distill.rs`
-//! 的蒸馏管线同层，便于共享 `LlmState` / 设置回落语义。
+//! 不再自建摄入流水线（提取→分块→批次→重试→落库→事件），这些策略已收敛至
+//! `rust_tunnel_rag::ingest` 的统一双索引流水线；本模块只提供 prompt、LLM
+//! 调用与 JSON 解析，经 [`LlmPageExtractor`] 注入流水线。
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use futures_util::FutureExt;
-use tokio::sync::{broadcast, Semaphore};
-
-use crate::db::knowledge::IndexKind;
 use crate::db::Database;
-use crate::llm::rag::chunker;
-use crate::llm::rag::extractor::{self, FileType};
 use crate::llm::LlmState;
-use crate::wiki::WikiEvent;
-
-/// 单批次 LLM 输入的 chunk 数上限与 token 上限。
-const MAX_CHUNKS_PER_BATCH: usize = 3;
-const MAX_TOKENS_PER_BATCH: usize = 6000;
-/// LLM 输出 content 单页上限（字符）。
-const PAGE_CONTENT_MAX_CHARS: usize = 4000;
-/// LLM 输出 title/summary 上限。
-const TITLE_MAX_CHARS: usize = 64;
-const SUMMARY_MAX_CHARS: usize = 200;
 
 /// Wiki 抽取 prompt：要求严格 JSON array。
 const WIKI_EXTRACT_PROMPT: &str = r#"你是文档结构化抽取器。把以下 Markdown 切片提炼为结构化 Wiki 页面。
@@ -41,246 +20,43 @@ const WIKI_EXTRACT_PROMPT: &str = r#"你是文档结构化抽取器。把以下 
 - 若切片无可提炼内容，返回 []
 - 只输出 JSON 数组，不要解释"#;
 
-/// 启动 Wiki 文档摄入后台任务。
+/// pages 索引的页面抽取器：把一批 Markdown 文本经 LLM 提炼为结构化页面。
 ///
-/// 流程：CAS pending→processing（发事件）→ 提取 → chunk → LLM 批量抽取 → 单事务落库 →
-/// ready/failed 事件；`catch_unwind` 兜底 panic→failed（照 `rag/ingest.rs`）。
-///
-/// `sem` 为可选并发信号量：调用方注入 `Some(Arc<Semaphore(2)>)` 限流；`None` 不限。
-#[allow(clippy::too_many_arguments)] // 保留：tokio::spawn 闭包 8 参，混合基础设施参数
-pub fn spawn_wiki_ingest(
+/// 批次切分、失败重试、落库截断都由 `rust_tunnel_rag::ingest` 的统一流水线负责，
+/// 本类型只关心 prompt、LLM 调用与 JSON 解析。
+pub struct LlmPageExtractor {
     db: Database,
     llm: LlmState,
-    wiki_id: String,
-    doc_id: String,
-    source_path: PathBuf,
-    file_type: FileType,
-    tx: broadcast::Sender<WikiEvent>,
-    sem: Option<Arc<Semaphore>>,
-) {
-    tokio::spawn(async move {
-        let _guard = match sem {
-            Some(s) => Some(s.acquire_owned().await.ok()),
-            None => None,
-        };
-
-        let emit = |status: &str, page_count: i64, err: Option<String>| {
-            let _ = tx.send(WikiEvent {
-                wiki_id: wiki_id.clone(),
-                doc_id: doc_id.clone(),
-                status: status.to_string(),
-                page_count,
-                error: err,
-            });
-        };
-
-        let result = std::panic::AssertUnwindSafe(async {
-            // CAS pending→processing：仅 pending 可抢占（reindex/first ingest 共用）。
-            // upload 路径为新建 doc=pending，reindex 路径由 API 先 CAS pending，摄入在
-            // 此再 pending→processing，二次 CAS 保证与并发 reindex 互斥。
-            let moved = db
-                .kdoc_mark_processing_if_pending(&doc_id, IndexKind::Pages)
-                .await
-                .unwrap_or(false);
-            if !moved {
-                // pending 为初始态：CAS 未命中说明 doc 不存在或已被抢占/在途，退出不误发事件。
-                return;
-            }
-            let _ = db.ks_update_status(&wiki_id, "processing").await;
-            emit("processing", 0, None);
-
-            match do_ingest(&db, &llm, &wiki_id, &doc_id, &source_path, file_type).await {
-                Ok(count) => {
-                    let _ = db.kdoc_update_index_status(&doc_id, IndexKind::Pages, "ready", count, None).await;
-                    let _ = db.ks_update_status(&wiki_id, "ready").await;
-                    emit("ready", count, None);
-                }
-                Err(e) => {
-                    let _ = db.kdoc_update_index_status(&doc_id, IndexKind::Pages, "failed", 0, Some(&e)).await;
-                    let _ = db.ks_update_status(&wiki_id, "failed").await;
-                    emit("failed", 0, Some(e));
-                }
-            }
-        })
-        .catch_unwind()
-        .await;
-
-        if let Err(payload) = result {
-            let msg = panic_message(&*payload);
-            tracing::error!(wiki_id = %wiki_id, doc_id = %doc_id, panic = %msg, "wiki ingest task panicked");
-            let _ = db
-                .kdoc_update_index_status(&doc_id, IndexKind::Pages, "failed", 0, Some(&msg))
-                .await;
-            let _ = db.ks_update_status(&wiki_id, "failed").await;
-            emit("failed", 0, Some(msg));
-        }
-    });
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_owned()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_owned()
+impl LlmPageExtractor {
+    /// 同步构造。`distill_model` 在每次抽取时读取（本地 SQLite，成本可忽略），
+    /// 未配置时由 `extract_pages` 返回 Err 走流水线统一的失败路径。
+    #[must_use]
+    pub fn new(db: Database, llm: LlmState) -> Self {
+        Self { db, llm }
     }
 }
 
-// 提取→分块→LLM 批量抽取→落库的顺序编排，拆分会把相关状态散到多个签名里。
-#[allow(clippy::too_many_lines, reason = "提取→分块→LLM 批量抽取→落库的顺序编排，拆分会把相关状态散到多个签名里")]
-async fn do_ingest(
-    db: &Database,
-    llm: &LlmState,
-    wiki_id: &str,
-    doc_id: &str,
-    source_path: &std::path::Path,
-    file_type: FileType,
-) -> Result<i64, String> {
-    let settings = db.memory_get_settings().await.map_err(|e| e.to_string())?;
-    let model = settings.distill_model.trim().to_string();
-    if model.is_empty() {
-        return Err("LLM 未配置：请在 设置 → AI 记忆体 中配置 distill_model".to_string());
-    }
-
-    let bytes = tokio::fs::read(source_path)
-        .await
-        .map_err(|e| format!("read source file: {e}"))?;
-    let content = tokio::task::spawn_blocking(move || extractor::extract(&bytes, file_type))
-        .await
-        .map_err(|e| format!("extract task: {e}"))?
-        .map_err(|e| e.to_string())?;
-    if content.trim().is_empty() {
-        return Err("no text extracted from document".to_string());
-    }
-    let chunks = chunker::chunk_markdown(&content, 1200, 150);
-    if chunks.is_empty() {
-        return Err("empty content".to_string());
-    }
-
-    let batches = batch_chunks(&chunks);
-    let mut all_pages: Vec<ExtractedPage> = Vec::new();
-    let mut last_err: Option<String> = None;
-    for batch in batches {
-        let batch_text = batch
-            .iter()
-            .map(|c| c.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
-        let mut attempt = 0;
-        let mut success = false;
-        while attempt < 2 {
-            match call_wiki_llm(llm, &model, &batch_text).await {
-                Ok(raw) => match parse_extract_value(&raw) {
-                    Ok(pages) => {
-                        all_pages.extend(pages);
-                        success = true;
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e.clone());
-                        attempt += 1;
-                        if attempt >= 2 {
-                            return Err(format!("LLM 返回 JSON 解析失败: {e}"));
-                        }
-                        tracing::warn!(wiki_id, doc_id, error = %e, attempt, "wiki LLM parse failed, retrying");
-                    }
-                },
-                Err(e) => {
-                    last_err = Some(e.clone());
-                    attempt += 1;
-                    if attempt >= 2 {
-                        return Err(e);
-                    }
-                    tracing::warn!(wiki_id, doc_id, error = %e, attempt, "wiki LLM call failed, retrying");
-                }
-            }
-        }
-        if !success {
-            if let Some(e) = last_err.take() {
-                return Err(e);
-            }
-        }
-    }
-
-    // 空抽取（切片无可提炼内容）→ ready page_count=0（不置 failed，属正常完成）。
-    if all_pages.is_empty() {
-        db.wiki_clear_pages_by_doc(wiki_id, doc_id)
+#[async_trait::async_trait]
+impl rust_tunnel_rag::ingest::PageExtractor for LlmPageExtractor {
+    async fn extract_pages(
+        &self,
+        batch_text: &str,
+    ) -> Result<Vec<rust_tunnel_rag::ingest::ExtractedPage>, String> {
+        let settings = self
+            .db
+            .memory_get_settings()
             .await
             .map_err(|e| e.to_string())?;
-        return Ok(0);
-    }
-
-    db.wiki_clear_pages_by_doc(wiki_id, doc_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut seen = std::collections::HashSet::new();
-    let mut upserted = 0i64;
-    for page in &all_pages {
-        let Some(norm_ref) = crate::db::wiki::normalize_wiki_ref(&page.page_ref) else {
-            tracing::warn!(wiki_id, doc_id, r = %page.page_ref, "wiki ingest: skip invalid ref");
-            continue;
-        };
-        if !seen.insert(norm_ref.clone()) {
-            // 同批次重复 ref，后者覆盖前者：DAO upsert 已处理覆盖
+        let model = settings.distill_model.trim().to_string();
+        if model.is_empty() {
+            return Err("LLM 未配置：请在 设置 → AI 记忆体 中配置 distill_model".to_string());
         }
-        let title = truncate_chars(&page.title, TITLE_MAX_CHARS);
-        let summary = truncate_chars(&page.summary, SUMMARY_MAX_CHARS);
-        let content = truncate_chars(&page.content, PAGE_CONTENT_MAX_CHARS);
-        match db
-            .wiki_upsert_page(
-                wiki_id,
-                &norm_ref,
-                &title,
-                &summary,
-                &content,
-                false,
-                Some(doc_id),
-            )
-            .await
-        {
-            Ok(_) => upserted += 1,
-            Err(e) => {
-                tracing::warn!(wiki_id, doc_id, r = %norm_ref, error = %e, "wiki ingest: upsert page failed");
-            }
-        }
+        let raw = call_wiki_llm(&self.llm, &model, batch_text).await?;
+        let pages = parse_extract_value(&raw)?;
+        Ok(pages)
     }
-
-    Ok(upserted)
-}
-
-fn batch_chunks(chunks: &[chunker::Chunk]) -> Vec<Vec<chunker::Chunk>> {
-    let mut batches: Vec<Vec<chunker::Chunk>> = Vec::new();
-    let mut cur: Vec<chunker::Chunk> = Vec::new();
-    let mut cur_tokens = 0usize;
-    for c in chunks {
-        let tok = c.token_count;
-        if !cur.is_empty()
-            && (cur.len() >= MAX_CHUNKS_PER_BATCH || cur_tokens + tok > MAX_TOKENS_PER_BATCH)
-        {
-            batches.push(std::mem::take(&mut cur));
-            cur_tokens = 0;
-        }
-        cur_tokens += tok;
-        cur.push(c.clone());
-        if cur.len() >= MAX_CHUNKS_PER_BATCH || cur_tokens >= MAX_TOKENS_PER_BATCH {
-            batches.push(std::mem::take(&mut cur));
-            cur_tokens = 0;
-        }
-    }
-    if !cur.is_empty() {
-        batches.push(cur);
-    }
-    batches
-}
-
-#[derive(Debug, Clone)]
-struct ExtractedPage {
-    page_ref: String,
-    title: String,
-    summary: String,
-    content: String,
 }
 
 async fn call_wiki_llm(llm: &LlmState, model: &str, batch_text: &str) -> Result<String, String> {
@@ -330,7 +106,7 @@ async fn call_wiki_llm(llm: &LlmState, model: &str, batch_text: &str) -> Result<
     Ok(raw.to_string())
 }
 
-fn parse_extract_value(raw: &str) -> Result<Vec<ExtractedPage>, String> {
+fn parse_extract_value(raw: &str) -> Result<Vec<rust_tunnel_rag::ingest::ExtractedPage>, String> {
     let cleaned = strip_code_fence(raw);
     let json_str = extract_json_array(&cleaned);
     let value: serde_json::Value =
@@ -371,7 +147,7 @@ fn parse_extract_value(raw: &str) -> Result<Vec<ExtractedPage>, String> {
         if content.is_empty() {
             continue;
         }
-        pages.push(ExtractedPage {
+        pages.push(rust_tunnel_rag::ingest::ExtractedPage {
             page_ref: norm,
             title,
             summary,
@@ -399,13 +175,6 @@ fn extract_json_array(text: &str) -> String {
         (Some(start), Some(end)) if end > start => text[start..=end].to_string(),
         _ => text.to_string(),
     }
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    s.chars().take(max).collect()
 }
 
 #[cfg(test)]
@@ -452,40 +221,20 @@ mod tests {
         assert_eq!(pages[0].page_ref, "good/ref");
     }
 
-    #[test]
-    fn batch_chunks_respects_limits() {
-        let chunks = vec![
-            chunker::Chunk {
-                heading_path: String::new(),
-                content: "a".repeat(4000),
-                token_count: 1000,
-            },
-            chunker::Chunk {
-                heading_path: String::new(),
-                content: "b".repeat(4000),
-                token_count: 1000,
-            },
-            chunker::Chunk {
-                heading_path: String::new(),
-                content: "c".repeat(4000),
-                token_count: 1000,
-            },
-            chunker::Chunk {
-                heading_path: String::new(),
-                content: "d".repeat(4000),
-                token_count: 1000,
-            },
-        ];
-        let batches = batch_chunks(&chunks);
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 3);
-        assert_eq!(batches[1].len(), 1);
-    }
+    // ── 管线级测试：经统一流水线 + mock LLM 上游 + 真实 DAO/FTS ─────────────────
 
-    // ── 管线级测试：mock LLM 上游 + 真实 DAO/FTS ─────────────────
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use axum::response::IntoResponse as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::broadcast;
+
+    use crate::db::knowledge::{IndexKind, KsCreateOpts};
+    use crate::llm::LlmState;
+    use rust_tunnel_rag::extractor::FileType;
+    use rust_tunnel_rag::ingest::{IngestOpts, KbEvent};
+    use rust_tunnel_rag::store::VectorStore;
 
     /// 起一个 mock LLM 上游（`POST /v1/chat/completions`）。`content` 为
     /// choices[0].message.content 的原始字符串；`status` 非 200 时返回错误体。
@@ -528,8 +277,16 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
+    /// TempDir 放前、store 放后：qdrant-edge 的 `EdgeShard` Drop 时同步 flush
+    /// 并 `expect()`（目录已删会 panic），故 store 必须先于 TempDir 析构。
+    fn tmp_store() -> (tempfile::TempDir, VectorStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::new(dir.path());
+        (dir, store)
+    }
+
     /// 测试基建：内存 DB + 注册 mock provider/model + distill_model 设置 +
-    /// wiki/doc 行 + 落盘 md 原文。返回 (db, llm, wiki_id, doc_id, source_path, _tmp)。
+    /// 容器/doc 行 + 落盘 md 原文。返回 (db, llm, source_id, doc_id, source_path, _tmp)。
     async fn pipeline_fixture(
         base_url: &str,
         doc_body: &str,
@@ -564,9 +321,27 @@ mod tests {
         db.memory_upsert_settings(&settings).await.unwrap();
         let llm = LlmState::new(Some(db.clone()), Some(cipher));
 
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "ops".into(), summary: "".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "ws1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
+        db.ks_create(&KsCreateOpts {
+            id: "w1".into(),
+            name: "ops".into(),
+            summary: String::new(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "ws1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
         db.kdoc_create("d1", "w1", "ops.md", "md", "h1")
             .await
             .unwrap();
@@ -576,18 +351,33 @@ mod tests {
         (db, llm, "w1".into(), "d1".into(), path, tmp)
     }
 
-    /// 收集事件直到 ready/failed（带超时），返回事件序列。
-    async fn collect_events(rx: &mut broadcast::Receiver<WikiEvent>) -> Vec<WikiEvent> {
+    /// 等下一条事件：同时容纳超时与 `Closed`（tx 被 move 进任务、结束后 sender 被 drop）。
+    async fn next_kb_event(rx: &mut broadcast::Receiver<KbEvent>) -> Option<KbEvent> {
+        match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv()).await {
+            Ok(Ok(ev)) => Some(ev),
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                // 低频测试不应 lag；若发生则继续等下一条
+                None
+            }
+            // `Closed`（tx 被 move 进任务、结束后 sender 被 drop）与超时同走结束路径。
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// 收集事件直到 pages 终态（ready/failed），同时容纳 `Closed`/超时。
+    async fn collect_pages_events(rx: &mut broadcast::Receiver<KbEvent>) -> Vec<KbEvent> {
         let mut out = Vec::new();
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-                .await
-                .expect("event timeout")
-                .expect("channel open");
-            let terminal = ev.status == "ready" || ev.status == "failed";
-            out.push(ev);
-            if terminal {
+            let Some(ev) = next_kb_event(rx).await else {
                 break;
+            };
+            let is_pages = ev.kind == IndexKind::Pages;
+            let terminal = ev.status == "ready" || ev.status == "failed";
+            if is_pages {
+                out.push(ev);
+                if terminal {
+                    break;
+                }
             }
         }
         out
@@ -598,66 +388,92 @@ mod tests {
     #[tokio::test]
     async fn pipeline_ready_emits_events_and_upserts_pages_and_edges() {
         let (base, _hits) = start_mock_llm(TWO_PAGES, 200).await;
-        let (db, llm, wiki, doc, path, _tmp) =
+        let (db, llm, source_id, doc_id, path, _tmp) =
             pipeline_fixture(&base, "# 运维手册\n\n部署前先备份。").await;
-        let (tx, mut rx) = broadcast::channel(8);
-        spawn_wiki_ingest(
-            db.clone(),
-            llm,
-            wiki.clone(),
-            doc.clone(),
-            path,
-            FileType::Markdown,
+        let source = db.ks_get(&source_id).await.unwrap().unwrap();
+        let (_store_dir, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(32);
+        rust_tunnel_rag::ingest::spawn_ingest(IngestOpts {
+            db: db.clone(),
+            store: store.clone(),
+            cipher: None,
+            source: source.clone(),
+            doc_id: doc_id.clone(),
+            source_path: path,
+            file_type: FileType::Markdown,
             tx,
-            None,
-        );
-        let events = collect_events(&mut rx).await;
+            vector_sem: None,
+            pages_sem: None,
+            page_extractor: Some(Arc::new(LlmPageExtractor::new(db.clone(), llm.clone()))),
+            only: Some(IndexKind::Pages),
+        });
+        let events = collect_pages_events(&mut rx).await;
 
-        assert_eq!(events.first().unwrap().status, "processing");
-        let last = events.last().unwrap();
+        assert!(
+            events.iter().any(|e| e.status == "processing"),
+            "应有 processing 事件: {events:?}"
+        );
+        let last = events.last().expect("应有终态事件");
         assert_eq!(last.status, "ready");
-        assert_eq!(last.page_count, 2);
+        assert_eq!(last.kind, IndexKind::Pages);
+        assert_eq!(last.chunk_count, 2, "chunk_count 即页数");
 
         let page = db
-            .wiki_get_page(&wiki, "deploy/checklist")
+            .wiki_get_page(&source_id, "deploy/checklist")
             .await
             .unwrap()
             .unwrap();
         assert!(page.content.contains("[[ops/backup]]"));
-        assert_eq!(page.source_doc_id.as_deref(), Some(doc.as_str()));
+        assert_eq!(page.source_doc_id.as_deref(), Some(doc_id.as_str()));
 
-        let graph = db.wiki_graph(&wiki).await.unwrap();
+        let graph = db.wiki_graph(&source_id).await.unwrap();
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1, "[[ref]] 应建边");
         assert!(graph.edges[0].to.is_some(), "闭合链接应回填 dst page id");
         assert!(!graph.edges[0].dangling);
 
-        let w = db.ks_get(&wiki).await.unwrap().unwrap();
+        let w = db.ks_get(&source_id).await.unwrap().unwrap();
         assert_eq!(w.status, "ready");
         assert_eq!(w.page_count, 2);
-        let idx = db.kdoc_get_index(&doc, crate::db::knowledge::IndexKind::Pages).await.unwrap().unwrap();
+        let idx = db
+            .kdoc_get_index(&doc_id, IndexKind::Pages)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(idx.status, "ready");
     }
 
     #[tokio::test]
     async fn pipeline_llm_500_marks_failed() {
         let (base, _hits) = start_mock_llm("", 500).await;
-        let (db, llm, wiki, doc, path, _tmp) = pipeline_fixture(&base, "# 手册\n\n内容。").await;
-        let (tx, mut rx) = broadcast::channel(8);
-        spawn_wiki_ingest(
-            db.clone(),
-            llm,
-            wiki.clone(),
-            doc.clone(),
-            path,
-            FileType::Markdown,
+        let (db, llm, source_id, doc_id, path, _tmp) =
+            pipeline_fixture(&base, "# 手册\n\n内容。").await;
+        let source = db.ks_get(&source_id).await.unwrap().unwrap();
+        let (_store_dir, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(32);
+        rust_tunnel_rag::ingest::spawn_ingest(IngestOpts {
+            db: db.clone(),
+            store: store.clone(),
+            cipher: None,
+            source: source.clone(),
+            doc_id: doc_id.clone(),
+            source_path: path,
+            file_type: FileType::Markdown,
             tx,
-            None,
-        );
-        let events = collect_events(&mut rx).await;
+            vector_sem: None,
+            pages_sem: None,
+            page_extractor: Some(Arc::new(LlmPageExtractor::new(db.clone(), llm.clone()))),
+            only: Some(IndexKind::Pages),
+        });
+        let events = collect_pages_events(&mut rx).await;
 
         assert_eq!(events.last().unwrap().status, "failed");
-        let idx = db.kdoc_get_index(&doc, crate::db::knowledge::IndexKind::Pages).await.unwrap().unwrap();
+        assert_eq!(events.last().unwrap().kind, IndexKind::Pages);
+        let idx = db
+            .kdoc_get_index(&doc_id, IndexKind::Pages)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(idx.status, "failed");
         assert!(idx.error.is_some());
     }
@@ -665,19 +481,26 @@ mod tests {
     #[tokio::test]
     async fn pipeline_bad_json_retries_then_fails() {
         let (base, hits) = start_mock_llm("这不是 JSON", 200).await;
-        let (db, llm, wiki, doc, path, _tmp) = pipeline_fixture(&base, "# 手册\n\n内容。").await;
-        let (tx, mut rx) = broadcast::channel(8);
-        spawn_wiki_ingest(
-            db.clone(),
-            llm,
-            wiki.clone(),
-            doc.clone(),
-            path,
-            FileType::Markdown,
+        let (db, llm, source_id, doc_id, path, _tmp) =
+            pipeline_fixture(&base, "# 手册\n\n内容。").await;
+        let source = db.ks_get(&source_id).await.unwrap().unwrap();
+        let (_store_dir, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(32);
+        rust_tunnel_rag::ingest::spawn_ingest(IngestOpts {
+            db: db.clone(),
+            store: store.clone(),
+            cipher: None,
+            source: source.clone(),
+            doc_id: doc_id.clone(),
+            source_path: path,
+            file_type: FileType::Markdown,
             tx,
-            None,
-        );
-        let events = collect_events(&mut rx).await;
+            vector_sem: None,
+            pages_sem: None,
+            page_extractor: Some(Arc::new(LlmPageExtractor::new(db.clone(), llm.clone()))),
+            only: Some(IndexKind::Pages),
+        });
+        let events = collect_pages_events(&mut rx).await;
 
         assert_eq!(events.last().unwrap().status, "failed");
         assert!(events
@@ -687,6 +510,7 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("JSON"));
+        // 流水线对每批次重试一次（BATCH_ATTEMPTS=2），本文档仅 1 批次
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
@@ -697,35 +521,43 @@ mod tests {
     #[tokio::test]
     async fn pipeline_empty_array_ready_with_zero_pages() {
         let (base, _hits) = start_mock_llm("[]", 200).await;
-        let (db, llm, wiki, doc, path, _tmp) = pipeline_fixture(&base, "# 空\n\n无内容。").await;
-        let (tx, mut rx) = broadcast::channel(8);
-        spawn_wiki_ingest(
-            db.clone(),
-            llm,
-            wiki.clone(),
-            doc.clone(),
-            path,
-            FileType::Markdown,
+        let (db, llm, source_id, doc_id, path, _tmp) =
+            pipeline_fixture(&base, "# 空\n\n无内容。").await;
+        let source = db.ks_get(&source_id).await.unwrap().unwrap();
+        let (_store_dir, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(32);
+        rust_tunnel_rag::ingest::spawn_ingest(IngestOpts {
+            db: db.clone(),
+            store: store.clone(),
+            cipher: None,
+            source: source.clone(),
+            doc_id: doc_id.clone(),
+            source_path: path,
+            file_type: FileType::Markdown,
             tx,
-            None,
-        );
-        let events = collect_events(&mut rx).await;
+            vector_sem: None,
+            pages_sem: None,
+            page_extractor: Some(Arc::new(LlmPageExtractor::new(db.clone(), llm.clone()))),
+            only: Some(IndexKind::Pages),
+        });
+        let events = collect_pages_events(&mut rx).await;
 
         let last = events.last().unwrap();
         assert_eq!(last.status, "ready");
-        assert_eq!(last.page_count, 0);
-        let w = db.ks_get(&wiki).await.unwrap().unwrap();
+        assert_eq!(last.chunk_count, 0);
+        assert_eq!(last.kind, IndexKind::Pages);
+        let w = db.ks_get(&source_id).await.unwrap().unwrap();
         assert_eq!(w.page_count, 0);
     }
 
     #[tokio::test]
     async fn pipeline_locked_page_survives_reingest() {
         let (base, _hits) = start_mock_llm(TWO_PAGES, 200).await;
-        let (db, llm, wiki, doc, path, _tmp) =
+        let (db, llm, source_id, doc_id, path, _tmp) =
             pipeline_fixture(&base, "# 运维手册\n\n部署前先备份。").await;
         // 预置同 ref 的 locked 手动页
         db.wiki_upsert_page(
-            &wiki,
+            &source_id,
             "deploy/checklist",
             "手动页",
             "手动摘要",
@@ -735,22 +567,28 @@ mod tests {
         )
         .await
         .unwrap();
-        let (tx, mut rx) = broadcast::channel(8);
-        spawn_wiki_ingest(
-            db.clone(),
-            llm,
-            wiki.clone(),
-            doc.clone(),
-            path,
-            FileType::Markdown,
+        let source = db.ks_get(&source_id).await.unwrap().unwrap();
+        let (_store_dir, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(32);
+        rust_tunnel_rag::ingest::spawn_ingest(IngestOpts {
+            db: db.clone(),
+            store: store.clone(),
+            cipher: None,
+            source: source.clone(),
+            doc_id: doc_id.clone(),
+            source_path: path,
+            file_type: FileType::Markdown,
             tx,
-            None,
-        );
-        let events = collect_events(&mut rx).await;
+            vector_sem: None,
+            pages_sem: None,
+            page_extractor: Some(Arc::new(LlmPageExtractor::new(db.clone(), llm.clone()))),
+            only: Some(IndexKind::Pages),
+        });
+        let events = collect_pages_events(&mut rx).await;
         assert_eq!(events.last().unwrap().status, "ready");
 
         let page = db
-            .wiki_get_page(&wiki, "deploy/checklist")
+            .wiki_get_page(&source_id, "deploy/checklist")
             .await
             .unwrap()
             .unwrap();
@@ -762,27 +600,51 @@ mod tests {
     async fn pipeline_missing_model_config_fails_fast() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
         let llm = LlmState::new(Some(db.clone()), None); // distill_model 未配置
-        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "ops".into(), summary: "".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "ws1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
-            .await
-            .unwrap();
+        db.ks_create(&KsCreateOpts {
+            id: "w1".into(),
+            name: "ops".into(),
+            summary: String::new(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: "workspace".into(),
+            client_id: "c1".into(),
+            workspace_id: "ws1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
+        .await
+        .unwrap();
         db.kdoc_create("d1", "w1", "ops.md", "md", "h1")
             .await
             .unwrap();
+        let source = db.ks_get("w1").await.unwrap().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("d1.md");
         std::fs::write(&path, "# 手册\n\n内容。").unwrap();
-        let (tx, mut rx) = broadcast::channel(8);
-        spawn_wiki_ingest(
-            db.clone(),
-            llm,
-            "w1".into(),
-            "d1".into(),
-            path,
-            FileType::Markdown,
+        let (store_dir, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(32);
+        rust_tunnel_rag::ingest::spawn_ingest(IngestOpts {
+            db: db.clone(),
+            store: store.clone(),
+            cipher: None,
+            source: source.clone(),
+            doc_id: "d1".into(),
+            source_path: path,
+            file_type: FileType::Markdown,
             tx,
-            None,
-        );
-        let events = collect_events(&mut rx).await;
+            vector_sem: None,
+            pages_sem: None,
+            page_extractor: Some(Arc::new(LlmPageExtractor::new(db.clone(), llm.clone()))),
+            only: Some(IndexKind::Pages),
+        });
+        let events = collect_pages_events(&mut rx).await;
         assert_eq!(events.last().unwrap().status, "failed");
         assert!(events
             .last()
@@ -791,5 +653,8 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("distill_model"));
+        // `tmp` 与 `store_dir`/`store` 的析构顺序由声明顺序保证（store 先于 dir），
+        // 无需手动 drop，保留至任务结束即可。
+        let _ = (&tmp, &store_dir);
     }
 }

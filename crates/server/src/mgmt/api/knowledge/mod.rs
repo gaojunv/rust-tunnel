@@ -19,9 +19,13 @@ mod query_events;
 mod sources;
 
 pub use docs::{delete_doc, get_doc, list_docs, reindex_doc, upload_doc};
-pub use pages::{delete_page, get_graph, get_page, list_pages, put_page, search_all, search_knowledge};
+pub use pages::{
+    delete_page, get_graph, get_page, list_pages, put_page, search_all, search_knowledge,
+};
 pub use query_events::{query_knowledge, sse_knowledge_events, test_embedding};
-pub use sources::{create_source, delete_source, get_source, list_sources, patch_source, update_source};
+pub use sources::{
+    create_source, delete_source, get_source, list_sources, patch_source, update_source,
+};
 
 use std::sync::Arc;
 
@@ -82,8 +86,7 @@ pub(crate) async fn knowledge_rt(
         .clone()
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no database".to_string()))?;
     // 复用 Wiki 的 LLM 并发池（2），语义是「LLM 调用总并发 2」。
-    let wiki = crate::mgmt::api::agent::wiki_runtime(state)
-        .map_err(|(c, m)| (c, m))?;
+    let wiki = crate::mgmt::api::agent::wiki_runtime(state)?;
     Ok(KnowledgeRuntime {
         db,
         store: llm.rag_store.clone(),
@@ -120,10 +123,7 @@ pub fn protected_router() -> Router<ApiState> {
             "/api/knowledge/:id/docs/:doc_id",
             get(get_doc).delete(delete_doc),
         )
-        .route(
-            "/api/knowledge/:id/docs/:doc_id/reindex",
-            post(reindex_doc),
-        )
+        .route("/api/knowledge/:id/docs/:doc_id/reindex", post(reindex_doc))
         .route("/api/knowledge/test-embedding", post(test_embedding))
         .route("/api/knowledge/:id/query", post(query_knowledge))
         .route("/api/knowledge/:id/pages", get(list_pages))
@@ -201,7 +201,11 @@ mod tests {
                 llm.cipher.clone(),
                 (*llm).clone(),
             );
-            let agent = server_state.agent_state.take().expect("agent state").with_memory(mem);
+            let agent = server_state
+                .agent_state
+                .take()
+                .expect("agent state")
+                .with_memory(mem);
             server_state.agent_state = Some(agent);
         }
         ApiState {
@@ -215,7 +219,10 @@ mod tests {
     fn test_router(state: ApiState) -> Router {
         let public = Router::new().route("/api/knowledge/events", get(super::sse_knowledge_events));
         let protected = Router::new()
-            .route("/api/knowledge", get(super::list_sources).post(super::create_source))
+            .route(
+                "/api/knowledge",
+                get(super::list_sources).post(super::create_source),
+            )
             .route(
                 "/api/knowledge/:id",
                 get(super::get_source)
@@ -241,7 +248,9 @@ mod tests {
             .route("/api/knowledge/:id/pages", get(super::list_pages))
             .route(
                 "/api/knowledge/:id/pages/*ref",
-                get(super::get_page).put(super::put_page).delete(super::delete_page),
+                get(super::get_page)
+                    .put(super::put_page)
+                    .delete(super::delete_page),
             )
             .route("/api/knowledge/:id/graph", get(super::get_graph))
             .route("/api/knowledge/:id/search", get(super::search_knowledge))
@@ -388,12 +397,16 @@ mod tests {
             .await;
             assert_eq!(status, HttpStatus::OK);
             // 统一视图：vector 侧状态在 body["vector"]["status"]
-            let v_status = body.get("vector").and_then(|v| v.get("status")).and_then(|s| s.as_str()).unwrap_or("");
+            let v_status = body
+                .get("vector")
+                .and_then(|v| v.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
             if v_status == "ready" {
                 return body
                     .get("vector")
                     .and_then(|v| v.get("chunk_count"))
-                    .and_then(|c| c.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -640,7 +653,11 @@ mod tests {
 
         let (status, _body) = call(
             &app,
-            json_request(Method::DELETE, format!("/api/knowledge/{kb_id}"), &json!(null)),
+            json_request(
+                Method::DELETE,
+                format!("/api/knowledge/{kb_id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -1155,9 +1172,15 @@ mod tests {
         db.kdoc_create(&doc_id, &kb_id, "busy.md", "md", "sha256:x")
             .await
             .unwrap();
-        db.kdoc_update_index_status(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector, "processing", 0, None)
-            .await
-            .unwrap();
+        db.kdoc_update_index_status(
+            &doc_id,
+            rust_tunnel_persistence::knowledge::IndexKind::Vector,
+            "processing",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         let source_path = dir
             .path()
             .join("knowledge_docs")
@@ -1182,9 +1205,15 @@ mod tests {
             body_text.contains("document is being processed, retry later"),
             "processing 中 reindex 应 409, got: {body_text}"
         );
-        db.kdoc_update_index_status(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector, "pending", 0, None)
-            .await
-            .unwrap();
+        db.kdoc_update_index_status(
+            &doc_id,
+            rust_tunnel_persistence::knowledge::IndexKind::Vector,
+            "pending",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
         let (status, _body) = call(
             &app,
             json_request(
@@ -1311,7 +1340,10 @@ mod tests {
         assert_eq!(after.emb_dimension, before.emb_dimension);
 
         let idx = db
-            .kdoc_get_index(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector)
+            .kdoc_get_index(
+                &doc_id,
+                rust_tunnel_persistence::knowledge::IndexKind::Vector,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1387,6 +1419,10 @@ mod tests {
     // ── Wiki 迁移测试（原 agent/wiki.rs） ──────────────────────────
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Wiki 容器端到端测试：CRUD→手工建页→搜索→设置需在同一 router 与临时目录上按序验证，拆分会丢失前序状态"
+    )]
     async fn wiki_container_crud_and_manual_page_and_search_and_settings() {
         let dir = tempfile::tempdir().unwrap();
         let app = wiki_test_router(test_api_state(dir.path()).await);

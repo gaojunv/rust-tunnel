@@ -2,7 +2,10 @@ use super::Database;
 use sqlx::{Pool, Sqlite};
 
 impl Database {
-    #[allow(clippy::too_many_lines, reason = "建表与幂等迁移的顺序编排，需按依赖集中初始化，拆分会分散约束")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "建表与幂等迁移的顺序编排，需按依赖集中初始化，拆分会分散约束"
+    )]
     /// Initialize database tables
     pub(crate) async fn initialize_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         // Enable WAL mode for concurrent reads/writes and set synchronous to NORMAL
@@ -2533,6 +2536,10 @@ mod tests {
         .unwrap();
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "旧 Wiki 表结构的建表 DDL 编排，拆分会把同一套表定义分散到多处"
+    )]
     async fn create_old_wiki_schema(pool: &sqlx::Pool<sqlx::Sqlite>) {
         sqlx::query(
             r"
@@ -2763,6 +2770,10 @@ mod tests {
 
     /// 1) KB+Wiki 存量统一到 knowledge_*，id/计数/索引标志正确。
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "端到端迁移测试：搭旧库→跑迁移→逐项校验须在同一测试内完成，拆分会丢失断言上下文"
+    )]
     async fn migration_unifies_kb_and_wiki_into_knowledge_sources() {
         // 用裸 sqlite::memory: 手动搭旧表+数据（不走 initialize_schema，避免新表提前存在）
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
