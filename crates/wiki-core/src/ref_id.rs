@@ -38,10 +38,9 @@ impl RefId {
         if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
             return None;
         }
-        if !s
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-')
-        {
+        if !s.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+        }) {
             return None;
         }
         Some(Self(s))
