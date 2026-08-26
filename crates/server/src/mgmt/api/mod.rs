@@ -26,6 +26,9 @@ pub mod dns;
 pub mod dto;
 /// API 错误类型。
 pub mod error;
+/// 统一知识容器路由（双索引容器 + 文档 + 页面 + 检索 + SSE，仅 rag feature）。
+#[cfg(feature = "rag")]
+pub mod knowledge;
 /// LLM 网关与模型组路由。
 pub mod llm;
 /// 登录与健康检查路由。
@@ -36,9 +39,6 @@ pub mod logs;
 pub mod mesh;
 /// 用户偏好路由。
 pub mod preferences;
-/// 统一知识容器路由（双索引容器 + 文档 + 页面 + 检索 + SSE，仅 rag feature）。
-#[cfg(feature = "rag")]
-pub mod knowledge;
 /// 反向代理规则与配置路由。
 pub mod reverse_proxy;
 /// 服务端接入 Token 管理路由。
@@ -220,7 +220,10 @@ pub struct ApiState {
 ///
 /// # Errors
 /// 当绑定 `api_addr` 或 80 端口监听失败，或 TLS 握手/HTTP 服务启动出错时返回 `std::io::Error`。
-#[allow(clippy::too_many_lines, reason = "路由装配按功能域顺序注册 30+ 组端点，含 TLS/非 TLS 双分支的监听与重定向，拆分会打散路由一览性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "路由装配按功能域顺序注册 30+ 组端点，含 TLS/非 TLS 双分支的监听与重定向，拆分会打散路由一览性"
+)]
 pub async fn run_api_server(
     api_addr: String,
     server_state: ServerState,
@@ -617,20 +620,20 @@ pub async fn run_api_server(
         };
 
         // Start HTTP redirect server on port 80
-        let http_app =
-            axum::Router::new().fallback(|req: axum::http::Request<Body>| async move {
-                let uri = req.uri();
-                let host = uri.host().unwrap_or("localhost").to_string();
-                let path = format!(
-                    "https://{host}{}",
-                    uri.path_and_query().map_or("/", axum::http::uri::PathAndQuery::as_str),
-                );
-                (
-                    StatusCode::MOVED_PERMANENTLY,
-                    [(axum::http::header::LOCATION, path)],
-                )
-                    .into_response()
-            });
+        let http_app = axum::Router::new().fallback(|req: axum::http::Request<Body>| async move {
+            let uri = req.uri();
+            let host = uri.host().unwrap_or("localhost").to_string();
+            let path = format!(
+                "https://{host}{}",
+                uri.path_and_query()
+                    .map_or("/", axum::http::uri::PathAndQuery::as_str),
+            );
+            (
+                StatusCode::MOVED_PERMANENTLY,
+                [(axum::http::header::LOCATION, path)],
+            )
+                .into_response()
+        });
 
         tokio::spawn(async move {
             let http_listener = match tokio::net::TcpListener::bind(&http_addr).await {

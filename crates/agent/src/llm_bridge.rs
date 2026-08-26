@@ -57,7 +57,10 @@ pub struct AgentLlmProxyChunk {
 /// # 契约
 /// 无论成功/失败，流总是以 `done=true` 的 chunk 结束（见 [`AgentLlmProxyChunk`]）。
 // 模型解析 + 路径分发 + 流式切块的顺序编排，共享大量局部状态，拆分会把相关逻辑散到多个签名里。
-#[allow(clippy::too_many_lines, reason = "模型解析 + 路径分发 + 流式切块的顺序编排，共享大量局部状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "模型解析 + 路径分发 + 流式切块的顺序编排，共享大量局部状态"
+)]
 pub fn forward(
     db: Database,
     session_id: String,

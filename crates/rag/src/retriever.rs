@@ -129,7 +129,10 @@ mod tests {
         ];
         let kept = filter_by_threshold(pts, 0.3);
         assert_eq!(kept.len(), 1);
-        #[allow(clippy::float_cmp, reason = "测试断言：阈值过滤后保留的 0.9 为构造时精确值")]
+        #[allow(
+            clippy::float_cmp,
+            reason = "测试断言：阈值过滤后保留的 0.9 为构造时精确值"
+        )]
         {
             assert_eq!(kept[0].score, 0.9);
         }

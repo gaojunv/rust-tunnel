@@ -133,7 +133,10 @@ impl EntityStats {
             let dt = (last.0 - first.0).as_secs_f64();
             if dt > 0.0 {
                 // 统计速率展示允许精度损失，大整数转 f64 误差可接受。
-                #[allow(clippy::cast_precision_loss, reason = "统计速率展示，u64 转 f64 精度损失可接受")]
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "统计速率展示，u64 转 f64 精度损失可接受"
+                )]
                 {
                     self.bytes_in_rate = (last.1.saturating_sub(first.1)) as f64 / dt;
                     self.bytes_out_rate = (last.2.saturating_sub(first.2)) as f64 / dt;
@@ -175,7 +178,10 @@ impl EntityStats {
             rtt_ms: self.median_rtt(),
             loss_pct: None,
             active_conns: {
-                #[allow(clippy::cast_possible_truncation, reason = "活跃连接数远小于 i32::MAX，截断不可达")]
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "活跃连接数远小于 i32::MAX，截断不可达"
+                )]
                 {
                     self.active_conns as i32
                 }

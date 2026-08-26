@@ -64,7 +64,10 @@ async fn test_acp_handshake_prompt_streams_events() {
 }
 
 #[tokio::test]
-#[allow(clippy::similar_names, reason = "测试中标签页 A/B 的发送与接收通道刻意对称命名（ws_tx_a/ws_rx_a vs ws_tx_b/ws_rx_b），便于对比")]
+#[allow(
+    clippy::similar_names,
+    reason = "测试中标签页 A/B 的发送与接收通道刻意对称命名（ws_tx_a/ws_rx_a vs ws_tx_b/ws_rx_b），便于对比"
+)]
 async fn test_multitab_broadcasts_frames_and_detach_stops_old_tab() {
     // 回归（H5）：多标签页/多窗口共用同一 ACP 进程。旧实现「最新连接获胜」——
     // ensure_session 把流式帧切到最新连接，回合进行中被动打开的第二个标签页把
@@ -285,7 +288,10 @@ async fn test_process_crash_sends_error_frame() {
 }
 
 #[tokio::test]
-#[allow(clippy::match_wild_err_arm, reason = "测试中超时统一视为失败，用通配 Err 覆盖超时与接收错误")]
+#[allow(
+    clippy::match_wild_err_arm,
+    reason = "测试中超时统一视为失败，用通配 Err 覆盖超时与接收错误"
+)]
 async fn test_cancel_then_immediate_new_prompt_not_suppressed() {
     // 回归（P0-5）：cancel 后立即重发 prompt，新回合的终态回调不得被旧回合
     // 的取消标记误吞（单布尔时代会错误抑制新回合的 done 帧）。
@@ -317,7 +323,10 @@ async fn test_cancel_then_immediate_new_prompt_not_suppressed() {
     // 新回合应正常收到 done 帧（不被旧回合的取消标记抑制）
     let mut got_done = false;
     let mut events = Vec::new();
-    #[allow(clippy::needless_continue, reason = "continue 使流式事件分支的意图更清晰")]
+    #[allow(
+        clippy::needless_continue,
+        reason = "continue 使流式事件分支的意图更清晰"
+    )]
     for _ in 0..10 {
         match tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv()).await {
             Ok(Some(ev)) if ev["type"] == "done" => {
@@ -329,7 +338,10 @@ async fn test_cancel_then_immediate_new_prompt_not_suppressed() {
                 continue;
             } // 流式事件，继续等终态
             Ok(None) => panic!("ws channel closed unexpectedly, events so far: {events:?}"),
-            #[allow(clippy::match_wild_err_arm, reason = "测试中超时统一视为失败，用通配 Err 覆盖超时与接收错误")]
+            #[allow(
+                clippy::match_wild_err_arm,
+                reason = "测试中超时统一视为失败，用通配 Err 覆盖超时与接收错误"
+            )]
             Err(_) => panic!("timed out waiting for done frame, events so far: {events:?}"),
         }
     }

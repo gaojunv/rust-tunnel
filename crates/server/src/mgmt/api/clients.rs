@@ -185,10 +185,10 @@ pub async fn kick_client(
 
 #[cfg(test)]
 mod tests {
-    use rust_tunnel_common::ControlMessage;
     use super::*;
     use crate::control_plane::client_registry::ClientRegistry;
     use crate::db::Database;
+    use rust_tunnel_common::ControlMessage;
     use tokio::sync::mpsc;
 
     async fn setup() -> (ClientRegistry, Database) {

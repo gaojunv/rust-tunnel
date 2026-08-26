@@ -27,7 +27,10 @@ use super::ChatMessage;
 /// - `model` 缺失或非字符串时返回 `Err("model is required")`。
 /// - `input` 缺失时返回 `Err("input is required")`。
 /// - `input` 非字符串且非数组时返回 `Err("input must be a string or array")`。
-#[allow(clippy::cast_possible_truncation, reason = "temperature/top_p 取值 0.0..2.0，f64 转 f32 精度损失可忽略且不会溢出")]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "temperature/top_p 取值 0.0..2.0，f64 转 f32 精度损失可忽略且不会溢出"
+)]
 pub fn responses_request_to_chat(body: &Value) -> Result<ChatCompletionRequest, String> {
     let model = body
         .get("model")
@@ -230,7 +233,10 @@ fn convert_tool_choice_to_chat(tc: &Value) -> Value {
 
 // ── B. 入口非流式响应转换 ──────────────────────────────────────
 
-#[allow(clippy::too_many_lines, reason = "非流式响应映射含 reasoning/content/tool_calls 三分支及 usage 细节，顺序编排拆分无益")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "非流式响应映射含 reasoning/content/tool_calls 三分支及 usage 细节，顺序编排拆分无益"
+)]
 /// Chat completion 非流式响应 JSON → Responses API 响应 JSON。
 pub fn chat_response_to_responses(chat: &Value) -> Value {
     let raw_id = chat.get("id").and_then(Value::as_str).unwrap_or("");
@@ -372,7 +378,10 @@ enum OutputItemKind {
 /// - `line_buf` 字节缓冲，跨网络块的不完整行留存；
 /// - 只在凑满 `\n` 行后才转 UTF-8（防止多字节字符被从中间切开）；
 /// - 幂等 close。
-#[allow(clippy::struct_excessive_bools, reason = "翻译器需分别跟踪 reasoning/文本/工具调用的开启与完成状态，4 个 bool 各司其职")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "翻译器需分别跟踪 reasoning/文本/工具调用的开启与完成状态，4 个 bool 各司其职"
+)]
 pub struct ChatToResponsesSseTranslator {
     /// 尚未遇到换行符的不完整数据（原始字节）。
     line_buf: Vec<u8>,
@@ -445,7 +454,10 @@ impl ChatToResponsesSseTranslator {
         }
     }
 
-#[allow(clippy::too_many_lines, reason = "字节级行缓冲与 SSE 事件拼装，含多分支")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "字节级行缓冲与 SSE 事件拼装，含多分支"
+    )]
     /// 喂入上游字节块，返回可立即发给客户端的 Responses SSE 字节。
     pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.line_buf.extend_from_slice(bytes);
@@ -461,7 +473,10 @@ impl ChatToResponsesSseTranslator {
         out.into_bytes()
     }
 
-    #[allow(clippy::too_many_lines, reason = "SSE 行缓冲与事件分发含 reasoning/文本/tool_calls 多分支状态机，扁平处理便于维护")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "SSE 行缓冲与事件分发含 reasoning/文本/tool_calls 多分支状态机，扁平处理便于维护"
+    )]
     fn process_line(&mut self, line: &str, out: &mut String) {
         let Some(payload) = line.strip_prefix("data:") else {
             return;
@@ -667,7 +682,10 @@ impl ChatToResponsesSseTranslator {
         }
     }
 
-    #[allow(clippy::too_many_lines, reason = "收尾需逐个关闭已开启 item 并构建 completed 输出，顺序编排较长")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "收尾需逐个关闭已开启 item 并构建 completed 输出，顺序编排较长"
+    )]
     /// 收尾：对每个已开启 item 发 done 事件，再发 response.completed。幂等。
     fn close(&mut self, out: &mut String) {
         if self.closed {
@@ -977,7 +995,10 @@ fn push_sse_event(out: &mut String, event_type: &str, data: &Value) {
 /// 提升，等于每轮往 prompt 头部插入新内容，前缀缓存从 instructions 结束处
 /// 就断掉（实测 DeepSeek 等上游命中只剩 system 块大小、长期固定不变）。
 /// 中段 system 一律按 user 角色原位输出，保持整段 prompt 纯追加。
-#[allow(clippy::too_many_lines, reason = "请求体转换需提取 instructions 与消息映射含多分支，顺序编排拆分无益")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "请求体转换需提取 instructions 与消息映射含多分支，顺序编排拆分无益"
+)]
 pub fn chat_body_to_responses_body(chat: &Value) -> Value {
     let model = chat.get("model").and_then(Value::as_str).unwrap_or("");
     let stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -1215,7 +1236,10 @@ fn convert_tool_choice_to_responses(tc: &Value) -> Value {
 
 // ── E. 上游非流式响应转换 ──────────────────────────────────────
 
-#[allow(clippy::too_many_lines, reason = "非流式逆变换需遍历 output 数组的多分支拼接，顺序编排拆分无益")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "非流式逆变换需遍历 output 数组的多分支拼接，顺序编排拆分无益"
+)]
 /// Responses API 响应 → Chat Completions 响应（非流式）。
 ///
 /// B 的逆变换：output 数组中 reasoning 的 summary 拼接 → reasoning_content；
@@ -1412,7 +1436,10 @@ impl ResponsesToChatSseTranslator {
         }
     }
 
-#[allow(clippy::too_many_lines, reason = "字节级行缓冲与 SSE 事件拼装，含多分支")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "字节级行缓冲与 SSE 事件拼装，含多分支"
+    )]
     /// 喂入上游字节块，返回可立即发给客户端的 Chat chunk SSE 字节。
     pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.line_buf.extend_from_slice(bytes);
@@ -1428,7 +1455,10 @@ impl ResponsesToChatSseTranslator {
         out.into_bytes()
     }
 
-    #[allow(clippy::too_many_lines, reason = "Responses→Chat 流式翻译含多事件分支与状态映射，扁平处理便于维护")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Responses→Chat 流式翻译含多事件分支与状态映射，扁平处理便于维护"
+    )]
     fn process_line(&mut self, line: &str, out: &mut String) {
         let Some(payload) = line.strip_prefix("data:") else {
             return;

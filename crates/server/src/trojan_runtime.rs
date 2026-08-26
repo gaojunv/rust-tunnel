@@ -154,7 +154,10 @@ pub fn spawn_trojan_cert_reload(
 ///
 /// # Errors
 /// 当 `resolve_trojan_tls` 证书解析失败时返回错误字符串。
-#[allow(clippy::too_many_lines, reason = "Trojan 启动编排含五阶段顺序逻辑与共享/独立双分支，共享大量局部状态，拆分反而降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Trojan 启动编排含五阶段顺序逻辑与共享/独立双分支，共享大量局部状态，拆分反而降低可读性"
+)]
 pub async fn apply_trojan_config(
     state: &ServerState,
     cfg: &TrojanDynamicConfig,
@@ -267,7 +270,13 @@ pub async fn apply_trojan_config(
             let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
                 std::sync::Arc::new(state_clone);
             if let Err(e) = crate::listener::start_trojan_listener_with_abort(
-                registry, collector, port, password, fallback, tls_config_rx, abort_rx,
+                registry,
+                collector,
+                port,
+                password,
+                fallback,
+                tls_config_rx,
+                abort_rx,
             )
             .await
             {

@@ -480,7 +480,10 @@ enum WsFrame {
     Other,
 }
 
-#[allow(clippy::too_many_lines, reason = "WebSocket 帧类型扁平派发：7 个变体共享同一 JSON 解析与校验路径，拆分会把相关校验散到多个签名、反而降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "WebSocket 帧类型扁平派发：7 个变体共享同一 JSON 解析与校验路径，拆分会把相关校验散到多个签名、反而降低可读性"
+)]
 fn parse_ws_frame(msg: Message) -> WsFrame {
     let Message::Text(text) = msg else {
         return WsFrame::Other;
@@ -682,7 +685,10 @@ async fn inject_refs(
     crate::agent::runner::compose_user_message(content, &ref_files)
 }
 
-#[allow(clippy::too_many_lines, reason = "WebSocket 连接生命周期编排：pending/ACP 分派/runner 回合/turn select 顺序编排，拆分会把共享状态散到多个签名")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "WebSocket 连接生命周期编排：pending/ACP 分派/runner 回合/turn select 顺序编排，拆分会把共享状态散到多个签名"
+)]
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
@@ -948,7 +954,8 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     // Runner 路径审批模式切换：更新 workspace.approval_mode（DB）+ 当前连接 rt（内存态）。
                     // rt 在首次 user_message 时才创建；若尚无 rt，仅更新 DB（下一条消息时 load 读取）。
                     if let Some(agent) = state.server_state.agent_state.as_ref() {
-                        let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await else {
+                        let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await
+                        else {
                             let _ = event_tx.send(serde_json::json!({"type": "error", "message": "workspace not found"})).await;
                             continue;
                         };

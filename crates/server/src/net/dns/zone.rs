@@ -65,7 +65,9 @@ impl DnsZone {
         self.get_records(name)
             .iter()
             .filter_map(|r| match r {
-                DnsRecord::TunnelA { target_ip, .. } | DnsRecord::MeshA { target_ip, .. } => Some(target_ip.clone()),
+                DnsRecord::TunnelA { target_ip, .. } | DnsRecord::MeshA { target_ip, .. } => {
+                    Some(target_ip.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -77,7 +79,8 @@ impl DnsZone {
         self.get_records(name)
             .iter()
             .filter_map(|r| match r {
-                DnsRecord::TunnelSrv { target, port, .. } | DnsRecord::MeshSrv { target, port, .. } => Some((target.clone(), *port)),
+                DnsRecord::TunnelSrv { target, port, .. }
+                | DnsRecord::MeshSrv { target, port, .. } => Some((target.clone(), *port)),
                 _ => None,
             })
             .collect()

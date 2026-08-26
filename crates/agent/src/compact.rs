@@ -91,11 +91,7 @@ pub fn render_for_summary(messages: &[ChatMessage]) -> String {
     for m in messages {
         match (m.role.as_str(), &m.content, &m.tool_calls) {
             ("tool", Some(c), _) => {
-                let _ = writeln!(
-                    out,
-                    "tool({}): {c}",
-                    m.name.as_deref().unwrap_or("?")
-                );
+                let _ = writeln!(out, "tool({}): {c}", m.name.as_deref().unwrap_or("?"));
             }
             (_, _, Some(calls)) => {
                 let names: Vec<&str> = calls
@@ -530,7 +526,10 @@ mod tests {
     }
 
     // 完整压缩流程长（端到端验证 DB 顺序与重放），拆分会打断连贯性。
-    #[allow(clippy::too_many_lines, reason = "端到端压缩验证长（DB 顺序与重放），拆分会打断连贯性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端压缩验证长（DB 顺序与重放），拆分会打断连贯性"
+    )]
     #[tokio::test]
     async fn test_maybe_compact_reinserts_kept_segment_after_summary() {
         // 端到端：per-model 极小阈值触发压缩；summarize 无 provider 可用 → 失败走

@@ -23,7 +23,10 @@ impl AcmeClient {
     /// # Errors
     ///
     /// 当 ACME 账户未初始化、ACME 订单创建/挑战失败、挑战验证超时、CSR 生成或证书下载/解析/落盘失败时返回错误。
-    #[allow(clippy::too_many_lines, reason = "ACME 订单全流程顺序编排：建单、部署 HTTP-01 挑战、轮询校验、CSR 终结与落盘，共享大量局部状态，拆分会降低可读性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ACME 订单全流程顺序编排：建单、部署 HTTP-01 挑战、轮询校验、CSR 终结与落盘，共享大量局部状态，拆分会降低可读性"
+    )]
     pub async fn request_certificate(&self, domain: &str) -> AcmeResult<CertificateMetadata> {
         info!("Requesting certificate for domain: {}", domain);
 
@@ -296,7 +299,10 @@ impl AcmeClient {
     /// # Errors
     ///
     /// 当 ACME 账户未初始化、ACME 订单/DNS TXT 创建或传播失败、挑战验证超时、CSR 生成或证书落盘/解析失败时返回错误。
-    #[allow(clippy::too_many_lines, reason = "DNS-01 订单全流程顺序编排：建单、创建/等待 DNS TXT 传播、轮询校验、CSR 终结与落盘，共享大量状态，拆分会降低可读性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "DNS-01 订单全流程顺序编排：建单、创建/等待 DNS TXT 传播、轮询校验、CSR 终结与落盘，共享大量状态，拆分会降低可读性"
+    )]
     pub async fn request_certificate_with_dns(
         &self,
         domain: &str,

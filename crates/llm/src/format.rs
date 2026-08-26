@@ -205,7 +205,10 @@ impl AnthropicSseTranslator {
         out.into_bytes()
     }
 
-    #[allow(clippy::too_many_lines, reason = "Anthropic SSE 翻译的多阶段派发：usage 补发、message_start、reasoning/text/tool 增量与 finish 收尾，扁平分支可读性更高")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Anthropic SSE 翻译的多阶段派发：usage 补发、message_start、reasoning/text/tool 增量与 finish 收尾，扁平分支可读性更高"
+    )]
     fn process_line(&mut self, line: &str, out: &mut String) {
         let Some(payload) = line.strip_prefix("data:") else {
             return; // event:/comment/空行一律忽略，事件类型由转换器自行生成

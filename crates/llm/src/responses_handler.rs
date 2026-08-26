@@ -16,7 +16,10 @@ use super::pipeline::ResponsePostProcess;
 use super::responses;
 use super::usage::UsageContext;
 
-#[allow(clippy::too_many_lines, reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，与 openai/anthropic 保持一致")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，与 openai/anthropic 保持一致"
+)]
 /// POST /v1/responses — Responses API request.
 ///
 /// 流程严格仿 `openai_handler::handle_chat_completions`，协议标识用 `"responses"`。

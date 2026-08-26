@@ -111,8 +111,8 @@ pub async fn sse_stats_stream(
     if state.auth_config.is_enabled() {
         let token = params.token.as_deref().unwrap_or("");
 
-        let is_valid =
-            !token.is_empty() && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok();
+        let is_valid = !token.is_empty()
+            && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok();
 
         if !is_valid {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();

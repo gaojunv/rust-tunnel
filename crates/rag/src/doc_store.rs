@@ -204,7 +204,10 @@ mod tests {
         let root = dir.path();
         write(&root.join("rag_docs/stray.txt"), "not a container dir").await;
 
-        assert_eq!(migrate_legacy_doc_dirs(root).await, MigrationReport::default());
+        assert_eq!(
+            migrate_legacy_doc_dirs(root).await,
+            MigrationReport::default()
+        );
         assert!(root.join("rag_docs/stray.txt").exists());
     }
 }

@@ -94,11 +94,7 @@ pub async fn update_dns_config(
 
     if let Some(db) = state.server_state.db() {
         if let Err(e) = db.save_dns_config(tunnel_domain, mesh_domain).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     }
 

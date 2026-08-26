@@ -167,7 +167,11 @@ mod tests {
             sni_ext.extend_from_slice(&u16::try_from(name.len()).unwrap_or(u16::MAX).to_be_bytes());
             sni_ext.extend_from_slice(name.as_bytes());
             exts.extend_from_slice(&0u16.to_be_bytes()); // ext type: server_name
-            exts.extend_from_slice(&u16::try_from(sni_ext.len()).unwrap_or(u16::MAX).to_be_bytes());
+            exts.extend_from_slice(
+                &u16::try_from(sni_ext.len())
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
             exts.extend_from_slice(&sni_ext);
         }
         body.extend_from_slice(&u16::try_from(exts.len()).unwrap_or(u16::MAX).to_be_bytes());

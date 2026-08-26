@@ -65,7 +65,10 @@ impl AcpBridge {
     /// - `busy` 守卫命中（已有回合进行中且非 drain 路径）时返回错误
     /// - ACP 握手未完成（`connection` 或 `acp_session_id` 为空）时返回错误
     /// - `send_request_to` 注册失败（连接关闭）时返回错误并重置 `busy`
-    #[allow(clippy::too_many_lines, reason = "prompt 发送与终态回调的队列 drain、超时与取消抑制逻辑共享大量局部状态，拆分会打散错误处理")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prompt 发送与终态回调的队列 drain、超时与取消抑制逻辑共享大量局部状态，拆分会打散错误处理"
+    )]
     pub async fn prompt(&self, session_id: &str, content: &str) -> Result<(), String> {
         self.prompt_inner(session_id, content, false).await
     }
@@ -73,7 +76,10 @@ impl AcpBridge {
     /// `prompt` 的内部变体。`drain=true` 表示由终态回调的队列 drain 路径调用：
     /// 此时 `busy` 已被终态回调在同一锁内为下一条重新置位（防 `submit_prompt`
     /// 抢跑，见终态回调注释），故跳过 `busy` 检查，直接发送。
-    #[allow(clippy::too_many_lines, reason = "prompt 发送与终态回调的队列 drain、超时与取消抑制逻辑共享大量局部状态，拆分会打散错误处理")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prompt 发送与终态回调的队列 drain、超时与取消抑制逻辑共享大量局部状态，拆分会打散错误处理"
+    )]
     async fn prompt_inner(
         &self,
         session_id: &str,
@@ -297,7 +303,10 @@ impl AcpBridge {
     /// - 会话不存在或进程已退出时返回错误
     /// - 排队已达 `MAX_PENDING_PROMPTS` 上限时返回错误
     /// - 持久化队列写入失败时返回错误（调用方应以 error 帧回发前端）
-    #[allow(clippy::too_many_lines, reason = "入队与 drain 的双段锁与持久化顺序编排共享状态，拆分会打散并发控制")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "入队与 drain 的双段锁与持久化顺序编排共享状态，拆分会打散并发控制"
+    )]
     pub async fn submit_prompt(
         &self,
         session_id: &str,

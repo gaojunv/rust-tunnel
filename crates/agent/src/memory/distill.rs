@@ -150,7 +150,10 @@ fn spawn_distill(memory: &MemoryState, snapshot: DistillSnapshot, trigger: &str)
 
 /// 实际蒸馏：渲染 → LLM 非流式无 tools → JSON 解析 → 逐条 embed + 去重落库 →
 /// done 事件。任何一步失败仅广播 failed 事件 + warn，不 panic、不阻断调用方。
-#[allow(clippy::too_many_lines, reason = "蒸馏全流程顺序编排：渲染/LLM调用/解析/落库/Skill分支，拆分会打散状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "蒸馏全流程顺序编排：渲染/LLM调用/解析/落库/Skill分支，拆分会打散状态"
+)]
 async fn do_distill(memory: MemoryState, snapshot: DistillSnapshot, trigger: String) {
     let s = memory.settings().await;
     let rendered = render_distill_text(&snapshot.messages);
@@ -772,7 +775,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp, reason = "测试断言：缺省 confidence 为字面量 0.8，精确比较即所需语义")]
+    #[allow(
+        clippy::float_cmp,
+        reason = "测试断言：缺省 confidence 为字面量 0.8，精确比较即所需语义"
+    )]
     fn parse_facts_bare_object() {
         let raw = "{\"facts\": [{\"content\": \"机器是 linux\", \"scope\": \"client\"}]}";
         let facts = parse_facts(raw).unwrap();

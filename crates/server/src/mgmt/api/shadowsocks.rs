@@ -63,11 +63,7 @@ pub async fn update_shadowsocks_config(
             .replace_shadowsocks_config(port, cipher, password, enabled)
             .await
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     }
 

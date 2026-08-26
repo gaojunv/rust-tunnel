@@ -56,7 +56,10 @@ pub fn host_without_port(raw: &str) -> &str {
 /// upstream IOs are bridged with `copy_bidirectional`, raw bytes flowing
 /// through the control-channel tunnel.
 /// HTTP 隧道握手、统计、WS 分支与错误回退的顺序编排，拆分会割裂共享的 `collector`/`connector` 状态。
-#[allow(clippy::too_many_lines, reason = "HTTP 隧道握手、统计、WS 分支与错误回退的顺序编排，拆分会割裂共享的 stats/connector 状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "HTTP 隧道握手、统计、WS 分支与错误回退的顺序编排，拆分会割裂共享的 stats/connector 状态"
+)]
 pub(super) async fn handle_client_backend(
     state: Arc<ReverseProxyState>,
     req: Request<Body>,

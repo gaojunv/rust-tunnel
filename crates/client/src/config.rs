@@ -159,7 +159,10 @@ impl ClientConfig {
     /// # Errors
     ///
     /// 当指定的配置文件不存在或解析失败时返回 `Err`；当 `server` 或 `password` 最终为空时返回 `Err`。
-    #[allow(clippy::too_many_lines, reason = "三级配置叠加（文件→环境变量→CLI）的顺序编排，含大量字段逐一覆盖分支，拆分无益")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "三级配置叠加（文件→环境变量→CLI）的顺序编排，含大量字段逐一覆盖分支，拆分无益"
+    )]
     pub fn from_cli(cli: ClientCli) -> Result<Self, String> {
         let mut config = Self::default();
 

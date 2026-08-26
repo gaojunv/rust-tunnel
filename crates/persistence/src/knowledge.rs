@@ -316,7 +316,9 @@ impl Database {
         }
         if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
             qb.push(" AND (name LIKE ").push_bind(format!("%{q}%"));
-            qb.push(" OR summary LIKE ").push_bind(format!("%{q}%")).push(")");
+            qb.push(" OR summary LIKE ")
+                .push_bind(format!("%{q}%"))
+                .push(")");
         }
         if let Some(st) = filter.status.as_deref().filter(|s| !s.is_empty()) {
             qb.push(" AND status = ").push_bind(st);
@@ -354,7 +356,9 @@ impl Database {
         }
         if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
             qb.push(" AND (name LIKE ").push_bind(format!("%{q}%"));
-            qb.push(" OR summary LIKE ").push_bind(format!("%{q}%")).push(")");
+            qb.push(" OR summary LIKE ")
+                .push_bind(format!("%{q}%"))
+                .push(")");
         }
         if let Some(st) = filter.status.as_deref().filter(|s| !s.is_empty()) {
             qb.push(" AND status = ").push_bind(st);
@@ -469,11 +473,13 @@ impl Database {
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn ks_set_enabled(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE knowledge_sources SET enabled = ?, updated_at = datetime('now') WHERE id = ?")
-            .bind(i64::from(enabled))
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE knowledge_sources SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(i64::from(enabled))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -481,11 +487,13 @@ impl Database {
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn ks_update_status(&self, id: &str, status: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE knowledge_sources SET status = ?, updated_at = datetime('now') WHERE id = ?")
-            .bind(status)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE knowledge_sources SET status = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(status)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -644,11 +652,10 @@ impl Database {
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn kdoc_count_by_source(&self, source_id: &str) -> Result<i64, sqlx::Error> {
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM knowledge_docs WHERE source_id = ?")
-                .bind(source_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM knowledge_docs WHERE source_id = ?")
+            .bind(source_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.0)
     }
 
@@ -728,10 +735,7 @@ impl Database {
     /// 列出某容器下的全部文档，按创建时间排序。
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
-    pub async fn kdoc_list(
-        &self,
-        source_id: &str,
-    ) -> Result<Vec<KnowledgeDocRecord>, sqlx::Error> {
+    pub async fn kdoc_list(&self, source_id: &str) -> Result<Vec<KnowledgeDocRecord>, sqlx::Error> {
         sqlx::query_as::<_, KnowledgeDocRecord>(
             "SELECT id, source_id, filename, file_type, content_hash, created_at, updated_at \
              FROM knowledge_docs WHERE source_id = ? ORDER BY created_at",
@@ -905,7 +909,9 @@ mod tests {
     use super::*;
 
     async fn test_db() -> Database {
-        Database::new(":memory:").await.expect("create in-memory db")
+        Database::new(":memory:")
+            .await
+            .expect("create in-memory db")
     }
 
     fn vec_opts(id: &str, name: &str) -> KsCreateOpts {
@@ -984,7 +990,10 @@ mod tests {
         assert_eq!(ks.name, "改名");
         assert_eq!(ks.summary, "新描述");
         assert_eq!(ks.top_k, 8);
-        assert_eq!(ks.emb_base_url, "https://api.example.com", "emb 配置未被覆盖");
+        assert_eq!(
+            ks.emb_base_url, "https://api.example.com",
+            "emb 配置未被覆盖"
+        );
 
         db.ks_create(&vec_opts("ks-2", "库2")).await.unwrap();
         let filter = KsListFilter::default();
@@ -1141,8 +1150,14 @@ mod tests {
         assert!(ids.contains(&"c1".to_string()));
         assert!(ids.contains(&"w1".to_string()));
         assert!(!ids.contains(&"w2".to_string()));
-        assert!(!ids.contains(&"v1".to_string()), "vector 容器不应在 pages 可见性中");
-        assert!(!ids.contains(&"d1".to_string()), "停用容器不应在 pages 可见性中");
+        assert!(
+            !ids.contains(&"v1".to_string()),
+            "vector 容器不应在 pages 可见性中"
+        );
+        assert!(
+            !ids.contains(&"d1".to_string()),
+            "停用容器不应在 pages 可见性中"
+        );
 
         let vis = db.ks_visible_sources("c1", "w1", 10).await.unwrap();
         assert_eq!(vis.len(), 3);
@@ -1190,6 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "双索引开关与 per-kind 状态矩阵断言路径多，单测直接铺开")]
     async fn dual_index_switch_and_per_kind_independent_status() {
         let db = test_db().await;
         db.ks_create(&KsCreateOpts {
@@ -1218,17 +1234,29 @@ mod tests {
             .unwrap();
         let idxs = db.kdoc_list_indexes("doc1").await.unwrap();
         assert_eq!(idxs.len(), 2, "双索引容器应为文档创建两个 pending 行");
-        assert!(idxs.iter().any(|r| r.kind == "vector" && r.status == "pending"));
-        assert!(idxs.iter().any(|r| r.kind == "pages" && r.status == "pending"));
+        assert!(idxs
+            .iter()
+            .any(|r| r.kind == "vector" && r.status == "pending"));
+        assert!(idxs
+            .iter()
+            .any(|r| r.kind == "pages" && r.status == "pending"));
 
         // per-kind 独立：vector ready，pages 仍 pending
         db.kdoc_update_index_status("doc1", IndexKind::Vector, "ready", 5, None)
             .await
             .unwrap();
-        let v = db.kdoc_get_index("doc1", IndexKind::Vector).await.unwrap().unwrap();
+        let v = db
+            .kdoc_get_index("doc1", IndexKind::Vector)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(v.status, "ready");
         assert_eq!(v.item_count, 5);
-        let p = db.kdoc_get_index("doc1", IndexKind::Pages).await.unwrap().unwrap();
+        let p = db
+            .kdoc_get_index("doc1", IndexKind::Pages)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(p.status, "pending", "pages 侧不应被 vector 更新影响");
         assert_eq!(p.item_count, 0);
 
@@ -1450,25 +1478,19 @@ mod tests {
         db.wiki_upsert_page("w1", "a/b", "T", "S", "hello world", false, Some("doc1"))
             .await
             .unwrap();
-        let fts_before: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_pages_fts")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let fts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_pages_fts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(fts_before, 1);
         db.ks_delete("w1").await.unwrap();
-        let fts_after: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_pages_fts")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let fts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_pages_fts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(fts_after, 0, "容器删除应同步清理 FTS");
         assert!(db.kdoc_get("doc1").await.unwrap().is_none());
-        assert!(db
-            .wiki_get_page("w1", "a/b")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(db.wiki_get_page("w1", "a/b").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1530,7 +1552,9 @@ mod tests {
         let idx = db.kdoc_list_indexes("d-off").await.unwrap();
         assert!(idx.is_empty(), "两开关全关时不应产生索引行，实际: {idx:?}");
 
-        db.ks_create(&vec_opts("ks-on", "有索引容器")).await.unwrap();
+        db.ks_create(&vec_opts("ks-on", "有索引容器"))
+            .await
+            .unwrap();
         db.kdoc_create("d-on", "ks-on", "notes.md", "md", "hash-on")
             .await
             .unwrap();

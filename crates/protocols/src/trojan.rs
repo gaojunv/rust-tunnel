@@ -342,7 +342,11 @@ impl UdpPacket {
         let mut out = Vec::with_capacity(self.payload.len() + 32);
         self.address.encode(&mut out);
         out.extend_from_slice(&self.port.to_be_bytes());
-        out.extend_from_slice(&u16::try_from(self.payload.len()).unwrap_or(u16::MAX).to_be_bytes());
+        out.extend_from_slice(
+            &u16::try_from(self.payload.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.payload);
         out
@@ -531,7 +535,10 @@ const UDP_SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 ///
 /// TLS 流双向承载 `ATYP+ADDR+PORT+LEN+CRLF+payload` 报文，每个目标地址维护一个出站
 /// `UdpSocket`，各目标的响应通过单一 writer 任务经 mpsc 复用到 TLS 流。
-#[allow(clippy::too_many_lines, reason = "UDP ASSOCIATE 主循环含握手附带包预处理与超时/回包/清理多分支，拆分会割裂状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "UDP ASSOCIATE 主循环含握手附带包预处理与超时/回包/清理多分支，拆分会割裂状态"
+)]
 pub async fn handle_udp_associate(
     connection_id: u64,
     trojan_port: u16,
@@ -570,7 +577,10 @@ pub async fn handle_udp_associate(
     let (dead_tx, mut dead_rx) = mpsc::channel::<SocketAddr>(64);
 
     let mut read_buf: Vec<u8> = initial_payload;
-    #[allow(clippy::large_stack_arrays, reason = "UDP 单次读取需容纳最大 65535 字节载荷，栈上缓冲避免重复分配")]
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "UDP 单次读取需容纳最大 65535 字节载荷，栈上缓冲避免重复分配"
+    )]
     let mut chunk = [0u8; 65536];
 
     // Process packets that arrived together with the handshake BEFORE entering
@@ -820,7 +830,10 @@ pub async fn proxy_trojan_connection(
 
     // UDP ASSOCIATE: hand off to the UDP session handler
     if trojan_ctx.command == TrojanCommand::UdpAssociate {
-        #[allow(clippy::large_futures, reason = "UDP ASSOCIATE 需多路复用与超时状态机，仅在请求路径构造一次")]
+        #[allow(
+            clippy::large_futures,
+            reason = "UDP ASSOCIATE 需多路复用与超时状态机，仅在请求路径构造一次"
+        )]
         {
             handle_udp_associate(
                 connection_id,
@@ -1429,7 +1442,11 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(atyp_addr);
         buf.extend_from_slice(&port.to_be_bytes());
-        buf.extend_from_slice(&u16::try_from(payload.len()).unwrap_or(u16::MAX).to_be_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(payload);
         buf
@@ -1941,7 +1958,11 @@ mod legacy_tests {
         let mut buf = vec![0x01];
         buf.extend_from_slice(&ip.octets());
         buf.extend_from_slice(&port.to_be_bytes());
-        buf.extend_from_slice(&u16::try_from(payload.len()).unwrap_or(u16::MAX).to_be_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(payload);
         buf

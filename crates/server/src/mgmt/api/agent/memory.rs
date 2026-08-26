@@ -320,7 +320,10 @@ pub async fn get_settings(State(state): State<ApiState>) -> impl IntoResponse {
 ///   且 emb_api_key 非空（或已存有可用 key），否则 400；
 /// - `emb_dimension` 与已存值不同 → 409 拒绝直切（换 emb 模型需先清空重建）；
 /// - `emb_api_key` 空串 = 沿用已存密文。
-#[allow(clippy::too_many_lines, reason = "设置校验与部分更新的顺序编排共享大量局部状态，拆分会增加签名冗余")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "设置校验与部分更新的顺序编排共享大量局部状态，拆分会增加签名冗余"
+)]
 pub async fn put_settings(
     State(state): State<ApiState>,
     Json(body): Json<UpdateMemorySettingsRequest>,
@@ -1215,7 +1218,10 @@ mod tests {
 
     // ── memories CRUD ────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines, reason = "CRUD 全链路端到端用例，顺序编排大量断言与状态校验，拆分会割裂用例可读性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "CRUD 全链路端到端用例，顺序编排大量断言与状态校验，拆分会割裂用例可读性"
+    )]
     #[tokio::test]
     async fn memories_crud_pin_and_clear() {
         let dir = tempfile::tempdir().unwrap();

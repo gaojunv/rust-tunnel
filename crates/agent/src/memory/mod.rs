@@ -252,7 +252,10 @@ async fn best_scope_match(
 /// # Errors
 /// embedding 失败、维度未配置（`emb_dimension <= 0`）、DB 或向量写失败时返回 `Err`，
 /// 由调用方决定降级语义（distill 静默跳过单条，remember 把错误喂回模型）。
-#[allow(clippy::too_many_arguments, reason = "记忆写入参数包 10 项，Opts 化仅 3 调用点、收益低")] // 保留：3 调用点方法，Opts 化成本高
+#[allow(
+    clippy::too_many_arguments,
+    reason = "记忆写入参数包 10 项，Opts 化仅 3 调用点、收益低"
+)] // 保留：3 调用点方法，Opts 化成本高
 pub async fn upsert_memory_with_dedup(
     memory: &MemoryState,
     s: &AgentMemorySettingsRecord,
@@ -275,7 +278,10 @@ pub async fn upsert_memory_with_dedup(
         .await
         .map_err(|e| format!("embedding failed: {e}"))?;
     let dim_usize = usize::try_from(dim).unwrap_or(0);
-    let hits = memory.store.search(MEMORY_KB_ID, dim_usize, &vec, DEDUP_TOP_K).await;
+    let hits = memory
+        .store
+        .search(MEMORY_KB_ID, dim_usize, &vec, DEDUP_TOP_K)
+        .await;
     if let Some((score, id, existing)) =
         best_scope_match(memory, &hits, scope_type, client_id, workspace_id).await
     {
@@ -387,7 +393,10 @@ pub async fn mock_embedding_server(dim: usize) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock embedding server");
-    #[allow(clippy::missing_panics_doc, reason = "测试代码：绑定回环随机端口必成功")]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "测试代码：绑定回环随机端口必成功"
+    )]
     let addr = listener.local_addr().expect("mock server local_addr");
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -452,7 +461,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::float_cmp, reason = "测试断言：confidence 取 max 后为字面量 1.0，精确比较即所需语义")]
+    #[allow(
+        clippy::float_cmp,
+        reason = "测试断言：confidence 取 max 后为字面量 1.0，精确比较即所需语义"
+    )]
     async fn dedup_same_scope_updates_not_duplicates() {
         let base = mock_embedding_server(8).await;
         let (db, memory) = test_memory_with_embedding(&base).await;

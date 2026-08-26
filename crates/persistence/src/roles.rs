@@ -527,7 +527,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines, reason = "角色列表过滤与分页的集成场景编排，拆分会打散断言")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "角色列表过滤与分页的集成场景编排，拆分会打散断言"
+    )]
     async fn role_list_filters() {
         let db = Database::new(":memory:").await.unwrap();
         // 注意：Database::new 已 seed 2 个内置角色（general, explore）
@@ -666,7 +669,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines, reason = "可见性多作用域组合的集成场景编排，拆分无益")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "可见性多作用域组合的集成场景编排，拆分无益"
+    )]
     async fn role_visible_scope_visibility() {
         let db = Database::new(":memory:").await.unwrap();
         // 注意：Database::new 已 seed 2 个内置 subagent 角色（general, explore）

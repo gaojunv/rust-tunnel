@@ -885,7 +885,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let p = db.wiki_get_page("w1", "deploy/prod").await.unwrap().unwrap();
+        let p = db
+            .wiki_get_page("w1", "deploy/prod")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(p.title, "部署-手动");
         assert_eq!(p.locked, 1);
 
@@ -900,7 +904,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let p = db.wiki_get_page("w1", "deploy/prod").await.unwrap().unwrap();
+        let p = db
+            .wiki_get_page("w1", "deploy/prod")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(p.title, "部署-手动", "locked 页不应被 ingest 覆盖");
 
         let count: i64 =
@@ -922,7 +930,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fts_count, 0);
-        assert!(db.wiki_get_page("w1", "deploy/prod").await.unwrap().is_none());
+        assert!(db
+            .wiki_get_page("w1", "deploy/prod")
+            .await
+            .unwrap()
+            .is_none());
         let _ = IndexKind::Pages.as_str();
     }
 
@@ -930,17 +942,31 @@ mod tests {
     async fn wiki_search_like_fallback_and_escape() {
         let db = Database::new(":memory:").await.unwrap();
         db.ks_create(&pages_opts("w1", "wiki")).await.unwrap();
-        db.wiki_upsert_page("w1", "p1", "部署文档", "摘要", "这里是部署相关内容", false, None)
-            .await
-            .unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "p1",
+            "部署文档",
+            "摘要",
+            "这里是部署相关内容",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         db.wiki_upsert_page("w1", "p2", "其他", "摘要", "完全不相关的内容", false, None)
             .await
             .unwrap();
 
         let hits = db.wiki_search(&["w1".into()], "部署", 10).await.unwrap();
-        assert!(hits.iter().any(|h| h.page_ref == "p1"), "2字查询应 LIKE 回退命中");
+        assert!(
+            hits.iter().any(|h| h.page_ref == "p1"),
+            "2字查询应 LIKE 回退命中"
+        );
 
-        let hits = db.wiki_search(&["w1".into()], "部署相关", 10).await.unwrap();
+        let hits = db
+            .wiki_search(&["w1".into()], "部署相关", 10)
+            .await
+            .unwrap();
         assert!(hits.iter().any(|h| h.page_ref == "p1"));
 
         let hits = db.wiki_search(&["w1".into()], "\"*-:\"", 10).await.unwrap();
@@ -957,9 +983,17 @@ mod tests {
     async fn wiki_graph_dangling() {
         let db = Database::new(":memory:").await.unwrap();
         db.ks_create(&pages_opts("w1", "wiki")).await.unwrap();
-        db.wiki_upsert_page("w1", "a", "A", "", "link to [[b]] and [[missing]]", false, None)
-            .await
-            .unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "a",
+            "A",
+            "",
+            "link to [[b]] and [[missing]]",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         db.wiki_upsert_page("w1", "b", "B", "", "no links", false, None)
             .await
             .unwrap();
@@ -1015,10 +1049,21 @@ mod tests {
             .await
             .unwrap();
         // 更新同一 ref 应正确替换 FTS 行（旧 rowid 删除，新 rowid 插入）
-        db.wiki_upsert_page("w1", "r1", "t2", "s2", "hello world unique123 updated", false, None)
+        db.wiki_upsert_page(
+            "w1",
+            "r1",
+            "t2",
+            "s2",
+            "hello world unique123 updated",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let hits = db
+            .wiki_search(&["w1".into()], "unique123", 10)
             .await
             .unwrap();
-        let hits = db.wiki_search(&["w1".into()], "unique123", 10).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "t2");
         let fts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_pages_fts")

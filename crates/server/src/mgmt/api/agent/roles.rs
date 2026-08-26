@@ -172,7 +172,10 @@ pub async fn get_role(
 ///
 /// # Errors
 /// 400 字段校验失败；403 内置角色改名；404 不存在；409 重名；503 未初始化；500 DB 错误。
-#[allow(clippy::too_many_lines, reason = "角色更新合并校验：字段回退/校验/唯一约束分散多阶段，顺序编排长但语义内聚，拆分反而割裂校验上下文")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "角色更新合并校验：字段回退/校验/唯一约束分散多阶段，顺序编排长但语义内聚，拆分反而割裂校验上下文"
+)]
 pub async fn update_role(
     State(state): State<ApiState>,
     Path(id): Path<String>,

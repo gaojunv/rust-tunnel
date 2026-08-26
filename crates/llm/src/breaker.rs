@@ -78,7 +78,10 @@ impl ModelBreakers {
     ///   试探期间其余请求拒绝（单飞）。
     #[must_use]
     pub fn allow(&self, model_id: &str) -> bool {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map.entry(model_id.to_string()).or_default();
         match entry.open {
             None => true,
@@ -116,7 +119,10 @@ impl ModelBreakers {
 
     /// 记录成功（含上游返回 4xx——说明上游可达）：复位为 Closed。
     pub fn record_success(&self, model_id: &str) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map.entry(model_id.to_string()).or_default();
         let was_probe = entry.probe_in_flight;
         entry.consecutive_failures = 0;
@@ -132,7 +138,10 @@ impl ModelBreakers {
     /// Closed 下累加，达 `FAILURE_THRESHOLD` 转 Open（冷却 `BASE_COOLDOWN_SECS`）。
     /// 半开试探失败：冷却翻倍（上限 `MAX_COOLDOWN_SECS`）重新 Open。
     pub fn record_failure(&self, model_id: &str) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map.entry(model_id.to_string()).or_default();
 
         if entry.probe_in_flight {
@@ -172,7 +181,10 @@ impl ModelBreakers {
 
     /// 手动重置单个模型。
     pub fn reset(&self, model_id: &str) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = map.get_mut(model_id) {
             entry.consecutive_failures = 0;
             entry.open = None;
@@ -190,7 +202,10 @@ impl ModelBreakers {
     /// 快照（组详情 API）。
     #[must_use]
     pub fn snapshot(&self, model_id: &str) -> BreakerSnapshot {
-        let map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(entry) = map.get(model_id) else {
             return BreakerSnapshot {
                 state: BreakerStateView::Closed,
@@ -229,8 +244,11 @@ impl ModelBreakers {
         let mut map = self.inner.lock().expect("breaker mutex poisoned");
         if let Some(entry) = map.get_mut(model_id) {
             if let Some(open) = entry.open.as_mut() {
-                open.opened_at =
-                    Instant::now().checked_sub(open.cooldown).unwrap().checked_sub(Duration::from_secs(1)).unwrap();
+                open.opened_at = Instant::now()
+                    .checked_sub(open.cooldown)
+                    .unwrap()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap();
             }
             entry.probe_in_flight = false;
         }
@@ -243,8 +261,11 @@ impl ModelBreakers {
         let mut map = self.inner.lock().expect("breaker mutex poisoned");
         if let Some(entry) = map.get_mut(model_id) {
             if let Some(open) = entry.open.as_mut() {
-                open.opened_at =
-                    Instant::now().checked_sub(open.cooldown).unwrap().checked_sub(Duration::from_secs(301)).unwrap();
+                open.opened_at = Instant::now()
+                    .checked_sub(open.cooldown)
+                    .unwrap()
+                    .checked_sub(Duration::from_secs(301))
+                    .unwrap();
             }
         }
     }
@@ -359,7 +380,9 @@ mod tests {
             let open = entry.open.as_mut().unwrap();
             open.opened_at = std::time::Instant::now()
                 .checked_sub(open.cooldown)
-                .unwrap().checked_sub(std::time::Duration::from_secs(1)).unwrap();
+                .unwrap()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap();
         }
         assert!(!b.allow("m1"), "窗口内的在飞试探不应被回收");
     }

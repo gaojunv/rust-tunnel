@@ -36,7 +36,8 @@ async fn disable_conflicting_rules_on_port(
         match err {
             E::DomainConflict { .. } => {
                 // Keep the oldest rule per domain, disable duplicates.
-                let mut seen_domains: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut seen_domains: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 let mut victims: Vec<String> = Vec::new();
                 for r in &on_port {
                     let clashes = r.domains.iter().any(|d| !seen_domains.insert(d.clone()));
@@ -109,7 +110,10 @@ async fn disable_conflicting_rules_on_port(
 }
 
 #[tokio::main]
-#[allow(clippy::too_many_lines, reason = "服务端装配含 DB、ACME、DNS、反代、LLM、统计等长顺序编排，拆分会分散状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "服务端装配含 DB、ACME、DNS、反代、LLM、统计等长顺序编排，拆分会分散状态"
+)]
 async fn main() -> TunnelResult<()> {
     let config = ServerConfig::load().map_err(std::io::Error::other)?;
     tracing::info!("Starting rust-tunnel server on {}", config.control_addr);
@@ -371,7 +375,8 @@ async fn main() -> TunnelResult<()> {
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let report = rust_tunnel_server::llm::rag::doc_store::migrate_legacy_doc_dirs(&data_dir).await;
+        let report =
+            rust_tunnel_server::llm::rag::doc_store::migrate_legacy_doc_dirs(&data_dir).await;
         if report != rust_tunnel_server::llm::rag::doc_store::MigrationReport::default() {
             tracing::info!(
                 moved = report.moved,
@@ -389,7 +394,10 @@ async fn main() -> TunnelResult<()> {
     {
         if let Some(db) = state.db().cloned() {
             match db
-                .kdoc_fail_inflight(rust_tunnel_persistence::knowledge::IndexKind::Vector, "interrupted by server restart")
+                .kdoc_fail_inflight(
+                    rust_tunnel_persistence::knowledge::IndexKind::Vector,
+                    "interrupted by server restart",
+                )
                 .await
             {
                 Ok(0) => {}
@@ -401,7 +409,10 @@ async fn main() -> TunnelResult<()> {
             }
             // Wiki 启动对账：同上，把卡死的 wiki doc 复位为 failed。
             match db
-                .kdoc_fail_inflight(rust_tunnel_persistence::knowledge::IndexKind::Pages, "interrupted by server restart")
+                .kdoc_fail_inflight(
+                    rust_tunnel_persistence::knowledge::IndexKind::Pages,
+                    "interrupted by server restart",
+                )
                 .await
             {
                 Ok(0) => {}

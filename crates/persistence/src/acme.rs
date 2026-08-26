@@ -13,7 +13,10 @@ impl Database {
     /// # Errors
     ///
     /// 数据库连接不可用、SQL 执行失败或连接池已关闭时返回 `sqlx::Error`。
-    #[allow(clippy::too_many_arguments, reason = "证书保存需一次写入 8 个字段，拆 Opts 会增加调用方样板且调用点分散")] // 保留：多调用点方法，Opts 化成本高
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "证书保存需一次写入 8 个字段，拆 Opts 会增加调用方样板且调用点分散"
+    )] // 保留：多调用点方法，Opts 化成本高
     pub async fn save_acme_certificate(
         &self,
         domain: &str,
@@ -585,7 +588,10 @@ mod tests {
         assert_eq!(db.cleanup_expired_acme_challenges().await.unwrap(), 0);
     }
 
-    #[allow(clippy::too_many_lines, reason = "续期过滤的多场景分支测试需在一处串联 7 类证书状态与 3 档时间窗口，拆分会割裂断言上下文")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "续期过滤的多场景分支测试需在一处串联 7 类证书状态与 3 档时间窗口，拆分会割裂断言上下文"
+    )]
     #[tokio::test]
     async fn load_certificates_needing_renewal_filters_correctly() {
         let db = in_memory_db().await;

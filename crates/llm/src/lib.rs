@@ -163,7 +163,10 @@ pub struct ProviderConfig {
 /// 三态反序列化：字段缺失 → `None`；显式 `null` → `Some(None)`；字符串 → `Some(Some(s))`。
 /// 裸 `Option<String>` 无法区分前两者（serde 把缺失/null 都映到 None），
 /// 导致前端“清除 extra_config”的显式 null 被误当“保留原值”，开关永远关不掉。
-#[allow(clippy::option_option, reason = "三态语义需区分缺失、显式 null 与字符串，Option<Option<String>> 为 serde 已知模式")]
+#[allow(
+    clippy::option_option,
+    reason = "三态语义需区分缺失、显式 null 与字符串，Option<Option<String>> 为 serde 已知模式"
+)]
 fn deserialize_nullable_string<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -739,7 +742,10 @@ pub struct LogLlmRequestOpts {
 }
 
 /// 记录一条 LLM 请求日志（受 `LlmState::request_logging` 开关控制，关闭时直接返回）。
-#[allow(clippy::unused_async, reason = "与落库路径保持 async 调用统一，开关关闭时也需 await")]
+#[allow(
+    clippy::unused_async,
+    reason = "与落库路径保持 async 调用统一，开关关闭时也需 await"
+)]
 pub async fn log_llm_request(llm: &LlmState, opts: &LogLlmRequestOpts) {
     if !llm
         .request_logging

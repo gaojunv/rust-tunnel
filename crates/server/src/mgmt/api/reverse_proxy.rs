@@ -146,9 +146,7 @@ pub async fn create_proxy_rule(
                 .await
                 .remove(&id);
             if let Err(del_err) = state.server_state.proxy_state.delete_rule(&id).await {
-                tracing::error!(
-                    "Compensating delete failed after reconcile error: {del_err}"
-                );
+                tracing::error!("Compensating delete failed after reconcile error: {del_err}");
             }
             return (
                 StatusCode::CONFLICT,
@@ -213,7 +211,10 @@ fn conflicts_from_error(e: &crate::reverse_proxy::error::ReconcileError) -> Vec<
 
 // PUT /api/proxy/rules/:id — update a proxy rule
 /// 更新反代规则（PUT /api/proxy/rules/:id）。
-#[allow(clippy::too_many_lines, reason = "HTTP 规则更新需校验→持久化→新旧端口 reconcile→Trojan 模式同步→ACME 触发，顺序编排拆分会降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "HTTP 规则更新需校验→持久化→新旧端口 reconcile→Trojan 模式同步→ACME 触发，顺序编排拆分会降低可读性"
+)]
 pub async fn update_proxy_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -434,11 +435,7 @@ pub async fn update_reverse_proxy_config(
             .save_reverse_proxy_config(max_conn, timeout, buffer)
             .await
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     }
 

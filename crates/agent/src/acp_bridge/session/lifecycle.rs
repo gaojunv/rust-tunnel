@@ -38,7 +38,10 @@ impl AcpBridge {
     /// - `workspace.runtime_type` 非 `host` 时返回错误（ACP 暂不支持 docker）
     /// - LLM 网关未注入或模型配置缺失时返回带阶段前缀的错误
     /// - `start_llm_proxy` / `spawn_agent` / `acp_handshake` 任一阶段失败时返回对应阶段错误并清理占位条目
-    #[allow(clippy::too_many_lines, reason = "spawn 流水线顺序编排含 LLM 代理/模型门禁/spawn/handshake/配置注入等多阶段共享状态，拆分会打散局部变量与错误归因")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "spawn 流水线顺序编排含 LLM 代理/模型门禁/spawn/handshake/配置注入等多阶段共享状态，拆分会打散局部变量与错误归因"
+    )]
     pub async fn ensure_session(
         &self,
         session_id: &str,

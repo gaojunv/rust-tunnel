@@ -44,7 +44,10 @@ pub async fn retrieve_for_session(
         .saturating_mul(8)
         .clamp(1, 50);
     let dim_usize = usize::try_from(dim).unwrap_or(0);
-    let hits = memory.store.search(MEMORY_KB_ID, dim_usize, &query_vec, over).await;
+    let hits = memory
+        .store
+        .search(MEMORY_KB_ID, dim_usize, &query_vec, over)
+        .await;
     if hits.is_empty() {
         return None;
     }
@@ -77,7 +80,10 @@ pub async fn retrieve_for_session(
     });
     // 阈值过滤：pinned（且 pin_always_inject=1）恒注入；其余需 ≥ score_threshold。
     let pin_always = s.pin_always_inject != 0;
-    #[allow(clippy::cast_possible_truncation, reason = "score_threshold 为 0–1 配置值，精度损失可接受")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "score_threshold 为 0–1 配置值，精度损失可接受"
+    )]
     let threshold = s.score_threshold as f32;
     let items: Vec<AgentMemoryRecord> = candidates
         .into_iter()
@@ -234,7 +240,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::many_single_char_names, reason = "测试中 g/c/w 对应三种 scope，单字母命名直观")]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "测试中 g/c/w 对应三种 scope，单字母命名直观"
+    )]
     fn build_memory_block_record_fields_serialized() {
         // scope 映射
         let global_rec = record("m1", "global", "", "", false, "global内容");

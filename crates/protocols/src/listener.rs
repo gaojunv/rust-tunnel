@@ -111,8 +111,14 @@ pub async fn start_shadowsocks_listener_with_abort(
 ///
 /// 从独立 listener 的每连接逻辑提取，供独立监听模式与反代 SNI 分流模式共用。
 /// 每连接从 watch channel borrow 最新的 TLS 配置（证书热更新机制）。
-#[allow(clippy::too_many_arguments, reason = "Trojan 连接需端口/密码/回退/TLS 配置/注册表/统计六要素，拆分会割裂调用点")]
-#[allow(clippy::large_futures, reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Trojan 连接需端口/密码/回退/TLS 配置/注册表/统计六要素，拆分会割裂调用点"
+)]
+#[allow(
+    clippy::large_futures,
+    reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估"
+)]
 pub async fn handle_trojan_connection(
     inbound: TcpStream,
     client_addr: std::net::SocketAddr,
@@ -214,7 +220,10 @@ pub async fn start_trojan_listener(
         let tls_config_rx_clone = tls_config_rx.clone();
 
         tokio::spawn(
-            #[allow(clippy::large_futures, reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估")]
+            #[allow(
+                clippy::large_futures,
+                reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估"
+            )]
             async move {
                 handle_trojan_connection(
                     inbound,
