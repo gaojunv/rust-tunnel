@@ -6,7 +6,7 @@ description = "A simple intranet penetration tool with server and client"
 license = "MIT"
 
 [workspace]
-members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/server", "crates/stats"]
+members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/server", "crates/stats", "crates/wiki-core", "crates/wiki-serve"]
 
 [workspace.lints.clippy]
 # 企业级 lint 基线：pedantic 组已在批次 9/10 全仓清零，转 deny 硬门禁。
@@ -102,6 +102,15 @@ agent-client-protocol = { version = "2", features = ["unstable_elicitation"] }
 libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
+
+# ── 桌面笔记骨架（wiki-core / wiki-serve）──────────────────────────
+# 仅这两个 crate 使用；未挂到根 package 的 dependencies，故不影响既有
+# `cargo build` / `cargo test` 的编译面。
+comrak = "0.54"
+tantivy = "0.26"
+gray_matter = "0.3"
+walkdir = "2.5"
+petgraph = "0.6"
 
 [features]
 # rag 默认开启：集成测试 tests/rag_multiformat.rs 用根 crate 的

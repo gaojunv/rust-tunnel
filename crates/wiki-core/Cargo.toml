@@ -1,0 +1,29 @@
+[package]
+name = "rust-tunnel-wiki-core"
+version = "0.4.0"
+edition = "2021"
+description = "Local Markdown vault domain logic for the wiki desktop app: ref normalization, front matter, wikilink extraction, link graph, full-text search and server sync"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[features]
+default = ["search"]
+# tantivy 是重型依赖（编译期与产物体积均可观），对齐 server 侧 `rag` 门控
+# qdrant-edge 的做法单独成 feature；默认开启是因为全文检索属本 crate 的核心
+# 能力，`--no-default-features` 留作快速迭代通道。
+search = ["dep:tantivy"]
+
+[dependencies]
+comrak.workspace = true
+gray_matter.workspace = true
+petgraph.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tantivy = { workspace = true, optional = true }
+thiserror.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
