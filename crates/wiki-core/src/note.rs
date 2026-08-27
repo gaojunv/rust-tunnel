@@ -124,12 +124,9 @@ mod tests {
     #[test]
     fn note_key_from_path_markdown_extension() {
         assert_eq!(
-            note_key_from_path(
-                Path::new("/vault"),
-                Path::new("/vault/hello.markdown")
-            )
-            .as_ref()
-            .map(NoteKey::as_str),
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/hello.markdown"))
+                .as_ref()
+                .map(NoteKey::as_str),
             Some("hello")
         );
     }
@@ -143,12 +140,9 @@ mod tests {
             Some("hello")
         );
         assert_eq!(
-            note_key_from_path(
-                Path::new("/vault"),
-                Path::new("/vault/hello.MARKDOWN")
-            )
-            .as_ref()
-            .map(NoteKey::as_str),
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/hello.MARKDOWN"))
+                .as_ref()
+                .map(NoteKey::as_str),
             Some("hello")
         );
     }
@@ -180,12 +174,9 @@ mod tests {
     #[test]
     fn note_key_from_path_windows_backslash() {
         assert_eq!(
-            note_key_from_path(
-                Path::new("/vault"),
-                Path::new("/vault/a\\b\\c.md")
-            )
-            .as_ref()
-            .map(NoteKey::as_str),
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/a\\b\\c.md"))
+                .as_ref()
+                .map(NoteKey::as_str),
             Some("a/b/c")
         );
     }

@@ -30,11 +30,11 @@ pub mod dto;
 pub mod error;
 /// 应用状态（vault 根目录）。
 pub mod state;
-/// Vault 纯逻辑操作（不依赖 `tauri`）。
-pub mod vault_ops;
 /// Tauri 装配层（仅 `tauri` feature）。
 #[cfg(feature = "tauri")]
 pub mod tauri_app;
+/// Vault 纯逻辑操作（不依赖 `tauri`）。
+pub mod vault_ops;
 
 #[cfg(feature = "tauri")]
 pub use tauri_app::run;

@@ -98,11 +98,7 @@ pub fn delete_note(state: &AppState, key: String) -> IpcResult<()> {
 ///
 /// `root` 不存在或检索失败时返回 [`crate::error::IpcError`]。
 #[allow(clippy::needless_pass_by_value)]
-pub fn search_notes(
-    state: &AppState,
-    query: String,
-    limit: usize,
-) -> IpcResult<Vec<SearchHitDto>> {
+pub fn search_notes(state: &AppState, query: String, limit: usize) -> IpcResult<Vec<SearchHitDto>> {
     let root = state.root();
     vault_ops::search_notes(&root, &query, limit)
 }

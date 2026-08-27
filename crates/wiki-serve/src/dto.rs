@@ -14,9 +14,7 @@ use rust_tunnel_wiki_core::search::SearchHit;
 
 /// 将 `SystemTime` 转为 unix 秒，失败回退为 0。
 fn system_time_to_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// 笔记摘要（列表用）。

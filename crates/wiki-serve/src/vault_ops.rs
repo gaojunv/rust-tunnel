@@ -87,8 +87,7 @@ fn merge_frontmatter_title(raw: &str, desired: &str) -> String {
 
     let mut yaml = String::from("---\n");
     // `serde_json::to_string` 产生带引号的字符串，合法 YAML 标量
-    let esc_title =
-        serde_json::to_string(desired).unwrap_or_else(|_| format!("\"{desired}\""));
+    let esc_title = serde_json::to_string(desired).unwrap_or_else(|_| format!("\"{desired}\""));
     let _ = writeln!(yaml, "title: {esc_title}");
 
     if let Some(ref_id) = fm.ref_id {
@@ -114,8 +113,7 @@ fn merge_frontmatter_title(raw: &str, desired: &str) -> String {
         for (k, v) in map {
             match v {
                 serde_json::Value::String(s) => {
-                    let esc =
-                        serde_json::to_string(&s).unwrap_or_else(|_| format!("\"{s}\""));
+                    let esc = serde_json::to_string(&s).unwrap_or_else(|_| format!("\"{s}\""));
                     let _ = writeln!(yaml, "{k}: {esc}");
                 }
                 serde_json::Value::Number(n) => {
@@ -224,12 +222,7 @@ pub fn get_note(root: &Path, key: &str) -> IpcResult<NoteDto> {
 ///
 /// 路径逃逸、IO 失败等。
 #[allow(clippy::needless_pass_by_value)]
-pub fn save_note(
-    root: &Path,
-    key: &str,
-    body: &str,
-    title: Option<String>,
-) -> IpcResult<NoteDto> {
+pub fn save_note(root: &Path, key: &str, body: &str, title: Option<String>) -> IpcResult<NoteDto> {
     let target = resolve_note_path(root, key)?;
     let to_write = if let Some(desired) = title.as_deref() {
         merge_frontmatter_title(body, desired)
@@ -302,8 +295,8 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> IpcResult<Vec<Sea
     fs::create_dir_all(&tmp_dir).map_err(IpcError::Io)?;
 
     let res: IpcResult<Vec<SearchHitDto>> = (|| {
-        let mut index = rust_tunnel_wiki_core::search::SearchIndex::open(&tmp_dir)
-            .map_err(IpcError::Search)?;
+        let mut index =
+            rust_tunnel_wiki_core::search::SearchIndex::open(&tmp_dir).map_err(IpcError::Search)?;
         for note in &notes {
             index.add_note(note).map_err(IpcError::Search)?;
         }
@@ -645,8 +638,13 @@ mod tests {
     #[test]
     fn save_note_frontmatter_title_injected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        save_note(dir.path(), "t1", "body without fm", Some("My Title".to_owned()))
-            .expect("save");
+        save_note(
+            dir.path(),
+            "t1",
+            "body without fm",
+            Some("My Title".to_owned()),
+        )
+        .expect("save");
         let content = fs::read_to_string(dir.path().join("t1.md")).expect("read");
         assert!(content.contains("title:"), "应含 title 字段：{content}");
         assert!(content.contains("My Title"));
@@ -751,9 +749,15 @@ mod tests {
     fn search_notes_empty_query_or_zero_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
         save_note(dir.path(), "a", "hello world", None).expect("a");
-        assert!(search_notes(dir.path(), "", 10).expect("empty q").is_empty());
-        assert!(search_notes(dir.path(), "   ", 10).expect("blank").is_empty());
-        assert!(search_notes(dir.path(), "hello", 0).expect("zero").is_empty());
+        assert!(search_notes(dir.path(), "", 10)
+            .expect("empty q")
+            .is_empty());
+        assert!(search_notes(dir.path(), "   ", 10)
+            .expect("blank")
+            .is_empty());
+        assert!(search_notes(dir.path(), "hello", 0)
+            .expect("zero")
+            .is_empty());
     }
 
     #[test]
@@ -801,7 +805,11 @@ mod tests {
         write_file(dir.path(), "a.md", "[[b]] and [[b]]");
         write_file(dir.path(), "b.md", "x");
         let g = get_graph(dir.path()).expect("graph");
-        let ab: Vec<_> = g.edges.iter().filter(|e| e.from == "a" && e.to == "b").collect();
+        let ab: Vec<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.from == "a" && e.to == "b")
+            .collect();
         assert_eq!(ab.len(), 1);
     }
 
@@ -833,7 +841,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(dir.path(), "a.md", "hello");
         ensure_vault_ready(dir.path()).expect("ensure nonempty");
-        assert!(!dir.path().join("welcome.md").exists(), "非空 vault 不应创建 welcome");
+        assert!(
+            !dir.path().join("welcome.md").exists(),
+            "非空 vault 不应创建 welcome"
+        );
         assert!(dir.path().join("a.md").exists());
         let info = get_vault_info(dir.path()).expect("info");
         assert_eq!(info.note_count, 1);
