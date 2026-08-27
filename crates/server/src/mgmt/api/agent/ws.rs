@@ -806,6 +806,24 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         }
     }
 
+    // 回合真值推送：WS 建连时把服务端是否在跑的真值推给前端，纠正刷新后前端
+    // 按历史推断 running 卡死的误判。runner（非 ACP）路径恒发 false 是刻意的
+    // ——runner 回合跑在发起它的那条 WS 连接的循环里、事件也只发往那条连接的
+    // event_tx，新连接本来就收不到旧回合的任何帧，报 false 比让前端显示一个
+    // 永远不会解除的 running 更准确。
+    let turn_running: bool = if let Some(agent) = state.server_state.agent_state.as_ref() {
+        if let Some(bridge) = agent.acp_bridge.as_ref() {
+            bridge.session_turn_running(&session_id).await
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let _ = event_tx
+        .send(serde_json::json!({"type": "turn_state", "running": turn_running}))
+        .await;
+
     // 预 spawn（后台、不阻塞连接循环）：WS 一建立即拉起 ACP agent，mode/effort
     // 快捷按钮无需等首条 user_message。session 已 spawn（重连/多标签页）时
     // ensure_session 幂等只刷新 ws_tx；失败静默——离线客户端/无模型配置等报错

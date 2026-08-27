@@ -442,6 +442,21 @@ impl AcpBridge {
             .is_some_and(|a| !a.exited)
     }
 
+    /// 会话回合是否正在进行中（WS 连接建立时推送回合真值用）。
+    ///
+    /// 语义：`busy && !exited`。`busy` 为真且进程未退出即视为有回合在跑；
+    /// 会话条目不存在返回 `false`。`exited` 的陈旧条目视同无回合——进程已死，
+    /// 回合不可能继续推进；WS 建连时推送该真值给前端，纠正刷新后前端按
+    /// 「历史最后一行是不是工具卡」猜 running 而卡死（辉光+停止按钮 10 分钟）
+    /// 的误判。
+    pub async fn session_turn_running(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|a| a.busy && !a.exited)
+    }
+
     /// 等待会话的 ACP 握手 + 配置注入完成（连接预 spawn 可能在后台进行）。
     /// 已就绪立即返回；超时、会话被移除（spawn 失败/Sender drop）返回 Err
     /// （spawn 失败时透出缓存的真实原因）。

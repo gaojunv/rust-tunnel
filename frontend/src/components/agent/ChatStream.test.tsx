@@ -2248,4 +2248,80 @@ describe('ChatStream running state', () => {
     expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
     expect(scrollEl.scrollTop).toBe(160);
   });
+
+  it('回归本 bug：以 tool_result 结尾的历史误判 running，turn_state false 纠正为可发送', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
+      { id: 'm3', session_id: 's1', role: 'tool', content: 'src/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    // 首次装载按历史末行 tool_result 推断 running → 停止按钮出现
+    expect(await screen.findByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: false });
+    });
+    // 服务端权威 false（且未在本连接发过消息）→ 纠正为非 running，变回发送按钮
+    expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+  });
+
+  it('护栏：建连后先 send 再收到 turn_state false 不误清 running', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    expect(await screen.findByText('agent.chatEmptyHint')).toBeTruthy();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'hello' } });
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.send' }));
+    // send 成功 → sentSinceOpenRef=true 且 running=true（停止按钮）
+    expect(ws.sent.some((s) => s.includes('"type":"user_message"'))).toBe(true);
+    expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    // 迟到的 turn_state false（建连后用户已发消息）→ 护栏阻止误清
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: false });
+    });
+    expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+  });
+
+  it('多标签页/真在跑：空历史收到 turn_state true 进入 running', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    expect(await screen.findByText('agent.chatEmptyHint')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: true });
+    });
+    expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+  });
+
+  it('竞态回归：turn_state false 先到、tool_result 历史后到不误判 running', async () => {
+    // 用 deferred promise 精确控制顺序：先让 turn_state 到达（设定真值 false），
+    // 再 resolve 带 tool_result 结尾的历史，确保测的是“帧先、历史后”这条竞态路径。
+    let resolveHistory!: (rows: unknown) => void;
+    (listAgentMessages as Mock).mockReturnValue(new Promise((resolve) => { resolveHistory = resolve; }));
+    renderChat();
+    // WS 已建连（FakeWs 构造时即指向 wsInstance），先到帧置权威 false
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: false });
+    });
+    // 后到的历史：末行 tool_result，本应推断 running=true，但被真值压住
+    await act(async () => {
+      resolveHistory([
+        { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+        { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
+        { id: 'm3', session_id: 's1', role: 'tool', content: 'src/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-05' },
+      ]);
+    });
+    expect(await screen.findByText('看下目录')).toBeTruthy();
+    // 真值 false 压住历史推断：最终可发送（非 running）
+    expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+  });
 });

@@ -468,3 +468,28 @@ async fn test_handle_spawn_exit_marks_exited() {
         "exit should be recorded"
     );
 }
+
+#[tokio::test]
+async fn test_session_turn_running_busy_true() {
+    let bridge = mock_bridge(|_| unreachable!("no requests expected")).await;
+    let mut agent = spawned_agent();
+    agent.busy = true;
+    bridge.sessions.lock().await.insert("sess-1".into(), agent);
+    assert!(bridge.session_turn_running("sess-1").await);
+}
+
+#[tokio::test]
+async fn test_session_turn_running_busy_but_exited_is_false() {
+    let bridge = mock_bridge(|_| unreachable!("no requests expected")).await;
+    let mut agent = spawned_agent();
+    agent.busy = true;
+    agent.exited = true;
+    bridge.sessions.lock().await.insert("sess-1".into(), agent);
+    assert!(!bridge.session_turn_running("sess-1").await);
+}
+
+#[tokio::test]
+async fn test_session_turn_running_missing_is_false() {
+    let bridge = mock_bridge(|_| unreachable!("no requests expected")).await;
+    assert!(!bridge.session_turn_running("ghost").await);
+}

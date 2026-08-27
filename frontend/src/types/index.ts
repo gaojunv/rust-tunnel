@@ -1176,7 +1176,9 @@ export type AgentWsEvent =
   | {
       type: 'available_commands';
       commands?: { name: string; description?: string }[];
-    };
+    }
+  // 建连时的回合真值快照（服务端权威），用于纠正前端按历史推断的 running（刷新/切回标签页后避免按 tool_calls/tool_result 误判为仍在跑）。
+  | { type: 'turn_state'; running?: boolean };
 
 /** 工作台全局通知（浏览器标签闪动/系统通知）。经 `/api/agent/notifications/ws`
  *  推送；与后端 `agent::notify::AgentNotification` 字段一一对应。 */

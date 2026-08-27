@@ -34,6 +34,7 @@ export interface UseChatHistoryOptions {
   scrollRef: React.MutableRefObject<HTMLDivElement | null>;
   earlierButtonRef: React.MutableRefObject<HTMLDivElement | null>;
   lastButtonHeightRef: React.MutableRefObject<number>;
+  serverTurnRunningRef: React.MutableRefObject<boolean | null>;
 }
 
 export interface UseChatHistoryReturn {
@@ -49,7 +50,7 @@ export interface UseChatHistoryReturn {
 }
 
 export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryReturn {
-  const { sessionId, items, setItems, streamingIdxRef, runningRef, setRunning, armRunningTimeout, scrollRef, earlierButtonRef, lastButtonHeightRef } = opts;
+  const { sessionId, items, setItems, streamingIdxRef, runningRef, setRunning, armRunningTimeout, scrollRef, earlierButtonRef, lastButtonHeightRef, serverTurnRunningRef } = opts;
 
   const [hasMore, setHasMore] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -109,7 +110,8 @@ export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryRetur
     }
     if (rows.length > 0) {
       const last = rows[rows.length - 1];
-      if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current) {
+      // 竞态护栏：若服务端已明确说不在跑（turn_state false 先到），后到的历史推断不能再把 running 推回 true。
+      if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current && serverTurnRunningRef.current !== false) {
         partialLoadRef.current = true;
         runningRef.current = true;
         setRunning(true);
@@ -120,7 +122,7 @@ export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryRetur
     loadedRawRef.current = rows;
     earlierCountRef.current = 0;
     setHasMore(historyHasMore(history));
-  }, [history, armRunningTimeout, runningRef, setItems, setRunning]);
+  }, [history, armRunningTimeout, runningRef, serverTurnRunningRef, setItems, setRunning]);
 
   const loadEarlier = useCallback(async () => {
     if (loadingEarlierRef.current) return;

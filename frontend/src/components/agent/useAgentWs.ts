@@ -58,6 +58,8 @@ export interface UseAgentWsOptions {
   streamingIdxRef: React.MutableRefObject<number | null>;
   streamingKindRef: React.MutableRefObject<'assistant' | 'thought' | null>;
   subStreamRef: React.MutableRefObject<Map<string, { idx: number; kind: 'assistant' | 'thought' }>>;
+  sentSinceOpenRef: React.MutableRefObject<boolean>;
+  serverTurnRunningRef: React.MutableRefObject<boolean | null>;
   flushChunks: () => void;
   breakStream: () => void;
   breakSubStream: (parentToolId: string) => void;
@@ -96,6 +98,8 @@ export function useAgentWs(opts: UseAgentWsOptions): void {
     streamingIdxRef,
     streamingKindRef,
     subStreamRef,
+    sentSinceOpenRef,
+    serverTurnRunningRef,
     flushChunks,
     breakStream,
     breakSubStream,
@@ -126,6 +130,8 @@ export function useAgentWs(opts: UseAgentWsOptions): void {
 
       ws.onopen = () => {
         attempts = 0;
+        sentSinceOpenRef.current = false;
+        serverTurnRunningRef.current = null;
         setDisconnected(false);
         lastFrameAtRef.current = Date.now();
         if (needHistoryReload) {
@@ -149,6 +155,17 @@ export function useAgentWs(opts: UseAgentWsOptions): void {
         }
         if (msg.type === 'heartbeat') {
           if (runningRef.current) armRunningTimeout();
+        } else if (msg.type === 'turn_state') {
+          serverTurnRunningRef.current = msg.running === true;
+          if (msg.running === true) {
+            armRunning();
+          } else if (msg.running === false) {
+            // 护栏：建连后用户手速极快先发了消息、turn_state 才到达时，不能把刚起的回合误清。
+            if (sentSinceOpenRef.current === false) {
+              stopRunning();
+              partialLoadRef.current = false;
+            }
+          }
         } else if (msg.type === 'assistant_chunk') {
           if (msg.content) {
             const parent = msg.parent_tool_call_id;
@@ -500,6 +517,8 @@ export function useAgentWs(opts: UseAgentWsOptions): void {
     streamingIdxRef,
     streamingKindRef,
     subStreamRef,
+    sentSinceOpenRef,
+    serverTurnRunningRef,
     flushChunks,
     breakStream,
     breakSubStream,

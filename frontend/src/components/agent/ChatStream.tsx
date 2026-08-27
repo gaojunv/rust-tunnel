@@ -79,6 +79,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   const planSeenThisTurnRef = useRef(false);
   const respondedRequestRef = useRef<Set<string>>(new Set());
   const modelChangeSeqRef = useRef(0);
+  const sentSinceOpenRef = useRef(false);
+  // null = 尚未收到服务端回合真值；true/false = 服务端权威结论
+  const serverTurnRunningRef = useRef<boolean | null>(null);
 
   const { chunkBufRef, chunkFlushTimerRef, streamingIdxRef, streamingKindRef, subStreamRef, flushChunks, breakStream, breakSubStream, scheduleChunkFlush } =
     useStreamBuffer({ setItems });
@@ -140,6 +143,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     scrollRef,
     earlierButtonRef,
     lastButtonHeightRef,
+    serverTurnRunningRef,
   });
 
   const reconcileConfigRollback = useCallback((serverOptions: SessionConfigOption[]) => {
@@ -182,6 +186,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     streamingIdxRef,
     streamingKindRef,
     subStreamRef,
+    sentSinceOpenRef,
+    serverTurnRunningRef,
     flushChunks,
     breakStream,
     breakSubStream,
@@ -301,6 +307,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
       setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
       return;
     }
+    sentSinceOpenRef.current = true;
     setItems((prev) => [...prev, { kind: 'user', content: text, id: nextLiveItemId() }]);
     setInput('');
     setRefs([]);
@@ -334,6 +341,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
       setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
       return;
     }
+    sentSinceOpenRef.current = true;
     setItems((prev) => [...prev, { kind: 'user', content: text, id: nextLiveItemId() }]);
     armRunning();
   }, [slashCommands, armRunning, t]);
