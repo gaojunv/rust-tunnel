@@ -28,13 +28,9 @@ export interface UseChatHistoryOptions {
   items: ChatItem[];
   setItems: React.Dispatch<React.SetStateAction<ChatItem[]>>;
   streamingIdxRef: React.MutableRefObject<number | null>;
-  runningRef: React.MutableRefObject<boolean>;
-  setRunning: React.Dispatch<React.SetStateAction<boolean>>;
-  armRunningTimeout: () => void;
   scrollRef: React.MutableRefObject<HTMLDivElement | null>;
   earlierButtonRef: React.MutableRefObject<HTMLDivElement | null>;
   lastButtonHeightRef: React.MutableRefObject<number>;
-  serverTurnRunningRef: React.MutableRefObject<boolean | null>;
 }
 
 export interface UseChatHistoryReturn {
@@ -50,7 +46,7 @@ export interface UseChatHistoryReturn {
 }
 
 export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryReturn {
-  const { sessionId, items, setItems, streamingIdxRef, runningRef, setRunning, armRunningTimeout, scrollRef, earlierButtonRef, lastButtonHeightRef, serverTurnRunningRef } = opts;
+  const { sessionId, items, setItems, streamingIdxRef, scrollRef, earlierButtonRef, lastButtonHeightRef } = opts;
 
   const [hasMore, setHasMore] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -58,6 +54,8 @@ export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryRetur
   const loadedRawRef = useRef<AgentMessage[]>([]);
   const earlierCountRef = useRef(0);
   const loadedRef = useRef(false);
+  // 「本次装载拿到的历史可能不完整」——由 useAgentWs 在收到 turn_state{running:true}
+  // 时置位（服务端确实在跑，回合中途的消息还没全落库），done 到达时触发一次对账重载。
   const partialLoadRef = useRef(false);
   const reconcileRef = useRef(false);
   const historyRef = useRef<AgentMessagesPage | AgentMessage[] | undefined>(undefined);
@@ -108,21 +106,14 @@ export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryRetur
       setItems(historyToChatItemsWithSkip(mergedRaw, compactionSkippedIndices(mergedRaw)));
       return;
     }
-    if (rows.length > 0) {
-      const last = rows[rows.length - 1];
-      // 竞态护栏：若服务端已明确说不在跑（turn_state false 先到），后到的历史推断不能再把 running 推回 true。
-      if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current && serverTurnRunningRef.current !== false) {
-        partialLoadRef.current = true;
-        runningRef.current = true;
-        setRunning(true);
-        armRunningTimeout();
-      }
-    }
+    // running 不再按历史末行推断。服务端建连即推 turn_state 真值（见 useAgentWs），
+    // 而「末行是 tool_calls/tool_result」是回合正常结束后的常态（收尾文本未落库），
+    // 抢在真值到达前猜 running 只会让输入框闪一下再被纠正回来。
     setItems(historyToChatItems(rows));
     loadedRawRef.current = rows;
     earlierCountRef.current = 0;
     setHasMore(historyHasMore(history));
-  }, [history, armRunningTimeout, runningRef, serverTurnRunningRef, setItems, setRunning]);
+  }, [history, setItems]);
 
   const loadEarlier = useCallback(async () => {
     if (loadingEarlierRef.current) return;

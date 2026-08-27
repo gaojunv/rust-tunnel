@@ -80,8 +80,6 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   const respondedRequestRef = useRef<Set<string>>(new Set());
   const modelChangeSeqRef = useRef(0);
   const sentSinceOpenRef = useRef(false);
-  // null = 尚未收到服务端回合真值；true/false = 服务端权威结论
-  const serverTurnRunningRef = useRef<boolean | null>(null);
 
   const { chunkBufRef, chunkFlushTimerRef, streamingIdxRef, streamingKindRef, subStreamRef, flushChunks, breakStream, breakSubStream, scheduleChunkFlush } =
     useStreamBuffer({ setItems });
@@ -137,13 +135,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     items,
     setItems,
     streamingIdxRef,
-    runningRef,
-    setRunning,
-    armRunningTimeout,
     scrollRef,
     earlierButtonRef,
     lastButtonHeightRef,
-    serverTurnRunningRef,
   });
 
   const reconcileConfigRollback = useCallback((serverOptions: SessionConfigOption[]) => {
@@ -187,7 +181,6 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     streamingKindRef,
     subStreamRef,
     sentSinceOpenRef,
-    serverTurnRunningRef,
     flushChunks,
     breakStream,
     breakSubStream,

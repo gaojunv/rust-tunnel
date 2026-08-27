@@ -471,8 +471,8 @@ describe('ChatStream running state', () => {
     expect(await screen.findByText('List')).toBeTruthy();
     // StatusBadge 对 failed 渲染 ✗（折叠卡片头部可见，无需展开）
     expect(screen.getByText('✗')).toBeTruthy();
-    // 重载时末尾是 tool_calls 行 → running 兜底置 true（回合可能仍在服务端跑）
-    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    // running 不按末行推断：等服务端 turn_state 真值，装载本身不置 running
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('does not render orphan card for tool_calls with paired tool_result', async () => {
@@ -549,9 +549,13 @@ describe('ChatStream running state', () => {
     ];
     (listAgentMessages as Mock).mockResolvedValueOnce(partial).mockResolvedValue(complete);
     renderChat();
-    // 半截装载：孤儿卡 failed + running 兜底
+    // 半截装载：孤儿卡 failed
     expect(await screen.findByText('List')).toBeTruthy();
     expect(screen.getByText('✗')).toBeTruthy();
+    // 服务端真值说在跑 → 标记本次装载不完整（partialLoad），并进入 running
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: true });
+    });
     expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // done → invalidate → refetch 返回完整历史 → 对账重载
     await act(async () => {
@@ -559,7 +563,7 @@ describe('ChatStream running state', () => {
     });
     expect(await screen.findByText('完成')).toBeTruthy();
     expect(screen.getByText('✓')).toBeTruthy();
-    // running 兜底不复发（对账重载跳过 running heuristic）
+    // 对账重载后 running 已解除，且不复发
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
@@ -2173,9 +2177,13 @@ describe('ChatStream running state', () => {
         has_more: true,
       });
     renderChat();
-    // 半截装载：孤儿工具卡（failed）+ running 兜底
+    // 半截装载：孤儿工具卡（failed）
     expect(await screen.findByText('消息 4')).toBeTruthy();
     expect(screen.getByText('✗')).toBeTruthy();
+    // 服务端真值说在跑 → 标记本次装载不完整，done 时才会对账重载
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: true });
+    });
     // 加载更早页（m0..m2，最后一页 → hasMore false，按钮消失）
     await act(async () => {
       fireEvent.click(screen.getByText('agent.loadEarlierMessages'));
@@ -2249,22 +2257,24 @@ describe('ChatStream running state', () => {
     expect(scrollEl.scrollTop).toBe(160);
   });
 
-  it('回归本 bug：以 tool_result 结尾的历史误判 running，turn_state false 纠正为可发送', async () => {
+  it('回归本 bug：以 tool_result 结尾的历史装载后即可发送，不闪 running', async () => {
     (listAgentMessages as Mock).mockResolvedValue([
       { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
       { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
       { id: 'm3', session_id: 's1', role: 'tool', content: 'src/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 首次装载按历史末行 tool_result 推断 running → 停止按钮出现
-    expect(await screen.findByRole('button', { name: 'agent.stop' })).toBeTruthy();
-    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    expect(await screen.findByText('看下目录')).toBeTruthy();
+    // 历史末行是 tool_result（回合正常结束的常态）→ 装载不再猜 running：
+    // turn_state 真值到达前就是发送态，不存在「闪一下 running 再消失」的窗口。
+    expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+    // 随后到达的真值 false 保持这一状态
     act(() => {
       wsInstance!.emit({ type: 'turn_state', running: false });
     });
-    // 服务端权威 false（且未在本连接发过消息）→ 纠正为非 running，变回发送按钮
     expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
@@ -2301,8 +2311,8 @@ describe('ChatStream running state', () => {
   });
 
   it('竞态回归：turn_state false 先到、tool_result 历史后到不误判 running', async () => {
-    // 用 deferred promise 精确控制顺序：先让 turn_state 到达（设定真值 false），
-    // 再 resolve 带 tool_result 结尾的历史，确保测的是“帧先、历史后”这条竞态路径。
+    // 历史装载不再触碰 running，这条竞态从源头消失；保留用例锁死这一点——
+    // 后到的历史（末行 tool_result）不得把服务端已给出的 false 顶回 running。
     let resolveHistory!: (rows: unknown) => void;
     (listAgentMessages as Mock).mockReturnValue(new Promise((resolve) => { resolveHistory = resolve; }));
     renderChat();
@@ -2310,7 +2320,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'turn_state', running: false });
     });
-    // 后到的历史：末行 tool_result，本应推断 running=true，但被真值压住
+    // 后到的历史：末行 tool_result
     await act(async () => {
       resolveHistory([
         { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
@@ -2319,9 +2329,31 @@ describe('ChatStream running state', () => {
       ]);
     });
     expect(await screen.findByText('看下目录')).toBeTruthy();
-    // 真值 false 压住历史推断：最终可发送（非 running）
+    // 最终可发送（非 running）
     expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+  });
+
+  it('真值 true 先到、历史后到：装载不得清掉 running', async () => {
+    // 反向竞态：服务端说在跑，随后到达的历史装载不能把 running 抹掉
+    // （防止有人给历史装载补一条「末行不是工具卡就置 idle」的对称逻辑）。
+    let resolveHistory!: (rows: unknown) => void;
+    (listAgentMessages as Mock).mockReturnValue(new Promise((resolve) => { resolveHistory = resolve; }));
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'turn_state', running: true });
+    });
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    // 后到的历史以普通 assistant 文本结尾（「看起来像已结束」）
+    await act(async () => {
+      resolveHistory([
+        { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+        { id: 'm2', session_id: 's1', role: 'assistant', content: '好的', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      ]);
+    });
+    expect(await screen.findByText('好的')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
   });
 });

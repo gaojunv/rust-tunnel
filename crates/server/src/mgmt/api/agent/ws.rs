@@ -790,6 +790,26 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // 异步执行，两轮之间的 cancel/approval_response 帧也要在此处理。
     let mut acp_active = false;
 
+    // 回合真值推送：WS 建连后**第一件事**就是把服务端是否在跑的真值推给前端。
+    // 前端不再按历史末行猜 running，完全等这一帧，所以它必须抢在任何可能阻塞的
+    // await（如下面要抢 acp_bridge 锁的 session_config_options）之前发出——晚一
+    // 拍，输入框就多禁用一拍。runner（非 ACP）路径恒发 false 是刻意的：runner
+    // 回合跑在发起它的那条 WS 连接的循环里、事件也只发往那条连接的 event_tx，
+    // 新连接本来就收不到旧回合的任何帧，报 false 比让前端显示一个永远不会解除
+    // 的 running 更准确。
+    let turn_running: bool = if let Some(agent) = state.server_state.agent_state.as_ref() {
+        if let Some(bridge) = agent.acp_bridge.as_ref() {
+            bridge.session_turn_running(&session_id).await
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let _ = event_tx
+        .send(serde_json::json!({"type": "turn_state", "running": turn_running}))
+        .await;
+
     // ACP 会话已就绪（重连/多标签页场景）：立即推送配置快照，前端设置菜单
     // 无需等下一次 config_option_update。session 尚未 spawn 时返回 None 跳过。
     // 能返回 Some 说明该 session 已有活跃 ACP 进程（workspace 必然配置了
@@ -805,24 +825,6 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             }
         }
     }
-
-    // 回合真值推送：WS 建连时把服务端是否在跑的真值推给前端，纠正刷新后前端
-    // 按历史推断 running 卡死的误判。runner（非 ACP）路径恒发 false 是刻意的
-    // ——runner 回合跑在发起它的那条 WS 连接的循环里、事件也只发往那条连接的
-    // event_tx，新连接本来就收不到旧回合的任何帧，报 false 比让前端显示一个
-    // 永远不会解除的 running 更准确。
-    let turn_running: bool = if let Some(agent) = state.server_state.agent_state.as_ref() {
-        if let Some(bridge) = agent.acp_bridge.as_ref() {
-            bridge.session_turn_running(&session_id).await
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    let _ = event_tx
-        .send(serde_json::json!({"type": "turn_state", "running": turn_running}))
-        .await;
 
     // 预 spawn（后台、不阻塞连接循环）：WS 一建立即拉起 ACP agent，mode/effort
     // 快捷按钮无需等首条 user_message。session 已 spawn（重连/多标签页）时
