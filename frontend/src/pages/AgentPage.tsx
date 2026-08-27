@@ -290,8 +290,16 @@ export default function AgentPage() {
   return (
     <div className="flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:min-h-[480px]">
       {/* 顶栏：logo + WorkspaceBar + SessionBar + 多会话标签（同一行，省空间；
-          标签区 flex-1 横向滚动，全关时隐藏，引导页提供新建入口） */}
-      <div className="flex items-center gap-1.5 border-b border-border/60 p-1.5 md:gap-2 md:p-2">
+          标签区 flex-1 横向滚动，全关时隐藏，引导页提供新建入口）
+          移动端 pr-[3.25rem]：右上角 MobileMenuFab 是 fixed 悬浮（right-3 + h-10 w-10
+          → 占视口右缘 12~52px，z-50），不参与本行 flex 布局，必须靠 padding 主动让位，
+          否则会话标题 truncate 到卡片右缘（距视口 14px）后尾部仍压在按钮底下。
+          52px + 外层 px-2(8px) = 内容右缘距视口 60px，与按钮左缘留 8px 间隙。
+          ⚠️ 改 Header.tsx MobileMenuFab 的 right/尺寸时必须同步这里。 */}
+      <div
+        data-testid="agent-topbar"
+        className="flex items-center gap-1.5 border-b border-border/60 p-1.5 pr-[3.25rem] md:gap-2 md:p-2 md:pr-2"
+      >
         {/* 移动端 393px 宽度寸土寸金：装饰图标让位给标签栏，仅桌面端显示 */}
         <Sparkles className="hidden h-4 w-4 shrink-0 text-primary md:block" />
         <WorkspaceBar
