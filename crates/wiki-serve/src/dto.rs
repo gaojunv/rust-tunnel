@@ -1,0 +1,135 @@
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![allow(clippy::missing_docs_in_private_items)]
+
+//! IPC 数据传输对象（字段名与前端约定，不得更改）。
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use rust_tunnel_wiki_core::note::Note;
+#[cfg(feature = "search")]
+use rust_tunnel_wiki_core::search::SearchHit;
+
+/// 将 `SystemTime` 转为 unix 秒，失败回退为 0。
+fn system_time_to_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// 笔记摘要（列表用）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteSummary {
+    /// vault 内相对路径键（去扩展名，`/` 分隔）。
+    pub key: String,
+    /// 显示标题。
+    pub title: String,
+    /// 标签列表。
+    pub tags: Vec<String>,
+    /// 最后修改时间（unix 秒）。
+    pub modified: u64,
+}
+
+impl From<&Note> for NoteSummary {
+    fn from(n: &Note) -> Self {
+        Self {
+            key: n.key.as_str().to_owned(),
+            title: n.title.clone(),
+            tags: n.tags.clone(),
+            modified: system_time_to_secs(n.modified),
+        }
+    }
+}
+
+/// 单篇笔记详情。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteDto {
+    /// vault 内相对路径键。
+    pub key: String,
+    /// 显示标题。
+    pub title: String,
+    /// 别名列表。
+    pub aliases: Vec<String>,
+    /// 标签列表。
+    pub tags: Vec<String>,
+    /// 正文（已剥离 frontmatter）。
+    pub body: String,
+    /// 最后修改时间（unix 秒）。
+    pub modified: u64,
+}
+
+impl From<&Note> for NoteDto {
+    fn from(n: &Note) -> Self {
+        Self {
+            key: n.key.as_str().to_owned(),
+            title: n.title.clone(),
+            aliases: n.aliases.clone(),
+            tags: n.tags.clone(),
+            body: n.body.clone(),
+            modified: system_time_to_secs(n.modified),
+        }
+    }
+}
+
+/// 搜索命中。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchHitDto {
+    /// 命中的笔记键。
+    pub note_key: String,
+    /// 命中笔记标题。
+    pub title: String,
+    /// 命中片段。
+    pub snippet: String,
+    /// 相关度分数。
+    pub score: f64,
+}
+
+#[cfg(feature = "search")]
+impl From<&SearchHit> for SearchHitDto {
+    fn from(h: &SearchHit) -> Self {
+        Self {
+            note_key: h.note_key.as_str().to_owned(),
+            title: h.title.clone(),
+            snippet: h.snippet.clone(),
+            score: h.score,
+        }
+    }
+}
+
+/// 图节点。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphNode {
+    /// 笔记键。
+    pub key: String,
+    /// 显示标题。
+    pub title: String,
+}
+
+/// 图边（有向）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GraphEdge {
+    /// 起点笔记键。
+    pub from: String,
+    /// 终点笔记键。
+    pub to: String,
+}
+
+/// 链接图 DTO。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphDto {
+    /// 全部节点。
+    pub nodes: Vec<GraphNode>,
+    /// 全部有向边（已排序去重）。
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Vault 信息。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultInfo {
+    /// vault 根目录字符串。
+    pub root: String,
+    /// 笔记数量。
+    pub note_count: usize,
+}

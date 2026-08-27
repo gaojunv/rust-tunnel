@@ -22,3 +22,10 @@ client.toml
 
 # Claude Code 会话 worktree（避免 gitlink 误提交）
 .claude/worktrees/
+
+wiki-desktop-ui/node_modules
+wiki-desktop-ui/dist
+wiki-desktop-ui/*.tsbuildinfo
+
+# tauri-build 每次构建重新生成的 ACL/capability schema
+crates/wiki-serve/gen/schemas/

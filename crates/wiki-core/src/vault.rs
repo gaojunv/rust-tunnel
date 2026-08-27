@@ -228,31 +228,9 @@ impl VaultScanner {
     }
 }
 
-/// 从 `vault_root` 与 `file_path` 推导 [`NoteKey`]。
-///
-/// 优先尝试调用 [`crate::note::note_key_from_path`]（若桩已实现则直接复用），
-/// 失败时回退到本地实现：相对路径去 `.md`/`.markdown` 扩展并将 `\` 归一为 `/`。
+/// 从 `vault_root` 与 `file_path` 推导 [`NoteKey`]（委托 [`crate::note::note_key_from_path`]）。
 fn derive_note_key(vault_root: &Path, file_path: &Path) -> Option<NoteKey> {
-    if let Some(k) = crate::note::note_key_from_path(vault_root, file_path) {
-        return Some(k);
-    }
-    let rel = file_path.strip_prefix(vault_root).ok()?;
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    let lower = rel_str.to_ascii_lowercase();
-    let stripped = if lower.ends_with(".markdown") {
-        // 按字节长度切除，避免大小写不一致时的切片错位
-        let end = rel_str.len() - ".markdown".len();
-        &rel_str[..end]
-    } else if std::path::Path::new(&lower)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-    {
-        let end = rel_str.len() - ".md".len();
-        &rel_str[..end]
-    } else {
-        return None;
-    };
-    Some(NoteKey::new(stripped.to_owned()))
+    crate::note::note_key_from_path(vault_root, file_path)
 }
 
 /// 默认忽略模式：`.obsidian`、`.git`、`.trash`、`node_modules`。

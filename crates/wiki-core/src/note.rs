@@ -73,13 +73,30 @@ pub struct Note {
     pub modified: SystemTime,
 }
 
-/// 从绝对文件路径推导 `NoteKey`。
+/// 从 `vault_root` 与 `file_path` 推导 [`NoteKey`]。
 ///
-/// 当前为桩实现：恒返回 `None`。真实实现会基于 `vault_root` 计算相对路径、
-/// 去扩展名并将 `\` 归一为 `/`。
+/// 基于 `vault_root` 计算相对路径，去 `.md`/`.markdown` 扩展（大小写不敏感、按
+/// 字节长度切除避免大小写不一致时的切片错位），并将 `\` 归一为 `/`。非 Markdown
+/// 文件或 `file_path` 不在 `vault_root` 之下时返回 `None`。
 #[must_use]
-pub fn note_key_from_path(_vault_root: &Path, _file_path: &Path) -> Option<NoteKey> {
-    None
+pub fn note_key_from_path(vault_root: &Path, file_path: &Path) -> Option<NoteKey> {
+    let rel = file_path.strip_prefix(vault_root).ok()?;
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let lower = rel_str.to_ascii_lowercase();
+    let stripped = if lower.ends_with(".markdown") {
+        // 按字节长度切除，避免大小写不一致时的切片错位
+        let end = rel_str.len() - ".markdown".len();
+        &rel_str[..end]
+    } else if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        let end = rel_str.len() - ".md".len();
+        &rel_str[..end]
+    } else {
+        return None;
+    };
+    Some(NoteKey::new(stripped.to_owned()))
 }
 
 #[cfg(test)]
@@ -95,10 +112,81 @@ mod tests {
     }
 
     #[test]
-    fn path_stub_returns_none() {
+    fn note_key_from_path_nested_dir() {
         assert_eq!(
-            note_key_from_path(Path::new("/vault"), Path::new("/vault/a.md")),
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/a/b/c.md"))
+                .as_ref()
+                .map(NoteKey::as_str),
+            Some("a/b/c")
+        );
+    }
+
+    #[test]
+    fn note_key_from_path_markdown_extension() {
+        assert_eq!(
+            note_key_from_path(
+                Path::new("/vault"),
+                Path::new("/vault/hello.markdown")
+            )
+            .as_ref()
+            .map(NoteKey::as_str),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn note_key_from_path_uppercase_md_extension() {
+        assert_eq!(
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/hello.MD"))
+                .as_ref()
+                .map(NoteKey::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            note_key_from_path(
+                Path::new("/vault"),
+                Path::new("/vault/hello.MARKDOWN")
+            )
+            .as_ref()
+            .map(NoteKey::as_str),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn note_key_from_path_non_md_returns_none() {
+        assert_eq!(
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/a.txt")),
             None
+        );
+        assert_eq!(
+            note_key_from_path(Path::new("/vault"), Path::new("/vault/a")),
+            None
+        );
+    }
+
+    #[test]
+    fn note_key_from_path_outside_root_returns_none() {
+        assert_eq!(
+            note_key_from_path(Path::new("/vault"), Path::new("/other/a.md")),
+            None
+        );
+        assert_eq!(
+            note_key_from_path(Path::new("/vault"), Path::new("/vault-other/a.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn note_key_from_path_windows_backslash() {
+        assert_eq!(
+            note_key_from_path(
+                Path::new("/vault"),
+                Path::new("/vault/a\\b\\c.md")
+            )
+            .as_ref()
+            .map(NoteKey::as_str),
+            Some("a/b/c")
         );
     }
 }
