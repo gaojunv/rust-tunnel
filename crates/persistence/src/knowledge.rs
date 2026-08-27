@@ -1205,7 +1205,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "双索引开关与 per-kind 状态矩阵断言路径多，单测直接铺开")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "双索引开关与 per-kind 状态矩阵断言路径多，单测直接铺开"
+    )]
     async fn dual_index_switch_and_per_kind_independent_status() {
         let db = test_db().await;
         db.ks_create(&KsCreateOpts {
