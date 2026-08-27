@@ -148,7 +148,10 @@ impl AcmeClient {
                         "active" => CertificateStatus::Active,
                         "expired" => CertificateStatus::Expired,
                         "failed" => CertificateStatus::Failed,
-                        #[allow(clippy::match_same_arms, reason = "pending 与未知状态同归 Pending，但显式列出 pending 更清晰")]
+                        #[allow(
+                            clippy::match_same_arms,
+                            reason = "pending 与未知状态同归 Pending，但显式列出 pending 更清晰"
+                        )]
                         _ => CertificateStatus::Pending,
                     },
                     issued_at: record.issued_at.map(|dt| dt.to_rfc3339()),
@@ -178,7 +181,10 @@ impl AcmeClient {
                         "active" => CertificateStatus::Active,
                         "expired" => CertificateStatus::Expired,
                         "failed" => CertificateStatus::Failed,
-                        #[allow(clippy::match_same_arms, reason = "pending 与未知状态同归 Pending，但显式保留语义分支")]
+                        #[allow(
+                            clippy::match_same_arms,
+                            reason = "pending 与未知状态同归 Pending，但显式保留语义分支"
+                        )]
                         _ => CertificateStatus::Pending,
                     },
                     issued_at: record.issued_at.map(|dt| dt.to_rfc3339()),

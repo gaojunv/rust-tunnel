@@ -20,8 +20,14 @@ use super::ServerState;
 ///
 /// # Errors
 /// 当控制通道读写或注册失败时返回 `TunnelError`。
-#[allow(clippy::match_same_arms, reason = "不同 ControlMessage 变体分发到不同处理逻辑，合并会降低可读性")]
-#[allow(clippy::too_many_lines, reason = "控制连接编排含注册、鉴权、读写循环与全量消息分发，共享大量局部状态，拆分反而降低可读性")]
+#[allow(
+    clippy::match_same_arms,
+    reason = "不同 ControlMessage 变体分发到不同处理逻辑，合并会降低可读性"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "控制连接编排含注册、鉴权、读写循环与全量消息分发，共享大量局部状态，拆分反而降低可读性"
+)]
 async fn handle_client_connection(
     reader: impl AsyncRead + Unpin + Send,
     writer: impl AsyncWrite + Unpin + Send + 'static,
@@ -112,7 +118,9 @@ async fn handle_client_connection(
     let cleanup_registry = registry.clone();
     let result: TunnelResult<()> = async {
         loop {
-            let Some(msg) = ControlMessage::read_from_stream(&mut reader).await? else { break };
+            let Some(msg) = ControlMessage::read_from_stream(&mut reader).await? else {
+                break;
+            };
             match msg {
                 ControlMessage::Ping {
                     seq,
@@ -267,7 +275,10 @@ async fn handle_client_connection(
 ///
 /// # Errors
 /// 当监听绑定或 TLS 配置失败时返回 `TunnelError`。
-#[allow(clippy::match_same_arms, reason = "不同 ControlMessage 变体分发到不同处理逻辑，合并会降低可读性")]
+#[allow(
+    clippy::match_same_arms,
+    reason = "不同 ControlMessage 变体分发到不同处理逻辑，合并会降低可读性"
+)]
 #[allow(clippy::too_many_lines)]
 pub async fn run_server(
     config: ServerConfig,

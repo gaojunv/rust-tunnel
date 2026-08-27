@@ -110,8 +110,9 @@ impl AliyunDnsSolver {
         // Compute HMAC-SHA1 signature
         // HMAC 接受任意长度 key，`new_from_slice` 实际不可失败；此处向上传播错误
         // 而非兜底伪造签名，避免用错误 key 签出的请求在远端表现为难以定位的鉴权失败。
-        let mut mac = HmacSha1::new_from_slice(format!("{}&", self.access_key_secret).as_bytes())
-            .map_err(|e| AcmeError::Dns(format!("failed to build HMAC-SHA1 signer: {e}")))?;
+        let mut mac =
+            HmacSha1::new_from_slice(format!("{}&", self.access_key_secret).as_bytes())
+                .map_err(|e| AcmeError::Dns(format!("failed to build HMAC-SHA1 signer: {e}")))?;
         mac.update(string_to_sign.as_bytes());
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
@@ -254,10 +255,10 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         value: &str,
         timeout: Duration,
     ) -> AcmeResult<()> {
-        use trust_dns_resolver::TokioAsyncResolver;
         use trust_dns_resolver::config::{
             NameServerConfig, Protocol, ResolverConfig, ResolverOpts,
         };
+        use trust_dns_resolver::TokioAsyncResolver;
 
         // Build resolver with Google DNS + Alibaba DNS
         let mut config = ResolverConfig::new();

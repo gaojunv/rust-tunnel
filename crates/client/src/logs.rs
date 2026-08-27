@@ -50,15 +50,22 @@ impl<S> Layer<S> for ClientLogLayer
 where
     S: tracing::Subscriber,
 {
-    #[allow(clippy::items_after_statements, reason = "Visitor 定义紧邻使用点更易读，移至顶部反而割裂逻辑")]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "Visitor 定义紧邻使用点更易读，移至顶部反而割裂逻辑"
+    )]
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let metadata = event.metadata();
-        let timestamp =
-            i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros())).unwrap_or(i64::MAX);
+        let timestamp = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros()),
+        )
+        .unwrap_or(i64::MAX);
 
         struct ClientFieldVisitor {
             message: String,

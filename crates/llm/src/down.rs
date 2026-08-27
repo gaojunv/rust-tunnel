@@ -61,7 +61,10 @@ impl KnownFailures {
     /// - provider 级（认证失败）：`p:<provider_id>`
     /// - 模型级（404 等）：`m:<model_id>`
     pub fn record(&self, key: &str, kind: FailureKind, status: u16, message: &str) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(
             key.to_string(),
             Entry {
@@ -78,7 +81,10 @@ impl KnownFailures {
     /// 查询该键对应的失败信息；超过 TTL 视为已恢复并清除（惰性过期）。
     #[must_use]
     pub fn lookup(&self, key: &str) -> Option<KnownFailureInfo> {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map.get(key)?;
         if entry.recorded_at.elapsed() >= KNOWN_FAILURE_TTL {
             map.remove(key);
@@ -89,14 +95,20 @@ impl KnownFailures {
 
     /// 清除单条（如某模型被编辑后立即恢复探测）。
     pub fn remove(&self, key: &str) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.remove(key);
     }
 
     /// 全量清除：配置变更（provider/model/group CRUD、手动重置）后调用，
     /// 让新配置立即可见、无需等 TTL。
     pub fn clear_all(&self) {
-        let mut map = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.clear();
     }
 }
@@ -152,8 +164,11 @@ mod tests {
         {
             let mut map = kf.inner.lock().unwrap();
             let entry = map.get_mut("p:p1").unwrap();
-            entry.recorded_at =
-                Instant::now().checked_sub(KNOWN_FAILURE_TTL).unwrap().checked_sub(Duration::from_secs(1)).unwrap();
+            entry.recorded_at = Instant::now()
+                .checked_sub(KNOWN_FAILURE_TTL)
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap();
         }
         assert!(kf.lookup("p:p1").is_none());
         // 惰性过期已清理

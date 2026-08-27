@@ -32,8 +32,8 @@ pub async fn sse_log_stream(
     if state.auth_config.is_enabled() {
         let token = params.token.as_deref().unwrap_or("");
 
-        let is_valid =
-            !token.is_empty() && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok();
+        let is_valid = !token.is_empty()
+            && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok();
 
         if !is_valid {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
@@ -332,7 +332,10 @@ mod tests {
     use crate::auth::AuthConfig;
     use std::sync::Arc;
 
-    #[allow(clippy::large_futures, reason = "测试辅助 future 仅在单测中构造一次，boxing 无收益")]
+    #[allow(
+        clippy::large_futures,
+        reason = "测试辅助 future 仅在单测中构造一次，boxing 无收益"
+    )]
     async fn get_enabled(state: ApiState) -> bool {
         let resp = get_llm_logging(State(state)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -352,13 +355,19 @@ mod tests {
         }
     }
 
-    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
+    #[allow(
+        clippy::large_futures,
+        reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益"
+    )]
     #[tokio::test]
     async fn test_get_llm_logging_default_true() {
         assert!(get_enabled(make_state()).await);
     }
 
-    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
+    #[allow(
+        clippy::large_futures,
+        reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益"
+    )]
     #[tokio::test]
     async fn test_put_llm_logging_toggles_and_persists() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
@@ -397,7 +406,10 @@ mod tests {
         assert_eq!(stored, "false");
     }
 
-    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
+    #[allow(
+        clippy::large_futures,
+        reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益"
+    )]
     #[tokio::test]
     async fn test_put_llm_logging_turns_back_on() {
         let state = make_state();
@@ -414,7 +426,10 @@ mod tests {
 
     /// 完整端到端 round-trip：PUT 关闭 → dynamic_config 同步 → DB 持久化 →
     /// 模拟服务重启（load_or_seed 回读）→ 重启后的 GET 仍为 false。
-    #[allow(clippy::large_futures, reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益")]
+    #[allow(
+        clippy::large_futures,
+        reason = "测试辅助调用 ApiState 快照，future 大小仅单测路径，boxing 无收益"
+    )]
     #[tokio::test]
     async fn test_llm_logging_round_trip_survives_restart() {
         let db = crate::db::Database::new(":memory:").await.unwrap();

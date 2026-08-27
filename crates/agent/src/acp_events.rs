@@ -29,8 +29,14 @@ use agent_client_protocol::schema::MaybeUndefined;
 /// 帧额外输出 `parent_tool_call_id`（有值才输出）与 `is_subagent`（仅 true 时
 /// 输出），前端据此按父子关系分组渲染。无 `_meta` 的事件字段缺省，完全无感降级。
 // 对 9 个 ACP 帧变体的扁平派发，共享大量局部状态，拆分会把相关逻辑散到多个签名里反而降低可读性。
-#[allow(clippy::too_many_lines, reason = "对 9 个 ACP 帧变体的扁平派发，拆分会把相关逻辑散到多个签名里反而降低可读性")]
-#[allow(clippy::match_same_arms, reason = "UserMessageChunk 显式分支为文档目的，虽与通配分支同为 None，但中间夹着关键业务分支，合并会掩盖意图")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "对 9 个 ACP 帧变体的扁平派发，拆分会把相关逻辑散到多个签名里反而降低可读性"
+)]
+#[allow(
+    clippy::match_same_arms,
+    reason = "UserMessageChunk 显式分支为文档目的，虽与通配分支同为 None，但中间夹着关键业务分支，合并会掩盖意图"
+)]
 pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {

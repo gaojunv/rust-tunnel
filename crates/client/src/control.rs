@@ -196,8 +196,12 @@ async fn start_heartbeat(sender: ControlSender) {
         if seq > 0 {
             interval.tick().await;
         }
-        let timestamp_micros =
-            u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros())).unwrap_or(u64::MAX);
+        let timestamp_micros = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros()),
+        )
+        .unwrap_or(u64::MAX);
         seq = seq.wrapping_add(1);
         if let Err(e) = sender
             .send(ControlMessage::Ping {
@@ -218,7 +222,10 @@ async fn start_heartbeat(sender: ControlSender) {
 /// # Errors
 ///
 /// 当收到 `Disconnect` 或底层 `read_from_stream` 出错时返回 `Err`。
-#[allow(clippy::too_many_lines, reason = "对控制通道全部消息变体的扁平派发，共享状态与分支多，拆分无益")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "对控制通道全部消息变体的扁平派发，共享状态与分支多，拆分无益"
+)]
 async fn process_control_messages<R: AsyncRead + Unpin>(
     reader: &mut R,
     state: ClientState,
@@ -488,7 +495,10 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
 /// # Errors
 ///
 /// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
-#[allow(clippy::too_many_lines, reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分"
+)]
 pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
     // Connect to server with or without TLS
     let (mut reader, mut writer): (

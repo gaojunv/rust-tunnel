@@ -184,7 +184,10 @@ pub async fn get_workspace(
 }
 
 /// `PUT /api/agent/workspaces/:id`：更新工作区。
-#[allow(clippy::too_many_lines, reason="校验与归一化编排集中于单一 handler，拆分会分散校验逻辑降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "校验与归一化编排集中于单一 handler，拆分会分散校验逻辑降低可读性"
+)]
 pub async fn update_workspace(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1122,7 +1125,10 @@ pub async fn list_workspace_files(
 }
 
 #[cfg(test)]
-#[allow(clippy::large_futures, reason = "测试中 handler future 较大但仅在单测路径构造一次，boxing 需单独性能评估")]
+#[allow(
+    clippy::large_futures,
+    reason = "测试中 handler future 较大但仅在单测路径构造一次，boxing 需单独性能评估"
+)]
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;

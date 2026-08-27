@@ -49,8 +49,14 @@ pub(crate) async fn send_tool_call_delta(
 /// 保持 tool_calls 原顺序。
 /// `persist`：false 时跳过 thought/assistant 行落库（子 agent 内存态）。
 /// `llm`：task 短路需要调 LLM。
-#[allow(clippy::too_many_arguments, reason = "单调用点内部函数，混合基础设施参数")]
-#[allow(clippy::too_many_lines, reason = "工具调用的分段并发与串行编排，含 task 批处理与只读并发组划分，拆分会打散状态")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "单调用点内部函数，混合基础设施参数"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "工具调用的分段并发与串行编排，含 task 批处理与只读并发组划分，拆分会打散状态"
+)]
 pub(crate) async fn handle_tool_calls(
     agent: &AgentState,
     llm: &Arc<LlmState>,
@@ -383,8 +389,14 @@ pub(crate) fn synthesize_tool_diffs(
 
 /// 串行执行单个工具调用并发送 WS 帧+落库（remember/use_skill 短路、审批、写操作）。
 /// `persist`：false 时跳过 DB 落库（子 agent 内存态）。
-#[allow(clippy::too_many_arguments, reason = "单调用点内部函数，混合基础设施参数")]
-#[allow(clippy::too_many_lines, reason = "单个工具调用的审批、版本门控与执行落库链，分支共享大量上下文，拆分无益")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "单调用点内部函数，混合基础设施参数"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "单个工具调用的审批、版本门控与执行落库链，分支共享大量上下文，拆分无益"
+)]
 pub(crate) async fn handle_single_tool_call(
     agent: &AgentState,
     _llm: &Arc<LlmState>,

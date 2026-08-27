@@ -47,7 +47,10 @@ pub fn client_supports_edit_file(client_version: Option<&str>) -> bool {
 /// `mode` 为 `"plan"` 时只暴露只读工具子集 + `todo_write`（辅助出方案），
 /// 写类工具对模型不可见（模型不会调用，parse 层再兜底拒绝）。
 // 30+ 工具的扁平声明与 plan 模式裁剪，拆分反而让工具清单与裁剪逻辑分离。
-#[allow(clippy::too_many_lines, reason = "30+ 工具的扁平声明与 plan 模式裁剪，拆分反而让清单与裁剪逻辑分离")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "30+ 工具的扁平声明与 plan 模式裁剪，拆分反而让清单与裁剪逻辑分离"
+)]
 #[must_use]
 pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
     let file_props = |extra: &[(&str, serde_json::Value)]| {
@@ -624,7 +627,10 @@ fn git_paths_cmd(tool: &str, prefix: &[&str], paths: &[String]) -> Result<Vec<St
 
 /// 把待校验的 git 参数经 git_plan 规划为可执行的 GitExec 命令。非法参数在此
 /// fail-closed 报错：模型在 parse 阶段即收到错误，而非隧道执行失败或注入风险。
-#[allow(clippy::needless_pass_by_value, reason = "Vec<String> 由调用方 git_paths_cmd 构造，传引用会增加借用复杂度")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Vec<String> 由调用方 git_paths_cmd 构造，传引用会增加借用复杂度"
+)]
 fn plan_git_cmd(tool: &str, args: Vec<String>) -> Result<AgentCommand, String> {
     let planned = super::git_plan::plan(&args).map_err(|e| format!("tool '{tool}': {e}"))?;
     Ok(AgentCommand::GitExec { args: planned.args })
@@ -757,7 +763,10 @@ fn check_path_len(value: &str, arg: &str) -> Result<(), String> {
 /// # Errors
 /// 参数缺失、类型错误、长度超限或 git 白名单校验失败时返回面向模型的错误文本。
 // 20+ 工具的扁平派发，共享多类局部状态，拆分会把相关逻辑与错误处理散到多个签名里反而降低可读性。
-#[allow(clippy::too_many_lines, reason = "20+ 工具的扁平派发，拆分会把相关逻辑与错误处理散到多个签名里反而降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "20+ 工具的扁平派发，拆分会把相关逻辑与错误处理散到多个签名里反而降低可读性"
+)]
 pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, String> {
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid tool arguments: {e}"))?;

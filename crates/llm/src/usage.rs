@@ -427,8 +427,12 @@ pub async fn wrap_and_record(
 
     // 流耗尽时落库：追加一个末尾 future，消费完成后触发记录，且不产出额外字节。
     let tail_stream = futures_util::stream::once(async move {
-        let usage =
-            std::mem::take(&mut *scanner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).finish();
+        let usage = std::mem::take(
+            &mut *scanner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .finish();
         let insert = ctx.into_insert(
             usage,
             status_code,

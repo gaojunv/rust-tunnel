@@ -574,7 +574,10 @@ mod tests {
             .expect("build request")
     }
 
-    #[allow(clippy::too_many_lines, reason = "CRUD 全链路端到端用例，顺序编排大量断言与状态校验，拆分会割裂用例可读性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "CRUD 全链路端到端用例，顺序编排大量断言与状态校验，拆分会割裂用例可读性"
+    )]
     #[tokio::test]
     async fn skills_crud_toggle_and_validation() {
         let dir = tempfile::tempdir().unwrap();

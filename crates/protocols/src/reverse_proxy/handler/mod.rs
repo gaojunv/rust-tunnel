@@ -41,7 +41,10 @@ pub type ProxyState = (RouteSource, Arc<UpstreamClient>, Arc<ReverseProxyState>)
 
 /// Unified axum handler that replaces both the legacy per-rule handler and
 /// the shared-listener handler.
-#[allow(clippy::too_many_lines, reason = "代理主路径的路由、统计、WS 升级与错误回退的顺序编排，拆分会割裂共享的统计与连接状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "代理主路径的路由、统计、WS 升级与错误回退的顺序编排，拆分会割裂共享的统计与连接状态"
+)]
 pub async fn handle_proxy_request_unified(
     State((source, upstream, proxy_state)): State<ProxyState>,
     mut req: Request<Body>,
@@ -669,7 +672,10 @@ mod tests {
     /// End-to-end: client → proxy → backend WebSocket upgrade + bidirectional
     /// byte echo through the tunnel. Uses raw TCP + a hand-written HTTP/1.1
     /// upgrade handshake so the test doesn't pull in tokio-tungstenite.
-    #[allow(clippy::too_many_lines, reason = "WS 握手与双向回显的端到端编排，含 mock backend 搭建与端口协商，拆分会割裂测试脚手架")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "WS 握手与双向回显的端到端编排，含 mock backend 搭建与端口协商，拆分会割裂测试脚手架"
+    )]
     #[tokio::test]
     async fn websocket_upgrade_proxies_end_to_end() {
         use std::collections::HashSet;
@@ -861,7 +867,10 @@ mod tests {
     /// The fake client lives at the registry message level: it answers
     /// OpenTunnel, completes the WS handshake on the first Data frame, then
     /// echoes raw bytes.
-    #[allow(clippy::too_many_lines, reason = "Client 隧道 WS 端到端编排，含 mock TunnelOpener 与双向回显，拆分会割裂脚手架状态")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Client 隧道 WS 端到端编排，含 mock TunnelOpener 与双向回显，拆分会割裂脚手架状态"
+    )]
     #[tokio::test]
     async fn websocket_upgrade_to_client_backend_end_to_end() {
         use std::net::SocketAddr;

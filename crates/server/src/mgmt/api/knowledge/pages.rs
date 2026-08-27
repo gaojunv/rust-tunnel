@@ -79,6 +79,7 @@ pub struct SearchParams {
     pub limit: Option<i64>,
 }
 
+/// `GET /api/knowledge/:id/pages`：分页列出指定容器下的页面，支持 `q`/`ref_prefix`/`locked` 过滤；只读，不写库。
 pub async fn list_pages(
     State(state): State<ApiState>,
     Path(source_id): Path<String>,
@@ -113,6 +114,7 @@ pub async fn list_pages(
     }
 }
 
+/// `GET /api/knowledge/:id/pages/*ref`：按归一化 `ref` 查询单页详情；只读，不写库也不改图谱。
 pub async fn get_page(
     State(state): State<ApiState>,
     Path((source_id, page_ref)): Path<(String, String)>,
@@ -131,6 +133,8 @@ pub async fn get_page(
     }
 }
 
+/// `PUT /api/knowledge/:id/pages/*ref`：创建或更新单页（幂等 upsert），写库并同事务同步 FTS 与页面链接图谱（解析 `[[ref]]` 重建出边、回填悬空入边）。
+/// 已 `locked` 的页面不会被非锁定写入覆盖；`ref` 取 `body.ref` 优先、回退路径参数，均需归一化校验。
 pub async fn put_page(
     State(state): State<ApiState>,
     Path((source_id, page_ref)): Path<(String, String)>,
@@ -177,6 +181,8 @@ pub async fn put_page(
     }
 }
 
+/// `DELETE /api/knowledge/:id/pages/*ref`：删除指定页面，写库并同事务清理 FTS、出边及入边悬空化。
+/// 同步更新容器的 `page_count`/`version`；目标不存在返回 404。
 pub async fn delete_page(
     State(state): State<ApiState>,
     Path((source_id, page_ref)): Path<(String, String)>,
@@ -195,6 +201,7 @@ pub async fn delete_page(
     }
 }
 
+/// `GET /api/knowledge/:id/graph`：返回指定容器的页面链接图谱（`nodes` 为页面摘要、`edges` 为有向边，含悬空标记）；只读，不写库。
 pub async fn get_graph(
     State(state): State<ApiState>,
     Path(source_id): Path<String>,
@@ -215,6 +222,8 @@ pub async fn get_graph(
     }
 }
 
+/// `GET /api/knowledge/:id/search`：在单个容器内检索页面（FTS5 优先、短词/零命中回退 LIKE）；只读，不写库。
+/// 限定 `source_id` 作用域，`limit` 缺省 20、 clamped 1..20。
 pub async fn search_knowledge(
     State(state): State<ApiState>,
     Path(source_id): Path<String>,
@@ -234,6 +243,8 @@ pub async fn search_knowledge(
     }
 }
 
+/// `GET /api/knowledge/search`：跨全部容器全局检索页面（FTS5 优先、短词/零命中回退 LIKE）；只读，不写库。
+/// 空作用域（`visible_wiki_ids=[]`）即全局，与单容器检索 `search_knowledge` 互补；`limit` 缺省 20、clamped 1..20。
 pub async fn search_all(
     State(state): State<ApiState>,
     Query(params): Query<SearchParams>,

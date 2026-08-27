@@ -168,7 +168,11 @@ async fn docx_upload_reaches_ready() {
         let parsed: Value = serde_json::from_str(&body)
             .unwrap_or_else(|_| panic!("upload must return doc JSON, got: {body}"));
         let doc_id = parsed["id"].as_str().expect("doc id").to_string();
-        let st = parsed.get("vector").and_then(|v| v.get("status")).and_then(|s| s.as_str()).unwrap_or("");
+        let st = parsed
+            .get("vector")
+            .and_then(|v| v.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
         assert!(
             st == "pending" || st == "processing",
             "initial doc status should be pending/processing, got {st}"
@@ -189,11 +193,16 @@ async fn docx_upload_reaches_ready() {
                     return None;
                 }
                 let v = body.get("vector");
-                let status = v.and_then(|x| x.get("status")).and_then(|s| s.as_str()).unwrap_or("");
+                let status = v
+                    .and_then(|x| x.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
                 if status == "ready" || status == "failed" {
                     Some((
                         status.to_string(),
-                        v.and_then(|x| x.get("chunk_count")).and_then(|c| c.as_i64()).unwrap_or(0),
+                        v.and_then(|x| x.get("chunk_count"))
+                            .and_then(|c| c.as_i64())
+                            .unwrap_or(0),
                     ))
                 } else {
                     None

@@ -63,8 +63,14 @@ pub async fn handle_list_models(
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，含大量分支与状态")]
-#[allow(clippy::cast_possible_truncation, reason = "temperature/top_p 取值 0.0..2.0，f64 转 f32 精度损失可忽略且不会溢出")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，含大量分支与状态"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "temperature/top_p 取值 0.0..2.0，f64 转 f32 精度损失可忽略且不会溢出"
+)]
 /// POST /v1/chat/completions — chat completion.
 pub async fn handle_chat_completions(
     State(state): State<LlmHandlerState>,
@@ -277,7 +283,10 @@ pub async fn handle_chat_completions(
     .await
 }
 
-#[allow(clippy::too_many_lines, reason = "非流式伪工具调用还原含多分支扫描与重建，顺序编排较长")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "非流式伪工具调用还原含多分支扫描与重建，顺序编排较长"
+)]
 /// 非流式响应：从 OpenAI chat.completion body 中解析伪工具调用文本，
 /// 还原为结构化 `tool_calls`，让客户端能正常执行工具。
 ///
@@ -363,7 +372,10 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
     Response::from_parts(parts, Body::from(new_bytes))
 }
 
-#[allow(clippy::too_many_lines, reason = "流式状态机含增量解析与多队列缓冲，扁平处理便于维护")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "流式状态机含增量解析与多队列缓冲，扁平处理便于维护"
+)]
 /// 流式响应：增量解析伪工具调用，文本按到达顺序透传，tool_call 完整后注入结构化 chunk。
 ///
 /// 只在 compat 模式开启时调用。内部状态机：
@@ -432,7 +444,10 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
         };
     }
 
-    #[allow(clippy::items_after_statements, reason = "State 仅为 unfold 闭包的私有状态，紧邻使用处定义更清晰")]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "State 仅为 unfold 闭包的私有状态，紧邻使用处定义更清晰"
+    )]
     struct State {
         stream: futures_util::stream::BoxStream<'static, Result<Bytes, axum::Error>>,
         byte_buf: Vec<u8>,
@@ -763,7 +778,10 @@ mod tests {
     /// RAG 注入端到端：api key 绑 KB → 请求 chat completions → 上游收到的 messages[0]
     /// 是注入的 system 消息且含 `<knowledge_base>`；usage log 记录 rag_chunks_injected=1。
     #[cfg(feature = "rag")]
-    #[allow(clippy::too_many_lines, reason = "RAG 注入端到端测试含多 mock 与断言，行数超限可接受")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "RAG 注入端到端测试含多 mock 与断言，行数超限可接受"
+    )]
     #[tokio::test]
     async fn rag_injects_knowledge_base_into_messages() {
         use axum::routing::post;
@@ -886,7 +904,10 @@ mod tests {
     /// 检索降级为空，请求原样透传上游（messages 无 knowledge_base 注入），
     /// usage log 记录成功且 rag_chunks_injected 为 None。验证「RAG 永不阻断会话」。
     #[cfg(feature = "rag")]
-    #[allow(clippy::too_many_lines, reason = "RAG 降级直通测试含多 mock 与断言，行数超限可接受")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "RAG 降级直通测试含多 mock 与断言，行数超限可接受"
+    )]
     #[tokio::test]
     async fn rag_degrades_to_pass_through_when_embedding_unreachable() {
         use axum::routing::post;
@@ -1438,7 +1459,10 @@ mod tests {
     /// 回归：compat 流式重写命中伪工具调用时，必须保留上游末尾的 usage chunk，
     /// 否则下游 AnthropicSseTranslator 只能走 `[DONE]` 分支硬编码 output_tokens=0，
     /// 导致 UsageSseScanner 统计的 tokens 全 0。
-    #[allow(clippy::too_many_lines, reason = "端到端流式 usage 保留测试含多断言，行数超限可接受")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端流式 usage 保留测试含多断言，行数超限可接受"
+    )]
     #[tokio::test]
     async fn test_stream_rewrite_preserves_usage_chunk() {
         let sse_data = concat!(

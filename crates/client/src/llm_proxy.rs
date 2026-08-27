@@ -75,7 +75,10 @@ pub async fn serve(
     Ok((port, kill_tx))
 }
 
-#[allow(clippy::too_many_lines, reason = "HTTP 解析与控制通道转发的顺序编排，状态共享难以拆分")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "HTTP 解析与控制通道转发的顺序编排，状态共享难以拆分"
+)]
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     session_id: String,

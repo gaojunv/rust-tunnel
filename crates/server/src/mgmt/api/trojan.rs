@@ -112,11 +112,7 @@ pub async fn update_trojan_config(
             .replace_trojan_config(port, &password, fallback, enabled, &domain)
             .await
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     }
 

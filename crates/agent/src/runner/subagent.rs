@@ -132,7 +132,10 @@ async fn handle_subagent_tool_calls(
 /// - 上游 LLM 不可用或流式传输致命错误时返回错误
 /// - 非流式响应体解析失败时返回错误
 /// - 轮数耗尽后最终摘要调用失败时返回错误
-#[allow(clippy::too_many_lines, reason = "子 agent 回合的流式聚合与重试回退完整流水线，共享聚合器与状态，拆分无益")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "子 agent 回合的流式聚合与重试回退完整流水线，共享聚合器与状态，拆分无益"
+)]
 pub async fn run_subagent_loop(
     agent: &AgentState,
     llm: &Arc<LlmState>,

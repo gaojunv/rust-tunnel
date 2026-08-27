@@ -26,7 +26,10 @@ impl ServerConfig {
     /// - 配置文件不存在或解析失败
     /// - `ss_enabled`/`trojan_enabled`/`dns_enabled`/`acme_enabled` 相关必填字段缺失或取值非法
     /// - `dns_bind` 不是合法 `SocketAddr`
-    #[allow(clippy::too_many_lines, reason = "三级配置顺序编排（默认值→TOML→环境变量→CLI）外加四类校验，共享大量局部状态，拆分反而降低可读性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "三级配置顺序编排（默认值→TOML→环境变量→CLI）外加四类校验，共享大量局部状态，拆分反而降低可读性"
+    )]
     pub fn from_cli(cli: ServerCli) -> Result<Self, String> {
         let mut config = Self::default();
 

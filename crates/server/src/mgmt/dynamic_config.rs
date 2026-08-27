@@ -100,7 +100,10 @@ impl DynamicConfig {
         clippy::too_many_lines,
         reason = "顺序加载 6 类动态配置并在缺失时回写种子，共享同一 DB/ServerConfig 上下文，拆分会散开编排逻辑"
     )]
-    #[allow(clippy::single_match_else, reason = "携带 guard 的 match 在 edition 2021 下用 if let 需 let-chain，保留 match 更清晰")]
+    #[allow(
+        clippy::single_match_else,
+        reason = "携带 guard 的 match 在 edition 2021 下用 if let 需 let-chain，保留 match 更清晰"
+    )]
     pub async fn load_or_seed(db: &Database, server_config: &ServerConfig) -> Self {
         // Log level
         let log_level = if let Ok(Some(level)) = db.load_server_setting("log_level").await {
@@ -112,12 +115,13 @@ impl DynamicConfig {
         };
 
         // LLM request logging
-        let llm_request_logging = if let Ok(Some(v)) = db.load_server_setting("llm_request_logging").await {
-            v == "1" || v == "true"
-        } else {
-            let _ = db.save_server_setting("llm_request_logging", "true").await;
-            true
-        };
+        let llm_request_logging =
+            if let Ok(Some(v)) = db.load_server_setting("llm_request_logging").await {
+                v == "1" || v == "true"
+            } else {
+                let _ = db.save_server_setting("llm_request_logging", "true").await;
+                true
+            };
 
         // Shadowsocks
         let ss = match db.load_shadowsocks_configs().await {

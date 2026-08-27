@@ -209,7 +209,10 @@ fn check_stash_ref(s: &str) -> Result<(), GitPlanError> {
 /// # Errors
 /// 缺少子命令、子命令不在白名单、参数为未知 flag/非法值、或 pathspec 有穿越/以 `-` 开头时返回对应错误。
 // 大 match 派发（覆盖全部 git 子命令的 flag/pathspec 白名单），拆分会把相关状态散到多个签名里反而降低可读性。
-#[allow(clippy::too_many_lines, reason = "大 match 派发（覆盖全部 git 子命令的 flag/pathspec 白名单），拆分会把相关状态散到多个签名里反而降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "大 match 派发（覆盖全部 git 子命令的 flag/pathspec 白名单），拆分会把相关状态散到多个签名里反而降低可读性"
+)]
 pub fn plan(args: &[String]) -> Result<PlannedGit, GitPlanError> {
     let Some(sub) = args.first() else {
         return Err(GitPlanError::MissingSubcommand);

@@ -35,8 +35,8 @@ export function PageHeader({ title, description, children, className }: PageHead
       ref={cardRef}
       className={cn(
         'glass-card relative flex flex-col gap-4 overflow-hidden rounded-2xl border border-border/60 px-6 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-8 sm:py-6',
-        // 立体感：顶部内侧高光 + 品牌色柔和投影
-        'shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.05),0_12px_32px_-16px_hsl(var(--primary)/0.28)]',
+        // 立体感：顶部内侧高光 + 柔和投影（移动端去掉品牌色辉光外投影，大屏恢复）
+        'shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.05),0_2px_8px_-4px_hsl(var(--foreground)/0.08)] md:shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.05),0_12px_32px_-16px_hsl(var(--primary)/0.28)]',
         className
       )}
     >

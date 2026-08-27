@@ -32,7 +32,10 @@ use super::{
 };
 
 impl AcpBridge {
-    #[allow(clippy::too_many_lines, reason = "ACP 连接任务的通知/权限/fs/表单处理器与握手流水线顺序编排，拆分会打散共享状态与闭包捕获")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ACP 连接任务的通知/权限/fs/表单处理器与握手流水线顺序编排，拆分会打散共享状态与闭包捕获"
+    )]
     pub(crate) async fn acp_handshake(
         &self,
         session_id: &str,

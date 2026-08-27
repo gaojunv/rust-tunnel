@@ -30,10 +30,7 @@ pub fn compose_user_message(
                 } else {
                     text.clone()
                 };
-                let _ = write!(
-                    out,
-                    "\n\n--- 引用文件: {path} ---\n```\n{truncated}\n```"
-                );
+                let _ = write!(out, "\n\n--- 引用文件: {path} ---\n```\n{truncated}\n```");
             }
             Err(_) => {
                 let _ = write!(out, "\n\n[无法读取: {path}]");

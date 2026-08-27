@@ -162,8 +162,14 @@ fn anthropic_tool_choice_to_openai(v: &Value) -> Option<Value> {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "Anthropic→OpenAI 转换含消息/工具/中段 system 降级的扁平分发，拆分会分散状态")]
-#[allow(clippy::cast_possible_truncation, reason = "temperature/top_p 取值 0.0..2.0，f64 转 f32 精度损失可忽略且不会溢出")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Anthropic→OpenAI 转换含消息/工具/中段 system 降级的扁平分发，拆分会分散状态"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "temperature/top_p 取值 0.0..2.0，f64 转 f32 精度损失可忽略且不会溢出"
+)]
 /// Convert Anthropic Messages request to unified ChatCompletionRequest.
 fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
     let anthropic_model = body
@@ -340,7 +346,10 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
     })
 }
 
-#[allow(clippy::too_many_lines, reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，含大量分支与状态")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，含大量分支与状态"
+)]
 /// POST /v1/messages — Anthropic Messages API。
 ///
 /// 候选链内每候选独立判定发送策略：候选 provider 配置了 `anthropic_base_url` 时，
@@ -1196,7 +1205,10 @@ mod tests {
     /// 端到端（进程内）：组 [坏候选 500 → 好候选 200]，非流式请求应转移成功，
     /// 且最终响应来自好候选；usage log 记录 failover_from = 首选坏候选、
     /// model_name = 实际出账好候选。转换路径上游是 OpenAI 协议（chat.completion）。
-    #[allow(clippy::too_many_lines, reason = "端到端故障转移测试含双 mock 与断言，行数超限可接受")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端故障转移测试含双 mock 与断言，行数超限可接受"
+    )]
     #[tokio::test]
     async fn test_convert_path_failover() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1316,7 +1328,10 @@ mod tests {
     /// 1. 发往上游的 messages 末尾有 system 引导；
     /// 2. 上游返回 <tool_call> 文本时被还原为 Anthropic tool_use 事件；
     /// 3. 坏标签不泄漏。
-    #[allow(clippy::too_many_lines, reason = "端到端 compat 流式测试含 mock 与多断言，行数超限可接受")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端 compat 流式测试含 mock 与多断言，行数超限可接受"
+    )]
     #[tokio::test]
     async fn test_anthropic_compat_end_to_end_with_mock_upstream() {
         use axum::routing::post;
@@ -1529,7 +1544,10 @@ mod tests {
     /// → RAG 注入 messages[0]（含 `<knowledge_base>`）→ 上游（OpenAI 格式）收到；
     /// usage log 记录 rag_chunks_injected=1。复刻 openai_handler 的 rag 注入测试。
     #[cfg(feature = "rag")]
-    #[allow(clippy::too_many_lines, reason = "端到端回退路径 RAG 注入测试含多 mock 与断言")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端回退路径 RAG 注入测试含多 mock 与断言"
+    )]
     #[tokio::test]
     async fn anthropic_fallback_injects_knowledge_base() {
         use axum::routing::post;
@@ -1912,7 +1930,10 @@ mod tests {
 
     /// 多候选直通 failover：首选直通 404（确定性失败 → 记 known-failures）自动尝试第二候选
     /// （同为直通）并成功返回 Anthropic 格式。
-    #[allow(clippy::too_many_lines, reason = "多候选 404 failover 测试含双 mock 与断言")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "多候选 404 failover 测试含双 mock 与断言"
+    )]
     #[tokio::test]
     async fn test_anthropic_passthrough_group_first_404_failover() {
         use std::sync::atomic::Ordering;
@@ -2152,7 +2173,10 @@ mod tests {
     /// 备选有 anthropic_base_url 直通成功。回归 body/端点错配根因：链上有直通候选时，
     /// openai_body 曾被整包换成原始 Anthropic body，导致无 anthropic_base_url 的转换候选
     /// 拿 Anthropic 格式 body 打 /v1/chat/completions（上游 400）——用户 opencode zen 实证场景。
-    #[allow(clippy::too_many_lines, reason = "混合链 failover 测试含双 mock 与端点/Body 断言")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "混合链 failover 测试含双 mock 与端点/Body 断言"
+    )]
     #[tokio::test]
     async fn test_anthropic_mixed_chain_convert_then_passthrough() {
         use std::sync::atomic::Ordering;

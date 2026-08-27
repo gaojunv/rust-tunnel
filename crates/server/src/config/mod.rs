@@ -12,7 +12,10 @@ pub use file::ServerConfigFile;
 
 /// 最终生效的服务端配置（合并后的只读快照，由 `ServerConfig::from_cli` 产出）。
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_excessive_bools, reason = "服务端配置聚合各功能开关，布尔字段对应独立特性，拆分反而增加装配复杂度")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "服务端配置聚合各功能开关，布尔字段对应独立特性，拆分反而增加装配复杂度"
+)]
 pub struct ServerConfig {
     /// 控制通道监听地址。
     pub control_addr: String,

@@ -337,7 +337,10 @@ pub async fn call_upstream_with_body(
 /// 当上游连接意外断开（如 LLM 服务商网关 idle timeout），向客户端发送一个
 /// OpenAI 风格的 SSE error chunk 再正常关闭流，而不是让 hyper 在中途截断响应
 /// （客户端收到 "Connection closed mid-response"）。
-#[allow(clippy::unused_async, reason = "与 relay_upstream_body 签名保持 async 统一，便于上层 await")]
+#[allow(
+    clippy::unused_async,
+    reason = "与 relay_upstream_body 签名保持 async 统一，便于上层 await"
+)]
 async fn relay_upstream_stream(resp: reqwest::Response) -> Result<Response, (StatusCode, String)> {
     let byte_stream = resp.bytes_stream().map(|result| {
         result
@@ -487,7 +490,10 @@ pub fn set_body_model(body: &mut serde_json::Value, model: &str) {
 ///
 /// # Errors
 /// 上游连接失败、返回非 2xx 或首字节超时/前缀超限时返回 `(StatusCode, message)`。
-#[allow(clippy::too_many_lines, reason = "首字节守卫的缓冲与超时逻辑集中一处，拆分会打散错误与流状态的关联")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "首字节守卫的缓冲与超时逻辑集中一处，拆分会打散错误与流状态的关联"
+)]
 pub async fn call_upstream_stream_guarded(
     client: &Client,
     base_url: &str,
@@ -649,7 +655,10 @@ fn deterministic_failure(status: StatusCode) -> Option<crate::down::FailureKind>
 /// `/v1/messages` 直通（原始 Anthropic body，model 替换为候选名）；否则走下方
 /// ChatCompletions / Responses 转换分支。直通失败的处理（retryable/确定性/4xx）
 /// 与转换分支完全一致——组内可混合直通与转换候选并互相故障转移。
-#[allow(clippy::too_many_lines, reason = "故障转移主循环：熔断/确定性失败跳过、畸形响应原地重试与 retryable/确定性分流，集中一处便于审计")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "故障转移主循环：熔断/确定性失败跳过、畸形响应原地重试与 retryable/确定性分流，集中一处便于审计"
+)]
 pub async fn execute_with_failover(
     client: &Client,
     breakers: &crate::breaker::ModelBreakers,
@@ -697,7 +706,10 @@ pub async fn execute_with_failover(
         // （仅针对"上游 200 但空/畸形响应"类 502——空 body / 非 JSON body /
         // 空 SSE 流 / Responses 转换 parse 失败）。这类失败穿透状态码判定
         // （HTTP 200），但 body 校验识别后属于可重试的上游抖动。
-        #[allow(clippy::items_after_statements, reason = "重试常量紧跟重试逻辑，移到函数顶部会与熔断/确定性跳过判定相距过远")]
+        #[allow(
+            clippy::items_after_statements,
+            reason = "重试常量紧跟重试逻辑，移到函数顶部会与熔断/确定性跳过判定相距过远"
+        )]
         const MAX_MALFORMED_RETRIES: usize = 1; // 首次之外的额外重试次数
         let mut cand_attempt = 0usize;
 
@@ -1051,7 +1063,10 @@ fn summarize_request_for_log(req_body: &serde_json::Value) -> String {
 
 /// Build an OpenAI-format error response.
 #[must_use]
-#[allow(clippy::needless_pass_by_value, reason = "跨 crate 的公开 API，调用点多处以 String 字面量传入，按值接收避免调用端额外借用转换")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "跨 crate 的公开 API，调用点多处以 String 字面量传入，按值接收避免调用端额外借用转换"
+)]
 pub fn error_response(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1074,7 +1089,10 @@ pub fn error_response(status: StatusCode, message: String, error_type: &str) -> 
 
 /// Build an Anthropic-format error response for Anthropic-protocol domains.
 #[must_use]
-#[allow(clippy::needless_pass_by_value, reason = "跨 crate 的公开 API，调用点多处以 String 字面量传入，按值接收避免调用端额外借用转换")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "跨 crate 的公开 API，调用点多处以 String 字面量传入，按值接收避免调用端额外借用转换"
+)]
 pub fn error_response_anthropic(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
@@ -1099,7 +1117,10 @@ pub fn error_response_anthropic(status: StatusCode, message: String, error_type:
 /// Build a 404 "model not found" response that carries the available model list,
 /// per spec: 未匹配 → 返回 404，body 中包含可用模型列表。
 #[must_use]
-#[allow(clippy::needless_pass_by_value, reason = "跨 crate 的公开 API，available_models 由调用点一次性构造的 Vec 传入，按值接收避免额外克隆")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "跨 crate 的公开 API，available_models 由调用点一次性构造的 Vec 传入，按值接收避免额外克隆"
+)]
 pub fn model_not_found_response(message: String, available_models: Vec<String>) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1122,7 +1143,10 @@ pub fn model_not_found_response(message: String, available_models: Vec<String>) 
 }
 
 #[cfg(test)]
-#[allow(clippy::items_after_statements, reason = "测试模块内 use 与静态 fixture 集中一处，移至模块头会与生产代码分隔")]
+#[allow(
+    clippy::items_after_statements,
+    reason = "测试模块内 use 与静态 fixture 集中一处，移至模块头会与生产代码分隔"
+)]
 mod tests {
     use super::*;
 
@@ -2415,7 +2439,10 @@ mod tests {
     /// Responses 候选非流式：断言上游收到 Responses 格式请求体（input 数组、store:false、
     /// 无 messages 字段），URL 是 /v1/responses；上游返回 Responses JSON，
     /// 网关得到 chat completion JSON。
-    #[allow(clippy::too_many_lines, reason = "端到端集成测试：构造 mock 上游、发起网关调用并校验请求体与响应格式，顺序流程不宜拆分")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "端到端集成测试：构造 mock 上游、发起网关调用并校验请求体与响应格式，顺序流程不宜拆分"
+    )]
     #[tokio::test]
     async fn test_failover_responses_candidate_non_streaming() {
         use std::sync::{
@@ -2646,7 +2673,10 @@ mod tests {
 
     /// 混合候选链故障转移：首选 Responses 候选 500，次选 chat 候选成功——
     /// 断言两次上游调用格式各自正确、最终响应正常。
-    #[allow(clippy::too_many_lines, reason = "混合协议故障转移集成测试：双 mock 上游与候选链编排，顺序流程集中一处更易读")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "混合协议故障转移集成测试：双 mock 上游与候选链编排，顺序流程集中一处更易读"
+    )]
     #[tokio::test]
     async fn test_failover_mixed_chain_responses_500_then_chat_success() {
         use std::sync::{
@@ -2804,7 +2834,10 @@ mod tests {
     }
 
     /// 解析 mock 收到的原始 HTTP 请求 → (请求行, JSON body)。
-    #[allow(clippy::unused_async, reason = "与真实上游调用保持 async 签名一致，便于测试 await")]
+    #[allow(
+        clippy::unused_async,
+        reason = "与真实上游调用保持 async 签名一致，便于测试 await"
+    )]
     async fn parse_mock_request(buf: &[u8]) -> (String, serde_json::Value) {
         let text = String::from_utf8_lossy(buf);
         let first_line = text.lines().next().unwrap_or("").to_string();
@@ -2916,7 +2949,10 @@ mod tests {
 
     /// 纯函数级：组 [A(直通), B(直通)]，首选直通 404（确定性失败 → 记 known-failures）
     /// 自动尝试备选直通成功；第二次请求首选被跳过（TTL 内）直达备选。
-    #[allow(clippy::too_many_lines, reason = "直通与故障转移集成测试：双 mock 上游与确定性失败缓存交互，顺序流程不宜拆分")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "直通与故障转移集成测试：双 mock 上游与确定性失败缓存交互，顺序流程不宜拆分"
+    )]
     #[tokio::test]
     async fn test_failover_anthropic_passthrough_404_then_backup() {
         use std::sync::{

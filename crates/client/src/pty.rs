@@ -112,7 +112,10 @@ pub async fn serve_on(listener: TcpListener) -> std::io::Result<()> {
 /// （不建立新 shell）。正常会话：有 `id` 时注册到 PTY_REGISTRY，连接结束移除。
 /// resize 通道的接收端在 TCP→PTY 任务中以非阻塞方式轮询（`try_recv`），确保
 /// resize 不阻塞数据转发。
-#[allow(clippy::too_many_lines, reason = "PTY 会话生命周期：协商/resize/双向桥接/回收，状态机难以拆分")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "PTY 会话生命周期：协商/resize/双向桥接/回收，状态机难以拆分"
+)]
 async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut buf_reader = BufReader::new(read_half);
@@ -430,7 +433,10 @@ mod tests {
     // 不建立新 shell。由于 PTY_REGISTRY 是全局 static，此测试验证 resize_for
     // 解析和 registry 查找逻辑——真实 resize 通道传递需端到端测试覆盖。
     #[tokio::test]
-    #[allow(clippy::items_after_statements, reason = "测试内辅助逻辑紧邻使用点更清晰")]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "测试内辅助逻辑紧邻使用点更清晰"
+    )]
     async fn resize_for_sends_signal_and_closes() {
         let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(8);
         let test_id = "test-resize-id".to_string();

@@ -158,11 +158,7 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
     let records = match db.llm_list_providers().await {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
 
@@ -257,11 +253,7 @@ pub async fn create_provider(
         )
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
     llm_invalidate(&state).await;
@@ -287,11 +279,7 @@ pub async fn update_provider(
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "provider not found").into_response(),
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
 
@@ -344,11 +332,7 @@ pub async fn update_provider(
         )
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
     llm_invalidate(&state).await;
@@ -367,11 +351,7 @@ pub async fn toggle_provider(
     };
     let enabled = body["enabled"].as_bool().unwrap_or(false);
     if let Err(e) = db.llm_toggle_provider(&id, enabled).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     StatusCode::OK.into_response()
@@ -386,11 +366,7 @@ pub async fn delete_provider(
         return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if let Err(e) = db.llm_delete_provider(&id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     StatusCode::OK.into_response()
@@ -409,11 +385,7 @@ pub async fn list_provider_models(
     let records = match db.llm_list_models_for_provider(&provider_id).await {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     let models: Vec<ModelConfig> = records
@@ -441,11 +413,7 @@ pub async fn list_all_models(State(state): State<ApiState>) -> impl IntoResponse
     let records = match db.llm_list_models().await {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     let models: Vec<ModelConfig> = records
@@ -490,11 +458,7 @@ pub async fn add_model(
         )
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
     llm_invalidate(&state).await;
@@ -528,11 +492,7 @@ pub async fn update_model(
         )
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     StatusCode::OK.into_response()
@@ -547,11 +507,7 @@ pub async fn delete_model(
         return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if let Err(e) = db.llm_delete_model(&id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     StatusCode::OK.into_response()
@@ -567,11 +523,7 @@ pub async fn list_api_keys(State(state): State<ApiState>) -> impl IntoResponse {
     let records = match db.llm_list_api_keys().await {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     let keys: Vec<ApiKeyView> = records
@@ -600,10 +552,7 @@ async fn ensure_kb_exists(
     match db.ks_get(kb_id).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err((StatusCode::BAD_REQUEST, "kb not found".to_string())),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))),
     }
 }
 
@@ -628,11 +577,7 @@ pub async fn create_api_key(
         .llm_save_api_key(&id, &hash, &prefix, &body.name, body.kb_id.as_deref())
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
     let resp = CreateApiKeyResponse {
@@ -673,22 +618,14 @@ pub async fn toggle_api_key(
     if body.get("enabled").is_some() {
         let enabled = body["enabled"].as_bool().unwrap_or(false);
         if let Err(e) = db.llm_toggle_api_key(&id, enabled).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     }
 
     // kb_id：含键则绑定/解绑（Value::Null → 解绑）。存在性已在上面校验。
     if body.get("kb_id").is_some() {
         if let Err(e) = db.llm_set_api_key_kb(&id, new_kb_id).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     }
 
@@ -704,11 +641,7 @@ pub async fn delete_api_key(
         return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response();
     };
     if let Err(e) = db.llm_delete_api_key(&id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     StatusCode::OK.into_response()
 }
@@ -774,11 +707,7 @@ pub async fn get_usage_summary(
     };
     match db.llm_usage_summary(&start, &end).await {
         Ok(s) => Json(serde_json::json!({"summary": s})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
     }
 }
 
@@ -804,11 +733,7 @@ pub async fn get_usage_aggregate(
     }
     match db.llm_aggregate_usage(&start, &end, group_by).await {
         Ok(rows) => Json(serde_json::json!({"group_by": group_by, "rows": rows})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
     }
 }
 
@@ -837,11 +762,9 @@ pub async fn get_usage_logs(
         (Ok(logs), Ok(total)) => {
             Json(serde_json::json!({"logs": logs, "total": total})).into_response()
         }
-        (Err(e), _) | (_, Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response(),
+        (Err(e), _) | (_, Err(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+        }
     }
 }
 
@@ -879,11 +802,7 @@ pub async fn list_model_groups(State(state): State<ApiState>) -> impl IntoRespon
     let groups = match db.llm_list_model_groups().await {
         Ok(g) => g,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     let mut views = Vec::with_capacity(groups.len());
@@ -923,11 +842,7 @@ pub async fn create_model_group(
         }
         Ok(false) => {}
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -935,11 +850,7 @@ pub async fn create_model_group(
         .llm_create_model_group(&id, &body.name, body.enabled.unwrap_or(true))
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     (
@@ -962,21 +873,13 @@ pub async fn get_model_group(
         Ok(Some(g)) => g,
         Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     let members = match db.llm_list_group_members(&id).await {
         Ok(m) => m,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     let breakers = llm_breakers(&state).await;
@@ -1035,11 +938,7 @@ pub async fn update_model_group(
         Ok(Some(g)) => g,
         Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
     if body.name.is_empty() {
@@ -1055,20 +954,12 @@ pub async fn update_model_group(
         }
         Ok(false) => {}
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     }
     let enabled = body.enabled.unwrap_or(group.enabled != 0);
     if let Err(e) = db.llm_update_model_group(&id, &body.name, enabled).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok"})).into_response()
@@ -1088,19 +979,11 @@ pub async fn delete_model_group(
         Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     }
     if let Err(e) = db.llm_delete_model_group(&id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok"})).into_response()
@@ -1120,11 +1003,7 @@ pub async fn replace_group_members(
         Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     }
     // 校验 model_id 存在
@@ -1146,11 +1025,7 @@ pub async fn replace_group_members(
         .map(|(i, m)| (m.model_id.clone(), i32::try_from(i + 1).unwrap_or(i32::MAX)))
         .collect();
     if let Err(e) = db.llm_replace_group_members(&id, &normalized).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {e}"),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok"})).into_response()
@@ -1169,11 +1044,7 @@ pub async fn reset_group_breaker(
         Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     }
     let members = db.llm_list_group_members(&id).await.unwrap_or_default();

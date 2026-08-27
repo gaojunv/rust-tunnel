@@ -264,9 +264,15 @@ mod tests {
         let sizes = batch_sizes.lock().unwrap();
         assert_eq!(sizes.as_slice(), &[64, 64, 22]);
         // 跨批拼接顺序与输入一致
-        #[allow(clippy::cast_precision_loss, reason = "测试断言：索引 i 最大 150，远小于 f32 精确整数范围")]
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "测试断言：索引 i 最大 150，远小于 f32 精确整数范围"
+        )]
         for (i, v) in out.iter().enumerate() {
-            #[allow(clippy::float_cmp, reason = "测试断言：上限位编码 0.0 exact 值，精确比较为所需语义")]
+            #[allow(
+                clippy::float_cmp,
+                reason = "测试断言：上限位编码 0.0 exact 值，精确比较为所需语义"
+            )]
             {
                 assert_eq!(v[0], i as f32, "text {i} out of order");
             }

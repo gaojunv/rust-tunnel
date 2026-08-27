@@ -177,6 +177,19 @@ describe('AgentPage', () => {
     expect(screen.queryByText('agent.selectOrNewSession')).toBeNull();
   });
 
+  it('reserves top-bar right padding for the floating mobile menu button', async () => {
+    api.listAgentSessions.mockResolvedValue([sessionFixtures.s1]);
+
+    renderPage();
+    await screen.findAllByTestId('chat-stream');
+
+    // MobileMenuFab 是 fixed 悬浮（视口右缘 12~52px，z-50），不占 flex 布局空间：
+    // 顶栏必须主动 padding 让位，否则会话标题即使 truncate 到卡片右缘（距视口 14px）
+    // 尾部仍压在按钮底下。此断言防止该预留在后续布局调整中被删掉（已回归两次）。
+    const topbar = screen.getByTestId('agent-topbar');
+    expect(topbar.className).toContain('pr-[3.25rem]');
+  });
+
   it('returns to guide state after deleting the active session (no auto-reselect)', async () => {
     api.listAgentSessions.mockResolvedValue([sessionFixtures.s1, sessionFixtures.s2]);
     api.deleteAgentSession.mockResolvedValue(undefined);

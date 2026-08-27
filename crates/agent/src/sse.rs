@@ -133,7 +133,10 @@ impl SseAggregator {
 
     /// 喂入一行（不含 \n）。`data: ` 前缀可选空格；非 data 行/畸形 JSON 跳过。
     // SSE delta 解析的顺序编排（tool_calls/content/reasoning/usage 多分支），拆分会把共享的 bytes/limit 状态散到多个签名里。
-    #[allow(clippy::too_many_lines, reason = "SSE delta 解析的顺序编排，拆分会把共享的 bytes/limit 状态散到多个签名里")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "SSE delta 解析的顺序编排，拆分会把共享的 bytes/limit 状态散到多个签名里"
+    )]
     pub fn feed_line(&mut self, line: &str) -> SseFeed {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data:") else {

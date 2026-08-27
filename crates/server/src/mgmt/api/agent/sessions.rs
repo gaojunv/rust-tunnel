@@ -333,7 +333,10 @@ pub async fn export_session(
 }
 
 /// 会话 → Markdown（导出 handler 与单测共用的纯函数）。
-#[allow(clippy::too_many_lines, reason = "Markdown 渲染：对 6 种消息 kind 的扁平派发 + 结构化字段分支，拆分会把相关渲染散到多个函数")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Markdown 渲染：对 6 种消息 kind 的扁平派发 + 结构化字段分支，拆分会把相关渲染散到多个函数"
+)]
 fn session_to_markdown(
     session: &crate::db::agent::AgentSessionRecord,
     messages: &[crate::db::agent::AgentMessageRecord],
@@ -921,7 +924,9 @@ mod tests {
         // 空串清除 → 读回空串
         let resp = put_default_model(
             State(state.clone()),
-            Json(UpdateSessionModelRequest { model: String::new() }),
+            Json(UpdateSessionModelRequest {
+                model: String::new(),
+            }),
         )
         .await
         .into_response();

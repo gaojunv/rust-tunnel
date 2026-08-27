@@ -76,7 +76,13 @@ mod tests {
     };
 
     /// 建一个 vector 容器（`enabled`/`index_vector` 可覆盖），返回记录。
-    async fn create_vector_source(db: &Database, id: &str, base: &str, enabled: bool, vector: bool) {
+    async fn create_vector_source(
+        db: &Database,
+        id: &str,
+        base: &str,
+        enabled: bool,
+        vector: bool,
+    ) {
         db.ks_create(&KsCreateOpts {
             id: id.to_owned(),
             name: format!("kb-{id}"),

@@ -184,8 +184,14 @@ impl SharedListener {
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "连接分发需携带全部路由与 TLS 上下文，拆分会割裂 spawn 闭包的共享状态")]
-#[allow(clippy::large_futures, reason = "handler 状态机大但仅在每连接路径构造一次，boxing 需单独性能评估")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "连接分发需携带全部路由与 TLS 上下文，拆分会割裂 spawn 闭包的共享状态"
+)]
+#[allow(
+    clippy::large_futures,
+    reason = "handler 状态机大但仅在每连接路径构造一次，boxing 需单独性能评估"
+)]
 async fn handle_one_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,

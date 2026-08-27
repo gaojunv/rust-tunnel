@@ -17,7 +17,10 @@ use super::{SpawnedAgent, TurnSegment};
 /// - tool_call/tool_result/plan：到达即落；session_title 写回 sessions 表。
 ///
 /// 落库不依赖 WS 连接存活——断线期间后台跑完的回合同样可追溯。
-#[allow(clippy::too_many_lines, reason = "按帧类型分派的扁平 match，含多分支落库与缓冲合并逻辑，拆分会打散错误处理")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "按帧类型分派的扁平 match，含多分支落库与缓冲合并逻辑，拆分会打散错误处理"
+)]
 pub(super) async fn persist_acp_frame(
     db: &Database,
     sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,

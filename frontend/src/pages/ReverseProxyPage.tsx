@@ -47,7 +47,7 @@ export default function ReverseProxyPage() {
         title={t('reverseProxy.title')}
         description={t('reverseProxy.description')}
       >
-        <Button onClick={handleCreate} className="shadow-glow">
+        <Button onClick={handleCreate} className="md:shadow-glow">
           <Plus className="mr-2 h-4 w-4" />
           {t('reverseProxy.newRule')}
         </Button>

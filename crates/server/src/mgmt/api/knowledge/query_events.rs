@@ -60,7 +60,8 @@ pub async fn test_embedding(
         let Some(kb) = (match rt.db.ks_get(kb_id).await {
             Ok(r) => r,
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+                    .into_response()
             }
         }) else {
             return (StatusCode::NOT_FOUND, "knowledge source not found").into_response();
@@ -75,7 +76,8 @@ pub async fn test_embedding(
     match embedder.embed_one("dimension probe").await {
         Ok(v) => {
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-            Json(serde_json::json!({ "dimension": v.len(), "latency_ms": latency_ms })).into_response()
+            Json(serde_json::json!({ "dimension": v.len(), "latency_ms": latency_ms }))
+                .into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("embedding failed: {e}")).into_response(),
     }

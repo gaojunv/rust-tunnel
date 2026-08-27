@@ -479,7 +479,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines, reason = "Skill 列表多维过滤与排序的集成场景编排，需集中断言")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Skill 列表多维过滤与排序的集成场景编排，需集中断言"
+    )]
     async fn skill_list_filters_and_order() {
         let db = Database::new(":memory:").await.unwrap();
         seed(&db, "g1", "global-skill", "global", "", "").await;

@@ -467,7 +467,10 @@ mod tests {
         "s1".to_string()
     }
 
-    #[allow(clippy::float_cmp, reason = "测试中对字面量阈值 0.40 做精确相等校验，值为写入前确定的常量，经 SQLite REAL 往返应逐位相等")] 
+    #[allow(
+        clippy::float_cmp,
+        reason = "测试中对字面量阈值 0.40 做精确相等校验，值为写入前确定的常量，经 SQLite REAL 往返应逐位相等"
+    )]
     #[tokio::test]
     async fn test_settings_default_and_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
@@ -522,7 +525,10 @@ mod tests {
         assert_eq!(s5.created_at, s3.created_at, "created_at 应保持首建时间");
     }
 
-    #[allow(clippy::float_cmp, reason = "测试中对字面量置信度做精确相等校验，值为写入前确定的常量，往返应相等")] 
+    #[allow(
+        clippy::float_cmp,
+        reason = "测试中对字面量置信度做精确相等校验，值为写入前确定的常量，往返应相等"
+    )]
     #[tokio::test]
     async fn test_memories_crud() {
         let db = Database::new(":memory:").await.unwrap();
@@ -621,7 +627,10 @@ mod tests {
         assert_eq!(v, 1);
     }
 
-    #[allow(clippy::too_many_lines, reason = "多作用域/标签/分页的串联断言测试，长但内聚，拆分会割裂用例")] 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "多作用域/标签/分页的串联断言测试，长但内聚，拆分会割裂用例"
+    )]
     #[tokio::test]
     async fn test_memory_list_scope_filter() {
         let db = Database::new(":memory:").await.unwrap();
@@ -797,7 +806,10 @@ mod tests {
         assert_eq!(q[0].id, "m2");
     }
 
-    #[allow(clippy::float_cmp, reason = "测试中对字面量置信度 0.4 做精确相等校验，值为写入前确定的常量")] 
+    #[allow(
+        clippy::float_cmp,
+        reason = "测试中对字面量置信度 0.4 做精确相等校验，值为写入前确定的常量"
+    )]
     #[tokio::test]
     async fn test_memory_list_order_and_paging() {
         let db = Database::new(":memory:").await.unwrap();
@@ -867,7 +879,10 @@ mod tests {
         assert_eq!(fallback.len(), 5);
     }
 
-    #[allow(clippy::float_cmp, reason = "测试中对置信度的精确写入/读回校验，往返应相等")] 
+    #[allow(
+        clippy::float_cmp,
+        reason = "测试中对置信度的精确写入/读回校验，往返应相等"
+    )]
     #[tokio::test]
     async fn test_memory_batch_and_hits() {
         let db = Database::new(":memory:").await.unwrap();

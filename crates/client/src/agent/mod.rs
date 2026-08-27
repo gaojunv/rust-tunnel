@@ -514,7 +514,10 @@ fn kill_group(pid: Option<u32>) {
 /// `None`（工作目录交给 `docker exec -w` 处理）。`stdin_data` 为 `Some` 时经 stdin
 /// 管道写入子进程。`cancel_rx` 为 `Some` 时支持中途取消：进程以进程组方式 spawn，
 /// 取消或超时都 SIGKILL 整个进程组（含孙进程，避免 `sh` 被杀而 `cargo build` 成孤儿）。
-#[allow(clippy::too_many_lines, reason = "宿主命令执行全流程编排：spawn/管道/超时/取消/回收，状态共享难以拆分")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "宿主命令执行全流程编排：spawn/管道/超时/取消/回收，状态共享难以拆分"
+)]
 async fn run_host(
     cmd: &str,
     cwd: Option<&Path>,
@@ -680,7 +683,10 @@ async fn run_host(
 ///
 /// 取消边界：仅 shell/search 可取消（走 `cancel_rx` 进程组 kill），其余命令
 /// （read/write/list/git）收到 AgentExecCancel 静默忽略、按原超时跑完。
-#[allow(clippy::too_many_lines, reason = "对全部 AgentCommand 变体的扁平派发，拆分会散落沙箱与容器分支")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "对全部 AgentCommand 变体的扁平派发，拆分会散落沙箱与容器分支"
+)]
 pub async fn handle_exec_request(
     command: &AgentCommand,
     root_path: &Path,
@@ -3009,7 +3015,10 @@ mod tests {
     // ── 原子写测试 ──────────────────────────────────────────────────────
 
     #[tokio::test]
-    #[allow(clippy::case_sensitive_file_extension_comparisons, reason = "仅判断临时文件 .tmp 后缀，无需大小写无关比较")]
+    #[allow(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "仅判断临时文件 .tmp 后缀，无需大小写无关比较"
+    )]
     async fn test_atomic_write_no_tmp_residual() {
         let dir = temp_workspace(&[]);
         let target = dir.join("file.txt");

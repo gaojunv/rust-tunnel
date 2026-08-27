@@ -79,7 +79,10 @@ pub async fn authenticate_or_reject(
 ///
 /// # Errors
 /// 请求体缺少 `model` 字段或其值非字符串时返回 `Err(Response)`，状态码 400。
-#[allow(clippy::unused_async, reason = "与 authenticate/resolve 同为 async 流水线，保持调用端 await 统一")]
+#[allow(
+    clippy::unused_async,
+    reason = "与 authenticate/resolve 同为 async 流水线，保持调用端 await 统一"
+)]
 pub async fn extract_model_or_reject(
     state: &LlmHandlerState,
     body: &Value,
@@ -218,8 +221,14 @@ pub enum ResponsePostProcess {
 ///
 /// 调用方负责协议特有的请求解析与 RAG/compat 改写（`PreparedRequest` 已含最终内容），
 /// 本函数只做与协议无关的执行与出账。
-#[allow(clippy::too_many_lines, reason = "请求执行编排：日志、故障转移、成功/失败双分支与出账，顺序流程不宜拆分")]
-#[allow(clippy::too_many_arguments, reason = "内部执行函数，混合基础设施参数（state/chain/ctx/db）")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "请求执行编排：日志、故障转移、成功/失败双分支与出账，顺序流程不宜拆分"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "内部执行函数，混合基础设施参数（state/chain/ctx/db）"
+)]
 pub async fn run_execution(
     state: &LlmHandlerState,
     protocol: &'static str,

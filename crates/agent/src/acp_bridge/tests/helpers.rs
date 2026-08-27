@@ -403,8 +403,14 @@ pub(super) async fn send_mcp_request(
 /// 通知，再等待一个许可才回 PromptResponse——队列/取消测试用。
 /// `recorded`（None 不记录）：收集收到的 method/通知名（如 `session/cancel`）。
 /// `resume_fails`：true 时 `session/resume` 回 JSON-RPC error（测回退 session/new）。
-#[allow(clippy::too_many_arguments, reason = "测试 mock 的多分支基础设施参数，收敛会打散匹配")]
-#[allow(clippy::too_many_lines, reason = "mock ACP agent 的多 method 分派与流式通知构造，共享缓冲与状态，拆分会打散匹配")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "测试 mock 的多分支基础设施参数，收敛会打散匹配"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "mock ACP agent 的多 method 分派与流式通知构造，共享缓冲与状态，拆分会打散匹配"
+)]
 pub(super) async fn mock_acp_agent(
     mut stdin_rx: mpsc::Receiver<ControlMessage>,
     stdout_tx: mpsc::Sender<Vec<u8>>,
