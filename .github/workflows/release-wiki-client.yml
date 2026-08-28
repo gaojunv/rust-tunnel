@@ -79,9 +79,7 @@ jobs:
         uses: actions/checkout@v4
 
       # 前端产物必须先于 Rust 构建存在（tauri.conf.json 的 frontendDist 指向
-      # ../../wiki-desktop-ui/dist，该路径以 tauri.conf.json 所在目录为基准）。
-      # 构建方式与 release-server.yml 的前端一节一致：cd 进目录 npm ci + npm run build，
-      # cwd 明确、不依赖任何工具对相对路径的推断。
+      # ../../wiki-desktop-ui/dist）。实际构建由 beforeBuildCommand 触发，这里只装依赖。
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -89,12 +87,8 @@ jobs:
           cache: npm
           cache-dependency-path: wiki-desktop-ui/package-lock.json
 
-      - name: Build desktop UI
-        run: |
-          cd wiki-desktop-ui
-          npm ci
-          npm run build
-          ls -lh dist
+      - name: Install UI dependencies
+        run: npm ci --prefix wiki-desktop-ui
 
       - name: Install Rust with target
         uses: dtolnay/rust-toolchain@stable
@@ -113,15 +107,8 @@ jobs:
         run: npm install -g @tauri-apps/cli@^2
 
       # tauri feature 默认关闭（门控整条 Tauri 依赖链，让无 GUI 系统库的机器也能
-      # cargo test），打包时必须显式 -f tauri。cwd 必须是 tauri.conf.json 所在目录。
-      #
-      # tauri.conf.json 里已删除 beforeBuildCommand/beforeDevCommand：Tauri CLI 跑
-      # 这两个钩子时的 cwd 不是配置文件所在目录，而是「app dir」——找不到 package.json
-      # 祖先时退化为配置目录的父级（即 crates/），于是 ../../wiki-desktop-ui 解析到了
-      # 仓库根的上一层（ENOENT .../work/rust-tunnel/wiki-desktop-ui/package.json，
-      # macOS 与 Windows 上都复现）。`-c '{"build":{"beforeBuildCommand":""}}'` 覆盖
-      # 也压不住钩子，因此改为不配钩子、由上一步显式构建前端（本地流程见
-      # docs/wiki-desktop.md，同样是手工先 npm run build）。
+      # cargo test），打包时必须显式 -f tauri。cwd 必须是 tauri.conf.json 所在目录，
+      # 其 beforeBuildCommand 的相对路径（../../wiki-desktop-ui）以此为基准。
       #
       # --bundles 在 Tauri CLI 的签名是 [<BUNDLES>...]（重复参数），不是逗号列表，
       # 必须展开为 -b <one> -b <other>，否则 `msi,nsis` 或 `msi nsis` 都会被当成

@@ -5,7 +5,9 @@
   "identifier": "com.rust-tunnel.wiki",
   "build": {
     "frontendDist": "../../wiki-desktop-ui/dist",
-    "devUrl": "http://localhost:1420"
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev --prefix ../../wiki-desktop-ui",
+    "beforeBuildCommand": "npm run build --prefix ../../wiki-desktop-ui"
   },
   "app": {
     "windows": [

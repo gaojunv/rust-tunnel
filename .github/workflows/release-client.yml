@@ -118,7 +118,7 @@ jobs:
           cache-on-failure: true
       - name: Install Linux GUI deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev librsvg2-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y mold libgtk-3-dev librsvg2-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev pkg-config libdbus-1-dev libxdo-dev
       - name: Build GUI
         run: cargo build --release -p rust-tunnel-client-gui --target ${{ matrix.target }}
       - name: Upload GUI to remote
