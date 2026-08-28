@@ -1,7 +1,8 @@
-//! 客户端二进制归档的只读列举与下载 API。
+//! 客户端二进制与 wiki 桌面安装包归档的只读列举与下载 API。
 //!
-//! 数据源是 CI（`.github/workflows/release-client.yml`）按 tag 落盘的目录：
+//! 数据源是 CI 按 tag 落盘的目录：
 //!
+//! 客户端归档（`client_dist_dir`）：
 //! ```text
 //! <client_dist_dir>/
 //! ├── v0.8.2/
@@ -11,7 +12,19 @@
 //! └── latest -> v0.8.2
 //! ```
 //!
-//! 服务端只读该目录，不做写入、不做校验和重算（沿用 CI 生成的 `SHA256SUMS`）。
+//! wiki 桌面归档（`wiki_dist_dir`）：
+//! ```text
+//! <wiki_dist_dir>/
+//! ├── v0.8.2/
+//! │   ├── wiki-desktop-macos-aarch64.dmg
+//! │   ├── wiki-desktop-macos-x86_64.dmg
+//! │   ├── wiki-desktop-windows-x86_64.msi
+//! │   ├── wiki-desktop-windows-x86_64-setup.exe
+//! │   └── SHA256SUMS
+//! └── latest -> v0.8.2
+//! ```
+//!
+//! 服务端只读归档目录，不做写入、不做校验和重算（沿用 CI 生成的 `SHA256SUMS`）。
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -45,6 +58,8 @@ pub struct ClientDownloadFile {
     pub os: String,
     /// 目标架构（`x86_64` / `aarch64`，无法解析时为原始后缀）。
     pub arch: String,
+    /// 文件扩展名小写（`dmg` / `msi` / `exe` 等），无扩展名时为 `None`。
+    pub format: Option<String>,
     /// 文件字节数。
     pub size: u64,
     /// `SHA256SUMS` 中记录的校验和（清单缺失或未收录该文件时为 `None`）。
@@ -100,18 +115,40 @@ fn is_safe_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
-/// 从 CI 产物名解析 `(os, arch)`。
+/// 从 CI 产物名解析 `(os, arch, format)`。
 ///
-/// CI 产物形如 `rust-tunnel-client-<os>-<arch>`，Windows 额外带 `.exe`。
-/// 不符合该形态时回退 `("unknown", <剩余部分>)`，保证列表不因命名变化而漏文件。
-fn platform_from_filename(name: &str) -> (String, String) {
-    let stem = name.strip_suffix(".exe").unwrap_or(name);
-    let rest = stem.strip_prefix("rust-tunnel-client-").unwrap_or(stem);
-    match rest.split_once('-') {
-        Some((os, arch)) if !os.is_empty() && !arch.is_empty() => {
-            (os.to_string(), arch.to_string())
+/// 形如 `rust-tunnel-client-<os>-<arch>[.exe]` 或 `wiki-desktop-<os>-<arch>[-setup].<ext>`，
+/// 按已知扩展名与前缀剥离后，首段为 os、次段为 arch，其余丢弃。
+/// 不符合该形态时回退 `("unknown", <剩余部分>, format)`，保证列表不因命名变化而漏文件。
+fn platform_from_filename(name: &str) -> (String, String, Option<String>) {
+    const KNOWN_EXTS: &[&str] = &["dmg", "msi", "exe", "deb", "AppImage", "rpm", "zip"];
+    const KNOWN_PREFIXES: &[&str] = &["rust-tunnel-client-", "wiki-desktop-"];
+
+    let (stem, format) = match name.rsplit_once('.') {
+        Some((prefix, suffix))
+            if KNOWN_EXTS
+                .iter()
+                .any(|ext| ext.eq_ignore_ascii_case(suffix)) =>
+        {
+            (prefix, Some(suffix.to_ascii_lowercase()))
         }
-        _ => ("unknown".to_string(), rest.to_string()),
+        _ => (name, None),
+    };
+
+    let mut rest = stem;
+    for prefix in KNOWN_PREFIXES {
+        if let Some(stripped) = stem.strip_prefix(prefix) {
+            rest = stripped;
+            break;
+        }
+    }
+
+    let mut parts = rest.split('-');
+    match (parts.next(), parts.next()) {
+        (Some(os), Some(arch)) if !os.is_empty() && !arch.is_empty() => {
+            (os.to_string(), arch.to_string(), format)
+        }
+        _ => ("unknown".to_string(), rest.to_string(), format),
     }
 }
 
@@ -167,16 +204,14 @@ fn resolve_download_path(
     base: &Path,
     version: &str,
     file: &str,
+    unavailable_msg: &'static str,
 ) -> Result<PathBuf, (StatusCode, &'static str)> {
     if !is_safe_segment(version) || !is_safe_segment(file) {
         return Err((StatusCode::BAD_REQUEST, "invalid path segment"));
     }
-    let base = base.canonicalize().map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "client archive directory unavailable",
-        )
-    })?;
+    let base = base
+        .canonicalize()
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, unavailable_msg))?;
     let target = base
         .join(version)
         .join(file)
@@ -229,12 +264,13 @@ async fn read_version(
         if !meta.is_file() {
             continue;
         }
-        let (os, arch) = platform_from_filename(&name);
+        let (os, arch, format) = platform_from_filename(&name);
         files.push(ClientDownloadFile {
             sha256: checksums.get(&name).cloned(),
             name,
             os,
             arch,
+            format,
             size: meta.len(),
         });
     }
@@ -317,11 +353,11 @@ pub async fn scan_impl(base: &Path) -> ClientDownloadsResponse {
     }
 }
 
-// ── Axum handlers ─────────────────────────────────────────────────
+// ── 内部实现：供 client / wiki 复用 ────────────────────────────────
 
-/// `GET /api/client-downloads`：列出归档中的客户端版本（JWT Header 保护）。
-pub async fn list_client_downloads(State(state): State<super::ApiState>) -> Response {
-    let Some(base) = state.server_state.client_dist_dir.clone() else {
+/// 列举归档的内部实现，`base` 为 `None` 时返回空状态而非报错。
+async fn list_impl(base: Option<PathBuf>) -> Response {
+    let Some(base) = base else {
         return Json(ClientDownloadsResponse {
             dir_available: false,
             configured_dir: None,
@@ -351,28 +387,29 @@ fn download_authorized(
     !token.is_empty() && crate::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok()
 }
 
-/// `GET /api/client-downloads/:version/:file`：下载指定版本的平台二进制。
-///
-/// 在公开路由上自带鉴权（`?token=` 或 `Authorization` Header），因为浏览器
-/// 原生下载（`<a download>`）无法携带 Header。
-pub async fn download_client_binary(
-    State(state): State<super::ApiState>,
-    UrlPath((version, file)): UrlPath<(String, String)>,
-    Query(query): Query<DownloadQuery>,
+/// 下载端点的内部实现，`not_configured_msg` / `unavailable_msg` 按产品区分文案。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "下载端点复用：base/version/file/token/request + 两条按产品区分的文案，打包成结构体反而增加装配成本"
+)]
+async fn download_impl(
+    state: super::ApiState,
+    base: Option<PathBuf>,
+    version: String,
+    file: String,
+    query_token: Option<String>,
     request: Request<Body>,
+    not_configured_msg: &'static str,
+    unavailable_msg: &'static str,
 ) -> Response {
-    if !download_authorized(&state, &request, query.token.as_deref()) {
+    if !download_authorized(&state, &request, query_token.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let Some(base) = state.server_state.client_dist_dir.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "client_dist_dir is not configured",
-        )
-            .into_response();
+    let Some(base) = base else {
+        return (StatusCode::SERVICE_UNAVAILABLE, not_configured_msg).into_response();
     };
-    let path = match resolve_download_path(&base, &version, &file) {
+    let path = match resolve_download_path(&base, &version, &file, unavailable_msg) {
         Ok(path) => path,
         Err(rejection) => return rejection.into_response(),
     };
@@ -390,6 +427,66 @@ pub async fn download_client_binary(
         headers.insert(header::CONTENT_DISPOSITION, disposition);
     }
     response.into_response()
+}
+
+// ── Axum handlers ─────────────────────────────────────────────────
+
+/// `GET /api/client-downloads`：列出归档中的客户端版本（JWT Header 保护）。
+pub async fn list_client_downloads(State(state): State<super::ApiState>) -> Response {
+    list_impl(state.server_state.client_dist_dir.clone()).await
+}
+
+/// `GET /api/wiki-downloads`：列出归档中的 wiki 桌面版本（JWT Header 保护）。
+pub async fn list_wiki_downloads(State(state): State<super::ApiState>) -> Response {
+    list_impl(state.server_state.wiki_dist_dir.clone()).await
+}
+
+/// `GET /api/client-downloads/:version/:file`：下载指定版本的平台二进制。
+///
+/// 在公开路由上自带鉴权（`?token=` 或 `Authorization` Header），因为浏览器
+/// 原生下载（`<a download>`）无法携带 Header。
+pub async fn download_client_binary(
+    State(state): State<super::ApiState>,
+    UrlPath((version, file)): UrlPath<(String, String)>,
+    Query(query): Query<DownloadQuery>,
+    request: Request<Body>,
+) -> Response {
+    let base = state.server_state.client_dist_dir.clone();
+    download_impl(
+        state,
+        base,
+        version,
+        file,
+        query.token,
+        request,
+        "client_dist_dir is not configured",
+        "client archive directory unavailable",
+    )
+    .await
+}
+
+/// `GET /api/wiki-downloads/:version/:file`：下载指定版本的 wiki 桌面安装包。
+///
+/// 在公开路由上自带鉴权（`?token=` 或 `Authorization` Header），因为浏览器
+/// 原生下载（`<a download>`）无法携带 Header。
+pub async fn download_wiki_binary(
+    State(state): State<super::ApiState>,
+    UrlPath((version, file)): UrlPath<(String, String)>,
+    Query(query): Query<DownloadQuery>,
+    request: Request<Body>,
+) -> Response {
+    let base = state.server_state.wiki_dist_dir.clone();
+    download_impl(
+        state,
+        base,
+        version,
+        file,
+        query.token,
+        request,
+        "wiki_dist_dir is not configured",
+        "wiki archive directory unavailable",
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -421,6 +518,32 @@ mod tests {
         }
     }
 
+    /// 造一个 wiki 归档目录。
+    fn make_wiki_archive(root: &Path, version: &str, with_checksums: bool) {
+        let dir = root.join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = [
+            "wiki-desktop-macos-aarch64.dmg",
+            "wiki-desktop-macos-x86_64.dmg",
+            "wiki-desktop-windows-x86_64.msi",
+            "wiki-desktop-windows-x86_64-setup.exe",
+        ];
+        for name in files {
+            std::fs::write(dir.join(name), b"wiki-payload").unwrap();
+        }
+        if with_checksums {
+            let digest = "c".repeat(64);
+            let mut manifest = String::new();
+            for name in files {
+                manifest.push_str(&digest);
+                manifest.push_str("  ");
+                manifest.push_str(name);
+                manifest.push('\n');
+            }
+            std::fs::write(dir.join(CHECKSUM_FILE), manifest).unwrap();
+        }
+    }
+
     #[test]
     fn safe_segment_rejects_traversal() {
         assert!(is_safe_segment("v0.8.2"));
@@ -439,28 +562,48 @@ mod tests {
     fn platform_parsed_for_all_ci_targets() {
         assert_eq!(
             platform_from_filename("rust-tunnel-client-linux-x86_64"),
-            ("linux".into(), "x86_64".into())
+            ("linux".into(), "x86_64".into(), None)
         );
         assert_eq!(
             platform_from_filename("rust-tunnel-client-macos-x86_64"),
-            ("macos".into(), "x86_64".into())
+            ("macos".into(), "x86_64".into(), None)
         );
         assert_eq!(
             platform_from_filename("rust-tunnel-client-macos-aarch64"),
-            ("macos".into(), "aarch64".into())
+            ("macos".into(), "aarch64".into(), None)
         );
         assert_eq!(
             platform_from_filename("rust-tunnel-client-windows-x86_64.exe"),
-            ("windows".into(), "x86_64".into())
+            ("windows".into(), "x86_64".into(), Some("exe".into()))
         );
         // 未知命名不丢文件，退化为 unknown
         assert_eq!(
             platform_from_filename("something-else"),
-            ("something".into(), "else".into())
+            ("something".into(), "else".into(), None)
         );
         assert_eq!(
             platform_from_filename("blob"),
-            ("unknown".into(), "blob".into())
+            ("unknown".into(), "blob".into(), None)
+        );
+    }
+
+    #[test]
+    fn wiki_platform_parsed() {
+        assert_eq!(
+            platform_from_filename("wiki-desktop-macos-aarch64.dmg"),
+            ("macos".into(), "aarch64".into(), Some("dmg".into()))
+        );
+        assert_eq!(
+            platform_from_filename("wiki-desktop-macos-x86_64.dmg"),
+            ("macos".into(), "x86_64".into(), Some("dmg".into()))
+        );
+        assert_eq!(
+            platform_from_filename("wiki-desktop-windows-x86_64.msi"),
+            ("windows".into(), "x86_64".into(), Some("msi".into()))
+        );
+        assert_eq!(
+            platform_from_filename("wiki-desktop-windows-x86_64-setup.exe"),
+            ("windows".into(), "x86_64".into(), Some("exe".into()))
         );
     }
 
@@ -557,6 +700,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_wiki_archive_with_format_and_checksums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        make_wiki_archive(root, "v0.9.0", true);
+        std::os::unix::fs::symlink("v0.9.0", root.join(LATEST_LINK)).unwrap();
+
+        let response = scan_impl(root).await;
+        assert!(response.dir_available);
+        assert_eq!(response.latest.as_deref(), Some("v0.9.0"));
+        assert_eq!(response.versions.len(), 1);
+        let version = &response.versions[0];
+        assert_eq!(version.files.len(), 4);
+        // 按文件名升序，校验 format
+        let by_name: std::collections::HashMap<_, _> =
+            version.files.iter().map(|f| (f.name.as_str(), f)).collect();
+        assert_eq!(
+            by_name["wiki-desktop-macos-aarch64.dmg"].format.as_deref(),
+            Some("dmg")
+        );
+        assert_eq!(
+            by_name["wiki-desktop-macos-x86_64.dmg"].format.as_deref(),
+            Some("dmg")
+        );
+        assert_eq!(
+            by_name["wiki-desktop-windows-x86_64.msi"].format.as_deref(),
+            Some("msi")
+        );
+        assert_eq!(
+            by_name["wiki-desktop-windows-x86_64-setup.exe"]
+                .format
+                .as_deref(),
+            Some("exe")
+        );
+        // 同 os/arch 的 msi 与 exe 能通过 format 区分
+        assert_ne!(
+            by_name["wiki-desktop-windows-x86_64.msi"].format,
+            by_name["wiki-desktop-windows-x86_64-setup.exe"].format
+        );
+        assert!(version.files.iter().all(|f| f.sha256.is_some()));
+        assert!(version.files.iter().all(|f| f.size == 12));
+    }
+
+    #[tokio::test]
     async fn scan_skips_stray_files_and_empty_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -583,7 +769,13 @@ mod tests {
         std::fs::write(root.join("outside-secret"), b"nope").unwrap();
 
         // 正常路径
-        let ok = resolve_download_path(root, "v1.0.0", "rust-tunnel-client-linux-x86_64").unwrap();
+        let ok = resolve_download_path(
+            root,
+            "v1.0.0",
+            "rust-tunnel-client-linux-x86_64",
+            "client archive directory unavailable",
+        )
+        .unwrap();
         assert!(ok.is_file());
 
         // 穿越尝试在段校验阶段就被挡住
@@ -593,16 +785,26 @@ mod tests {
             ("v1.0.0", "../outside-secret"),
             ("v1.0.0/..", "outside-secret"),
         ] {
-            let err = resolve_download_path(root, version, file).unwrap_err();
+            let err =
+                resolve_download_path(root, version, file, "client archive directory unavailable")
+                    .unwrap_err();
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{version}/{file}");
         }
 
         // 合法段但文件不存在
-        let err = resolve_download_path(root, "v1.0.0", "nope").unwrap_err();
+        let err =
+            resolve_download_path(root, "v1.0.0", "nope", "client archive directory unavailable")
+                .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         // 目录不是文件
-        let err = resolve_download_path(root, "v1.0.0", "v1.0.0").unwrap_err();
+        let err = resolve_download_path(
+            root,
+            "v1.0.0",
+            "v1.0.0",
+            "client archive directory unavailable",
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
@@ -616,7 +818,9 @@ mod tests {
         // 归档目录内的软链指向目录外 —— 段校验过得去，规范化后必须被拦
         std::os::unix::fs::symlink(&secret, root.join("v1.0.0").join("leak")).unwrap();
 
-        let err = resolve_download_path(&root, "v1.0.0", "leak").unwrap_err();
+        let err =
+            resolve_download_path(&root, "v1.0.0", "leak", "client archive directory unavailable")
+                .unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }

@@ -1,0 +1,207 @@
+name: Release Wiki Desktop
+
+# wiki 桌面端（Tauri 2 · crates/wiki-serve + wiki-desktop-ui）安装包发布。
+#
+# 触发用独立 tag `wiki-v*`，与 release-client.yml 的 `v*` 解耦：Tauri 打包要跑
+# 三条 runner、装 WiX/NSIS、编译整条 tauri 依赖链，耗时远高于单文件二进制，不适合
+# 跟随每次服务端/客户端发版。
+#
+# 产物由各 runner 直接 SCP 到 ${DEPLOY_PATH}/wiki/<version>/（版本隔离），不走
+# Artifact 中转以避开存储配额；全部平台上传完成后由 finalize-wiki 在服务端生成
+# 校验和并更新 latest 软链。行为对齐 release-client.yml。
+#
+# 服务端 `wiki_dist_dir` 指向 ${DEPLOY_PATH}/wiki，Web 管理界面「下载」页的
+# Wiki 桌面端分区只读该目录。
+on:
+  push:
+    tags:
+      - 'wiki-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '归档目录名（留空：tag 触发取 tag 去掉 wiki- 前缀，否则 dev-<sha7>）'
+        required: false
+        type: string
+
+jobs:
+  # 版本目录名只算一次，build 与 finalize 共用 —— 三处各算一遍迟早会算出不一样的结果
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      dir: ${{ steps.resolve.outputs.dir }}
+    steps:
+      - name: Resolve archive directory name
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            DIR="${INPUT_VERSION}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # wiki-v0.4.0 -> v0.4.0：下载页按 semver 降序排版本，带 wiki- 前缀会解析
+            # 失败并退化成按名称排序，历史版本顺序就乱了
+            DIR="${GITHUB_REF_NAME#wiki-}"
+          else
+            DIR="dev-${GITHUB_SHA:0:7}"
+          fi
+          # 与服务端 is_safe_segment 同一把尺子（只放行 A-Za-z0-9._+-）。非法目录名
+          # 会被下载页静默过滤，表现为「上传成功但页面看不见」，所以在这里就挡住。
+          if ! printf '%s' "${DIR}" | grep -Eq '^[A-Za-z0-9._+-]{1,128}$' \
+            || [ "${DIR}" = "." ] || [ "${DIR}" = ".." ]; then
+            echo "::error::invalid archive directory name: '${DIR}' (allowed charset: A-Za-z0-9._+-)"
+            exit 1
+          fi
+          echo "dir=${DIR}" >> "$GITHUB_OUTPUT"
+          echo "Archive directory: wiki/${DIR}"
+
+  build-wiki:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-aarch64
+            bundles: dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: macos-x86_64
+            bundles: dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            bundles: msi,nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 前端产物必须先于 Rust 构建存在（tauri.conf.json 的 frontendDist 指向
+      # ../../wiki-desktop-ui/dist）。实际构建由 beforeBuildCommand 触发，这里只装依赖。
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: wiki-desktop-ui/package-lock.json
+
+      - name: Install UI dependencies
+        run: npm ci --prefix wiki-desktop-ui
+
+      - name: Install Rust with target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wiki-${{ matrix.target }}
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
+
+      # tauri feature 默认关闭（门控整条 Tauri 依赖链，让无 GUI 系统库的机器也能
+      # cargo test），打包时必须显式 -f tauri。cwd 必须是 tauri.conf.json 所在目录，
+      # 其 beforeBuildCommand 的相对路径（../../wiki-desktop-ui）以此为基准。
+      - name: Build wiki desktop bundles
+        working-directory: crates/wiki-serve
+        run: tauri build --ci -f tauri -t ${{ matrix.target }} -b ${{ matrix.bundles }}
+
+      # Tauri 产物名形如 `Wiki Desktop_0.4.0_aarch64.dmg`（含空格与版本号）。空格不在
+      # 服务端 is_safe_segment 的放行字符集内，会被下载页过滤掉，故统一重命名为
+      # wiki-desktop-<os>-<arch>[-setup].<ext> —— 也是下载页解析 os/arch 的约定形态。
+      - name: Collect and rename bundles
+        shell: bash
+        env:
+          BUNDLE_DIR: target/${{ matrix.target }}/release/bundle
+          PLATFORM: ${{ matrix.platform }}
+          BUNDLES: ${{ matrix.bundles }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p upload
+
+          pick() {  # $1=bundle 子目录 $2=扩展名 $3=目标文件名
+            local files=("${BUNDLE_DIR}/$1"/*."$2")
+            if [ ${#files[@]} -eq 0 ]; then
+              echo "::error::no *.$2 bundle found under ${BUNDLE_DIR}/$1"
+              exit 1
+            fi
+            if [ ${#files[@]} -gt 1 ]; then
+              echo "::warning::multiple *.$2 bundles found, taking the first: ${files[*]}"
+            fi
+            cp "${files[0]}" "upload/$3"
+          }
+
+          case "${BUNDLES}" in *dmg*)  pick dmg  dmg "wiki-desktop-${PLATFORM}.dmg" ;; esac
+          case "${BUNDLES}" in *msi*)  pick msi  msi "wiki-desktop-${PLATFORM}.msi" ;; esac
+          case "${BUNDLES}" in *nsis*) pick nsis exe "wiki-desktop-${PLATFORM}-setup.exe" ;; esac
+
+          echo "--- upload/ ---"
+          ls -lh upload
+
+      # 各平台自行 SCP 直传：appleboy/scp-action 是 Docker action，只能跑在 Linux
+      # runner，因此统一用原生 ssh/scp（Windows runner 走 git-bash，自带 OpenSSH）
+      - name: Upload bundles to remote server
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ secrets.SERVER_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DIR: ${{ needs.resolve-version.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_PATH}" ]; then
+            echo "::error::secrets.DEPLOY_PATH is empty"
+            exit 1
+          fi
+          mkdir -p "${HOME}/.ssh"
+          KEY="${HOME}/.ssh/rt_deploy_key"
+          printf '%s\n' "${SSH_KEY}" > "${KEY}"
+          chmod 600 "${KEY}"
+          PORT="${SSH_PORT:-22}"
+          DEST="${DEPLOY_PATH}/wiki/${DIR}"
+          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
+          for file in upload/*; do
+            echo "Uploading $(basename "${file}") -> ${DEST}/"
+            scp "${SSH_OPTS[@]}" -P "${PORT}" "${file}" "${SSH_USER}@${SSH_HOST}:${DEST}/"
+          done
+          rm -f "${KEY}"
+
+  finalize-wiki:
+    needs: [resolve-version, build-wiki]
+    runs-on: ubuntu-latest
+    steps:
+      # 校验和统一在服务端算：Windows runner 没有 sha256sum，跨平台各算一段再拼
+      # 清单不如让服务端一次算完（与 release-client.yml 同一考量）
+      - name: Checksum and latest symlink
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            set -e
+            BASE="${{ secrets.DEPLOY_PATH }}/wiki"
+            DIR="${{ needs.resolve-version.outputs.dir }}"
+            cd "${BASE}/${DIR}"
+            # 安装包不需要执行位，只要可读
+            chmod 644 wiki-desktop-*
+            sha256sum wiki-desktop-* > SHA256SUMS
+            echo "--- ${BASE}/${DIR} ---"
+            ls -lh
+            echo "--- SHA256SUMS ---"
+            cat SHA256SUMS
+            ln -sfn "${DIR}" "${BASE}/latest"
+            ls -ld "${BASE}/latest"
+            echo "Wiki desktop ${DIR} deployed successfully to ${BASE}/${DIR}/ (latest -> ${DIR})"

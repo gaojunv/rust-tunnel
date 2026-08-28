@@ -1310,8 +1310,8 @@
     }
   },
   "downloads": {
-    "title": "客户端下载",
-    "description": "按版本获取内网穿透客户端二进制，包含各平台校验和",
+    "title": "下载中心",
+    "description": "按版本获取客户端与 Wiki 桌面端产物，包含各平台校验和",
     "refresh": "刷新",
     "latest": "最新",
     "download": "下载",
@@ -1324,7 +1324,16 @@
     "usageTitle": "启动客户端",
     "usageHint": "把 <client_token> 换成「客户端」页面里的接入 token；--name 用于在服务端标识该客户端。",
     "dirUnavailable": "归档目录不存在或不可读。请确认服务端 client_dist_dir 配置，并让 CI 推送过客户端包。",
-    "empty": "归档目录为空，还没有已发布的客户端版本。"
+    "empty": "归档目录为空，还没有已发布的客户端版本。",
+    "tabClient": "客户端",
+    "tabWiki": "Wiki 桌面端",
+    "wikiUsageTitle": "安装说明",
+    "wikiUsageMac": "macOS 的 .dmg 未签名，首次打开请右键 → 打开，或执行 xattr -dr com.apple.quarantine <路径> 去除隔离标记。",
+    "wikiUsageWindows": "Windows 提供 .msi 与 NSIS .exe 两种安装包，二选一即可。",
+    "wikiUsageVault": "笔记 vault 按 WIKI_VAULT_ROOT → $HOME/wiki-vault → ./vault 优先级解析，首次启动会自动创建目录并写入 welcome.md。",
+    "wikiUsageHint": "笔记 vault 按 WIKI_VAULT_ROOT → $HOME/wiki-vault → ./vault 优先级解析，首次启动会自动创建目录并写入 welcome.md。",
+    "wikiDirUnavailable": "归档目录不存在或不可读。请确认服务端 wiki_dist_dir 配置，并让 CI 推送过桌面端产物。",
+    "wikiEmpty": "归档目录为空，还没有已发布的 Wiki 桌面端版本。"
   },
   "wiki": {
     "saveError": "保存失败：{{error}}",

@@ -70,6 +70,7 @@ import {
   queryKnowledge,
   clientsApi,
   getClientDownloads,
+  getWikiDownloads,
   listAgentWorkspaces,
   getMemorySettings,
   updateMemorySettings,
@@ -903,6 +904,11 @@ export function useClients() {
 /** 客户端二进制归档列表（服务端扫描 `client_dist_dir`，CI 推包后需重拉才可见）。 */
 export function useClientDownloads() {
   return useQuery({ queryKey: ['client-downloads'], queryFn: () => getClientDownloads() });
+}
+
+/** Wiki 桌面端归档列表（服务端扫描 `wiki_dist_dir`，与 client 完全同构）。 */
+export function useWikiDownloads() {
+  return useQuery({ queryKey: ['wiki-downloads'], queryFn: () => getWikiDownloads() });
 }
 
 /** 订阅记忆/技能 SSE：事件到达即失效记忆与技能列表（后台重拉）。

@@ -15,6 +15,7 @@
 #   LOG_LEVEL          -> log
 #   DB_PATH            -> db_path
 #   CLIENT_DIST_DIR    -> client_dist_dir
+#   WIKI_DIST_DIR      -> wiki_dist_dir
 #   DNS_ENABLED        -> dns_enabled
 #   DNS_BIND           -> dns_bind
 #   DNS_TUNNEL_DOMAIN  -> dns_tunnel_domain
@@ -121,6 +122,12 @@ db_path = "./data/rust-tunnel.db"
 # Web 管理界面「客户端下载」页只读该目录
 # 默认值：./client（相对于服务进程工作目录）
 client_dist_dir = "./client"
+
+# wiki 桌面端安装包归档目录
+# CI（.github/workflows/release-wiki-client.yml）按 wiki-v* tag 落盘为 <dir>/<version>/，
+# 并维护 <dir>/latest 软链；Web 下载页的「Wiki 桌面端」分区只读该目录
+# 默认值：./wiki（相对于服务进程工作目录）
+wiki_dist_dir = "./wiki"
 
 # --------------------
 # 客户端认证配置

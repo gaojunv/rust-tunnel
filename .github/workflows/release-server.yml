@@ -82,14 +82,17 @@ jobs:
             -e "s|\${SS_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
             -e "s|\${TROJAN_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
             -e "s|\${CLIENT_DIST_DIR}|${DEPLOY_PATH%/}/client|g" \
+            -e "s|\${WIKI_DIST_DIR}|${DEPLOY_PATH%/}/wiki|g" \
             contrib/config.toml.template > config.toml
           # 校验占位符已全部替换（漏替换会让服务端读到字面量，静默跑错配置）
-          if grep -nE '\$\{(ADMIN_PASSWORD|CLIENT_AUTH_TOKEN|SS_PASSWORD|TROJAN_PASSWORD|CLIENT_DIST_DIR)\}' config.toml; then
+          if grep -nE '\$\{(ADMIN_PASSWORD|CLIENT_AUTH_TOKEN|SS_PASSWORD|TROJAN_PASSWORD|CLIENT_DIST_DIR|WIKI_DIST_DIR)\}' config.toml; then
             echo "::error::config.toml still contains unresolved placeholders (check repo secrets)"
             exit 1
           fi
           echo "--- client_dist_dir ---"
           grep client_dist_dir config.toml
+          echo "--- wiki_dist_dir ---"
+          grep wiki_dist_dir config.toml
 
       - name: Deploy files to remote server
         uses: appleboy/scp-action@v0.1.7

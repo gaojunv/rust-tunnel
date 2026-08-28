@@ -32,6 +32,11 @@ db_path = "./data/rust-tunnel.db"
 # /opt/rust-tunnel，与 DEPLOY_PATH 未必一致。
 client_dist_dir = "${CLIENT_DIST_DIR}"
 
+# wiki 桌面端安装包归档目录 (部署时替换为 DEPLOY_PATH 下的 wiki 子目录)
+# release-wiki-client.yml 按 wiki-v* tag 落盘 <dir>/<version>/，Web 下载页的
+# Wiki 桌面端分区只读该目录。绝对路径的理由同 client_dist_dir。
+wiki_dist_dir = "${WIKI_DIST_DIR}"
+
 # Shadowsocks 代理配置
 ss_enabled = true
 ss_port = 8388

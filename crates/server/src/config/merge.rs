@@ -74,6 +74,9 @@ impl ServerConfig {
                 if let Some(v) = file_config.client_dist_dir {
                     config.client_dist_dir = v;
                 }
+                if let Some(v) = file_config.wiki_dist_dir {
+                    config.wiki_dist_dir = v;
+                }
                 if let Some(v) = file_config.ss_enabled {
                     config.ss_enabled = v;
                 }
@@ -193,6 +196,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("CLIENT_DIST_DIR") {
             config.client_dist_dir = v;
+        }
+        if let Ok(v) = std::env::var("WIKI_DIST_DIR") {
+            config.wiki_dist_dir = v;
         }
 
         // Environment variables for Shadowsocks
@@ -332,6 +338,9 @@ impl ServerConfig {
         }
         if let Some(v) = cli.client_dist_dir {
             config.client_dist_dir = v;
+        }
+        if let Some(v) = cli.wiki_dist_dir {
+            config.wiki_dist_dir = v;
         }
         if let Some(v) = cli.ss_enabled {
             config.ss_enabled = v;

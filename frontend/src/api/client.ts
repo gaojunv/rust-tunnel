@@ -268,6 +268,19 @@ export const clientDownloadUrl = (version: string, file: string): string => {
   return token ? `${path}?token=${encodeURIComponent(token)}` : path;
 };
 
+// Wiki Desktop Downloads API（与 Client Downloads 完全同构，仅路径不同）。
+export const getWikiDownloads = async (): Promise<ClientDownloadsResponse> => {
+  const { data } = await api.get<ClientDownloadsResponse>('/wiki-downloads');
+  return data;
+};
+
+/** 构造 Wiki 桌面端产物下载地址（同 clientDownloadUrl，走 `?token=` 校验，见其注释）。 */
+export const wikiDownloadUrl = (version: string, file: string): string => {
+  const token = localStorage.getItem('auth_token') ?? '';
+  const path = `/api/wiki-downloads/${encodeURIComponent(version)}/${encodeURIComponent(file)}`;
+  return token ? `${path}?token=${encodeURIComponent(token)}` : path;
+};
+
 // Reverse Proxy API
 export const getProxyRules = async (): Promise<ProxyRule[]> => {
   const response = await api.get<{ rules: ProxyRule[] }>('/proxy/rules');

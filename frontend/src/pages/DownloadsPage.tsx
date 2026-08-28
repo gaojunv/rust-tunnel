@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Apple,
@@ -20,11 +20,12 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Skeleton } from '@/components/ui/skeleton';
-import { useClientDownloads } from '@/api/hooks';
-import { clientDownloadUrl } from '@/api/client';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { useClientDownloads, useWikiDownloads } from '@/api/hooks';
+import { clientDownloadUrl, wikiDownloadUrl } from '@/api/client';
 import { formatBytes } from '@/utils/format';
 import { cn } from '@/lib/utils';
-import type { ClientDownloadFile, ClientDownloadVersion } from '@/types';
+import type { ClientDownloadFile, ClientDownloadVersion, ClientDownloadsResponse } from '@/types';
 
 /** 平台图标：Windows 与其他桌面端共用 MonitorSmartphone（lucide 无 Windows 图标）。 */
 function PlatformIcon({ os, className }: { os: string; className?: string }) {
@@ -75,7 +76,15 @@ function CopyButton({
 }
 
 /** 单个平台产物一行：图标 + 平台名 + 体积 + SHA256 复制 + 下载按钮。 */
-function FileRow({ version, file }: { version: string; file: ClientDownloadFile }) {
+function FileRow({
+  version,
+  file,
+  downloadUrl,
+}: {
+  version: string;
+  file: ClientDownloadFile;
+  downloadUrl: (version: string, file: string) => string;
+}) {
   const { t } = useTranslation();
 
   return (
@@ -86,7 +95,14 @@ function FileRow({ version, file }: { version: string; file: ClientDownloadFile 
         </div>
         <div className="min-w-0">
           <div className="truncate text-sm font-medium">{platformLabel(file)}</div>
-          <div className="truncate font-mono text-xs text-muted-foreground">{file.name}</div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate font-mono text-xs text-muted-foreground">{file.name}</span>
+            {file.format && (
+              <Badge variant="outline" className="shrink-0 font-mono text-[10px] tracking-wide">
+                {file.format.toUpperCase()}
+              </Badge>
+            )}
+          </div>
         </div>
       </div>
 
@@ -95,7 +111,7 @@ function FileRow({ version, file }: { version: string; file: ClientDownloadFile 
         {file.sha256 && <CopyButton value={file.sha256} label={t('downloads.copySha256')} />}
         <Button asChild size="sm" variant="outline" className="gap-1.5">
           {/* 原生下载：URL 自带 ?token=，见 clientDownloadUrl 注释 */}
-          <a href={clientDownloadUrl(version, file.name)} download={file.name}>
+          <a href={downloadUrl(version, file.name)} download={file.name}>
             <Download className="h-3.5 w-3.5" />
             {t('downloads.download')}
           </a>
@@ -108,9 +124,11 @@ function FileRow({ version, file }: { version: string; file: ClientDownloadFile 
 /** 版本卡片：标题行（版本号 + latest 徽标 + 时间）+ 平台产物列表。 */
 function VersionCard({
   version,
+  downloadUrl,
   highlight,
 }: {
   version: ClientDownloadVersion;
+  downloadUrl: (version: string, file: string) => string;
   highlight?: boolean;
 }) {
   const { t, i18n } = useTranslation();
@@ -130,7 +148,7 @@ function VersionCard({
       </CardHeader>
       <CardContent className="space-y-2">
         {version.files.map((file) => (
-          <FileRow key={file.name} version={version.version} file={file} />
+          <FileRow key={file.name} version={version.version} file={file} downloadUrl={downloadUrl} />
         ))}
       </CardContent>
     </Card>
@@ -159,9 +177,42 @@ function UsageCard({ latestFile }: { latestFile: ClientDownloadFile | null }) {
   );
 }
 
-export default function DownloadsPage() {
+/** Wiki 桌面端安装提示卡：未签名 dmg / msi+exe 二选一 / vault 路径优先级。 */
+function WikiUsageCard() {
   const { t } = useTranslation();
-  const { data, isLoading, isFetching, refetch } = useClientDownloads();
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm font-medium">{t('downloads.wikiUsageTitle')}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm leading-relaxed text-muted-foreground">
+        <p>{t('downloads.wikiUsageMac')}</p>
+        <p>{t('downloads.wikiUsageWindows')}</p>
+        <p>{t('downloads.wikiUsageVault')}</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 归档分区通用骨架：StatCard 三连 + 最新版本卡 + 使用/安装卡 + 历史折叠 + 三种空状态。 */
+function ArchiveSection({
+  data,
+  isLoading,
+  downloadUrl,
+  usage,
+  dirUnavailableKey,
+  emptyKey,
+}: {
+  data: ClientDownloadsResponse | undefined;
+  isLoading: boolean;
+  downloadUrl: (version: string, file: string) => string;
+  usage: ReactNode;
+  /** 空状态文案的 i18n key（client 与 wiki 的 dirUnavailable/empty 提示的配置项名不同）。 */
+  dirUnavailableKey: string;
+  emptyKey: string;
+}) {
+  const { t } = useTranslation();
   const [historyOpen, setHistoryOpen] = useState(false);
 
   const latestVersion = useMemo(
@@ -176,85 +227,137 @@ export default function DownloadsPage() {
     () => (data?.versions ?? []).reduce((sum, v) => sum + v.files.length, 0),
     [data]
   );
-  // Linux x86_64 优先作为命令示例的二进制名（服务器场景最常见）
-  const sampleFile =
-    latestVersion?.files.find((f) => f.os === 'linux') ?? latestVersion?.files[0] ?? null;
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-24 w-full" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    );
+  }
+
+  if (!data?.dir_available) {
+    return (
+      <div className="glass-card flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center text-muted-foreground">
+        <FolderX className="h-8 w-8 text-muted-foreground/50" />
+        {/* key 由调用方按分区传入（client 与 wiki 的配置项名不同），此处按任意 i18n key 处理 */}
+        <p>{t(dirUnavailableKey as never)}</p>
+        {data?.configured_dir && (
+          <code className="rounded bg-muted/50 px-2 py-1 font-mono text-xs">{data.configured_dir}</code>
+        )}
+      </div>
+    );
+  }
+
+  if (data.versions.length === 0) {
+    return (
+      <div className="glass-card flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center text-muted-foreground">
+        <Package className="h-8 w-8 text-muted-foreground/50" />
+        <p>{t(emptyKey as never)}</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard
+          title={t('downloads.statLatest')}
+          value={latestVersion?.version ?? '—'}
+          icon={<Package className="h-4 w-4" />}
+        />
+        <StatCard
+          title={t('downloads.statVersions')}
+          value={data.versions.length}
+          icon={<History className="h-4 w-4" />}
+        />
+        <StatCard title={t('downloads.statFiles')} value={totalFiles} icon={<Download className="h-4 w-4" />} />
+      </div>
+
+      {latestVersion && <VersionCard version={latestVersion} downloadUrl={downloadUrl} highlight />}
+
+      {usage}
+
+      {olderVersions.length > 0 && (
+        <Collapsible open={historyOpen} onOpenChange={setHistoryOpen}>
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" className="w-full justify-between">
+              <span className="flex items-center gap-2">
+                <History className="h-4 w-4" />
+                {t('downloads.history', { count: olderVersions.length })}
+              </span>
+              <ChevronDown className={cn('h-4 w-4 transition-transform', historyOpen && 'rotate-180')} />
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="space-y-4 pt-4">
+            {olderVersions.map((version) => (
+              <VersionCard key={version.version} version={version} downloadUrl={downloadUrl} />
+            ))}
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+    </>
+  );
+}
+
+export default function DownloadsPage() {
+  const { t } = useTranslation();
+  const [tab, setTab] = useState<'client' | 'wiki'>('client');
+  const client = useClientDownloads();
+  const wiki = useWikiDownloads();
+
+  const isFetching = tab === 'client' ? client.isFetching : wiki.isFetching;
+  const handleRefresh = () => {
+    if (tab === 'client') void client.refetch();
+    else void wiki.refetch();
+  };
+
+  // 客户端启动命令的示例二进制名：Linux x86_64 优先
+  const clientLatest = useMemo(
+    () => client.data?.versions.find((v) => v.is_latest) ?? client.data?.versions[0] ?? null,
+    [client.data]
+  );
+  const clientSampleFile =
+    clientLatest?.files.find((f) => f.os === 'linux') ?? clientLatest?.files[0] ?? null;
 
   return (
     <div className="space-y-6">
       <PageHeader title={t('downloads.title')} description={t('downloads.description')}>
-        <Button variant="outline" onClick={() => void refetch()} disabled={isFetching}>
+        <Button variant="outline" onClick={handleRefresh} disabled={isFetching}>
           <RefreshCw className={cn('mr-2 h-4 w-4', isFetching && 'animate-spin')} />
           {t('downloads.refresh')}
         </Button>
       </PageHeader>
 
-      {isLoading ? (
-        <div className="space-y-4">
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-64 w-full" />
-        </div>
-      ) : !data?.dir_available ? (
-        <div className="glass-card flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center text-muted-foreground">
-          <FolderX className="h-8 w-8 text-muted-foreground/50" />
-          <p>{t('downloads.dirUnavailable')}</p>
-          {data?.configured_dir && (
-            <code className="rounded bg-muted/50 px-2 py-1 font-mono text-xs">
-              {data.configured_dir}
-            </code>
-          )}
-        </div>
-      ) : data.versions.length === 0 ? (
-        <div className="glass-card flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center text-muted-foreground">
-          <Package className="h-8 w-8 text-muted-foreground/50" />
-          <p>{t('downloads.empty')}</p>
-        </div>
-      ) : (
-        <>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <StatCard
-              title={t('downloads.statLatest')}
-              value={latestVersion?.version ?? '—'}
-              icon={<Package className="h-4 w-4" />}
-            />
-            <StatCard
-              title={t('downloads.statVersions')}
-              value={data.versions.length}
-              icon={<History className="h-4 w-4" />}
-            />
-            <StatCard
-              title={t('downloads.statFiles')}
-              value={totalFiles}
-              icon={<Download className="h-4 w-4" />}
-            />
-          </div>
+      <Tabs value={tab} onValueChange={(v) => setTab(v as 'client' | 'wiki')}>
+        <TabsList>
+          <TabsTrigger value="client">{t('downloads.tabClient')}</TabsTrigger>
+          <TabsTrigger value="wiki">{t('downloads.tabWiki')}</TabsTrigger>
+        </TabsList>
 
-          {latestVersion && <VersionCard version={latestVersion} highlight />}
+        <TabsContent value="client" className="space-y-4">
+          <ArchiveSection
+            data={client.data}
+            isLoading={client.isLoading}
+            downloadUrl={clientDownloadUrl}
+            usage={<UsageCard latestFile={clientSampleFile} />}
+            dirUnavailableKey="downloads.dirUnavailable"
+            emptyKey="downloads.empty"
+          />
+        </TabsContent>
 
-          <UsageCard latestFile={sampleFile} />
-
-          {olderVersions.length > 0 && (
-            <Collapsible open={historyOpen} onOpenChange={setHistoryOpen}>
-              <CollapsibleTrigger asChild>
-                <Button variant="ghost" className="w-full justify-between">
-                  <span className="flex items-center gap-2">
-                    <History className="h-4 w-4" />
-                    {t('downloads.history', { count: olderVersions.length })}
-                  </span>
-                  <ChevronDown
-                    className={cn('h-4 w-4 transition-transform', historyOpen && 'rotate-180')}
-                  />
-                </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="space-y-4 pt-4">
-                {olderVersions.map((version) => (
-                  <VersionCard key={version.version} version={version} />
-                ))}
-              </CollapsibleContent>
-            </Collapsible>
-          )}
-        </>
-      )}
+        <TabsContent value="wiki" className="space-y-4">
+          <ArchiveSection
+            data={wiki.data}
+            isLoading={wiki.isLoading}
+            downloadUrl={wikiDownloadUrl}
+            usage={<WikiUsageCard />}
+            dirUnavailableKey="downloads.wikiDirUnavailable"
+            emptyKey="downloads.wikiEmpty"
+          />
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

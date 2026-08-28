@@ -266,6 +266,11 @@ pub async fn run_api_server(
             "/api/client-downloads/:version/:file",
             get(client_downloads::download_client_binary),
         )
+        .route(
+            // wiki 桌面安装包下载（同上，自带 ?token= 校验）
+            "/api/wiki-downloads/:version/:file",
+            get(client_downloads::download_wiki_binary),
+        )
         .route("/api/preferences", get(preferences::get_preferences));
 
     // Protected routes (require auth only when password is set)
@@ -284,6 +289,11 @@ pub async fn run_api_server(
         .route(
             "/api/client-downloads",
             get(client_downloads::list_client_downloads),
+        )
+        // wiki 桌面安装包归档列表（下载端点在 public_routes —— 用 ?token= 查询参数）
+        .route(
+            "/api/wiki-downloads",
+            get(client_downloads::list_wiki_downloads),
         )
         // Server auth token management
         .route(

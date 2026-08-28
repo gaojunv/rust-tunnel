@@ -57,6 +57,10 @@ pub struct ServerCli {
     #[clap(long = "client-dist-dir")]
     pub client_dist_dir: Option<String>,
 
+    /// Directory holding versioned wiki desktop installers (`<dir>/<tag>/…`), served by the web download page
+    #[clap(long = "wiki-dist-dir")]
+    pub wiki_dist_dir: Option<String>,
+
     /// Enable Shadowsocks proxy service
     #[clap(long = "ss-enabled")]
     pub ss_enabled: Option<bool>,

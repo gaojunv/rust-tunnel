@@ -204,6 +204,10 @@ async fn main() -> TunnelResult<()> {
     if !config.client_dist_dir.trim().is_empty() {
         state.client_dist_dir = Some(std::path::PathBuf::from(&config.client_dist_dir));
     }
+    // wiki 桌面端安装包归档目录（只读，供 Web 下载页扫描；空字符串视为未配置）
+    if !config.wiki_dist_dir.trim().is_empty() {
+        state.wiki_dist_dir = Some(std::path::PathBuf::from(&config.wiki_dist_dir));
+    }
 
     // Initialize logging with LogStore capture (after state creation so LogStore is available)
     let log_store = state.log_store.clone();

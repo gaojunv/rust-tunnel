@@ -1313,8 +1313,8 @@
     }
   },
   "downloads": {
-    "title": "Client Downloads",
-    "description": "Grab tunnel client binaries per release, with per-platform checksums",
+    "title": "Downloads",
+    "description": "Grab client and Wiki Desktop builds per release, with per-platform checksums",
     "refresh": "Refresh",
     "latest": "Latest",
     "download": "Download",
@@ -1327,7 +1327,16 @@
     "usageTitle": "Run the client",
     "usageHint": "Replace <client_token> with the access token from the Clients page; --name labels this client on the server.",
     "dirUnavailable": "Archive directory is missing or unreadable. Check the server's client_dist_dir setting and make sure CI has published a client build.",
-    "empty": "Archive directory is empty — no client releases published yet."
+    "empty": "Archive directory is empty — no client releases published yet.",
+    "tabClient": "Client",
+    "tabWiki": "Wiki Desktop",
+    "wikiUsageTitle": "Installation notes",
+    "wikiUsageMac": "macOS .dmg is unsigned — on first launch, right-click → Open, or run xattr -dr com.apple.quarantine <path> to clear quarantine.",
+    "wikiUsageWindows": "Windows ships both a .msi and an NSIS .exe installer — pick either one.",
+    "wikiUsageVault": "The notes vault resolves as WIKI_VAULT_ROOT → $HOME/wiki-vault → ./vault; the first launch creates the directory and writes welcome.md automatically.",
+    "wikiUsageHint": "The notes vault resolves as WIKI_VAULT_ROOT → $HOME/wiki-vault → ./vault; the first launch creates the directory and writes welcome.md automatically.",
+    "wikiDirUnavailable": "Archive directory is missing or unreadable. Check the server's wiki_dist_dir setting and make sure CI has published a Wiki Desktop build.",
+    "wikiEmpty": "Archive directory is empty — no Wiki Desktop releases published yet."
   },
   "wiki": {
     "saveError": "Save failed: {{error}}",

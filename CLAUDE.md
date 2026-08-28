@@ -120,6 +120,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 ### API 端点
 - 公开：`POST /api/login`、`GET /api/health`、`GET /api/knowledge/events`（SSE，`?token=` 认证）
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
+- 产物归档下载：`GET /api/client-downloads`、`GET /api/wiki-downloads`（列表，需 JWT）；`GET /api/client-downloads/:version/:file`、`GET /api/wiki-downloads/:version/:file`（下载，公开路由自带 `?token=` 校验，因 `<a download>` 不能带 Header）。分别只读 `client_dist_dir` / `wiki_dist_dir`，由 `release-client.yml` / `release-wiki-client.yml` 落盘
 - LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`、`POST /v1/responses`（Responses API 入口，与 `/v1/chat/completions` 同域）
 - 统一知识容器（新）：`/api/knowledge`（CRUD）、`/api/knowledge/:id`、`/api/knowledge/:id/docs`、`/api/knowledge/:id/docs/:doc_id`（含 `/reindex`）、`/api/knowledge/test-embedding`、`/api/knowledge/:id/query`（向量检索预览）、`/api/knowledge/:id/pages`、`/api/knowledge/:id/graph`、`/api/knowledge/:id/search`、`/api/knowledge/search`
 - AI agent（新）：`GET /api/agent/ws`（WebSocket 回合/事件流）、`/api/agent/workspaces`（CRUD，含 `/files`、`/sessions`）、`/api/agent/sessions/:id`（含 `/model`、`/archive`、`/messages`、`/role`）、`/api/agent/default-model`、`/api/agent/roles`（多角色子代理 CRUD，含 `:id/toggle`）
@@ -158,9 +159,18 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 ## CI/CD
 
-GitHub Actions 工作流（`.github/workflows/release-server.yml`）：
-1. `build-frontend`：Node.js 构建 → 上传 `frontend/dist/`
-2. `build-server`：下载前端 → `x86_64-unknown-linux-musl` 静态编译 → strip → 上传二进制
-3. `deploy`：SCP 二进制 + systemd 服务 + 配置到远程服务器 → SSH 重启服务
+GitHub Actions 工作流：
+
+- `release-server.yml`（手动触发）— 单 job：Node 构建前端 → `x86_64-unknown-linux-musl` 静态编译
+  （`--features rag,embed-frontend`）→ 从 `contrib/config.toml.template` 渲染配置（占位符替换后校验）
+  → SCP 二进制 + systemd 服务 + 配置 → SSH 重启服务
+- `release-client.yml`（tag `v*` / 手动）— 四平台矩阵构建客户端二进制，各 runner 直接 SCP 到
+  `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 在服务端生成 `SHA256SUMS` 并更新 `latest` 软链
+- `release-wiki-client.yml`（tag `wiki-v*` / 手动）— wiki 桌面端（Tauri 2）安装包：macOS
+  aarch64/x86_64 `.dmg` + Windows `.msi`/NSIS `.exe`，产物重命名为
+  `wiki-desktop-<os>-<arch>[-setup].<ext>` 后 SCP 到 `${DEPLOY_PATH}/wiki/<version>/`（版本目录名 =
+  tag 去掉 `wiki-` 前缀），`finalize-wiki` 生成校验和与 `latest` 软链。触发用独立 tag 前缀与
+  `release-client.yml` 解耦（Tauri 打包耗时远高于单文件二进制）
 
 部署使用 systemd（`contrib/rust-tunnel-server.service`），配置模板 `contrib/config.toml.template`。
+两个归档目录经 `client_dist_dir` / `wiki_dist_dir` 交给服务端只读，Web「下载」页分两个分区展示。

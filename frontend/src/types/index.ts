@@ -162,6 +162,8 @@ export interface ClientDownloadFile {
   size: number;
   /** 来自 `SHA256SUMS` 的校验和，缺失时为 null。 */
   sha256: string | null;
+  /** 小写扩展名（如 `dmg` / `msi` / `exe`），无扩展名时为 null。 */
+  format: string | null;
 }
 
 /** 一个版本目录（`<client_dist_dir>/<tag>/`）下的全部产物。 */

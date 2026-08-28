@@ -25,6 +25,8 @@ pub struct ServerConfigFile {
     pub db_path: Option<String>,
     /// 客户端二进制归档目录。
     pub client_dist_dir: Option<String>,
+    /// wiki 桌面端安装包归档目录。
+    pub wiki_dist_dir: Option<String>,
     /// 是否启用 Shadowsocks。
     pub ss_enabled: Option<bool>,
     /// Shadowsocks 监听端口。
