@@ -95,6 +95,17 @@ pub fn client_supports_edit(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_EDIT_CLIENT_VERSION)
 }
 
+/// 首个支持 `ClientMappingSummary` 的客户端版本。
+pub const MIN_MAPPING_SUMMARY_CLIENT_VERSION: (u64, u64, u64) = (0, 9, 0);
+
+/// 客户端版本是否支持 `ClientMappingSummary`；缺失/非法视为不支持（保守，
+/// 避免老客户端收到未知 bincode 变体断开控制连接）。
+pub fn client_supports_mapping_summary(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_MAPPING_SUMMARY_CLIENT_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

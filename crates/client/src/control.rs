@@ -7,10 +7,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use crate::log_buffer::LogBuffer;
 use crate::logs::{spawn_log_forwarder, ClientLogLayer};
+use crate::status::ClientStatus;
 use crate::{proxy, spawn::SpawnManager, ClientConfig};
 use rust_tunnel_common::{
-    connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, MeshServiceDef,
+    connect_tls_insecure, init_logging_with_layer, protocol::MappingSummary, ClientLogEntry, ControlMessage, MeshServiceDef,
     TunnelError, TunnelResult,
 };
 
@@ -56,11 +58,24 @@ pub struct ClientState {
     /// LLM 回环代理的 session_id → kill 信号发送端（AgentLlmProxyStop 触发，
     /// 释放回环监听端口）。重 spawn 时旧句柄先 send 再替换，自愈泄漏。
     llm_proxy_kills: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    /// 可选的状态广播通道（托盘/GUI 订阅）。
+    status_tx: Option<Arc<tokio::sync::watch::Sender<ClientStatus>>>,
+    /// 可选的本地环形日志缓冲（与 `ClientLogLayer` 双写）。
+    log_buffer: Option<Arc<LogBuffer>>,
+    /// 共享的可变状态（RTT/映射摘要/错误等），经 `watch` 广播。
+    status_inner: Arc<Mutex<ClientStatus>>,
 }
 
 impl ClientState {
-    fn new(config: ClientConfig, control_sender: ControlSender) -> Self {
+    pub(crate) fn new(config: ClientConfig, control_sender: ControlSender) -> Self {
+        let server = config.server.clone();
+        let client_name = config.name.clone().unwrap_or_default();
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let initial = ClientStatus::new(server, client_name, version);
         Self {
+            status_inner: Arc::new(Mutex::new(initial)),
+            status_tx: None,
+            log_buffer: None,
             config,
             control_sender,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -68,6 +83,81 @@ impl ClientState {
             spawn_manager: SpawnManager::new(),
             llm_proxy_pending: crate::llm_proxy::new_pending_map(),
             llm_proxy_kills: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 注入状态广播通道（托盘/GUI 订阅）。
+    #[must_use]
+    pub fn with_status_channel(
+        mut self,
+        tx: Arc<tokio::sync::watch::Sender<ClientStatus>>,
+    ) -> Self {
+        self.status_tx = Some(tx);
+        self
+    }
+
+    /// 注入本地环形日志缓冲。
+    #[must_use]
+    pub fn with_log_buffer(mut self, buffer: Arc<LogBuffer>) -> Self {
+        self.log_buffer = Some(buffer);
+        self
+    }
+
+    /// 快照当前状态。
+    #[must_use]
+    pub fn snapshot(&self) -> ClientStatus {
+        // Try to read without blocking async context; fallback to default if contended
+        self.status_inner.try_lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 更新 RTT 并广播。
+    pub fn set_rtt(&self, rtt_ms: f64) {
+        if let Ok(mut guard) = self.status_inner.try_lock() {
+            guard.rtt_ms = Some(rtt_ms);
+            let snap = guard.clone();
+            drop(guard);
+            if let Some(tx) = &self.status_tx {
+                let _ = tx.send(snap);
+            }
+        }
+    }
+
+    /// 更新映射摘要并广播。
+    pub fn set_mapping_summary(&self, summary: MappingSummary) {
+        if let Ok(mut guard) = self.status_inner.try_lock() {
+            guard.mapping_summary = Some(summary);
+            let snap = guard.clone();
+            drop(guard);
+            if let Some(tx) = &self.status_tx {
+                let _ = tx.send(snap);
+            }
+        }
+    }
+
+    /// 更新最近错误并广播。
+    pub fn set_last_error(&self, err: Option<String>) {
+        if let Ok(mut guard) = self.status_inner.try_lock() {
+            guard.last_error = err;
+            let snap = guard.clone();
+            drop(guard);
+            if let Some(tx) = &self.status_tx {
+                let _ = tx.send(snap);
+            }
+        }
+    }
+
+    /// 标记已连接并广播。
+    pub fn set_connected(&self, connected: bool) {
+        if let Ok(mut guard) = self.status_inner.try_lock() {
+            guard.connected = connected;
+            if connected && guard.connected_at.is_none() {
+                guard.connected_at = Some(std::time::SystemTime::now());
+            }
+            let snap = guard.clone();
+            drop(guard);
+            if let Some(tx) = &self.status_tx {
+                let _ = tx.send(snap);
+            }
         }
     }
 
@@ -248,6 +338,9 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         .wrapping_sub(ping_timestamp_micros);
                         let server_processing_time =
                             pong_timestamp_micros.wrapping_sub(ping_timestamp_micros);
+                        #[allow(clippy::cast_precision_loss, reason = "RTT micros fits in f64 mantissa for realistic values")]
+                        let rtt_ms = client_rtt_micros as f64 / 1000.0;
+                        state.set_rtt(rtt_ms);
                         debug!(
                             "Received heartbeat pong seq={} rtt={}us server_processing={}us",
                             seq, client_rtt_micros, server_processing_time
@@ -472,6 +565,10 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     } => {
                         debug!("Received mesh relay data");
                     }
+                    ControlMessage::ClientMappingSummary { summary } => {
+                        debug!("received mapping summary: {} rules", summary.rules.len());
+                        state.set_mapping_summary(summary);
+                    }
                     _ => {
                         warn!("Unexpected message from server: {:?}", msg);
                     }
@@ -494,12 +591,44 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
 ///
 /// # Errors
 ///
+/// 带可注入 `watch` 广播与日志缓冲的客户端入口，供 GUI 复用。
+///
+/// `status_tx` 为托盘/GUI 的 `watch` 广播端；`shared_log_buffer` 为 GUI 拉取的环形缓冲。
+/// 传 `None` 时回落到默认行为（与 [`run_client`] 一致）。
+///
+/// # Errors
 /// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
 #[allow(
     clippy::too_many_lines,
     reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分"
 )]
+pub async fn run_client_with_status(
+    config: ClientConfig,
+    status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
+    shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
+) -> TunnelResult<()> {
+    run_client_inner(config, status_tx, shared_log_buffer).await
+}
+
+/// 客户端主入口（无注入，默认行为）。
+///
+/// 建立控制通道、完成注册与消息循环。
+///
+/// # Errors
+/// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
 pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
+    run_client_inner(config, None, None).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分"
+)]
+async fn run_client_inner(
+    config: ClientConfig,
+    status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
+    shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
+) -> TunnelResult<()> {
     // Connect to server with or without TLS
     let (mut reader, mut writer): (
         Box<dyn AsyncRead + Unpin + Send>,
@@ -645,13 +774,19 @@ pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
         init_logging_with_layer(&config.log, stored.clone());
     }
 
+    // 本地环形缓冲（托盘/GUI 拉取），与远端上报双写
+    let log_buffer = shared_log_buffer.unwrap_or_else(|| std::sync::Arc::new(crate::log_buffer::LogBuffer::default()));
     if let Some(stored) = LOG_LAYER.get() {
         stored.set_sender(log_tx);
+        stored.set_log_buffer(log_buffer.clone());
         spawn_log_forwarder(log_rx, log_ctrl_sender);
     }
     // --- End log capture setup ---
 
-    let state = ClientState::new(config, sender.clone());
+    let mut state = ClientState::new(config, sender.clone()).with_log_buffer(log_buffer);
+    if let Some(tx) = status_tx {
+        state = state.with_status_channel(tx);
+    }
 
     // Start heartbeat task
     tokio::spawn(start_heartbeat(sender));

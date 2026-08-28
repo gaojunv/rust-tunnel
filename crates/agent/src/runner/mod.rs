@@ -33,8 +33,8 @@ pub(crate) use turn::{persist_message, record_tool_result, PersistMessageOpts};
 pub use turn::{run_agent_turn, runner_persist_summary, runner_usage_ctx};
 pub use version_gate::{
     client_supports_cancel, client_supports_edit, client_supports_git_exec,
-    client_supports_read_range, client_supports_shell_timeout, client_supports_terminal,
-    parse_version,
+    client_supports_mapping_summary, client_supports_read_range, client_supports_shell_timeout,
+    client_supports_terminal, parse_version, MIN_MAPPING_SUMMARY_CLIENT_VERSION,
 };
 pub(crate) use version_gate::{
     client_supports_search_patch, MIN_EDIT_CLIENT_VERSION, MIN_GIT_EXEC_CLIENT_VERSION,

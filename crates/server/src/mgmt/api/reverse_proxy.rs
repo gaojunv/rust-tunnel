@@ -162,6 +162,9 @@ pub async fn create_proxy_rule(
     // 反代规则变更可能影响 Trojan 共享/独立模式
     crate::trojan_runtime::sync_trojan_mode(&state.server_state).await;
 
+    // 增量推送映射摘要到受影响的客户端（若规则包含 client 后端）
+    crate::control_plane::server::push_mapping_summary_for_rule(&state.server_state, &rule).await;
+
     if cert_status.source == crate::reverse_proxy::CertSourceKind::PendingIssuance {
         if let Some(mgr) = state.server_state.proxy_state.cert_manager().cloned() {
             if rule.tls.as_ref().is_some_and(|t| t.acme) {
@@ -339,6 +342,14 @@ pub async fn update_proxy_rule(
     // 新旧端口 reconcile 都完成后，检查 Trojan 共享/独立模式是否需要切换
     crate::trojan_runtime::sync_trojan_mode(&state.server_state).await;
 
+    // 增量推送：覆盖新旧规则共同涉及的客户端（清理旧关联 + 更新新关联）
+    crate::control_plane::server::push_mapping_summary_for_rule_pair(
+        &state.server_state,
+        Some(&previous),
+        Some(&rule),
+    )
+    .await;
+
     if cert_status.source == crate::reverse_proxy::CertSourceKind::PendingIssuance {
         if let Some(mgr) = state.server_state.proxy_state.cert_manager().cloned() {
             if rule.tls.as_ref().is_some_and(|t| t.acme) {
@@ -404,6 +415,14 @@ pub async fn delete_proxy_rule(
 
     // 共享 listener 可能已删除/降级，检查 Trojan 是否需要回退独立监听
     crate::trojan_runtime::sync_trojan_mode(&state.server_state).await;
+
+    // 增量推送：被删规则曾关联的客户端需刷新摘要（可能变为空）
+    crate::control_plane::server::push_mapping_summary_for_rule_pair(
+        &state.server_state,
+        Some(&deleted),
+        None,
+    )
+    .await;
 
     Json(serde_json::json!({ "deleted": id })).into_response()
 }

@@ -6,10 +6,12 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+use crate::agent::runner::client_supports_mapping_summary;
 use crate::config::ServerConfig;
 use crate::control_plane::client_registry::TunnelOpenOutcome;
 use rust_tunnel_common::{
-    create_server_config, load_or_generate_cert, ControlMessage, TunnelError, TunnelResult,
+    create_server_config, load_or_generate_cert, BackendSummary, ControlMessage, MappingSummary,
+    RouteSummary, RuleSummary, TunnelError, TunnelResult,
 };
 
 use super::ServerState;
@@ -112,6 +114,16 @@ async fn handle_client_connection(
             }
         }
     });
+
+    // 首包映射摘要推送（仅对支持的客户端版本下发，避免老客户端收到未知变体断连）。
+    if client_supports_mapping_summary(entry.client_version.as_deref()) {
+        if let Some(summary) = build_mapping_summary(&state, &entry).await {
+            let _ = entry
+                .control_sender
+                .send(ControlMessage::ClientMappingSummary { summary })
+                .await;
+        }
+    }
 
     // 2. Reader loop: dispatch to registry active_connections / heartbeat / etc.
     let name_for_cleanup = entry.name.clone();
@@ -269,6 +281,213 @@ async fn handle_client_connection(
         .disconnect(&name_for_cleanup, "connection closed")
         .await;
     result
+}
+
+// ── 映射摘要推送 ─────────────────────────────────────────────────
+
+const MAX_CONTROL_MSG_BYTES: usize = 1024 * 1024;
+
+fn rule_references_client(
+    rule: &rust_tunnel_protocols::reverse_proxy::ProxyRule,
+    client_name: &str,
+) -> bool {
+    for route in &rule.routes {
+        for backend in &route.backends {
+            if backend.kind == rust_tunnel_protocols::reverse_proxy::BackendKind::Client
+                && backend.client_name.as_deref() == Some(client_name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn truncate_summary_for_limit(mut summary: MappingSummary) -> Option<MappingSummary> {
+    let Ok(bytes) =
+        bincode::serialize(&ControlMessage::ClientMappingSummary { summary: summary.clone() })
+    else {
+        return Some(summary);
+    };
+    if bytes.len() + 4 <= MAX_CONTROL_MSG_BYTES {
+        return Some(summary);
+    }
+    let original_len = summary.rules.len();
+    let mut lo = 0usize;
+    let mut hi = original_len;
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = usize::midpoint(lo, hi);
+        let mut probe = summary.clone();
+        probe.rules.truncate(mid);
+        probe.truncated = mid < original_len;
+        let Ok(b) = bincode::serialize(&ControlMessage::ClientMappingSummary { summary: probe })
+        else {
+            break;
+        };
+        if b.len() + 4 <= MAX_CONTROL_MSG_BYTES {
+            best = mid;
+            if mid == hi {
+                break;
+            }
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    summary.rules.truncate(best);
+    summary.truncated = true;
+    if let Ok(b) = bincode::serialize(&ControlMessage::ClientMappingSummary {
+        summary: summary.clone(),
+    }) {
+        if b.len() + 4 > MAX_CONTROL_MSG_BYTES {
+            return None;
+        }
+    }
+    Some(summary)
+}
+
+/// 构造映射摘要：过滤 `kind == Client && client_name == X` 的规则，拼 `RuleSummary`，
+/// 并填充 `connected_at`/`active_tunnels`/`rtt_ms`/`truncated`。
+#[allow(clippy::too_many_lines, reason = "映射摘要组装含规则过滤+摘要拼装+1MB截断，共享局部状态拆分反而降低可读性")]
+async fn build_mapping_summary(
+    state: &ServerState,
+    entry: &crate::control_plane::client_registry::ClientEntry,
+) -> Option<MappingSummary> {
+    let client_name = entry.name.as_str();
+    let rules_snapshot: Vec<rust_tunnel_protocols::reverse_proxy::ProxyRule> = {
+        let rules = state.proxy_state.rules.lock().await;
+        rules.values().cloned().collect()
+    };
+
+    let mut rule_summaries: Vec<RuleSummary> = Vec::new();
+    for rule in &rules_snapshot {
+        if !rule_references_client(rule, client_name) {
+            continue;
+        }
+        let route_summaries: Vec<RouteSummary> = rule
+            .routes
+            .iter()
+            .map(|r| RouteSummary {
+                path: r.path.clone(),
+                backends: r
+                    .backends
+                    .iter()
+                    .map(|b| BackendSummary {
+                        kind: match b.kind {
+                            rust_tunnel_protocols::reverse_proxy::BackendKind::Client => {
+                                "client".to_string()
+                            }
+                            rust_tunnel_protocols::reverse_proxy::BackendKind::Direct => {
+                                "direct".to_string()
+                            }
+                        },
+                        addr: b.addr.clone(),
+                        client_name: b.client_name.clone(),
+                        weight: b.weight,
+                    })
+                    .collect(),
+            })
+            .collect();
+        rule_summaries.push(RuleSummary {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            listen: rule.listen.clone(),
+            domains: rule.domains.clone(),
+            tls_enabled: rule.tls.as_ref().is_some_and(|t| t.enabled),
+            routes: route_summaries,
+        });
+    }
+
+    let connected_at = u64::try_from(entry.connected_at.timestamp_micros()).unwrap_or(0);
+    let active_tunnels = u32::try_from(entry.active_tunnel_count().await).unwrap_or(u32::MAX);
+
+    let summary = MappingSummary {
+        connected_at: Some(connected_at),
+        active_tunnels,
+        rtt_ms: None, // TODO: 从质量监控/心跳 stats 读取真实 RTT
+        rules: rule_summaries,
+        truncated: false,
+    };
+
+    truncate_summary_for_limit(summary)
+}
+
+/// 向单个在线客户端增量推送最新映射摘要（供反代规则变更后调用）。
+/// 内部做版本门控与 1MB 截断；客户端离线或不支持则静默返回 false。
+pub async fn push_mapping_summary_to_client(
+    state: &ServerState,
+    client_name: &str,
+) -> bool {
+    let Some(registry) = state.client_registry.as_ref() else {
+        return false;
+    };
+    let Some(entry) = registry.get(client_name).await else {
+        return false;
+    };
+    if !client_supports_mapping_summary(entry.client_version.as_deref()) {
+        return false;
+    }
+    let Some(summary) = build_mapping_summary(state, &entry).await else {
+        return false;
+    };
+    entry
+        .control_sender
+        .send(ControlMessage::ClientMappingSummary { summary })
+        .await
+        .is_ok()
+}
+
+/// 向所有受 `rule` 影响的客户端推送映射摘要（增量推送入口，规则保存/删除后调用）。
+/// 从 `rule` 的 routes 中提取所有 `kind == Client` 的 `client_name` 去重后逐个推送。
+pub async fn push_mapping_summary_for_rule(
+    state: &ServerState,
+    rule: &rust_tunnel_protocols::reverse_proxy::ProxyRule,
+) {
+    use std::collections::HashSet;
+    let mut affected: HashSet<String> = HashSet::new();
+    for route in &rule.routes {
+        for backend in &route.backends {
+            if backend.kind == rust_tunnel_protocols::reverse_proxy::BackendKind::Client {
+                if let Some(name) = backend.client_name.as_deref() {
+                    if !name.is_empty() {
+                        affected.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for name in affected {
+        let _ = push_mapping_summary_to_client(state, &name).await;
+    }
+}
+
+/// 向旧规则曾关联、但新规则不再关联的客户端也推送一次（用于更新/删除时清理其摘要）。
+pub async fn push_mapping_summary_for_rule_pair(
+    state: &ServerState,
+    old_rule: Option<&rust_tunnel_protocols::reverse_proxy::ProxyRule>,
+    new_rule: Option<&rust_tunnel_protocols::reverse_proxy::ProxyRule>,
+) {
+    use std::collections::HashSet;
+    let mut affected: HashSet<String> = HashSet::new();
+    for rule in old_rule.into_iter().chain(new_rule) {
+        for route in &rule.routes {
+            for backend in &route.backends {
+                if backend.kind == rust_tunnel_protocols::reverse_proxy::BackendKind::Client {
+                    if let Some(name) = backend.client_name.as_deref() {
+                        if !name.is_empty() {
+                            affected.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for name in affected {
+        let _ = push_mapping_summary_to_client(state, &name).await;
+    }
 }
 
 /// 启动控制面主服务（监听、TLS 握手与连接分发）。

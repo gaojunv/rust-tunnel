@@ -4,11 +4,8 @@ use std::io::IsTerminal;
 use std::time::Duration;
 
 use rust_tunnel_client::control;
-use rust_tunnel_client::ClientConfig;
-use rust_tunnel_common::{init_logging_with_level, TunnelError, TunnelResult};
-
-const INITIAL_BACKOFF_SECS: u64 = 1;
-const MAX_BACKOFF_SECS: u64 = 30;
+use rust_tunnel_client::{ClientConfig, ReconnectPolicy};
+use rust_tunnel_common::{init_logging_with_level, TunnelResult};
 
 fn wait_for_exit() {
     if std::io::stdout().is_terminal() {
@@ -49,31 +46,29 @@ async fn run() -> TunnelResult<()> {
         });
     }
 
-    let mut backoff_secs = INITIAL_BACKOFF_SECS;
+    let mut policy = ReconnectPolicy::new();
 
     loop {
         match control::run_client(config.clone()).await {
             Ok(()) => {
                 tracing::warn!("Control connection closed.");
-                // Connection was established successfully before dropping — reset backoff
-                backoff_secs = INITIAL_BACKOFF_SECS;
+                policy.reset();
             }
-            Err(TunnelError::ControlChannel(msg)) if msg.contains("register failed") => {
-                tracing::error!("registration rejected by server: {msg}");
+            Err(e) if !ReconnectPolicy::should_reconnect(&e) => {
+                tracing::error!("registration rejected by server: {e}");
+                eprintln!("register failed: {e}, exiting");
                 std::process::exit(2);
             }
             Err(e) => {
                 tracing::warn!("Connection error: {}.", e);
-                // Connection never established — backoff will keep doubling
             }
         }
 
+        let backoff_secs = policy.next_backoff();
         tracing::info!("Reconnecting in {}s... (Ctrl+C to quit)", backoff_secs);
 
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-            }
+            () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Received Ctrl+C. Exiting.");
                 return Ok(());

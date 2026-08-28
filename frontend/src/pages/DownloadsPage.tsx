@@ -27,6 +27,10 @@ import { formatBytes } from '@/utils/format';
 import { cn } from '@/lib/utils';
 import type { ClientDownloadFile, ClientDownloadVersion, ClientDownloadsResponse } from '@/types';
 
+function isGuiFile(name: string): boolean {
+  return name.includes("gui") || name.endsWith(".dmg");
+}
+
 /** 平台图标：Windows 与其他桌面端共用 MonitorSmartphone（lucide 无 Windows 图标）。 */
 function PlatformIcon({ os, className }: { os: string; className?: string }) {
   if (os === 'macos') return <Apple className={className} />;
@@ -146,10 +150,41 @@ function VersionCard({
         </div>
         {modified && <span className="text-xs text-muted-foreground">{modified}</span>}
       </CardHeader>
-      <CardContent className="space-y-2">
-        {version.files.map((file) => (
-          <FileRow key={file.name} version={version.version} file={file} downloadUrl={downloadUrl} />
-        ))}
+      <CardContent className="space-y-3">
+        {(() => {
+          const cli = version.files.filter((f) => !isGuiFile(f.name));
+          const gui = version.files.filter((f) => isGuiFile(f.name));
+          return (
+            <>
+              {cli.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-xs font-medium text-muted-foreground">CLI</div>
+                  {cli.map((file) => (
+                    <FileRow
+                      key={file.name}
+                      version={version.version}
+                      file={file}
+                      downloadUrl={downloadUrl}
+                    />
+                  ))}
+                </div>
+              )}
+              {gui.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-xs font-medium text-muted-foreground">GUI / Desktop</div>
+                  {gui.map((file) => (
+                    <FileRow
+                      key={file.name}
+                      version={version.version}
+                      file={file}
+                      downloadUrl={downloadUrl}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          );
+        })()}
       </CardContent>
     </Card>
   );

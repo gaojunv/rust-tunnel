@@ -3,8 +3,8 @@ use figment::{
     providers::{Format, Toml},
     Figment,
 };
-use serde::Deserialize;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Client endpoint for rust-tunnel intranet penetration tool
 #[derive(Parser, Debug, Clone)]
@@ -67,7 +67,7 @@ pub struct ClientCli {
 }
 
 /// 从 TOML 配置文件解析的客户端配置（全部字段可选，未填则回落至默认值/环境变量/CLI）。
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ClientConfigFile {
     /// 服务端地址（`host:port`）
     pub server: Option<String>,
@@ -301,6 +301,76 @@ impl ClientConfig {
 
         Ok(config)
     }
+
+    /// 转换为可序列化的文件配置。
+    #[must_use]
+    pub fn to_file_config(&self) -> ClientConfigFile {
+        ClientConfigFile {
+            server: Some(self.server.clone()),
+            name: self.name.clone(),
+            password: Some(self.password.clone()),
+            tls: Some(self.tls),
+            tls_server_name: self.tls_server_name.clone(),
+            tls_insecure: Some(self.tls_insecure),
+            mesh: self.mesh.clone(),
+            mesh_name: self.mesh_name.clone(),
+            mesh_services: Some(self.mesh_services.clone()),
+            enable_agent: Some(self.enable_agent),
+            agent_pty_port: Some(self.agent_pty_port),
+            log: Some(self.log.clone()),
+        }
+    }
+
+    /// 原子写入 TOML 配置（临时文件 + rename，避免崩溃写半截）。
+    ///
+    /// # Errors
+    /// 当序列化或文件写入失败时返回 `Err`。
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        let file_cfg = self.to_file_config();
+        let toml_str = toml::to_string_pretty(&file_cfg)
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create config dir: {e}"))?;
+            }
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, toml_str).map_err(|e| format!("Failed to write config: {e}"))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("Failed to rename config: {e}"))?;
+        Ok(())
+    }
+}
+
+/// 平台相关的默认配置文件路径：
+///
+/// - macOS: `~/Library/Application Support/rust-tunnel/client.toml`
+/// - Windows: `%APPDATA%\rust-tunnel\client.toml`
+/// - Linux: `$XDG_CONFIG_HOME/rust-tunnel/client.toml` 或 `~/.config/rust-tunnel/client.toml`
+#[must_use]
+pub fn default_config_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join("Library/Application Support/rust-tunnel/client.toml");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("rust-tunnel/client.toml");
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("rust-tunnel/client.toml");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".config/rust-tunnel/client.toml");
+    }
+    PathBuf::from("client.toml")
 }
 
 #[cfg(test)]

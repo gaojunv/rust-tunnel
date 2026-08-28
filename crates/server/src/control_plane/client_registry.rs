@@ -86,6 +86,13 @@ pub struct ClientEntry {
     pub agent_pending: Mutex<HashMap<String, oneshot::Sender<rust_tunnel_common::AgentResult>>>,
 }
 
+impl ClientEntry {
+    /// 返回活跃隧道数快照（只读，供映射摘要等展示用途）。
+    pub async fn active_tunnel_count(&self) -> usize {
+        self.active_connections.lock().await.len()
+    }
+}
+
 /// 在线客户端全局注册表，按名称索引。`Clone` 后内部状态 `Arc` 共享。
 #[derive(Clone)]
 pub struct ClientRegistry {

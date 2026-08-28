@@ -1,0 +1,36 @@
+[package]
+name = "rust-tunnel-client-gui"
+version = "0.8.0"
+edition = "2021"
+description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rust-tunnel-client-gui"
+path = "src/main.rs"
+
+[dependencies]
+rust-tunnel-client = { path = "../client" }
+rust-tunnel-common = { path = "../common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+directories = "5.0"
+keyring = "3"
+auto-launch = "0.5"
+notify-rust = { version = "4" }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.31"
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
+tray-icon = { version = "0.19" }
+muda = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="rtg" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="0.55" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+    <radialGradient id="rtglow" cx="0.5" cy="0.35" r="0.9">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="0.6" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rttail" x1="5" y1="27.5" x2="20" y2="24.5" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.95"/>
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="12" fill="url(#rtg)"/>
+  <rect width="48" height="48" rx="12" fill="url(#rtglow)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round">
+    <circle cx="27.5" cy="24" r="11" opacity="0.4"/>
+    <circle cx="27.5" cy="24" r="6.5" opacity="0.75"/>
+  </g>
+  <circle cx="27.5" cy="24" r="2.6" fill="#ffffff"/>
+  <path d="M5 27.5 Q 12 25.5 19 24.6" fill="none" stroke="url(#rttail)" stroke-width="2.6" stroke-linecap="round"/>
+  <circle cx="19.4" cy="24.5" r="1.8" fill="#ffffff"/>
+</svg>

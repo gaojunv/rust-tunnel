@@ -92,8 +92,105 @@ jobs:
             "${SSH_USER}@${SSH_HOST}:${DEST}/${{ matrix.asset }}"
           rm -f "${KEY}"
 
+  build-gui:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: rust-tunnel-client-gui
+            asset: rust-tunnel-client-gui-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rust-tunnel-client-gui.exe
+            asset: rust-tunnel-client-gui-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev librsvg2-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev pkg-config
+      - name: Build GUI
+        run: cargo build --release -p rust-tunnel-client-gui --target ${{ matrix.target }}
+      - name: Upload GUI to remote
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ secrets.SERVER_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.ssh"
+          KEY="${HOME}/.ssh/rt_deploy_key"
+          printf '%s\n' "${SSH_KEY}" > "${KEY}"
+          chmod 600 "${KEY}"
+          PORT="${SSH_PORT:-22}"
+          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
+          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
+          scp "${SSH_OPTS[@]}" -P "${PORT}" "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${SSH_USER}@${SSH_HOST}:${DEST}/${{ matrix.asset }}"
+          rm -f "${KEY}"
+
+  build-gui-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+      - name: Build universal2 binary
+        run: |
+          cargo build --release -p rust-tunnel-client-gui --target aarch64-apple-darwin
+          cargo build --release -p rust-tunnel-client-gui --target x86_64-apple-darwin
+          mkdir -p target/universal2
+          lipo -create target/aarch64-apple-darwin/release/rust-tunnel-client-gui target/x86_64-apple-darwin/release/rust-tunnel-client-gui -output target/universal2/rust-tunnel-client-gui
+      - name: Bundle .app and dmg
+        env:
+          VERSION: ${{ github.ref_name }}
+          GUI_BIN: target/universal2/rust-tunnel-client-gui
+        run: |
+          bash scripts/bundle-macos.sh
+          ls -lh dist/
+      - name: Upload dmg
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ secrets.SERVER_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.ssh"
+          KEY="${HOME}/.ssh/rt_deploy_key"
+          printf '%s\n' "${SSH_KEY}" > "${KEY}"
+          chmod 600 "${KEY}"
+          PORT="${SSH_PORT:-22}"
+          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
+          DMG="dist/RustTunnel-${GITHUB_REF_NAME}-macos-universal2.dmg"
+          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
+          scp "${SSH_OPTS[@]}" -P "${PORT}" "$DMG" "${SSH_USER}@${SSH_HOST}:${DEST}/"
+          rm -f "${KEY}"
+
   finalize-client:
-    needs: build-client
+    needs: [build-client, build-gui, build-gui-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Checksum, permissions and latest symlink
@@ -108,8 +205,8 @@ jobs:
             BASE="${{ secrets.DEPLOY_PATH }}/client"
             TAG="${{ github.ref_name }}"
             cd "${BASE}/${TAG}"
-            chmod +x rust-tunnel-client-*
-            sha256sum rust-tunnel-client-* > SHA256SUMS
+            chmod +x rust-tunnel-client-* RustTunnel-*.dmg 2>/dev/null || true
+            sha256sum rust-tunnel-client-* RustTunnel-*.dmg 2>/dev/null > SHA256SUMS || sha256sum rust-tunnel-client-* > SHA256SUMS
             echo "--- ${BASE}/${TAG} ---"
             ls -lh
             echo "--- SHA256SUMS ---"

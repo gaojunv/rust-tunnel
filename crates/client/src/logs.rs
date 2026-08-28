@@ -20,6 +20,8 @@ const LOG_FLUSH_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_se
 #[derive(Clone)]
 pub struct ClientLogLayer {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<ClientLogEntry>>>>,
+    /// 可选的本地环形缓冲，双写供 GUI 拉取最近日志。
+    log_buffer: Arc<Mutex<Option<std::sync::Arc<crate::log_buffer::LogBuffer>>>>,
 }
 
 impl ClientLogLayer {
@@ -29,6 +31,14 @@ impl ClientLogLayer {
     pub fn new() -> Self {
         Self {
             tx: Arc::new(Mutex::new(None)),
+            log_buffer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 注入本地环形缓冲（与 `set_sender` 独立，可热替换）。
+    pub fn set_log_buffer(&self, buffer: std::sync::Arc<crate::log_buffer::LogBuffer>) {
+        if let Ok(mut guard) = self.log_buffer.lock() {
+            *guard = Some(buffer);
         }
     }
 
@@ -105,6 +115,12 @@ where
             message: visitor.message,
         };
 
+        // 双写：本地环形缓冲（GUI 拉取）+ 远端批量上报
+        if let Ok(guard) = self.log_buffer.lock() {
+            if let Some(ref buf) = *guard {
+                buf.push(entry.clone());
+            }
+        }
         if let Ok(guard) = self.tx.lock() {
             if let Some(ref tx) = *guard {
                 let _ = tx.send(entry);

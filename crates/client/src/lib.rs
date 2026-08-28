@@ -20,4 +20,14 @@ pub mod pty;
 /// 长生命周期进程管理：spawn/stdin/stdout 桥接
 pub mod spawn;
 
+/// 本地环形日志缓冲（托盘/GUI 拉取最近日志）
+pub mod log_buffer;
+/// 重连策略（指数退避与可重连判定，供 CLI/GUI 复用）
+pub mod reconnect;
+/// 客户端运行状态快照（托盘/GUI 展示）
+pub mod status;
+
 pub use config::*;
+pub use log_buffer::{LogBuffer, LogBuffer as ClientLogBuffer};
+pub use reconnect::ReconnectPolicy;
+pub use status::ClientStatus;

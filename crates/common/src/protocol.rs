@@ -447,6 +447,65 @@ pub enum ControlMessage {
         /// 归属会话 ID。
         session_id: String,
     },
+    /// 客户端上报的映射摘要（用于桌面托盘/状态展示）。
+    ClientMappingSummary {
+        /// 映射摘要。
+        summary: MappingSummary,
+    },
+}
+
+/// 客户端映射摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MappingSummary {
+    /// 连接建立时间（微秒，自 epoch）。
+    pub connected_at: Option<u64>,
+    /// 活跃隧道数。
+    pub active_tunnels: u32,
+    /// RTT（毫秒）。
+    pub rtt_ms: Option<f64>,
+    /// 规则摘要列表。
+    pub rules: Vec<RuleSummary>,
+    /// 是否因 1MB 上限被截断。
+    pub truncated: bool,
+}
+
+/// 规则摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuleSummary {
+    /// 规则 ID。
+    pub id: String,
+    /// 规则名称。
+    pub name: String,
+    /// 监听地址。
+    pub listen: String,
+    /// 域名列表。
+    pub domains: Vec<String>,
+    /// 是否启用 TLS。
+    pub tls_enabled: bool,
+    /// 路由摘要列表。
+    pub routes: Vec<RouteSummary>,
+}
+
+/// 路由摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteSummary {
+    /// 路径。
+    pub path: String,
+    /// 后端摘要列表。
+    pub backends: Vec<BackendSummary>,
+}
+
+/// 后端摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendSummary {
+    /// 后端类型。
+    pub kind: String,
+    /// 后端地址。
+    pub addr: String,
+    /// 关联客户端名称。
+    pub client_name: Option<String>,
+    /// 权重。
+    pub weight: u32,
 }
 
 impl ControlMessage {

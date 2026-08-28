@@ -30,6 +30,7 @@ impl IndexKind {
     }
 
     /// 从 DB 字符串解析，大小写敏感。
+    #[allow(clippy::should_implement_trait, reason = "返回 Option 而非 Result，不符合 FromStr 签名")]
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
