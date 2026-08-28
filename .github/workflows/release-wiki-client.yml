@@ -79,9 +79,7 @@ jobs:
         uses: actions/checkout@v4
 
       # 前端产物必须先于 Rust 构建存在（tauri.conf.json 的 frontendDist 指向
-      # ../../wiki-desktop-ui/dist）。先显式构建前端，再让 tauri build 跳过
-      # beforeBuildCommand（避免 CI 上因 working-directory 导致相对路径解析失败
-      # 的 `ENOENT wiki-desktop-ui/package.json`）。
+      # ../../wiki-desktop-ui/dist）。实际构建由 beforeBuildCommand 触发，这里只装依赖。
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -89,11 +87,8 @@ jobs:
           cache: npm
           cache-dependency-path: wiki-desktop-ui/package-lock.json
 
-      - name: Build desktop UI
-        run: |
-          npm ci --prefix wiki-desktop-ui
-          npm run build --prefix wiki-desktop-ui
-          ls -lh wiki-desktop-ui/dist
+      - name: Install UI dependencies
+        run: npm ci --prefix wiki-desktop-ui
 
       - name: Install Rust with target
         uses: dtolnay/rust-toolchain@stable
@@ -113,9 +108,7 @@ jobs:
 
       # tauri feature 默认关闭（门控整条 Tauri 依赖链，让无 GUI 系统库的机器也能
       # cargo test），打包时必须显式 -f tauri。cwd 必须是 tauri.conf.json 所在目录，
-      # 其 beforeBuildCommand 的相对路径（../../wiki-desktop-ui）以此为基准，
-      # 但 CI 上由上一节点已预构建前端，此处用 --no-bundle 前先让 Rust 编译通过，
-      # 真正的 bundle 阶段 tauri 会复用 dist（见下方说明）。
+      # 其 beforeBuildCommand 的相对路径（../../wiki-desktop-ui）以此为基准。
       #
       # --bundles 在 Tauri CLI 的签名是 [<BUNDLES>...]（重复参数），不是逗号列表，
       # 必须展开为 -b <one> -b <other>，否则 `msi,nsis` 或 `msi nsis` 都会被当成
@@ -125,10 +118,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 前端已预构建，Tauri 的 beforeBuildCommand 在不同 runner 的 cwd 下会因
-          # 相对路径解析失败（ENOENT），因此用 -c 合并一个空 beforeBuildCommand 覆盖掉
-          # tauri.conf.json 的 "npm run build --prefix ../../wiki-desktop-ui"。
-          override='{"build":{"beforeBuildCommand":""}}'
           bundles="${{ matrix.bundles }}"
           IFS=',' read -ra parts <<< "$bundles"
           bundle_args=()
@@ -137,7 +126,7 @@ jobs:
             [ -n "$b" ] && bundle_args+=(-b "$b")
           done
           echo "Bundles: ${bundle_args[*]:-<none>}"
-          tauri build --ci -c "$override" -f tauri -t ${{ matrix.target }} "${bundle_args[@]}"
+          tauri build --ci -f tauri -t ${{ matrix.target }} "${bundle_args[@]}"
 
       # Tauri 产物名形如 `Wiki Desktop_0.4.0_aarch64.dmg`（含空格与版本号）。空格不在
       # 服务端 is_safe_segment 的放行字符集内，会被下载页过滤掉，故统一重命名为

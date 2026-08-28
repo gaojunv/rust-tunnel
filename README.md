@@ -1,314 +1,255 @@
 # Rust Tunnel
 
-一个基于 Rust 的内网穿透工具，采用客户端-服务器架构，配有 React/TypeScript 前端管理界面。支持 TLS 加密、Shadowsocks 代理和实时连接质量监控。
+基于 Rust 的客户端-服务器内网穿透与边缘代理平台，配有 React/TypeScript 管理界面。服务器运行在公网，通过加密控制通道将流量转发到内网客户端；同时内置 Shadowsocks / Trojan 代理、反向代理（含直连与隧道两类后端）、嵌入式 DNS / Mesh 服务发现、ACME 自动证书、SQLite 持久化、实时可观测性，以及 LLM 网关（含 RAG 知识库）与 AI Agent 工作台（ACP 为主路径，隧道内工具执行）。
 
 ## 功能特性
 
-- 支持多个端口转发
-- 基于 Tokio 的异步 IO
-- TLS 加密控制通道（默认开启，自动生成自签名证书）
-- 内置 Shadowsocks 代理服务器（AES-256-GCM / ChaCha20-Poly1305）
-- 实时连接质量监控（RTT、丢包率、质量评分）
-- 心跳检测保持连接
-- 简洁的协议设计
-- Web 管理界面（支持连接监控、流量统计、客户端管理、质量监控、Shadowsocks 管理）
-- JWT 身份认证（可选）
-- 客户端认证令牌（可选）
-- 实时流量图表
-- 支持客户端断开后自动重连
-- TOML 配置文件支持
-- 环境变量配置支持
-- SQLite 数据持久化（流量统计、质量历史、Shadowsocks 配置）
+- **内网穿透**：加密控制通道（TLS 默认开启，自签名 Ed25519）、客户端注册与隧道复用（`ClientConnector → ClientRegistry.open_tunnel → ClientTunnelStream`）
+- **反向代理**：规则化路由，`Direct` 直连 / `Client` 隧道两类后端，统一 `Connector` 抽象，支持 TCP/HTTP 与 SNI 分发
+- **代理协议**：内置 Shadowsocks（`shadowsocks-rust`，AES-256-GCM / ChaCha20-Poly1305）与 Trojan（TLS 必需，SHA-224 认证，回退伪装）
+- **网络基建**：嵌入式 DNS 权威（`*.tunnel.local` / `*.mesh.local`）、Mesh 服务发现、PKI/ACME 自动续签、API TLS
+- **可观测性**：心跳 RTT/丢包/吞吐、质量评分 0–100 与告警阈值；流量分钟级分桶（保留 24h）+ 聚合统计；结构化日志（tracing Layer → 内存 + SQLite，分页/过滤/SSE）
+- **LLM 网关**：OpenAI / Anthropic / Responses 三协议入口（`POST /v1/chat/completions` 与 `POST /v1/responses`），provider / model / api-key / 用量管理，compat 工具调用改写，上游 `responses` 协议按模型 `extra_config` 声明
+- **统一知识容器**：多格式提取（PDF/Word/Excel/PPT→Markdown）→ Markdown 分块 → 远端 embedding → qdrant-edge 向量 + 页面图谱双索引；后台摄入、重建、检索预览与跨源搜索
+- **AI Agent 工作台**：WebSocket 回合流，ACP 主路径（`AgentSpawn`/`AgentLlmProxy` 经控制通道在客户端 spawn 进程、stdio pump、idle reaper）+ runner 回退路径；隧道内工具执行（shell/read/write/patch/list/search/git/code_outline/read_symbol/task 等）、审批矩阵、多角色子代理、会话压缩与标题生成
+- **管理面**：Axum + `rust-embed` 嵌入前端，JWT 认证，产物归档下载（client / wiki-desktop）
+- **桌面端**：`crates/client-gui` 托盘客户端（winit + tray-icon + eframe/egui，四 Tab：连接/日志/设置/关于）
+- **Wiki 桌面**：Tauri 2 打包（`wiki-desktop-ui` + `wiki-core`/`wiki-serve`），Markdown + 全文检索 + 图谱
+
+## 架构
+
+### Cargo Workspace
+
+根元包 `rust-tunnel` 仅托管 `tests/` e2e 测试，无实现代码；实现分布在 13 个 crate：
+
+| crate | 说明 |
+|---|---|
+| `crates/common` | 协议/TLS/错误/日志/mesh + `DEFAULT_PTY_PORT` |
+| `crates/client` | 客户端 lib + bin（控制通道、隧道 shuttle、配置） |
+| `crates/client-gui` | 桌面托盘客户端（winit/tray-icon/eframe） |
+| `crates/server` | 服务端装配（control_plane/protocols/persistence/mgmt/llm/pki/net/agent/config） |
+| `crates/agent` | Agent 领域（runner/tools/executor/approval/session/title/compact/sse/spawner/acp_bridge/acp_events/llm_bridge/roles） |
+| `crates/llm` | LLM 网关（openai/anthropic/responses 适配、provider/model/key、用量、model_groups） |
+| `crates/rag` | RAG 知识库（extractor/chunker/embedder/store/retriever/ingest） |
+| `crates/persistence` | SQLite 访问层 |
+| `crates/pki` | 证书与 ACME |
+| `crates/protocols` | SS/Trojan/反向代理协议实现 |
+| `crates/stats` | 统计收集与持久化 |
+| `crates/wiki-core` / `wiki-serve` | Wiki 核心与服务 |
+
+依赖单向：`common ← client`、`common ← server`，`rag` 为非默认 feature（门控 qdrant-edge 与向量索引侧）。
+
+### 核心数据流
+
+1. 客户端经 TLS 控制通道向服务端 `Register{protocol_version:2, name, password, version}` 注册
+2. 管道路由由 Web 管理的反向代理规则定义（`kind=Direct` 直连外部，`kind=Client` 经隧道到内网）
+3. `ClientConnector → ClientRegistry.open_tunnel → ClientTunnelStream` 在控制通道上搭建 `AsyncRead/Write` 流
+4. 反向代理的 TCP/HTTP handler 经 `Connector` trait 统一调用，无需关心后端类型
 
 ## 安装 Rust
-
-如果你还没有安装 Rust，可以通过以下方式安装：
 
 **macOS / Linux:**
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-安装完成后需要重新加载终端环境：
-```bash
 source $HOME/.cargo/env
 ```
+**Windows:** 下载并运行 [rustup-init.exe](https://rustup.rs/)
 
-**Windows:**
-下载并运行 [rustup-init.exe](https://rustup.rs/)
+前端需 Node.js（建议经 nvm 安装）。
 
-## 编译项目
+## 编译
 
 ```bash
-cargo build --release
+cargo build                      # 调试构建（默认不含 qdrant-edge）
+cargo build -p rust-tunnel-server --features rag              # 含 RAG 的完整构建
+cargo build -p rust-tunnel-server --features rag,embed-frontend  # 含前端嵌入（发布形态）
+cargo check
+cargo clippy -p rust-tunnel-server
 ```
 
-编译完成后，可执行文件位于 `target/release/` 目录：
-- `rust-tunnel-server` - 服务器端
-- `rust-tunnel-client` - 客户端
+前端嵌入产物由 `frontend-dist/`（gitignored）经 `rust-embed` 打入二进制：
+
+```bash
+cd frontend && npm install && npm run build
+rm -rf ../frontend-dist && cp -r dist ../frontend-dist
+```
 
 ## 使用方法
 
-### 服务器端
-
-在具有公网 IP 的服务器上运行：
+### 服务端
 
 ```bash
-# 基本用法（TLS 默认开启）
-./rust-tunnel-server --bind 0.0.0.0:8080
+# 基本（TLS 默认开启，自签名证书自动生成）
+cargo run -p rust-tunnel-server --features rag -- --bind 0.0.0.0:8080
 
-# 禁用 TLS
-./rust-tunnel-server --bind 0.0.0.0:8080 --tls false
+# 指定配置与端口
+./rust-tunnel-server --config /path/to/config.toml --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000
 
-# 启用 Shadowsocks 代理
-./rust-tunnel-server --bind 0.0.0.0:8080 --ss-enabled true --ss-port 8388 --ss-cipher aes-256-gcm --ss-password mypassword
-
-# 使用配置文件
-./rust-tunnel-server --config /path/to/config.toml
+# 启用 Shadowsocks / Trojan / DNS / 反向代理 / ACME（亦可在 Web 界面或 TOML 中配置）
+./rust-tunnel-server --ss-enabled true --ss-port 8388 --ss-cipher aes-256-gcm --ss-password <pwd> \
+  --trojan-enabled true --trojan-port 443 --trojan-password <pwd> --trojan-fallback 127.0.0.1:80 \
+  --dns-enabled true --dns-bind 0.0.0.0:53
 ```
 
-参数说明：
-- `--config <PATH>` - TOML 配置文件路径
-- `--bind <ADDR>` - 控制连接监听地址 (默认: 0.0.0.0:8080)
-- `--api-bind <ADDR>` - API/前端管理界面监听地址 (默认: 0.0.0.0:3000)
-- `--admin-password <PASSWORD>` - Web UI 管理员密码（可选，启用认证）
-- `--jwt-secret <SECRET>` - JWT 签名密钥（可选，未指定时自动生成）
-- `--client-auth-token <TOKEN>` - 客户端认证令牌（可选，设置后客户端必须提供此令牌才能注册）
-- `--tls <BOOL>` - 启用 TLS 加密控制通道 (默认: true)
-- `--tls-cert <PATH>` - TLS 证书文件路径 (默认: `./data/tls/cert.pem`)
-- `--tls-key <PATH>` - TLS 私钥文件路径 (默认: `./data/tls/key.pem`)
-- `--db-path <PATH>` - SQLite 数据库路径 (默认: `./data/rust-tunnel.db`)
-- `--ss-enabled <BOOL>` - 启用 Shadowsocks 代理 (默认: false)
-- `--ss-port <PORT>` - Shadowsocks 监听端口（启用 SS 时必填）
-- `--ss-cipher <CIPHER>` - Shadowsocks 加密方式 (aes-256-gcm, chacha20-ietf-poly1305；启用 SS 时必填)
-- `--ss-password <PASSWORD>` - Shadowsocks 密码（启用 SS 时必填）
-- `--log <LEVEL>` - 日志级别 (trace/debug/info/warn/error)
+常用参数（完整见 `--help`）：
+
+- `--config <PATH>` — TOML 配置文件
+- `--bind <ADDR>` — 控制通道监听（默认 `0.0.0.0:8080`）
+- `--api-bind <ADDR>` — API/Web 监听（默认 `0.0.0.0:3000`）
+- `--admin-password <PWD>` / `--jwt-secret <SECRET>` / `--client-auth-token <TOKEN>`
+- `--tls / --tls-cert / --tls-key` — 控制通道 TLS（默认开启，缺省自动生成 `data/tls/*`）
+- `--db-path <PATH>` — SQLite 路径（默认 `./data/rust-tunnel.db`，WAL 模式）
+- `--client-dist-dir / --wiki-dist-dir` — 归档只读目录（CI 落盘，Web 下载页消费）
+- `--ss-enabled / --ss-port / --ss-cipher / --ss-password`
+- `--trojan-enabled / --trojan-port / --trojan-password / --trojan-fallback`
+- `--dns-enabled / --dns-bind / --dns-tunnel-domain / --dns-mesh-domain`
+- `--reverse-proxy-enabled / --reverse-proxy-max-connections / --reverse-proxy-connection-timeout / --reverse-proxy-buffer-size`
+- `--api-tls / --api-domain`
+- `--acme-enabled / --acme-server-url / --acme-cert-dir / --acme-auto-renew / --acme-renewal-check-interval / --acme-renewal-days-before-expiry / --acme-email / --acme-tos-agreed`
+- `--log <LEVEL>` — trace/debug/info/warn/error
+
+> 产物形态以 `contrib/config.toml.template` 为部署模板（占位符在 CI 中渲染后校验，见 [CI/CD](#cicd)）。
 
 ### 客户端
 
-在内网主机上运行：
+客户端已收敛为零配置范式，不再使用 `--forward`；转发由服务端的反向代理规则定义，客户端仅需注册与隧道承载。
 
 ```bash
-# 基本用法（TLS 默认开启，自动接受自签名证书）
-./rust-tunnel-client --server <SERVER_ADDR>:8080 --forward 8080:localhost:80
+# 基本
+cargo run -p rust-tunnel-client -- --server example.com:8080 --password <client_token> --name home-nas
 
-# 禁用 TLS
-./rust-tunnel-client --server <SERVER_ADDR>:8080 --forward 8080:localhost:80 --tls false
+# TLS 控制（默认开启，TOFU 接受自签名）
+./rust-tunnel-client --server example.com:8080 --password <token> --tls true --tls-insecure true
 
-# 使用认证令牌
-./rust-tunnel-client --server <SERVER_ADDR>:8080 --forward 8080:localhost:80 --auth-token my-token
+# Mesh 与 Agent 执行器
+./rust-tunnel-client --server example.com:8080 --password <token> --mesh home --mesh-name nas \
+  --mesh-service db:mysql:localhost:3306 --enable-agent --agent-pty-port 45631
 
-# 使用配置文件
-./rust-tunnel-client --config /path/to/config.toml
+# 配置文件
+./rust-tunnel-client --config /path/to/client.toml
 ```
 
-参数说明：
-- `--config <PATH>` - TOML 配置文件路径
-- `--server <ADDR>` - 服务器地址 (例如: 123.123.123.123:8080)
-- `--forward <REMOTE_PORT>:<LOCAL_HOST>:<LOCAL_PORT>` - 端口转发规则
-  - 可以指定多个 `--forward` 参数转发多个端口
-  - 支持 IPv6 地址
-- `--auth-token <TOKEN>` - 认证令牌（服务器启用客户端认证时必填）
-- `--tls <BOOL>` - 启用 TLS 加密 (默认: true)
-- `--tls-server-name <NAME>` - TLS SNI 服务器名称 (默认: 从服务器地址提取主机名)
-- `--tls-insecure <BOOL>` - 接受自签名证书/TOFU 模式 (默认: true)
-- `--log <LEVEL>` - 日志级别 (默认: info)
+参数：`--server <host:port>`（必填）、`--password <token>`（必填）、`--name <name>`（默认 hostname）、`--tls`/`--tls-server-name`/`--tls-insecure`、`--mesh`/`--mesh-name`/`--mesh-service`（可重复）、`--enable-agent`/`--agent-pty-port`、`--log`、`--config`。
 
-### 配置文件
+`client.toml` 示例见 [`config/client.example.toml`](config/client.example.toml)。
 
-服务器和客户端都支持 TOML 配置文件：
-
-**服务器配置示例 (`server.toml`):**
-```toml
-control_addr = "0.0.0.0:8080"
-api_addr = "0.0.0.0:3000"
-admin_password = "admin123"
-client_auth_token = "client-secret"
-tls = true
-tls_cert = "./data/tls/cert.pem"
-tls_key = "./data/tls/key.pem"
-db_path = "./data/rust-tunnel.db"
-log = "info"
-ss_enabled = true
-ss_port = 8388
-ss_cipher = "aes-256-gcm"
-ss_password = "shadowsocks-password"
-```
-
-**客户端配置示例 (`client.toml`):**
-```toml
-server = "example.com:8080"
-forwards = ["8080:localhost:80", "9000:127.0.0.1:3000"]
-auth_token = "client-secret"
-tls = true
-tls_server_name = "tunnel.example.com"
-tls_insecure = true
-log = "info"
-```
-
-配置优先级（从高到低）：命令行参数 > 环境变量 > 配置文件 > 默认值
-
-### 环境变量
-
-所有配置项都可以通过环境变量设置：
-
-**服务器环境变量：** `CONTROL_ADDR`, `API_BIND`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CLIENT_AUTH_TOKEN`, `TLS`, `TLS_CERT`, `TLS_KEY`, `LOG_LEVEL`, `DB_PATH`, `SS_ENABLED`, `SS_PORT`, `SS_CIPHER`, `SS_PASSWORD`
-
-**客户端环境变量：** `SERVER_ADDR`, `FORWARDS`（逗号分隔）, `AUTH_TOKEN`, `TLS`, `TLS_SERVER_NAME`, `TLS_INSECURE`, `LOG_LEVEL`
-
-### 示例
-
-将内网主机的 80 端口暴露到服务器的 8080 端口：
-
-**服务器：**
-```bash
-./rust-tunnel-server --bind 0.0.0.0:8080
-```
-
-**客户端：**
-```bash
-./rust-tunnel-client --server 你的服务器IP:8080 --forward 8080:localhost:80
-```
-
-然后就可以通过 `http://你的服务器IP:8080` 访问到内网主机 80 端口上的服务了。
-
-> **注意**：`--bind` 指定的是**控制端口**（用于客户端和服务器之间的通信），`--forward` 第一个参数是**远程端口**（用于公网用户访问）。这两个端口**必须不同**，因为它们需要分别绑定。例如，不要让控制端口和远程端口都用 8080。
-
-### Shadowsocks 使用
-
-启用 Shadowsocks 后，可以使用任何兼容的 Shadowsocks 客户端连接：
+### 桌面托盘客户端
 
 ```bash
-# 服务器端启用 Shadowsocks
-./rust-tunnel-server --bind 0.0.0.0:8080 --ss-enabled true --ss-port 8388 --ss-cipher aes-256-gcm --ss-password mypassword
+cargo run -p rust-tunnel-client-gui
 ```
 
-客户端配置：
-- 服务器地址：你的服务器IP
-- 端口：8388（或你设置的 `--ss-port`）
-- 加密方式：aes-256-gcm 或 chacha20-ietf-poly1305
-- 密码：你设置的 `--ss-password`
+原生托盘 + eframe 四 Tab（连接/日志/设置/关于），配置落地于平台标准目录（macOS `~/Library/Application Support` / Windows `%APPDATA%` / Linux `~/.config`），支持 keyring 与自启动。
 
-## 工作原理
+### Wiki 桌面端
 
-1. 客户端主动与服务器建立控制连接（支持 TLS 加密）
-2. 服务器在指定的远程端口开始监听
-3. 当有新连接到达服务器的远程端口时，服务器通过控制连接通知客户端
-4. 客户端建立到本地目标地址的连接
-5. 两端通过隧道转发数据
-6. 心跳机制保持连接并测量 RTT 和丢包率
+位于 `wiki-desktop-ui`（Tauri 2），产物由 [`release-wiki-client.yml`](.github/workflows/release-wiki-client.yml) 按 `wiki-v*` tag 构建为 macOS `.dmg` 与 Windows `.msi`/`.exe`。
 
-## TLS 加密
+## 配置
 
-- 默认启用 TLS 加密控制通道
-- 服务器自动生成自签名证书（Ed25519，有效期 1 年），保存为 PEM 文件
-- 客户端默认使用 TOFU（Trust On First Use）模式，自动接受服务器证书
-- 支持自定义证书：通过 `--tls-cert` 和 `--tls-key` 指定
+三级优先级：**CLI > 环境变量 > TOML 配置文件 > 默认值**。
 
-## 连接质量监控
+- 服务端 TOML 参考：[`config/server.example.toml`](config/server.example.toml)（含生产/开发/no-tls 示例段）
+- 客户端 TOML 参考：[`config/client.example.toml`](config/client.example.toml)
+- 环境变量示例：[`.env.example`](.env.example)
+- 部署模板：[`contrib/config.toml.template`](contrib/config.toml.template)（`release-server.yml` 渲染 `${ADMIN_PASSWORD}` / `${CLIENT_AUTH_TOKEN}` / `${CLIENT_DIST_DIR}` / `${WIKI_DIST_DIR}` / `${SS_PASSWORD}` / `${TROJAN_PASSWORD}` 等占位符）
 
-- 实时追踪每个端口的 RTT（往返时间）、丢包率和吞吐量
-- 质量评分（0-100），基于延迟和丢包率计算
-- 告警阈值：警告（RTT >= 200ms 或丢包 >= 5%）、严重（RTT >= 500ms 或丢包 >= 15%）
-- 历史数据保留：内存中 60 分钟，数据库中 24 小时
-- 通过 Web 管理界面或 API 查看
+服务端环境变量映射（节选）：`CONTROL_ADDR`/`API_BIND`/`ADMIN_PASSWORD`/`JWT_SECRET`/`CLIENT_AUTH_TOKEN`/`TLS`/`TLS_CERT`/`TLS_KEY`/`LOG_LEVEL`/`DB_PATH`/`CLIENT_DIST_DIR`/`WIKI_DIST_DIR`/`DNS_ENABLED`/`DNS_BIND`/`DNS_TUNNEL_DOMAIN`/`DNS_MESH_DOMAIN`/`TROJAN_ENABLED`/`TROJAN_PORT`/`TROJAN_PASSWORD`/`TROJAN_FALLBACK` 等，完整见 `config/server.example.toml` 头部注释与 `--help`。
+
+客户端环境变量：`SERVER_ADDR`/`PASSWORD`/`NAME`/`TLS`/`TLS_SERVER_NAME`/`TLS_INSECURE`/`MESH_ID`/`MESH_NAME`/`MESH_SERVICES`（逗号分隔）/`LOG_LEVEL`。
+
+数据库（SQLite，WAL）：`--db-path`（默认 `./data/rust-tunnel.db`）。表：`port_traffic`/`traffic_buckets`/`client_sessions`/`connection_quality_history`/`shadowsocks_config`/`trojan_config`/`log_entries`/`clients`/`server_auth`/`knowledge_sources`/`knowledge_docs`/`knowledge_doc_index`/`knowledge_chunks`/`knowledge_pages`/`knowledge_page_edges`/`agent_workspaces`/`agent_sessions`/`agent_messages`/`agent_roles` 等；向量本体位于 `<db_parent>/rag/<source_id>/`，文档原文位于 `<db_parent>/knowledge_docs/<source_id>/`；向量索引仅随 `rag` feature 编译。
+
+## Web 管理界面
+
+启动后访问 `http://<server>:3000`（或 `--api-bind` 指定地址）：
+
+- Dashboard / Mesh / DNS / Clients（含详情与踢下线）/ Shadowsocks / Trojan / 反向代理 / ACME / 日志 / 设置
+- LLM 网关（`LLMPage`）与统一知识容器（`KnowledgePage`，向量与页面双索引）
+- AI Agent 工作台（`AgentPage`，会话列表/消息流/审批弹层/@文件引用/workspace 管理与 ACP 引擎配置）
+- 下载页（客户端二进制与 Wiki 桌面安装包，分区展示，只读归档目录）
+
+技术栈：`react-router-dom v6`（`createBrowserRouter` + `ProtectedRoute`，路由级 lazy）、`@tanstack/react-query v5`、Vite（`/api` 代理到 `localhost:3000`）、`Tailwind CSS`/`Radix UI`/`Recharts`/`CodeMirror 6`/`xterm.js`/`streamdown` 等；共享组件在 `frontend/src/components/shared/`，页面在 `frontend/src/pages/`，类型在 `frontend/src/types/index.ts`，API 客户端在 `frontend/src/api/client.ts`（Axios + JWT 拦截）。
+
+## TLS 与安全
+
+- 控制通道 TLS 默认开启，缺省自动生成 Ed25519 自签名证书（PEM，1 年有效期）；支持 `--tls-cert`/`--tls-key` 指定自定义证书
+- 客户端默认 TOFU（`--tls-insecure true`）接受自签名；可经 `--tls-server-name` 指定 SNI
+- API TLS 与 ACME（`instant-acme` + `hickory-proto`）支持自动续签与 80 端口重定向
+- Web JWT 认证（`--admin-password` 启用时）、客户端接入 Token（`--client-auth-token` / `server_auth` 表）、下载端点的 `?token=` 查询参数校验（因 `<a download>` 无法带 Header）
+
+## 可观测性
+
+- 质量监控：心跳 RTT/丢包/吞吐，评分 0–100，阈值告警（警告 RTT≥200ms/丢包≥5%，严重 RTT≥500ms/丢包≥15%），历史保留内存 60 分钟、DB 24 小时
+- 流量：聚合与分钟级分桶，`stats` crate 负责收集与落库，SSE 推送到前端图表
+- 日志：自定义 tracing Layer 同时写入内存环与 SQLite，API 支持分页/过滤/SSE
+
+## LLM 网关 / 知识库 / Agent
+
+- **LLM 网关**：`POST /v1/chat/completions` 与 `POST /v1/responses`（后者经 `responses.rs` 双向转换），provider/model/api-key/用量/model-groups（多模型 failover 与熔断），`compat` 工具调用改写
+- **知识库**：`extractor`（PDF/Word/Excel/PPT→Markdown，`lopdf`/`zip`/`quick-xml`）→ `chunker` → `embedder`（远端）→ `store`（qdrant-edge shard）→ `retriever`（检索注入）→ `ingest`（后台任务）；SSE 事件流 `GET /api/knowledge/events?token=`
+- **Agent**：WebSocket `GET /api/agent/ws`（含 `notifications/ws`、`terminal/ws`），workspace/session/message 持久化，per-workspace 执行锁与 per-session 回合锁，上下文压缩与自动标题，多角色子代理（`agent_roles`，`mode=subagent|primary|all`，工具白/黑名单、模型覆盖、`@role-name` 切换）
 
 ## 开发
 
-### 后端开发
-
-```bash
-# 检查代码错误
-cargo check
-
-# 运行测试
-cargo test
-
-# 调试模式运行服务器（含 RAG 的完整构建）
-cargo run -p rust-tunnel-server --features rag -- --bind 0.0.0.0:8080
-
-# 调试模式运行客户端
-cargo run -p rust-tunnel-client -- --server localhost:8080 --password <token> --name home-nas
-```
-
-### 前端开发
-
-```bash
-cd frontend
-
-# 安装依赖
-npm install
-
-# 开发模式运行（支持热重载）
-npm run dev
-
-# 构建前端
-npm run build
-
-# 构建并部署到 frontend-dist
-npm run build && rm -rf ../frontend-dist && cp -r dist ../frontend-dist
-```
-
-### Web 管理界面
-
-启动服务器后，可以通过浏览器访问 `http://<服务器IP>:3000` 打开管理界面，功能包括：
-
-- 查看已连接的客户端
-- 实时连接数统计
-- 流量监控图表
-- 客户端详情查看
-- 连接质量监控（RTT、丢包率、质量评分）
-- 质量告警
-- Shadowsocks 代理管理
-- 断开客户端连接
-
-## API 接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/login` | 登录 |
-| GET | `/api/health` | 健康检查 |
-| POST | `/api/logout` | 登出 |
-| GET | `/api/clients` | 列出所有客户端 |
-| DELETE | `/api/clients/:port` | 断开指定客户端 |
-| GET | `/api/traffic` | 获取所有流量数据 |
-| GET | `/api/traffic/:port` | 获取指定端口流量 |
-| GET | `/api/metrics` | 服务器指标 |
-| GET | `/api/quality/all` | 所有客户端质量数据 |
-| GET | `/api/quality/:port` | 指定端口质量数据 |
-| GET | `/api/quality/:port/history` | 质量历史数据 |
-| GET | `/api/quality/warnings` | 质量告警 |
-| GET | `/api/shadowsocks` | Shadowsocks 配置 |
-| GET | `/api/shadowsocks/stats` | Shadowsocks 统计 |
-| GET | `/api/shadowsocks/quality` | Shadowsocks 质量 |
-
-## 依赖
-
 ### 后端
 
-- `tokio` - 异步运行时
-- `clap` - 命令行参数解析
-- `figment` / `toml` - 配置文件支持
-- `thiserror` / `anyhow` - 错误处理
-- `tracing` - 日志
-- `serde` / `bincode` - 序列化
-- `axum` / `tower-http` - Web 框架
-- `rust-embed` - 嵌入前端资源
-- `jsonwebtoken` - JWT 认证
-- `sqlx` - SQLite 数据库
-- `rustls` / `tokio-rustls` / `rcgen` - TLS 加密
-- `shadowsocks` - Shadowsocks 代理协议
-- `chrono` - 时间处理
-- `gethostname` - 获取主机名
+```bash
+cargo check
+cargo test -p rust-tunnel-common --lib
+cargo test -p rust-tunnel-client --lib
+cargo test -p rust-tunnel-server --lib            # 无 RAG，快速
+cargo test -p rust-tunnel-server --lib --features rag  # 含 RAG
+cargo test                                        # 根 e2e（含 rag dev-dep）
+cargo test -j 2                                   # 内存受限时（e2e 含 qdrant-edge 编译较重）
+cargo clippy -p rust-tunnel-server
+cargo run -p rust-tunnel-server --bin checkdb     # SQLite 诊断
+```
 
 ### 前端
 
-- `React` - UI 框架
-- `TypeScript` - 类型安全
-- `Vite` - 构建工具
-- `React Query` - 数据获取
-- `Recharts` - 图表库
-- `Tailwind CSS` - 样式框架
+```bash
+cd frontend
+npm install
+npm run dev          # Vite HMR，/api → localhost:3000
+npm run build        # tsc + Vite
+npm run lint         # ESLint --max-warnings 0
+npm test             # Vitest (jsdom)
+```
+
+### 构建缓存
+
+```bash
+du -sh target
+cargo clean -p rust-tunnel-server
+cargo clean
+```
+
+Lint 基线：`clippy::pedantic = deny`（`doc_markdown = allow`），`unwrap_used`/`expect_used`/`panic`/`unwrap_in_result` = deny，`missing_docs = deny`。
+
+## API 概览
+
+完整路由见 [`crates/server/src/mgmt/api/mod.rs`](crates/server/src/mgmt/api/mod.rs)。
+
+- 公开：`POST /api/login`、`GET /api/health`、`GET /api/knowledge/events`（SSE，`?token=`）、`GET /api/stats/stream`、`GET /api/logs/stream`、`GET /api/agent/ws` 等；下载：`GET /api/client-downloads/:version/:file`、`GET /api/wiki-downloads/:version/:file`（公开，`?token=` 校验）
+- 受保护（设置密码时需 JWT）：`POST /api/logout`、`/api/clients`、`/api/server-auth`、`/api/stats/query`、`/api/stats/summary`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/mesh/*`、`/api/dns/*`、`/api/logs/*`、`/api/proxy/rules`、`/api/acme/*`、`/api/llm/*`、`/api/knowledge/*`、`/api/agent/*`、`/api/preferences`、`/api/settings` 等
+- LLM：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/api-keys`、`/api/llm/usage/*`、`/api/llm/model-groups/*`，以及 `POST /v1/responses` 与 `POST /v1/chat/completions`
+- 知识容器：`/api/knowledge` CRUD、`/api/knowledge/:id/docs`、`/api/knowledge/:id/query`（检索预览）、`/api/knowledge/:id/pages|graph|search`、`/api/knowledge/search`
+- Agent：`/api/agent/workspaces`、`/api/agent/workspaces/:id/files|fs/*|git/*|github/*|sessions`、`/api/agent/sessions/:id`（含 `/model`、`/role`、`/archive`、`/messages`、`/export`）、`/api/agent/roles`、`/api/agent/default-model`
+
+## CI/CD
+
+GitHub Actions（见 [`.github/workflows/`](.github/workflows/)）：
+
+- `release-server.yml`（手动）：前端构建 → `x86_64-unknown-linux-musl` 静态编译（`--features rag,embed-frontend`）→ 从 `contrib/config.toml.template` 渲染配置并校验 → SCP 二进制 + systemd 服务 + 配置 → SSH 重启
+- `release-client.yml`（tag `v*` / 手动）：四平台矩阵构建客户端二进制，SCP 到 `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 生成 `SHA256SUMS` 并更新 `latest` 软链
+- `release-wiki-client.yml`（tag `wiki-v*` / 手动）：Tauri 2 安装包（macOS aarch64/x86_64 `.dmg` + Windows `.msi`/NSIS `.exe`），重命名为 `wiki-desktop-<os>-<arch>[-setup].<ext>` 后 SCP 到 `${DEPLOY_PATH}/wiki/<version>/`（目录名 = tag 去 `wiki-` 前缀），`finalize-wiki` 生成校验和与 `latest` 软链
+
+部署为 systemd（[`contrib/rust-tunnel-server.service`](contrib/rust-tunnel-server.service)），两类归档经 `client_dist_dir` / `wiki_dist_dir` 以绝对路径只读暴露给 Web 下载页。
+
+## 依赖
+
+后端（节选，完整见 [`Cargo.toml`](Cargo.toml)）：`tokio`、`axum`/`tower-http`/`hyper`、`sqlx`/`chrono`/`uuid`、`rustls`/`tokio-rustls`/`rcgen`/`webpki-roots`、`shadowsocks`、`qdrant-edge`、`tantivy`/`comrak`/`petgraph`、`portable-pty`、`agent-client-protocol`（`unstable_elicitation`）、`hickory-proto`/`trust-dns-resolver`/`instant-acme` 等；前端见 [`frontend/package.json`](frontend/package.json)。
 
 ## License
 
