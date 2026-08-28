@@ -1,4 +1,4 @@
-name: Deploy Server (No Artifacts)
+name: Deploy Server
 
 # 单 job 构建 + 部署：不使用 Artifact，避免存储配额问题
 # 手动触发；如需 tag 触发可取消下方注释（注意与 release-server.yml 的 tag 触发会重复部署）
