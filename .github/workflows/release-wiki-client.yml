@@ -109,9 +109,24 @@ jobs:
       # tauri feature 默认关闭（门控整条 Tauri 依赖链，让无 GUI 系统库的机器也能
       # cargo test），打包时必须显式 -f tauri。cwd 必须是 tauri.conf.json 所在目录，
       # 其 beforeBuildCommand 的相对路径（../../wiki-desktop-ui）以此为基准。
+      #
+      # --bundles 在 Tauri CLI 的签名是 [<BUNDLES>...]（重复参数），不是逗号列表，
+      # 必须展开为 -b <one> -b <other>，否则 `msi,nsis` 或 `msi nsis` 都会被当成
+      # 单个非法值（invalid value 'msi nsis'）。
       - name: Build wiki desktop bundles
         working-directory: crates/wiki-serve
-        run: tauri build --ci -f tauri -t ${{ matrix.target }} -b ${{ matrix.bundles }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundles="${{ matrix.bundles }}"
+          IFS=',' read -ra parts <<< "$bundles"
+          bundle_args=()
+          for b in "${parts[@]}"; do
+            b="$(echo "$b" | xargs)"
+            [ -n "$b" ] && bundle_args+=(-b "$b")
+          done
+          echo "Bundles: ${bundle_args[*]:-<none>}"
+          tauri build --ci -f tauri -t ${{ matrix.target }} "${bundle_args[@]}"
 
       # Tauri 产物名形如 `Wiki Desktop_0.4.0_aarch64.dmg`（含空格与版本号）。空格不在
       # 服务端 is_safe_segment 的放行字符集内，会被下载页过滤掉，故统一重命名为
