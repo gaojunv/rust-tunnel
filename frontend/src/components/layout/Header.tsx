@@ -38,12 +38,13 @@ import {
   Bot,
   BookOpen,
   Sparkles,
+  Download,
 } from 'lucide-react';
 // three.js 体积大（约 600KB），装饰性背景懒加载，不阻塞首屏
 const DataFlowBackground = lazy(() => import('@/components/dataflow/DataFlowBackground'));
 
 interface NavItem {
-  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.knowledge' | 'nav.agentWorkbench' | 'nav.logs' | 'nav.settings';
+  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.knowledge' | 'nav.agentWorkbench' | 'nav.logs' | 'nav.clientDownloads' | 'nav.settings';
   icon: React.ReactNode;
   href: string;
 }
@@ -89,6 +90,7 @@ const navGroups: NavGroup[] = [
     labelKey: 'nav.system',
     items: [
       { labelKey: 'nav.logs', icon: <ScrollText className="h-4 w-4" />, href: '/logs' },
+      { labelKey: 'nav.clientDownloads', icon: <Download className="h-4 w-4" />, href: '/downloads' },
       { labelKey: 'nav.settings', icon: <Settings className="h-4 w-4" />, href: '/settings' },
     ],
   },

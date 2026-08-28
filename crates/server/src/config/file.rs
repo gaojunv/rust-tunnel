@@ -23,6 +23,8 @@ pub struct ServerConfigFile {
     pub log: Option<String>,
     /// SQLite 数据库路径。
     pub db_path: Option<String>,
+    /// 客户端二进制归档目录。
+    pub client_dist_dir: Option<String>,
     /// 是否启用 Shadowsocks。
     pub ss_enabled: Option<bool>,
     /// Shadowsocks 监听端口。

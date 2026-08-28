@@ -89,6 +89,7 @@ impl TestHarness {
             tls_key: key_path.to_string_lossy().to_string(),
             log: "warn".to_string(),
             db_path: db_path.to_string_lossy().to_string(),
+            client_dist_dir: data_dir.join("client").to_string_lossy().to_string(),
             ss_enabled: false,
             ss_port: None,
             ss_cipher: None,

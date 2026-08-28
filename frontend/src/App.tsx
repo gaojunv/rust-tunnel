@@ -20,6 +20,7 @@ const LogsPage = lazy(() => import('./pages/LogsPage'));
 const ClientsPage = lazy(() => import('./pages/ClientsPage'));
 const ClientDetailPage = lazy(() => import('./pages/ClientDetailPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const DownloadsPage = lazy(() => import('./pages/DownloadsPage'));
 const LLMPage = lazy(() => import('./pages/LLMPage'));
 const KnowledgePage = lazy(() => import('./pages/KnowledgePage'));
 const AgentPage = lazy(() => import('./pages/AgentPage'));
@@ -70,6 +71,7 @@ const router = createBrowserRouter([
           { path: '/llm/kb', element: <Navigate to="/llm/knowledge" replace /> },
           { path: '/agent', element: <AgentPage /> },
           { path: '/agent/memory', element: <Navigate to="/llm/knowledge" replace /> },
+          { path: '/downloads', element: <DownloadsPage /> },
           { path: '/settings', element: <SettingsPage /> },
         ],
       },

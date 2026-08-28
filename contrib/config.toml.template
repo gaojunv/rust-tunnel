@@ -26,6 +26,9 @@ log = "info"
 # 数据库路径
 db_path = "./data/rust-tunnel.db"
 
+# 客户端二进制归档目录（release-client.yml 按 tag 落盘 <dir>/<tag>/）
+client_dist_dir = "./client"
+
 # Shadowsocks 代理配置
 ss_enabled = true
 ss_port = 8388

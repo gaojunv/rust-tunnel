@@ -18,6 +18,8 @@ use tower_http::cors::{Any, CorsLayer};
 pub mod acme;
 /// Agent 工作台路由。
 pub mod agent;
+/// 客户端二进制归档的列举与下载路由。
+pub mod client_downloads;
 /// 客户端管理路由。
 pub mod clients;
 /// DNS 记录与配置路由。
@@ -259,6 +261,11 @@ pub async fn run_api_server(
         .route("/api/agent/ws", get(agent::agent_ws))
         .route("/api/agent/notifications/ws", get(agent::notifications_ws))
         .route("/api/agent/terminal/ws", get(agent::terminal_ws))
+        .route(
+            // 浏览器原生下载（<a download>）无法带 Header，故在此自带 ?token= 校验
+            "/api/client-downloads/:version/:file",
+            get(client_downloads::download_client_binary),
+        )
         .route("/api/preferences", get(preferences::get_preferences));
 
     // Protected routes (require auth only when password is set)
@@ -273,6 +280,11 @@ pub async fn run_api_server(
             patch(clients::patch_client_note).delete(clients::delete_client),
         )
         .route("/api/clients/:name/kick", post(clients::kick_client))
+        // 客户端二进制归档列表（下载端点在 public_routes —— 用 ?token= 查询参数）
+        .route(
+            "/api/client-downloads",
+            get(client_downloads::list_client_downloads),
+        )
         // Server auth token management
         .route(
             "/api/server-auth",

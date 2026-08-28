@@ -53,6 +53,10 @@ pub struct ServerCli {
     #[clap(long = "db-path")]
     pub db_path: Option<String>,
 
+    /// Directory holding versioned client binaries (`<dir>/<tag>/…`), served by the web download page
+    #[clap(long = "client-dist-dir")]
+    pub client_dist_dir: Option<String>,
+
     /// Enable Shadowsocks proxy service
     #[clap(long = "ss-enabled")]
     pub ss_enabled: Option<bool>,

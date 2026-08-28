@@ -150,6 +150,37 @@ export interface ServerAuthView {
   updated_at: string;
 }
 
+// === Client Downloads ===
+
+/** 单个客户端二进制文件（对应 CI 上传的一个平台产物）。 */
+export interface ClientDownloadFile {
+  name: string;
+  /** 平台，如 `linux` / `macos` / `windows`；无法解析时为 `unknown`。 */
+  os: string;
+  /** 架构，如 `x86_64` / `aarch64`。 */
+  arch: string;
+  size: number;
+  /** 来自 `SHA256SUMS` 的校验和，缺失时为 null。 */
+  sha256: string | null;
+}
+
+/** 一个版本目录（`<client_dist_dir>/<tag>/`）下的全部产物。 */
+export interface ClientDownloadVersion {
+  version: string;
+  is_latest: boolean;
+  /** 目录 mtime（Unix 秒），不可读时为 null。 */
+  modified_at: number | null;
+  files: ClientDownloadFile[];
+}
+
+export interface ClientDownloadsResponse {
+  /** 归档目录是否存在且可读；false 时前端呈现空状态而非报错。 */
+  dir_available: boolean;
+  configured_dir: string | null;
+  latest: string | null;
+  versions: ClientDownloadVersion[];
+}
+
 // === ACME Certificate Management ===
 
 export type CertificateStatus = 'pending' | 'active' | 'expired' | 'failed';

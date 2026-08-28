@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub log: String,
     /// SQLite 数据库路径。
     pub db_path: String,
+    /// 客户端二进制归档目录（CI 按版本落盘 `<dir>/<tag>/`，Web 端下载页只读该目录）。
+    pub client_dist_dir: String,
     /// 是否启用 Shadowsocks。
     pub ss_enabled: bool,
     /// Shadowsocks 监听端口。
@@ -104,6 +106,7 @@ impl Default for ServerConfig {
             tls_key: "./data/tls/key.pem".to_string(),
             log: "info".to_string(),
             db_path: "./data/rust-tunnel.db".to_string(),
+            client_dist_dir: "./client".to_string(),
             ss_enabled: false,
             ss_port: None,
             ss_cipher: None,
@@ -153,6 +156,7 @@ mod tests {
         assert!(config.tls); // TLS enabled by default
         assert_eq!(config.tls_cert, "./data/tls/cert.pem");
         assert_eq!(config.tls_key, "./data/tls/key.pem");
+        assert_eq!(config.client_dist_dir, "./client");
         assert!(!config.ss_enabled);
         assert!(config.ss_port.is_none());
         assert!(config.ss_cipher.is_none());
@@ -181,6 +185,7 @@ mod tests {
             tls_key: Some("/custom/key.pem".to_string()),
             log: Some("debug".to_string()),
             db_path: Some("./test.db".to_string()),
+            client_dist_dir: Some("./test-client".to_string()),
             ss_enabled: Some(true),
             ss_port: Some(8388),
             ss_cipher: Some("aes-256-gcm".to_string()),
@@ -220,6 +225,7 @@ mod tests {
         assert_eq!(config.tls_key, "/custom/key.pem");
         assert_eq!(config.log, "debug");
         assert_eq!(config.db_path, "./test.db");
+        assert_eq!(config.client_dist_dir, "./test-client");
         assert!(config.ss_enabled);
         assert_eq!(config.ss_port, Some(8388));
         assert_eq!(config.ss_cipher, Some("aes-256-gcm".into()));
@@ -239,6 +245,7 @@ mod tests {
             tls_key: "./test-key.pem".to_string(),
             log: "debug".to_string(),
             db_path: "./test.db".to_string(),
+            client_dist_dir: "./test-client".to_string(),
             ss_enabled: true,
             ss_port: Some(8388),
             ss_cipher: Some("aes-256-gcm".to_string()),
@@ -278,6 +285,7 @@ mod tests {
         assert_eq!(config.tls_key, cloned.tls_key);
         assert_eq!(config.log, cloned.log);
         assert_eq!(config.db_path, cloned.db_path);
+        assert_eq!(config.client_dist_dir, cloned.client_dist_dir);
         assert_eq!(config.ss_enabled, cloned.ss_enabled);
         assert_eq!(config.ss_port, cloned.ss_port);
         assert_eq!(config.ss_cipher, cloned.ss_cipher);
@@ -306,6 +314,7 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            client_dist_dir: None,
             ss_enabled: None,
             ss_port: None,
             ss_cipher: None,
@@ -353,6 +362,7 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            client_dist_dir: None,
             ss_enabled: Some(true),
             ss_port: None,
             ss_cipher: Some("aes-256-gcm".to_string()),
@@ -400,6 +410,7 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            client_dist_dir: None,
             ss_enabled: Some(true),
             ss_port: Some(8388),
             ss_cipher: Some("invalid-cipher".to_string()),
@@ -447,6 +458,7 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            client_dist_dir: None,
             ss_enabled: None,
             ss_port: None,
             ss_cipher: None,
@@ -494,6 +506,7 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            client_dist_dir: None,
             ss_enabled: None,
             ss_port: None,
             ss_cipher: None,
@@ -541,6 +554,7 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            client_dist_dir: None,
             ss_enabled: None,
             ss_port: None,
             ss_cipher: None,

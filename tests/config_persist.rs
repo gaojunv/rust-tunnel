@@ -43,6 +43,7 @@ fn test_config(db_path: &str, api_port: u16) -> ServerConfig {
         tls_key: "./data/tls/key.pem".to_string(),
         log: "warn".to_string(),
         db_path: db_path.to_string(),
+        client_dist_dir: "./client".to_string(),
         ss_enabled: false,
         ss_port: None,
         ss_cipher: None,

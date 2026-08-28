@@ -23,6 +23,7 @@ import type {
   DnsSettings,
   Client,
   ServerAuthView,
+  ClientDownloadsResponse,
   LlmProvider,
   CreateProviderRequest,
   LlmModel,
@@ -247,6 +248,24 @@ export const serverAuthApi = {
   set: async (token: string): Promise<void> => {
     await api.put('/server-auth', { token });
   },
+};
+
+// Client Downloads API
+export const getClientDownloads = async (): Promise<ClientDownloadsResponse> => {
+  const { data } = await api.get<ClientDownloadsResponse>('/client-downloads');
+  return data;
+};
+
+/**
+ * 构造客户端二进制的直接下载地址。
+ *
+ * 浏览器原生下载（`<a download>`）无法携带 Authorization 头，故服务端把该端点
+ * 放在 public_routes 里自带 `?token=` 校验 —— 与日志 SSE / agent WS 同一约定。
+ */
+export const clientDownloadUrl = (version: string, file: string): string => {
+  const token = localStorage.getItem('auth_token') ?? '';
+  const path = `/api/client-downloads/${encodeURIComponent(version)}/${encodeURIComponent(file)}`;
+  return token ? `${path}?token=${encodeURIComponent(token)}` : path;
 };
 
 // Reverse Proxy API

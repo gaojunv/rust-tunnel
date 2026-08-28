@@ -71,6 +71,9 @@ impl ServerConfig {
                 if let Some(v) = file_config.db_path {
                     config.db_path = v;
                 }
+                if let Some(v) = file_config.client_dist_dir {
+                    config.client_dist_dir = v;
+                }
                 if let Some(v) = file_config.ss_enabled {
                     config.ss_enabled = v;
                 }
@@ -187,6 +190,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("DB_PATH") {
             config.db_path = v;
+        }
+        if let Ok(v) = std::env::var("CLIENT_DIST_DIR") {
+            config.client_dist_dir = v;
         }
 
         // Environment variables for Shadowsocks
@@ -323,6 +329,9 @@ impl ServerConfig {
         }
         if let Some(v) = cli.db_path {
             config.db_path = v;
+        }
+        if let Some(v) = cli.client_dist_dir {
+            config.client_dist_dir = v;
         }
         if let Some(v) = cli.ss_enabled {
             config.ss_enabled = v;

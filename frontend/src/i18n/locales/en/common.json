@@ -113,6 +113,7 @@
     "roles": "Roles",
     "system": "System",
     "logs": "Logs",
+    "clientDownloads": "Client Downloads",
     "settings": "Settings",
     "logout": "Logout",
     "openMenu": "Open menu"
@@ -1310,6 +1311,23 @@
       "autoScrollOn": "Auto-scroll on",
       "scrollToBottom": "Scroll to bottom"
     }
+  },
+  "downloads": {
+    "title": "Client Downloads",
+    "description": "Grab tunnel client binaries per release, with per-platform checksums",
+    "refresh": "Refresh",
+    "latest": "Latest",
+    "download": "Download",
+    "copySha256": "SHA256",
+    "copyCommand": "Copy command",
+    "statLatest": "Latest version",
+    "statVersions": "Versions",
+    "statFiles": "Files",
+    "history": "Older versions ({{count}})",
+    "usageTitle": "Run the client",
+    "usageHint": "Replace <client_token> with the access token from the Clients page; --name labels this client on the server.",
+    "dirUnavailable": "Archive directory is missing or unreadable. Check the server's client_dist_dir setting and make sure CI has published a client build.",
+    "empty": "Archive directory is empty — no client releases published yet."
   },
   "wiki": {
     "saveError": "Save failed: {{error}}",

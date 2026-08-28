@@ -69,6 +69,7 @@ import {
   testEmbedding,
   queryKnowledge,
   clientsApi,
+  getClientDownloads,
   listAgentWorkspaces,
   getMemorySettings,
   updateMemorySettings,
@@ -897,6 +898,11 @@ export function useAgentWorkspaces() {
 
 export function useClients() {
   return useQuery({ queryKey: ['clients'], queryFn: () => clientsApi.list() });
+}
+
+/** 客户端二进制归档列表（服务端扫描 `client_dist_dir`，CI 推包后需重拉才可见）。 */
+export function useClientDownloads() {
+  return useQuery({ queryKey: ['client-downloads'], queryFn: () => getClientDownloads() });
 }
 
 /** 订阅记忆/技能 SSE：事件到达即失效记忆与技能列表（后台重拉）。

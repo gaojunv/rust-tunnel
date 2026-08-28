@@ -246,6 +246,10 @@ pub struct ServerState {
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
     /// API/控制通道 TLS 只读设置（领域切片）
     pub tls: TlsSettings,
+    /// 客户端二进制归档目录（只读设置，由装配层从 `ServerConfig::client_dist_dir` 注入）。
+    ///
+    /// `None` 表示未配置，Web 下载页会呈现空状态而非报错。
+    pub client_dist_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerState {
@@ -286,6 +290,7 @@ impl ServerState {
                 },
             })),
             tls: TlsSettings::default(),
+            client_dist_dir: None,
         };
         // 反代状态挂上同一个统计采集器：proxy 埋点才能汇总到 /api/stats/*
         state
@@ -329,6 +334,7 @@ impl ServerState {
                 },
             })),
             tls: TlsSettings::default(),
+            client_dist_dir: None,
         };
         // ClientRegistry 挂上统计采集器：open_tunnel 的连接数/流量埋点依赖它
         if let Some(registry) = state.client_registry.as_mut() {

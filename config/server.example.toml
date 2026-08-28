@@ -14,6 +14,7 @@
 #   TLS_KEY            -> tls_key
 #   LOG_LEVEL          -> log
 #   DB_PATH            -> db_path
+#   CLIENT_DIST_DIR    -> client_dist_dir
 #   DNS_ENABLED        -> dns_enabled
 #   DNS_BIND           -> dns_bind
 #   DNS_TUNNEL_DOMAIN  -> dns_tunnel_domain
@@ -114,6 +115,12 @@ log = "info"
 # 用于存储：流量统计、客户端连接历史、流量 Buckets
 # 默认值：./data/rust-tunnel.db
 db_path = "./data/rust-tunnel.db"
+
+# 客户端二进制归档目录
+# CI（.github/workflows/release-client.yml）按 tag 落盘为 <dir>/<tag>/，并维护 <dir>/latest 软链
+# Web 管理界面「客户端下载」页只读该目录
+# 默认值：./client（相对于服务进程工作目录）
+client_dist_dir = "./client"
 
 # --------------------
 # 客户端认证配置

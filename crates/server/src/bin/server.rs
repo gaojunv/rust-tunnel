@@ -200,6 +200,11 @@ async fn main() -> TunnelResult<()> {
     state.tls.cert_path = config.tls_cert.clone();
     state.tls.key_path = config.tls_key.clone();
 
+    // 客户端二进制归档目录（只读，供 Web 下载页扫描；空字符串视为未配置）
+    if !config.client_dist_dir.trim().is_empty() {
+        state.client_dist_dir = Some(std::path::PathBuf::from(&config.client_dist_dir));
+    }
+
     // Initialize logging with LogStore capture (after state creation so LogStore is available)
     let log_store = state.log_store.clone();
     if let Some(store) = log_store {
