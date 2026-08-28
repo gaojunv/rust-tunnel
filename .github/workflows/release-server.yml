@@ -1,19 +1,21 @@
-name: Release Server
+name: Deploy Server (No Artifacts)
 
-# 当推送 tag 时触发，也可以手动触发
+# 单 job 构建 + 部署：不使用 Artifact，避免存储配额问题
+# 手动触发；如需 tag 触发可取消下方注释（注意与 release-server.yml 的 tag 触发会重复部署）
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+  # push:
+  #   tags:
+  #     - 'v*'
 
 jobs:
-  build-frontend:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ---------- 前端 ----------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -29,31 +31,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-
 
-      - name: Build frontend
+      - name: Build frontend and stage for embedding
         run: |
           cd frontend
           npm ci
           npm run build
+          cd ..
+          rm -rf frontend-dist
+          cp -r frontend/dist frontend-dist
 
-      - name: Upload frontend dist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend/dist/
-
-  build-server:
-    needs: [build-frontend]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend-dist/
-
+      # ---------- 后端 ----------
       - name: Install Rust with musl target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -76,29 +63,9 @@ jobs:
         run: |
           cargo build --release -p rust-tunnel-server --target x86_64-unknown-linux-musl --features rag,embed-frontend
           strip target/x86_64-unknown-linux-musl/release/rust-tunnel-server
+          cp target/x86_64-unknown-linux-musl/release/rust-tunnel-server ./rust-tunnel-server
 
-      - name: Upload server binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-tunnel-server
-          path: target/x86_64-unknown-linux-musl/release/rust-tunnel-server
-
-  deploy:
-    needs: [build-server]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download server binary
-        uses: actions/download-artifact@v4
-        with:
-          name: rust-tunnel-server
-          path: ./
-
-      - name: Make binary executable
-        run: chmod +x ./rust-tunnel-server
-
+      # ---------- 部署 ----------
       - name: Generate config from template
         run: |
           sed \
