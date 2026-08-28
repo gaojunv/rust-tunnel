@@ -1,9 +1,10 @@
 name: Release Client
 
 # 当推送 tag 时触发，也可以手动触发
-# 构建矩阵在多 runner 上产出二进制，完成后由 deploy-client 聚合
-# 并以版本隔离的方式直传到服务器的 ${DEPLOY_PATH}/client/<tag>/ 目录
-# 行为对齐 deploy-direct.yml（SCP 直传，不依赖 Releases/Artifacts 分发）
+# 构建矩阵在多 runner 上产出二进制后，各 runner 直接 SCP 上传到服务器的
+# ${DEPLOY_PATH}/client/<tag>/ 目录（版本隔离），不使用 Artifact 中转，避免存储配额问题
+# 全部平台上传完成后由 finalize-client 在服务端生成校验和并更新 latest 软链接
+# 行为对齐 release-server.yml（SCP 直传，不依赖 Releases/Artifacts 分发）
 on:
   push:
     tags:
@@ -18,20 +19,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            artifact: rust-tunnel-client-linux-x86_64
             binary: rust-tunnel-client
+            asset: rust-tunnel-client-linux-x86_64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: rust-tunnel-client-macos-x86_64
             binary: rust-tunnel-client
+            asset: rust-tunnel-client-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: rust-tunnel-client-macos-aarch64
             binary: rust-tunnel-client
+            asset: rust-tunnel-client-macos-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: rust-tunnel-client-windows-x86_64
             binary: rust-tunnel-client.exe
+            asset: rust-tunnel-client-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -65,67 +66,41 @@ jobs:
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
 
-      - name: Upload client binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
-
-  deploy-client:
-    needs: build-client
-    runs-on: ubuntu-latest
-    # 仅 tag 推送时上传到服务器；手动触发未带 tag 时跳过，避免覆盖
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Download all client artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./client-dist
-          pattern: rust-tunnel-client-*
-          merge-multiple: false
-
-      - name: Prepare versioned package
+      # 各平台自行 SCP 直传：appleboy/scp-action 是 Docker action，只能跑在 Linux runner，
+      # 因此这里统一用原生 ssh/scp（Windows runner 走 git-bash，自带 OpenSSH 客户端）
+      # 仅 tag 推送时上传；手动触发未带 tag 时跳过，避免覆盖
+      - name: Upload binary to remote server
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ secrets.SERVER_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          PKG="pkg/client/${TAG}"
-          mkdir -p "${PKG}"
-          echo "Packaging version ${TAG} -> ${PKG}"
-          for d in client-dist/rust-tunnel-client-*; do
-            artifact="$(basename "$d")"
-            echo "Processing ${artifact} ..."
-            if [[ "${artifact}" == *windows* ]]; then
-              if [ -f "${d}/rust-tunnel-client.exe" ]; then
-                cp "${d}/rust-tunnel-client.exe" "${PKG}/${artifact}.exe"
-              else
-                cp "${d}/"* "${PKG}/"
-              fi
-            else
-              if [ -f "${d}/rust-tunnel-client" ]; then
-                cp "${d}/rust-tunnel-client" "${PKG}/${artifact}"
-              else
-                cp "${d}/"* "${PKG}/"
-              fi
-            fi
-          done
-          (cd "${PKG}" && sha256sum * > SHA256SUMS)
-          echo "--- pkg layout ---"
-          ls -lhR pkg
-          echo "--- SHA256SUMS ---"
-          cat "${PKG}/SHA256SUMS"
+          mkdir -p "${HOME}/.ssh"
+          KEY="${HOME}/.ssh/rt_deploy_key"
+          printf '%s\n' "${SSH_KEY}" > "${KEY}"
+          chmod 600 "${KEY}"
+          PORT="${SSH_PORT:-22}"
+          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
+          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+          echo "Uploading ${{ matrix.asset }} -> ${DEST}/"
+          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
+          scp "${SSH_OPTS[@]}" -P "${PORT}" \
+            "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "${SSH_USER}@${SSH_HOST}:${DEST}/${{ matrix.asset }}"
+          rm -f "${KEY}"
 
-      - name: Deploy client to remote server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT }}
-          source: "pkg/client/${{ github.ref_name }}/*"
-          target: ${{ secrets.DEPLOY_PATH }}/client/${{ github.ref_name }}
-          strip_components: 3
-
-      - name: Set permissions and update latest symlink
+  finalize-client:
+    needs: build-client
+    runs-on: ubuntu-latest
+    # 仅 tag 推送时收尾；手动触发未带 tag 时跳过
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checksum, permissions and latest symlink
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -136,10 +111,13 @@ jobs:
             set -e
             BASE="${{ secrets.DEPLOY_PATH }}/client"
             TAG="${{ github.ref_name }}"
-            echo "Deployed to ${BASE}/${TAG}:"
-            ls -lh "${BASE}/${TAG}/"
-            chmod +x "${BASE}/${TAG}/"* || true
-            cat "${BASE}/${TAG}/SHA256SUMS" || true
+            cd "${BASE}/${TAG}"
+            chmod +x rust-tunnel-client-*
+            sha256sum rust-tunnel-client-* > SHA256SUMS
+            echo "--- ${BASE}/${TAG} ---"
+            ls -lh
+            echo "--- SHA256SUMS ---"
+            cat SHA256SUMS
             ln -sfn "${TAG}" "${BASE}/latest"
             ls -ld "${BASE}/latest"
             echo "Client ${TAG} deployed successfully to ${BASE}/${TAG}/ (latest -> ${TAG})"
