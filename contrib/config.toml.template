@@ -26,8 +26,11 @@ log = "info"
 # 数据库路径
 db_path = "./data/rust-tunnel.db"
 
-# 客户端二进制归档目录（release-client.yml 按 tag 落盘 <dir>/<tag>/）
-client_dist_dir = "./client"
+# 客户端二进制归档目录 (部署时替换为 DEPLOY_PATH 下的 client 子目录)
+# release-client.yml 按 tag 落盘 <dir>/<tag>/，Web 下载页只读该目录。
+# 用绝对路径而非 ./client：service 的 WorkingDirectory 是硬编码的
+# /opt/rust-tunnel，与 DEPLOY_PATH 未必一致。
+client_dist_dir = "${CLIENT_DIST_DIR}"
 
 # Shadowsocks 代理配置
 ss_enabled = true

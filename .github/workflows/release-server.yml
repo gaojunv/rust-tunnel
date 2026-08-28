@@ -67,13 +67,29 @@ jobs:
 
       # ---------- 部署 ----------
       - name: Generate config from template
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
+          # DEPLOY_PATH 缺失时 client_dist_dir 会静默变成 "/client"（占位符校验放行），
+          # 下载页就永远空着 —— 先挡住
+          if [ -z "${DEPLOY_PATH}" ]; then
+            echo "::error::secrets.DEPLOY_PATH is empty"
+            exit 1
+          fi
           sed \
             -e "s|\${ADMIN_PASSWORD}|${{ secrets.ADMIN_PASSWORD }}|g" \
             -e "s|\${CLIENT_AUTH_TOKEN}|${{ secrets.CLIENT_AUTH_TOKEN }}|g" \
             -e "s|\${SS_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
             -e "s|\${TROJAN_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
+            -e "s|\${CLIENT_DIST_DIR}|${DEPLOY_PATH%/}/client|g" \
             contrib/config.toml.template > config.toml
+          # 校验占位符已全部替换（漏替换会让服务端读到字面量，静默跑错配置）
+          if grep -nE '\$\{(ADMIN_PASSWORD|CLIENT_AUTH_TOKEN|SS_PASSWORD|TROJAN_PASSWORD|CLIENT_DIST_DIR)\}' config.toml; then
+            echo "::error::config.toml still contains unresolved placeholders (check repo secrets)"
+            exit 1
+          fi
+          echo "--- client_dist_dir ---"
+          grep client_dist_dir config.toml
 
       - name: Deploy files to remote server
         uses: appleboy/scp-action@v0.1.7
