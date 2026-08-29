@@ -52,13 +52,13 @@ export default function SkillDialog({ open, onClose, skill = null, onCreated }: 
     if (initRef.current) return;
     initRef.current = true;
     if (skill) {
-      setName(skill.name);
-      setDescription(skill.description);
-      setContent(skill.content);
-      setTagsStr(skill.tags.join(', '));
-      setScope(skill.scope_type);
-      setClientId(skill.client_id);
-      setWorkspaceId(skill.workspace_id);
+      setName(skill.name ?? '');
+      setDescription(skill.description ?? '');
+      setContent(skill.content ?? '');
+      setTagsStr(Array.isArray(skill.tags) ? skill.tags.join(', ') : '');
+      setScope(skill.scope_type ?? 'workspace');
+      setClientId(skill.client_id ?? '');
+      setWorkspaceId(skill.workspace_id ?? '');
     } else {
       setName('');
       setDescription('');
@@ -79,8 +79,8 @@ export default function SkillDialog({ open, onClose, skill = null, onCreated }: 
 
   // 新建：非 global 作用域必须绑定 client/workspace（编辑模式沿用既有坐标）。
   const canSubmit =
-    name.trim() !== '' &&
-    content.trim() !== '' &&
+    (name ?? '').trim() !== '' &&
+    (content ?? '').trim() !== '' &&
     (scope !== 'client' || clientId !== '') &&
     (scope !== 'workspace' || workspaceId !== '');
 
@@ -95,9 +95,9 @@ export default function SkillDialog({ open, onClose, skill = null, onCreated }: 
       updateMutation.mutate(
         {
           id: skill.id,
-          name: name.trim(),
-          description: description.trim(),
-          content: content.trim(),
+          name: (name ?? '').trim(),
+          description: (description ?? '').trim(),
+          content: (content ?? '').trim(),
           scope_type: scope,
           tags,
         },
@@ -106,9 +106,9 @@ export default function SkillDialog({ open, onClose, skill = null, onCreated }: 
     } else {
       createMutation.mutate(
         {
-          name: name.trim(),
-          description: description.trim(),
-          content: content.trim(),
+          name: (name ?? '').trim(),
+          description: (description ?? '').trim(),
+          content: (content ?? '').trim(),
           scope_type: scope,
           ...(scope === 'client' ? { client_id: clientId } : {}),
           ...(scope === 'workspace' ? { workspace_id: workspaceId } : {}),

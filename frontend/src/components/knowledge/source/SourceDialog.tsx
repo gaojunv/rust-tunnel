@@ -56,7 +56,7 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
   // 全局 embedding 是否已配置（与 KbDialog 同口径：base_url 或 model 非空即视为已配置）。
   const globalEmbConfigured =
     !!globalSettings &&
-    (globalSettings.emb_base_url.trim() !== '' || globalSettings.emb_model.trim() !== '');
+    ((globalSettings.emb_base_url ?? '').trim() !== '' || (globalSettings.emb_model ?? '').trim() !== '');
 
   const [name, setName] = useState('');
   const [summary, setSummary] = useState('');
@@ -106,21 +106,21 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
     initRef.current = true;
 
     if (source) {
-      setName(source.name);
-      setSummary(source.summary);
-      setScope(source.scope_type);
-      setClientId(source.client_id);
-      setWorkspaceId(source.workspace_id);
-      setIndexVector(source.index_vector);
-      setIndexPages(source.index_pages);
-      setEmbBaseUrl(source.emb_base_url);
+      setName(source.name ?? '');
+      setSummary(source.summary ?? '');
+      setScope(source.scope_type ?? 'workspace');
+      setClientId(source.client_id ?? '');
+      setWorkspaceId(source.workspace_id ?? '');
+      setIndexVector(!!source.index_vector);
+      setIndexPages(!!source.index_pages);
+      setEmbBaseUrl(source.emb_base_url ?? '');
       setEmbApiKey('');
-      setEmbModel(source.emb_model);
-      setEmbDimension(source.emb_dimension);
-      setTopK(source.top_k);
-      setChunkSize(source.chunk_size);
-      setChunkOverlap(source.chunk_overlap);
-      setScoreThreshold(source.score_threshold);
+      setEmbModel(source.emb_model ?? '');
+      setEmbDimension(source.emb_dimension ?? '');
+      setTopK(source.top_k ?? 5);
+      setChunkSize(source.chunk_size ?? 512);
+      setChunkOverlap(source.chunk_overlap ?? 64);
+      setScoreThreshold(source.score_threshold ?? 0.3);
       setUseGlobalEmb(false);
     } else {
       setName('');
@@ -190,9 +190,9 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
     isEdit &&
     source != null &&
     indexVector &&
-    (embBaseUrl.trim() !== source.emb_base_url ||
-      embModel.trim() !== source.emb_model ||
-      Number(embDimension) !== source.emb_dimension ||
+    ((embBaseUrl ?? '').trim() !== (source.emb_base_url ?? '') ||
+      (embModel ?? '').trim() !== (source.emb_model ?? '') ||
+      Number(embDimension) !== (source.emb_dimension ?? 0) ||
       embApiKey !== '');
 
   const switchOnVector = isEdit && source != null && !source.index_vector && indexVector;
@@ -203,7 +203,7 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
   const embeddingIncomplete =
     indexVector &&
     (isEdit ? true : !useGlobalEmb) &&
-    (!embBaseUrl.trim() || !embModel.trim() || embDimension === '' || Number(embDimension) < 1);
+    (!(embBaseUrl ?? '').trim() || !(embModel ?? '').trim() || embDimension === '' || Number(embDimension) < 1);
 
   // 创建模式下非 global 作用域必须绑定 client/workspace。
   const scopeValid =
@@ -215,16 +215,16 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
   const doUpdate = () => {
     if (!source) return;
     const payload: UpdateKnowledgeSourceRequest = {
-      name: name.trim(),
-      summary: summary.trim(),
+      name: (name ?? '').trim(),
+      summary: (summary ?? '').trim(),
       index_vector: indexVector,
       index_pages: indexPages,
     };
     if (indexVector) {
-      payload.emb_base_url = embBaseUrl.trim();
+      payload.emb_base_url = (embBaseUrl ?? '').trim();
       // 空串省略=保留旧密钥（后端 filter 语义），与 KbDialog 一致。
       if (embApiKey) payload.emb_api_key = embApiKey;
-      payload.emb_model = embModel.trim();
+      payload.emb_model = (embModel ?? '').trim();
       payload.emb_dimension = embDimension as number;
       payload.top_k = topK;
       payload.chunk_size = chunkSize;
@@ -241,7 +241,7 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
   };
 
   const submit = () => {
-    if (!name.trim()) return;
+    if (!(name ?? '').trim()) return;
     setSubmitError(null);
     const fail = (err: unknown) => {
       setSubmitError(t('ks.saveError', { error: getApiErrorMessage(err) }));
@@ -281,8 +281,8 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
     }
 
     const req: CreateKnowledgeSourceRequest = {
-      name: name.trim(),
-      summary: summary.trim(),
+      name: (name ?? '').trim(),
+      summary: (summary ?? '').trim(),
       index_vector: indexVector,
       index_pages: indexPages,
       scope_type: scope,
@@ -291,9 +291,9 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
     };
     if (indexVector) {
       if (!useGlobalEmb) {
-        req.emb_base_url = embBaseUrl.trim();
+        req.emb_base_url = (embBaseUrl ?? '').trim();
         if (embApiKey) req.emb_api_key = embApiKey;
-        req.emb_model = embModel.trim();
+        req.emb_model = (embModel ?? '').trim();
         req.emb_dimension = embDimension as number;
       }
       req.top_k = topK;
@@ -616,7 +616,7 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
               onClick={submit}
               disabled={
                 busy ||
-                !name.trim() ||
+                !(name ?? '').trim() ||
                 !hasAtLeastOneIndex ||
                 !scopeValid ||
                 (indexVector && embeddingIncomplete)

@@ -27,7 +27,7 @@ export default function SkillSection() {
       scope: filters.scope === 'all' ? undefined : filters.scope,
       client_id: filters.scope === 'client' ? filters.clientId || undefined : undefined,
       workspace_id: filters.scope === 'workspace' ? filters.workspaceId || undefined : undefined,
-      q: filters.q.trim() || undefined,
+      q: (filters.q ?? '').trim() || undefined,
       enabled: filters.enabledOnly || undefined,
     }),
     [filters],

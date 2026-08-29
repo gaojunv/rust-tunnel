@@ -67,7 +67,7 @@ export default function SourceList({
   const { t } = useTranslation();
   useKnowledgeStream();
 
-  const searching = filters.q.trim().length > 0;
+  const searching = (filters.q ?? '').trim().length > 0;
 
   return (
     <SectionFrame

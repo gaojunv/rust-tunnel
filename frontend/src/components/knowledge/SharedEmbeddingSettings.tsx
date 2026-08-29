@@ -31,10 +31,10 @@ export default function SharedEmbeddingSettings() {
   useEffect(() => {
     if (!settings || initRef.current) return;
     initRef.current = true;
-    setEmbBaseUrl(settings.emb_base_url);
+    setEmbBaseUrl(settings.emb_base_url ?? '');
     setEmbApiKey('');
-    setEmbModel(settings.emb_model);
-    setEmbDimension(settings.emb_dimension || '');
+    setEmbModel(settings.emb_model ?? '');
+    setEmbDimension(settings.emb_dimension ?? '');
   }, [settings]);
 
   const runTest = () => {
@@ -64,9 +64,9 @@ export default function SharedEmbeddingSettings() {
     setSaveError(null);
     updateMutation.mutate(
       {
-        emb_base_url: embBaseUrl.trim(),
+        emb_base_url: (embBaseUrl ?? '').trim(),
         ...(embApiKey ? { emb_api_key: embApiKey } : {}),
-        emb_model: embModel.trim(),
+        emb_model: (embModel ?? '').trim(),
         emb_dimension: typeof embDimension === 'number' ? embDimension : 0,
       },
       {

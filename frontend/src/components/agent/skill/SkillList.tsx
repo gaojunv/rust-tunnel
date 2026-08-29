@@ -113,7 +113,7 @@ export default function SkillList({
                   {s.enabled ? t('skill.enabled') : t('skill.disabled')}
                 </span>
                 <Badge variant="outline">{t(`skill.trigger_${s.source_trigger}`)}</Badge>
-                {s.tags.slice(0, 3).map((tag) => (
+                {(s.tags ?? []).slice(0, 3).map((tag) => (
                   <Badge key={tag} variant="secondary">
                     {tag}
                   </Badge>

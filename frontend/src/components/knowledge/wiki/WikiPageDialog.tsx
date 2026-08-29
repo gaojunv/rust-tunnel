@@ -39,10 +39,10 @@ export default function WikiPageDialog({ wikiId, open, onClose, page = null }: P
     if (initRef.current) return;
     initRef.current = true;
     if (page) {
-      setRef(page.ref);
-      setTitle(page.title);
-      setSummary(page.summary);
-      setContent(page.content);
+      setRef(page.ref ?? '');
+      setTitle(page.title ?? '');
+      setSummary(page.summary ?? '');
+      setContent(page.content ?? '');
     } else {
       setRef('');
       setTitle('');
@@ -54,7 +54,7 @@ export default function WikiPageDialog({ wikiId, open, onClose, page = null }: P
 
   // ref 规范：^[a-z0-9][a-z0-9/_-]{0,127}$（同后端 normalize_wiki_ref）
   const REF_RE = /^[a-z0-9][a-z0-9/_-]{0,127}$/;
-  const canSubmit = ref.trim() !== '' && REF_RE.test(ref.trim()) && content.trim() !== '';
+  const canSubmit = (ref ?? '').trim() !== '' && REF_RE.test((ref ?? '').trim()) && (content ?? '').trim() !== '';
 
   const submit = () => {
     if (!canSubmit) return;
@@ -62,8 +62,8 @@ export default function WikiPageDialog({ wikiId, open, onClose, page = null }: P
     putMutation.mutate(
       {
         wikiId,
-        ref: ref.trim(),
-        req: { ref: ref.trim(), title: title.trim(), summary: summary.trim(), content },
+        ref: (ref ?? '').trim(),
+        req: { ref: (ref ?? '').trim(), title: (title ?? '').trim(), summary: (summary ?? '').trim(), content: content ?? '' },
       },
       {
         onSuccess: onClose,

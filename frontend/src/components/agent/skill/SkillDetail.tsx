@@ -13,7 +13,7 @@ import {
   GitBranch,
 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
-import { useDeleteSkill, useToggleSkill } from '@/api/hooks';
+import { useDeleteSkill, useSkill, useToggleSkill } from '@/api/hooks';
 import Markdown from '@/components/agent/Markdown';
 import SkillDialog from './SkillDialog';
 import type { AgentSkill } from '@/types';
@@ -26,6 +26,8 @@ interface Props {
 
 export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
   const { t } = useTranslation();
+  const { data: fullSkill } = useSkill(skill.id);
+  const display = (fullSkill ?? skill) as AgentSkill;
   const toggleMutation = useToggleSkill();
   const deleteMutation = useDeleteSkill();
   const [editOpen, setEditOpen] = useState(false);
@@ -59,22 +61,22 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
             </Button>
             <div className="min-w-0">
               <CardTitle className="flex items-center gap-2 text-lg">
-                <span className="truncate">{skill.name}</span>
+                <span className="truncate">{display.name}</span>
                 <Badge variant="outline" className="shrink-0">
-                  {t(`skill.trigger_${skill.source_trigger}`)}
+                  {t(`skill.trigger_${display.source_trigger}`)}
                 </Badge>
               </CardTitle>
               <p className="mt-1 text-xs text-muted-foreground">
-                {t(`skill.scope_${skill.scope_type}`)}
-                {skill.client_id && ` · ${skill.client_id}`}
-                {skill.workspace_id && ` · ${skill.workspace_id}`}
+                {t(`skill.scope_${display.scope_type}`)}
+                {display.client_id && ` · ${display.client_id}`}
+                {display.workspace_id && ` · ${display.workspace_id}`}
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <Switch
-              checked={skill.enabled}
-              onCheckedChange={() => toggleMutation.mutate(skill.id)}
+              checked={display.enabled}
+              onCheckedChange={() => toggleMutation.mutate(display.id)}
               aria-label={t('skill.enabledSwitch')}
             />
             <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
@@ -105,7 +107,7 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
           <CardTitle className="text-base">{t('skill.contentTitle')}</CardTitle>
         </CardHeader>
         <CardContent className="p-4">
-          <Markdown content={skill.content} />
+          <Markdown content={display.content ?? ''} />
         </CardContent>
       </Card>
 
@@ -118,32 +120,32 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
           <div className="flex items-center gap-2">
             <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
             <span className="text-muted-foreground">{t('skill.sourceTrigger')}:</span>
-            <span>{t(`skill.trigger_${skill.source_trigger}`)}</span>
+            <span>{t(`skill.trigger_${display.source_trigger}`)}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.sourceSession')}:</span>
-            <span className="truncate">{skill.source_session_id || '—'}</span>
+            <span className="truncate">{display.source_session_id || '—'}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.useCount')}:</span>
-            <span>{skill.use_count}</span>
+            <span>{display.use_count}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.lastUsed')}:</span>
-            <span>{skill.last_used_at ?? t('skill.never')}</span>
+            <span>{display.last_used_at ?? t('skill.never')}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.createdAt')}:</span>
-            <span>{skill.created_at}</span>
+            <span>{display.created_at}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.updatedAt')}:</span>
-            <span>{skill.updated_at}</span>
+            <span>{display.updated_at}</span>
           </div>
         </CardContent>
       </Card>
 
-      <SkillDialog open={editOpen} onClose={() => setEditOpen(false)} skill={skill} />
+      <SkillDialog open={editOpen} onClose={() => setEditOpen(false)} skill={display} />
     </div>
   );
 }
