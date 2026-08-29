@@ -30,7 +30,7 @@ import { useChatHistory } from './useChatHistory';
 import { useAgentWs } from './useAgentWs';
 import { nextLiveItemId } from './liveId';
 
-const RUNNING_TIMEOUT_MS = 10 * 60 * 1000;
+const RUNNING_TIMEOUT_MS = 30 * 60 * 1000;
 
 interface Props {
   sessionId: string;

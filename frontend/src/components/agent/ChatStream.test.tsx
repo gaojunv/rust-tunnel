@@ -186,7 +186,7 @@ describe('ChatStream running state', () => {
     expect(screen.getByText(/agent.connectionInterrupted/)).toBeTruthy();
   });
 
-  it('force-clears running after 10min timeout', async () => {
+  it('force-clears running after 30min timeout', async () => {
     // 说明：vitest v4 + jsdom 环境下，组件模块内部调用的 setTimeout 不会被
     // vi.advanceTimersByTime 驱动（见 task-9 报告），因此改为 spy 捕获 10 分钟
     // 超时回调并确定性触发；断言语义不变：超时兜底必须无条件解除 Running。
@@ -194,7 +194,7 @@ describe('ChatStream running state', () => {
     const origSetTimeout = globalThis.setTimeout;
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(
       ((cb: () => void, ms?: number) => {
-        if (ms === 10 * 60 * 1000) timeoutCb = cb;
+        if (ms === 30 * 60 * 1000) timeoutCb = cb;
         return origSetTimeout(cb, ms ?? 0) as ReturnType<typeof setTimeout>;
       }) as typeof setTimeout,
     );
@@ -209,7 +209,7 @@ describe('ChatStream running state', () => {
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
-  it('resets the 10min running timeout on turn activity frames', async () => {
+  it('resets the 30min running timeout on turn activity frames', async () => {
     // 不活动兜底语义：回合活动帧（tool_call/assistant_chunk 等）到达必须重置
     // 倒计时——旧的绝对 10 分钟定时器会在 ACP 长回合流式推进中误报「响应超时」
     // 并过期仍在等待的审批卡，而回合其实还在正常跑。
@@ -220,7 +220,7 @@ describe('ChatStream running state', () => {
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(
       ((cb: () => void, ms?: number) => {
         const id = origSetTimeout(cb, ms ?? 0);
-        if (ms === 10 * 60 * 1000) armed.push({ cb, id });
+        if (ms === 30 * 60 * 1000) armed.push({ cb, id });
         return id;
       }) as typeof setTimeout,
     );
@@ -252,7 +252,7 @@ describe('ChatStream running state', () => {
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
-  it('does not reset the 10min timeout on config/title frames', async () => {
+  it('does not reset the 30min timeout on config/title frames', async () => {
     // 配置/标题类帧可能由无关操作触发（另一标签页切配置），不代表本回合在推进，
     // 不得重置不活动兜底——否则真卡死的回合永远等不到兜底。
     const armed: { cb: () => void; id: ReturnType<typeof setTimeout> }[] = [];
@@ -260,7 +260,7 @@ describe('ChatStream running state', () => {
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(
       ((cb: () => void, ms?: number) => {
         const id = origSetTimeout(cb, ms ?? 0);
-        if (ms === 10 * 60 * 1000) armed.push({ cb, id });
+        if (ms === 30 * 60 * 1000) armed.push({ cb, id });
         return id;
       }) as typeof setTimeout,
     );
@@ -300,7 +300,7 @@ describe('ChatStream running state', () => {
     vi.spyOn(globalThis, 'setTimeout').mockImplementation(
       ((cb: () => void, ms?: number) => {
         const id = origSetTimeout(cb, ms ?? 0);
-        if (ms === 10 * 60 * 1000) armed.push({ cb, id });
+        if (ms === 30 * 60 * 1000) armed.push({ cb, id });
         return id;
       }) as typeof setTimeout,
     );

@@ -20,7 +20,7 @@ use super::{AcpBridge, SpawnedAgent};
 async fn broadcast_turn_timeout(sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>, sid: &str) {
     let frame = serde_json::json!({
         "type": "status",
-        "message": "回合超时（10 分钟无响应），已自动取消"
+        "message": "回合超时（30 分钟无响应），已自动取消"
     });
     let conns: Vec<mpsc::Sender<serde_json::Value>> = {
         let mut map = sessions.lock().await;
@@ -42,9 +42,10 @@ const REAP_INTERVAL: Duration = Duration::from_mins(1);
 /// 回合级看门狗：单回合超此时长即触发 session/cancel（agent 在
 /// `cancel_grace` 内不响应则复用 cancel 兜底杀进程）。模型/上游网络挂起
 /// 时避免会话永久 busy——此前只能靠 idle reaper（30min）兜底，且活动刷新
-/// 可能让挂起回合永远不被回收。10 分钟对长任务（大重构/批量文件生成）
-/// 足够宽容，对真挂起（无任何事件到达）足够快。
-const TURN_TIMEOUT: Duration = Duration::from_mins(10);
+/// 可能让挂起回合永远不被回收。30 分钟对长任务（大重构/批量文件生成）
+/// 足够宽容，对真挂起（无任何事件到达）仍能及时回收（原 10 分钟过短，长
+/// 会话常被误杀）。
+const TURN_TIMEOUT: Duration = Duration::from_mins(30);
 
 impl AcpBridge {
     /// 后台回收空闲 ACP agent：超 `IDLE_TIMEOUT` 未活动即移除会话表条目并
