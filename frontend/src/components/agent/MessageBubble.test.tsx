@@ -802,7 +802,7 @@ describe('opencode bash 工具卡片展示', () => {
     expect(screen.getAllByText('cargo build').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('/Users/example/Projects/rust-tunnel')).toBeTruthy();
     // 不再曝露 raw JSON / cd 前缀
-    expect(screen.queryByText(/cd \/Users\/gaojun\/Projects\/rust-tunnel/)).toBeNull();
+    expect(screen.queryByText(/cd \/Users\/example\/Projects\/rust-tunnel/)).toBeNull();
     expect(screen.queryByText('{"command"')).toBeNull();
   });
 
