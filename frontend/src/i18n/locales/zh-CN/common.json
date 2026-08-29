@@ -25,7 +25,15 @@
     "add": "添加",
     "disabled": "已禁用",
     "confirm": "确认",
-    "saveError": "保存失败：{{error}}"
+    "saveError": "保存失败：{{error}}",
+    "toast": {
+      "saved": "已保存",
+      "deleted": "已删除",
+      "actionFailed": "操作失败：{{error}}"
+    },
+    "clearSearch": "清除搜索",
+    "loadMore": "加载更多",
+    "loadedOf": "已加载 {{loaded}} / 共 {{total}}"
   },
   "timeRange": {
     "custom": "自定义"
@@ -700,8 +708,7 @@
       "memory": "记忆",
       "skill": "技能",
       "roles": "角色"
-    },
-    "settingsHint": "在各分区右上角 ··· 打开设置"
+    }
   },
   "ks": {
     "title": "知识库",

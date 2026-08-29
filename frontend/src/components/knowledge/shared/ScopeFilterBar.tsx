@@ -2,8 +2,9 @@ import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Search } from 'lucide-react';
+import { Search, X } from 'lucide-react';
 import { useAgentWorkspaces, useClients } from '@/api/hooks';
 import { useDebouncedSearch } from './useDebouncedSearch';
 import type { AgentMemoryScope } from '@/types';
@@ -75,8 +76,22 @@ export default function ScopeFilterBar({
               onChange={(e) => setQInput(e.target.value)}
               placeholder={t(searchPlaceholderKey)}
               aria-label={t(searchPlaceholderKey)}
-              className="h-9 pl-8"
+              className="h-9 pl-8 pr-8"
             />
+            {qInput && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2"
+                aria-label={t('common.clearSearch')}
+                onClick={() => {
+                  setQInput('');
+                  onSearchChange('');
+                }}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         </div>
         {scope === 'client' && (

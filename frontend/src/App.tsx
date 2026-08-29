@@ -7,6 +7,7 @@ import { PreferencesProvider } from './preferences/PreferencesProvider';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import AppLayout from './components/layout/AppLayout';
+import { Toaster } from '@/components/ui/sonner';
 import './index.css';
 
 // 路由级代码分割：非首页页面按需加载（three.js / xterm / streamdown 等重依赖随之拆出首屏）
@@ -86,6 +87,7 @@ function App() {
         <I18nProvider>
           <QueryClientProvider client={queryClient}>
             <RouterProvider router={router} />
+            <Toaster richColors closeButton position="bottom-right" />
           </QueryClientProvider>
         </I18nProvider>
       </ThemeProvider>
