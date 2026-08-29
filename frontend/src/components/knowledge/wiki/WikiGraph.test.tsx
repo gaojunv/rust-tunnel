@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import type { WikiGraphEdge, WikiPageSummary } from '@/types';
-import WikiGraph from './WikiGraph';
+import WikiGraph, { shouldTreatAsClick } from './WikiGraph';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
@@ -53,7 +53,6 @@ const nodes: WikiPageSummary[] = [
 const edges: WikiGraphEdge[] = [
   { from: 'p1', from_ref: 'deploy/prod', to: 'p2', to_ref: 'deploy/checklist', dangling: false },
   { from: 'p2', from_ref: 'deploy/checklist', to: 'p3', to_ref: 'ops/monitor', dangling: false },
-  // 悬空边：目标页不存在
   { from: 'p1', from_ref: 'deploy/prod', to: null, to_ref: 'missing/page', dangling: true },
 ];
 
@@ -68,11 +67,9 @@ describe('WikiGraph（jsdom 退化模式：静态网格布局）', () => {
 
   it('renders all nodes with ref labels', () => {
     renderGraph();
-    // ref 同时出现在节点 <text> 标签与 <title> 工具提示中，用 getAllByText
     expect(screen.getAllByText('deploy/prod').length).toBeGreaterThan(0);
     expect(screen.getAllByText('deploy/checklist').length).toBeGreaterThan(0);
     expect(screen.getAllByText('ops/monitor').length).toBeGreaterThan(0);
-    // 每个节点一个 circle
     expect(document.querySelectorAll('g.wiki-node circle')).toHaveLength(3);
   });
 
@@ -90,7 +87,6 @@ describe('WikiGraph（jsdom 退化模式：静态网格布局）', () => {
     const dangling = document.querySelector('.wiki-edge-dangling');
     expect(dangling).toBeTruthy();
     expect(dangling!.getAttribute('stroke-dasharray')).toBe('6 4');
-    // 悬空边的目标 ref 作为标签渲染
     expect(screen.getByText('missing/page')).toBeTruthy();
   });
 
@@ -98,12 +94,25 @@ describe('WikiGraph（jsdom 退化模式：静态网格布局）', () => {
     const onNodeClick = vi.fn();
     renderGraph(onNodeClick);
     const node = document.querySelector('g.wiki-node[data-ref="deploy/checklist"]')!;
-    fireEvent.click(node.querySelector('circle')!);
+    fireEvent.click(node);
     expect(onNodeClick).toHaveBeenCalledWith('deploy/checklist');
   });
 
   it('renders an empty state when there are no nodes', () => {
     render(<WikiGraph nodes={[]} edges={[]} />);
     expect(screen.getByText('wiki.graphEmpty')).toBeTruthy();
+  });
+
+  it('shouldTreatAsClick: small move is click, large move is drag', () => {
+    expect(shouldTreatAsClick({ x: 0, y: 0 }, { x: 3, y: 4 })).toBe(true);
+    expect(shouldTreatAsClick({ x: 0, y: 0 }, { x: 10, y: 0 })).toBe(false);
+    expect(shouldTreatAsClick({ x: 5, y: 5 }, { x: 5, y: 5 })).toBe(true);
+  });
+
+  it('renders zoom controls', () => {
+    renderGraph();
+    expect(screen.getByLabelText('wiki.graphZoomIn')).toBeTruthy();
+    expect(screen.getByLabelText('wiki.graphZoomOut')).toBeTruthy();
+    expect(screen.getByLabelText('wiki.graphReset')).toBeTruthy();
   });
 });
