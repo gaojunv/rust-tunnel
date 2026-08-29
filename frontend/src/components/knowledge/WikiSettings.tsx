@@ -52,10 +52,7 @@ export default function WikiSettings() {
   return (
     <div className="space-y-4">
       <div className="flex flex-row flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 className="text-base font-semibold">{t('wiki.settings.title')}</h3>
-          <p className="mt-1 text-sm text-muted-foreground">{t('wiki.settings.enabledDesc')}</p>
-        </div>
+        <p className="text-sm text-muted-foreground">{t('wiki.settings.enabledDesc')}</p>
         <div className="flex items-center gap-2">
           <Switch
             checked={enabled}

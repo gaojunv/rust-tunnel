@@ -20,6 +20,14 @@ vi.mock('../../../api/client', () => ({
   getApiErrorMessage: (err: unknown) => (err as Error)?.message ?? String(err),
 }));
 
+vi.mock('@/utils/format', () => ({
+  formatDateTime: (s: string) => `fmt:${s}`,
+  formatBytes: (n: number) => `${n} B`,
+  formatBps: (n: number) => `${n} B/s`,
+  formatMs: (n: number) => `${n} ms`,
+  formatPercent: (n: number) => `${n}%`,
+}));
+
 const settingsFixture: AgentMemorySettings = {
   enabled: true,
   emb_base_url: 'https://emb.example.com/v1',
@@ -60,7 +68,6 @@ describe('MemorySettings', () => {
     api.updateMemorySettings.mockResolvedValue(settingsFixture);
     renderSettings();
 
-    // embedding 字段已移至页面顶部的共享设置（SharedEmbeddingSettings），此处不应渲染
     expect(screen.queryByLabelText('memory.settings.embBaseUrl')).toBeNull();
 
     await screen.findByDisplayValue('deepseek-chat');
@@ -81,15 +88,31 @@ describe('MemorySettings', () => {
     });
   });
 
-  it('clears all memories via the clear button', async () => {
+  it('组件内不再渲染 h3 标题（外层 DialogHeader 已有）', async () => {
+    api.getMemorySettings.mockResolvedValue(settingsFixture);
+    renderSettings();
+    await screen.findByDisplayValue('deepseek-chat');
+    // MemorySettings 内不再渲染 <h3>memory.settings.title</h3>
+    const headings = screen.queryAllByRole('heading', { level: 3 });
+    expect(headings.length).toBe(0);
+    // 描述文字仍保留
+    expect(screen.getByText('memory.settings.enabledDesc')).toBeTruthy();
+  });
+
+  it('清空走 ConfirmDialog 而非 window.confirm', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm');
     api.getMemorySettings.mockResolvedValue(settingsFixture);
     api.clearMemory.mockResolvedValue({});
     renderSettings();
 
     await screen.findByDisplayValue('deepseek-chat');
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     fireEvent.click(screen.getByText('memory.settings.clear'));
 
+    // 应弹出 ConfirmDialog（标题为拆分后的 clearConfirmTitle）
+    expect(await screen.findByText('memory.settings.clearConfirmTitle')).toBeTruthy();
+    expect(confirmSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText('common.confirm'));
     await waitFor(() => {
       expect(api.clearMemory).toHaveBeenCalled();
     });

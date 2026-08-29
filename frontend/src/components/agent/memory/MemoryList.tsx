@@ -6,17 +6,23 @@ import { Pin } from 'lucide-react';
 import { useMemoryStream } from '@/api/hooks';
 import ScopeFilterBar from '@/components/knowledge/shared/ScopeFilterBar';
 import SectionFrame from '@/components/knowledge/shared/SectionFrame';
+import LoadMoreFooter from '@/components/knowledge/shared/LoadMoreFooter';
+import { formatDateTime } from '@/utils/format';
 import { useTranslation } from 'react-i18next';
 import type { AgentMemory, AgentMemoryScope, MemoryFilters } from '@/types';
 
 interface Props {
   memories: AgentMemory[];
+  total?: number;
   filters: MemoryFilters;
   onFiltersChange: (filters: MemoryFilters) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
   onSettings?: () => void;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
 }
 
 function scopeVariant(scope: AgentMemoryScope): 'default' | 'secondary' | 'outline' {
@@ -25,22 +31,39 @@ function scopeVariant(scope: AgentMemoryScope): 'default' | 'secondary' | 'outli
   return 'outline';
 }
 
+function hasActiveFilter(filters: MemoryFilters): boolean {
+  return (
+    (filters.q ?? '').trim() !== '' ||
+    filters.scope !== 'all' ||
+    filters.pinned ||
+    !!filters.clientId ||
+    !!filters.workspaceId
+  );
+}
+
 export default function MemoryList({
   memories,
+  total,
   filters,
   onFiltersChange,
   selectedId,
   onSelect,
   onNew,
   onSettings,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: Props) {
   const { t } = useTranslation();
   useMemoryStream();
 
+  const effectiveTotal = total ?? memories.length;
+  const showLoadMore = hasMore !== undefined && onLoadMore !== undefined;
+
   return (
     <SectionFrame
       title={t('memory.listTitle')}
-      count={memories.length}
+      count={effectiveTotal}
       newLabel={t('memory.newMemory')}
       onNew={onNew}
       onSettings={onSettings}
@@ -72,44 +95,51 @@ export default function MemoryList({
       {memories.length === 0 ? (
         <Card>
           <CardContent className="p-6 text-center text-sm text-muted-foreground">
-            {t('memory.empty')}
+            {hasActiveFilter(filters) ? t('memory.noSearchResults') : t('memory.empty')}
           </CardContent>
         </Card>
       ) : (
-        memories.map((m) => (
-          <Card
-            key={m.id}
-            className={cn(
-              'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === m.id && 'border-primary/60 bg-primary/5',
-            )}
-            onClick={() => onSelect(m.id)}
-          >
-            <CardContent className="p-4">
-              <div className="flex items-start justify-between gap-2">
-                <p className="line-clamp-2 text-sm font-medium">{m.content}</p>
-                <Badge variant={scopeVariant(m.scope_type)} className="shrink-0">
-                  {t(`memory.scope_${m.scope_type}`)}
-                </Badge>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-                {m.pinned && (
-                  <span className="inline-flex items-center gap-0.5 text-primary">
-                    <Pin className="h-3 w-3" />
-                    {t('memory.pinned')}
-                  </span>
-                )}
-                <Badge variant="outline">{t(`memory.trigger_${m.source_trigger}`)}</Badge>
-                {m.tags.slice(0, 3).map((tag) => (
-                  <Badge key={tag} variant="secondary">
-                    {tag}
-                  </Badge>
-                ))}
-                <span className="ml-auto">{t('memory.hits', { count: m.hit_count })}</span>
-              </div>
-            </CardContent>
-          </Card>
-        ))
+        <>
+          {memories.map((m) => (
+            <Card
+              key={m.id}
+              className={cn(
+                'cursor-pointer transition-colors hover:border-primary/40',
+                selectedId === m.id && 'border-primary/60 bg-primary/5',
+              )}
+              onClick={() => onSelect(m.id)}
+            >
+              <CardContent className="flex h-12 items-center justify-between gap-2 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium leading-none" title={m.content}>
+                    {m.content}
+                  </p>
+                  <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    {m.pinned && <Pin className="h-3 w-3 shrink-0 text-primary" />}
+                    <Badge variant={scopeVariant(m.scope_type)} className="h-5 px-1.5 text-xs">
+                      {t(`memory.scope_${m.scope_type}`)}
+                    </Badge>
+                    <Badge variant="outline" className="h-5 px-1.5 text-xs">
+                      {t(`memory.trigger_${m.source_trigger}`)}
+                    </Badge>
+                    <span className="truncate text-xs">{formatDateTime(m.updated_at)}</span>
+                  </div>
+                </div>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {t('memory.hits', { count: m.hit_count })}
+                </span>
+              </CardContent>
+            </Card>
+          ))}
+          {showLoadMore && (
+            <LoadMoreFooter
+              loaded={memories.length}
+              total={effectiveTotal}
+              loading={loadingMore}
+              onLoadMore={onLoadMore}
+            />
+          )}
+        </>
       )}
     </SectionFrame>
   );

@@ -4,9 +4,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
+import { toast } from 'sonner';
 import {
   ArrowLeft,
-  Edit3,
   Loader2,
   Trash2,
   AlertTriangle,
@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
 import { useDeleteSkill, useSkill, useToggleSkill } from '@/api/hooks';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
+import { formatDateTime } from '@/utils/format';
 import Markdown from '@/components/agent/Markdown';
 import SkillDialog from './SkillDialog';
 import type { AgentSkill } from '@/types';
@@ -30,19 +32,35 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
   const display = (fullSkill ?? skill) as AgentSkill;
   const toggleMutation = useToggleSkill();
   const deleteMutation = useDeleteSkill();
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const [editOpen, setEditOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const remove = () => {
-    if (confirm(t('skill.deleteConfirm'))) {
-      setError(null);
-      deleteMutation.mutate(skill.id, {
-        onSuccess: onDeleted,
-        onError: (err) => {
-          setError(t('skill.saveError', { error: getApiErrorMessage(err) }));
-        },
-      });
-    }
+    confirm(
+      { title: t('skill.deleteConfirmTitle'), description: t('skill.deleteConfirmDesc') },
+      () => {
+        setError(null);
+        deleteMutation.mutate(skill.id, {
+          onSuccess: () => {
+            toast.success(t('common.toast.deleted'));
+            onDeleted();
+          },
+          onError: (err) => {
+            setError(t('skill.saveError', { error: getApiErrorMessage(err) }));
+          },
+        });
+      },
+    );
+  };
+
+  const handleToggle = () => {
+    setError(null);
+    toggleMutation.mutate(display.id, {
+      onError: (err) => {
+        setError(t('skill.saveError', { error: getApiErrorMessage(err) }));
+      },
+    });
   };
 
   return (
@@ -76,12 +94,9 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
           <div className="flex items-center gap-2">
             <Switch
               checked={display.enabled}
-              onCheckedChange={() => toggleMutation.mutate(display.id)}
+              onCheckedChange={handleToggle}
               aria-label={t('skill.enabledSwitch')}
             />
-            <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
-              <Edit3 className="mr-1 h-4 w-4" /> {t('common.edit')}
-            </Button>
             <Button variant="outline" size="sm" className="text-destructive" onClick={remove}>
               {deleteMutation.isPending ? (
                 <Loader2 className="mr-1 h-4 w-4 animate-spin" />
@@ -132,20 +147,29 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.lastUsed')}:</span>
-            <span>{display.last_used_at ?? t('skill.never')}</span>
+            <span>{display.last_used_at ? formatDateTime(display.last_used_at) : t('skill.never')}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.createdAt')}:</span>
-            <span>{display.created_at}</span>
+            <span>{formatDateTime(display.created_at)}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('skill.updatedAt')}:</span>
-            <span>{display.updated_at}</span>
+            <span>{formatDateTime(display.updated_at)}</span>
           </div>
         </CardContent>
       </Card>
 
       <SkillDialog open={editOpen} onClose={() => setEditOpen(false)} skill={display} />
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }

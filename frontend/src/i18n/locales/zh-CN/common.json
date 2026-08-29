@@ -822,7 +822,6 @@
     "description": "管理 AI 工作台的记忆：会话蒸馏、检索注入与手动维护",
     "listTitle": "记忆",
     "newMemory": "新建记忆",
-    "editMemory": "编辑记忆",
     "noSelection": "从列表中选择一条记忆以查看和管理",
     "empty": "暂无记忆。归档 AI 工作台会话将自动蒸馏记忆，或点击「新建记忆」手动添加。",
     "all": "全部",
@@ -883,8 +882,13 @@
       "clear": "清空重建",
       "clearDesc": "清空全部记忆与向量。更换 Embedding 模型前必须先清空。",
       "clearConfirm": "确定清空全部记忆？此操作不可撤销。",
-      "cleared": "已清空"
-    }
+      "cleared": "已清空",
+      "clearConfirmTitle": "清空全部记忆",
+      "clearConfirmDesc": "确定清空全部记忆？此操作将删除全部记忆与向量，且不可撤销。"
+    },
+    "noSearchResults": "无匹配记忆",
+    "deleteConfirmTitle": "删除记忆",
+    "deleteConfirmDesc": "删除这条记忆？此操作不可撤销。"
   },
   "skill": {
     "title": "技能库",
@@ -937,7 +941,10 @@
       "listMax": "清单最大条数",
       "save": "保存设置",
       "saved": "已保存"
-    }
+    },
+    "noSearchResults": "无匹配技能",
+    "deleteConfirmTitle": "删除技能",
+    "deleteConfirmDesc": "删除这个技能？此操作不可撤销。"
   },
   "role": {
     "title": "角色",

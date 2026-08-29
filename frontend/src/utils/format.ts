@@ -22,3 +22,11 @@ export const formatMs = (value: number): string => {
 
 export const formatPercent = (value: number): string =>
   (value * 100).toFixed(1) + '%';
+
+// 展示时间戳：ISO → 本地字符串，空/非法返回 '-'。
+export const formatDateTime = (iso: string | null | undefined): string => {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString();
+};
