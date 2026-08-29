@@ -75,21 +75,28 @@ impl SpawnManager {
         cwd: Option<&str>,
         control_tx: mpsc::Sender<ControlMessage>,
     ) -> Result<(), String> {
+        let aug_path = augmented_path();
         let mut cmd = Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if !env.iter().any(|(k, _)| k == "PATH") {
+            cmd.env("PATH", &aug_path);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        let mut child: Child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn '{command}' failed: {e}"))?;
+        let mut child: Child = cmd.spawn().map_err(|e| {
+            let cur_path = std::env::var("PATH").unwrap_or_default();
+            format!(
+                "spawn '{command}' failed: {e} (PATH='{cur_path}' augmented='{aug_path}')"
+            )
+        })?;
 
         let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
         let mut stdout = child.stdout.take().ok_or("no stdout pipe")?;
@@ -179,6 +186,39 @@ impl SpawnManager {
             false
         }
     }
+}
+
+fn augmented_path() -> String {
+    let proc_path = std::env::var("PATH").unwrap_or_default();
+    let login_path = shell_login_path();
+    merge_paths(&proc_path, &login_path)
+}
+
+fn shell_login_path() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let out = std::process::Command::new(&shell)
+        .args(["-l", "-c", "printf '%s' \"$PATH\""])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn merge_paths(a: &str, b: &str) -> String {
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut out: Vec<String> = Vec::new();
+    for part in a.split(':').chain(b.split(':')) {
+        let p = part.trim();
+        if p.is_empty() || !seen.insert(p.to_string()) {
+            continue;
+        }
+        out.push(p.to_string());
+    }
+    if out.is_empty() {
+        return b.to_string();
+    }
+    out.join(":")
 }
 
 #[cfg(test)]

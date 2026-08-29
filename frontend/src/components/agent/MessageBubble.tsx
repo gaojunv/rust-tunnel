@@ -9,6 +9,7 @@ import {
   ChevronUp,
   FileText,
   FileAudio,
+  Folder,
   Globe,
   Image as ImageIcon,
   ListChecks,
@@ -125,6 +126,69 @@ function basename(path: string): string {
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
 }
 
+/** 命令中的 `cd <path> && ` 前缀拆解：返回 `{command: 核心命令, cdDir: 最终目录}`。
+ *  非该形态原样返回（cdDir=null）。opencode 的 agent 常把 `cd <dir> && ` prepend 到
+ *  命令前（Claude 系模型尤甚，见 opencode #4982），标题/命令块只关心核心命令、
+ *  目录单独展示。连续 cd 链（`cd /a && cd /b && ls`）整体剥掉，cdDir 取最后一个
+ *  （最终工作目录）。路径 token 用 `[^\s&;]+` 防止把 `&&` 吞进路径。 */
+export function splitCdCommand(cmd: string): { command: string; cdDir: string | null } {
+  let trimmed = cmd.trim();
+  let cdDir: string | null = null;
+  const re = /^cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;]+))\s*&&\s+/;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(trimmed)) !== null) {
+    cdDir = m[1] ?? m[2] ?? m[3];
+    trimmed = trimmed.slice(m[0].length).trim();
+  }
+  return { command: trimmed || cmd.trim(), cdDir };
+}
+
+/** opencode bash 的 ACP title 是两行壳格式：`# Running in <dir>\n$ <command>`（无
+ *  目录时仅 `$ <command>`，见 opencode bash 工具的 ACP 渲染）。单行 truncate 时只
+ *  露出 `# Running in <dir>`、真实命令被挤到第二行截断——正是「全是 cwd、看不到
+ *  命令」的根因。从 title 解析出 command 与 cwd（`# Running in` 的目录已经过
+ *  opencode 相对化/`~` 化）。仅命中壳形态才解析：普通 title（claude-code 的命令
+ *  本体/占位词如 "Bash"/"Terminal"）返回全 null，交由原摘要链兜底。 */
+export function parseExecTitle(title: string | undefined): { command: string | null; cwd: string | null } {
+  const raw = (title ?? '').trim();
+  if (!raw) return { command: null, cwd: null };
+  const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  const isShell =
+    lines.some((l) => /^#\s*Running\s+in\s+\S/.test(l)) || lines.some((l) => l.startsWith('$'));
+  if (!isShell) return { command: null, cwd: null };
+  let cwd: string | null = null;
+  const rest: string[] = [];
+  for (const line of lines) {
+    const m = /^#\s*Running\s+in\s+(.+)$/.exec(line);
+    if (m) {
+      cwd = m[1].trim() || null;
+      continue;
+    }
+    rest.push(line.replace(/^\$\s?/, ''));
+  }
+  const command = rest.join('\n').trim();
+  return { command: command || null, cwd };
+}
+
+/** 从 args JSON 提取 execute 类工作目录：opencode 用 `workdir`，runner shell 用 `cwd`。
+ *  非 JSON / 无该字段返回 null。 */
+function execCwdFromArgs(args: string | undefined): string | null {
+  if (!args) return null;
+  try {
+    const v: unknown = JSON.parse(args);
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>;
+      const w = o.workdir;
+      if (typeof w === 'string' && w.trim()) return w.trim();
+      const c = o.cwd;
+      if (typeof c === 'string' && c.trim()) return c.trim();
+    }
+  } catch {
+    /* 非 JSON → 无 cwd */
+  }
+  return null;
+}
+
 /** 文件类工具别名（含空格版用于匹配 ACP title 前缀，如 "Edit src/a.ts"）。 */
 const FILE_ALIASES = [
   'read file', 'read_file', 'read', 'list directory', 'list dir', 'list_dir',
@@ -179,7 +243,12 @@ function toolSummary(
   };
   const nm = (name ?? '').toLowerCase();
   const isExec = kind === 'execute' || ['shell', 'bash', 'execute', 'run', 'sh', 'cmd'].includes(nm);
-  if (isExec) return str('cmd', 'command');
+  if (isExec) {
+    const cmd = str('cmd', 'command');
+    // opencode 场景 command 常被 prepend `cd <dir> && `（agent 行为），摘要剥前缀
+    // 只看核心命令，目录作为次要信息在卡片头部的 cwd 徽章单独展示。
+    return cmd ? splitCdCommand(cmd).command : null;
+  }
   // runner 规范工具名特殊摘要（须在通用 isFileTool 之前，否则被 path 覆盖）
   // read_file 行区间读取：offset/limit 参数时摘要为 basename:offset-end
   // 兼容 number 与可解析为有限正整数的字符串（LLM 有时传 "120"）
@@ -491,6 +560,12 @@ export function ToolCard({ item }: { item: ChatItem }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const { label, extra } = splitToolTitle(item.toolName, item.toolKind);
+  const kind = effectiveToolKind(item.toolName, item.toolKind);
+  // opencode bash 的 ACP title 是两行壳 `# Running in <dir>\n$ <command>`（无目录时仅
+  // `$ <command>`），单行 truncate 时只露目录、真实命令被挤到第二行截断（用户反馈
+  // 「全是 cwd 看不到命令」）。execute 类从 title 解析出真实命令，摘要链优先于 title
+  // 原文。
+  const execTitle = kind === 'execute' ? parseExecTitle(item.toolName) : null;
   // 摘要只显示一份：args 提取的结构化摘要优先（通常是绝对路径/命令），
   // 缺失时才用 title 内嵌目标（通常是相对路径）——两者同源，同显即用户反馈的
   // 「标题双重路径」问题；两者都无路径（如 ACP Edit 的 raw_input 为空占位、
@@ -498,6 +573,7 @@ export function ToolCard({ item }: { item: ChatItem }) {
   // 保证文件操作卡片头部始终能看到目标文件。
   const summary =
     toolSummary(item.toolName, item.toolKind, item.toolArgs) ??
+    execTitle?.command ??
     extra ??
     item.toolDiffs?.[0]?.path ??
     item.toolLocations?.[0]?.path ??
@@ -505,6 +581,9 @@ export function ToolCard({ item }: { item: ChatItem }) {
   // 文件类工具的摘要是路径：头部只显示文件名，完整路径挂 PathTip（悬浮/点击查看）
   const isFile = isFileTool(item.toolKind, item.toolName);
   const displaySummary = isFile && summary ? basename(summary) : summary;
+  // opencode bash 工作目录：title 壳的 `# Running in` 优先（opencode 已做相对化/~），
+  // 否则 args 的 workdir/cwd（runner shell 字段）。非 execute 恒 null。
+  const execCwd = kind === 'execute' ? (execTitle?.cwd ?? execCwdFromArgs(item.toolArgs)) : null;
   const status = resolveToolStatus(item);
   const isError = status === 'failed';
   // 不确定进度条：工具仍在执行（pending/in_progress/running，result 未产出）时
@@ -514,7 +593,6 @@ export function ToolCard({ item }: { item: ChatItem }) {
   // - 空参数（{} / null / 空串）没有信息量 → 不显示
   // - edit 类且带 diffs → diff 已是输入的完整呈现，args JSON 纯冗余
   // - read/search 类且头部摘要非空 → 摘要已表达输入要点（路径/搜索词），避免重复
-  const kind = effectiveToolKind(item.toolName, item.toolKind);
   const showArgs =
     !!item.toolArgs &&
     !isNoopArgs(item.toolArgs) &&
@@ -537,6 +615,16 @@ export function ToolCard({ item }: { item: ChatItem }) {
           ) : (
             <span className="min-w-0 truncate font-mono text-muted-foreground">{displaySummary}</span>
           )
+        )}
+        {/* opencode bash 执行目录：basename 小徽章 + PathTip 看全路径（命令本体已优先
+            显示在摘要位，目录是次要定位信息，不与命令抢位） */}
+        {execCwd && (
+          <PathTip path={execCwd}>
+            <span className="flex shrink-0 items-center gap-1">
+              <Folder className="h-3 w-3 shrink-0 text-muted-foreground/70" />
+              <span className="truncate font-mono">{basename(execCwd)}</span>
+            </span>
+          </PathTip>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           <StatusBadge item={item} />

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { cleanup, render, screen, fireEvent } from '@testing-library/react';
-import MessageBubble, { CollapsiblePre, effectiveToolKind, resolveToolStatus, splitToolTitle } from './MessageBubble';
+import MessageBubble, { CollapsiblePre, effectiveToolKind, parseExecTitle, resolveToolStatus, splitCdCommand, splitToolTitle } from './MessageBubble';
 import type { ChatItem } from './types';
 
 vi.mock('react-i18next', () => ({
@@ -723,6 +723,121 @@ describe('toolSummary enhanced for runner tools', () => {
     // git_* 工具 kind=other，但 effectiveToolKind 返回 other（Git label 来自 RUNNER_TOOL_META）
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('Git');
+  });
+});
+
+describe('opencode bash 工具卡片展示', () => {
+  afterEach(cleanup);
+
+  it('parseExecTitle 解析两行壳 title：命令提取、Running in 目录单独归位', () => {
+    expect(parseExecTitle('# Running in /Users/example/Projects/rust-tunnel\n$ cargo build')).toEqual({
+      command: 'cargo build',
+      cwd: '/Users/example/Projects/rust-tunnel',
+    });
+    expect(parseExecTitle('$ ls -la')).toEqual({ command: 'ls -la', cwd: null });
+    // 非壳形态（claude-code 命令本体/占位词）原样不解析，交由原摘要链
+    expect(parseExecTitle('Bash')).toEqual({ command: null, cwd: null });
+    expect(parseExecTitle('Terminal')).toEqual({ command: null, cwd: null });
+    expect(parseExecTitle('cargo build')).toEqual({ command: null, cwd: null });
+    expect(parseExecTitle(undefined)).toEqual({ command: null, cwd: null });
+  });
+
+  it('splitCdCommand 剥 cd 前缀链，cdDir 取最终目录', () => {
+    expect(splitCdCommand('cd /Users/example/Projects/rust-tunnel && cargo build')).toEqual({
+      command: 'cargo build',
+      cdDir: '/Users/example/Projects/rust-tunnel',
+    });
+    expect(splitCdCommand('cd /a && cd /b && ls')).toEqual({ command: 'ls', cdDir: '/b' });
+    expect(splitCdCommand('cd .. && ls')).toEqual({ command: 'ls', cdDir: '..' });
+    expect(splitCdCommand('cd "a b" && ls')).toEqual({ command: 'ls', cdDir: 'a b' });
+    // 无 && 链不剥（cd 就是命令本体）；无 cd 前缀原样
+    expect(splitCdCommand('cd src')).toEqual({ command: 'cd src', cdDir: null });
+    expect(splitCdCommand('cargo build')).toEqual({ command: 'cargo build', cdDir: null });
+  });
+
+  it('opencode 两行 title 卡片：头部显示真实命令而非 Running in 目录', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '',
+          toolName: '# Running in /Users/example/Projects/rust-tunnel\n$ cargo build',
+          toolKind: 'execute',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('cargo build');
+    expect(header.textContent).not.toContain('Running in');
+  });
+
+  it('command 带 cd 前缀：头部摘要只显示核心命令，cwd 目录缩成 basename 徽章', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'Bash', toolKind: 'execute',
+          toolArgs: '{"command":"cd /Users/example/Projects/rust-tunnel && cargo build","workdir":"/Users/example/Projects/rust-tunnel"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('cargo build');
+    // 目录徽章只显示 basename，完整路径不占头部
+    expect(header.textContent).toContain('rust-tunnel');
+    expect(header.textContent).not.toContain('cd /Users/example/Projects/rust-tunnel');
+  });
+
+  it('展开区：命令剥 cd 前缀成独立命令块，workdir 顶置为目录行', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'Bash', toolKind: 'execute',
+          toolArgs: '{"command":"cd /Users/example/Projects/rust-tunnel && cargo build","workdir":"/Users/example/Projects/rust-tunnel"}',
+          toolResult: 'done',
+          toolStatus: 'completed',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    // 命令块显示核心命令；目录行显示完整 workdir
+    expect(screen.getAllByText('cargo build').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('/Users/example/Projects/rust-tunnel')).toBeTruthy();
+    // 不再曝露 raw JSON / cd 前缀
+    expect(screen.queryByText(/cd \/Users\/gaojun\/Projects\/rust-tunnel/)).toBeNull();
+    expect(screen.queryByText('{"command"')).toBeNull();
+  });
+
+  it('execute 结果 JSON 结构化：stdout/exitCode 可读展示，不再吐 raw JSON', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'Bash', toolKind: 'execute',
+          toolArgs: '{"command":"cargo build"}',
+          toolResult: '{"stdout":"Compiling rust-tunnel v0.1.0","stderr":"","exitCode":0}',
+          toolStatus: 'completed',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText(/Compiling rust-tunnel/)).toBeTruthy();
+    // i18n mock 下 t(key) 原样返回 key，按字面量断言
+    expect(screen.getByText(/agent.exitCode/)).toBeTruthy();
+    expect(screen.queryByText('{"stdout"')).toBeNull();
+  });
+
+  it('execute 结果 JSON 含 stderr/非零退出码：红色报错与失败徽章', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'Bash', toolKind: 'execute',
+          toolArgs: '{"command":"npm run build"}',
+          toolResult: '{"stdout":"","stderr":"error TS2304","exitCode":1}',
+          toolStatus: 'failed',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText(/error TS2304/)).toBeTruthy();
+    expect(screen.getByText(/agent.exitCode/)).toBeTruthy();
   });
 });
 

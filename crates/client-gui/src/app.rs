@@ -1,27 +1,19 @@
-//! GUI 应用状态（watch/日志/配置/重连控制）。
-
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 use tokio::sync::watch;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer};
 
-/// GUI 全局状态。
 pub struct AppState {
-    /// 连接状态 watch 接收端。
     pub status_rx: watch::Receiver<ClientStatus>,
-    /// 连接状态 watch 发送端（由 control 回调驱动）。
     pub status_tx: Arc<watch::Sender<ClientStatus>>,
-    /// 本地环形日志缓冲。
     pub log_buffer: Arc<LogBuffer>,
-    /// 当前生效的配置（设置面板编辑后经保存落盘并触发重连）。
-    pub config: Option<ClientConfig>,
-    /// 重连取消标记：设置后后台 run 循环的下一次迭代感知并走重连。
-    pub reconnect_requested: Arc<std::sync::atomic::AtomicBool>,
+    pub config: Arc<Mutex<Option<ClientConfig>>>,
+    pub reconnect_requested: Arc<AtomicBool>,
+    pub should_exit: Arc<AtomicBool>,
 }
 
 impl AppState {
-    /// 创建初始状态。
     #[must_use]
     pub fn new(initial_status: ClientStatus) -> Self {
         let (tx, rx) = watch::channel(initial_status);
@@ -30,8 +22,20 @@ impl AppState {
             status_rx: rx,
             status_tx: tx,
             log_buffer: Arc::new(LogBuffer::default()),
-            config: None,
-            reconnect_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            config: Arc::new(Mutex::new(None)),
+            reconnect_requested: Arc::new(AtomicBool::new(false)),
+            should_exit: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[must_use]
+    pub fn config_snapshot(&self) -> Option<ClientConfig> {
+        self.config.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_config(&self, cfg: Option<ClientConfig>) {
+        if let Ok(mut g) = self.config.lock() {
+            *g = cfg;
         }
     }
 }

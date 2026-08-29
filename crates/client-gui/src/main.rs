@@ -5,6 +5,7 @@
 mod app;
 mod autostart;
 mod config_store;
+mod fonts;
 mod notify;
 mod tray;
 mod ui;
@@ -25,7 +26,7 @@ struct GuiApp {
 impl GuiApp {
     fn new(app_state: Arc<app::AppState>) -> Self {
         let settings = app_state
-            .config
+            .config_snapshot()
             .as_ref()
             .map(ui::settings::SettingsState::from_config)
             .unwrap_or_default();
@@ -39,7 +40,18 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 轮询托盘菜单动作
+        // 关闭拦截：点 × 仅隐藏到托盘，不退出进程；仅托盘"退出"置 should_exit 后才真正关闭
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let should_exit = self
+                .app_state
+                .should_exit
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if !should_exit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                return;
+            }
+        }
         for action in tray::poll_menu_actions() {
             match action {
                 tray::TrayAction::Show => {
@@ -58,6 +70,9 @@ impl eframe::App for GuiApp {
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 tray::TrayAction::Quit => {
+                    self.app_state
+                        .should_exit
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -65,30 +80,48 @@ impl eframe::App for GuiApp {
 
         let status = self.app_state.status_rx.borrow().clone();
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate() {
-                    let sel = self.selected_tab == idx;
-                    if ui.selectable_label(sel, *label).clicked() {
-                        self.selected_tab = idx;
+        egui::TopBottomPanel::top("tabs")
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate() {
+                        let sel = self.selected_tab == idx;
+                        if ui.selectable_label(sel, *label).clicked() {
+                            self.selected_tab = idx;
+                        }
                     }
-                }
+                });
+                ui.add_space(2.0);
             });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(10.0);
+            match self.selected_tab {
+                0 => ui::status::show(ui, &status),
+                1 => ui::mappings::show(ui, &status),
+                2 => ui::settings::show(ui, &mut self.settings, &self.app_state),
+                3 => ui::logs::show(ui, &self.app_state.log_buffer),
+                _ => {}
+            }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
-            0 => ui::status::show(ui, &status),
-            1 => ui::mappings::show(ui, &status),
-            2 => ui::settings::show(ui, &mut self.settings, self.app_state.config.as_ref()),
-            3 => ui::logs::show(ui, &self.app_state.log_buffer),
-            _ => {}
-        });
-
-        // 需要时重绘（状态变更由 watch 驱动 request_repaint）
-        ctx.request_repaint_after(Duration::from_millis(500));
+        let needs_repaint = !status.connected || status.last_error.is_some();
+        if needs_repaint {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(600));
+        }
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::map_unwrap_or,
+    reason = "GUI 托盘启动编排，一次性初始化链路拆分无益"
+)]
 fn spawn_runtime(
     app_state: Arc<app::AppState>,
     status_tx: Arc<tokio::sync::watch::Sender<ClientStatus>>,
@@ -106,7 +139,40 @@ fn spawn_runtime(
                 return;
             }
         };
-        rt.block_on(async move {
+        // GUI 初始化：先把磁盘配置写入 AppState.config 供状态面板"服务器/客户端名"即时回显
+        fn fill_keyring(c: &mut ClientConfig) {
+            if c.password.is_empty() {
+                let cname = c.name.as_deref().unwrap_or("");
+                if let Some(pw) = config_store::read_password_from_keyring(&c.server, cname) {
+                    c.password = pw;
+                }
+            }
+        }
+        let mut bootstrap = config_store::load_from_default_path()
+            .or_else(|| ClientConfig::load().ok());
+        if let Some(ref mut c) = bootstrap {
+            fill_keyring(c);
+            app_state.set_config(Some(c.clone()));
+            let mut s = app_state.status_rx.borrow().clone();
+            s.server.clone_from(&c.server);
+            s.client_name = c.name.clone().unwrap_or_default();
+            s.version = env!("CARGO_PKG_VERSION").to_string();
+            let _ = app_state.status_tx.send(s);
+        }
+        // GUI 全局日志初始化：立即可见（否则日志面板在首次连接前为空）
+        {
+            use rust_tunnel_client::{logs::ClientLogLayer, log_buffer::LogBuffer as LB};
+            use rust_tunnel_common::init_logging_with_layer;
+            let lb: Arc<LB> = log_buffer.clone();
+            let layer = ClientLogLayer::new();
+            layer.set_log_buffer(lb);
+            // 用当前 log 级别（若有配置否则 info）初始化；重复 init 内部 try_init 会静默忽略
+            let lvl = bootstrap.as_ref().map(|c| c.log.as_str()).unwrap_or("info");
+            init_logging_with_layer(lvl, layer);
+                    tracing::info!("GUI 已启动");
+                    tracing::info!("配置路径: {}", config_store::default_path().display());
+                }
+                rt.block_on(async move {
             // 初始配置：优先 GUI 默认路径，其次 CLI env/TOML
             let mut config = if let Some(c) = config_store::load_from_default_path() {
                 c
@@ -261,7 +327,10 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "Rust Tunnel",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(app_state)))),
+        Box::new(move |cc| {
+            fonts::setup_fonts(&cc.egui_ctx);
+            Ok(Box::new(GuiApp::new(app_state)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 

@@ -1096,6 +1096,8 @@
     "turnDuration": "上回合耗时",
     "plan": "执行计划",
     "toolFailed": "失败",
+    "exitCode": "退出码 {{code}}",
+    "noOutput": "无输出",
     "subagent": "子代理",
     "subagentTypeExplore": "探索",
     "subagentTypeGeneral": "通用",

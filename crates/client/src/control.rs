@@ -7,6 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+
+
 use crate::log_buffer::LogBuffer;
 use crate::logs::{spawn_log_forwarder, ClientLogLayer};
 use crate::status::ClientStatus;
@@ -683,6 +685,8 @@ async fn run_client_inner(
     register.write_to_stream(&mut writer).await?;
     info!("Sent Register to server (name='{client_name}')");
 
+    // 创建 writer channel 需在注册成功后与生命周期解耦：成功后显式构建
+    // ControlState 才能把 connected 同步到 GUI watch
     match ControlMessage::read_from_stream(&mut reader).await {
         Ok(Some(ControlMessage::RegisterResponse { success: true, .. })) => {
             info!("registered as '{client_name}'");
@@ -787,15 +791,21 @@ async fn run_client_inner(
     if let Some(tx) = status_tx {
         state = state.with_status_channel(tx);
     }
+    state.set_connected(true);
+    state.set_last_error(None);
 
     // Start heartbeat task
     tokio::spawn(start_heartbeat(sender));
 
-    // Process incoming messages from server
-    process_control_messages(&mut reader, state).await?;
-
-    warn!("Control connection terminated");
-    Ok(())
+    let result = process_control_messages(&mut reader, state.clone()).await;
+    state.set_connected(false);
+    if let Err(ref e) = result {
+        state.set_last_error(Some(e.to_string()));
+    }
+    if result.is_ok() {
+        warn!("Control connection terminated");
+    }
+    result
 }
 
 #[cfg(test)]

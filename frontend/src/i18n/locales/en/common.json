@@ -1099,6 +1099,8 @@
     "turnDuration": "Last turn took",
     "plan": "Plan",
     "toolFailed": "Failed",
+    "exitCode": "exit {{code}}",
+    "noOutput": "No output",
     "subagent": "Subagent",
     "subagentTypeExplore": "Explore",
     "subagentTypeGeneral": "General",

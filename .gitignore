@@ -6,6 +6,7 @@
 frontend/node_modules
 frontend/dist
 frontend-dist
+dist/
 data/rust-tunnel.db
 data/rust-tunnel.db-wal
 data/rust-tunnel.db-shm

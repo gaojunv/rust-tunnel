@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Folder } from 'lucide-react';
 import type { ToolKind } from './types';
-import { CollapsiblePre, effectiveToolKind } from './MessageBubble';
+import { CollapsiblePre, effectiveToolKind, splitCdCommand } from './MessageBubble';
 
 /** 短标量阈值：单行且 ≤120 字符的 string 直接一行 kv；更长的走折叠块。 */
 const SHORT_STRING_MAX = 120;
@@ -120,9 +121,21 @@ function Fields({ entries }: { entries: [string, unknown][] }) {
   );
 }
 
+/** execute 类参数的执行目录：命令内 `cd <dir> && ` 前缀目录优先（agent 常 prepend，
+ *  见 splitCdCommand），否则 opencode 的 workdir / runner shell 的 cwd 字段。 */
+function execWorkDir(parsed: Record<string, unknown>, cdDir: string | null): string | null {
+  if (cdDir) return cdDir;
+  for (const k of ['workdir', 'cwd'] as const) {
+    const v = parsed[k];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 /**
  * 结构化工具参数视图：把 toolArgs 的 raw JSON 转成人可读的分层展示。
- * - execute 类：description 说明行 + 命令块（多行 heredoc 原样换行），其余标量按通用规则
+ * - execute 类：description 说明行 + 执行目录行（basename 显示完整路径）+ 命令块
+ *   （多行 heredoc 原样换行，命令内 `cd <dir> && ` 前缀剥出归入目录行），其余标量按通用规则
  * - 其他：顶层字段短标量一行 kv、长文本/嵌套结构折叠块
  * - JSON 解析失败或非 plain object → 回退原文折叠（CollapsiblePre）
  */
@@ -137,15 +150,23 @@ export function ToolArgsView({ name, kind, args }: { name?: string; kind?: ToolK
           ? parsed.command
           : null;
     if (cmd) {
+      const { command, cdDir } = splitCdCommand(cmd);
+      const workDir = execWorkDir(parsed, cdDir);
       const description = typeof parsed.description === 'string' ? parsed.description : '';
       const rest = Object.entries(parsed).filter(
-        ([k]) => k !== 'cmd' && k !== 'command' && k !== 'description',
+        ([k]) => k !== 'cmd' && k !== 'command' && k !== 'description' && k !== 'workdir' && k !== 'cwd',
       );
       return (
         <div className="space-y-1.5">
           {description && <div className="text-xs text-muted-foreground">{description}</div>}
+          {workDir && (
+            <div className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+              <Folder className="h-3 w-3 shrink-0" />
+              <span className="truncate font-mono">{workDir}</span>
+            </div>
+          )}
           <pre className="whitespace-pre-wrap break-words rounded-md border border-border/60 bg-muted/60 px-2.5 py-1.5 font-mono text-xs">
-            {cmd}
+            {command}
           </pre>
           {rest.length > 0 && <Fields entries={rest} />}
         </div>
@@ -218,9 +239,73 @@ function ReadResult({ result, args }: { result: string; args?: string }) {
   );
 }
 
+/** 尝试把 execute 结果解析为 opencode bash 的结构化输出 `{stdout, stderr, exitCode}`
+ *  （失败时 ShellError.info 同构，stdout/stderr 经 toJSON 已是字符串）。仅当对象含
+ *  至少一个已知键才判定——普通纯文本 JSON.parse 失败即返回 null，不会误伤。 */
+function parseExecResultObject(
+  result: string,
+): { stdout: string; stderr: string; exitCode: number | null } | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(result);
+  } catch {
+    return null;
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  if (!('stdout' in o) && !('stderr' in o) && !('exitCode' in o)) return null;
+  const str = (x: unknown): string => (typeof x === 'string' ? x : typeof x === 'number' ? String(x) : '');
+  return {
+    stdout: str(o.stdout),
+    stderr: str(o.stderr),
+    exitCode: typeof o.exitCode === 'number' ? o.exitCode : null,
+  };
+}
+
+/** opencode bash 执行结果（`{stdout, stderr, exitCode}` JSON）的结构化展示：
+ *  exitCode 徽章 + stdout 主输出 + stderr 报错（红色区分）。非该形态回退终端
+ *  深色文本。 */
+function ExecResult({ result }: { result: string }) {
+  const { t } = useTranslation();
+  const parsed = parseExecResultObject(result);
+  if (!parsed) {
+    return (
+      <CollapsiblePre
+        text={result}
+        preClassName="rounded-md bg-zinc-950 px-2.5 py-1.5 font-mono text-zinc-100"
+      />
+    );
+  }
+  const { stdout, stderr, exitCode } = parsed;
+  return (
+    <div className="space-y-1.5">
+      {exitCode != null && (
+        <div className={exitCode === 0 ? 'text-xs text-green-600' : 'text-xs text-destructive'}>
+          {exitCode === 0 ? '✓' : '✗'} {t('agent.exitCode', { code: exitCode })}
+        </div>
+      )}
+      {stdout && (
+        <CollapsiblePre
+          text={stdout}
+          preClassName="rounded-md bg-zinc-950 px-2.5 py-1.5 font-mono text-zinc-100"
+        />
+      )}
+      {stderr && (
+        <CollapsiblePre
+          text={stderr}
+          preClassName="rounded-md bg-zinc-950 px-2.5 py-1.5 font-mono text-red-400"
+        />
+      )}
+      {!stdout && !stderr && (
+        <div className="text-xs text-muted-foreground">{t('agent.noOutput')}</div>
+      )}
+    </div>
+  );
+}
+
 /**
  * 结构化工具结果视图：按工具类别选择展示形态。
- * - execute：终端深色输出块（折叠复用 CollapsiblePre 阈值逻辑，preClassName 换肤）
+ * - execute：opencode bash 的 `{stdout,stderr,exitCode}` JSON 结构化；其余走终端深色输出块
  * - read：marker caption + 行号 gutter（ACP 自带行号原样透传）
  * - search：代码块样式（path:line: 匹配 文本）
  * - 其他：原文折叠（CollapsiblePre）
@@ -242,12 +327,7 @@ export function ToolResultView({
   let content: ReactNode;
   const eff = effectiveToolKind(name, kind);
   if (eff === 'execute') {
-    content = (
-      <CollapsiblePre
-        text={result}
-        preClassName="rounded-md bg-zinc-950 px-2.5 py-1.5 font-mono text-zinc-100"
-      />
-    );
+    content = <ExecResult result={result} />;
   } else if (eff === 'read') {
     content = <ReadResult result={result} args={args} />;
   } else if (eff === 'search') {
