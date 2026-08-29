@@ -17,6 +17,8 @@ data/tls/
 .env
 **/.DS_Store
 .claude/
+.vscode/
+docs/
 server.toml
 client.toml
 # deploy-server skill 渲染生成的部署配置（含明文密码，勿提交）
