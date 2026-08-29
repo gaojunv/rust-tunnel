@@ -22,7 +22,11 @@ pub fn show(ui: &mut Ui, status: &ClientStatus) {
             ui.add_space(6.0);
             status_dot(
                 ui,
-                if status.connected { "已连接" } else { "离线" },
+                if status.connected {
+                    "已连接"
+                } else {
+                    "离线"
+                },
                 status.connected,
             );
             egui::Grid::new("status_grid")
@@ -75,11 +79,17 @@ pub fn show(ui: &mut Ui, status: &ClientStatus) {
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("最近隧道").strong().small());
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().max_height(92.0).show(ui, |ui| {
-                    for (id, addr, _) in status.recent_tunnels.iter().take(8) {
-                        ui.label(egui::RichText::new(format!("{id}: {addr}")).small().monospace());
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(92.0)
+                    .show(ui, |ui| {
+                        for (id, addr, _) in status.recent_tunnels.iter().take(8) {
+                            ui.label(
+                                egui::RichText::new(format!("{id}: {addr}"))
+                                    .small()
+                                    .monospace(),
+                            );
+                        }
+                    });
             });
     }
 }

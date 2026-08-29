@@ -102,6 +102,10 @@ fn is_valid_github_name(s: &str) -> bool {
 
 /// 解密 workspace 的 github_token：无 token → `Ok(None)`；解密失败（主密钥缺失 /
 /// 轮换 / 数据损坏）→ 400。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 async fn decrypt_workspace_token(
     state: &ApiState,
     ws: &AgentWorkspaceRecord,
@@ -203,6 +207,10 @@ struct GithubCtx {
 
 /// 统一前置：加载 workspace（404）、解密 token（无 token → 400）、解析 owner/repo
 /// （手填 + 探测都失败 → 400）。写操作在拿到 ctx 后再做 409 审批判定。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 async fn load_github_ctx(
     state: &ApiState,
     workspace_id: &str,

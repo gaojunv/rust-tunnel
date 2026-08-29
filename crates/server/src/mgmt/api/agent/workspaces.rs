@@ -327,6 +327,10 @@ pub async fn delete_workspace(
 /// 面板执行辅助：加载 workspace、docker container 存在性检查、经隧道执行命令。
 /// 错误一律映射为 HTTP 响应（404/503），与 `list_workspace_files` 的语义一致：
 /// 客户端离线/隧道失败/exec 错误 → 503（前端区分「离线」与「空结果」）。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 async fn workspace_exec(
     state: &ApiState,
     workspace_id: &str,
@@ -363,6 +367,10 @@ async fn workspace_exec(
 /// 加载 workspace + docker 容器存在性检查 + GitExec 客户端版本门控。
 /// GitExec 是新 bincode 变体：老客户端（<0.5.0）收到会反序列化失败断开控制连接，
 /// 必须在服务端短路为 409 提示升级（面板读/写端点统一走这里）。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 async fn load_git_workspace(
     state: &ApiState,
     workspace_id: &str,
@@ -400,6 +408,10 @@ async fn load_git_workspace(
 /// Git 读端点统一流程：加载+版本门控 → git_plan 校验（fail-closed 400）→ 隧道执行。
 /// 返回 FileContent 原文；git 命令失败保留 stderr（503 + error 体，区别于旧的
 /// workspace_exec 裸 503，便于面板展示 git 错误信息）。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 async fn run_git_read(
     state: &ApiState,
     workspace_id: &str,

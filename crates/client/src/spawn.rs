@@ -93,9 +93,7 @@ impl SpawnManager {
         }
         let mut child: Child = cmd.spawn().map_err(|e| {
             let cur_path = std::env::var("PATH").unwrap_or_default();
-            format!(
-                "spawn '{command}' failed: {e} (PATH='{cur_path}' augmented='{aug_path}')"
-            )
+            format!("spawn '{command}' failed: {e} (PATH='{cur_path}' augmented='{aug_path}')")
         })?;
 
         let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;

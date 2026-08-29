@@ -352,8 +352,7 @@ pub fn default_config_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library/Application Support/rust-tunnel/client.toml");
+            return PathBuf::from(home).join("Library/Application Support/rust-tunnel/client.toml");
         }
     }
     #[cfg(target_os = "windows")]

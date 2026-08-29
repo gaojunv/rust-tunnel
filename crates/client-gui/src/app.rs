@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use tokio::sync::watch;
 

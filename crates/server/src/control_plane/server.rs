@@ -304,9 +304,9 @@ fn rule_references_client(
 }
 
 fn truncate_summary_for_limit(mut summary: MappingSummary) -> Option<MappingSummary> {
-    let Ok(bytes) =
-        bincode::serialize(&ControlMessage::ClientMappingSummary { summary: summary.clone() })
-    else {
+    let Ok(bytes) = bincode::serialize(&ControlMessage::ClientMappingSummary {
+        summary: summary.clone(),
+    }) else {
         return Some(summary);
     };
     if bytes.len() + 4 <= MAX_CONTROL_MSG_BYTES {
@@ -351,7 +351,10 @@ fn truncate_summary_for_limit(mut summary: MappingSummary) -> Option<MappingSumm
 
 /// 构造映射摘要：过滤 `kind == Client && client_name == X` 的规则，拼 `RuleSummary`，
 /// 并填充 `connected_at`/`active_tunnels`/`rtt_ms`/`truncated`。
-#[allow(clippy::too_many_lines, reason = "映射摘要组装含规则过滤+摘要拼装+1MB截断，共享局部状态拆分反而降低可读性")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "映射摘要组装含规则过滤+摘要拼装+1MB截断，共享局部状态拆分反而降低可读性"
+)]
 async fn build_mapping_summary(
     state: &ServerState,
     entry: &crate::control_plane::client_registry::ClientEntry,
@@ -417,10 +420,7 @@ async fn build_mapping_summary(
 
 /// 向单个在线客户端增量推送最新映射摘要（供反代规则变更后调用）。
 /// 内部做版本门控与 1MB 截断；客户端离线或不支持则静默返回 false。
-pub async fn push_mapping_summary_to_client(
-    state: &ServerState,
-    client_name: &str,
-) -> bool {
+pub async fn push_mapping_summary_to_client(state: &ServerState, client_name: &str) -> bool {
     let Some(registry) = state.client_registry.as_ref() else {
         return false;
     };
@@ -538,6 +538,7 @@ pub async fn run_server(
 
         tracing::debug!("New control connection from {}", addr);
 
+        #[allow(clippy::large_futures, reason = "长连接任务一生一次，栈大小可接受")]
         tokio::spawn(async move {
             // Wrap TCP stream with TLS if enabled
             let result = if let Some(acceptor) = tls_acceptor_clone {

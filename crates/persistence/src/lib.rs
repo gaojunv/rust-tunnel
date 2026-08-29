@@ -98,6 +98,15 @@ impl Database {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=67108864")
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect_with(options)
             .await?;
 

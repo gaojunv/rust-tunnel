@@ -30,7 +30,7 @@ missing_docs = "deny"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "process", "signal"] }
 thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -146,6 +146,12 @@ zip.workspace = true
 debug = 1
 opt-level = 1
 incremental = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
 
 [profile.dev]
 opt-level = 0

@@ -2,13 +2,15 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::Level;
 use tracing_subscriber::Layer;
 
 use crate::db::Database;
+
+const LOG_CHANNEL_CAPACITY: usize = 2048;
 
 /// 日志落库批量刷盘间隔：500ms，平衡实时性与 DB 压力。
 const LOG_FLUSH_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(500);
@@ -29,8 +31,8 @@ pub struct LogStore {
     pub tx: broadcast::Sender<LogEntry>,
     /// Dynamic log level (0=TRACE, 1=DEBUG, 2=INFO, 3=WARN, 4=ERROR)
     pub level: Arc<AtomicU8>,
-    /// Buffer write channel — non-blocking send from tracing layer
-    buffer_tx: mpsc::UnboundedSender<LogEntry>,
+    buffer_tx: mpsc::Sender<LogEntry>,
+    dropped_logs: Arc<AtomicU64>,
 }
 
 struct LogStoreInner {
@@ -85,7 +87,8 @@ impl LogStore {
     #[must_use]
     pub fn new(db: Option<Database>) -> Self {
         let (tx, _rx) = broadcast::channel(256);
-        let (buffer_tx, mut buffer_rx) = mpsc::unbounded_channel::<LogEntry>();
+        let (buffer_tx, mut buffer_rx) = mpsc::channel::<LogEntry>(LOG_CHANNEL_CAPACITY);
+        let dropped_logs = Arc::new(AtomicU64::new(0));
 
         let store = Self {
             inner: Arc::new(Mutex::new(LogStoreInner {
@@ -96,6 +99,7 @@ impl LogStore {
             tx,
             level: Arc::new(AtomicU8::new(level_to_u8(Level::INFO))),
             buffer_tx,
+            dropped_logs: dropped_logs.clone(),
         };
 
         // Spawn background task
@@ -158,9 +162,23 @@ impl LogStore {
         Self::new(None)
     }
 
-    /// Send a log entry through the non-blocking channel
+    /// Send a log entry through the bounded channel (drops on backpressure).
     pub fn send(&self, entry: LogEntry) {
-        let _ = self.buffer_tx.send(entry);
+        if self.buffer_tx.try_send(entry).is_err() {
+            let prev = self.dropped_logs.fetch_add(1, Ordering::Relaxed);
+            if prev.is_multiple_of(100) {
+                tracing::warn!(
+                    dropped = prev + 1,
+                    "Log channel full, dropping entries (backpressure)"
+                );
+            }
+        }
+    }
+
+    /// Number of log entries dropped due to channel backpressure.
+    #[must_use]
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_logs.load(Ordering::Relaxed)
     }
 
     /// Get all buffered entries (for historical loading)

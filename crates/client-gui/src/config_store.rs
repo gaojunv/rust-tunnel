@@ -53,9 +53,7 @@ pub fn load_from_default_path() -> Option<ClientConfig> {
 /// 当序列化或文件写入失败时返回 `Err`。
 pub fn save_to_default_path(config: &ClientConfig) -> Result<(), StoreError> {
     let path = default_path();
-    config
-        .save_to_path(&path)
-        .map_err(StoreError::Save)
+    config.save_to_path(&path).map_err(StoreError::Save)
 }
 
 /// 钥匙串 service 固定为 `rust-tunnel`。
@@ -85,8 +83,8 @@ pub fn write_password_to_keyring(
     password: &str,
 ) -> Result<(), StoreError> {
     let account = keyring_account(server, client_name);
-    let entry =
-        keyring::Entry::new(KEYRING_SERVICE, &account).map_err(|e| StoreError::Keyring(e.to_string()))?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
+        .map_err(|e| StoreError::Keyring(e.to_string()))?;
     entry
         .set_password(password)
         .map_err(|e| StoreError::Keyring(e.to_string()))

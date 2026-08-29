@@ -46,8 +46,10 @@ fn validate_font_bytes(data: &FontData) -> bool {
     if bytes.len() < 4 {
         return false;
     }
-    matches!(&bytes[0..4], b"ttcf" | b"OTTO" | b"true" | b"\x00\x01\x00\x00")
-        || (bytes[0] == 0 && bytes[1] == 1)
+    matches!(
+        &bytes[0..4],
+        b"ttcf" | b"OTTO" | b"true" | b"\x00\x01\x00\x00"
+    ) || (bytes[0] == 0 && bytes[1] == 1)
 }
 
 fn cjk_candidates() -> Vec<(String, u32)> {
@@ -59,7 +61,10 @@ fn cjk_candidates() -> Vec<(String, u32)> {
         }
         v.push(("/System/Library/Fonts/Hiragino Sans GB.ttc".to_string(), 0));
         v.push(("/System/Library/Fonts/STHeiti Light.ttc".to_string(), 1));
-        v.push(("/System/Library/Fonts/Supplemental/Songti.ttc".to_string(), 6));
+        v.push((
+            "/System/Library/Fonts/Supplemental/Songti.ttc".to_string(),
+            6,
+        ));
     }
     #[cfg(target_os = "windows")]
     {

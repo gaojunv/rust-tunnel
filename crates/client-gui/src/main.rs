@@ -10,7 +10,7 @@ mod notify;
 mod tray;
 mod ui;
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
 use eframe::egui;
@@ -86,7 +86,8 @@ impl eframe::App for GuiApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate() {
+                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate()
+                    {
                         let sel = self.selected_tab == idx;
                         if ui.selectable_label(sel, *label).clicked() {
                             self.selected_tab = idx;
@@ -148,8 +149,8 @@ fn spawn_runtime(
                 }
             }
         }
-        let mut bootstrap = config_store::load_from_default_path()
-            .or_else(|| ClientConfig::load().ok());
+        let mut bootstrap =
+            config_store::load_from_default_path().or_else(|| ClientConfig::load().ok());
         if let Some(ref mut c) = bootstrap {
             fill_keyring(c);
             app_state.set_config(Some(c.clone()));
@@ -161,7 +162,7 @@ fn spawn_runtime(
         }
         // GUI 全局日志初始化：立即可见（否则日志面板在首次连接前为空）
         {
-            use rust_tunnel_client::{logs::ClientLogLayer, log_buffer::LogBuffer as LB};
+            use rust_tunnel_client::{log_buffer::LogBuffer as LB, logs::ClientLogLayer};
             use rust_tunnel_common::init_logging_with_layer;
             let lb: Arc<LB> = log_buffer.clone();
             let layer = ClientLogLayer::new();
@@ -169,10 +170,10 @@ fn spawn_runtime(
             // 用当前 log 级别（若有配置否则 info）初始化；重复 init 内部 try_init 会静默忽略
             let lvl = bootstrap.as_ref().map(|c| c.log.as_str()).unwrap_or("info");
             init_logging_with_layer(lvl, layer);
-                    tracing::info!("GUI 已启动");
-                    tracing::info!("配置路径: {}", config_store::default_path().display());
-                }
-                rt.block_on(async move {
+            tracing::info!("GUI 已启动");
+            tracing::info!("配置路径: {}", config_store::default_path().display());
+        }
+        rt.block_on(async move {
             // 初始配置：优先 GUI 默认路径，其次 CLI env/TOML
             let mut config = if let Some(c) = config_store::load_from_default_path() {
                 c
@@ -213,7 +214,9 @@ fn spawn_runtime(
                 let cfg = config.clone();
                 let tx = status_tx.clone();
                 let lb = log_buffer.clone();
-                let res = rust_tunnel_client::control::run_client_with_status(cfg, Some(tx), Some(lb)).await;
+                let res =
+                    rust_tunnel_client::control::run_client_with_status(cfg, Some(tx), Some(lb))
+                        .await;
 
                 match res {
                     Ok(()) => {
@@ -251,12 +254,16 @@ fn spawn_runtime(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if reconnect_flag.load(std::sync::atomic::Ordering::SeqCst) {
                         reconnect_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                        if let Some(c) = config_store::load_from_default_path().or_else(|| ClientConfig::load().ok()) {
+                        if let Some(c) = config_store::load_from_default_path()
+                            .or_else(|| ClientConfig::load().ok())
+                        {
                             // 钥匙串回填
                             let mut c2 = c;
                             if c2.password.is_empty() {
                                 let cn = c2.name.as_deref().unwrap_or("");
-                                if let Some(pw) = config_store::read_password_from_keyring(&c2.server, cn) {
+                                if let Some(pw) =
+                                    config_store::read_password_from_keyring(&c2.server, cn)
+                                {
                                     c2.password = pw;
                                 }
                             }
@@ -293,12 +300,7 @@ fn main() -> anyhow::Result<()> {
     let reconnect_flag = app_state.reconnect_requested.clone();
 
     // 后台 tokio 运行时（控制通道/隧道）
-    spawn_runtime(
-        app_state.clone(),
-        status_tx,
-        log_buffer,
-        reconnect_flag,
-    );
+    spawn_runtime(app_state.clone(), status_tx, log_buffer, reconnect_flag);
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，
     // 此处先构建托盘（持有生命周期），再起 eframe。

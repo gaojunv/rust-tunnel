@@ -7590,10 +7590,8 @@ dependencies = [
  "instant-acme",
  "jsonwebtoken",
  "libc",
- "lopdf",
  "md-5",
  "mime_guess",
- "quick-xml 0.31.0",
  "rand 0.8.6",
  "rcgen",
  "reqwest 0.12.28",
@@ -7631,7 +7629,6 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "x509-parser 0.16.0",
- "zip",
 ]
 
 [[package]]
@@ -7639,6 +7636,7 @@ name = "rust-tunnel-stats"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "parking_lot",
  "rust-tunnel-common",
  "rust-tunnel-persistence",
  "serde",

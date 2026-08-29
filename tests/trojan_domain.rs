@@ -39,6 +39,7 @@ fn test_config(db_path: &str, api_port: u16) -> ServerConfig {
         log: "warn".to_string(),
         db_path: db_path.to_string(),
         client_dist_dir: "./client".to_string(),
+        wiki_dist_dir: "./wiki".to_string(),
         ss_enabled: false,
         ss_port: None,
         ss_cipher: None,

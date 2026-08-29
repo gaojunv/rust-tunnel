@@ -7,15 +7,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-
-
 use crate::log_buffer::LogBuffer;
 use crate::logs::{spawn_log_forwarder, ClientLogLayer};
 use crate::status::ClientStatus;
 use crate::{proxy, spawn::SpawnManager, ClientConfig};
 use rust_tunnel_common::{
-    connect_tls_insecure, init_logging_with_layer, protocol::MappingSummary, ClientLogEntry, ControlMessage, MeshServiceDef,
-    TunnelError, TunnelResult,
+    connect_tls_insecure, init_logging_with_layer, protocol::MappingSummary, ClientLogEntry,
+    ControlMessage, MeshServiceDef, TunnelError, TunnelResult,
 };
 
 /// 控制通道心跳间隔：30s，兼顾 NAT 保活与服务端超时检测。
@@ -109,7 +107,10 @@ impl ClientState {
     #[must_use]
     pub fn snapshot(&self) -> ClientStatus {
         // Try to read without blocking async context; fallback to default if contended
-        self.status_inner.try_lock().map(|g| g.clone()).unwrap_or_default()
+        self.status_inner
+            .try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// 更新 RTT 并广播。
@@ -340,7 +341,10 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         .wrapping_sub(ping_timestamp_micros);
                         let server_processing_time =
                             pong_timestamp_micros.wrapping_sub(ping_timestamp_micros);
-                        #[allow(clippy::cast_precision_loss, reason = "RTT micros fits in f64 mantissa for realistic values")]
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            reason = "RTT micros fits in f64 mantissa for realistic values"
+                        )]
                         let rtt_ms = client_rtt_micros as f64 / 1000.0;
                         state.set_rtt(rtt_ms);
                         debug!(
@@ -779,7 +783,8 @@ async fn run_client_inner(
     }
 
     // 本地环形缓冲（托盘/GUI 拉取），与远端上报双写
-    let log_buffer = shared_log_buffer.unwrap_or_else(|| std::sync::Arc::new(crate::log_buffer::LogBuffer::default()));
+    let log_buffer = shared_log_buffer
+        .unwrap_or_else(|| std::sync::Arc::new(crate::log_buffer::LogBuffer::default()));
     if let Some(stored) = LOG_LAYER.get() {
         stored.set_sender(log_tx);
         stored.set_log_buffer(log_buffer.clone());

@@ -9,8 +9,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::time::Instant;
+
+use parking_lot::Mutex as ParkMutex;
 
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -195,7 +196,7 @@ impl EntityStats {
 /// Thread-safe, cloneable handle to the unified stats collector.
 #[derive(Clone)]
 pub struct StatsCollector {
-    inner: Arc<StdMutex<HashMap<(EntityType, String), EntityStats>>>,
+    inner: Arc<ParkMutex<HashMap<(EntityType, String), EntityStats>>>,
     db: Option<Database>,
     tx: broadcast::Sender<StatsSnapshot>,
 }
@@ -206,7 +207,7 @@ impl StatsCollector {
     pub fn new(db: Option<Database>) -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
-            inner: Arc::new(StdMutex::new(HashMap::new())),
+            inner: Arc::new(ParkMutex::new(HashMap::new())),
             db,
             tx,
         }
@@ -232,10 +233,7 @@ impl StatsCollector {
             return;
         }
         let key = (entity_type, entity_id.to_string());
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.lock();
         let entry = map.entry(key).or_insert_with(EntityStats::new);
         entry.record_bytes(bytes_in, bytes_out);
     }
@@ -243,10 +241,7 @@ impl StatsCollector {
     /// Record an RTT sample (from client heartbeat or TCP_INFO).
     pub fn record_rtt(&self, entity_type: EntityType, entity_id: &str, rtt_ms: f64) {
         let key = (entity_type, entity_id.to_string());
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.lock();
         map.entry(key)
             .or_insert_with(EntityStats::new)
             .push_rtt(rtt_ms);
@@ -255,20 +250,14 @@ impl StatsCollector {
     /// Increment active connection count.
     pub fn incr_conns(&self, entity_type: EntityType, entity_id: &str) {
         let key = (entity_type, entity_id.to_string());
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.lock();
         map.entry(key).or_insert_with(EntityStats::new).active_conns += 1;
     }
 
     /// Decrement active connection count.
     pub fn decr_conns(&self, entity_type: EntityType, entity_id: &str) {
         let key = (entity_type, entity_id.to_string());
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.lock();
         if let Some(e) = map.get_mut(&key) {
             if e.active_conns > 0 {
                 e.active_conns -= 1;
@@ -280,10 +269,7 @@ impl StatsCollector {
 
     /// 重算所有实体的滑动窗口速率（每 5 秒由定时任务调用）。
     pub fn tick_rates(&self) {
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.lock();
         for stats in map.values_mut() {
             stats.recalc_rate();
         }
@@ -300,42 +286,60 @@ impl StatsCollector {
             .unwrap_or(now);
 
         let snapshots: Vec<StatsSnapshot> = {
-            let map = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = self.inner.lock();
             map.iter()
                 .map(|((et, eid), stats)| stats.snapshot(*et, eid, snapshot_time))
                 .collect()
         };
 
         if let Some(ref db) = self.db {
-            for snap in &snapshots {
-                if let Err(e) = sqlx::query(
-                    r"INSERT OR REPLACE INTO stats_snapshots
-                       (entity_type, entity_id, timestamp, bytes_in, bytes_out,
-                        bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&snap.entity_type)
-                .bind(&snap.entity_id)
-                .bind(snap.timestamp)
-                .bind(snap.bytes_in)
-                .bind(snap.bytes_out)
-                .bind(snap.bytes_in_rate)
-                .bind(snap.bytes_out_rate)
-                .bind(snap.rtt_ms)
-                .bind(snap.loss_pct)
-                .bind(snap.active_conns)
-                .execute(&db.pool)
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to flush stats snapshot for {}/{}: {}",
-                        snap.entity_type,
-                        snap.entity_id,
-                        e
-                    );
+            if !snapshots.is_empty() {
+                let mut tx = match db.pool.begin().await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        tracing::warn!("Failed to begin stats flush transaction: {e}");
+                        for snap in &snapshots {
+                            let _ = self.tx.send(snap.clone());
+                        }
+                        return;
+                    }
+                };
+                let mut ok = true;
+                for snap in &snapshots {
+                    if let Err(e) = sqlx::query(
+                        r"INSERT OR REPLACE INTO stats_snapshots
+                           (entity_type, entity_id, timestamp, bytes_in, bytes_out,
+                            bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&snap.entity_type)
+                    .bind(&snap.entity_id)
+                    .bind(snap.timestamp)
+                    .bind(snap.bytes_in)
+                    .bind(snap.bytes_out)
+                    .bind(snap.bytes_in_rate)
+                    .bind(snap.bytes_out_rate)
+                    .bind(snap.rtt_ms)
+                    .bind(snap.loss_pct)
+                    .bind(snap.active_conns)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to flush stats snapshot for {}/{}: {}",
+                            snap.entity_type,
+                            snap.entity_id,
+                            e
+                        );
+                        ok = false;
+                    }
+                }
+                if ok {
+                    if let Err(e) = tx.commit().await {
+                        tracing::warn!("Failed to commit stats flush transaction: {e}");
+                    }
+                } else if let Err(e) = tx.rollback().await {
+                    tracing::warn!("Failed to rollback stats flush transaction: {e}");
                 }
             }
         }
@@ -348,10 +352,7 @@ impl StatsCollector {
     /// Build a summary of current stats (in-memory only, no DB query).
     #[must_use]
     pub fn get_summary(&self) -> StatsSummary {
-        let map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.inner.lock();
         let mut summary = StatsSummary::default();
 
         for ((entity_type, _entity_id), stats) in map.iter() {
@@ -430,7 +431,7 @@ mod tests {
     fn rate_calculation() {
         let c = StatsCollector::new(None);
         {
-            let mut map = c.inner.lock().unwrap();
+            let mut map = c.inner.lock();
             let key = (EntityType::Proxy, "r1".to_string());
             let entry = map.entry(key).or_insert_with(EntityStats::new);
             let past = Instant::now()
@@ -442,7 +443,7 @@ mod tests {
             entry.rate_window.push_back((Instant::now(), 0, 10000));
         }
         c.tick_rates();
-        let map = c.inner.lock().unwrap();
+        let map = c.inner.lock();
         let key = (EntityType::Proxy, "r1".to_string());
         let stats = map.get(&key).unwrap();
         assert!(stats.bytes_out_rate > 0.0);
@@ -471,7 +472,7 @@ mod tests {
         c.record_rtt(EntityType::Client, "c1", 10.0);
         c.record_rtt(EntityType::Client, "c1", 20.0);
         c.record_rtt(EntityType::Client, "c1", 30.0);
-        let map = c.inner.lock().unwrap();
+        let map = c.inner.lock();
         let key = (EntityType::Client, "c1".to_string());
         let stats = map.get(&key).unwrap();
         assert_eq!(stats.median_rtt(), Some(20.0));
@@ -481,7 +482,7 @@ mod tests {
     fn snapshot_has_correct_entity_type() {
         let c = StatsCollector::new(None);
         c.record_bytes(EntityType::Proxy, "r1", 100, 200);
-        let map = c.inner.lock().unwrap();
+        let map = c.inner.lock();
         let key = (EntityType::Proxy, "r1".to_string());
         let stats = map.get(&key).unwrap();
         let snap = stats.snapshot(EntityType::Proxy, "r1", Utc::now());

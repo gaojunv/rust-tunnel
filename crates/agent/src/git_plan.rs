@@ -486,11 +486,10 @@ pub fn parse_remote_url(url: &str) -> Option<(String, String)> {
     } else if let Some(rest) = url.strip_prefix("ssh://git@") {
         let (_, p) = rest.split_once('/')?;
         p
-    } else if let Some(rest) = url.strip_prefix("git@") {
+    } else {
+        let rest = url.strip_prefix("git@")?;
         // git@github.com:o/r.git —— host 后是 ':' 而非 '/'
         rest.split_once(':')?.1
-    } else {
-        return None;
     };
     let path = path.strip_suffix(".git").unwrap_or(path);
     let path = path.trim_end_matches('/');

@@ -51,6 +51,10 @@ pub struct PreparedRequest {
 ///
 /// # Errors
 /// `auth::authenticate` 返回 `None`（缺失或无效的 API key）时返回 `Err(Response)`，状态码 401。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 pub async fn authenticate_or_reject(
     state: &LlmHandlerState,
     headers: &HeaderMap,
@@ -82,6 +86,10 @@ pub async fn authenticate_or_reject(
 #[allow(
     clippy::unused_async,
     reason = "与 authenticate/resolve 同为 async 流水线，保持调用端 await 统一"
+)]
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
 )]
 pub async fn extract_model_or_reject(
     state: &LlmHandlerState,
@@ -115,6 +123,10 @@ pub async fn extract_model_or_reject(
 ///
 /// # Errors
 /// `resolve_with_failover` 未找到匹配模型/别名/模型组时返回 `Err(Response)`，状态码 404。
+#[allow(
+    clippy::result_large_err,
+    reason = "Response 大小由 axum 决定，装箱无收益"
+)]
 pub async fn resolve_chain_or_reject(
     state: &LlmHandlerState,
     model: &str,

@@ -22,13 +22,21 @@ pub fn show(ui: &mut Ui, log_buffer: &Arc<LogBuffer>) {
                     if ui.small_button("清空").clicked() {
                         log_buffer.clear();
                     }
-                    ui.label(egui::RichText::new(format!("{} 条", log_buffer.len())).weak().small());
+                    ui.label(
+                        egui::RichText::new(format!("{} 条", log_buffer.len()))
+                            .weak()
+                            .small(),
+                    );
                 });
             });
             ui.add_space(6.0);
             let n = log_buffer.len();
             if n == 0 {
-                ui.label(egui::RichText::new("暂无日志（连接后自动采集，含控制/隧道/agent 动态）").weak().small());
+                ui.label(
+                    egui::RichText::new("暂无日志（连接后自动采集，含控制/隧道/agent 动态）")
+                        .weak()
+                        .small(),
+                );
                 return;
             }
             let max_h = (ui.available_height() - 8.0).clamp(80.0, 360.0);
@@ -44,8 +52,17 @@ pub fn show(ui: &mut Ui, log_buffer: &Arc<LogBuffer>) {
                         let m = (secs / 60) % 60;
                         let s = secs % 60;
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("{h:02}:{m:02}:{s:02}")).small().weak().monospace());
-                            ui.label(egui::RichText::new(e.level.clone()).small().color(level_color(&e.level)));
+                            ui.label(
+                                egui::RichText::new(format!("{h:02}:{m:02}:{s:02}"))
+                                    .small()
+                                    .weak()
+                                    .monospace(),
+                            );
+                            ui.label(
+                                egui::RichText::new(e.level.clone())
+                                    .small()
+                                    .color(level_color(&e.level)),
+                            );
                             ui.label(
                                 egui::RichText::new(format!("{} — {}", e.target, e.message))
                                     .small()

@@ -6,7 +6,10 @@ use rust_tunnel_client::ClientConfig;
 
 use crate::{app::AppState, config_store};
 
-#[allow(clippy::struct_excessive_bools, reason = "设置面板布尔开关组，拆为 enum 反而割裂布局")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "设置面板布尔开关组，拆为 enum 反而割裂布局"
+)]
 #[derive(Debug, Clone)]
 pub struct SettingsState {
     pub server: String,
@@ -102,7 +105,10 @@ pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
                 ui.checkbox(&mut state.tls_insecure, "跳过证书校验 (TOFU)");
             });
             ui.add_space(4.0);
-            ui.checkbox(&mut state.enable_agent, "启用 Agent 执行器（远程命令/文件操作）");
+            ui.checkbox(
+                &mut state.enable_agent,
+                "启用 Agent 执行器（远程命令/文件操作）",
+            );
             ui.add_space(10.0);
             let can_save = !state.server.trim().is_empty() && !state.password.trim().is_empty();
             ui.add_enabled_ui(can_save, |ui| {
@@ -117,7 +123,9 @@ pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
                                 if state.save_to_keyring && !cfg.password.is_empty() {
                                     let cname = cfg.name.as_deref().unwrap_or("");
                                     if let Err(e) = config_store::write_password_to_keyring(
-                                        &cfg.server, cname, &cfg.password,
+                                        &cfg.server,
+                                        cname,
+                                        &cfg.password,
                                     ) {
                                         state.status_msg =
                                             Some(format!("配置已保存，但钥匙串失败: {e}"));
@@ -127,14 +135,13 @@ pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
                                     }
                                 } else if !state.save_to_keyring {
                                     let cname = cfg.name.as_deref().unwrap_or("");
-                                    config_store::delete_password_from_keyring(
-                                        &cfg.server, cname,
-                                    );
-                                    state.status_msg =
-                                        Some("已保存，正在重连…".to_string());
+                                    config_store::delete_password_from_keyring(&cfg.server, cname);
+                                    state.status_msg = Some("已保存，正在重连…".to_string());
                                 } else {
-                                    state.status_msg =
-                                        Some(format!("已保存到 {}", config_store::default_path().display()));
+                                    state.status_msg = Some(format!(
+                                        "已保存到 {}",
+                                        config_store::default_path().display()
+                                    ));
                                 }
                                 // 更新内存态并触发控制链路重载（无需重启）
                                 cfg.password.clone_from(&state.password);
@@ -149,7 +156,11 @@ pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
                 }
             });
             if !can_save {
-                ui.label(egui::RichText::new("请填写服务器与密码后保存").weak().small());
+                ui.label(
+                    egui::RichText::new("请填写服务器与密码后保存")
+                        .weak()
+                        .small(),
+                );
             }
             if let Some(msg) = state.status_msg.clone() {
                 ui.add_space(6.0);
@@ -157,9 +168,12 @@ pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
             }
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(format!("配置路径: {}", config_store::default_path().display()))
-                    .weak()
-                    .small(),
+                egui::RichText::new(format!(
+                    "配置路径: {}",
+                    config_store::default_path().display()
+                ))
+                .weak()
+                .small(),
             );
         });
 }

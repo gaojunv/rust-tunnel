@@ -792,9 +792,13 @@ mod tests {
         }
 
         // 合法段但文件不存在
-        let err =
-            resolve_download_path(root, "v1.0.0", "nope", "client archive directory unavailable")
-                .unwrap_err();
+        let err = resolve_download_path(
+            root,
+            "v1.0.0",
+            "nope",
+            "client archive directory unavailable",
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         // 目录不是文件
@@ -818,9 +822,13 @@ mod tests {
         // 归档目录内的软链指向目录外 —— 段校验过得去，规范化后必须被拦
         std::os::unix::fs::symlink(&secret, root.join("v1.0.0").join("leak")).unwrap();
 
-        let err =
-            resolve_download_path(&root, "v1.0.0", "leak", "client archive directory unavailable")
-                .unwrap_err();
+        let err = resolve_download_path(
+            &root,
+            "v1.0.0",
+            "leak",
+            "client archive directory unavailable",
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }
