@@ -25,7 +25,15 @@
     "add": "Add",
     "disabled": "Disabled",
     "confirm": "Confirm",
-    "saveError": "Save failed: {{error}}"
+    "saveError": "Save failed: {{error}}",
+    "toast": {
+      "saved": "Saved",
+      "deleted": "Deleted",
+      "actionFailed": "Action failed: {{error}}"
+    },
+    "clearSearch": "Clear search",
+    "loadMore": "Load more",
+    "loadedOf": "Loaded {{loaded}} of {{total}}"
   },
   "timeRange": {
     "custom": "Custom"
@@ -700,8 +708,7 @@
       "memory": "Memory",
       "skill": "Skills",
       "roles": "Roles"
-    },
-    "settingsHint": "Open settings from the gear icon in each section header"
+    }
   },
   "ks": {
     "title": "Knowledge",

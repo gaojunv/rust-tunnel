@@ -1,4 +1,5 @@
 import { Card, CardContent } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
 
 interface Props {
   list: React.ReactNode;
@@ -13,11 +14,17 @@ interface Props {
 export default function MasterDetail({ list, detail, hasSelection, emptyText, isLoading, loadingText }: Props) {
   return (
     <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-      <div className={hasSelection ? 'hidden lg:block lg:w-80 lg:shrink-0' : 'lg:w-80 lg:shrink-0'}>
+      <div
+        className={
+          hasSelection ? 'hidden lg:block lg:w-80 lg:shrink-0 lg:max-h-[calc(100dvh-12rem)] lg:overflow-y-auto' : 'lg:w-80 lg:shrink-0 lg:max-h-[calc(100dvh-12rem)] lg:overflow-y-auto'
+        }
+      >
         {isLoading ? (
-          <Card>
-            <CardContent className="p-6 text-sm text-muted-foreground">{loadingText}</CardContent>
-          </Card>
+          <div className="space-y-2" aria-label={loadingText}>
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-16 w-full" />
+          </div>
         ) : (
           list
         )}

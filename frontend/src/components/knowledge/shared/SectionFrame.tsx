@@ -21,8 +21,9 @@ export default function SectionFrame({ title, count, newLabel, onNew, onSettings
         </h2>
         <div className="flex items-center gap-2">
           {onSettings && (
-            <Button variant="outline" size="sm" onClick={onSettings} aria-label={settingsLabel}>
+            <Button variant="outline" size="sm" onClick={onSettings}>
               <Settings className="h-4 w-4" />
+              {settingsLabel}
             </Button>
           )}
           <Button size="sm" onClick={onNew}>
