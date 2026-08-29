@@ -186,7 +186,7 @@ async fn generate_title_inner(
     }
     agent
         .db
-        .agent_update_session_title(session_id, &title)
+        .agent_update_session_title_if_empty(session_id, &title)
         .await
         .map_err(|e| format!("db error: {e}"))?;
     tracing::info!(session_id, title, "auto-generated session title");

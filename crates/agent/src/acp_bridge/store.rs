@@ -150,7 +150,7 @@ pub(super) async fn persist_acp_frame(
         }
         "session_title" => {
             if let Some(title) = frame["title"].as_str() {
-                if let Err(e) = db.agent_update_session_title(sid, title).await {
+                if let Err(e) = db.agent_update_session_title_if_empty(sid, title).await {
                     tracing::warn!(session_id = %sid, "persist session title failed: {e}");
                 }
             }

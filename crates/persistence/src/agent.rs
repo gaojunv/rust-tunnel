@@ -551,6 +551,24 @@ impl Database {
         Ok(())
     }
 
+    /// 仅当标题为空时更新（自动标题用），非空则不覆盖用户重命名。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
+    pub async fn agent_update_session_title_if_empty(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_sessions SET title = ?, updated_at = datetime('now') WHERE id = ? AND COALESCE(TRIM(title), '') = ''",
+        )
+        .bind(title)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 更新会话关联模型，None 表示清除。
     /// # Errors
     /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
