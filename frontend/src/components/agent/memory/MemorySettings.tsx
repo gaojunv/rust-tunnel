@@ -5,6 +5,7 @@ import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { AlertTriangle, ChevronDown, Loader2 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
 import { useClearMemory, useMemorySettings, useUpdateMemorySettings } from '@/api/hooks';
@@ -13,6 +14,7 @@ import { useClearMemory, useMemorySettings, useUpdateMemorySettings } from '@/ap
  *  embedding 全局配置在共享设置（SharedEmbeddingSettings）Tab，此处仅管理记忆体特有参数。 */
 export default function MemorySettings() {
   const { t } = useTranslation();
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const { data: settings, isLoading } = useMemorySettings();
   const updateMutation = useUpdateMemorySettings();
   const clearMutation = useClearMemory();
@@ -65,16 +67,19 @@ export default function MemorySettings() {
   };
 
   const clearAll = () => {
-    if (confirm(t('memory.settings.clearConfirm'))) {
-      setSaveMsg(null);
-      setSaveError(null);
-      clearMutation.mutate(undefined, {
-        onSuccess: () => setSaveMsg(t('memory.settings.cleared')),
-        onError: (err) => {
-          setSaveError(t('memory.saveError', { error: getApiErrorMessage(err) }));
-        },
-      });
-    }
+    confirm(
+      { title: t('memory.settings.clearConfirmTitle'), description: t('memory.settings.clearConfirmDesc') },
+      () => {
+        setSaveMsg(null);
+        setSaveError(null);
+        clearMutation.mutate(undefined, {
+          onSuccess: () => setSaveMsg(t('memory.settings.cleared')),
+          onError: (err) => {
+            setSaveError(t('memory.saveError', { error: getApiErrorMessage(err) }));
+          },
+        });
+      },
+    );
   };
 
   const busy = updateMutation.isPending || clearMutation.isPending;
@@ -82,10 +87,7 @@ export default function MemorySettings() {
   return (
     <div className="space-y-4">
       <div className="flex flex-row flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 className="text-base font-semibold">{t('memory.settings.title')}</h3>
-          <p className="mt-1 text-sm text-muted-foreground">{t('memory.settings.enabledDesc')}</p>
-        </div>
+        <p className="text-sm text-muted-foreground">{t('memory.settings.enabledDesc')}</p>
         <div className="flex items-center gap-2">
           <Switch
             checked={enabled}
@@ -196,6 +198,15 @@ export default function MemorySettings() {
           </>
         )}
       </div>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }

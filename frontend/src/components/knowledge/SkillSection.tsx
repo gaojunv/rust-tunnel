@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import SkillList from '@/components/agent/skill/SkillList';
@@ -6,7 +6,8 @@ import SkillDetail from '@/components/agent/skill/SkillDetail';
 import SkillDialog from '@/components/agent/skill/SkillDialog';
 import SkillSettings from '@/components/knowledge/SkillSettings';
 import MasterDetail from '@/components/knowledge/shared/MasterDetail';
-import { useSkills } from '@/api/hooks';
+import { usePagedList } from '@/components/knowledge/shared/usePagedList';
+import { listSkills } from '@/api/client';
 import type { AgentSkill, SkillFilters } from '@/types';
 
 export default function SkillSection() {
@@ -33,26 +34,53 @@ export default function SkillSection() {
     [filters],
   );
 
-  const { data, isLoading } = useSkills(params);
-  const skills = data?.skills ?? [];
+  const fetchPage = useCallback(
+    async (offset: number, limit: number) => {
+      const res = await listSkills({ ...params, offset, limit });
+      return { items: res.skills, total: res.total };
+    },
+    [params],
+  );
+
+  const filtersKey = useMemo(() => JSON.stringify(params), [params]);
+
+  const { items: skills, total, loading, loadingMore, hasMore, loadMore } = usePagedList<AgentSkill>({
+    fetchPage,
+    filtersKey,
+    pageSize: 20,
+  });
+
+  useEffect(() => {
+    if (selectedId && skills.length > 0 && !skills.some((s) => s.id === selectedId)) {
+      setSelectedId(null);
+    }
+    if (selectedId && skills.length === 0 && !loading) {
+      setSelectedId(null);
+    }
+  }, [skills, selectedId, loading]);
+
   const selectedSkill = skills.find((s) => s.id === selectedId) ?? null;
 
   return (
     <div className="space-y-6">
       <MasterDetail
-        isLoading={isLoading}
+        isLoading={loading}
         loadingText={t('common.loading')}
         hasSelection={!!selectedSkill}
         emptyText={t('skill.noSelection')}
         list={
           <SkillList
             skills={skills}
+            total={total}
             filters={filters}
             onFiltersChange={setFilters}
             selectedId={selectedId}
             onSelect={setSelectedId}
             onNew={() => setDialogOpen(true)}
             onSettings={() => setSettingsOpen(true)}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            onLoadMore={loadMore}
           />
         }
         detail={

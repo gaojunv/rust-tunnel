@@ -6,14 +6,12 @@ import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
-import { useAgentWorkspaces, useClients, useCreateMemory, useUpdateMemory } from '@/api/hooks';
+import { useAgentWorkspaces, useClients, useCreateMemory } from '@/api/hooks';
 import type { AgentMemory, AgentMemoryScope } from '@/types';
 
 interface Props {
   open: boolean;
   onClose: () => void;
-  /** 传入则为编辑模式；null/undefined 为手动新建。 */
-  memory?: AgentMemory | null;
   /** 新建成功回调（携带创建的记忆）。 */
   onCreated?: (memory: AgentMemory) => void;
 }
@@ -24,14 +22,12 @@ const parseTags = (s: string): string[] =>
     .map((tag) => tag.trim())
     .filter(Boolean);
 
-export default function MemoryDialog({ open, onClose, memory = null, onCreated }: Props) {
+export default function MemoryDialog({ open, onClose, onCreated }: Props) {
   const { t } = useTranslation();
   const createMutation = useCreateMemory();
-  const updateMutation = useUpdateMemory();
   const { data: clients } = useClients();
   const { data: workspaces } = useAgentWorkspaces();
 
-  const isEdit = !!memory;
   const [content, setContent] = useState('');
   const [tagsStr, setTagsStr] = useState('');
   const [scope, setScope] = useState<AgentMemoryScope>('workspace');
@@ -40,8 +36,7 @@ export default function MemoryDialog({ open, onClose, memory = null, onCreated }
   const [confidence, setConfidence] = useState(0.8);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  // initRef：每个 open 周期初始化一次表单。memory 对象随列表 refetch 变化
-  // 身份，重跑初始化会覆盖进行中的编辑（仿 KbDialog 防覆盖模式）。
+  // initRef：每个 open 周期重置一次表单。
   const initRef = useRef(false);
   useEffect(() => {
     if (!open) {
@@ -50,23 +45,14 @@ export default function MemoryDialog({ open, onClose, memory = null, onCreated }
     }
     if (initRef.current) return;
     initRef.current = true;
-    if (memory) {
-      setContent(memory.content);
-      setTagsStr(memory.tags.join(', '));
-      setScope(memory.scope_type);
-      setClientId(memory.client_id);
-      setWorkspaceId(memory.workspace_id);
-      setConfidence(memory.confidence);
-    } else {
-      setContent('');
-      setTagsStr('');
-      setScope('workspace');
-      setClientId('');
-      setWorkspaceId('');
-      setConfidence(0.8);
-    }
+    setContent('');
+    setTagsStr('');
+    setScope('workspace');
+    setClientId('');
+    setWorkspaceId('');
+    setConfidence(0.8);
     setSubmitError(null);
-  }, [open, memory]);
+  }, [open]);
 
   const changeScope = (s: AgentMemoryScope) => {
     setScope(s);
@@ -84,42 +70,34 @@ export default function MemoryDialog({ open, onClose, memory = null, onCreated }
     if (!canSubmit) return;
     setSubmitError(null);
     const tags = parseTags(tagsStr);
-    const fail = (err: unknown) => {
-      setSubmitError(t('memory.saveError', { error: getApiErrorMessage(err) }));
-    };
-    if (isEdit && memory) {
-      updateMutation.mutate(
-        { id: memory.id, content: content.trim(), tags, scope, confidence },
-        { onSuccess: onClose, onError: fail },
-      );
-    } else {
-      createMutation.mutate(
-        {
-          content: content.trim(),
-          scope,
-          ...(scope === 'client' ? { client_id: clientId } : {}),
-          ...(scope === 'workspace' ? { workspace_id: workspaceId } : {}),
-          tags,
-          confidence,
+    createMutation.mutate(
+      {
+        content: content.trim(),
+        scope,
+        ...(scope === 'client' ? { client_id: clientId } : {}),
+        ...(scope === 'workspace' ? { workspace_id: workspaceId } : {}),
+        tags,
+        confidence,
+      },
+      {
+        onSuccess: (m) => {
+          onClose();
+          onCreated?.(m);
         },
-        {
-          onSuccess: (m) => {
-            onClose();
-            onCreated?.(m);
-          },
-          onError: fail,
+        onError: (err) => {
+          setSubmitError(t('memory.saveError', { error: getApiErrorMessage(err) }));
         },
-      );
-    }
+      },
+    );
   };
 
-  const busy = createMutation.isPending || updateMutation.isPending;
+  const busy = createMutation.isPending;
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{isEdit ? t('memory.editMemory') : t('memory.newMemory')}</DialogTitle>
+          <DialogTitle>{t('memory.newMemory')}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
           <div className="space-y-2">
@@ -146,7 +124,7 @@ export default function MemoryDialog({ open, onClose, memory = null, onCreated }
               <option value="workspace">{t('memory.scope_workspace')}</option>
             </select>
           </div>
-          {!isEdit && scope === 'client' && (
+          {scope === 'client' && (
             <div className="space-y-2">
               <Label>{t('memory.clientLabel')}</Label>
               <select
@@ -164,7 +142,7 @@ export default function MemoryDialog({ open, onClose, memory = null, onCreated }
               </select>
             </div>
           )}
-          {!isEdit && scope === 'workspace' && (
+          {scope === 'workspace' && (
             <div className="space-y-2">
               <Label>{t('memory.workspaceLabel')}</Label>
               <select

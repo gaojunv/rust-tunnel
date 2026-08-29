@@ -24,6 +24,14 @@ vi.mock('../../../api/memoryStream', () => ({
   memoryStream: { subscribe: vi.fn(() => () => {}) },
 }));
 
+vi.mock('@/utils/format', () => ({
+  formatDateTime: (s: string) => `fmt:${s}`,
+  formatBytes: (n: number) => `${n} B`,
+  formatBps: (n: number) => `${n} B/s`,
+  formatMs: (n: number) => `${n} ms`,
+  formatPercent: (n: number) => `${n}%`,
+}));
+
 const memoryFixture: AgentMemory = {
   id: 'm1',
   content: 'user prefers rust over go',
@@ -45,9 +53,7 @@ const onFiltersChange = vi.fn();
 const onSelect = vi.fn();
 const onNew = vi.fn();
 
-// Radix Select 在 jsdom 里 Portal 被 aria-hidden 隔离，仅暴露 trigger（combobox），
-// 故此处测"行为意图"而非下拉 DOM：onScopeChange 成功被触发且 client/ws 条件显示随 props 变化。
-function Harness({ memories, initialScope = 'all' as MemoryFilters['scope'] }: { memories: AgentMemory[]; initialScope?: MemoryFilters['scope'] }) {
+function Harness({ memories, total, hasMore, initialScope = 'all' as MemoryFilters['scope'] }: { memories: AgentMemory[]; total?: number; hasMore?: boolean; initialScope?: MemoryFilters['scope'] }) {
   const [filters, setFilters] = useState<MemoryFilters>({
     scope: initialScope,
     clientId: '',
@@ -62,20 +68,40 @@ function Harness({ memories, initialScope = 'all' as MemoryFilters['scope'] }: {
   return (
     <MemoryList
       memories={memories}
+      total={total}
       filters={filters}
       onFiltersChange={change}
       selectedId={null}
       onSelect={onSelect}
       onNew={onNew}
+      hasMore={hasMore}
+      onLoadMore={hasMore ? vi.fn() : undefined}
     />
   );
 }
 
-const renderList = (memories: AgentMemory[] = [memoryFixture], opts?: { initialScope?: MemoryFilters['scope'] }) => {
+const renderList = (memories: AgentMemory[] = [memoryFixture], opts?: { initialScope?: MemoryFilters['scope']; filters?: MemoryFilters; total?: number; hasMore?: boolean }) => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  if (opts?.filters) {
+    return render(
+      <QueryClientProvider client={qc}>
+        <MemoryList
+          memories={memories}
+          total={opts.total}
+          filters={opts.filters}
+          onFiltersChange={onFiltersChange}
+          selectedId={null}
+          onSelect={onSelect}
+          onNew={onNew}
+          hasMore={opts.hasMore}
+          onLoadMore={opts.hasMore ? vi.fn() : undefined}
+        />
+      </QueryClientProvider>,
+    );
+  }
   return render(
     <QueryClientProvider client={qc}>
-      <Harness memories={memories} initialScope={opts?.initialScope} />
+      <Harness memories={memories} total={opts?.total} hasMore={opts?.hasMore} initialScope={opts?.initialScope} />
     </QueryClientProvider>,
   );
 };
@@ -86,23 +112,52 @@ describe('MemoryList', () => {
     vi.clearAllMocks();
   });
 
-  it('renders memory cards with scope/trigger badges, pinned mark and hit count', () => {
-    renderList();
+  it('紧凑行渲染：内容/徽章/时间同行，带 LoadMoreFooter', () => {
+    const onLoadMore = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryList
+          memories={[memoryFixture]}
+          total={5}
+          filters={{ scope: 'all', clientId: '', workspaceId: '', q: '', pinned: false }}
+          onFiltersChange={onFiltersChange}
+          selectedId={null}
+          onSelect={onSelect}
+          onNew={onNew}
+          hasMore
+          onLoadMore={onLoadMore}
+        />
+      </QueryClientProvider>,
+    );
     expect(screen.getByText('user prefers rust over go')).toBeTruthy();
-    expect(screen.getAllByText('memory.scope_global').length).toBeGreaterThan(0);
-    expect(screen.getByText('memory.trigger_distill')).toBeTruthy();
-    expect(screen.getByText('memory.pinned')).toBeTruthy();
-    expect(screen.getByText('memory.hits')).toBeTruthy();
-    expect(screen.getByText('rust')).toBeTruthy();
-    expect(screen.getByText('preference')).toBeTruthy();
+    // 紧凑行：时间戳走 formatDateTime
+    expect(screen.getByText('fmt:2026-08-02T00:00:00Z')).toBeTruthy();
+    // LoadMoreFooter 计数
+    expect(screen.getByText('common.loadedOf')).toBeTruthy();
+    expect(screen.getByText('common.loadMore')).toBeTruthy();
+    fireEvent.click(screen.getByText('common.loadMore'));
+    expect(onLoadMore).toHaveBeenCalled();
+  });
+
+  it('空态区分：无过滤时显示 empty，有搜索时显示 noSearchResults', () => {
+    // 无过滤 → empty
+    renderList([], { filters: { scope: 'all', clientId: '', workspaceId: '', q: '', pinned: false } });
+    expect(screen.getByText('memory.empty')).toBeTruthy();
+    cleanup();
+    // 有 q → noSearchResults
+    renderList([], { filters: { scope: 'all', clientId: '', workspaceId: '', q: 'rust', pinned: false } });
+    expect(screen.getByText('memory.noSearchResults')).toBeTruthy();
+    cleanup();
+    // pinned 也算激活过滤
+    renderList([], { filters: { scope: 'all', clientId: '', workspaceId: '', q: '', pinned: true } });
+    expect(screen.getByText('memory.noSearchResults')).toBeTruthy();
   });
 
   it('shows client/workspace selects only for matching scope', () => {
     const { rerender } = renderList([], { initialScope: 'all' });
-    // all：都不显示
     expect(screen.queryByRole('combobox', { name: 'memory.clientLabel' })).toBeNull();
     expect(screen.queryByRole('combobox', { name: 'memory.workspaceLabel' })).toBeNull();
-    // client：仅 client 显示
     cleanup();
     renderList([], { initialScope: 'client' });
     expect(screen.getByRole('combobox', { name: 'memory.clientLabel' })).toBeTruthy();
@@ -137,8 +192,9 @@ describe('MemoryList', () => {
     );
   });
 
-  it('shows empty state when there are no memories', () => {
-    renderList([]);
-    expect(screen.getByText('memory.empty')).toBeTruthy();
+  it('hasMore=false 时不渲染 LoadMoreFooter', () => {
+    // 不传 hasMore/onLoadMore 时不渲染 footer
+    renderList([memoryFixture]);
+    expect(screen.queryByText('common.loadMore')).toBeNull();
   });
 });

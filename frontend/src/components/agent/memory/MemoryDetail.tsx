@@ -6,9 +6,9 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
+import { toast } from 'sonner';
 import {
   ArrowLeft,
-  Edit3,
   Loader2,
   Pin,
   Trash2,
@@ -20,7 +20,8 @@ import {
   usePinMemory,
   useUpdateMemory,
 } from '@/api/hooks';
-import MemoryDialog from './MemoryDialog';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
+import { formatDateTime } from '@/utils/format';
 import type { AgentMemory, AgentMemoryScope } from '@/types';
 
 interface Props {
@@ -41,14 +42,14 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
   const updateMutation = useUpdateMemory();
   const deleteMutation = useDeleteMemory();
   const pinMutation = usePinMemory();
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
 
-  // MemoryPage 用 key={memory.id} 渲染，切换记忆时组件重挂载，本地表单随之重置。
+  // MemorySection 用 key={memory.id} 渲染，切换记忆时组件重挂载，本地表单随之重置。
   const [content, setContent] = useState(memory.content);
   const [tagsStr, setTagsStr] = useState(memory.tags.join(', '));
   const [scope, setScope] = useState<AgentMemoryScope>(memory.scope_type);
   const [confidence, setConfidence] = useState(memory.confidence);
   const [error, setError] = useState<string | null>(null);
-  const [editOpen, setEditOpen] = useState(false);
 
   const dirty =
     content !== memory.content ||
@@ -76,15 +77,30 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
   };
 
   const remove = () => {
-    if (confirm(t('memory.deleteConfirm'))) {
-      setError(null);
-      deleteMutation.mutate(memory.id, {
-        onSuccess: onDeleted,
-        onError: (err) => {
-          setError(t('memory.saveError', { error: getApiErrorMessage(err) }));
-        },
-      });
-    }
+    confirm(
+      { title: t('memory.deleteConfirmTitle'), description: t('memory.deleteConfirmDesc') },
+      () => {
+        setError(null);
+        deleteMutation.mutate(memory.id, {
+          onSuccess: () => {
+            toast.success(t('common.toast.deleted'));
+            onDeleted();
+          },
+          onError: (err) => {
+            setError(t('memory.saveError', { error: getApiErrorMessage(err) }));
+          },
+        });
+      },
+    );
+  };
+
+  const handlePin = () => {
+    setError(null);
+    pinMutation.mutate(memory.id, {
+      onError: (err) => {
+        setError(t('memory.saveError', { error: getApiErrorMessage(err) }));
+      },
+    });
   };
 
   return (
@@ -103,7 +119,7 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
             </Button>
             <div className="min-w-0">
               <CardTitle className="flex items-center gap-2 text-lg">
-                <span className="truncate">{memory.content}</span>
+                <span className="line-clamp-2" title={memory.content}>{memory.content}</span>
                 <Badge variant="outline" className="shrink-0">
                   {t(`memory.trigger_${memory.source_trigger}`)}
                 </Badge>
@@ -118,12 +134,9 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
           <div className="flex items-center gap-2">
             <Switch
               checked={memory.pinned}
-              onCheckedChange={() => pinMutation.mutate(memory.id)}
+              onCheckedChange={handlePin}
               aria-label={t('memory.pinnedSwitch')}
             />
-            <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
-              <Edit3 className="mr-1 h-4 w-4" /> {t('common.edit')}
-            </Button>
             <Button variant="outline" size="sm" className="text-destructive" onClick={remove}>
               {deleteMutation.isPending ? (
                 <Loader2 className="mr-1 h-4 w-4 animate-spin" />
@@ -143,7 +156,7 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
         </div>
       )}
 
-      {/* 编辑表单 */}
+      {/* 内联编辑表单（唯一编辑路径，带 dirty 检测） */}
       <Card>
         <CardContent className="space-y-4 p-4">
           <div className="space-y-2">
@@ -225,20 +238,28 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('memory.lastHit')}:</span>
-            <span>{memory.last_hit_at ?? t('memory.never')}</span>
+            <span>{memory.last_hit_at ? formatDateTime(memory.last_hit_at) : t('memory.never')}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('memory.createdAt')}:</span>
-            <span>{memory.created_at}</span>
+            <span>{formatDateTime(memory.created_at)}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{t('memory.updatedAt')}:</span>
-            <span>{memory.updated_at}</span>
+            <span>{formatDateTime(memory.updated_at)}</span>
           </div>
         </CardContent>
       </Card>
 
-      <MemoryDialog open={editOpen} onClose={() => setEditOpen(false)} memory={memory} />
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }

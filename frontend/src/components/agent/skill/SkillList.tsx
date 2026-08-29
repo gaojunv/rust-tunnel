@@ -5,17 +5,23 @@ import { Switch } from '@/components/ui/switch';
 import { useMemoryStream } from '@/api/hooks';
 import ScopeFilterBar from '@/components/knowledge/shared/ScopeFilterBar';
 import SectionFrame from '@/components/knowledge/shared/SectionFrame';
+import LoadMoreFooter from '@/components/knowledge/shared/LoadMoreFooter';
+import { formatDateTime } from '@/utils/format';
 import { useTranslation } from 'react-i18next';
 import type { AgentMemoryScope, AgentSkill, SkillFilters } from '@/types';
 
 interface Props {
   skills: AgentSkill[];
+  total?: number;
   filters: SkillFilters;
   onFiltersChange: (filters: SkillFilters) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
   onSettings?: () => void;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
 }
 
 function scopeVariant(scope: AgentMemoryScope): 'default' | 'secondary' | 'outline' {
@@ -24,22 +30,39 @@ function scopeVariant(scope: AgentMemoryScope): 'default' | 'secondary' | 'outli
   return 'outline';
 }
 
+function hasActiveFilter(filters: SkillFilters): boolean {
+  return (
+    (filters.q ?? '').trim() !== '' ||
+    filters.scope !== 'all' ||
+    filters.enabledOnly ||
+    !!filters.clientId ||
+    !!filters.workspaceId
+  );
+}
+
 export default function SkillList({
   skills,
+  total,
   filters,
   onFiltersChange,
   selectedId,
   onSelect,
   onNew,
   onSettings,
+  hasMore,
+  loadingMore,
+  onLoadMore,
 }: Props) {
   const { t } = useTranslation();
   useMemoryStream();
 
+  const effectiveTotal = total ?? skills.length;
+  const showLoadMore = hasMore !== undefined && onLoadMore !== undefined;
+
   return (
     <SectionFrame
       title={t('skill.listTitle')}
-      count={skills.length}
+      count={effectiveTotal}
       newLabel={t('skill.newSkill')}
       onNew={onNew}
       onSettings={onSettings}
@@ -75,54 +98,61 @@ export default function SkillList({
       {skills.length === 0 ? (
         <Card>
           <CardContent className="p-6 text-center text-sm text-muted-foreground">
-            {t('skill.empty')}
+            {hasActiveFilter(filters) ? t('skill.noSearchResults') : t('skill.empty')}
           </CardContent>
         </Card>
       ) : (
-        skills.map((s) => (
-          <Card
-            key={s.id}
-            className={cn(
-              'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === s.id && 'border-primary/60 bg-primary/5',
-            )}
-            onClick={() => onSelect(s.id)}
-          >
-            <CardContent className="p-4">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold">{s.name}</p>
-                  {s.description && (
-                    <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{s.description}</p>
-                  )}
+        <>
+          {skills.map((s) => (
+            <Card
+              key={s.id}
+              className={cn(
+                'cursor-pointer transition-colors hover:border-primary/40',
+                selectedId === s.id && 'border-primary/60 bg-primary/5',
+              )}
+              onClick={() => onSelect(s.id)}
+            >
+              <CardContent className="flex h-12 items-center justify-between gap-2 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold leading-none" title={s.name}>
+                    {s.name}
+                  </p>
+                  <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <span
+                      className={cn(
+                        'inline-flex items-center gap-1',
+                        s.enabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground',
+                      )}
+                    >
+                      <span
+                        className={cn('h-1.5 w-1.5 rounded-full', s.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50')}
+                      />
+                      {s.enabled ? t('skill.enabled') : t('skill.disabled')}
+                    </span>
+                    <Badge variant={scopeVariant(s.scope_type)} className="h-5 px-1.5 text-xs">
+                      {t(`skill.scope_${s.scope_type}`)}
+                    </Badge>
+                    <Badge variant="outline" className="h-5 px-1.5 text-xs">
+                      {t(`skill.trigger_${s.source_trigger}`)}
+                    </Badge>
+                    <span className="truncate text-xs">{formatDateTime(s.updated_at)}</span>
+                  </div>
                 </div>
-                <Badge variant={scopeVariant(s.scope_type)} className="shrink-0">
-                  {t(`skill.scope_${s.scope_type}`)}
-                </Badge>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-                <span
-                  className={cn(
-                    'inline-flex items-center gap-1',
-                    s.enabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground',
-                  )}
-                >
-                  <span
-                    className={cn('h-1.5 w-1.5 rounded-full', s.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50')}
-                  />
-                  {s.enabled ? t('skill.enabled') : t('skill.disabled')}
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {t('skill.uses', { count: s.use_count })}
                 </span>
-                <Badge variant="outline">{t(`skill.trigger_${s.source_trigger}`)}</Badge>
-                {(s.tags ?? []).slice(0, 3).map((tag) => (
-                  <Badge key={tag} variant="secondary">
-                    {tag}
-                  </Badge>
-                ))}
-                <span className="ml-auto">{t('skill.uses', { count: s.use_count })}</span>
-              </div>
-            </CardContent>
-          </Card>
-        ))
+              </CardContent>
+            </Card>
+          ))}
+          {showLoadMore && (
+            <LoadMoreFooter
+              loaded={skills.length}
+              total={effectiveTotal}
+              loading={loadingMore}
+              onLoadMore={onLoadMore}
+            />
+          )}
+        </>
       )}
     </SectionFrame>
   );
