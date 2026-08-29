@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn parses_sni_and_lowercases() {
-        let buf = build_client_hello(Some("Trojan.Gaojun.TOP"));
+        let buf = build_client_hello(Some("Trojan.Example.COM"));
         assert_eq!(
             parse_client_hello_sni(&buf),
             SniParse::Sni("trojan.example.com".to_string())
