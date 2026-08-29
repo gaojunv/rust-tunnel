@@ -13,8 +13,9 @@ data/rust-tunnel.db-shm
 data/rag/
 data/rag_docs/
 data/llm_master.key
+data/tls/
 .env
-.vscode/.DS_Store
+**/.DS_Store
 .claude/
 server.toml
 client.toml
@@ -32,3 +33,6 @@ wiki-desktop-ui/*.tsbuildinfo
 
 # tauri-build 每次构建重新生成的 ACL/capability schema
 crates/wiki-serve/gen/schemas/
+
+# 本地临时文件
+nohup.out
