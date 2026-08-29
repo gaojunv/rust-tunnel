@@ -27,6 +27,8 @@ export interface UseChatHistoryOptions {
   sessionId: string;
   items: ChatItem[];
   setItems: React.Dispatch<React.SetStateAction<ChatItem[]>>;
+  /** 回合进行中为 true：live 流式期间不能用后台 refetch 快照覆盖 items（streamingIdxRef 会错位）。 */
+  runningRef: React.MutableRefObject<boolean>;
   streamingIdxRef: React.MutableRefObject<number | null>;
   scrollRef: React.MutableRefObject<HTMLDivElement | null>;
   earlierButtonRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -46,7 +48,7 @@ export interface UseChatHistoryReturn {
 }
 
 export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryReturn {
-  const { sessionId, items, setItems, streamingIdxRef, scrollRef, earlierButtonRef, lastButtonHeightRef } = opts;
+  const { sessionId, items, setItems, runningRef, streamingIdxRef, scrollRef, earlierButtonRef, lastButtonHeightRef } = opts;
 
   const [hasMore, setHasMore] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -80,17 +82,38 @@ export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryRetur
     el.scrollTop += hasMore ? h : -h;
   }, [hasMore, scrollRef, lastButtonHeightRef]);
 
-  const { data: history } = useQuery<AgentMessagesPage | AgentMessage[]>({
+  const { data: history, isFetchedAfterMount } = useQuery<AgentMessagesPage | AgentMessage[]>({
     queryKey: ['agent-messages', sessionId],
     queryFn: () => listAgentMessages(sessionId),
     refetchOnMount: 'always',
     refetchOnWindowFocus: false,
   });
 
+  // mount 首帧若来自缓存快照（isFetchedAfterMount=false），置位此 ref；其后的权威
+  // refetch（isFetchedAfterMount=true）必须在无 live 回合时用全量历史覆盖缓存——
+  // 否则缓存若是过期子集，「切菜单再切回」会丢中间新增的消息（只显示缓存那部分）。
+  const paintedFromCacheRef = useRef(false);
+
   useEffect(() => {
     historyRef.current = history;
     const rows = historyRows(history);
     if (!history) return;
+
+    // 缓存快照首帧已上屏后权威 refetch 到达：无 live 流式（runningRef/streamingIdxRef）
+    // 时用全量历史覆盖缓存帧；有 live 流式则丢弃（覆盖会让 streamingIdxRef 指向旧数组
+    // 错位），交给 done 的 reconcile 对账兜底。此处只读 reconcileRef、不消费——交给
+    // 下方原逻辑统一消费/合并。
+    if (paintedFromCacheRef.current && isFetchedAfterMount) {
+      paintedFromCacheRef.current = false;
+      if (!reconcileRef.current && !runningRef.current && streamingIdxRef.current === null) {
+        loadedRawRef.current = rows;
+        earlierCountRef.current = 0;
+        setHasMore(historyHasMore(history));
+        setItems(historyToChatItems(rows));
+        return;
+      }
+    }
+
     if (loadedRef.current && !(itemsRef.current.length === 0 && rows.length > 0)) return;
     const isReconcileReload = reconcileRef.current;
     reconcileRef.current = false;
@@ -109,11 +132,12 @@ export function useChatHistory(opts: UseChatHistoryOptions): UseChatHistoryRetur
     // running 不再按历史末行推断。服务端建连即推 turn_state 真值（见 useAgentWs），
     // 而「末行是 tool_calls/tool_result」是回合正常结束后的常态（收尾文本未落库），
     // 抢在真值到达前猜 running 只会让输入框闪一下再被纠正回来。
+    if (!isFetchedAfterMount) paintedFromCacheRef.current = true;
     setItems(historyToChatItems(rows));
     loadedRawRef.current = rows;
     earlierCountRef.current = 0;
     setHasMore(historyHasMore(history));
-  }, [history, setItems]);
+  }, [history, isFetchedAfterMount, setItems, runningRef, streamingIdxRef]);
 
   const loadEarlier = useCallback(async () => {
     if (loadingEarlierRef.current) return;

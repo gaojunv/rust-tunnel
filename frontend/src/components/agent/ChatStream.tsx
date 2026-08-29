@@ -134,6 +134,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     sessionId,
     items,
     setItems,
+    runningRef,
     streamingIdxRef,
     scrollRef,
     earlierButtonRef,

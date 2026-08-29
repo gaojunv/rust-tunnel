@@ -110,4 +110,44 @@ describe('useChatHistory 分页合并', () => {
     expect(await screen.findByText('消息 9')).toBeTruthy();
     expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
   });
+
+  it('切菜单再切回（同 QueryClient 重挂载）：权威 refetch 覆盖过期缓存快照，新消息不丢', async () => {
+    const row = (i: number) => ({
+      id: `m${i}`,
+      session_id: 's1',
+      role: 'user' as const,
+      content: `消息 ${i}`,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind: 'message' as const,
+      created_at: '2026-08-05',
+    });
+    // 共享 QueryClient：模拟路由切换（组件卸载/重挂载）时查询缓存存活
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const renderWithSharedCache = () =>
+      render(
+        <QueryClientProvider client={qc}>
+          <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
+        </QueryClientProvider>,
+      );
+
+    // 首次访问：2 条消息落入缓存快照
+    vi.mocked(listAgentMessages).mockResolvedValueOnce({ messages: [row(0), row(1)], has_more: false } as never);
+    renderWithSharedCache();
+    expect(await screen.findByText('消息 0')).toBeTruthy();
+    expect(await screen.findByText('消息 1')).toBeTruthy();
+    expect(screen.queryByText('消息 2')).toBeNull();
+
+    cleanup(); // 切走菜单：组件卸载，缓存快照（2 条）存活
+
+    // 切走期间服务端新增 1 条消息
+    vi.mocked(listAgentMessages).mockResolvedValueOnce({ messages: [row(0), row(1), row(2)], has_more: false } as never);
+
+    // 切回来重挂载：首帧上屏缓存快照（2 条），权威 refetch 返回 3 条——必须覆盖，否则 消息 2 丢失
+    renderWithSharedCache();
+    expect(await screen.findByText('消息 2')).toBeTruthy();
+    expect(screen.getByText('消息 0')).toBeTruthy();
+    expect(screen.getByText('消息 1')).toBeTruthy();
+  });
 });
