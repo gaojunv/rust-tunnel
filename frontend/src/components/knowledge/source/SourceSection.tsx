@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import SourceList, { EMPTY_SOURCE_FILTERS, type SourceFilters } from '@/components/knowledge/source/SourceList';
@@ -7,7 +7,7 @@ import SourceDialog from '@/components/knowledge/source/SourceDialog';
 import SharedEmbeddingSettings from '@/components/knowledge/SharedEmbeddingSettings';
 import WikiSettings from '@/components/knowledge/WikiSettings';
 import MasterDetail from '@/components/knowledge/shared/MasterDetail';
-import { useKnowledgeSources } from '@/api/hooks';
+import { useKnowledgeSource } from '@/api/hooks';
 import type { KnowledgeSource } from '@/types';
 
 /** 统一知识容器分区：取代原 KbSection（向量库）与 WikiSection（Wiki 容器）。 */
@@ -18,32 +18,17 @@ export default function SourceSection() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  const params = useMemo(
-    () => ({
-      index_kind: filters.indexKind === 'all' ? undefined : filters.indexKind,
-      scope: filters.scope === 'all' ? undefined : filters.scope,
-      client_id: filters.scope === 'client' ? filters.clientId || undefined : undefined,
-      workspace_id: filters.scope === 'workspace' ? filters.workspaceId || undefined : undefined,
-      q: (filters.q ?? '').trim() || undefined,
-      status: filters.status || undefined,
-    }),
-    [filters],
-  );
-
-  const { data, isLoading } = useKnowledgeSources(params);
-  const sources = data?.sources ?? [];
-  const selected = sources.find((s) => s.id === selectedId) ?? null;
+  const { data: selected, isLoading: detailLoading } = useKnowledgeSource(selectedId ?? '');
 
   return (
     <div className="space-y-6">
       <MasterDetail
-        isLoading={isLoading}
+        isLoading={false}
         loadingText={t('common.loading')}
-        hasSelection={!!selected}
+        hasSelection={!!selectedId}
         emptyText={t('ks.noSelection')}
         list={
           <SourceList
-            sources={sources}
             filters={filters}
             onFiltersChange={setFilters}
             selectedId={selectedId}
@@ -60,6 +45,8 @@ export default function SourceSection() {
               onBack={() => setSelectedId(null)}
               onDeleted={() => setSelectedId(null)}
             />
+          ) : detailLoading && selectedId ? (
+            <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
           ) : null
         }
       />

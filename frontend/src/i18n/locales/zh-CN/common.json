@@ -815,7 +815,12 @@
     "score": "分数",
     "saveError": "保存失败：{{error}}",
     "actionError": "操作失败：{{error}}",
-    "deleteConfirm": "删除容器「{{name}}」？此操作不可撤销，文档、向量分块与页面将一并清除。"
+    "deleteConfirm": "删除容器「{{name}}」？此操作不可撤销，文档、向量分块与页面将一并清除。",
+    "uploadInvalidFile": "{{name}}：{{reason}}",
+    "uploadReasonExt": "不支持的扩展名",
+    "uploadReasonSize": "超过大小限制（上限 {{max}}）",
+    "uploading": "上传中…",
+    "uploadFailed": "上传失败"
   },
   "memory": {
     "title": "AI 记忆体",
@@ -1380,6 +1385,11 @@
       "listMax": "清单最大条数",
       "save": "保存设置",
       "saved": "已保存"
-    }
+    },
+    "graphZoomIn": "放大",
+    "graphZoomOut": "缩小",
+    "graphReset": "重置视图",
+    "editTab": "编辑",
+    "previewTab": "预览"
   }
 }

@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent } from '@/components/ui/card';
 import { FileUp, Loader2 } from 'lucide-react';
 
@@ -15,7 +16,21 @@ export function maxBytesFor(ext: string): number {
   return TEXT_EXTENSIONS.includes(ext) ? TEXT_MAX_BYTES : BINARY_MAX_BYTES;
 }
 
+function formatMax(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))}MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`;
+  return `${bytes}B`;
+}
+
 export const ACCEPT_STRING = ACCEPTED_EXTENSIONS.map((e) => `.${e}`).join(',');
+
+// 上传中条目（逐文件反馈）
+export interface PendingUpload {
+  id: string;
+  name: string;
+  status: 'uploading' | 'failed';
+  reason?: string;
+}
 
 export interface DocUploadZoneLabels {
   uploadHint: string;
@@ -41,35 +56,58 @@ export default function DocUploadZone({
   disabled,
   formatUploadError,
 }: Props) {
+  const { t } = useTranslation();
   const [dragging, setDragging] = useState(false);
-  const [localError, setLocalError] = useState<string | null>(null);
+  const [pending, setPending] = useState<PendingUpload[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = (list: FileList | null) => {
     if (!list || list.length === 0) return;
-    let hasInvalid = false;
+    const invalidEntries: PendingUpload[] = [];
     const accepted: File[] = [];
-    Array.from(list).forEach((f) => {
+    Array.from(list).forEach((f, idx) => {
       const ext = f.name.toLowerCase().split('.').pop() ?? '';
-      if (ACCEPTED_EXTENSIONS.includes(ext) && f.size <= maxBytesFor(ext)) {
-        accepted.push(f);
+      if (!ACCEPTED_EXTENSIONS.includes(ext)) {
+        const reason = t('ks.uploadReasonExt');
+        invalidEntries.push({ id: `invalid-${Date.now()}-${idx}`, name: f.name, status: 'failed', reason: t('ks.uploadInvalidFile', { name: f.name, reason }) });
+      } else if (f.size > maxBytesFor(ext)) {
+        const reason = t('ks.uploadReasonSize', { max: formatMax(maxBytesFor(ext)) });
+        invalidEntries.push({ id: `invalid-${Date.now()}-${idx}`, name: f.name, status: 'failed', reason: t('ks.uploadInvalidFile', { name: f.name, reason }) });
       } else {
-        hasInvalid = true;
+        accepted.push(f);
       }
     });
-    setLocalError(hasInvalid ? labels.fileInvalid : null);
+    if (invalidEntries.length > 0) {
+      setPending((prev) => [...prev, ...invalidEntries]);
+    }
     accepted.forEach((f) => {
+      const id = `${Date.now()}-${f.name}-${Math.random().toString(36).slice(2, 6)}`;
+      setPending((prev) => [...prev, { id, name: f.name, status: 'uploading' }]);
       try {
         const result = onUpload(f);
         if (result instanceof Promise) {
-          result.catch((err: unknown) => {
-            if (formatUploadError) setLocalError(formatUploadError(err));
+          result.then(() => {
+            setPending((prev) => prev.filter((p) => p.id !== id));
+          }).catch((err: unknown) => {
+            const reason = formatUploadError ? formatUploadError(err) : String(err);
+            setPending((prev) => prev.map((p) => (p.id === id ? { ...p, status: 'failed', reason } : p)));
           });
+        } else {
+          setPending((prev) => prev.filter((p) => p.id !== id));
         }
       } catch (err: unknown) {
-        if (formatUploadError) setLocalError(formatUploadError(err));
+        const reason = formatUploadError ? formatUploadError(err) : String(err);
+        setPending((prev) => prev.map((p) => (p.id === id ? { ...p, status: 'failed', reason } : p)));
       }
     });
+  };
+
+  const onKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (e) => {
+    if (disabled) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      fileInputRef.current?.click();
+    }
   };
 
   return (
@@ -88,7 +126,10 @@ export default function DocUploadZone({
           }}
         />
         <div
-          className={`flex flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed p-6 text-center transition-colors ${
+          tabIndex={disabled ? -1 : 0}
+          aria-disabled={disabled}
+          onKeyDown={onKeyDown}
+          className={`flex flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed p-6 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
             dragging ? 'border-primary bg-primary/5' : 'border-border'
           }`}
           onDragOver={(e) => {
@@ -113,8 +154,28 @@ export default function DocUploadZone({
           )}
           <span className="text-sm font-medium">{labels.uploadHint}</span>
           <span className="text-xs text-muted-foreground">{labels.browse}</span>
-          {localError && <span className="text-xs text-destructive">{localError}</span>}
         </div>
+        {pending.length > 0 && (
+          <div className="mt-3 space-y-1">
+            {pending.map((p) => (
+              <div key={p.id} className="flex items-center gap-2 text-xs">
+                {p.status === 'uploading' ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                ) : (
+                  <span className="h-3.5 w-3.5 shrink-0 text-destructive">!</span>
+                )}
+                {p.status === 'uploading' ? (
+                  <>
+                    <span className="text-muted-foreground">{p.name}</span>
+                    <span className="text-muted-foreground">{t('ks.uploading')}</span>
+                  </>
+                ) : (
+                  <span className="text-destructive break-words">{p.reason ?? p.name}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );

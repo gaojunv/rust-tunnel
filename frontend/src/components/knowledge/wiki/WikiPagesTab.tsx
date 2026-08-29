@@ -104,6 +104,10 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
   const [qInput, setQInput] = useState('');
   const [searchQ, setSearchQ] = useState('');
   const [openRef, setOpenRef] = useState<string | null>(defaultOpenRef);
+
+  useEffect(() => {
+    if (defaultOpenRef) setOpenRef(defaultOpenRef);
+  }, [defaultOpenRef]);
   const [dialog, setDialog] = useState<{ open: boolean; page: WikiPage | null }>({ open: false, page: null });
   const [actionError, setActionError] = useState<string | null>(null);
 
