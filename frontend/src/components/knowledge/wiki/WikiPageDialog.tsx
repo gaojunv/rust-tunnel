@@ -6,6 +6,7 @@ import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
+import Markdown from '@/components/agent/Markdown';
 import { usePutWikiPage } from '@/api/hooks';
 import type { WikiPage } from '@/types';
 
@@ -27,6 +28,7 @@ export default function WikiPageDialog({ wikiId, open, onClose, page = null }: P
   const [summary, setSummary] = useState('');
   const [content, setContent] = useState('');
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [preview, setPreview] = useState(false);
 
   // initRef：每个 open 周期初始化一次表单（编辑/新建）。page 对象随列表 refetch
   // 变化身份，重跑初始化会覆盖进行中的编辑（仿 KbDialog 防覆盖模式）。
@@ -113,15 +115,39 @@ export default function WikiPageDialog({ wikiId, open, onClose, page = null }: P
             />
           </div>
           <div className="space-y-2">
-            <Label>{t('wiki.pageContent')}</Label>
-            <textarea
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              rows={8}
-              placeholder={t('wiki.pageContentPlaceholder')}
-              aria-label={t('wiki.pageContent')}
-              className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
-            />
+            <div className="flex items-center justify-between">
+              <Label>{t('wiki.pageContent')}</Label>
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => setPreview(false)}
+                  className={`rounded border px-2 py-1 text-xs ${!preview ? 'bg-primary text-primary-foreground' : 'bg-card'}`}
+                >
+                  {t('wiki.editTab')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreview(true)}
+                  className={`rounded border px-2 py-1 text-xs ${preview ? 'bg-primary text-primary-foreground' : 'bg-card'}`}
+                >
+                  {t('wiki.previewTab')}
+                </button>
+              </div>
+            </div>
+            {preview ? (
+              <div className="min-h-[180px] rounded-md border border-input bg-background p-3">
+                <Markdown content={content} />
+              </div>
+            ) : (
+              <textarea
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                rows={8}
+                placeholder={t('wiki.pageContentPlaceholder')}
+                aria-label={t('wiki.pageContent')}
+                className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+              />
+            )}
           </div>
         </div>
         {submitError && <p className="text-sm text-destructive">{submitError}</p>}

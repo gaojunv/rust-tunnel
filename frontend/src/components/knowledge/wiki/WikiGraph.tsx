@@ -26,6 +26,13 @@ const NODE_R = 12;
 const COLLIDE_R = NODE_R + 6;
 const MAX_NODES = 500;
 const DANGLE_LEN = 90;
+const CLICK_THRESHOLD = 6;
+
+export function shouldTreatAsClick(down: { x: number; y: number }, up: { x: number; y: number }): boolean {
+  const dx = down.x - up.x;
+  const dy = down.y - up.y;
+  return Math.sqrt(dx * dx + dy * dy) <= CLICK_THRESHOLD;
+}
 
 /** 环境退化探测（照 CodeMirrorEditor.isEditorSupported 先例）。 */
 function isJsdom(): boolean {
@@ -91,6 +98,7 @@ export default function WikiGraph({ nodes, edges, loading, onNodeClick }: Props)
   // 平移缩放状态（退化模式禁用）
   const [view, setView] = useState({ x: 0, y: 0, scale: 1 });
   const dragRef = useRef<{ kind: 'pan' } | { kind: 'node'; id: string } | null>(null);
+  const downPosRef = useRef<{ x: number; y: number } | null>(null);
   const viewRef = useRef(view);
   viewRef.current = view;
 
@@ -219,6 +227,20 @@ export default function WikiGraph({ nodes, edges, loading, onNodeClick }: Props)
     }
   };
 
+  const zoomTo = (factor: number) => {
+    if (degraded) return;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const v = viewRef.current;
+    const newScale = Math.min(4, Math.max(0.2, v.scale * factor));
+    // 以画布中心为锚点
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const wx = (cx - rect.left - v.x) / v.scale;
+    const wy = (cy - rect.top - v.y) / v.scale;
+    setView({ x: cx - rect.left - wx * newScale, y: cy - rect.top - wy * newScale, scale: newScale });
+  };
+
   const onWheel = (e: React.WheelEvent) => {
     if (degraded) return;
     e.preventDefault();
@@ -270,9 +292,11 @@ export default function WikiGraph({ nodes, edges, loading, onNodeClick }: Props)
             y2={end.y}
             strokeDasharray="6 4"
           />
-          <text x={end.x + 4} y={end.y + 3} className="fill-destructive/70 text-[10px]">
-            {e.to_ref}
-          </text>
+          {view.scale >= 0.6 && (
+            <text x={end.x + 4} y={end.y + 3} className="fill-destructive/70 text-[10px]">
+              {e.to_ref}
+            </text>
+          )}
         </g>
       );
     }
@@ -299,10 +323,14 @@ export default function WikiGraph({ nodes, edges, loading, onNodeClick }: Props)
         className={n.locked ? 'wiki-node wiki-node-locked' : 'wiki-node'}
         onClick={(e) => {
           e.stopPropagation();
+          const down = downPosRef.current;
+          const up = { x: (e as unknown as { clientX: number; clientY: number }).clientX, y: (e as unknown as { clientX: number; clientY: number }).clientY };
+          if (down && !shouldTreatAsClick(down, up)) return;
           onNodeClick?.(n.ref);
         }}
         onPointerDown={(e) => {
           e.stopPropagation();
+          downPosRef.current = { x: e.clientX, y: e.clientY };
           startNodeDrag(n.id, e.clientX, e.clientY);
         }}
         style={{ cursor: onNodeClick ? 'pointer' : 'grab' }}
@@ -345,7 +373,18 @@ export default function WikiGraph({ nodes, edges, loading, onNodeClick }: Props)
           </span>
         )}
       </div>
-      <div className="overflow-hidden rounded-lg border border-border bg-muted/20">
+      <div className="relative overflow-hidden rounded-lg border border-border bg-muted/20">
+        <div className="absolute right-2 top-2 z-10 flex items-center gap-1">
+          <button type="button" aria-label={t('wiki.graphZoomIn')} onClick={() => zoomTo(1.2)} className="rounded border bg-card p-1.5 shadow hover:bg-accent">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+          </button>
+          <button type="button" aria-label={t('wiki.graphZoomOut')} onClick={() => zoomTo(1 / 1.2)} className="rounded border bg-card p-1.5 shadow hover:bg-accent">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+          </button>
+          <button type="button" aria-label={t('wiki.graphReset')} onClick={() => setView({ x: 0, y: 0, scale: 1 })} className="rounded border bg-card p-1.5 shadow hover:bg-accent">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>
+          </button>
+        </div>
         <svg
           ref={svgRef}
           viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}

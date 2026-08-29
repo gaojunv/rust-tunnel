@@ -815,7 +815,12 @@
     "score": "Score",
     "saveError": "Save failed: {{error}}",
     "actionError": "Action failed: {{error}}",
-    "deleteConfirm": "Delete container “{{name}}”? This cannot be undone — documents, vector chunks and pages all go."
+    "deleteConfirm": "Delete container “{{name}}”? This cannot be undone — documents, vector chunks and pages all go.",
+    "uploadInvalidFile": "{{name}}: {{reason}}",
+    "uploadReasonExt": "unsupported extension",
+    "uploadReasonSize": "exceeds size limit (max {{max}})",
+    "uploading": "Uploading…",
+    "uploadFailed": "Upload failed"
   },
   "memory": {
     "title": "AI Memory",
@@ -1383,6 +1388,11 @@
       "listMax": "Max list items",
       "save": "Save settings",
       "saved": "Saved"
-    }
+    },
+    "graphZoomIn": "Zoom in",
+    "graphZoomOut": "Zoom out",
+    "graphReset": "Reset view",
+    "editTab": "Edit",
+    "previewTab": "Preview"
   }
 }
