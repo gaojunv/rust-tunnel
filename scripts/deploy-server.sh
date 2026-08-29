@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# deploy-server.sh — 本地构建并部署 rust-tunnel 服务端到 your.example.com
+# deploy-server.sh — 本地构建并部署 rust-tunnel 服务端
 # 蓝本: .github/workflows/release-server.yml  (单 job: 前端嵌入 → musl 静态编译 → 渲染配置 → SCP → SSH 重启)
 # 用法: ./scripts/deploy-server.sh [--dry-run] [--skip-frontend] [--skip-build] [--target <triple>] [--host <host>] [--port <port>] [--user <user>] [--deploy-path <path>]
+# 部署目标通过环境变量 / .env / --host 配置，不在脚本中硬编码服务器地址。
 set -euo pipefail
 
 # ---------- 颜色 ----------
@@ -13,7 +14,7 @@ die()   { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 
 # ---------- 默认值 ----------
 TARGET="x86_64-unknown-linux-musl"
-SERVER_HOST="${SERVER_HOST:-your.example.com}"
+SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-22}"
 SERVER_USER="${SERVER_USER:-root}"
 SERVER_SSH_KEY="${SERVER_SSH_KEY:-}"
@@ -35,19 +36,19 @@ usage() {
   --skip-frontend        跳过前端构建（复用现有 frontend-dist/）
   --skip-build           跳过 cargo build（复用已有二进制）
   --target <triple>      musl target，默认 x86_64-unknown-linux-musl
-  --host <host>          覆盖 SERVER_HOST (默认 your.example.com)
+  --host <host>          覆盖 SERVER_HOST (必填，无默认值)
   --port <port>          覆盖 SERVER_PORT (默认 22)
   --user <user>          覆盖 SERVER_USER (默认 root)
   --deploy-path <path>   覆盖 DEPLOY_PATH (如 /opt/rust-tunnel)
   -h, --help             显示帮助
 
 环境变量 (优先级: 命令行 > 环境变量 > .env 文件):
-  SERVER_HOST, SERVER_PORT, SERVER_USER, SERVER_SSH_KEY
+  SERVER_HOST (必填), SERVER_PORT, SERVER_USER, SERVER_SSH_KEY
   DEPLOY_PATH, ADMIN_PASSWORD, CLIENT_AUTH_TOKEN, SS_PASSWORD
   DEPLOY_DRY_RUN=1  等价于 --dry-run
 
 示例:
-  ./scripts/deploy-server.sh                        # 完整构建+部署
+  ./scripts/deploy-server.sh                        # 完整构建+部署（需先配置 SERVER_HOST）
   ./scripts/deploy-server.sh --dry-run              # 仅本地构建校验
   ./scripts/deploy-server.sh --skip-frontend        # 仅改后端时提速
   SERVER_HOST=your.example.com ./scripts/deploy-server.sh
@@ -94,6 +95,14 @@ if [[ "${DRY_RUN}" == "1" || "${DRY_RUN}" == "true" ]]; then
   DRY_RUN=1
 else
   DRY_RUN=0
+fi
+
+if [[ -z "${SERVER_HOST}" ]]; then
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    warn "SERVER_HOST 未设置（dry-run 下可忽略，完整部署时必填）"
+  else
+    die "SERVER_HOST 未设置，请通过 --host / SERVER_HOST 环境变量 / .env 配置（例如 SERVER_HOST=your.example.com）"
+  fi
 fi
 
 info "配置: host=${SERVER_HOST}:${SERVER_PORT} user=${SERVER_USER} target=${TARGET} dry_run=${DRY_RUN} skip_frontend=${SKIP_FRONTEND} skip_build=${SKIP_BUILD}"
