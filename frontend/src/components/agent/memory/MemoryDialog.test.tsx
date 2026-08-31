@@ -11,7 +11,6 @@ vi.mock('react-i18next', () => ({
 
 const api = vi.hoisted(() => ({
   createMemory: vi.fn(),
-  updateMemory: vi.fn(),
   listAgentWorkspaces: vi.fn(),
   clientsApi: { list: vi.fn() },
 }));
@@ -19,6 +18,14 @@ const api = vi.hoisted(() => ({
 vi.mock('../../../api/client', () => ({
   ...api,
   getApiErrorMessage: (err: unknown) => (err as Error)?.message ?? String(err),
+}));
+
+vi.mock('@/utils/format', () => ({
+  formatDateTime: (s: string) => `fmt:${s}`,
+  formatBytes: (n: number) => `${n} B`,
+  formatBps: (n: number) => `${n} B/s`,
+  formatMs: (n: number) => `${n} ms`,
+  formatPercent: (n: number) => `${n}%`,
 }));
 
 const memoryFixture: AgentMemory = {
@@ -38,14 +45,13 @@ const memoryFixture: AgentMemory = {
   updated_at: '2026-08-02T00:00:00Z',
 };
 
-const renderDialog = (memory?: AgentMemory | null) => {
+const renderDialog = () => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryDialog
         open
         onClose={vi.fn()}
-        memory={memory ?? null}
         onCreated={vi.fn()}
       />
     </QueryClientProvider>
@@ -56,6 +62,14 @@ describe('MemoryDialog', () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it('仅提供新建入口，标题为 newMemory', () => {
+    api.listAgentWorkspaces.mockResolvedValue([]);
+    api.clientsApi.list.mockResolvedValue([]);
+    renderDialog();
+    expect(screen.getByText('memory.newMemory')).toBeTruthy();
+    expect(screen.queryByText('memory.editMemory')).toBeNull();
   });
 
   it('disables save while content is empty', () => {
@@ -105,7 +119,6 @@ describe('MemoryDialog', () => {
     api.createMemory.mockResolvedValue({ ...memoryFixture, id: 'm-new' });
 
     renderDialog();
-    // 先切到 client 作用域，客户端下拉才会出现（默认 workspace）
     fireEvent.change(screen.getByLabelText('memory.scopeLabel'), { target: { value: 'client' } });
     await screen.findByRole('option', { name: 'nas' });
 
@@ -122,29 +135,6 @@ describe('MemoryDialog', () => {
         client_id: 'nas',
         tags: [],
         confidence: 0.8,
-      });
-    });
-  });
-
-  it('edit mode prefills fields and updates via PUT', async () => {
-    api.listAgentWorkspaces.mockResolvedValue([]);
-    api.clientsApi.list.mockResolvedValue([]);
-    api.updateMemory.mockResolvedValue(memoryFixture);
-
-    renderDialog(memoryFixture);
-    await screen.findByDisplayValue('user prefers rust over go');
-
-    fireEvent.change(screen.getByLabelText('memory.content'), {
-      target: { value: 'user prefers rust, not go' },
-    });
-    fireEvent.click(screen.getByText('common.save'));
-
-    await waitFor(() => {
-      expect(api.updateMemory).toHaveBeenCalledWith('m1', {
-        content: 'user prefers rust, not go',
-        tags: ['rust'],
-        scope: 'global',
-        confidence: 0.9,
       });
     });
   });

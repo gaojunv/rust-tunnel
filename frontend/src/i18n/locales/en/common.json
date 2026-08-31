@@ -25,7 +25,15 @@
     "add": "Add",
     "disabled": "Disabled",
     "confirm": "Confirm",
-    "saveError": "Save failed: {{error}}"
+    "saveError": "Save failed: {{error}}",
+    "toast": {
+      "saved": "Saved",
+      "deleted": "Deleted",
+      "actionFailed": "Action failed: {{error}}"
+    },
+    "clearSearch": "Clear search",
+    "loadMore": "Load more",
+    "loadedOf": "Loaded {{loaded}} of {{total}}"
   },
   "timeRange": {
     "custom": "Custom"
@@ -700,8 +708,7 @@
       "memory": "Memory",
       "skill": "Skills",
       "roles": "Roles"
-    },
-    "settingsHint": "Open settings from the gear icon in each section header"
+    }
   },
   "ks": {
     "title": "Knowledge",
@@ -808,14 +815,18 @@
     "score": "Score",
     "saveError": "Save failed: {{error}}",
     "actionError": "Action failed: {{error}}",
-    "deleteConfirm": "Delete container “{{name}}”? This cannot be undone — documents, vector chunks and pages all go."
+    "deleteConfirm": "Delete container “{{name}}”? This cannot be undone — documents, vector chunks and pages all go.",
+    "uploadInvalidFile": "{{name}}: {{reason}}",
+    "uploadReasonExt": "unsupported extension",
+    "uploadReasonSize": "exceeds size limit (max {{max}})",
+    "uploading": "Uploading…",
+    "uploadFailed": "Upload failed"
   },
   "memory": {
     "title": "AI Memory",
     "description": "Manage AI workbench memory: session distill, retrieval injection and manual curation",
     "listTitle": "Memories",
     "newMemory": "New Memory",
-    "editMemory": "Edit Memory",
     "noSelection": "Select a memory from the list to view and manage it",
     "empty": "No memories yet. Archiving an AI workbench session distills memories automatically, or click \"New Memory\" to add one manually.",
     "all": "All",
@@ -876,8 +887,13 @@
       "clear": "Clear & Rebuild",
       "clearDesc": "Clears all memories and vectors. Must be done before changing the Embedding model.",
       "clearConfirm": "Clear all memories? This cannot be undone.",
-      "cleared": "Cleared"
-    }
+      "cleared": "Cleared",
+      "clearConfirmTitle": "Clear all memories",
+      "clearConfirmDesc": "Clear all memories? This cannot be undone. This will delete all memories and vectors."
+    },
+    "noSearchResults": "No matching memories",
+    "deleteConfirmTitle": "Delete memory",
+    "deleteConfirmDesc": "Delete this memory? This cannot be undone."
   },
   "skill": {
     "title": "Skill Library",
@@ -930,7 +946,10 @@
       "listMax": "Max list items",
       "save": "Save Settings",
       "saved": "Saved"
-    }
+    },
+    "noSearchResults": "No matching skills",
+    "deleteConfirmTitle": "Delete skill",
+    "deleteConfirmDesc": "Delete this skill? This cannot be undone."
   },
   "role": {
     "title": "Roles",
@@ -941,6 +960,10 @@
     "deleteRole": "Delete Role",
     "noSelection": "Select a role from the list to view and manage",
     "empty": "No custom roles yet. Built-in roles general (universal subagent) and explore (read-only) are always available.",
+    "noSearchResults": "No matching roles",
+    "scopeFilter": "Scope",
+    "scopeAll": "All scopes",
+    "actionFailed": "Action failed: {{error}}",
     "all": "All",
     "searchPlaceholder": "Search roles…",
     "enabledOnly": "Enabled only",
@@ -1376,6 +1399,11 @@
       "listMax": "Max list items",
       "save": "Save settings",
       "saved": "Saved"
-    }
+    },
+    "graphZoomIn": "Zoom in",
+    "graphZoomOut": "Zoom out",
+    "graphReset": "Reset view",
+    "editTab": "Edit",
+    "previewTab": "Preview"
   }
 }

@@ -65,8 +65,7 @@ export default function SourceDetail({ source, onBack, onDeleted }: Props) {
   const [editOpen, setEditOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState('docs');
-  // 图谱节点联动：openReq.seq 递增触发 PagesTab 重挂载并打开 defaultOpenRef
-  const [openReq, setOpenReq] = useState<{ ref: string; seq: number } | null>(null);
+  const [openReq, setOpenReq] = useState<string | null>(null);
 
   const [query, setQuery] = useState('');
   const ime = useImeGuard();
@@ -92,7 +91,7 @@ export default function SourceDetail({ source, onBack, onDeleted }: Props) {
   const graph = useWikiGraph(activeTab === 'graph' ? source.id : '');
 
   const handleNodeClick = (ref: string) => {
-    setOpenReq((cur) => ({ ref, seq: (cur?.seq ?? 0) + 1 }));
+    setOpenReq(ref);
     setActiveTab('pages');
   };
 
@@ -164,7 +163,9 @@ export default function SourceDetail({ source, onBack, onDeleted }: Props) {
           <div className="flex items-center gap-2">
             <Switch
               checked={source.enabled}
-              onCheckedChange={(v) => toggleMutation.mutate({ id: source.id, enabled: v })}
+              onCheckedChange={(v) =>
+                toggleMutation.mutate({ id: source.id, enabled: v }, { onError: (err) => setError(t('ks.actionError', { error: getApiErrorMessage(err) })) })
+              }
               aria-label={t('ks.enabledSwitch')}
             />
             <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
@@ -204,11 +205,11 @@ export default function SourceDetail({ source, onBack, onDeleted }: Props) {
             </TabsTrigger>
           ))}
         </TabsList>
-        <TabsContent value="docs" className="mt-4">
+        <TabsContent value="docs" className="mt-4" forceMount>
           <SourceDocsTab source={source} />
         </TabsContent>
         {source.index_vector && (
-          <TabsContent value="query" className="mt-4">
+          <TabsContent value="query" className="mt-4" forceMount>
             <Card>
               <CardHeader>
                 <CardTitle className="text-base">{t('ks.query')}</CardTitle>
@@ -265,14 +266,13 @@ export default function SourceDetail({ source, onBack, onDeleted }: Props) {
         )}
         {source.index_pages && (
           <>
-            <TabsContent value="pages" className="mt-4">
+            <TabsContent value="pages" className="mt-4" forceMount>
               <WikiPagesTab
-                key={openReq?.seq ?? 0}
                 wikiId={source.id}
-                defaultOpenRef={openReq?.ref ?? null}
+                defaultOpenRef={openReq}
               />
             </TabsContent>
-            <TabsContent value="graph" className="mt-4">
+            <TabsContent value="graph" className="mt-4" forceMount>
               <WikiGraph
                 nodes={graph.data?.nodes ?? []}
                 edges={graph.data?.edges ?? []}

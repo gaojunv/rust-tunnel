@@ -1,12 +1,15 @@
+import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
-import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Database, FileStack } from 'lucide-react';
 import { useKnowledgeStream } from '@/api/hooks';
+import { listKnowledgeSources } from '@/api/client';
 import ScopeFilterBar from '@/components/knowledge/shared/ScopeFilterBar';
 import SectionFrame from '@/components/knowledge/shared/SectionFrame';
+import LoadMoreFooter from '@/components/knowledge/shared/LoadMoreFooter';
+import { usePagedList } from '@/components/knowledge/shared/usePagedList';
 import type { AgentMemoryScope, KnowledgeIndexKind, KnowledgeSource } from '@/types';
 
 /** 统一容器列表的 UI 过滤条件（父组件持有，映射到 `/api/knowledge` 查询参数）。 */
@@ -29,13 +32,14 @@ export const EMPTY_SOURCE_FILTERS: SourceFilters = {
 };
 
 interface Props {
-  sources: KnowledgeSource[];
   filters: SourceFilters;
   onFiltersChange: (filters: SourceFilters) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
   onSettings?: () => void;
+  /** 兼容旧调用：若传入则直接展示，不再分页拉取。 */
+  sources?: KnowledgeSource[];
 }
 
 function statusVariant(status: string): 'default' | 'secondary' | 'destructive' | 'outline' {
@@ -55,24 +59,81 @@ function statusClass(status: string): string {
   return '';
 }
 
+function CompactRow({ s, selected, onSelect }: { s: KnowledgeSource; selected: boolean; onSelect: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div
+      onClick={onSelect}
+      className={cn(
+        'flex h-12 cursor-pointer items-center justify-between gap-2 rounded-md border px-3 transition-colors hover:border-primary/40',
+        selected && 'border-primary/60 bg-primary/5',
+        !s.enabled && 'opacity-60',
+      )}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="truncate text-sm font-medium">{s.name}</span>
+        <Badge variant={statusVariant(s.status)} className={cn('shrink-0 text-[10px]', statusClass(s.status))}>
+          {t(`ks.status.${s.status}`)}
+        </Badge>
+        {s.index_vector && (
+          <Badge variant="outline" className="hidden shrink-0 gap-1 border-sky-500/40 text-sky-600 dark:text-sky-400 sm:inline-flex">
+            <Database className="h-3 w-3" />
+            {t('ks.badgeVector')}
+          </Badge>
+        )}
+        {s.index_pages && (
+          <Badge variant="outline" className="hidden shrink-0 gap-1 border-violet-500/40 text-violet-600 dark:text-violet-400 sm:inline-flex">
+            <FileStack className="h-3 w-3" />
+            {t('ks.badgePages')}
+          </Badge>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+        <span>{s.doc_count}</span>
+        {!s.enabled && <Badge variant="secondary" className="text-[10px]">{t('ks.disabled')}</Badge>}
+      </div>
+    </div>
+  );
+}
+
 export default function SourceList({
-  sources,
   filters,
   onFiltersChange,
   selectedId,
   onSelect,
   onNew,
   onSettings,
+  sources: sourcesProp,
 }: Props) {
   const { t } = useTranslation();
   useKnowledgeStream();
 
   const searching = (filters.q ?? '').trim().length > 0;
+  const filtersKey = JSON.stringify(filters);
+
+  const fetchPage = useCallback(async (offset: number, limit: number) => {
+    const res = await listKnowledgeSources({
+      index_kind: filters.indexKind === 'all' ? undefined : filters.indexKind,
+      scope: filters.scope === 'all' ? undefined : filters.scope,
+      client_id: filters.scope === 'client' ? filters.clientId || undefined : undefined,
+      workspace_id: filters.scope === 'workspace' ? filters.workspaceId || undefined : undefined,
+      q: (filters.q ?? '').trim() || undefined,
+      status: filters.status || undefined,
+      limit,
+      offset,
+    });
+    return { items: res.sources, total: res.total };
+  }, [filters.indexKind, filters.scope, filters.clientId, filters.workspaceId, filters.q, filters.status]);
+
+  const paged = usePagedList<KnowledgeSource>({ fetchPage, filtersKey, pageSize: 20 });
+  const usingPaged = sourcesProp === undefined;
+  const sources = usingPaged ? paged.items : sourcesProp!;
+  const total = usingPaged ? paged.total : sourcesProp!.length;
 
   return (
     <SectionFrame
       title={t('ks.listTitle')}
-      count={sources.length}
+      count={total}
       newLabel={t('ks.new')}
       onNew={onNew}
       onSettings={onSettings}
@@ -129,69 +190,22 @@ export default function SourceList({
       />
 
       {sources.length === 0 ? (
-        <Card>
-          <CardContent className="p-6 text-center text-sm text-muted-foreground">
+        paged.loading && usingPaged ? (
+          <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+        ) : (
+          <div className="rounded-lg border p-6 text-center text-sm text-muted-foreground">
             {searching ? t('ks.noSearchResults') : t('ks.empty')}
-          </CardContent>
-        </Card>
+          </div>
+        )
       ) : (
-        sources.map((s) => (
-          <Card
-            key={s.id}
-            className={cn(
-              'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === s.id && 'border-primary/60 bg-primary/5',
-              // 总闸关闭的容器整卡降饱和，与状态徽章区分：状态说的是索引进度，这里说的是是否生效
-              !s.enabled && 'opacity-60',
-            )}
-            onClick={() => onSelect(s.id)}
-          >
-            <CardContent className="p-4">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold">{s.name}</p>
-                  {s.summary && (
-                    <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{s.summary}</p>
-                  )}
-                </div>
-                <Badge variant={statusVariant(s.status)} className={cn('shrink-0', statusClass(s.status))}>
-                  {t(`ks.status.${s.status}`)}
-                </Badge>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-                {s.index_vector && (
-                  <Badge variant="outline" className="gap-1 border-sky-500/40 text-sky-600 dark:text-sky-400">
-                    <Database className="h-3 w-3" />
-                    {t('ks.badgeVector')}
-                  </Badge>
-                )}
-                {s.index_pages && (
-                  <Badge variant="outline" className="gap-1 border-violet-500/40 text-violet-600 dark:text-violet-400">
-                    <FileStack className="h-3 w-3" />
-                    {t('ks.badgePages')}
-                  </Badge>
-                )}
-                <Badge variant="outline">{t(`ks.scope_${s.scope_type}`)}</Badge>
-                {!s.enabled && <Badge variant="secondary">{t('ks.disabled')}</Badge>}
-              </div>
-              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-                <span>{t('ks.docCount', { count: s.doc_count })}</span>
-                {s.index_pages && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span>{t('ks.pageCount', { count: s.page_count })}</span>
-                  </>
-                )}
-                {s.index_vector && s.emb_model && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span className="truncate">{s.emb_model}</span>
-                  </>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        ))
+        <>
+          <div className="space-y-1">
+            {sources.map((s) => (
+              <CompactRow key={s.id} s={s} selected={selectedId === s.id} onSelect={() => onSelect(s.id)} />
+            ))}
+          </div>
+          {usingPaged && <LoadMoreFooter loaded={sources.length} total={total} loading={paged.loadingMore} onLoadMore={paged.loadMore} />}
+        </>
       )}
     </SectionFrame>
   );

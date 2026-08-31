@@ -34,9 +34,9 @@ const KNOW_TABS: { value: KnowTab; icon: React.ReactNode; labelKey: string }[] =
 ];
 
 function useCounts() {
-  const { data: sources } = useKnowledgeSources({});
-  const { data: mem } = useMemories({});
-  const { data: skills } = useSkills({});
+  const { data: sources } = useKnowledgeSources({ limit: 1 });
+  const { data: mem } = useMemories({ limit: 1 });
+  const { data: skills } = useSkills({ limit: 1 });
   const { data: roles } = useRoles({});
   return {
     kb: sources?.total ?? sources?.sources?.length ?? 0,
@@ -74,72 +74,41 @@ export default function KnowledgePage() {
     <div className="space-y-6">
       <PageHeader title={t('knowledge.title')} description={t('knowledge.description')} />
 
-      {/* 移动端：横向 pill 条（可横滑，不换行） */}
-      <div className="flex gap-1.5 overflow-x-auto pb-1 lg:hidden">
-        {KNOW_TABS.map((tab) => {
-          const active = tab.value === activeTab;
-          return (
-            <button
-              key={tab.value}
-              onClick={() => setActiveTab(tab.value)}
-              className={cn(
-                'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm font-medium transition-colors',
-                active
-                  ? 'border-primary bg-primary text-primary-foreground'
-                  : 'border-border bg-card text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-              )}
-            >
-              {tab.icon}
-              {t(tab.labelKey)}
-              <Badge
-                variant={active ? 'secondary' : 'outline'}
-                className={cn('ml-1 h-5 min-w-5 justify-center px-1 text-[10px]', active && 'bg-primary-foreground/15 text-primary-foreground')}
+      {/* 统一顶部横向 Tabs 条（sticky 吸顶，可横向滚动） */}
+      <div className="sticky top-0 z-10 -mx-4 border-b bg-background/95 px-4 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/60 sm:mx-0 sm:px-0">
+        <div className="flex gap-1.5 overflow-x-auto">
+          {KNOW_TABS.map((tab) => {
+            const active = tab.value === activeTab;
+            return (
+              <button
+                key={tab.value}
+                onClick={() => setActiveTab(tab.value)}
+                className={cn(
+                  'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm font-medium transition-colors',
+                  active
+                    ? 'border-primary bg-primary text-primary-foreground'
+                    : 'border-border bg-card text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+                )}
               >
-                {counts[tab.value]}
-              </Badge>
-            </button>
-          );
-        })}
+                {tab.icon}
+                {t(tab.labelKey)}
+                <Badge
+                  variant={active ? 'secondary' : 'outline'}
+                  className={cn('ml-1 h-5 min-w-5 justify-center px-1 text-[10px]', active && 'bg-primary-foreground/15 text-primary-foreground')}
+                >
+                  {counts[tab.value]}
+                </Badge>
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-        {/* 桌面：左侧竖向导航（sticky，随 ScrollArea 整页滚动而吸顶） */}
-        <nav className="hidden w-52 shrink-0 lg:block">
-          <div className="sticky top-6 space-y-1 rounded-xl border bg-card p-2">
-            {KNOW_TABS.map((tab) => {
-              const active = tab.value === activeTab;
-              return (
-                <button
-                  key={tab.value}
-                  onClick={() => setActiveTab(tab.value)}
-                  className={cn(
-                    'flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-                    active
-                      ? 'bg-primary text-primary-foreground'
-                      : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-                  )}
-                >
-                  {tab.icon}
-                  <span className="flex-1 text-left">{t(tab.labelKey)}</span>
-                  <Badge
-                    variant={active ? 'secondary' : 'outline'}
-                    className={cn('h-5 min-w-5 justify-center px-1 text-[10px]', active && 'bg-primary-foreground/15 text-primary-foreground')}
-                  >
-                    {counts[tab.value]}
-                  </Badge>
-                </button>
-              );
-            })}
-            <p className="px-3 pt-2 text-[11px] leading-relaxed text-muted-foreground">{t('knowledge.settingsHint')}</p>
-          </div>
-        </nav>
-
-        <div className="min-w-0 flex-1">
-          {activeTab === 'kb' && <SourceSection />}
-          {activeTab === 'memory' && <MemorySection />}
-          {activeTab === 'skill' && <SkillSection />}
-          {activeTab === 'roles' && <RoleSection />}
-        </div>
+      <div className="min-w-0">
+        {activeTab === 'kb' && <SourceSection />}
+        {activeTab === 'memory' && <MemorySection />}
+        {activeTab === 'skill' && <SkillSection />}
+        {activeTab === 'roles' && <RoleSection />}
       </div>
     </div>
   );

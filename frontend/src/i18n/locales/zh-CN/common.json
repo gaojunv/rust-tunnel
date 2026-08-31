@@ -25,7 +25,15 @@
     "add": "添加",
     "disabled": "已禁用",
     "confirm": "确认",
-    "saveError": "保存失败：{{error}}"
+    "saveError": "保存失败：{{error}}",
+    "toast": {
+      "saved": "已保存",
+      "deleted": "已删除",
+      "actionFailed": "操作失败：{{error}}"
+    },
+    "clearSearch": "清除搜索",
+    "loadMore": "加载更多",
+    "loadedOf": "已加载 {{loaded}} / 共 {{total}}"
   },
   "timeRange": {
     "custom": "自定义"
@@ -700,8 +708,7 @@
       "memory": "记忆",
       "skill": "技能",
       "roles": "角色"
-    },
-    "settingsHint": "在各分区右上角 ··· 打开设置"
+    }
   },
   "ks": {
     "title": "知识库",
@@ -808,14 +815,18 @@
     "score": "分数",
     "saveError": "保存失败：{{error}}",
     "actionError": "操作失败：{{error}}",
-    "deleteConfirm": "删除容器「{{name}}」？此操作不可撤销，文档、向量分块与页面将一并清除。"
+    "deleteConfirm": "删除容器「{{name}}」？此操作不可撤销，文档、向量分块与页面将一并清除。",
+    "uploadInvalidFile": "{{name}}：{{reason}}",
+    "uploadReasonExt": "不支持的扩展名",
+    "uploadReasonSize": "超过大小限制（上限 {{max}}）",
+    "uploading": "上传中…",
+    "uploadFailed": "上传失败"
   },
   "memory": {
     "title": "AI 记忆体",
     "description": "管理 AI 工作台的记忆：会话蒸馏、检索注入与手动维护",
     "listTitle": "记忆",
     "newMemory": "新建记忆",
-    "editMemory": "编辑记忆",
     "noSelection": "从列表中选择一条记忆以查看和管理",
     "empty": "暂无记忆。归档 AI 工作台会话将自动蒸馏记忆，或点击「新建记忆」手动添加。",
     "all": "全部",
@@ -876,8 +887,13 @@
       "clear": "清空重建",
       "clearDesc": "清空全部记忆与向量。更换 Embedding 模型前必须先清空。",
       "clearConfirm": "确定清空全部记忆？此操作不可撤销。",
-      "cleared": "已清空"
-    }
+      "cleared": "已清空",
+      "clearConfirmTitle": "清空全部记忆",
+      "clearConfirmDesc": "确定清空全部记忆？此操作将删除全部记忆与向量，且不可撤销。"
+    },
+    "noSearchResults": "无匹配记忆",
+    "deleteConfirmTitle": "删除记忆",
+    "deleteConfirmDesc": "删除这条记忆？此操作不可撤销。"
   },
   "skill": {
     "title": "技能库",
@@ -930,7 +946,10 @@
       "listMax": "清单最大条数",
       "save": "保存设置",
       "saved": "已保存"
-    }
+    },
+    "noSearchResults": "无匹配技能",
+    "deleteConfirmTitle": "删除技能",
+    "deleteConfirmDesc": "删除这个技能？此操作不可撤销。"
   },
   "role": {
     "title": "角色",
@@ -941,6 +960,10 @@
     "deleteRole": "删除角色",
     "noSelection": "从列表中选择一个角色以查看和管理",
     "empty": "暂无自定义角色。内置角色 general（通用子代理）和 explore（只读探索）始终可用。",
+    "noSearchResults": "无匹配角色",
+    "scopeFilter": "作用域",
+    "scopeAll": "全部作用域",
+    "actionFailed": "操作失败：{{error}}",
     "all": "全部",
     "searchPlaceholder": "搜索角色…",
     "enabledOnly": "仅看已启用",
@@ -1373,6 +1396,11 @@
       "listMax": "清单最大条数",
       "save": "保存设置",
       "saved": "已保存"
-    }
+    },
+    "graphZoomIn": "放大",
+    "graphZoomOut": "缩小",
+    "graphReset": "重置视图",
+    "editTab": "编辑",
+    "previewTab": "预览"
   }
 }

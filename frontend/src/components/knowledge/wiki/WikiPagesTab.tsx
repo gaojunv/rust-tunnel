@@ -1,12 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Lock, Plus, RefreshCw, Search, Trash2, ArrowLeft, Loader2, FileText, AlertTriangle } from 'lucide-react';
+import { Lock, Plus, Pencil, Search, Trash2, ArrowLeft, Loader2, FileText, AlertTriangle, X } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
-import { useDeleteWikiPage, useWikiPage, useWikiPages, useWikiSearch } from '@/api/hooks';
+import { listWikiPages } from '@/api/client';
+import { useDeleteWikiPage, useWikiPage, useWikiSearch } from '@/api/hooks';
+import LoadMoreFooter from '@/components/knowledge/shared/LoadMoreFooter';
+import { usePagedList } from '@/components/knowledge/shared/usePagedList';
 import Markdown from '@/components/agent/Markdown';
 import { ConfirmDialog, useConfirm } from '@/components/llm/confirm';
 import WikiPageDialog from './WikiPageDialog';
@@ -90,7 +93,7 @@ function PageRow({
 
 interface Props {
   wikiId: string;
-  /** 图谱节点点击联动：默认打开的页面 ref（父组件通过 key 变化触发重挂载）。 */
+  /** 图谱节点点击联动：默认打开的页面 ref（父组件通过 useEffect 同步）。 */
   defaultOpenRef?: string | null;
 }
 
@@ -104,6 +107,10 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
   const [qInput, setQInput] = useState('');
   const [searchQ, setSearchQ] = useState('');
   const [openRef, setOpenRef] = useState<string | null>(defaultOpenRef);
+
+  useEffect(() => {
+    if (defaultOpenRef) setOpenRef(defaultOpenRef);
+  }, [defaultOpenRef]);
   const [dialog, setDialog] = useState<{ open: boolean; page: WikiPage | null }>({ open: false, page: null });
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -113,7 +120,11 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
     return () => clearTimeout(timer);
   }, [qInput]);
 
-  const { data: pagesData, isLoading } = useWikiPages(wikiId);
+  const fetchPage = useCallback(async (offset: number, limit: number) => {
+    const res = await listWikiPages(wikiId, { limit, offset });
+    return { items: res.pages, total: res.total };
+  }, [wikiId]);
+  const paged = usePagedList<WikiPageSummary>({ fetchPage, filtersKey: wikiId, pageSize: 20 });
   const { data: searchData, isFetching: searching } = useWikiSearch(wikiId, searchQ);
   const { data: openPage, isLoading: pageLoading } = useWikiPage(wikiId, openRef);
 
@@ -122,6 +133,7 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
   const openByRef = (ref: string) => {
     setActionError(null);
     setOpenRef(ref);
+    setQInput('');
   };
 
   const removePage = (page: WikiPageSummary) => {
@@ -157,8 +169,19 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
               onChange={(e) => setQInput(e.target.value)}
               placeholder={t('wiki.pageSearchPlaceholder')}
               aria-label={t('wiki.pageSearchPlaceholder')}
-              className="h-9 pl-8"
+              className="h-9 pl-8 pr-8"
             />
+            {qInput && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2"
+                aria-label={t('common.clearSearch')}
+                onClick={() => setQInput('')}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            )}
           </div>
           {searchActive && (
             <div className="mt-2 max-h-64 space-y-1 overflow-y-auto pr-1">
@@ -225,8 +248,9 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
                 size="sm"
                 onClick={() => openPage && setDialog({ open: true, page: openPage })}
                 disabled={!openPage}
+                aria-label={t('common.edit')}
               >
-                <RefreshCw className="mr-1 h-4 w-4" /> {t('common.edit')}
+                <Pencil className="mr-1 h-4 w-4" /> {t('common.edit')}
               </Button>
             </div>
           </CardHeader>
@@ -248,29 +272,32 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
         <Card>
           <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
             <CardTitle className="text-base">
-              {t('wiki.pages')} ({pagesData?.pages.length ?? 0})
+              {t('wiki.pages')} ({paged.total})
             </CardTitle>
             <Button size="sm" onClick={() => setDialog({ open: true, page: null })}>
               <Plus className="mr-1 h-4 w-4" /> {t('wiki.newPage')}
             </Button>
           </CardHeader>
           <CardContent className="p-4">
-            {isLoading ? (
+            {paged.loading ? (
               <div className="text-sm text-muted-foreground">{t('common.loading')}</div>
-            ) : (pagesData?.pages.length ?? 0) === 0 ? (
+            ) : paged.items.length === 0 ? (
               <div className="text-sm text-muted-foreground">{t('wiki.noPages')}</div>
             ) : (
-              <div>
-                {pagesData!.pages.map((p) => (
-                  <PageRow
-                    key={p.id}
-                    page={p}
-                    onClick={() => openByRef(p.ref)}
-                    onDelete={() => removePage(p)}
-                    deleting={deleteMutation.isPending && deleteMutation.variables?.ref === p.ref}
-                  />
-                ))}
-              </div>
+              <>
+                <div>
+                  {paged.items.map((p) => (
+                    <PageRow
+                      key={p.id}
+                      page={p}
+                      onClick={() => openByRef(p.ref)}
+                      onDelete={() => removePage(p)}
+                      deleting={deleteMutation.isPending && deleteMutation.variables?.ref === p.ref}
+                    />
+                  ))}
+                </div>
+                <LoadMoreFooter loaded={paged.items.length} total={paged.total} loading={paged.loadingMore} onLoadMore={paged.loadMore} />
+              </>
             )}
           </CardContent>
         </Card>

@@ -6,9 +6,11 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
 import { getApiErrorMessage } from '@/api/client';
 import { useCreateRole, useUpdateRole, useClients, useAgentWorkspaces } from '@/api/hooks';
 import { listAgentSelectableModels } from '@/api/agentModels';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { AgentRole, AgentRoleMode, AgentRoleScope, CreateRoleRequest, UpdateRoleRequest } from '@/types';
 
 interface Props {
@@ -162,7 +164,10 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
       const req: UpdateRoleRequest = { ...base };
       updateMutation.mutate(
         { id: role.id, ...req },
-        { onSuccess: (_, vars) => { void vars; } },
+        {
+          onSuccess: () => { toast.success(t('common.toast.saved')); onClose(); },
+          onError: fail,
+        },
       );
     } else {
       const req: CreateRoleRequest = {
@@ -171,7 +176,7 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
         ...(scope === 'workspace' ? { workspace_id: workspaceId } : {}),
       };
       createMutation.mutate(req, {
-        onSuccess: () => {},
+        onSuccess: () => { toast.success(t('common.toast.saved')); onClose(); },
         onError: fail,
       });
     }
@@ -198,7 +203,7 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
                 type="checkbox"
                 checked={selected.includes(tool)}
                 onChange={() => toggleTool(tool, target)}
-                className="h-3.5 w-3.5 rounded border-gray-300"
+                className="h-3.5 w-3.5 rounded border-gray-300 accent-primary"
               />
               {tool}
             </label>
@@ -286,28 +291,30 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
           {/* 模型覆盖 */}
           <div className="space-y-2">
             <Label>{t('role.modelOverride')}</Label>
-            <select
-              value={modelOverride}
-              onChange={(e) => setModelOverride(e.target.value)}
-              aria-label={t('role.modelOverride')}
-              className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            >
-              <option value="">{t('role.modelInherit')}</option>
-              {(modelOptions?.models ?? []).length > 0 && (
-                <optgroup label={t('agent.model')}>
-                  {modelOptions!.models.map((m) => (
-                    <option key={m.id} value={m.label}>{m.label}</option>
-                  ))}
-                </optgroup>
-              )}
-              {(modelOptions?.groups ?? []).length > 0 && (
-                <optgroup label={t('agent.modelGroups')}>
-                  {modelOptions!.groups.map((g) => (
-                    <option key={g.id} value={g.label}>{g.label}</option>
-                  ))}
-                </optgroup>
-              )}
-            </select>
+            <Select value={modelOverride || '__inherit__'} onValueChange={(v) => setModelOverride(v === '__inherit__' ? '' : v)}>
+              <SelectTrigger aria-label={t('role.modelOverride')}>
+                <SelectValue placeholder={t('role.modelInherit')} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__inherit__">{t('role.modelInherit')}</SelectItem>
+                {(modelOptions?.models ?? []).length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>{t('agent.model')}</SelectLabel>
+                    {modelOptions!.models.map((m) => (
+                      <SelectItem key={m.id} value={m.label}>{m.label}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
+                {(modelOptions?.groups ?? []).length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>{t('agent.modelGroups')}</SelectLabel>
+                    {modelOptions!.groups.map((g) => (
+                      <SelectItem key={g.id} value={g.label}>{g.label}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
+              </SelectContent>
+            </Select>
           </div>
 
           {/* 模式 */}
@@ -322,6 +329,7 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
                     value={opt.value}
                     checked={mode === opt.value}
                     onChange={() => setMode(opt.value)}
+                    className="accent-primary"
                   />
                   {t(opt.labelKey)}
                 </label>
@@ -341,6 +349,7 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
                     value={opt.value}
                     checked={scope === opt.value}
                     onChange={() => changeScope(opt.value)}
+                    className="accent-primary"
                   />
                   {t(opt.labelKey)}
                 </label>
@@ -350,37 +359,33 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
           {scope === 'client' && (
             <div className="space-y-2">
               <Label>{t('role.clientLabel')}</Label>
-              <select
-                value={clientId}
-                onChange={(e) => setClientId(e.target.value)}
-                aria-label={t('role.clientLabel')}
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              >
-                <option value="">{t('role.clientPlaceholder')}</option>
-                {(clients ?? []).map((c) => (
-                  <option key={c.name} value={c.name}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
+              <Select value={clientId || '__none__'} onValueChange={(v) => setClientId(v === '__none__' ? '' : v)}>
+                <SelectTrigger aria-label={t('role.clientLabel')}>
+                  <SelectValue placeholder={t('role.clientPlaceholder')} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">{t('role.clientPlaceholder')}</SelectItem>
+                  {(clients ?? []).map((c) => (
+                    <SelectItem key={c.name} value={c.name}>{c.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )}
           {scope === 'workspace' && (
             <div className="space-y-2">
               <Label>{t('role.workspaceLabel')}</Label>
-              <select
-                value={workspaceId}
-                onChange={(e) => setWorkspaceId(e.target.value)}
-                aria-label={t('role.workspaceLabel')}
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              >
-                <option value="">{t('role.workspacePlaceholder')}</option>
-                {(workspaces ?? []).map((w) => (
-                  <option key={w.id} value={w.id}>
-                    {w.name}
-                  </option>
-                ))}
-              </select>
+              <Select value={workspaceId || '__none__'} onValueChange={(v) => setWorkspaceId(v === '__none__' ? '' : v)}>
+                <SelectTrigger aria-label={t('role.workspaceLabel')}>
+                  <SelectValue placeholder={t('role.workspacePlaceholder')} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">{t('role.workspacePlaceholder')}</SelectItem>
+                  {(workspaces ?? []).map((w) => (
+                    <SelectItem key={w.id} value={w.id}>{w.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )}
         </div>

@@ -24,6 +24,14 @@ vi.mock('../../../api/memoryStream', () => ({
   memoryStream: { subscribe: vi.fn(() => () => {}) },
 }));
 
+vi.mock('@/utils/format', () => ({
+  formatDateTime: (s: string) => `fmt:${s}`,
+  formatBytes: (n: number) => `${n} B`,
+  formatBps: (n: number) => `${n} B/s`,
+  formatMs: (n: number) => `${n} ms`,
+  formatPercent: (n: number) => `${n}%`,
+}));
+
 const skillFixture: AgentSkill = {
   id: 's1',
   name: 'Release checklist',
@@ -70,8 +78,24 @@ function Harness({ skills, initialScope = 'all' as SkillFilters['scope'] }: { sk
   );
 }
 
-const renderList = (skills: AgentSkill[] = [skillFixture], opts?: { initialScope?: SkillFilters['scope'] }) => {
+const renderList = (skills: AgentSkill[] = [skillFixture], opts?: { initialScope?: SkillFilters['scope']; filters?: SkillFilters; hasMore?: boolean }) => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  if (opts?.filters) {
+    return render(
+      <QueryClientProvider client={qc}>
+        <SkillList
+          skills={skills}
+          filters={opts.filters}
+          onFiltersChange={onFiltersChange}
+          selectedId={null}
+          onSelect={onSelect}
+          onNew={onNew}
+          hasMore={opts.hasMore}
+          onLoadMore={opts.hasMore ? vi.fn() : undefined}
+        />
+      </QueryClientProvider>,
+    );
+  }
   return render(
     <QueryClientProvider client={qc}>
       <Harness skills={skills} initialScope={opts?.initialScope} />
@@ -85,16 +109,41 @@ describe('SkillList', () => {
     vi.clearAllMocks();
   });
 
-  it('renders skill cards with name/description/scope badge/enabled/tags/uses', () => {
-    renderList();
+  it('紧凑行渲染：名称/徽章/时间同行，带 LoadMoreFooter', () => {
+    const onLoadMore = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SkillList
+          skills={[skillFixture]}
+          total={5}
+          filters={{ scope: 'all', clientId: '', workspaceId: '', q: '', enabledOnly: false }}
+          onFiltersChange={onFiltersChange}
+          selectedId={null}
+          onSelect={onSelect}
+          onNew={onNew}
+          hasMore
+          onLoadMore={onLoadMore}
+        />
+      </QueryClientProvider>,
+    );
     expect(screen.getByText('Release checklist')).toBeTruthy();
-    expect(screen.getByText('Run before every release')).toBeTruthy();
-    expect(screen.getAllByText('skill.scope_global').length).toBeGreaterThan(0);
-    expect(screen.getByText('skill.enabled')).toBeTruthy();
-    expect(screen.getByText('skill.trigger_distill')).toBeTruthy();
-    expect(screen.getByText('skill.uses')).toBeTruthy();
-    expect(screen.getByText('deploy')).toBeTruthy();
-    expect(screen.getByText('review')).toBeTruthy();
+    // 紧凑行：不再渲染 description 文本（仅在详情页）
+    expect(screen.getByText('fmt:2026-08-02T00:00:00Z')).toBeTruthy();
+    expect(screen.getByText('common.loadedOf')).toBeTruthy();
+    fireEvent.click(screen.getByText('common.loadMore'));
+    expect(onLoadMore).toHaveBeenCalled();
+  });
+
+  it('空态区分：无过滤时显示 empty，有搜索时显示 noSearchResults', () => {
+    renderList([], { filters: { scope: 'all', clientId: '', workspaceId: '', q: '', enabledOnly: false } });
+    expect(screen.getByText('skill.empty')).toBeTruthy();
+    cleanup();
+    renderList([], { filters: { scope: 'all', clientId: '', workspaceId: '', q: 'release', enabledOnly: false } });
+    expect(screen.getByText('skill.noSearchResults')).toBeTruthy();
+    cleanup();
+    renderList([], { filters: { scope: 'all', clientId: '', workspaceId: '', q: '', enabledOnly: true } });
+    expect(screen.getByText('skill.noSearchResults')).toBeTruthy();
   });
 
   it('shows client/workspace selects only for matching scope', () => {
@@ -134,8 +183,8 @@ describe('SkillList', () => {
     );
   });
 
-  it('shows empty state when there are no skills', () => {
-    renderList([]);
-    expect(screen.getByText('skill.empty')).toBeTruthy();
+  it('hasMore=false 时不渲染 LoadMoreFooter', () => {
+    renderList([skillFixture]);
+    expect(screen.queryByText('common.loadMore')).toBeNull();
   });
 });

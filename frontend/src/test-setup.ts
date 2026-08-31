@@ -1,3 +1,16 @@
+import { vi } from 'vitest';
+
+vi.mock('sonner', () => ({
+  Toaster: () => null,
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    message: vi.fn(),
+  },
+}));
+
 import i18n from '@/i18n';
 
 await i18n.changeLanguage('en');

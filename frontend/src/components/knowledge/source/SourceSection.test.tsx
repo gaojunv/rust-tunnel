@@ -11,6 +11,7 @@ vi.mock('react-i18next', () => ({
 
 const api = vi.hoisted(() => ({
   listKnowledgeSources: vi.fn(),
+  getKnowledgeSource: vi.fn(),
   createKnowledgeSource: vi.fn(),
   updateKnowledgeSource: vi.fn(),
   deleteKnowledgeSource: vi.fn(),
@@ -71,10 +72,11 @@ const renderSection = () => {
 describe('SourceSection', () => {
   beforeEach(() => {
     api.listKnowledgeSources.mockResolvedValue({ sources: [sourceFixture], total: 1 });
+    api.getKnowledgeSource.mockResolvedValue(sourceFixture);
     api.listKnowledgeDocs.mockResolvedValue([]);
     api.listAgentWorkspaces.mockResolvedValue([{ id: 'ws1', name: 'default' }]);
     api.clientsApi.list.mockResolvedValue([]);
-    // 全局 embedding 未配置：创建时走自定义分支，不出现"使用全局配置"开关
+    // 全局 embedding 未配置：创建时走自定义分支，不出现“使用全局配置”开关
     api.getMemorySettings.mockResolvedValue({
       emb_base_url: '',
       emb_api_key: '',
@@ -92,13 +94,9 @@ describe('SourceSection', () => {
   it('renders container cards with both index badges', async () => {
     renderSection();
     expect(await screen.findByText('deploy-kb')).toBeTruthy();
-    expect(screen.getByText('Deployment runbooks')).toBeTruthy();
-    // 双索引都开 → 两个侧徽章同时出现
+    // 双索引都开 → 两个侧徽章同时出现（移动端 hidden，jsdom 仍在 DOM）
     expect(screen.getByText('ks.badgeVector')).toBeTruthy();
     expect(screen.getByText('ks.badgePages')).toBeTruthy();
-    // status/scope 文案与筛选下拉 option 同 key，用 getAllByText
-    expect(screen.getAllByText('ks.status.ready').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('ks.scope_workspace').length).toBeGreaterThan(0);
     expect(screen.queryByText('ks.empty')).toBeNull();
   });
 

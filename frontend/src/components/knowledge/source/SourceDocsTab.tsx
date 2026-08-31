@@ -97,7 +97,7 @@ function DocRow({
             {new Date(doc.created_at).toLocaleDateString()}
           </div>
           {sideErrors.map((e) => (
-            <div key={e.label} className="truncate text-xs text-destructive" title={`${e.label}: ${e.error}`}>
+            <div key={e.label} className="break-words text-xs text-destructive">
               {e.label}: {e.error}
             </div>
           ))}
