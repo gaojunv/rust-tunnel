@@ -8,6 +8,7 @@ import type { VaultInfo } from "@/api/types";
 
 export default function App() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [mode, setMode] = useState<"edit" | "preview">("preview");
   const [refreshToken, setRefreshToken] = useState(0);
   const [vault, setVault] = useState<VaultInfo | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
@@ -34,6 +35,7 @@ export default function App() {
       }
       setSelectedKey(nextKey);
       setEditorDirty(false);
+      setMode("preview");
     },
     [editorDirty],
   );
@@ -62,10 +64,12 @@ export default function App() {
           />
         </aside>
 
-        <main className="min-w-0 flex-1 overflow-y-auto bg-background">
+        <main className="min-w-0 flex-1 overflow-hidden bg-background">
           <NoteEditor
             key={selectedKey ?? "__none__"}
             noteKey={selectedKey}
+            mode={mode}
+            onModeChange={setMode}
             onSaved={handleSaved}
             onDeleted={handleDeleted}
             onDirtyChange={setEditorDirty}

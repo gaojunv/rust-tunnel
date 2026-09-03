@@ -12,12 +12,14 @@
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.1.2",
+    "@streamdown/cjk": "^1.0.3",
     "@tauri-apps/api": "^2.8.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.344.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "streamdown": "^2.5.0",
     "tailwind-merge": "^3.6.0",
     "tailwindcss-animate": "^1.0.7"
   },
