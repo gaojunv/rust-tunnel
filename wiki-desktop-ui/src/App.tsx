@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { TitleBar } from "@/components/TitleBar";
 import { WikiSidebar } from "@/components/WikiSidebar";
 import { NoteEditor } from "@/components/NoteEditor";
 import { GraphPanel } from "@/components/GraphPanel";
@@ -49,10 +50,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col bg-background">
-      <header className="flex h-14 shrink-0 items-center border-b px-4">
-        <h1 className="text-base font-semibold tracking-tight">Wiki Desktop</h1>
-        <span className="ml-3 text-xs text-muted-foreground">本地离线 Wiki</span>
-      </header>
+      <TitleBar dirty={editorDirty} />
 
       <div className="flex min-h-0 flex-1">
         <aside className="w-[300px] shrink-0 border-r bg-sidebar max-[900px]:w-[260px]">

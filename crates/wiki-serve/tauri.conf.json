@@ -15,7 +15,11 @@
         "height": 820,
         "minWidth": 800,
         "minHeight": 600,
-        "resizable": true
+        "resizable": true,
+        "decorations": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 12, "y": 10 }
       }
     ],
     "withGlobalTauri": true,
