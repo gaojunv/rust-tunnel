@@ -11,7 +11,7 @@ type Props = {
   mode: "edit" | "preview";
   onModeChange: (m: "edit" | "preview") => void;
   onSaved: () => void;
-  onDeleted: () => void;
+  onDeleted: (deletedKey?: string) => void;
   onDirtyChange: (dirty: boolean) => void;
   onNavigate?: (key: string) => void;
   onCreate?: (key: string) => void;
@@ -148,11 +148,12 @@ export function NoteEditor({
     setError(null);
     try {
       await deleteNote(noteKey);
-      onDeleted();
+      onDeleted(noteKey);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
+
 
   if (!noteKey) {
     return (
@@ -272,6 +273,7 @@ export function NoteEditor({
           <MarkdownPreview content={body} onNavigate={onNavigate} />
         </div>
       )}
+
     </div>
   );
 }

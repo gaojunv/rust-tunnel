@@ -8,6 +8,8 @@ import type { GraphDto } from "@/api/types";
 type Props = {
   selectedKey: string | null;
   refreshToken: number;
+  onNavigate: (key: string) => void;
+  onCreate: (key: string) => void;
 };
 
 function extractLinks(body: string): string[] {
@@ -18,7 +20,7 @@ function extractLinks(body: string): string[] {
   return out;
 }
 
-export function GraphPanel({ selectedKey, refreshToken }: Props) {
+export function GraphPanel({ selectedKey, refreshToken, onNavigate, onCreate }: Props) {
   const [graph, setGraph] = useState<GraphDto | null>(null);
   const [body, setBody] = useState<string | null>(null);
 
@@ -54,6 +56,11 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
     };
   }, [selectedKey]);
 
+  const titleMap = useMemo(() => {
+    if (!graph) return new Map<string, string>();
+    return new Map(graph.nodes.map((n) => [n.key, n.title] as const));
+  }, [graph]);
+
   const derived = useMemo(() => {
     if (!graph || !selectedKey) return null;
     const keys = new Set(graph.nodes.map((n) => n.key));
@@ -61,7 +68,6 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
     const backlinks = graph.edges.filter((e) => e.to === selectedKey).map((e) => e.from);
     const rawLinks = body ? extractLinks(body) : [];
     const broken = rawLinks.filter((k) => !keys.has(k));
-    // 去重
     const uniq = (arr: string[]) => [...new Set(arr)];
     return {
       outgoing: uniq(outgoing),
@@ -71,12 +77,10 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
     };
   }, [graph, selectedKey, body]);
 
-  // 全局统计（不管是否选中）
   const globalStats = useMemo(() => {
     if (!graph) return null;
     const edgeCount = graph.edges.length;
     const nodeCount = graph.nodes.length;
-    // 入度为 0 的孤儿
     const inDegree = new Map<string, number>();
     for (const n of graph.nodes) inDegree.set(n.key, 0);
     for (const e of graph.edges) inDegree.set(e.to, (inDegree.get(e.to) ?? 0) + 1);
@@ -84,20 +88,24 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
     return { nodeCount, edgeCount, orphans };
   }, [graph]);
 
+  const handleBrokenClick = (k: string) => {
+    const ok = window.confirm(`「${k}」尚未创建，现在创建吗？`);
+    if (!ok) return;
+    onCreate(k);
+  };
+
   return (
     <div className="flex h-full flex-col gap-4 p-4">
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="flex items-center gap-2 text-sm">
             <Network className="size-4" />
-            图谱（占位）
+            链接
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
-          {/* 后续会换成真实力导向图：此处仅文字列出统计，保留扩展点 */}
           <p className="text-xs text-muted-foreground">
-            后续会替换为力导向图可视化。当前为占位实现：基于 <code className="rounded bg-muted px-1">get_graph</code> 推导
-            出链 / 反链 / 断链。
+            基于 <code className="rounded bg-muted px-1">get_graph</code> 推导出链 / 反链 / 断链。
           </p>
 
           {globalStats && (
@@ -123,11 +131,21 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
                   <p className="text-xs text-muted-foreground">无出链</p>
                 ) : (
                   <ul className="space-y-1">
-                    {derived.outgoing.map((k) => (
-                      <li key={k} className="rounded bg-muted px-2 py-1 text-xs">
-                        {k}
-                      </li>
-                    ))}
+                    {derived.outgoing.map((k) => {
+                      const title = titleMap.get(k) ?? k;
+                      return (
+                        <li key={k}>
+                          <button
+                            type="button"
+                            onClick={() => onNavigate(k)}
+                            className="w-full rounded px-1.5 py-0.5 text-left text-xs hover:bg-accent/60"
+                          >
+                            <span>{title}</span>
+                            <span className="ml-1.5 text-xs text-muted-foreground">{k}</span>
+                          </button>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </section>
@@ -141,11 +159,21 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
                   <p className="text-xs text-muted-foreground">无反链</p>
                 ) : (
                   <ul className="space-y-1">
-                    {derived.backlinks.map((k) => (
-                      <li key={k} className="rounded bg-muted px-2 py-1 text-xs">
-                        {k}
-                      </li>
-                    ))}
+                    {derived.backlinks.map((k) => {
+                      const title = titleMap.get(k) ?? k;
+                      return (
+                        <li key={k}>
+                          <button
+                            type="button"
+                            onClick={() => onNavigate(k)}
+                            className="w-full rounded px-1.5 py-0.5 text-left text-xs hover:bg-accent/60"
+                          >
+                            <span>{title}</span>
+                            <span className="ml-1.5 text-xs text-muted-foreground">{k}</span>
+                          </button>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </section>
@@ -160,8 +188,14 @@ export function GraphPanel({ selectedKey, refreshToken }: Props) {
                 ) : (
                   <ul className="space-y-1">
                     {derived.broken.map((k) => (
-                      <li key={k} className="rounded bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-                        {k}
+                      <li key={k}>
+                        <button
+                          type="button"
+                          onClick={() => handleBrokenClick(k)}
+                          className="w-full rounded px-1.5 py-0.5 text-left text-xs text-amber-600 hover:bg-amber-500/10"
+                        >
+                          {k}
+                        </button>
                       </li>
                     ))}
                   </ul>

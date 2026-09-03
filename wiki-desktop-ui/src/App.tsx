@@ -3,11 +3,13 @@ import { TitleBar } from "@/components/TitleBar";
 import { WikiSidebar } from "@/components/WikiSidebar";
 import { NoteEditor } from "@/components/NoteEditor";
 import { GraphPanel } from "@/components/GraphPanel";
-import { vaultInfo } from "@/api/tauri";
+import { saveNote, vaultInfo } from "@/api/tauri";
 import type { VaultInfo } from "@/api/types";
+import { useNoteHistory } from "@/lib/use-note-history";
 
 export default function App() {
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const { current: selectedKey, canBack, canForward, navigate, back, forward, remove } =
+    useNoteHistory();
   const [mode, setMode] = useState<"edit" | "preview">("preview");
   const [refreshToken, setRefreshToken] = useState(0);
   const [vault, setVault] = useState<VaultInfo | null>(null);
@@ -27,38 +29,104 @@ export default function App() {
     reloadVault();
   }, [refreshToken, reloadVault]);
 
-  const handleSelect = useCallback(
+  const handleNavigate = useCallback(
     (nextKey: string) => {
       if (editorDirty) {
         const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
         if (!ok) return;
       }
-      setSelectedKey(nextKey);
+      navigate(nextKey);
       setEditorDirty(false);
       setMode("preview");
     },
-    [editorDirty],
+    [editorDirty, navigate],
   );
+
+  const handleBack = useCallback(() => {
+    if (editorDirty) {
+      const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
+      if (!ok) return;
+    }
+    back();
+    setEditorDirty(false);
+    setMode("preview");
+  }, [editorDirty, back]);
+
+  const handleForward = useCallback(() => {
+    if (editorDirty) {
+      const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
+      if (!ok) return;
+    }
+    forward();
+    setEditorDirty(false);
+    setMode("preview");
+  }, [editorDirty, forward]);
 
   const handleSaved = useCallback(() => {
     setRefreshToken((n) => n + 1);
   }, []);
 
-  const handleDeleted = useCallback(() => {
-    setSelectedKey(null);
-    setEditorDirty(false);
-    setRefreshToken((n) => n + 1);
-  }, []);
+  const handleDeleted = useCallback(
+    (deletedKey?: string) => {
+      const key = deletedKey ?? selectedKey;
+      if (key) remove(key);
+      setEditorDirty(false);
+      setRefreshToken((n) => n + 1);
+    },
+    [selectedKey, remove],
+  );
+
+  const handleCreated = useCallback(
+    async (key: string) => {
+      try {
+        await saveNote(key, "", key);
+        setRefreshToken((n) => n + 1);
+        navigate(key);
+        setMode("edit");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        window.alert(msg);
+      }
+    },
+    [navigate],
+  );
+
+
+
+  // 全局导航快捷键：Alt+ArrowLeft/Right 及 Ctrl+ArrowLeft/Right（!metaKey）
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (document.querySelector("[data-modal-open]")) return;
+      const isAlt = e.altKey && !e.ctrlKey && !e.metaKey;
+      const isCtrl = e.ctrlKey && !e.metaKey && !e.altKey;
+      if (!isAlt && !isCtrl) return;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        handleBack();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        handleForward();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleBack, handleForward]);
 
   return (
     <div className="flex h-screen flex-col bg-background">
-      <TitleBar dirty={editorDirty} />
+      <TitleBar
+        dirty={editorDirty}
+        canBack={canBack}
+        canForward={canForward}
+        onBack={handleBack}
+        onForward={handleForward}
+      />
 
       <div className="flex min-h-0 flex-1">
         <aside className="w-[300px] shrink-0 border-r bg-sidebar max-[900px]:w-[260px]">
           <WikiSidebar
             selectedKey={selectedKey}
-            onSelect={handleSelect}
+            onSelect={handleNavigate}
             refreshToken={refreshToken}
             vaultInfo={vault}
           />
@@ -73,11 +141,18 @@ export default function App() {
             onSaved={handleSaved}
             onDeleted={handleDeleted}
             onDirtyChange={setEditorDirty}
+            onNavigate={handleNavigate}
+            onCreate={handleCreated}
           />
         </main>
 
         <aside className="hidden w-[320px] shrink-0 border-l bg-sidebar xl:block">
-          <GraphPanel selectedKey={selectedKey} refreshToken={refreshToken} />
+          <GraphPanel
+            selectedKey={selectedKey}
+            refreshToken={refreshToken}
+            onNavigate={handleNavigate}
+            onCreate={handleCreated}
+          />
         </aside>
       </div>
     </div>
