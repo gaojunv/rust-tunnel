@@ -4,6 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Wiki Desktop</title>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("wiki-theme");
+          var theme = t === "light" ? "light" : "dark";
+          var el = document.documentElement;
+          if (theme === "light") {
+            el.classList.add("light");
+            el.classList.remove("dark");
+          } else {
+            el.classList.add("dark");
+            el.classList.remove("light");
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

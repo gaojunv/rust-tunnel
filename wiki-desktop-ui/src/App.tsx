@@ -55,7 +55,7 @@ export default function App() {
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <aside className="w-[300px] shrink-0 border-r bg-card/40 max-[900px]:w-[260px]">
+        <aside className="w-[300px] shrink-0 border-r bg-sidebar max-[900px]:w-[260px]">
           <WikiSidebar
             selectedKey={selectedKey}
             onSelect={handleSelect}
@@ -74,7 +74,7 @@ export default function App() {
           />
         </main>
 
-        <aside className="hidden w-[320px] shrink-0 border-l bg-card/30 xl:block">
+        <aside className="hidden w-[320px] shrink-0 border-l bg-sidebar xl:block">
           <GraphPanel selectedKey={selectedKey} refreshToken={refreshToken} />
         </aside>
       </div>
