@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy-server.sh — 本地构建并部署 rust-tunnel 服务端
-# 蓝本: .github/workflows/release-server.yml  (单 job: 前端嵌入 → musl 静态编译 → 渲染配置 → SCP → SSH 重启)
+# 蓝本: .github/workflows/release-server.yml  (单 job: 前端嵌入 → 原生 Linux 编译 → 渲染配置 → SCP → SSH 重启)
 # 用法: ./scripts/deploy-server.sh [--dry-run] [--skip-frontend] [--skip-build] [--target <triple>] [--host <host>] [--port <port>] [--user <user>] [--deploy-path <path>]
 # 部署目标通过环境变量 / .env / --host 配置，不在脚本中硬编码服务器地址。
 set -euo pipefail
@@ -13,7 +13,7 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()   { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 
 # ---------- 默认值 ----------
-TARGET="x86_64-unknown-linux-musl"
+TARGET="x86_64-unknown-linux-gnu"
 SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-22}"
 SERVER_USER="${SERVER_USER:-root}"
@@ -35,7 +35,7 @@ usage() {
   --dry-run              仅本地构建，不 SCP/SSH 推送
   --skip-frontend        跳过前端构建（复用现有 frontend-dist/）
   --skip-build           跳过 cargo build（复用已有二进制）
-  --target <triple>      musl target，默认 x86_64-unknown-linux-musl
+  --target <triple>      Rust target，默认 x86_64-unknown-linux-gnu（原生 Linux，动态 glibc）
   --host <host>          覆盖 SERVER_HOST (必填，无默认值)
   --port <port>          覆盖 SERVER_PORT (默认 22)
   --user <user>          覆盖 SERVER_USER (默认 root)
@@ -122,14 +122,11 @@ if [[ "${SKIP_FRONTEND}" -eq 0 ]]; then
   fi
 fi
 
-# musl target 检查（仅当需要构建时）
+# target 检查（仅当需要构建时；gnu 为默认 target 一般已安装）
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
   if ! rustup target list --installed 2>/dev/null | grep -q "${TARGET}"; then
     warn "未安装 target ${TARGET}，尝试安装..."
     rustup target add "${TARGET}" || die "安装 ${TARGET} 失败，请手动执行: rustup target add ${TARGET}"
-  fi
-  if ! command -v musl-gcc &>/dev/null; then
-    warn "未找到 musl-gcc，静态链接可能失败。Debian/Ubuntu: sudo apt-get install -y musl-tools"
   fi
 fi
 
@@ -168,12 +165,12 @@ else
   ok "前端已嵌入到 frontend-dist/ ($(du -sh frontend-dist | cut -f1))"
 fi
 
-# ---------- 2. 后端 musl 静态编译 ----------
+# ---------- 2. 后端原生 Linux 编译 ----------
 if [[ "${SKIP_BUILD}" -eq 1 ]]; then
   warn "跳过 cargo build，复用已有二进制"
   [[ -f ./rust-tunnel-server ]] || [[ -f "target/${TARGET}/release/rust-tunnel-server" ]] || warn "未找到已有二进制，部署将失败"
 else
-  info "━━━━━━━━ 2/5 后端编译 (${TARGET}) ━━━━━━━━"
+  info "━━━━━━━━ 2/5 后端编译 (${TARGET}，原生 glibc 动态链接) ━━━━━━━━"
   # rag 依赖 qdrant-edge 需 nightly (array_windows 等不稳定特性)，有 nightly 则优先用 nightly
   CARGO_CMD="cargo"
   if rustup toolchain list 2>/dev/null | grep -q nightly; then
@@ -188,9 +185,9 @@ else
   BIN_SIZE=$(du -h ./rust-tunnel-server | cut -f1)
   BIN_INFO=$(file ./rust-tunnel-server 2>/dev/null | head -1 || echo "unknown")
   ok "编译完成: ./rust-tunnel-server (${BIN_SIZE}) — ${BIN_INFO}"
-  if ! echo "${BIN_INFO}" | grep -qi "statically linked"; then
-    warn "二进制似乎非静态链接，请检查 musl 工具链"
-  fi
+  # 原生 glibc 动态链接：要求远端 glibc 版本 >= 本机构建时的 glibc 版本
+  GLIBC_VER=$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+  info "本机 glibc: ${GLIBC_VER}（远端 glibc 需 >= 此版本，否则远端启动会报 GLIBC_X.XX not found）"
 fi
 
 # ---------- 3. 渲染 config.toml ----------
@@ -263,6 +260,16 @@ if ! ssh "${SSH_OPTS[@]}" "${SERVER_USER}@${SERVER_HOST}" "echo ok" 2>&1 | grep 
   die "SSH 连接失败: ${SERVER_USER}@${SERVER_HOST}:${SERVER_PORT}  (检查 SERVER_HOST/PORT/USER/SSH_KEY)"
 fi
 ok "SSH 连通正常"
+
+# 原生 glibc 动态链接前置校验：远端 glibc 必须 >= 本机 glibc
+LOCAL_GLIBC=$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' | head -1 || echo "")
+REMOTE_GLIBC=$(ssh "${SSH_OPTS[@]}" "${SERVER_USER}@${SERVER_HOST}" "ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1" || echo "")
+if [[ -n "${LOCAL_GLIBC}" && -n "${REMOTE_GLIBC}" ]]; then
+  info "glibc 版本: 本机 ${LOCAL_GLIBC} / 远端 ${REMOTE_GLIBC}"
+  if [[ "$(printf '%s\n%s\n' "${LOCAL_GLIBC}" "${REMOTE_GLIBC}" | sort -V | head -1)" != "${LOCAL_GLIBC}" ]]; then
+    die "远端 glibc (${REMOTE_GLIBC}) 低于本机构建环境 (${LOCAL_GLIBC})，原生编译的二进制无法在远端运行。请在 glibc 更旧的机器/容器上构建，或升级远端系统。"
+  fi
+fi
 
 # 先停止服务，释放二进制占用（否则 scp/覆盖会报 Text file busy）
 info "停止远端服务以释放二进制占用..."
