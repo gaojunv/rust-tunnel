@@ -6,6 +6,7 @@ import { GraphPanel } from "@/components/GraphPanel";
 import { saveNote, vaultInfo } from "@/api/tauri";
 import type { VaultInfo } from "@/api/types";
 import { useNoteHistory } from "@/lib/use-note-history";
+import { QuickSwitcher } from "@/components/QuickSwitcher";
 
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace } =
@@ -14,6 +15,7 @@ export default function App() {
   const [refreshToken, setRefreshToken] = useState(0);
   const [vault, setVault] = useState<VaultInfo | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
 
   const reloadVault = useCallback(() => {
     vaultInfo()
@@ -120,8 +122,23 @@ export default function App() {
   );
 
   // 全局导航快捷键：Alt+ArrowLeft/Right 及 Ctrl+ArrowLeft/Right（!metaKey）
+  // Ctrl+K/Ctrl+P：快速切换（toggle；重命名等其他模态打开时守卫优先，不抢焦点）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const lower = e.key.toLowerCase();
+        if (lower === "k" || lower === "p") {
+          if (switcherOpen) {
+            e.preventDefault();
+            setSwitcherOpen(false);
+            return;
+          }
+          if (document.querySelector("[data-modal-open]")) return;
+          e.preventDefault();
+          setSwitcherOpen(true);
+          return;
+        }
+      }
       if (document.querySelector("[data-modal-open]")) return;
       const isAlt = e.altKey && !e.ctrlKey && !e.metaKey;
       const isCtrl = e.ctrlKey && !e.metaKey && !e.altKey;
@@ -136,7 +153,7 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [handleBack, handleForward]);
+  }, [handleBack, handleForward, switcherOpen]);
 
   return (
     <div className="flex h-screen flex-col bg-background">
@@ -146,6 +163,7 @@ export default function App() {
         canForward={canForward}
         onBack={handleBack}
         onForward={handleForward}
+        onOpenSwitcher={() => setSwitcherOpen(true)}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -183,6 +201,11 @@ export default function App() {
           />
         </aside>
       </div>
+      <QuickSwitcher
+        open={switcherOpen}
+        onClose={() => setSwitcherOpen(false)}
+        onSelect={handleNavigate}
+      />
     </div>
   );
 }

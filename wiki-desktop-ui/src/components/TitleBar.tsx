@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronLeft, ChevronRight, Maximize2, Minus, Square, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Maximize2, Minus, Search, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { isTauri } from "@/api/tauri";
@@ -10,6 +10,7 @@ type Props = {
   canForward?: boolean;
   onBack?: () => void;
   onForward?: () => void;
+  onOpenSwitcher?: () => void;
 };
 
 function isMac(): boolean {
@@ -22,6 +23,7 @@ export function TitleBar({
   canForward = false,
   onBack,
   onForward,
+  onOpenSwitcher,
 }: Props) {
   const [maximized, setMaximized] = useState(false);
   const showWindowControls = isTauri;
@@ -155,6 +157,19 @@ export function TitleBar({
 
       {/* Right cluster */}
       <div className="flex items-center gap-0 pr-1">
+        {onOpenSwitcher && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8"
+            onClick={onOpenSwitcher}
+            aria-label="快速切换"
+            title="快速切换 (Ctrl+K)"
+          >
+            <Search className="size-4" />
+          </Button>
+        )}
         <ThemeToggle />
         {showWindowControls && (
           <>
