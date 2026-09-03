@@ -1,6 +1,8 @@
 //! rust-tunnel 桌面托盘客户端（winit + tray-icon + eframe）。
 
 #![allow(clippy::missing_docs_in_private_items, reason = "GUI 二进制")]
+// Release 构建在 Windows 上隐藏控制台窗口（双击启动仅显示 GUI）
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod autostart;
