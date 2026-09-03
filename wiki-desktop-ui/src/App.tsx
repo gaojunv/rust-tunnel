@@ -8,7 +8,7 @@ import type { VaultInfo } from "@/api/types";
 import { useNoteHistory } from "@/lib/use-note-history";
 
 export default function App() {
-  const { current: selectedKey, canBack, canForward, navigate, back, forward, remove } =
+  const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace } =
     useNoteHistory();
   const [mode, setMode] = useState<"edit" | "preview">("preview");
   const [refreshToken, setRefreshToken] = useState(0);
@@ -91,7 +91,33 @@ export default function App() {
     [navigate],
   );
 
+  const handleCreateNote = useCallback(
+    async (key: string, title: string) => {
+      if (editorDirty) {
+        const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
+        if (!ok) return;
+      }
+      try {
+        await saveNote(key, "", title);
+        setRefreshToken((n) => n + 1);
+        navigate(key);
+        setMode("edit");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        window.alert(msg);
+      }
+    },
+    [editorDirty, navigate],
+  );
 
+  const handleRenamed = useCallback(
+    (oldKey: string, newKey: string) => {
+      replace(oldKey, newKey);
+      setEditorDirty(false);
+      setRefreshToken((n) => n + 1);
+    },
+    [replace],
+  );
 
   // 全局导航快捷键：Alt+ArrowLeft/Right 及 Ctrl+ArrowLeft/Right（!metaKey）
   useEffect(() => {
@@ -129,6 +155,7 @@ export default function App() {
             onSelect={handleNavigate}
             refreshToken={refreshToken}
             vaultInfo={vault}
+            onCreateNote={handleCreateNote}
           />
         </aside>
 
@@ -143,6 +170,7 @@ export default function App() {
             onDirtyChange={setEditorDirty}
             onNavigate={handleNavigate}
             onCreate={handleCreated}
+            onRenamed={handleRenamed}
           />
         </main>
 

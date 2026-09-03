@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Eye, Pencil, Save, Trash2, FileText } from "lucide-react";
+import { Eye, Pencil, Save, Trash2, FileText, FilePenLine } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getNote, saveNote, deleteNote } from "@/api/tauri";
 import type { NoteDto } from "@/api/types";
 import { MarkdownPreview } from "@/components/MarkdownPreview";
+import { NoteFormDialog } from "@/components/NoteFormDialog";
+import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
 
 type Props = {
   noteKey: string | null;
@@ -15,6 +17,7 @@ type Props = {
   onDirtyChange: (dirty: boolean) => void;
   onNavigate?: (key: string) => void;
   onCreate?: (key: string) => void;
+  onRenamed?: (oldKey: string, newKey: string) => void;
 };
 
 function isNotFoundError(msg: string): boolean {
@@ -31,6 +34,7 @@ export function NoteEditor({
   onDirtyChange,
   onNavigate,
   onCreate,
+  onRenamed,
 }: Props) {
   const [note, setNote] = useState<NoteDto | null>(null);
   const [title, setTitle] = useState("");
@@ -38,6 +42,7 @@ export function NoteEditor({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [renameOpen, setRenameOpen] = useState(false);
 
   const scrollPos = useRef({ edit: 0, preview: 0 });
   const editScrollRef = useRef<HTMLDivElement>(null);
@@ -154,6 +159,42 @@ export function NoteEditor({
     }
   };
 
+  const handleRename = useCallback(
+    async (raw: string) => {
+      if (!noteKey || !note) return;
+      const normalized = normalizeNoteKey(raw);
+      if (normalized === noteKey) return;
+      const err = validateNoteKey(raw);
+      if (err) throw new Error(err);
+      // 查重：若 getNote 能取到则已存在
+      try {
+        await getNote(normalized);
+        throw new Error("已存在同名笔记");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!isNotFoundError(msg) && msg !== "已存在同名笔记") {
+          // 非"不存在"错误（网络/权限等）直接抛出
+          throw e;
+        }
+        if (msg === "已存在同名笔记") throw e;
+        // 不存在 → 可继续
+      }
+      const titleToSave = title.trim() || undefined;
+      const saved = await saveNote(normalized, body, titleToSave);
+      try {
+        await deleteNote(noteKey);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        window.alert(`重命名已保存新笔记，但删除旧笔记失败：${msg}`);
+      }
+      setNote(saved);
+      setTitle(saved.title);
+      setBody(saved.body);
+      setRenameOpen(false);
+      onRenamed?.(noteKey, normalized);
+    },
+    [noteKey, note, title, body, onRenamed],
+  );
 
   if (!noteKey) {
     return (
@@ -233,6 +274,17 @@ export function NoteEditor({
           type="button"
           variant="ghost"
           size="icon"
+          className="size-8 shrink-0"
+          onClick={() => setRenameOpen(true)}
+          title="重命名"
+          aria-label="重命名"
+        >
+          <FilePenLine className="size-4" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
           className="size-8 shrink-0 hover:bg-destructive/10 hover:text-destructive"
           onClick={handleDelete}
           title="删除"
@@ -274,6 +326,19 @@ export function NoteEditor({
         </div>
       )}
 
+      {renameOpen && noteKey && (
+        <NoteFormDialog
+          title="重命名笔记"
+          label="新标题"
+          initial={noteKey}
+          placeholder="输入新的 key，例如 folder/note"
+          hint="重命名不会自动更新其他笔记中的 [[链接]]"
+          submitText="重命名"
+          validate={validateNoteKey}
+          onSubmit={handleRename}
+          onClose={() => setRenameOpen(false)}
+        />
+      )}
     </div>
   );
 }

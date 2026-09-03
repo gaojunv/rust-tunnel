@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, FileText, Clock3 } from "lucide-react";
+import { Search, FileText, Clock3, Plus } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { listNotes, searchNotes } from "@/api/tauri";
 import type { NoteSummary, SearchHitDto, VaultInfo } from "@/api/types";
+import { NoteFormDialog } from "@/components/NoteFormDialog";
+import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
 
 function formatRelative(sec: number): string {
   const diff = Math.floor(Date.now() / 1000) - sec;
@@ -19,12 +22,14 @@ type Props = {
   onSelect: (key: string) => void;
   refreshToken: number;
   vaultInfo: VaultInfo | null;
+  onCreateNote: (key: string, title: string) => void | Promise<void>;
 };
 
-export function WikiSidebar({ selectedKey, onSelect, refreshToken, vaultInfo }: Props) {
+export function WikiSidebar({ selectedKey, onSelect, refreshToken, vaultInfo, onCreateNote }: Props) {
   const [query, setQuery] = useState("");
   const [notes, setNotes] = useState<NoteSummary[]>([]);
   const [hits, setHits] = useState<SearchHitDto[] | null>(null);
+  const [newOpen, setNewOpen] = useState(false);
   const trimmed = query.trim();
 
   // 加载列表
@@ -71,6 +76,25 @@ export function WikiSidebar({ selectedKey, onSelect, refreshToken, vaultInfo }: 
     return new Set(hits.map((h) => h.note_key));
   }, [hits]);
 
+  const handleCreate = async (raw: string) => {
+    const normalized = normalizeNoteKey(raw);
+    const err = validateNoteKey(raw);
+    if (err) throw new Error(err);
+    if (notes.some((n) => n.key === normalized)) {
+      throw new Error("已存在同名笔记");
+    }
+    await onCreateNote(normalized, normalized);
+    setNewOpen(false);
+  };
+
+  const createValidate = (raw: string): string | null => {
+    const err = validateNoteKey(raw);
+    if (err) return err;
+    const normalized = normalizeNoteKey(raw);
+    if (notes.some((n) => n.key === normalized)) return "已存在同名笔记";
+    return null;
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* 顶部：vault 信息 */}
@@ -82,16 +106,29 @@ export function WikiSidebar({ selectedKey, onSelect, refreshToken, vaultInfo }: 
         <p className="text-xs text-muted-foreground">{vaultInfo ? `${vaultInfo.note_count} 篇笔记` : ""}</p>
       </div>
 
-      {/* 搜索框 */}
+      {/* 搜索框 + 新建按钮 */}
       <div className="p-3">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="搜索笔记…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            className="pl-9"
-          />
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              placeholder="搜索笔记…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              className="pl-9"
+            />
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-9 shrink-0"
+            onClick={() => setNewOpen(true)}
+            title="新建笔记"
+            aria-label="新建笔记"
+          >
+            <Plus className="size-4" />
+          </Button>
         </div>
         {isSearching && <p className="mt-2 text-xs text-muted-foreground">搜索：{trimmed}</p>}
       </div>
@@ -169,6 +206,19 @@ export function WikiSidebar({ selectedKey, onSelect, refreshToken, vaultInfo }: 
           </ul>
         )}
       </div>
+
+      {newOpen && (
+        <NoteFormDialog
+          title="新建笔记"
+          label="标题"
+          placeholder="例如 my-note 或 folder/note"
+          hint="将作为文件名保存，可用 / 分层"
+          submitText="创建"
+          validate={createValidate}
+          onSubmit={handleCreate}
+          onClose={() => setNewOpen(false)}
+        />
+      )}
     </div>
   );
 }
