@@ -87,7 +87,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 aes-gcm = "0.10"
-hickory-proto = "0.24"
+hickory-proto = "0.26"
 async-trait = "0.1"
 futures-util = "0.3"
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
