@@ -3,7 +3,7 @@ name = "rust-tunnel-server"
 version = "0.4.0"
 edition = "2021"
 description = "rust-tunnel server (intranet penetration, proxy, LLM gateway, agent)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 default-run = "rust-tunnel-server"
 
 [lints]

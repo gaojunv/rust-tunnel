@@ -3,7 +3,7 @@ name = "rust-tunnel-pki"
 version = "0.4.0"
 edition = "2021"
 description = "rust-tunnel certificate management and ACME automation (HTTP-01/DNS-01 challenge, DNS providers, cert storage/renewal)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [lints]
 workspace = true

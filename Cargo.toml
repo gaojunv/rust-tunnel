@@ -3,7 +3,7 @@ name = "rust-tunnel"
 version = "0.4.0"
 edition = "2021"
 description = "A simple intranet penetration tool with server and client"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [workspace]
 members = ["crates/agent", "crates/client", "crates/client-gui", "crates/common", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/server", "crates/stats", "crates/wiki-core", "crates/wiki-serve"]

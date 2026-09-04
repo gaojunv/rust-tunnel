@@ -3,7 +3,7 @@ name = "rust-tunnel-client-gui"
 version = "0.8.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [lints]
 workspace = true

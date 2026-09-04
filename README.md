@@ -253,4 +253,4 @@ GitHub Actions（见 [`.github/workflows/`](.github/workflows/)）：
 
 ## License
 
-MIT
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) 双许可，任选其一。
