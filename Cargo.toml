@@ -54,7 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # 嵌入前端资源（服务端 `embed-frontend` feature）
 rust-embed = { version = "8.0", features = ["axum"] }
 mime_guess = "2.0"
-jsonwebtoken = "9.0"
+jsonwebtoken = "10.3"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
