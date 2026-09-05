@@ -54,12 +54,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # 嵌入前端资源（服务端 `embed-frontend` feature）
 rust-embed = { version = "8.0", features = ["axum"] }
 mime_guess = "2.0"
-jsonwebtoken = "9.0"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 qdrant-edge = { version = "=0.7.2" }
-sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 gethostname = "0.4"
 # PTY for the agent terminal loopback service (wezterm-maintained, Unix/ConPTY)
 portable-pty = "0.9"
