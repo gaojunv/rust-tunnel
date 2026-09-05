@@ -1,0 +1,56 @@
+name: CodeQL
+
+# 自定义 CodeQL（替代仓库设置里的默认 Code scanning 设置）：
+# - 默认设置无法排除路径，tests/ 下的集成测试代码产生了大量
+#   hard-coded-cryptographic-value 类告警（测试用固定密码/令牌，非生产凭证）
+# - 三种语言统一 build-mode: none（不编译、直接抽取源码），Rust 在该模式下
+#   同样支持 paths-ignore 生效；interpreted 语言（JS/TS、Actions）本就无需构建
+# - 注意：Rust 源码内联的 #[cfg(test)] 模块不在 tests/ 目录，无法用路径排除，
+#   相关告警维持 dismiss 状态即可
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '47 3 * * 4' # 每周四例行扫描（避开整点/半点高峰）
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # 私有仓库读取 workflow 运行信息所需
+      contents: read
+      security-events: write # 上传 SARIF 结果到 Code scanning
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - rust
+          - javascript-typescript
+          - actions
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          paths-ignore:
+            - tests/** # 根元包 e2e 集成测试：含大量测试用固定凭证，已统一 dismiss
+          # 结果按语言分组展示，避免不同语言互相覆盖
+          category: /language:${{ matrix.language }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
