@@ -19,6 +19,7 @@ import {
 import { MoreHorizontal, RefreshCw, Trash2, AlertCircle } from 'lucide-react';
 import { AcmeStatusBadge } from './AcmeStatusBadge';
 import { useRenewAcmeCertificate, useDeleteAcmeCertificate } from '@/api/hooks';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import type { AcmeCertificate } from '@/types';
 
 interface AcmeCertificateTableProps {
@@ -47,11 +48,13 @@ export function AcmeCertificateTable({
   const { t } = useTranslation();
   const renewMutation = useRenewAcmeCertificate();
   const deleteMutation = useDeleteAcmeCertificate();
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
 
   const handleDelete = (domain: string) => {
-    if (window.confirm(t('acme.certificates.deleteConfirm', { domain }))) {
-      deleteMutation.mutate(domain);
-    }
+    confirm(
+      { title: t('common.confirm'), description: t('acme.certificates.deleteConfirm', { domain }) },
+      () => deleteMutation.mutate(domain),
+    );
   };
 
   const handleRenew = (domain: string) => {
@@ -138,6 +141,15 @@ export function AcmeCertificateTable({
           </Table>
         )}
       </CardContent>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </Card>
   );
 }

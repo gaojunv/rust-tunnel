@@ -88,7 +88,7 @@ function StatsOverview() {
 export default function DashboardPage() {
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const { data: clients = [], isLoading: clientsLoading } = useQuery({
+  const { data: clients = [], isLoading: clientsLoading, isError: clientsError, refetch: refetchClients } = useQuery({
     queryKey: ['clients', 'dashboard'],
     queryFn: () => clientsApi.list(),
     refetchInterval: 5000,
@@ -149,6 +149,13 @@ export default function DashboardPage() {
           {clientsLoading ? (
             <div className="py-12 text-center text-sm text-muted-foreground">
               {t('common.loading')}
+            </div>
+          ) : clientsError ? (
+            <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
+              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+              <Button variant="outline" size="sm" onClick={() => void refetchClients()}>
+                {t('common.retry')}
+              </Button>
             </div>
           ) : clients.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-12 text-muted-foreground">

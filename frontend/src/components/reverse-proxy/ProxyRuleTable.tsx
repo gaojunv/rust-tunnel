@@ -29,6 +29,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useDeleteProxyRule } from '@/api/hooks';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { cn } from '@/lib/utils';
 import type { ProxyRule } from '@/types';
 
@@ -97,11 +98,13 @@ function CertStatusBadge({ status }: { status?: ProxyRule['cert_status'] }) {
 export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: ProxyRuleTableProps) {
   const { t } = useTranslation();
   const deleteMutation = useDeleteProxyRule();
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
 
   const handleDelete = (rule: ProxyRule) => {
-    if (window.confirm(t('reverseProxy.table.deleteConfirm', { name: rule.name }))) {
-      deleteMutation.mutate(rule.id);
-    }
+    confirm(
+      { title: t('common.confirm'), description: t('reverseProxy.table.deleteConfirm', { name: rule.name }) },
+      () => deleteMutation.mutate(rule.id),
+    );
   };
 
   const getBackendSummary = (rule: ProxyRule): string => {
@@ -208,6 +211,15 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
           </Table>
         )}
       </CardContent>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </Card>
   );
 }

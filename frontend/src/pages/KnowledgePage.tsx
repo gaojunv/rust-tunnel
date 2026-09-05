@@ -75,7 +75,7 @@ export default function KnowledgePage() {
       <PageHeader title={t('knowledge.title')} description={t('knowledge.description')} />
 
       {/* 统一顶部横向 Tabs 条（sticky 吸顶，可横向滚动） */}
-      <div className="sticky top-0 z-10 -mx-4 border-b bg-background/95 px-4 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/60 sm:mx-0 sm:px-0">
+      <div className="sticky top-0 z-10 -mx-2 border-b bg-background/95 px-2 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/60 md:-mx-6 md:px-6">
         <div className="flex gap-1.5 overflow-x-auto">
           {KNOW_TABS.map((tab) => {
             const active = tab.value === activeTab;

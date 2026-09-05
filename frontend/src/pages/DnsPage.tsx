@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog';
 import { PageHeader } from '@/components/layout/PageHeader';
 import DnsConfigCard from '@/components/dns/DnsConfigCard';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
@@ -36,11 +37,12 @@ export default function DnsPage() {
     value: '',
   });
 
-  const { data: records, isLoading } = useQuery({
+  const { data: records, isLoading, isError, refetch } = useQuery({
     queryKey: ['dns-records'],
     queryFn: () => getDnsRecords(),
     refetchInterval: 15000,
   });
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
 
   const addMutation = useMutation({
     mutationFn: (data: AddDnsRecordRequest) => addDnsRecord(data),
@@ -145,6 +147,13 @@ export default function DnsPage() {
             <div className="text-center py-8 text-muted-foreground">
               {t('common.loading')}
             </div>
+          ) : isError ? (
+            <div className="flex flex-col items-center gap-3 py-8 text-center">
+              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+              <Button variant="outline" size="sm" onClick={() => void refetch()}>
+                {t('common.retry')}
+              </Button>
+            </div>
           ) : !records?.length ? (
             <div className="text-center py-8 text-muted-foreground">
               {t('dns.empty')}
@@ -180,11 +189,12 @@ export default function DnsPage() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => {
-                          if (window.confirm(t('dns.confirmDelete', { name: record.name }))) {
-                            deleteMutation.mutate(record.name);
-                          }
-                        }}
+                        onClick={() =>
+                          confirm(
+                            { title: t('common.confirm'), description: t('dns.confirmDelete', { name: record.name }) },
+                            () => deleteMutation.mutate(record.name),
+                          )
+                        }
                         disabled={deleteMutation.isPending}
                       >
                         <Trash2 className="h-4 w-4 text-destructive" />
@@ -197,6 +207,15 @@ export default function DnsPage() {
           )}
         </CardContent>
       </Card>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }

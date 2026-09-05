@@ -13,6 +13,7 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { useQuery } from '@tanstack/react-query';
 import { clientsApi } from '@/api/client';
 import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
 
 type StatusTone = 'critical' | 'warning' | 'connected' | 'unknown';
 
@@ -39,7 +40,7 @@ const STATUS_LABEL_KEYS = {
 
 export default function MeshPage() {
   const { t } = useTranslation();
-  const { data: clients = [], isLoading } = useQuery({
+  const { data: clients = [], isLoading, isError, refetch } = useQuery({
     queryKey: ['clients', 'mesh'],
     queryFn: () => clientsApi.list(),
     refetchInterval: 5000,
@@ -60,6 +61,13 @@ export default function MeshPage() {
           {isLoading ? (
             <div className="text-center py-8 text-muted-foreground">
               {t('common.loading')}
+            </div>
+          ) : isError ? (
+            <div className="flex flex-col items-center gap-3 py-8 text-center">
+              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+              <Button variant="outline" size="sm" onClick={() => void refetch()}>
+                {t('common.retry')}
+              </Button>
             </div>
           ) : clients.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">

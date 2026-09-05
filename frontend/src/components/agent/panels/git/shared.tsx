@@ -325,6 +325,7 @@ export function EntryRow({
   onOpenFile?: () => void;
   children?: ReactNode;
 }) {
+  const { t } = useTranslation();
   const badge = BADGE[status];
   const [menuOpen, setMenuOpen] = useState(false);
   const rowRef = useRef<HTMLDivElement>(null);
@@ -333,18 +334,18 @@ export function EntryRow({
     if (menuItems) return menuItems;
     const items: EntryRowMenuItem[] = [];
     if (onOpenFile) {
-      items.push({ label: '打开文件', icon: <FileText className="h-3 w-3" />, onClick: onOpenFile });
+      items.push({ label: t('agent.gitOpenFile'), icon: <FileText className="h-3 w-3" />, onClick: onOpenFile });
     }
     if (action) {
       items.push({ label: action.label, icon: action.icon, onClick: action.onClick });
     }
     items.push({
-      label: '复制路径',
+      label: t('agent.gitCopyPath'),
       icon: <Copy className="h-3 w-3" />,
       onClick: () => void copyToClipboard(path),
     });
     return items;
-  }, [menuItems, onOpenFile, action, path]);
+  }, [menuItems, onOpenFile, action, path, t]);
 
   const handleContextMenu = useCallback(
     (e: React.MouseEvent) => {
@@ -402,8 +403,8 @@ export function EntryRow({
             <DropdownMenuTrigger asChild>
               <button
                 type="button"
-                aria-label="更多操作"
-                title="更多操作"
+                aria-label={t('agent.gitMoreActions')}
+                title={t('agent.gitMoreActions')}
                 onClick={(e) => e.stopPropagation()}
                 className="shrink-0 rounded p-1 text-muted-foreground opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:bg-accent hover:text-foreground"
               >

@@ -7,6 +7,8 @@ import { PreferencesProvider } from './preferences/PreferencesProvider';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import AppLayout from './components/layout/AppLayout';
+import ErrorPage from './pages/ErrorPage';
+import NotFoundPage from './pages/NotFoundPage';
 import { Toaster } from '@/components/ui/sonner';
 import './index.css';
 
@@ -55,6 +57,7 @@ const router = createBrowserRouter([
     children: [
       {
         element: <AppLayout />,
+        errorElement: <ErrorPage />,
         children: [
           { path: '/', element: <Navigate to="/dashboard" replace /> },
           { path: '/dashboard', element: <DashboardPage /> },
@@ -74,6 +77,7 @@ const router = createBrowserRouter([
           { path: '/agent/memory', element: <Navigate to="/llm/knowledge" replace /> },
           { path: '/downloads', element: <DownloadsPage /> },
           { path: '/settings', element: <SettingsPage /> },
+          { path: '*', element: <NotFoundPage /> },
         ],
       },
     ],

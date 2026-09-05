@@ -33,7 +33,9 @@
     },
     "clearSearch": "Clear search",
     "loadMore": "Load more",
-    "loadedOf": "Loaded {{loaded}} of {{total}}"
+    "loadedOf": "Loaded {{loaded}} of {{total}}",
+    "loadFailed": "Failed to load data",
+    "retry": "Retry"
   },
   "timeRange": {
     "custom": "Custom"
@@ -1312,7 +1314,13 @@
     "notifApproval": "Approval needed",
     "notifApprovalBody": "Tool {{tool}} needs your approval",
     "notifElicitation": "Input needed",
-    "notifElicitationBody": "The agent asked you a question"
+    "notifElicitationBody": "The agent asked you a question",
+    "gitOpenFile": "Open file",
+    "gitCopyPath": "Copy path",
+    "gitMoreActions": "More actions",
+    "githubViewLogsLabel": "View logs",
+    "githubLogs": "Logs",
+    "githubSearchLogsPlaceholder": "Search logs…"
   },
   "logs": {
     "title": "Logs",
@@ -1335,7 +1343,10 @@
       "paused": "Paused",
       "autoScrollOn": "Auto-scroll on",
       "scrollToBottom": "Scroll to bottom"
-    }
+    },
+    "loadFailed": "Failed to load logs",
+    "loadMoreFailed": "Failed to load older logs",
+    "sseDisconnected": "Connection lost, reconnecting..."
   },
   "downloads": {
     "title": "Downloads",
@@ -1405,5 +1416,17 @@
     "graphReset": "Reset view",
     "editTab": "Edit",
     "previewTab": "Preview"
+  },
+  "error": {
+    "title": "Something went wrong",
+    "description": "An unexpected error occurred.",
+    "retry": "Retry",
+    "goHome": "Go home"
+  },
+  "notFound": {
+    "title": "Page not found",
+    "description": "The page you’re looking for doesn’t exist.",
+    "goHome": "Go home",
+    "goBack": "Go back"
   }
 }

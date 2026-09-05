@@ -3,15 +3,24 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { clientsApi, serverAuthApi } from '@/api/client';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 
 export default function ClientsPage() {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const { data: clients = [] } = useQuery({
+  const {
+    data: clients = [],
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['clients'],
     queryFn: clientsApi.list,
     refetchInterval: 5000,
   });
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const { data: auth } = useQuery({
     queryKey: ['server-auth'],
     queryFn: serverAuthApi.get,
@@ -76,6 +85,24 @@ export default function ClientsPage() {
       </section>
 
       <section className="card-aurora rounded-lg border bg-card">
+        {isLoading ? (
+          <div className="space-y-3 p-4">
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-3/4" />
+          </div>
+        ) : isError ? (
+          <div className="flex flex-col items-center gap-3 py-10 text-center">
+            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        ) : clients.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 py-10 text-sm text-muted-foreground">
+            {t('clients.list.noClients')}
+          </div>
+        ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -132,10 +159,13 @@ export default function ClientsPage() {
                               : t('clients.delete')
                         }
                         onClick={() => {
-                          const msg = c.online
+                          const description = c.online
                             ? t('clients.kickDeleteConfirm', { name: c.name })
                             : t('clients.deleteConfirm', { name: c.name });
-                          if (window.confirm(msg)) remove.mutate(c.name);
+                          confirm(
+                            { title: t('common.confirm'), description },
+                            () => remove.mutate(c.name),
+                          );
                         }}
                       >
                         {t('clients.delete')}
@@ -147,7 +177,17 @@ export default function ClientsPage() {
             </tbody>
           </table>
         </div>
+        )}
       </section>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }
