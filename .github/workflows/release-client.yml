@@ -11,6 +11,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# 最小权限：仅需 checkout 拉代码；缓存用 runtime token，上传走 SCP/SSH 密钥，均不依赖 GITHUB_TOKEN
+permissions:
+  contents: read
+
 jobs:
   build-client:
     strategy:

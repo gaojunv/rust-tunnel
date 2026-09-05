@@ -23,6 +23,10 @@ on:
         required: false
         type: string
 
+# 最小权限：仅需 checkout 拉代码；缓存用 runtime token，上传走 SCP/SSH 密钥，均不依赖 GITHUB_TOKEN
+permissions:
+  contents: read
+
 jobs:
   # 版本目录名只算一次，build 与 finalize 共用 —— 三处各算一遍迟早会算出不一样的结果
   resolve-version:

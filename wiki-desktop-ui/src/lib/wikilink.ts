@@ -95,8 +95,8 @@ function replaceWikilinksInLine(line: string): string {
         continue;
       }
       const href = `${WIKILINK_PREFIX}${encodeURIComponent(target)}`;
-      // 对 label 中的 ] 做最小转义，避免破坏 markdown 链接结构
-      const safeLabel = label.replace(/\]/g, "\\]");
+      // 先转义反斜杠再转义 ]，否则 "\]" 会被改写成 "\\]" 反而破坏 markdown 链接结构
+      const safeLabel = label.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
       out += `[${safeLabel}](${href})`;
       i = close + 2;
       continue;
