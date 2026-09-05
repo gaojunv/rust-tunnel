@@ -9,10 +9,15 @@ updates:
       time: "09:00"
       timezone: Asia/Shanghai
     open-pull-requests-limit: 10
+    # 组内只聚合 minor/patch（pre-1.0 的 minor 视为 major，自动排除）；
+    # major 升级以独立 PR 出现，作为需要代码迁移的显式待办。
     groups:
       rust-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   # 管理前端
   - package-ecosystem: npm
@@ -27,6 +32,9 @@ updates:
       npm-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   # Wiki 桌面端 UI
   - package-ecosystem: npm
