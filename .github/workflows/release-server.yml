@@ -8,6 +8,10 @@ on:
   #   tags:
   #     - 'v*'
 
+# 最小权限：仅需 checkout 拉代码；缓存用 runtime token，部署走 SSH 密钥，均不依赖 GITHUB_TOKEN
+permissions:
+  contents: read
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
