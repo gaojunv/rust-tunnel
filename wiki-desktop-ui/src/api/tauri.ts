@@ -1,4 +1,4 @@
-import type { GraphDto, NoteDto, NoteSummary, SearchHitDto, VaultInfo } from "./types";
+import type { DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo } from "./types";
 import { mockVault } from "./mock";
 
 // 是否处于 Tauri 容器内
@@ -34,6 +34,26 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
       ) as unknown as T;
     case "get_graph":
       return mockVault.getGraph() as unknown as T;
+    case "rename_note":
+      return mockVault.renameNote(
+        args?.["key"] as string,
+        args?.["newKey"] as string,
+        args?.["rewriteLinks"] as boolean,
+      ) as unknown as T;
+    case "rename_folder":
+      return mockVault.renameFolder(
+        args?.["oldPrefix"] as string,
+        args?.["newPrefix"] as string,
+        args?.["rewriteLinks"] as boolean,
+      ) as unknown as T;
+    case "delete_folder":
+      return mockVault.deleteFolder(args?.["prefix"] as string) as unknown as T;
+    case "list_notes_full":
+      return mockVault.listNotesFull() as unknown as T;
+    case "read_sync_state":
+      return mockVault.readSyncState() as unknown as T;
+    case "write_sync_state":
+      return mockVault.writeSyncState(args?.["json"] as string) as unknown as T;
     default:
       throw new Error(`未知命令: ${cmd}`);
   }
@@ -74,4 +94,32 @@ export function searchNotes(query: string, limit: number): Promise<SearchHitDto[
 
 export function getGraph(): Promise<GraphDto> {
   return call<GraphDto>("get_graph");
+}
+
+export function renameNote(key: string, newKey: string, rewriteLinks: boolean): Promise<NoteDto> {
+  return call<NoteDto>("rename_note", { key, newKey, rewriteLinks });
+}
+
+export function renameFolder(
+  oldPrefix: string,
+  newPrefix: string,
+  rewriteLinks: boolean,
+): Promise<RenameFolderResult> {
+  return call<RenameFolderResult>("rename_folder", { oldPrefix, newPrefix, rewriteLinks });
+}
+
+export function deleteFolder(prefix: string): Promise<DeleteFolderResult> {
+  return call<DeleteFolderResult>("delete_folder", { prefix });
+}
+
+export function listNotesFull(): Promise<NoteDto[]> {
+  return call<NoteDto[]>("list_notes_full");
+}
+
+export function readSyncState(): Promise<string | null> {
+  return call<string | null>("read_sync_state");
+}
+
+export function writeSyncState(json: string): Promise<void> {
+  return call<void>("write_sync_state", { json });
 }

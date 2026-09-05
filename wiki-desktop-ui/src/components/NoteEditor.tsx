@@ -1,12 +1,26 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Eye, Pencil, Save, Trash2, FileText, FilePenLine } from "lucide-react";
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from "react";
+import { Eye, Pencil, Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { getNote, saveNote, deleteNote } from "@/api/tauri";
+import { getNote, saveNote, deleteNote, renameNote } from "@/api/tauri";
 import type { NoteDto } from "@/api/types";
 import { MarkdownPreview } from "@/components/MarkdownPreview";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
+import { parseLineHeight } from "@/lib/caret-position";
+import { SelectionToolbar } from "@/components/ai/SelectionToolbar";
+import { LinkSuggestDialog } from "@/components/ai/LinkSuggestDialog";
+import { WikilinkAutocomplete } from "@/components/WikilinkAutocomplete";
+
+export interface NoteEditorHandle {
+  insertAtCursor(text: string): void;
+  replaceSelection(text: string): void;
+  getSelection(): { text: string; start: number; end: number } | null;
+  scrollToLine(line: number): void;
+  appendToBody(text: string): void;
+  getBody(): string;
+  getTitle(): string;
+}
 
 type Props = {
   noteKey: string | null;
@@ -18,6 +32,9 @@ type Props = {
   onNavigate?: (key: string) => void;
   onCreate?: (key: string) => void;
   onRenamed?: (oldKey: string, newKey: string) => void;
+  onOpenSettings?: () => void;
+  refreshToken?: number;
+  previewContainerRef?: React.RefObject<HTMLDivElement | null>;
 };
 
 function isNotFoundError(msg: string): boolean {
@@ -25,17 +42,10 @@ function isNotFoundError(msg: string): boolean {
   return lower.includes("notfound") || lower.includes("not found") || msg.includes("笔记不存在");
 }
 
-export function NoteEditor({
-  noteKey,
-  mode,
-  onModeChange,
-  onSaved,
-  onDeleted,
-  onDirtyChange,
-  onNavigate,
-  onCreate,
-  onRenamed,
-}: Props) {
+export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEditor(
+  { noteKey, mode, onModeChange, onSaved, onDeleted, onDirtyChange, onNavigate, onCreate, onRenamed, onOpenSettings, refreshToken, previewContainerRef: externalPreviewRef },
+  ref,
+) {
   const [note, setNote] = useState<NoteDto | null>(null);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -43,12 +53,16 @@ export function NoteEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
+  const [linkDialogOpen, setLinkDialogOpen] = useState(false);
 
   const scrollPos = useRef({ edit: 0, preview: 0 });
   const editScrollRef = useRef<HTMLDivElement>(null);
   const previewScrollRef = useRef<HTMLDivElement>(null);
   const rafEdit = useRef<number | null>(null);
   const rafPreview = useRef<number | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // 容器用于 SelectionToolbar 定位（relative）
+  const editorContentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!noteKey) {
@@ -166,34 +180,167 @@ export function NoteEditor({
       if (normalized === noteKey) return;
       const err = validateNoteKey(raw);
       if (err) throw new Error(err);
-      // 查重：若 getNote 能取到则已存在
       try {
         await getNote(normalized);
         throw new Error("已存在同名笔记");
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         if (!isNotFoundError(msg) && msg !== "已存在同名笔记") {
-          // 非"不存在"错误（网络/权限等）直接抛出
           throw e;
         }
         if (msg === "已存在同名笔记") throw e;
-        // 不存在 → 可继续
       }
-      const titleToSave = title.trim() || undefined;
-      const saved = await saveNote(normalized, body, titleToSave);
       try {
-        await deleteNote(noteKey);
+        const renamed = await renameNote(noteKey, normalized, true);
+        setNote(renamed);
+        setTitle(renamed.title);
+        setBody(renamed.body);
+        setRenameOpen(false);
+        onRenamed?.(noteKey, normalized);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        window.alert(`重命名已保存新笔记，但删除旧笔记失败：${msg}`);
+        window.alert(msg);
+        throw e;
       }
-      setNote(saved);
-      setTitle(saved.title);
-      setBody(saved.body);
-      setRenameOpen(false);
-      onRenamed?.(noteKey, normalized);
     },
-    [noteKey, note, title, body, onRenamed],
+    [noteKey, note, onRenamed],
+  );
+
+  // 外部预览容器 ref 同步（用于 TocPanel 预览态跳转）
+  useEffect(() => {
+    if (!externalPreviewRef) return;
+    // 将内部 previewScrollRef 的 current 同步到外部 ref
+    const el = previewScrollRef.current;
+    if (el) {
+      (externalPreviewRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+    }
+    // 模式切换时更新
+  }, [mode, externalPreviewRef, noteKey]);
+
+  // —— 命令句柄 ——
+  useImperativeHandle(
+    ref,
+    () => ({
+      getBody() {
+        return body;
+      },
+      getTitle() {
+        return title;
+      },
+      insertAtCursor(text: string) {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        // 预览模式时先切到编辑模式
+        if (mode === "preview") {
+          onModeChange("edit");
+          // 切模式后 textarea 可能尚未挂载，延迟插入
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (!el) return;
+            const start = el.selectionStart ?? el.value.length;
+            const end = el.selectionEnd ?? el.value.length;
+            el.setRangeText(text, start, end, "end");
+            setBody(el.value);
+            el.focus();
+          });
+          return;
+        }
+        const start = ta.selectionStart ?? ta.value.length;
+        const end = ta.selectionEnd ?? ta.value.length;
+        ta.setRangeText(text, start, end, "end");
+        setBody(ta.value);
+        ta.focus();
+      },
+      replaceSelection(text: string) {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        if (mode === "preview") {
+          onModeChange("edit");
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (!el) return;
+            const start = el.selectionStart ?? 0;
+            const end = el.selectionEnd ?? start;
+            el.setRangeText(text, start, end, "end");
+            setBody(el.value);
+            el.focus();
+          });
+          return;
+        }
+        const start = ta.selectionStart ?? 0;
+        const end = ta.selectionEnd ?? start;
+        ta.setRangeText(text, start, end, "end");
+        setBody(ta.value);
+        ta.focus();
+      },
+      getSelection() {
+        const ta = textareaRef.current;
+        if (!ta) return null;
+        const start = ta.selectionStart ?? 0;
+        const end = ta.selectionEnd ?? 0;
+        if (start === end) return null;
+        const text = ta.value.slice(start, end);
+        return { text, start, end };
+      },
+      scrollToLine(line: number) {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        if (mode === "preview") onModeChange("edit");
+        // 按行号换算 caret offset（任务描述公式）
+        const offset = body.split("\n").slice(0, line).join("\n").length;
+        const clamped = Math.min(offset, body.length);
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (!el) return;
+          el.focus();
+          try {
+            el.setSelectionRange(clamped, clamped);
+          } catch {
+            // 忽略
+          }
+          // 滚动近似：lineHeight * line
+          let lh = 20;
+          try {
+            lh = parseLineHeight(getComputedStyle(el));
+          } catch {
+            // fallback
+          }
+          el.scrollTop = line * lh;
+          // 同时同步容器滚动
+          if (editScrollRef.current) editScrollRef.current.scrollTop = el.scrollTop;
+        });
+      },
+      appendToBody(text: string) {
+        const ta = textareaRef.current;
+        if (!ta) {
+          // 无 textarea 时直接追加到 body state
+          setBody((prev) => (prev ? prev + text : text));
+          return;
+        }
+        if (mode === "preview") {
+          onModeChange("edit");
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (!el) {
+              setBody((prev) => (prev ? prev + text : text));
+              return;
+            }
+            const end = el.value.length;
+            el.setRangeText(text, end, end, "end");
+            setBody(el.value);
+            el.focus();
+            el.setSelectionRange(el.value.length, el.value.length);
+          });
+          return;
+        }
+        const end = ta.value.length;
+        ta.setRangeText(text, end, end, "end");
+        setBody(ta.value);
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      },
+    }),
+    [body, title, mode, onModeChange],
   );
 
   if (!noteKey) {
@@ -247,6 +394,23 @@ export function NoteEditor({
           )}
         </div>
         {dirty && <span className="mr-2 shrink-0 text-xs text-amber-600">有未保存的改动</span>}
+        {isEdit && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0"
+            onClick={() => {
+              if (!onOpenSettings) return;
+              // 无服务器配置时由 LinkSuggestDialog 内部也会触发 onOpenSettings，此处直接打开
+              setLinkDialogOpen(true);
+            }}
+            title="AI 建议"
+            aria-label="AI 建议"
+          >
+            <Sparkles className="size-4" />
+          </Button>
+        )}
         <Button
           type="button"
           variant="ghost"
@@ -305,13 +469,53 @@ export function NoteEditor({
             placeholder="笔记标题"
             className="border-0 bg-transparent px-0 text-xl font-semibold shadow-none focus-visible:ring-0"
           />
-          <textarea
-            id="note-body"
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            placeholder="在此输入正文…（Markdown，支持 [[wikilink]]）"
-            className="mt-3 min-h-0 flex-1 resize-none bg-transparent font-mono text-sm placeholder:text-muted-foreground focus-visible:outline-none"
-          />
+          <div ref={editorContentRef} className="relative mt-3 flex min-h-0 flex-1 flex-col">
+            <textarea
+              ref={textareaRef}
+              id="note-body"
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              placeholder="在此输入正文…（Markdown，支持 [[wikilink]]）"
+              className="min-h-0 flex-1 resize-none bg-transparent font-mono text-sm placeholder:text-muted-foreground focus-visible:outline-none"
+            />
+            {/* 选区工具条：仅编辑态挂载 */}
+            <SelectionToolbar
+              textareaRef={textareaRef}
+              containerRef={editorContentRef}
+              noteTitle={note?.title ?? title ?? noteKey}
+              noteBody={body}
+              noteKey={noteKey}
+              onReplaceSelection={(t) => {
+                const ta = textareaRef.current;
+                if (!ta) return;
+                const s = ta.selectionStart ?? 0;
+                const e = ta.selectionEnd ?? s;
+                ta.setRangeText(t, s, e, "end");
+                setBody(ta.value);
+                ta.focus();
+              }}
+              onInsertAfterSelection={(t) => {
+                const ta = textareaRef.current;
+                if (!ta) return;
+                const e = ta.selectionEnd ?? ta.value.length;
+                const before = ta.value.slice(0, e);
+                const after = ta.value.slice(e);
+                const next = before + t + after;
+                ta.value = next;
+                setBody(next);
+                ta.focus();
+                const pos = e + t.length;
+                ta.setSelectionRange(pos, pos);
+              }}
+              onOpenSettings={() => onOpenSettings?.()}
+            />
+            <WikilinkAutocomplete
+              textareaRef={textareaRef}
+              containerRef={editorContentRef}
+              refreshToken={refreshToken ?? 0}
+              isEdit={isEdit}
+            />
+          </div>
         </div>
       ) : (
         <div ref={previewScrollRef} onScroll={handlePreviewScroll} className="flex min-h-0 flex-1 flex-col overflow-auto px-4 py-3">
@@ -339,6 +543,71 @@ export function NoteEditor({
           onClose={() => setRenameOpen(false)}
         />
       )}
+
+      {linkDialogOpen && (
+        <LinkSuggestDialog
+          noteTitle={note?.title ?? title ?? noteKey}
+          noteBody={body}
+          onClose={() => setLinkDialogOpen(false)}
+          onInsertRef={(text) => {
+            const ta = textareaRef.current;
+            if (!ta) {
+              setBody((prev) => prev + text);
+              return;
+            }
+            if (mode === "preview") onModeChange("edit");
+            // 插入到光标
+            requestAnimationFrame(() => {
+              const el = textareaRef.current;
+              if (!el) {
+                setBody((prev) => prev + text);
+                return;
+              }
+              const s = el.selectionStart ?? el.value.length;
+              const e = el.selectionEnd ?? s;
+              el.setRangeText(text, s, e, "end");
+              setBody(el.value);
+              el.focus();
+            });
+            // 若已在编辑态，直接插入
+            if (mode === "edit" && textareaRef.current) {
+              const el = textareaRef.current;
+              const s = el.selectionStart ?? el.value.length;
+              const e = el.selectionEnd ?? s;
+              el.setRangeText(text, s, e, "end");
+              setBody(el.value);
+              el.focus();
+            }
+          }}
+          onAppendTag={(tagText) => {
+            // 标签追加到正文末尾（同一行空格分隔）
+            const suffix = body.endsWith("\n") || body.length === 0 ? tagText : ` ${tagText}`;
+            // 若在预览模式切编辑
+            if (mode === "preview") onModeChange("edit");
+            // 追加
+            const ta = textareaRef.current;
+            if (ta && mode === "edit") {
+              const end = ta.value.length;
+              ta.setRangeText(suffix, end, end, "end");
+              setBody(ta.value);
+              ta.focus();
+              ta.setSelectionRange(ta.value.length, ta.value.length);
+            } else {
+              setBody((prev) => prev + suffix);
+              requestAnimationFrame(() => {
+                const el = textareaRef.current;
+                if (!el) return;
+                el.focus();
+                el.setSelectionRange(el.value.length, el.value.length);
+              });
+            }
+          }}
+          onOpenSettings={() => {
+            setLinkDialogOpen(false);
+            onOpenSettings?.();
+          }}
+        />
+      )}
     </div>
   );
-}
+});

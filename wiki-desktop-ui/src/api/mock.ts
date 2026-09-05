@@ -1,4 +1,5 @@
-import type { NoteDto, NoteSummary, SearchHitDto, GraphDto, VaultInfo } from "./types";
+import type { DeleteFolderResult, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, GraphDto, VaultInfo } from "./types";
+import type { KnowledgeSourceInfo, RemotePage } from "./server";
 
 // —— 工具：从 body 中提取 [[wikilink]] ——
 function extractLinks(body: string): string[] {
@@ -11,6 +12,13 @@ function extractLinks(body: string): string[] {
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+// 格式化为 "YYYY-MM-DD HH:MM:SS"（UTC，与 parseRemoteTime 对齐）
+function formatUtcNow(): string {
+  const d = new Date();
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
 // 初始 5 篇互相引用的中文笔记：覆盖有 tags / 有别名 / 有断链 / 一个孤儿
@@ -109,6 +117,9 @@ const SEED: NoteDto[] = [
 // 可变内存库（save/delete 会改这里）
 const store = new Map<string, NoteDto>(SEED.map((n) => [n.key, { ...n }]));
 
+// 同步状态内存存储（对应 read_sync_state / write_sync_state）
+let syncStateJson: string | null = null;
+
 function toSummary(n: NoteDto): NoteSummary {
   return { key: n.key, title: n.title, tags: [...n.tags], modified: n.modified };
 }
@@ -124,6 +135,10 @@ function buildGraph(): GraphDto {
     }
   }
   return { nodes, edges };
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function snippetAround(body: string, query: string, len = 80): string {
@@ -143,6 +158,20 @@ export const mockVault = {
     return [...store.values()]
       .sort((a, b) => b.modified - a.modified)
       .map(toSummary);
+  },
+
+  listNotesFull(): NoteDto[] {
+    return [...store.values()]
+      .sort((a, b) => b.modified - a.modified)
+      .map((n) => ({ ...n, aliases: [...n.aliases], tags: [...n.tags] }));
+  },
+
+  readSyncState(): string | null {
+    return syncStateJson;
+  },
+
+  writeSyncState(json: string): void {
+    syncStateJson = json;
   },
 
   // 与 Rust 侧一致：笔记不存在时抛错（IpcError::NoteNotFound），而非返回 null
@@ -192,6 +221,96 @@ export const mockVault = {
     return hits.slice(0, limit);
   },
 
+  renameNote(key: string, newKey: string, rewriteLinks: boolean): NoteDto {
+    const src = store.get(key);
+    if (!src) throw new Error(`笔记不存在: ${key}`);
+    if (store.has(newKey)) throw new Error("已存在同名笔记");
+    const next: NoteDto = { ...src, key: newKey, title: newKey, modified: nowSec() };
+    store.delete(key);
+    store.set(newKey, next);
+    if (rewriteLinks) {
+      const pattern = new RegExp(`\\[\\[${escapeRegExp(key)}(?=[\\]|\\])`, "g");
+      let rewrittenCount = 0;
+      for (const n of store.values()) {
+        if (n.body.includes(`[[${key}`)) {
+          const before = n.body;
+          n.body = n.body.replace(pattern, `[[${newKey}`);
+          if (n.body !== before) rewrittenCount++;
+        }
+      }
+      void rewrittenCount;
+    }
+    return { ...next, aliases: [...next.aliases], tags: [...next.tags] };
+  },
+
+  renameFolder(oldPrefix: string, newPrefix: string, rewriteLinks: boolean): RenameFolderResult {
+    const moved: RenameFolderResult["moved"] = [];
+    const failed: RenameFolderResult["failed"] = [];
+    const toMove: Array<[string, string]> = [];
+    for (const k of store.keys()) {
+      if (k === oldPrefix || k.startsWith(oldPrefix + "/")) {
+        const suffix = k.slice(oldPrefix.length);
+        const nk = newPrefix + suffix;
+        toMove.push([k, nk]);
+      }
+    }
+    // 冲突检测：目标已存在且不在本次移动集合中（或重复目标）
+    const movingFromSet = new Set(toMove.map(([f]) => f));
+    const targetSet = new Set<string>();
+    for (const [from, to] of toMove) {
+      if (targetSet.has(to)) {
+        failed.push({ key: from, error: "目标已存在" });
+        continue;
+      }
+      if (store.has(to) && !movingFromSet.has(to)) {
+        failed.push({ key: from, error: "目标已存在" });
+        continue;
+      }
+      targetSet.add(to);
+    }
+    const failedFrom = new Set(failed.map((f) => f.key));
+    const succeeded = toMove.filter(([f]) => !failedFrom.has(f));
+    // 执行移动
+    for (const [from, to] of succeeded) {
+      const src = store.get(from)!;
+      const next: NoteDto = { ...src, key: to, title: to, modified: nowSec() };
+      store.delete(from);
+      store.set(to, next);
+      moved.push({ from_key: from, to_key: to });
+    }
+    // 链接重写：简单字符串替换 [[oldPrefix
+    let link_rewritten: string[] = [];
+    let rewritten_count = 0;
+    if (rewriteLinks && succeeded.length > 0) {
+      const pattern = new RegExp(`\\[\\[${escapeRegExp(oldPrefix)}(?=[\\]/|\\])`, "g");
+      for (const n of store.values()) {
+        if (n.body.includes(`[[${oldPrefix}`)) {
+          const before = n.body;
+          n.body = n.body.replace(pattern, `[[${newPrefix}`);
+          if (n.body !== before) {
+            link_rewritten.push(n.key);
+            rewritten_count++;
+          }
+        }
+      }
+    }
+    return { moved, failed, link_rewritten, rewritten_count };
+  },
+
+  deleteFolder(prefix: string): DeleteFolderResult {
+    const toDelete: string[] = [];
+    for (const k of store.keys()) {
+      if (k === prefix || k.startsWith(prefix + "/")) toDelete.push(k);
+    }
+    const deleted: string[] = [];
+    const failed: DeleteFolderResult["failed"] = [];
+    for (const k of toDelete) {
+      if (store.delete(k)) deleted.push(k);
+      else failed.push({ key: k, error: "删除失败" });
+    }
+    return { deleted, failed };
+  },
+
   getGraph(): GraphDto {
     return buildGraph();
   },
@@ -204,4 +323,163 @@ export type MockCommand =
   | "save_note"
   | "delete_note"
   | "search_notes"
-  | "get_graph";
+  | "get_graph"
+  | "rename_note"
+  | "rename_folder"
+  | "delete_folder"
+  | "list_notes_full"
+  | "read_sync_state"
+  | "write_sync_state";
+
+// —— 内存假服务器（仅用于非 Tauri 环境的 fetch 拦截） ——
+
+export const MOCK_BASE_URL = "mock://local";
+const MOCK_TOKEN = "mock-token";
+const MOCK_KB_ID = "mock-wiki";
+
+// 远端页面存储
+const mockRemotePages = new Map<string, RemotePage>();
+
+// 辅助：构造 JSON Response
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// 处理 mock 请求
+async function handleMockRequest(urlStr: string, init?: RequestInit): Promise<Response> {
+  const url = new URL(urlStr);
+  const method = (init?.method ?? "GET").toUpperCase();
+  const pathname = url.pathname;
+
+  // 登录
+  if (pathname === "/api/login" && method === "POST") {
+    const bodyText = typeof init?.body === "string" ? (init.body as string) : "";
+    let pwd = "";
+    try {
+      const j = JSON.parse(bodyText) as Record<string, unknown>;
+      pwd = String(j["password"] ?? "");
+    } catch {
+      pwd = "";
+    }
+    // 密码为 "mock" 或空串时成功（兼容 auth_required:false 场景）
+    if (pwd === "mock" || pwd === "") {
+      return jsonResponse({ token: MOCK_TOKEN, auth_required: false });
+    }
+    return new Response("密码错误", { status: 401 });
+  }
+
+  // 容器列表
+  if (pathname === "/api/knowledge" && method === "GET") {
+    const source: KnowledgeSourceInfo = {
+      id: MOCK_KB_ID,
+      name: "演示知识库",
+      kind: "wiki",
+      docCount: 0,
+      pageCount: mockRemotePages.size,
+    };
+    return jsonResponse({ sources: [source] });
+  }
+
+  // 页面分页
+  const pagesListRe = /^\/api\/knowledge\/([^/]+)\/pages$/;
+  const mList = pathname.match(pagesListRe);
+  if (mList && method === "GET") {
+    const kid = decodeURIComponent(mList[1]);
+    if (kid !== MOCK_KB_ID) return jsonResponse({ pages: [] });
+    const limit = Math.min(Number(url.searchParams.get("limit") ?? "200"), 200);
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    const all = [...mockRemotePages.values()].sort((a, b) => a.ref.localeCompare(b.ref));
+    const slice = all.slice(offset, offset + limit).map((p) => ({
+      ref: p.ref,
+      title: p.title,
+      locked: p.locked,
+      updated_at: p.updated_at,
+    }));
+    return jsonResponse({ pages: slice, total: all.length });
+  }
+
+  // 单页 CRUD：/api/knowledge/:id/pages/*ref
+  const pageRe = /^\/api\/knowledge\/([^/]+)\/pages\/(.+)$/;
+  const mPage = pathname.match(pageRe);
+  if (mPage) {
+    const kid = decodeURIComponent(mPage[1]);
+    if (kid !== MOCK_KB_ID) return new Response("not found", { status: 404 });
+    const ref = mPage[2].split("/").map(decodeURIComponent).join("/");
+    if (method === "GET") {
+      const page = mockRemotePages.get(ref);
+      if (!page) return new Response("not found", { status: 404 });
+      return jsonResponse(page);
+    }
+    if (method === "PUT") {
+      const bodyText = typeof init?.body === "string" ? (init.body as string) : "";
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(bodyText) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+      const title = String(parsed["title"] ?? ref);
+      const content = String(parsed["content"] ?? "");
+      const summary = String(parsed["summary"] ?? "");
+      const page: RemotePage = {
+        ref,
+        title,
+        summary,
+        content,
+        locked: false,
+        updated_at: formatUtcNow(),
+      };
+      mockRemotePages.set(ref, page);
+      return jsonResponse(page);
+    }
+    if (method === "DELETE") {
+      const existed = mockRemotePages.delete(ref);
+      if (!existed) return new Response("not found", { status: 404 });
+      return new Response(null, { status: 204 });
+    }
+  }
+
+  return new Response("not found", { status: 404 });
+}
+
+// 内存假服务器句柄（供测试或直接调用）
+export const mockServer = {
+  get pages() {
+    return mockRemotePages;
+  },
+  clear() {
+    mockRemotePages.clear();
+  },
+  login(password: string): { token: string } {
+    if (password === "mock" || password === "") return { token: MOCK_TOKEN };
+    throw new Error("密码错误");
+  },
+  listKnowledgeSources(): KnowledgeSourceInfo[] {
+    return [{ id: MOCK_KB_ID, name: "演示知识库", kind: "wiki", docCount: 0, pageCount: mockRemotePages.size }];
+  },
+};
+
+let interceptorInstalled = false;
+
+// 安装 fetch 拦截器：非 Tauri 且 baseUrl 为 mock 默认值时路由到内存假服务器
+export function installMockServerInterceptor(): void {
+  if (interceptorInstalled) return;
+  if (typeof window === "undefined") return;
+  interceptorInstalled = true;
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const urlStr =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+    if (!urlStr.startsWith(MOCK_BASE_URL)) {
+      return origFetch(input as RequestInfo, init);
+    }
+    return handleMockRequest(urlStr, init);
+  };
+}

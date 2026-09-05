@@ -7,6 +7,7 @@ export interface NoteSummary {
   tags: string[];
   /** unix 秒 */
   modified: number;
+  ref_id?: string | null;
 }
 
 /** 单篇笔记详情 */
@@ -18,6 +19,7 @@ export interface NoteDto {
   body: string;
   /** unix 秒 */
   modified: number;
+  ref_id?: string | null;
 }
 
 /** 搜索命中 */
@@ -50,4 +52,23 @@ export interface GraphDto {
 export interface VaultInfo {
   root: string;
   note_count: number;
+}
+/** 文件夹批量移动结果 */
+export interface MovedEntry {
+  from_key: string;
+  to_key: string;
+}
+export interface FailedEntry {
+  key: string;
+  error: string;
+}
+export interface RenameFolderResult {
+  moved: MovedEntry[];
+  failed: FailedEntry[];
+  link_rewritten: string[];
+  rewritten_count: number;
+}
+export interface DeleteFolderResult {
+  deleted: string[];
+  failed: FailedEntry[];
 }
