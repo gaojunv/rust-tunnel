@@ -518,7 +518,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                 )}
                 {todos.length > 0 && (
                   <div className="mb-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
-                    <div className="mb-1 text-xs font-medium text-muted-foreground">Tasks</div>
+                    <div className="mb-1 text-xs font-medium text-muted-foreground">{t('agent.tasks')}</div>
                     <ul className="space-y-0.5">
                       {todos.map((todoItem, i) => (
                         <li key={i} className="flex items-start gap-1.5 text-xs">

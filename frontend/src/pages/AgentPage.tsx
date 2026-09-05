@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
 import {
   listAgentWorkspaces,
   listAgentSessions,
@@ -51,7 +52,7 @@ export default function AgentPage() {
   // 编辑模式：传入当前工作区则 WorkspaceDialog 走 PUT（client/运行时不可改）
   const [editingWorkspace, setEditingWorkspace] = useState<AgentWorkspace | null>(null);
 
-  const { data: workspaces } = useQuery<AgentWorkspace[]>({
+  const { data: workspaces, isError: workspacesError, refetch: refetchWorkspaces } = useQuery<AgentWorkspace[]>({
     queryKey: ['agent-workspaces'],
     queryFn: listAgentWorkspaces,
   });
@@ -287,6 +288,19 @@ export default function AgentPage() {
   // calc(100dvh-…) 视口单位拼凑高度，移动端 100dvh 与外层 100vh 不一致（地址栏
   // 动态变化）会导致 AgentPage 高出外层剩余空间 → 外层 ScrollArea 与消息区叠出
   // 双重滚动条（历史：5ad703a 修过一次仍复发）。
+  if (workspacesError) {
+    return (
+      <Card className="flex h-full min-h-[320px] items-center justify-center md:min-h-[480px]">
+        <CardContent className="flex flex-col items-center gap-3 py-10 text-center">
+          <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+          <Button variant="outline" size="sm" onClick={() => void refetchWorkspaces()}>
+            {t('common.retry')}
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:min-h-[480px]">
       {/* 顶栏：logo + WorkspaceBar + SessionBar + 多会话标签（同一行，省空间；

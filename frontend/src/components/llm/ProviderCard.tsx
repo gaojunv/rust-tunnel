@@ -72,10 +72,10 @@ function ModelRow({ model, confirm }: { model: LlmModel; confirm: ReturnType<typ
             <SelectItem value="responses">{t('llm.providerCard.protocolResponses')}</SelectItem>
           </SelectContent>
         </Select>
-        <Button variant="ghost" size="icon" onClick={save} disabled={updateModelMutation.isPending}>
+        <Button variant="ghost" size="icon" aria-label={t('common.save')} onClick={save} disabled={updateModelMutation.isPending}>
           <Check className="w-3 h-3" />
         </Button>
-        <Button variant="ghost" size="icon" onClick={() => { setContextLimitTier(parseContextLimit(model.extra_config)); setUpstreamProtocol(parseUpstreamProtocol(model.extra_config)); setEditing(false); }}>
+        <Button variant="ghost" size="icon" aria-label={t('common.cancel')} onClick={() => { setContextLimitTier(parseContextLimit(model.extra_config)); setUpstreamProtocol(parseUpstreamProtocol(model.extra_config)); setEditing(false); }}>
           <X className="w-3 h-3" />
         </Button>
       </div>
@@ -91,12 +91,13 @@ function ModelRow({ model, confirm }: { model: LlmModel; confirm: ReturnType<typ
         {parseUpstreamProtocol(model.extra_config) === 'responses' && <Badge variant="secondary" className="ml-1 text-xs">Responses</Badge>}
       </div>
       <div className="flex items-center">
-        <Button variant="ghost" size="icon" onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setContextLimitTier(parseContextLimit(model.extra_config)); setUpstreamProtocol(parseUpstreamProtocol(model.extra_config)); setEditing(true); }}>
+        <Button variant="ghost" size="icon" aria-label={t('llm.providerCard.editModel')} onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setContextLimitTier(parseContextLimit(model.extra_config)); setUpstreamProtocol(parseUpstreamProtocol(model.extra_config)); setEditing(true); }}>
           <Edit3 className="w-3 h-3" />
         </Button>
         <Button
           variant="ghost"
           size="icon"
+          aria-label={t('llm.providerCard.deleteModel')}
           onClick={() =>
             confirm(
               { title: t('common.confirm'), description: t('llm.providerCard.deleteModelConfirm', { name: model.model_name }) },
@@ -125,7 +126,7 @@ export default function ProviderCard({ provider, onEdit }: Props) {
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
         <div className="flex items-center gap-3">
-          <Button variant="ghost" size="icon" onClick={() => setExpanded(!expanded)}>
+          <Button variant="ghost" size="icon" aria-label={expanded ? t('llm.providerCard.collapse') : t('llm.providerCard.expand')} onClick={() => setExpanded(!expanded)}>
             {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
           </Button>
           <CardTitle className="text-base">{provider.name}</CardTitle>
@@ -133,10 +134,11 @@ export default function ProviderCard({ provider, onEdit }: Props) {
         </div>
         <div className="flex items-center gap-2">
           <Switch checked={provider.enabled} onCheckedChange={(v) => toggleMutation.mutate({ id: provider.id, enabled: v })} />
-          <Button variant="ghost" size="icon" onClick={onEdit}><Edit3 className="w-4 h-4" /></Button>
+          <Button variant="ghost" size="icon" aria-label={t('llm.providerCard.editProvider')} onClick={onEdit}><Edit3 className="w-4 h-4" /></Button>
           <Button
             variant="ghost"
             size="icon"
+            aria-label={t('llm.providerCard.deleteProvider')}
             onClick={() =>
               confirm(
                 { title: t('common.confirm'), description: t('llm.providerCard.deleteProviderConfirm') },

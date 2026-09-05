@@ -127,6 +127,7 @@ function JobRow({
   onToggle: () => void;
   onViewLogs: () => void;
 }) {
+  const { t } = useTranslation();
   const kind = runStatusIconKind(job.status, job.conclusion);
   const dur = durationText(job.started_at, job.completed_at);
   const hasSteps = (job.steps?.length ?? 0) > 0;
@@ -160,12 +161,12 @@ function JobRow({
         </button>
         <button
           type="button"
-          aria-label={`查看日志 ${job.name}`}
-          title="查看日志"
+          aria-label={`${t('agent.githubViewLogsLabel')} ${job.name}`}
+          title={t('agent.githubViewLogsLabel')}
           onClick={onViewLogs}
           className="shrink-0 rounded px-1 py-0.5 text-[11px] text-muted-foreground opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:bg-accent hover:text-foreground"
         >
-          日志
+          {t('agent.githubLogs')}
         </button>
       </div>
       {expanded && hasSteps && (
@@ -341,7 +342,7 @@ function JobLogsDialog({
           <Input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索日志…"
+            placeholder={t('agent.githubSearchLogsPlaceholder')}
             className="h-7 pl-7 text-xs"
           />
         </div>

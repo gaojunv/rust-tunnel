@@ -12,7 +12,7 @@ export default function ClientDetailPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
 
-  const { data: clients = [], isLoading } = useQuery({
+  const { data: clients = [], isLoading, isError, refetch } = useQuery({
     queryKey: ['clients', 'detail'],
     queryFn: () => clientsApi.list(),
     refetchInterval: 5000,
@@ -25,6 +25,25 @@ export default function ClientDetailPage() {
       <div className="space-y-6">
         <PageHeader title={t('clientDetail.title')} description={t('common.loading')} />
         <div className="py-12 text-center text-muted-foreground">{t('common.loading')}</div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="space-y-6">
+        <PageHeader title={t('clientDetail.title')} description={t('common.loadFailed')}>
+          <Button variant="outline" onClick={() => navigate('/dashboard')}>
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {t('clientDetail.back')}
+          </Button>
+        </PageHeader>
+        <div className="flex flex-col items-center gap-3 py-12 text-center">
+          <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+          <Button variant="outline" size="sm" onClick={() => void refetch()}>
+            {t('common.retry')}
+          </Button>
+        </div>
       </div>
     );
   }

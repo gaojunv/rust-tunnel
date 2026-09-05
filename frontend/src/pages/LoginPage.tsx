@@ -51,7 +51,9 @@ export default function LoginPage() {
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
+              <label htmlFor="login-password" className="sr-only">{t('login.passwordLabel')}</label>
               <Input
+                id="login-password"
                 type="password"
                 placeholder={t('login.passwordPlaceholder')}
                 value={password}

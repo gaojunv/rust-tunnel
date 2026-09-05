@@ -136,6 +136,7 @@ export default function ApiKeyTable() {
                       <Button
                         variant="ghost"
                         size="icon"
+                        aria-label={t('llm.apiKeys.revoke')}
                         onClick={() =>
                           confirm(
                             { title: t('common.confirm'), description: t('llm.apiKeys.revokeConfirm') },

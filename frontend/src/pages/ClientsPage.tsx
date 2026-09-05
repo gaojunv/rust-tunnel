@@ -3,15 +3,24 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { clientsApi, serverAuthApi } from '@/api/client';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 
 export default function ClientsPage() {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const { data: clients = [] } = useQuery({
+  const {
+    data: clients = [],
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     queryKey: ['clients'],
     queryFn: clientsApi.list,
     refetchInterval: 5000,
   });
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const { data: auth } = useQuery({
     queryKey: ['server-auth'],
     queryFn: serverAuthApi.get,
@@ -47,35 +56,57 @@ export default function ClientsPage() {
             {auth?.client_token ?? '...'}
           </code>
           {!confirmRotate ? (
-            <button
-              className="rounded bg-amber-500 px-3 py-1 text-sm text-white hover:bg-amber-600"
+            <Button
+              size="sm"
+              variant="outline"
+              className="border-amber-500/30 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
               onClick={() => setConfirmRotate(true)}
             >
               {t('clients.rotate')}
-            </button>
+            </Button>
           ) : (
             <div className="flex items-center gap-2 text-sm">
               <span className="text-muted-foreground">
                 {t('clients.rotateConfirm')}
               </span>
-              <button
-                className="rounded bg-red-500 px-3 py-1 text-sm text-white hover:bg-red-600"
+              <Button
+                size="sm"
+                variant="destructive"
                 onClick={() => rotate.mutate()}
               >
                 {t('clients.confirm')}
-              </button>
-              <button
-                className="text-sm text-muted-foreground hover:text-foreground"
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
                 onClick={() => setConfirmRotate(false)}
               >
                 {t('common.cancel')}
-              </button>
+              </Button>
             </div>
           )}
         </div>
       </section>
 
       <section className="card-aurora rounded-lg border bg-card">
+        {isLoading ? (
+          <div className="space-y-3 p-4">
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-3/4" />
+          </div>
+        ) : isError ? (
+          <div className="flex flex-col items-center gap-3 py-10 text-center">
+            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        ) : clients.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 py-10 text-sm text-muted-foreground">
+            {t('clients.list.noClients')}
+          </div>
+        ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -114,15 +145,19 @@ export default function ClientsPage() {
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex gap-2">
-                      <button
-                        className="rounded bg-muted px-2.5 py-1 text-xs font-medium text-muted-foreground hover:text-foreground disabled:opacity-40"
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2.5 text-xs"
                         disabled={!c.online}
                         onClick={() => kick.mutate(c.name)}
                       >
                         {t('clients.kick')}
-                      </button>
-                      <button
-                        className="rounded bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive hover:bg-destructive/20 disabled:opacity-40"
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2.5 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
                         disabled={c.referenced_by_rules > 0}
                         title={
                           c.referenced_by_rules > 0
@@ -132,14 +167,17 @@ export default function ClientsPage() {
                               : t('clients.delete')
                         }
                         onClick={() => {
-                          const msg = c.online
+                          const description = c.online
                             ? t('clients.kickDeleteConfirm', { name: c.name })
                             : t('clients.deleteConfirm', { name: c.name });
-                          if (window.confirm(msg)) remove.mutate(c.name);
+                          confirm(
+                            { title: t('common.confirm'), description },
+                            () => remove.mutate(c.name),
+                          );
                         }}
                       >
                         {t('clients.delete')}
-                      </button>
+                      </Button>
                     </div>
                   </td>
                 </tr>
@@ -147,7 +185,17 @@ export default function ClientsPage() {
             </tbody>
           </table>
         </div>
+        )}
       </section>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }

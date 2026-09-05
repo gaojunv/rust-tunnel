@@ -16,6 +16,7 @@ import { Switch } from '@/components/ui/switch';
 import { useSetLogsLevel, useLlmLogging } from '@/api/hooks';
 import { getLogs } from '@/api/client';
 import type { LogEntry } from '@/types';
+import { toast } from 'sonner';
 import {
   Pause,
   Play,
@@ -60,6 +61,9 @@ export default function LogsPage() {
   const [hasMore, setHasMore] = useState(true);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [initialLoadError, setInitialLoadError] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
+  const [sseDisconnected, setSseDisconnected] = useState(false);
   const [serverLogLevel, setServerLogLevel] = useState<string>('INFO');
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -88,18 +92,22 @@ export default function LogsPage() {
           setHasMore(data.length >= 200);
         }
       } catch {
-        // Silently handle
+        if (!cancelled) {
+          setInitialLoadError(true);
+          toast.error(t('logs.loadFailed'));
+        }
       } finally {
         if (!cancelled) {
           setIsInitialLoading(false);
         }
       }
     };
+    setInitialLoadError(false);
     fetchInitial();
     return () => {
       cancelled = true;
     };
-  }, [levelFilter, sourceFilter]);
+  }, [levelFilter, sourceFilter, t]);
 
   // SSE connection
   useEffect(() => {
@@ -128,6 +136,7 @@ export default function LogsPage() {
     eventSourceRef.current = es;
 
     es.addEventListener('log', (e: MessageEvent) => {
+      setSseDisconnected(false);
       try {
         const entry: LogEntry = JSON.parse(e.data);
         setLogs((prev) => [...prev, entry]);
@@ -136,8 +145,9 @@ export default function LogsPage() {
       }
     });
 
+    setSseDisconnected(false);
     es.onerror = () => {
-      // EventSource auto-reconnects with exponential backoff
+      setSseDisconnected(true);
     };
 
     return () => {
@@ -165,6 +175,7 @@ export default function LogsPage() {
   const handleLoadMore = async () => {
     if (logs.length === 0 || !hasMore) return;
     setIsLoadingMore(true);
+    setLoadMoreError(false);
     try {
       const oldestId = logs[0]?.id;
       const params: Record<string, string | number> = {
@@ -181,7 +192,8 @@ export default function LogsPage() {
       setLogs((prev) => [...olderLogs, ...prev]);
       setHasMore(olderLogs.length >= 200);
     } catch {
-      // Silently handle
+      setLoadMoreError(true);
+      toast.error(t('logs.loadMoreFailed'));
     } finally {
       setIsLoadingMore(false);
     }
@@ -216,13 +228,14 @@ export default function LogsPage() {
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-2">
             <Switch
+              id="llm-logging-switch"
               checked={llmLogging?.enabled ?? true}
               onCheckedChange={(checked) => setLlmLogging(checked)}
               disabled={isToggling}
             />
-            <span className="text-sm text-muted-foreground">
+            <label htmlFor="llm-logging-switch" className="text-sm text-muted-foreground cursor-pointer">
               {t('logs.llmLogging')}
-            </span>
+            </label>
           </div>
           <Select value={serverLogLevel} onValueChange={handleServerLogLevelChange}>
             <SelectTrigger className="w-[130px]">
@@ -305,6 +318,11 @@ export default function LogsPage() {
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               {t('logs.loading')}
             </div>
+          ) : initialLoadError && filteredLogs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center gap-2 py-16 text-muted-foreground">
+              <Terminal className="mb-2 h-12 w-12 opacity-50" />
+              <p className="text-sm text-destructive">{t('logs.loadFailed')}</p>
+            </div>
           ) : filteredLogs.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
               <Terminal className="mb-4 h-12 w-12 opacity-50" />
@@ -320,6 +338,11 @@ export default function LogsPage() {
               className="h-[calc(100vh-320px)] overflow-y-auto bg-muted/30 dark:bg-black/40"
             >
               <div className="space-y-0.5 p-4">
+                {loadMoreError && (
+                  <div className="mx-auto mb-2 max-w-fit rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1 text-xs text-destructive">
+                    {t('logs.loadMoreFailed')}
+                  </div>
+                )}
                 {hasMore && (
                   <div className="flex justify-center py-2">
                     <Button
@@ -381,10 +404,18 @@ export default function LogsPage() {
           {searchQuery && ' ' + t('logs.footer.filtered')}
         </span>
         <div className="flex items-center gap-2">
+          {sseDisconnected && !isPaused && (
+            <Badge
+              variant="outline"
+              className="border-destructive/30 bg-destructive/10 text-destructive"
+            >
+              {t('logs.sseDisconnected')}
+            </Badge>
+          )}
           {isPaused && (
             <Badge
               variant="outline"
-              className="border-amber-500/25 bg-amber-500/10 text-amber-500"
+              className="border-amber-500/25 bg-amber-500/10 text-amber-600 dark:text-amber-400"
             >
               {t('logs.footer.paused')}
             </Badge>

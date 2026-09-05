@@ -21,9 +21,12 @@ import {
 } from '@/components/ui/dialog';
 import { PageHeader } from '@/components/layout/PageHeader';
 import DnsConfigCard from '@/components/dns/DnsConfigCard';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
+import { getApiErrorMessage } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
+import { toast } from 'sonner';
 import { Plus, Trash2 } from 'lucide-react';
 
 export default function DnsPage() {
@@ -36,11 +39,12 @@ export default function DnsPage() {
     value: '',
   });
 
-  const { data: records, isLoading } = useQuery({
+  const { data: records, isLoading, isError, refetch } = useQuery({
     queryKey: ['dns-records'],
     queryFn: () => getDnsRecords(),
     refetchInterval: 15000,
   });
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
 
   const addMutation = useMutation({
     mutationFn: (data: AddDnsRecordRequest) => addDnsRecord(data),
@@ -55,6 +59,9 @@ export default function DnsPage() {
     mutationFn: (name: string) => deleteDnsRecord(name),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dns-records'] });
+    },
+    onError: (err: unknown) => {
+      toast.error(t('dns.deleteFailed', { error: getApiErrorMessage(err) }));
     },
   });
 
@@ -86,8 +93,9 @@ export default function DnsPage() {
             </DialogHeader>
             <form onSubmit={handleAdd} className="space-y-4">
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('dns.name')}</label>
+                <label htmlFor="dns-name" className="text-sm font-medium">{t('dns.name')}</label>
                 <Input
+                  id="dns-name"
                   value={newRecord.name}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, name: e.target.value })
@@ -97,8 +105,9 @@ export default function DnsPage() {
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('dns.type')}</label>
+                <label htmlFor="dns-type" className="text-sm font-medium">{t('dns.type')}</label>
                 <select
+                  id="dns-type"
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   value={newRecord.record_type}
                   onChange={(e) =>
@@ -111,8 +120,9 @@ export default function DnsPage() {
                 </select>
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('dns.value')}</label>
+                <label htmlFor="dns-value" className="text-sm font-medium">{t('dns.value')}</label>
                 <Input
+                  id="dns-value"
                   value={newRecord.value}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, value: e.target.value })
@@ -144,6 +154,13 @@ export default function DnsPage() {
           {isLoading ? (
             <div className="text-center py-8 text-muted-foreground">
               {t('common.loading')}
+            </div>
+          ) : isError ? (
+            <div className="flex flex-col items-center gap-3 py-8 text-center">
+              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+              <Button variant="outline" size="sm" onClick={() => void refetch()}>
+                {t('common.retry')}
+              </Button>
             </div>
           ) : !records?.length ? (
             <div className="text-center py-8 text-muted-foreground">
@@ -180,11 +197,12 @@ export default function DnsPage() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => {
-                          if (window.confirm(t('dns.confirmDelete', { name: record.name }))) {
-                            deleteMutation.mutate(record.name);
-                          }
-                        }}
+                        onClick={() =>
+                          confirm(
+                            { title: t('common.confirm'), description: t('dns.confirmDelete', { name: record.name }) },
+                            () => deleteMutation.mutate(record.name),
+                          )
+                        }
                         disabled={deleteMutation.isPending}
                       >
                         <Trash2 className="h-4 w-4 text-destructive" />
@@ -197,6 +215,15 @@ export default function DnsPage() {
           )}
         </CardContent>
       </Card>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }
