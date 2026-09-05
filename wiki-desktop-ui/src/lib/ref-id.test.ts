@@ -110,3 +110,34 @@ describe("toRemoteRef", () => {
     expect(toRemoteRef("BADKEY", "good/ref")).toBe("good/ref");
   });
 });
+
+describe("deriveRefFromKey", () => {
+  it("确定性：同 key 同 ref", async () => {
+    const { deriveRefFromKey } = await import("./ref-id");
+    const a = await deriveRefFromKey("数据库");
+    const b = await deriveRefFromKey("数据库");
+    expect(a).toBe(b);
+  });
+
+  it("结果通过 normalizeRemoteRef", async () => {
+    const { deriveRefFromKey } = await import("./ref-id");
+    const { normalizeRemoteRef } = await import("./ref-id");
+    const ref = await deriveRefFromKey("任意中文key");
+    expect(normalizeRemoteRef(ref)).toBe(ref);
+  });
+
+  it("不同 key 产生不同 ref", async () => {
+    const { deriveRefFromKey } = await import("./ref-id");
+    const a = await deriveRefFromKey("数据库");
+    const b = await deriveRefFromKey("数据库2");
+    expect(a).not.toBe(b);
+  });
+
+  it("格式 /^n-[0-9a-f]{12}$/", async () => {
+    const { deriveRefFromKey } = await import("./ref-id");
+    const ref = await deriveRefFromKey("hello");
+    expect(ref).toMatch(/^n-[0-9a-f]{12}$/);
+    const ref2 = await deriveRefFromKey("中文测试");
+    expect(ref2).toMatch(/^n-[0-9a-f]{12}$/);
+  });
+});

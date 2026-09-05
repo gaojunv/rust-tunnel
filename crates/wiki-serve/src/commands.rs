@@ -191,6 +191,20 @@ pub fn list_notes_full(state: &AppState) -> IpcResult<Vec<NoteDto>> {
     vault_ops::list_notes_full(&root)
 }
 
+/// 设置笔记的 `ref`（校验后写回 frontmatter）。
+///
+/// `key`/`ref_id` 按 Tauri IPC 约定以拥有字符串传入，见 [`get_note`]。
+///
+/// # Errors
+///
+/// - `ref_id` 非法时返回 [`crate::error::IpcError::InvalidArgument`]
+/// - 路径逃逸 / 笔记不存在时透传 [`vault_ops::set_note_ref`] 的错误
+#[allow(clippy::needless_pass_by_value)]
+pub fn set_note_ref(state: &AppState, key: String, ref_id: String) -> IpcResult<NoteDto> {
+    let root = state.root();
+    vault_ops::set_note_ref(&root, &key, &ref_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

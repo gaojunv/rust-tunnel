@@ -54,6 +54,8 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
       return mockVault.readSyncState() as unknown as T;
     case "write_sync_state":
       return mockVault.writeSyncState(args?.["json"] as string) as unknown as T;
+    case "set_note_ref":
+      return mockVault.setNoteRef(args?.["key"] as string, args?.["refId"] as string) as unknown as T;
     default:
       throw new Error(`未知命令: ${cmd}`);
   }
@@ -122,4 +124,8 @@ export function readSyncState(): Promise<string | null> {
 
 export function writeSyncState(json: string): Promise<void> {
   return call<void>("write_sync_state", { json });
+}
+
+export function setNoteRef(key: string, ref: string): Promise<NoteDto> {
+  return call<NoteDto>("set_note_ref", { key, refId: ref });
 }

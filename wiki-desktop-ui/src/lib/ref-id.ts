@@ -1,6 +1,7 @@
 /**
  * 服务端 ref 规范镜像（与 Rust `normalize_wiki_ref` 严格一致）
  * 规则：trim+lowercase 后非空、≤128、仅 [a-z0-9/_-]、首字符 [a-z0-9]、不含 // ./ ../
+ * 不兼容 key 的派生规则：`n-` + SHA-256(UTF-8(key)) hex 的前 12 个字符
  */
 
 /**
@@ -46,4 +47,18 @@ export function toRemoteRef(key: string, frontmatterRef?: string | null): string
   const trimmed = key.trim();
   if (trimmed !== trimmed.toLowerCase()) return null;
   return normalizeRemoteRef(key);
+}
+
+/**
+ * 派生确定性 ref：`n-` + SHA-256(UTF-8(key)) hex 的前 12 个字符
+ * 与 sync-engine.ts 中 hashNote 的 crypto.subtle 用法一致
+ */
+export async function deriveRefFromKey(key: string): Promise<string> {
+  const data = new TextEncoder().encode(key);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  const arr = new Uint8Array(buf);
+  const hex = Array.from(arr)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `n-${hex.slice(0, 12)}`;
 }
