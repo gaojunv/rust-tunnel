@@ -28,6 +28,9 @@ pub struct NoteSummary {
     pub tags: Vec<String>,
     /// 最后修改时间（unix 秒）。
     pub modified: u64,
+    /// 关联的远端 `ref`（可选，前端按 `string | null` 接收）。
+    #[serde(default)]
+    pub ref_id: Option<String>,
 }
 
 impl From<&Note> for NoteSummary {
@@ -37,6 +40,7 @@ impl From<&Note> for NoteSummary {
             title: n.title.clone(),
             tags: n.tags.clone(),
             modified: system_time_to_secs(n.modified),
+            ref_id: n.ref_id.as_ref().map(|r| r.as_str().to_owned()),
         }
     }
 }
@@ -56,6 +60,9 @@ pub struct NoteDto {
     pub body: String,
     /// 最后修改时间（unix 秒）。
     pub modified: u64,
+    /// 关联的远端 `ref`（可选，前端按 `string | null` 接收）。
+    #[serde(default)]
+    pub ref_id: Option<String>,
 }
 
 impl From<&Note> for NoteDto {
@@ -67,6 +74,7 @@ impl From<&Note> for NoteDto {
             tags: n.tags.clone(),
             body: n.body.clone(),
             modified: system_time_to_secs(n.modified),
+            ref_id: n.ref_id.as_ref().map(|r| r.as_str().to_owned()),
         }
     }
 }
@@ -130,4 +138,44 @@ pub struct VaultInfo {
     pub root: String,
     /// 笔记数量。
     pub note_count: usize,
+}
+
+/// 单条重命名移动记录。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MovedEntry {
+    /// 原 key。
+    pub from_key: String,
+    /// 新 key。
+    pub to_key: String,
+}
+
+/// 单条失败记录。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailedEntry {
+    /// 失败对应的 key（待移动或待删除）。
+    pub key: String,
+    /// 错误描述。
+    pub error: String,
+}
+
+/// 文件夹重命名结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenameFolderResult {
+    /// 成功移动的条目。
+    pub moved: Vec<MovedEntry>,
+    /// 失败的条目。
+    pub failed: Vec<FailedEntry>,
+    /// 发生链接重写的笔记 key 列表。
+    pub link_rewritten: Vec<String>,
+    /// 链接重写总次数。
+    pub rewritten_count: usize,
+}
+
+/// 文件夹删除结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteFolderResult {
+    /// 已删除的笔记 key 列表。
+    pub deleted: Vec<String>,
+    /// 失败的条目。
+    pub failed: Vec<FailedEntry>,
 }

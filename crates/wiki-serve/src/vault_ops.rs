@@ -9,6 +9,7 @@ Vault 操作的纯逻辑层（完全不依赖 `tauri`）。
 `tauri` feature 时被 `cargo test` 直接覆盖。
 */
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rust_tunnel_wiki_core::graph::LinkGraph;
 use rust_tunnel_wiki_core::vault::{Vault, VaultScanner};
 
-use crate::dto::{GraphDto, GraphEdge, GraphNode, NoteDto, NoteSummary, SearchHitDto, VaultInfo};
+use crate::dto::{
+    DeleteFolderResult, FailedEntry, GraphDto, GraphEdge, GraphNode, MovedEntry, NoteDto,
+    NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
+};
 use crate::error::{IpcError, IpcResult};
 
 // ---------------------------------------------------------------------------
@@ -430,6 +434,504 @@ const WELCOME_NOTE_BODY: &str = concat!(
     "- Use `[[links]]` to connect notes and explore the graph view.\n",
     "- All notes are plain Markdown files under your vault directory.\n",
 );
+
+// ---------------------------------------------------------------------------
+// 同步状态与全量拉取（双向同步支撑）
+// ---------------------------------------------------------------------------
+
+/// 同步状态文件名（固定在 vault 根目录，点开头故被扫描器忽略）。
+const SYNC_STATE_FILE: &str = ".wiki-sync.json";
+
+/// 同步状态 JSON 大小上限（16 MiB，防御性限制）。
+const SYNC_STATE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// 读取 `<root>/.wiki-sync.json`；不存在返回 `Ok(None)`。
+///
+/// # Errors
+///
+/// 仅在 IO 失败时返回 [`IpcError::Io`]；`root` 不存在时按约定返回 `Ok(None)`。
+pub fn read_sync_state(root: &Path) -> IpcResult<Option<String>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let path = root.join(SYNC_STATE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).map_err(IpcError::Io)?;
+    Ok(Some(content))
+}
+
+/// 原子写入 `<root>/.wiki-sync.json`（临时文件 + `rename`）。
+///
+/// 路径硬编码为 `root.join(".wiki-sync.json")`，不接受前端路径参数。
+/// `json` 大小超过 16 MiB 时返回 [`IpcError::InvalidArgument`]。
+///
+/// # Errors
+///
+/// - `root` 不存在时返回 [`IpcError::VaultNotFound`]
+/// - `json` 超限时返回 [`IpcError::InvalidArgument`]
+/// - 写入或重命名失败时返回 [`IpcError::Io`]
+pub fn write_sync_state(root: &Path, json: &str) -> IpcResult<()> {
+    if !root.exists() {
+        return Err(IpcError::VaultNotFound(root.display().to_string()));
+    }
+    if json.len() > SYNC_STATE_MAX_BYTES {
+        return Err(IpcError::InvalidArgument(format!(
+            "sync state 过大：{} 字节，上限 {SYNC_STATE_MAX_BYTES} 字节",
+            json.len()
+        )));
+    }
+    let target = root.join(SYNC_STATE_FILE);
+    let tmp = root.join(format!("{SYNC_STATE_FILE}.tmp-{}", std::process::id()));
+    fs::write(&tmp, json.as_bytes()).map_err(IpcError::Io)?;
+    if let Err(err) = fs::rename(&tmp, &target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(IpcError::Io(err));
+    }
+    Ok(())
+}
+
+/// 一次拿全量笔记（含 `body`/`ref_id`），避免前端 N+1 次 `get_note`。
+///
+/// 复用 [`Vault::load`] 映射为 [`NoteDto`]，已包含 `ref_id` 与 `body`。
+///
+/// # Errors
+///
+/// `root` 不存在时返回 [`IpcError::VaultNotFound`]。
+pub fn list_notes_full(root: &Path) -> IpcResult<Vec<NoteDto>> {
+    if !root.exists() {
+        return Err(IpcError::VaultNotFound(root.display().to_string()));
+    }
+    let notes = Vault::load(root);
+    let out: Vec<NoteDto> = notes.iter().map(NoteDto::from).collect();
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 重命名 / 文件夹操作辅助
+// ---------------------------------------------------------------------------
+
+/// 校验 `key` / `prefix` 的路径合法性（复用 `resolve_note_path` 的思路）。
+fn validate_key_or_prefix(key: &str) -> IpcResult<String> {
+    if key.is_empty() {
+        return Err(IpcError::PathTraversal("空 key".to_owned()));
+    }
+    if key.trim().is_empty() {
+        return Err(IpcError::PathTraversal("空白 key".to_owned()));
+    }
+    if Path::new(key).is_absolute() {
+        return Err(IpcError::PathTraversal(format!("绝对路径：{key}")));
+    }
+    let normalized = key.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return Err(IpcError::PathTraversal(format!("绝对路径：{key}")));
+    }
+    if normalized.contains(':') {
+        return Err(IpcError::PathTraversal(format!("非法路径：{key}")));
+    }
+    // 去除末尾 `/` 后再检查段合法性，允许 `a/b/` 归一为 `a/b`
+    let trimmed = normalized.trim_end_matches('/').to_owned();
+    if trimmed.is_empty() {
+        return Err(IpcError::PathTraversal("空 key".to_owned()));
+    }
+    if trimmed.split('/').any(|seg| seg.is_empty() || seg == "..") {
+        if trimmed.split('/').any(|seg| seg == "..") {
+            return Err(IpcError::PathTraversal(format!("路径逃逸：{key}")));
+        }
+        return Err(IpcError::PathTraversal(format!("非法路径：{key}")));
+    }
+    Ok(trimmed)
+}
+
+/// 查找笔记实际存在的文件（`.md` 优先，其次 `.markdown`）。
+fn find_existing_note_file(root: &Path, key: &str) -> Option<PathBuf> {
+    let normalized = key.replace('\\', "/");
+    let md = root.join(&normalized).with_extension("md");
+    if md.exists() {
+        return Some(md);
+    }
+    let markdown = root.join(&normalized).with_extension("markdown");
+    if markdown.exists() {
+        return Some(markdown);
+    }
+    None
+}
+
+/// 目标路径（统一 `.md`）。
+fn target_note_path(root: &Path, key: &str) -> PathBuf {
+    let normalized = key.replace('\\', "/");
+    root.join(&normalized).with_extension("md")
+}
+
+/// 检查目标是否已存在（`.md` 或 `.markdown` 任一存在即视为占用）。
+fn target_exists(root: &Path, key: &str) -> bool {
+    let normalized = key.replace('\\', "/");
+    let md = root.join(&normalized).with_extension("md");
+    if md.exists() {
+        return true;
+    }
+    let markdown = root.join(&normalized).with_extension("markdown");
+    markdown.exists()
+}
+
+/// 对全 vault 笔记执行 `rewrite_wikilinks`，只写回内容变化的文件。
+fn rewrite_vault_links(
+    root: &Path,
+    rename_map: &HashMap<String, String>,
+) -> (Vec<String>, usize) {
+    if rename_map.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let scanner = VaultScanner::new(root);
+    let keys = scanner.scan();
+    let mut link_rewritten = Vec::new();
+    let mut total = 0usize;
+    for key in keys {
+        let key_str = key.as_str().to_owned();
+        let Some(path) = find_existing_note_file(root, &key_str) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let (new_content, count) =
+            rust_tunnel_wiki_core::link::rewrite_wikilinks(&content, rename_map);
+        if count == 0 || new_content == content {
+            continue;
+        }
+        if fs::write(&path, new_content.as_bytes()).is_ok() {
+            link_rewritten.push(key_str);
+            total += count;
+        }
+    }
+    link_rewritten.sort();
+    (link_rewritten, total)
+}
+
+/// 尝试清理空目录链（从 `from_key` 的父目录向上至 `root`，遇非空即停，不删 `root`）。
+fn cleanup_empty_parents(root: &Path, from_key: &str) {
+    let normalized = from_key.replace('\\', "/");
+    let mut cur = Path::new(&normalized).parent();
+    while let Some(parent) = cur {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        let dir = root.join(parent);
+        if !dir.exists() {
+            cur = parent.parent();
+            continue;
+        }
+        let is_empty = fs::read_dir(&dir).is_ok_and(|mut it| it.next().is_none());
+        if is_empty {
+            let _ = fs::remove_dir(&dir);
+        } else {
+            break;
+        }
+        cur = parent.parent();
+    }
+}
+
+/// 重命名单篇笔记（逐文件 `fs::rename`），可选全 vault 链接重写。
+///
+/// # Errors
+///
+/// - 路径非法 / 逃逸
+/// - 源笔记不存在
+/// - 目标已存在
+pub fn rename_note(
+    root: &Path,
+    old_key: &str,
+    new_key: &str,
+    rewrite_links: bool,
+) -> IpcResult<NoteDto> {
+    let old_norm = validate_key_or_prefix(old_key)?;
+    let new_norm = validate_key_or_prefix(new_key)?;
+    if old_norm == new_norm {
+        // 大小写仅变体的重命名：仍需处理文件系统大小写不敏感的场景，视为有效
+        // 但若完全相等则直接返回
+        if old_key == new_key {
+            return get_note(root, &old_norm);
+        }
+    }
+    // 校验归一后仍在 root 内
+    let old_candidate = root.join(&old_norm).with_extension("md");
+    if !old_candidate.starts_with(root) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 root 之外：{old_key}")));
+    }
+    let new_candidate = root.join(&new_norm).with_extension("md");
+    if !new_candidate.starts_with(root) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 root 之外：{new_key}")));
+    }
+    let Some(src_path) = find_existing_note_file(root, &old_norm) else {
+        return Err(IpcError::NoteNotFound(old_key.to_owned()));
+    };
+    if target_exists(root, &new_norm) {
+        // 若目标即源自身（同 key 不同扩展名的自冲突），视为已存在
+        let src_key_lower = old_norm.to_lowercase();
+        let new_key_lower = new_norm.to_lowercase();
+        if src_key_lower != new_key_lower {
+            return Err(IpcError::InvalidArgument(format!(
+                "目标已存在：{new_key}"
+            )));
+        }
+    }
+    if let Some(parent) = new_candidate.parent() {
+        fs::create_dir_all(parent).map_err(IpcError::Io)?;
+    }
+    fs::rename(&src_path, &new_candidate).map_err(IpcError::Io)?;
+    // 若源是 `.markdown` 且目标为 `.md`，`fs::rename` 已移动；无需额外清理
+    // 但若源目录下残留同 key 的另一种扩展名（异常双文件），删除之
+    let old_alt = root
+        .join(old_norm.replace('\\', "/"))
+        .with_extension("markdown");
+    if old_alt != src_path && old_alt.exists() {
+        let _ = fs::remove_file(&old_alt);
+    }
+    // 清理空父目录
+    cleanup_empty_parents(root, &old_norm);
+
+    if rewrite_links {
+        let mut rename_map = HashMap::new();
+        rename_map.insert(old_norm.to_lowercase(), new_norm.clone());
+        let (_rewritten, _count) = rewrite_vault_links(root, &rename_map);
+    }
+
+    get_note(root, &new_norm)
+}
+
+/// 重命名文件夹（批量 `fs::rename`），可选全 vault 链接重写。
+#[allow(clippy::too_many_lines)]
+///
+/// # Errors
+///
+/// - 路径非法 / 逃逸
+/// - `old_prefix` 未命中任何笔记
+/// - `new_prefix` 为 `old_prefix` 的子路径
+pub fn rename_folder(
+    root: &Path,
+    old_prefix: &str,
+    new_prefix: &str,
+    rewrite_links: bool,
+) -> IpcResult<RenameFolderResult> {
+    let old_norm = validate_key_or_prefix(old_prefix)?;
+    let new_norm = validate_key_or_prefix(new_prefix)?;
+    if old_norm == new_norm {
+        return Err(IpcError::InvalidArgument("前后缀相同，无需移动".to_owned()));
+    }
+    if new_norm == old_norm
+        || new_norm.starts_with(&format!("{old_norm}/"))
+    {
+        return Err(IpcError::InvalidArgument(format!(
+            "新前缀不能是旧前缀的子路径：{new_prefix} 在 {old_prefix} 之内"
+        )));
+    }
+    let old_candidate = root.join(&old_norm).with_extension("md");
+    if !old_candidate.starts_with(root) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 root 之外：{old_prefix}")));
+    }
+    let new_candidate = root.join(&new_norm).with_extension("md");
+    if !new_candidate.starts_with(root) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 root 之外：{new_prefix}")));
+    }
+
+    let scanner = VaultScanner::new(root);
+    let all_keys = scanner.scan();
+    let mut matched: Vec<String> = all_keys
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .filter(|k| k == &old_norm || k.starts_with(&format!("{old_norm}/")))
+        .collect();
+    if matched.is_empty() {
+        return Err(IpcError::NoteNotFound(old_prefix.to_owned()));
+    }
+    matched.sort();
+
+    // 预计算目标 key，检测批内冲突与已存在文件的冲突
+    let mut seen_targets: HashSet<String> = HashSet::new();
+    let mut planned: Vec<(String, String)> = Vec::new();
+    for key in &matched {
+        let new_key = if key == &old_norm {
+            new_norm.clone()
+        } else {
+            // SAFETY: 前缀匹配已保证
+            let suffix = &key[old_norm.len()..];
+            format!("{new_norm}{suffix}")
+        };
+        planned.push((key.clone(), new_key));
+    }
+
+    let mut moved: Vec<MovedEntry> = Vec::new();
+    let mut failed: Vec<FailedEntry> = Vec::new();
+
+    for (from_key, to_key) in planned {
+        let to_lower = to_key.to_lowercase();
+        if !seen_targets.insert(to_lower.clone()) {
+            failed.push(FailedEntry {
+                key: from_key.clone(),
+                error: format!("批内目标冲突：{to_key}"),
+            });
+            continue;
+        }
+        if target_exists(root, &to_key) {
+            // 若目标已在 matched 集合中（即同批内将被移走），允许覆盖检查延后；
+            // 但此处扫描基于移动前状态，无法区分，故一律视为占用
+            failed.push(FailedEntry {
+                key: from_key.clone(),
+                error: format!("目标已存在：{to_key}"),
+            });
+            continue;
+        }
+        let Some(src_path) = find_existing_note_file(root, &from_key) else {
+            failed.push(FailedEntry {
+                key: from_key.clone(),
+                error: "源文件不存在".to_owned(),
+            });
+            continue;
+        };
+        let dst_path = target_note_path(root, &to_key);
+        if let Some(parent) = dst_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                failed.push(FailedEntry {
+                    key: from_key.clone(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        }
+        match fs::rename(&src_path, &dst_path) {
+            Ok(()) => {
+                // 清理另一种扩展名的残留
+                let old_alt = root.join(from_key.replace('\\', "/")).with_extension("markdown");
+                if old_alt != src_path && old_alt.exists() {
+                    let _ = fs::remove_file(&old_alt);
+                }
+                moved.push(MovedEntry {
+                    from_key: from_key.clone(),
+                    to_key: to_key.clone(),
+                });
+            }
+            Err(err) => {
+                failed.push(FailedEntry {
+                    key: from_key.clone(),
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+
+    // 清理空目录链（对每个成功移动的源路径）
+    for m in &moved {
+        cleanup_empty_parents(root, &m.from_key);
+    }
+
+    let (link_rewritten, rewritten_count) = if rewrite_links && !moved.is_empty() {
+        let mut rename_map: HashMap<String, String> = HashMap::new();
+        for m in &moved {
+            rename_map.insert(m.from_key.to_lowercase(), m.to_key.clone());
+        }
+        rewrite_vault_links(root, &rename_map)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    moved.sort_by(|a, b| a.from_key.cmp(&b.from_key));
+    failed.sort_by(|a, b| a.key.cmp(&b.key));
+
+    Ok(RenameFolderResult {
+        moved,
+        failed,
+        link_rewritten,
+        rewritten_count,
+    })
+}
+
+/// 删除文件夹下的全部笔记，并清理空目录链。
+///
+/// # Errors
+///
+/// 路径非法 / 逃逸时返回 [`IpcError`]。
+pub fn delete_folder(root: &Path, prefix: &str) -> IpcResult<DeleteFolderResult> {
+    let norm = validate_key_or_prefix(prefix)?;
+    let candidate = root.join(&norm).with_extension("md");
+    if !candidate.starts_with(root) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 root 之外：{prefix}")));
+    }
+    let scanner = VaultScanner::new(root);
+    let all_keys = scanner.scan();
+    let matched: Vec<String> = all_keys
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .filter(|k| k == &norm || k.starts_with(&format!("{norm}/")))
+        .collect();
+
+    let mut deleted: Vec<String> = Vec::new();
+    let mut failed: Vec<FailedEntry> = Vec::new();
+
+    for key in matched {
+        let md = root.join(key.replace('\\', "/")).with_extension("md");
+        let markdown = root.join(key.replace('\\', "/")).with_extension("markdown");
+        let exists_md = md.exists();
+        let exists_markdown = markdown != md && markdown.exists();
+        if !exists_md && !exists_markdown {
+            failed.push(FailedEntry {
+                key: key.clone(),
+                error: "文件不存在".to_owned(),
+            });
+            continue;
+        }
+        let mut ok = true;
+        if exists_md {
+            if let Err(err) = fs::remove_file(&md) {
+                failed.push(FailedEntry {
+                    key: key.clone(),
+                    error: err.to_string(),
+                });
+                ok = false;
+            }
+        }
+        if exists_markdown {
+            if let Err(err) = fs::remove_file(&markdown) {
+                // 若 md 已删但 markdown 失败，视为失败
+                if ok {
+                    failed.push(FailedEntry {
+                        key: key.clone(),
+                        error: err.to_string(),
+                    });
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            deleted.push(key.clone());
+        }
+    }
+
+    for key in &deleted {
+        cleanup_empty_parents(root, key);
+    }
+    // 若前缀本身是目录（无笔记但有空目录），也尝试清理
+    let dir = root.join(norm.replace('\\', "/"));
+    if dir.is_dir() {
+        let is_empty = fs::read_dir(&dir).is_ok_and(|mut it| it.next().is_none());
+        if is_empty {
+            let _ = fs::remove_dir(&dir);
+            // 继续向上清理空父目录链
+            if let Some(parent) = Path::new(&norm.replace('\\', "/")).parent() {
+                if !parent.as_os_str().is_empty() {
+                    // 构造一个虚拟 key 以复用清理逻辑
+                    let virtual_key = format!("{}/__dummy__", parent.display());
+                    cleanup_empty_parents(root, &virtual_key);
+                }
+            }
+        }
+    }
+
+    deleted.sort();
+    failed.sort_by(|a, b| a.key.cmp(&b.key));
+
+    Ok(DeleteFolderResult { deleted, failed })
+}
 
 /// 获取链接图（节点 + 去重排序后的有向边）。
 ///
@@ -870,5 +1372,304 @@ mod tests {
         let content = fs::read_to_string(dir.path().join("welcome.md")).expect("read");
         assert!(content.contains("Mine"));
         assert!(!content.contains("Welcome to Wiki Desktop"));
+    }
+
+    #[test]
+    fn rename_note_moves_and_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a/note", "hello body", None).expect("save");
+        let dto = rename_note(dir.path(), "a/note", "b/note", false).expect("rename");
+        assert_eq!(dto.key, "b/note");
+        assert!(!dir.path().join("a/note.md").exists());
+        assert!(dir.path().join("b/note.md").exists());
+        let got = get_note(dir.path(), "b/note").expect("get after rename");
+        assert!(got.body.contains("hello"));
+        assert!(matches!(
+            get_note(dir.path(), "a/note"),
+            Err(IpcError::NoteNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn rename_note_target_conflict_goes_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a", "body a", None).expect("a");
+        save_note(dir.path(), "b", "body b", None).expect("b");
+        let err = rename_note(dir.path(), "a", "b", false).expect_err("应冲突");
+        assert!(matches!(err, IpcError::InvalidArgument(_)));
+        // 原文件仍在
+        assert!(dir.path().join("a.md").exists());
+    }
+
+    #[test]
+    fn rename_note_markdown_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(dir.path(), "old.markdown", "hello");
+        let dto = rename_note(dir.path(), "old", "new", false).expect("rename markdown");
+        assert_eq!(dto.key, "new");
+        assert!(dir.path().join("new.md").exists());
+        assert!(!dir.path().join("old.markdown").exists());
+    }
+
+    #[test]
+    fn rename_note_rewrite_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a", "body", None).expect("a");
+        save_note(dir.path(), "other", "link [[a]] and [[a|alias]]", None).expect("other");
+        rename_note(dir.path(), "a", "b", true).expect("rename with rewrite");
+        let other = get_note(dir.path(), "other").expect("other after");
+        assert!(other.body.contains("[[b]]"), "应重写：{}", other.body);
+        assert!(other.body.contains("[[b|alias]]"), "alias 保留：{}", other.body);
+        // rewrite=false 时不改
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        save_note(dir2.path(), "a", "body", None).expect("a2");
+        save_note(dir2.path(), "other", "link [[a]]", None).expect("other2");
+        rename_note(dir2.path(), "a", "b", false).expect("rename no rewrite");
+        let other2 = get_note(dir2.path(), "other").expect("other2 after");
+        assert!(other2.body.contains("[[a]]"), "不重写时保留：{}", other2.body);
+    }
+
+    #[test]
+    fn rename_note_rewrite_outside_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "folder/note", "body", None).expect("note");
+        save_note(dir.path(), "outside", "ref [[folder/note]]", None).expect("outside");
+        rename_note(dir.path(), "folder/note", "folder/renamed", true).expect("rename");
+        let outside = get_note(dir.path(), "outside").expect("outside after");
+        assert!(
+            outside.body.contains("[[folder/renamed]]"),
+            "文件夹外链接应改写：{}",
+            outside.body
+        );
+    }
+
+    #[test]
+    fn rename_folder_moves_nested_and_cleans_empty_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "docs/a", "body a", None).expect("a");
+        save_note(dir.path(), "docs/b/c", "body c", None).expect("c");
+        save_note(dir.path(), "other", "link [[docs/a]]", None).expect("other");
+        let res = rename_folder(dir.path(), "docs", "notes", true).expect("rename folder");
+        assert_eq!(res.moved.len(), 2);
+        assert!(res.failed.is_empty());
+        assert!(dir.path().join("notes/a.md").exists());
+        assert!(dir.path().join("notes/b/c.md").exists());
+        assert!(!dir.path().join("docs").exists(), "空目录应清理");
+        let other = get_note(dir.path(), "other").expect("other after");
+        assert!(other.body.contains("[[notes/a]]"), "链接应改写：{}", other.body);
+        assert!(!res.link_rewritten.is_empty());
+        assert!(res.rewritten_count >= 1);
+    }
+
+    #[test]
+    fn rename_folder_target_conflict_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "src/a", "body a", None).expect("a");
+        save_note(dir.path(), "dst/a", "body dst", None).expect("dst");
+        let res = rename_folder(dir.path(), "src", "dst", false).expect("rename");
+        assert!(res.moved.is_empty());
+        assert_eq!(res.failed.len(), 1);
+        assert_eq!(res.failed[0].key, "src/a");
+        assert!(dir.path().join("src/a.md").exists());
+    }
+
+    #[test]
+    fn rename_folder_markdown_extension_and_rewrite_toggle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(dir.path(), "old/x.markdown", "hello");
+        write_file(dir.path(), "other.md", "link [[old/x]]");
+        let res = rename_folder(dir.path(), "old", "new", true).expect("rename");
+        assert_eq!(res.moved.len(), 1);
+        assert!(dir.path().join("new/x.md").exists());
+        assert!(get_note(dir.path(), "other").expect("other").body.contains("[[new/x]]"));
+        // rewrite=false
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        write_file(dir2.path(), "old/x.md", "hello");
+        write_file(dir2.path(), "other.md", "link [[old/x]]");
+        let res2 = rename_folder(dir2.path(), "old", "new2", false).expect("rename2");
+        assert_eq!(res2.moved.len(), 1);
+        assert!(res2.link_rewritten.is_empty());
+        assert_eq!(res2.rewritten_count, 0);
+        assert!(
+            get_note(dir2.path(), "other")
+                .expect("other2")
+                .body
+                .contains("[[old/x]]")
+        );
+    }
+
+    #[test]
+    fn rename_folder_not_found_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = rename_folder(dir.path(), "missing", "new", false).expect_err("应不存在");
+        assert!(matches!(err, IpcError::NoteNotFound(_)));
+    }
+
+    #[test]
+    fn rename_folder_self_containment_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a/b", "body", None).expect("a/b");
+        let err = rename_folder(dir.path(), "a", "a/b", false).expect_err("子路径应拒绝");
+        assert!(matches!(err, IpcError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn rename_folder_rewrite_outside_folder_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "docs/a", "body", None).expect("a");
+        save_note(dir.path(), "outside", "ref [[docs/a]] and [[docs/a|alias]]", None)
+            .expect("outside");
+        let res = rename_folder(dir.path(), "docs", "notes", true).expect("rename");
+        assert_eq!(res.moved.len(), 1);
+        let outside = get_note(dir.path(), "outside").expect("outside after");
+        assert!(outside.body.contains("[[notes/a]]"), "应改写：{}", outside.body);
+    }
+
+    #[test]
+    fn delete_folder_removes_and_cleans_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "docs/a", "body a", None).expect("a");
+        save_note(dir.path(), "docs/b/c", "body c", None).expect("c");
+        save_note(dir.path(), "other", "keep", None).expect("other");
+        let res = delete_folder(dir.path(), "docs").expect("delete");
+        assert_eq!(res.deleted.len(), 2);
+        assert!(res.failed.is_empty());
+        assert!(res.deleted.contains(&"docs/a".to_owned()));
+        assert!(res.deleted.contains(&"docs/b/c".to_owned()));
+        assert!(!dir.path().join("docs").exists(), "空目录链应清理");
+        assert!(dir.path().join("other.md").exists());
+    }
+
+    #[test]
+    fn delete_folder_wrong_prefix_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a/b", "body", None).expect("a/b");
+        let res = delete_folder(dir.path(), "missing").expect("delete missing");
+        assert!(res.deleted.is_empty());
+        assert!(res.failed.is_empty());
+    }
+
+    // ---- 同步状态与全量拉取 ----
+
+    #[test]
+    fn read_sync_state_missing_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_sync_state(dir.path()).expect("read").is_none());
+        // root 不存在也返回 None
+        let missing = dir.path().join("no-such-root-xyz");
+        assert!(read_sync_state(&missing).expect("missing root").is_none());
+    }
+
+    #[test]
+    fn write_read_sync_state_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = r#"{"version":1,"entries":{}}"#;
+        write_sync_state(dir.path(), json).expect("write");
+        let back = read_sync_state(dir.path()).expect("read").expect("some");
+        assert_eq!(back, json);
+        // 覆盖写入
+        let json2 = r#"{"version":1,"entries":{"a":{"ref":"a"}}}"#;
+        write_sync_state(dir.path(), json2).expect("write2");
+        let back2 = read_sync_state(dir.path()).expect("read2").expect("some2");
+        assert_eq!(back2, json2);
+    }
+
+    #[test]
+    fn sync_state_not_counted_as_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a", "body a", None).expect("a");
+        write_sync_state(dir.path(), r#"{"v":1}"#).expect("write sync");
+        // vault 扫描不应把 .wiki-sync.json 当笔记
+        let info = get_vault_info(dir.path()).expect("info");
+        assert_eq!(info.note_count, 1);
+        let list = list_notes(dir.path()).expect("list");
+        assert_eq!(list.len(), 1);
+        let scanner = VaultScanner::new(dir.path());
+        assert_eq!(scanner.scan().len(), 1);
+        // 原子写不应残留 tmp 文件
+        let has_tmp = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".wiki-sync.json.tmp-"));
+        assert!(!has_tmp, "不应残留 tmp 文件");
+    }
+
+    #[test]
+    fn write_sync_state_missing_root_errors() {
+        let err = write_sync_state(Path::new("/non/existent/wiki-sync-root-xyz"), "{}")
+            .expect_err("应失败");
+        assert!(matches!(err, IpcError::VaultNotFound(_)));
+    }
+
+    #[test]
+    fn write_sync_state_oversize_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 构造超过 16 MiB 的 json（16*1024*1024 + 1 字节）
+        let big = "a".repeat(16 * 1024 * 1024 + 1);
+        let err = write_sync_state(dir.path(), &big).expect_err("应超限");
+        assert!(matches!(err, IpcError::InvalidArgument(_)));
+        // 未写入目标文件
+        assert!(!dir.path().join(".wiki-sync.json").exists());
+        // 也不残留 tmp
+        let has_tmp = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".wiki-sync.json.tmp-"));
+        assert!(!has_tmp);
+    }
+
+    #[test]
+    fn list_notes_full_returns_body_and_ref_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a", "hello body", None).expect("a");
+        save_note(dir.path(), "b", "plain", None).expect("b");
+        let full = list_notes_full(dir.path()).expect("full");
+        assert_eq!(full.len(), 2);
+        let a = full.iter().find(|n| n.key == "a").expect("a");
+        assert!(a.body.contains("hello body"));
+        // 无 ref 时为 None
+        assert!(a.ref_id.is_none());
+        // list 摘要同样含 ref_id 字段（None）
+        let list = list_notes(dir.path()).expect("list");
+        let la = list.iter().find(|n| n.key == "a").expect("la");
+        assert!(la.ref_id.is_none());
+    }
+
+    #[test]
+    fn list_notes_full_frontmatter_ref_mapped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            dir.path(),
+            "with-ref.md",
+            "---\nref: deploy/prod-checklist\ntitle: T\n---\nbody text",
+        );
+        write_file(dir.path(), "plain.md", "no frontmatter body");
+        let full = list_notes_full(dir.path()).expect("full");
+        let hit = full.iter().find(|n| n.key == "with-ref").expect("with-ref");
+        assert_eq!(hit.ref_id.as_deref(), Some("deploy/prod-checklist"));
+        assert!(hit.body.contains("body text"));
+        // 通过 get_note / list_notes 同样映射
+        let dto = get_note(dir.path(), "with-ref").expect("get");
+        assert_eq!(dto.ref_id.as_deref(), Some("deploy/prod-checklist"));
+        let list = list_notes(dir.path()).expect("list");
+        let sum = list.iter().find(|n| n.key == "with-ref").expect("sum");
+        assert_eq!(sum.ref_id.as_deref(), Some("deploy/prod-checklist"));
+        let plain = full.iter().find(|n| n.key == "plain").expect("plain");
+        assert!(plain.ref_id.is_none());
+    }
+
+    #[test]
+    fn dto_ref_id_serde_default_compat() {
+        // 旧 JSON 不含 ref_id 字段时应反序列化为 None（保持兼容）
+        let json = r#"{"key":"a","title":"T","tags":[],"modified":0}"#;
+        let sum: NoteSummary = serde_json::from_str(json).expect("summary");
+        assert!(sum.ref_id.is_none());
+        let json2 = r#"{"key":"a","title":"T","aliases":[],"tags":[],"body":"b","modified":0}"#;
+        let dto: NoteDto = serde_json::from_str(json2).expect("dto");
+        assert!(dto.ref_id.is_none());
+        // 含 ref_id 时正常解析
+        let json3 = r#"{"key":"a","title":"T","tags":[],"modified":0,"ref_id":"a/b"}"#;
+        let sum3: NoteSummary = serde_json::from_str(json3).expect("sum3");
+        assert_eq!(sum3.ref_id.as_deref(), Some("a/b"));
     }
 }

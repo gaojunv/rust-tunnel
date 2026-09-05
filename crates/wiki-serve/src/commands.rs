@@ -22,7 +22,9 @@ Tauri 的 `tauri::State<'_, T>` 只在 `tauri` feature 开启时存在，且
 无处可测；当前形态保留了这一层的可测性。
 */
 
-use crate::dto::{GraphDto, NoteDto, NoteSummary, SearchHitDto, VaultInfo};
+use crate::dto::{
+    DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
+};
 use crate::error::IpcResult;
 use crate::state::AppState;
 use crate::vault_ops;
@@ -113,6 +115,82 @@ pub fn get_graph(state: &AppState) -> IpcResult<GraphDto> {
     vault_ops::get_graph(&root)
 }
 
+/// 重命名单篇笔记。
+///
+/// # Errors
+///
+/// 路径非法、源不存在或目标已存在时返回 [`crate::error::IpcError`]。
+#[allow(clippy::needless_pass_by_value)]
+pub fn rename_note(
+    state: &AppState,
+    key: String,
+    new_key: String,
+    rewrite_links: bool,
+) -> IpcResult<NoteDto> {
+    let root = state.root();
+    vault_ops::rename_note(&root, &key, &new_key, rewrite_links)
+}
+
+/// 重命名文件夹（批量移动）.
+///
+/// # Errors
+///
+/// 路径非法、未命中或新前缀为旧前缀子路径时返回 [`crate::error::IpcError`]。
+#[allow(clippy::needless_pass_by_value)]
+pub fn rename_folder(
+    state: &AppState,
+    old_prefix: String,
+    new_prefix: String,
+    rewrite_links: bool,
+) -> IpcResult<RenameFolderResult> {
+    let root = state.root();
+    vault_ops::rename_folder(&root, &old_prefix, &new_prefix, rewrite_links)
+}
+
+/// 删除文件夹下的全部笔记.
+///
+/// # Errors
+///
+/// 路径非法时返回 [`crate::error::IpcError`]。
+#[allow(clippy::needless_pass_by_value)]
+pub fn delete_folder(state: &AppState, prefix: String) -> IpcResult<DeleteFolderResult> {
+    let root = state.root();
+    vault_ops::delete_folder(&root, &prefix)
+}
+
+/// 读取同步状态（`<root>/.wiki-sync.json`，不存在返回 `None`）。
+///
+/// # Errors
+///
+/// 透传 [`vault_ops::read_sync_state`] 的错误。
+pub fn read_sync_state(state: &AppState) -> IpcResult<Option<String>> {
+    let root = state.root();
+    vault_ops::read_sync_state(&root)
+}
+
+/// 原子写入同步状态（`<root>/.wiki-sync.json`）。
+///
+/// `json` 按 Tauri IPC 约定以拥有字符串传入。
+///
+/// # Errors
+///
+/// 透传 [`vault_ops::write_sync_state`] 的错误。
+#[allow(clippy::needless_pass_by_value)]
+pub fn write_sync_state(state: &AppState, json: String) -> IpcResult<()> {
+    let root = state.root();
+    vault_ops::write_sync_state(&root, &json)
+}
+
+/// 一次拿全量笔记（含 `body`/`ref_id`），避免 N+1 次 `get_note`。
+///
+/// # Errors
+///
+/// 透传 [`vault_ops::list_notes_full`] 的错误。
+pub fn list_notes_full(state: &AppState) -> IpcResult<Vec<NoteDto>> {
+    let root = state.root();
+    vault_ops::list_notes_full(&root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +218,16 @@ mod tests {
         let graph = get_graph(&state).expect("graph");
         assert_eq!(graph.nodes.len(), 1);
 
+        // 新增同步命令同样走透传路径（照抄现有范式）
+        let full = list_notes_full(&state).expect("full");
+        assert_eq!(full.len(), 1);
+        assert!(full[0].body.contains("body"));
+
+        assert!(read_sync_state(&state).expect("read none").is_none());
+        write_sync_state(&state, r#"{"v":1}"#.to_owned()).expect("write sync");
+        let back = read_sync_state(&state).expect("read back").expect("some");
+        assert_eq!(back, r#"{"v":1}"#);
+
         delete_note(&state, "hello".to_owned()).expect("delete");
         let list2 = list_notes(&state).expect("list2");
         assert!(list2.is_empty());
@@ -157,5 +245,40 @@ mod tests {
         assert!(res.is_err());
         let res2 = save_note(&state, "../../bad".to_owned(), "x".to_owned(), None);
         assert!(res2.is_err());
+    }
+
+    #[test]
+    fn commands_sync_state_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(dir.path().to_path_buf());
+        assert!(read_sync_state(&state).expect("none").is_none());
+        write_sync_state(&state, r#"{"a":1}"#.to_owned()).expect("write");
+        let got = read_sync_state(&state).expect("read").expect("some");
+        assert_eq!(got, r#"{"a":1}"#);
+        // 覆盖写入
+        write_sync_state(&state, r#"{"b":2}"#.to_owned()).expect("write2");
+        let got2 = read_sync_state(&state).expect("read2").expect("some2");
+        assert_eq!(got2, r#"{"b":2}"#);
+    }
+
+    #[test]
+    fn commands_list_notes_full_has_body_and_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(dir.path().to_path_buf());
+        save_note(
+            &state,
+            "a".to_owned(),
+            "---\nref: a/b\ntitle: T\n---\nhello body".to_owned(),
+            None,
+        )
+        .expect("save");
+        save_note(&state, "b".to_owned(), "plain body".to_owned(), None).expect("save b");
+        let full = list_notes_full(&state).expect("full");
+        assert_eq!(full.len(), 2);
+        let a = full.iter().find(|n| n.key == "a").expect("a");
+        assert_eq!(a.ref_id.as_deref(), Some("a/b"));
+        assert!(a.body.contains("hello body"));
+        let b = full.iter().find(|n| n.key == "b").expect("b");
+        assert!(b.ref_id.is_none());
     }
 }

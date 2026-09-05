@@ -110,15 +110,10 @@ pub fn parse_wikilink(text: &str) -> Option<WikiLink> {
     }
 }
 
-/// 从正文中提取全部 wiki 链接。
-///
-/// 手动扫描 `[[` / `![[` 并以最短闭合 `]]` 配对；落在代码块
-/// （`CodeBlock` / `Code`）内的位置通过 comrak `sourcepos` 换算字节
-/// 区间后跳过。
-#[must_use]
-pub fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
+/// 内部扫描器：返回带字节区间的 wiki 链接（`start` 含 `!` 前缀，`end` 为开区间）。
+fn scan_wikilinks_with_spans(content: &str) -> Vec<(WikiLink, usize, usize)> {
     let code_ranges = collect_code_ranges(content);
-    let mut links = Vec::new();
+    let mut out = Vec::new();
     let mut pos = 0usize;
     let len = content.len();
     while pos < len {
@@ -150,9 +145,8 @@ pub fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
         let candidate_end = close_pos + 2;
         // 若 opening 与首个 closing 之间还包含另一个 `[[`，视为嵌套，跳过外层以捕获最短闭合的内层
         let inner_slice = &content[abs_pos + 2..close_pos];
-        if inner_slice.find("[[").is_some() {
+        if inner_slice.contains("[[") {
             pos = abs_pos + 2;
-            // 定位到内层 `[[` 的绝对位置
             if let Some(inner_rel) = content[abs_pos + 2..close_pos].find("[[") {
                 pos = abs_pos + 2 + inner_rel;
             }
@@ -164,11 +158,109 @@ pub fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
         }
         let candidate = &content[candidate_start..candidate_end];
         if let Some(link) = parse_wikilink(candidate) {
-            links.push(link);
+            out.push((link, candidate_start, candidate_end));
         }
         pos = candidate_end;
     }
-    links
+    out
+}
+
+/// 从正文中提取全部 wiki 链接。
+///
+/// 手动扫描 `[[` / `![[` 并以最短闭合 `]]` 配对；落在代码块
+/// （`CodeBlock` / `Code`）内的位置通过 comrak `sourcepos` 换算字节
+/// 区间后跳过。内部复用带区间的扫描器，对外丢弃区间以保持签名不变。
+#[must_use]
+pub fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
+    scan_wikilinks_with_spans(content)
+        .into_iter()
+        .map(|(link, _, _)| link)
+        .collect()
+}
+
+/// 按 `rename` 映射重写 `content` 中的 wikilink `target`，返回 `(新内容, 替换次数)`。
+///
+/// - 只替换链接的 `target` 部分，保留 `alias`（`|alias`）、`anchor`（`#anchor`）、
+///   `embed`（`![[ ]]`）形态；跳过代码块/行内码（复用现有 `code-range` 机制）。
+/// - 匹配语义与 [`resolve_link`] 对齐：`rename` 的 key 统一小写比较；先全路径
+///   精确匹配，再按 `basename`（最后一段）匹配，但仅当该 `basename` 在 `rename`
+///   key 集合中唯一时才改（歧义不改）。
+/// - 从后往前按 `span` 替换，避免偏移失效。
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn rewrite_wikilinks(
+    content: &str,
+    rename: &std::collections::HashMap<String, String>,
+) -> (String, usize) {
+    if rename.is_empty() {
+        return (content.to_owned(), 0);
+    }
+    // 统一小写：保持值的原始大小写
+    let mut lower_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(rename.len());
+    for (k, v) in rename {
+        lower_map.insert(k.to_lowercase(), v.clone());
+    }
+    // 统计 basename 出现次数，用于歧义判断
+    let mut basename_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for k in lower_map.keys() {
+        let base = k.rsplit('/').next().unwrap_or(k.as_str()).to_owned();
+        *basename_counts.entry(base).or_insert(0) += 1;
+    }
+    let mut basename_unique: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (k, v) in &lower_map {
+        let base = k.rsplit('/').next().unwrap_or(k.as_str()).to_owned();
+        if basename_counts.get(&base).copied().unwrap_or(0) == 1 {
+            basename_unique.insert(base, v.clone());
+        }
+    }
+
+    let spans = scan_wikilinks_with_spans(content);
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    for (link, start, end) in spans {
+        let target_lower = link.target.to_lowercase();
+        let new_target_opt = if let Some(v) = lower_map.get(&target_lower) {
+            Some(v.clone())
+        } else {
+            let base = target_lower
+                .rsplit('/')
+                .next()
+                .unwrap_or(target_lower.as_str())
+                .to_owned();
+            basename_unique.get(&base).cloned()
+        };
+        let Some(new_target) = new_target_opt else {
+            continue;
+        };
+        if new_target == link.target {
+            continue;
+        }
+        let prefix = if link.embed { "![[" } else { "[[" };
+        let alias_part = link
+            .alias
+            .as_ref()
+            .map(|a| format!("|{a}"))
+            .unwrap_or_default();
+        let anchor_part = link
+            .anchor
+            .as_ref()
+            .map(|a| format!("#{a}"))
+            .unwrap_or_default();
+        let new_link = format!("{prefix}{new_target}{alias_part}{anchor_part}]]");
+        replacements.push((start, end, new_link));
+    }
+    if replacements.is_empty() {
+        return (content.to_owned(), 0);
+    }
+    let mut result = content.to_owned();
+    // 从后往前替换，避免偏移失效
+    for (start, end, new_text) in replacements.iter().rev() {
+        result.replace_range(*start..*end, new_text);
+    }
+    let count = replacements.len();
+    (result, count)
 }
 
 /// 将 `WikiLink` 解析到笔记集合。
@@ -519,5 +611,87 @@ mod tests {
             resolve_link(&link, &notes),
             ResolvedLink::Broken("missing".to_owned())
         );
+    }
+
+    #[test]
+    fn rewrite_preserves_alias_anchor_embed() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_owned(), "b".to_owned());
+        let (out, n) = rewrite_wikilinks("[[a|alias#sec]] and ![[a]]", &map);
+        assert_eq!(n, 2);
+        assert!(out.contains("[[b|alias#sec]]"), "alias/anchor 保留：{out}");
+        assert!(out.contains("![[b]]"), "embed 保留：{out}");
+    }
+
+    #[test]
+    fn rewrite_skips_code_span_and_fence() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_owned(), "b".to_owned());
+        let content = "```\n[[a]]\n```\n[[a]] and `[[a]]` then [[a]]";
+        let (out, n) = rewrite_wikilinks(content, &map);
+        assert_eq!(n, 2);
+        assert!(out.contains("```\n[[a]]\n```"), "fence 内不改");
+        assert!(out.contains("`[[a]]`"), "行内码不改");
+        // 非代码区已改
+        let outside_count = out.matches("[[b]]").count();
+        assert_eq!(outside_count, 2, "非代码区应改 2 处：{out}");
+    }
+
+    #[test]
+    fn rewrite_case_insensitive() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("A/B".to_owned(), "x/y".to_owned());
+        let (out, n) = rewrite_wikilinks("[[a/b]] and [[A/b]]", &map);
+        assert_eq!(n, 2);
+        assert_eq!(out.matches("[[x/y]]").count(), 2);
+    }
+
+    #[test]
+    fn rewrite_basename_ambiguous_not_rewritten() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a/note".to_owned(), "a/new-a".to_owned());
+        map.insert("b/note".to_owned(), "b/new-b".to_owned());
+        let (out, n) = rewrite_wikilinks("[[note]]", &map);
+        assert_eq!(n, 0, "basename 歧义不改");
+        assert_eq!(out, "[[note]]");
+    }
+
+    #[test]
+    fn rewrite_basename_unique_rewritten() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a/note".to_owned(), "a/new-a".to_owned());
+        let (out, n) = rewrite_wikilinks("[[note]]", &map);
+        assert_eq!(n, 1);
+        assert!(out.contains("[[a/new-a]]"));
+    }
+
+    #[test]
+    fn rewrite_no_match_unchanged() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("x".to_owned(), "y".to_owned());
+        let content = "[[a]] and [[b]]";
+        let (out, n) = rewrite_wikilinks(content, &map);
+        assert_eq!(n, 0);
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn rewrite_nested_and_adjacent() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_owned(), "x".to_owned());
+        map.insert("b".to_owned(), "y".to_owned());
+        let (out, n) = rewrite_wikilinks("[[a]][[b]] and [[a]] [[b]]", &map);
+        assert_eq!(n, 4);
+        assert!(out.contains("[[x]][[y]]"));
+        assert!(out.contains("[[x]] [[y]]"));
+    }
+
+    #[test]
+    fn rewrite_empty_map_noop() {
+        let map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let content = "[[a]]";
+        let (out, n) = rewrite_wikilinks(content, &map);
+        assert_eq!(n, 0);
+        assert_eq!(out, content);
     }
 }

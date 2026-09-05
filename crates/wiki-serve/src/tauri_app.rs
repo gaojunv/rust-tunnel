@@ -10,7 +10,9 @@
 //! 并装配 `generate_handler!` / `generate_context!`。
 
 use crate::commands;
-use crate::dto::{GraphDto, NoteDto, NoteSummary, SearchHitDto, VaultInfo};
+use crate::dto::{
+    DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
+};
 use crate::error::IpcResult;
 use crate::state::AppState;
 
@@ -100,6 +102,85 @@ pub fn get_graph(state: tauri::State<'_, AppState>) -> IpcResult<GraphDto> {
     commands::get_graph(&state)
 }
 
+/// 重命名单篇笔记.
+///
+/// # Errors
+///
+/// 透传 [`commands::rename_note`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn rename_note(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    new_key: String,
+    rewrite_links: bool,
+) -> IpcResult<NoteDto> {
+    commands::rename_note(&state, key, new_key, rewrite_links)
+}
+
+/// 重命名文件夹.
+///
+/// # Errors
+///
+/// 透传 [`commands::rename_folder`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn rename_folder(
+    state: tauri::State<'_, AppState>,
+    old_prefix: String,
+    new_prefix: String,
+    rewrite_links: bool,
+) -> IpcResult<RenameFolderResult> {
+    commands::rename_folder(&state, old_prefix, new_prefix, rewrite_links)
+}
+
+/// 删除文件夹.
+///
+/// # Errors
+///
+/// 透传 [`commands::delete_folder`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn delete_folder(
+    state: tauri::State<'_, AppState>,
+    prefix: String,
+) -> IpcResult<DeleteFolderResult> {
+    commands::delete_folder(&state, prefix)
+}
+
+/// 读取同步状态（`<root>/.wiki-sync.json`，不存在返回 `null`）。
+///
+/// # Errors
+///
+/// 透传 [`commands::read_sync_state`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn read_sync_state(state: tauri::State<'_, AppState>) -> IpcResult<Option<String>> {
+    commands::read_sync_state(&state)
+}
+
+/// 原子写入同步状态（`<root>/.wiki-sync.json`）。
+///
+/// # Errors
+///
+/// 透传 [`commands::write_sync_state`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn write_sync_state(state: tauri::State<'_, AppState>, json: String) -> IpcResult<()> {
+    commands::write_sync_state(&state, json)
+}
+
+/// 一次拿全量笔记（含 `body`/`ref_id`）。
+///
+/// # Errors
+///
+/// 透传 [`commands::list_notes_full`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn list_notes_full(state: tauri::State<'_, AppState>) -> IpcResult<Vec<NoteDto>> {
+    commands::list_notes_full(&state)
+}
+
 /// 启动 Tauri 应用.
 ///
 /// 首启时确保 vault 根目录存在且非空（空 vault 写入 `welcome.md`），随后
@@ -123,7 +204,13 @@ pub fn run() -> tauri::Result<()> {
             save_note,
             delete_note,
             search_notes,
-            get_graph
+            get_graph,
+            rename_note,
+            rename_folder,
+            delete_folder,
+            read_sync_state,
+            write_sync_state,
+            list_notes_full
         ])
         .run(tauri::generate_context!())
 }
