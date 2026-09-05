@@ -224,13 +224,25 @@ pub fn create_insecure_client_config() -> TunnelResult<Arc<ClientConfig>> {
 ///
 /// # Errors
 /// 当加载系统根证书失败或将证书加入 `RootCertStore` 失败时返回 `Err`。
+///
+/// # Panics
+/// 内部断言 `cert_result` 非空错误列表的 `unwrap` 理论上不可达（已由 `!is_empty` 守卫）。
 pub fn create_secure_client_config() -> TunnelResult<Arc<ClientConfig>> {
     let mut root_store = RootCertStore::empty();
 
     // Add system root certificates
-    for cert in rustls_native_certs::load_native_certs()
-        .map_err(|e| TunnelError::with_source("Failed to load system certificates", e))?
-    {
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        let mut iter = cert_result.errors.into_iter();
+        // 已检查 `!is_empty`，必有首项。
+        #[allow(clippy::unwrap_used, reason = "已由 !is_empty 守卫")]
+        let first_err = iter.next().unwrap();
+        return Err(TunnelError::with_source(
+            "Failed to load system certificates",
+            first_err,
+        ));
+    }
+    for cert in cert_result.certs {
         root_store
             .add(cert)
             .map_err(|e| TunnelError::with_source("Failed to add root certificate", e))?;

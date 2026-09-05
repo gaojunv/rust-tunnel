@@ -48,30 +48,30 @@ tower-http = { version = "0.5", features = ["cors", "fs", "compression-gzip", "c
 async-stream = "0.3"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1", "http2", "server", "server-auto"] }
-hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "rustls-native-certs"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "rustls-native-certs"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # 嵌入前端资源（服务端 `embed-frontend` feature）
 rust-embed = { version = "8.0", features = ["axum"] }
 mime_guess = "2.0"
-jsonwebtoken = "9.0"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 qdrant-edge = { version = "=0.7.2" }
-sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 gethostname = "0.4"
 # PTY for the agent terminal loopback service (wezterm-maintained, Unix/ConPTY)
 portable-pty = "0.9"
 toml = "0.8"
 figment = { version = "0.10", features = ["env", "toml"] }
 arc-swap = "1.7"
-rustls = "0.22"
-rustls-pemfile = "2.0"
-tokio-rustls = "0.25"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2.2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = "0.14"
-webpki-roots = "0.26"
-rustls-native-certs = "0.7"
+webpki-roots = "1.0"
+rustls-native-certs = "0.8"
 time = "0.3"
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
 md-5 = "0.10"
@@ -87,14 +87,14 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 aes-gcm = "0.10"
-hickory-proto = "0.24"
+hickory-proto = "0.26"
 async-trait = "0.1"
 futures-util = "0.3"
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
 x509-parser = "0.16"
 base64 = "0.22"
 urlencoding = "2.1"
-trust-dns-resolver = "0.23"
+hickory-resolver = "0.26"
 # ACP 协议 crate：unstable_elicitation 提供 AskUserQuestion 表单（elicitation/create）
 # 的类型与路由。只开这一个 unstable feature，不开全量 unstable（避免 mcp/auth 等
 # 无关不稳定类型）。旧版 claude-code-acp 不识别该 capability，行为与现状一致。

@@ -85,48 +85,44 @@ async fn handle_dns_query(registry: &DnsRegistry, data: &[u8]) -> Vec<u8> {
         }
     };
 
-    let req_id = request.id();
+    let req_id = request.metadata.id;
 
     // Only handle standard queries
-    if request.message_type() != MessageType::Query || request.op_code() != OpCode::Query {
+    if request.metadata.message_type != MessageType::Query
+        || request.metadata.op_code != OpCode::Query
+    {
         return build_error_response(req_id, ResponseCode::NotImp);
     }
 
-    let mut response = Message::new();
-    response.set_id(req_id);
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(OpCode::Query);
-    response.set_authoritative(true);
-    response.set_recursion_available(false);
+    let mut response = Message::new(req_id, MessageType::Response, OpCode::Query);
+    response.metadata.authoritative = true;
+    response.metadata.recursion_available = false;
 
-    if request.query_count() == 0 {
-        response.set_response_code(ResponseCode::FormErr);
+    if request.queries.is_empty() {
+        response.metadata.response_code = ResponseCode::FormErr;
         return encode_message(&response);
     }
 
     let mut response_code = ResponseCode::NoError;
 
-    for question in request.queries() {
-        let qname = question.name().to_string();
+    for question in &request.queries {
+        let qname = question.name.to_string();
         let qname = qname.trim_end_matches('.').to_lowercase();
 
-        debug!("DNS query: {} type={:?}", qname, question.query_type());
+        debug!("DNS query: {} type={:?}", qname, question.query_type);
 
-        match question.query_type() {
+        match question.query_type {
             RecordType::A => {
                 let ips = registry.query_a(&qname).await;
                 if ips.is_empty() {
                     response_code = ResponseCode::NXDomain;
                 } else {
-                    let mut name = question.name().clone();
+                    let mut name = question.name.clone();
                     name.set_fqdn(false);
                     for ip in &ips {
                         if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
-                            let mut record = Record::new();
-                            record.set_name(name.clone());
-                            record.set_record_type(RecordType::A);
-                            record.set_ttl(300);
-                            record.set_data(Some(RData::A(hickory_proto::rr::rdata::A(addr))));
+                            let record =
+                                Record::from_rdata(name.clone(), 300, RData::A(hickory_proto::rr::rdata::A(addr)));
                             response.add_answer(record);
                         }
                     }
@@ -139,16 +135,16 @@ async fn handle_dns_query(registry: &DnsRegistry, data: &[u8]) -> Vec<u8> {
                 } else {
                     for (target, port) in &srvs {
                         if let Ok(target_name) = Name::from_ascii(format!("{target}.")) {
-                            let mut record = Record::new();
-                            record.set_name(question.name().clone());
-                            record.set_record_type(RecordType::SRV);
-                            record.set_ttl(300);
-                            record.set_data(Some(RData::SRV(hickory_proto::rr::rdata::SRV::new(
-                                0,
-                                0,
-                                *port,
-                                target_name,
-                            ))));
+                            let record = Record::from_rdata(
+                                question.name.clone(),
+                                300,
+                                RData::SRV(hickory_proto::rr::rdata::SRV::new(
+                                    0,
+                                    0,
+                                    *port,
+                                    target_name,
+                                )),
+                            );
                             response.add_answer(record);
                         }
                     }
@@ -160,7 +156,7 @@ async fn handle_dns_query(registry: &DnsRegistry, data: &[u8]) -> Vec<u8> {
         }
     }
 
-    response.set_response_code(response_code);
+    response.metadata.response_code = response_code;
     encode_message(&response)
 }
 
@@ -168,7 +164,7 @@ fn encode_message(msg: &Message) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut encoder = BinEncoder::new(&mut buf);
     if msg.emit(&mut encoder).is_err() {
-        return build_error_response(msg.id(), ResponseCode::ServFail);
+        return build_error_response(msg.metadata.id, ResponseCode::ServFail);
     }
     let bytes = encoder.into_bytes();
     // Truncate to 512 bytes max for UDP DNS
@@ -180,9 +176,7 @@ fn encode_message(msg: &Message) -> Vec<u8> {
 }
 
 fn build_error_response(id: u16, code: ResponseCode) -> Vec<u8> {
-    let mut response = Message::new();
-    response.set_id(id);
-    response.set_message_type(MessageType::Response);
-    response.set_response_code(code);
+    let mut response = Message::new(id, MessageType::Response, OpCode::Query);
+    response.metadata.response_code = code;
     encode_message(&response)
 }
