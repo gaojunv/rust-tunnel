@@ -1078,14 +1078,15 @@ async fn list_dir(path: &Path) -> AgentResult {
     let mut total = 0usize;
     while let Ok(Some(entry)) = entries.next_entry().await {
         total += 1;
-        if lines.len() < LIST_DIR_MAX_ENTRIES {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
-            lines.push(if is_dir { format!("{name}/") } else { name });
-        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
+        lines.push(if is_dir { format!("{name}/") } else { name });
     }
     lines.sort();
     let truncated_entries = total > LIST_DIR_MAX_ENTRIES;
+    if truncated_entries {
+        lines.truncate(LIST_DIR_MAX_ENTRIES);
+    }
     let mut content = lines.join("\n");
     if truncated_entries {
         let _ = write!(content, "\n[truncated, total {total} entries]");
@@ -1710,13 +1711,21 @@ mod tests {
         let AgentResult::FileContent { content } = rd else {
             panic!("expected FileContent, got {rd:?}");
         };
-        // 保留前 N 条 + 末尾截断标记（标记真实总数）
+        // 保留排序后的前 N 条 + 末尾截断标记（标记真实总数）
         assert!(content.contains(&format!(
             "\n[truncated, total {} entries]",
             LIST_DIR_MAX_ENTRIES + 1
         )));
         assert_eq!(content.lines().count(), LIST_DIR_MAX_ENTRIES + 1);
-        assert!(!content.contains("f05000"));
+        let mut listed: Vec<&str> = content
+            .lines()
+            .take(LIST_DIR_MAX_ENTRIES)
+            .collect();
+        let mut sorted = listed.clone();
+        sorted.sort_unstable();
+        assert_eq!(listed, sorted, "listed entries should be deterministically sorted");
+        assert!(listed.contains(&"f00000"));
+        assert!(!content.contains("f05000"), "lexicographically last entry should be truncated");
     }
 
     #[tokio::test]

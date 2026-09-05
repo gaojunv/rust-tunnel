@@ -285,6 +285,14 @@ impl ClientConfig {
             config.agent_pty_port = v;
         }
 
+        if config.name.is_none() {
+            if let Ok(hostname) = gethostname::gethostname().into_string() {
+                if !hostname.is_empty() {
+                    config.name = Some(hostname);
+                }
+            }
+        }
+
         // Validate required fields
         if config.server.is_empty() {
             return Err(
@@ -518,9 +526,13 @@ mod tests {
     }
 
     #[test]
-    fn test_name_defaults_to_none_in_from_cli() {
-        // If name absent, from_cli leaves it None; run_client is where hostname
-        // is resolved. Assert None here.
+    fn test_name_defaults_to_hostname_in_from_cli() {
+        // from_cli now falls back to system hostname when --name is absent
+        // (previously this was done only in run_client). Isolate from NAME env.
+        let saved = std::env::var("NAME").ok();
+        if saved.is_some() {
+            std::env::remove_var("NAME");
+        }
         let cli = ClientCli {
             config_file: None,
             server: Some("host:8080".into()),
@@ -537,8 +549,14 @@ mod tests {
             log: None,
         };
         let cfg = ClientConfig::from_cli(cli).unwrap();
-        assert!(cfg.name.is_none());
+        let expected = gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "unknown".to_string());
+        assert_eq!(cfg.name, Some(expected));
         assert_eq!(cfg.password, "pw");
+        if let Some(v) = saved {
+            std::env::set_var("NAME", v);
+        }
     }
 
     #[test]
