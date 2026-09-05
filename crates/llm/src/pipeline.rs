@@ -324,9 +324,9 @@ pub async fn run_execution(
             // 出账候选与首选不同：改写 ctx 为实际出账方，并记录转移来源
             if failed_over {
                 ctx.provider_id = Some(candidate.provider.id.clone());
-                ctx.provider_name = candidate.provider.name.clone();
+                ctx.provider_name.clone_from(&candidate.provider.name);
                 ctx.model_id = Some(candidate.model_id.clone());
-                ctx.model_name = candidate.model_name.clone();
+                ctx.model_name.clone_from(&candidate.model_name);
                 ctx.failover_from = Some(first_candidate_model_name.to_string());
             }
             let elapsed_ms = started.elapsed().as_millis();

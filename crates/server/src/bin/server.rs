@@ -195,10 +195,10 @@ async fn main() -> TunnelResult<()> {
 
     // Set API TLS config on state (read-only, from config)
     state.tls.enabled = config.api_tls;
-    state.tls.domain = config.api_domain.clone();
+    state.tls.domain.clone_from(&config.api_domain);
     // 控制通道 TLS 证书路径：Trojan 无匹配 ACME 证书时回退复用
-    state.tls.cert_path = config.tls_cert.clone();
-    state.tls.key_path = config.tls_key.clone();
+    state.tls.cert_path.clone_from(&config.tls_cert);
+    state.tls.key_path.clone_from(&config.tls_key);
 
     // 客户端二进制归档目录（只读，供 Web 下载页扫描；空字符串视为未配置）
     if !config.client_dist_dir.trim().is_empty() {

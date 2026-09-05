@@ -116,7 +116,7 @@ pub async fn handle_responses(
     };
 
     // 覆盖为上游真实模型名（同 openai_handler）
-    request.model = actual_model.clone();
+    request.model.clone_from(&actual_model);
 
     // raw_body 保持 None（重建模式）：Responses 请求的 input/instructions/max_output_tokens
     // 等字段对 chat completions 上游是非法字段，透传会被严格校验的上游 400；
