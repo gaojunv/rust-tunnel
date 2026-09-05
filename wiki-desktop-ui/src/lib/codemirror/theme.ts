@@ -21,6 +21,14 @@ export const wikiTheme = EditorView.theme({
   },
   ".cm-scroller": {
     overflow: "auto",
+    // 隐藏原生滚动条，由 OverlayScrollbar 自绘
+    scrollbarWidth: "none",
+    msOverflowStyle: "none" as unknown as string,
+  },
+  ".cm-scroller::-webkit-scrollbar": {
+    width: "0",
+    height: "0",
+    display: "none",
   },
   ".cm-content": {
     padding: "8px 0",

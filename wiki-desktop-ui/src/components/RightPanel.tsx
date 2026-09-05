@@ -3,6 +3,7 @@
  */
 import { useEffect, useState } from "react";
 import { Network, Sparkles, Link2, List } from "lucide-react";
+import { ScrollArea } from "@/components/ui/scroll-area";
 
 type Props = {
   graphPanel: React.ReactNode;
@@ -92,10 +93,18 @@ export function RightPanel({ graphPanel, aiPanel, backlinksPanel, tocPanel }: Pr
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
-        <div className={tab === "graph" ? "h-full overflow-auto" : "hidden"}>{graphPanel}</div>
-        <div className={tab === "ai" ? "h-full overflow-auto" : "hidden"}>{aiPanel}</div>
-        <div className={tab === "backlinks" ? "h-full overflow-auto" : "hidden"}>{backlinksPanel}</div>
-        <div className={tab === "toc" ? "h-full overflow-auto" : "hidden"}>{tocPanel}</div>
+        <div className={tab === "graph" ? "h-full" : "hidden"}>
+          <ScrollArea className="h-full">{graphPanel}</ScrollArea>
+        </div>
+        <div className={tab === "ai" ? "h-full" : "hidden"}>
+          <ScrollArea className="h-full">{aiPanel}</ScrollArea>
+        </div>
+        <div className={tab === "backlinks" ? "h-full" : "hidden"}>
+          <ScrollArea className="h-full">{backlinksPanel}</ScrollArea>
+        </div>
+        <div className={tab === "toc" ? "h-full" : "hidden"}>
+          <ScrollArea className="h-full">{tocPanel}</ScrollArea>
+        </div>
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { DiffView } from "@/components/DiffView";
 import type { SyncState } from "@/lib/sync-engine";
 import type { PendingConflict, Resolution } from "@/lib/conflict-resolve";
@@ -134,7 +135,7 @@ export function ConflictResolveDialog({ conflicts, state, onResolved, onClose }:
           </div>
         ) : (
           <div className="flex min-h-0 flex-1">
-            <div className="w-[200px] shrink-0 border-r overflow-auto">
+            <ScrollArea className="w-[200px] shrink-0 border-r">
               <ul className="p-2 space-y-1">
                 {conflicts.map((c) => {
                   const isSelected = c.key === selectedKey;
@@ -156,10 +157,11 @@ export function ConflictResolveDialog({ conflicts, state, onResolved, onClose }:
                   );
                 })}
               </ul>
-            </div>
+            </ScrollArea>
 
             <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-              <div className="min-h-0 flex-1 overflow-auto p-4 space-y-3">
+              <ScrollArea className="min-h-0 flex-1 p-4">
+                <div className="space-y-3">
                 {loading && <p className="text-sm text-muted-foreground">加载中…</p>}
                 {loadError && <p className="text-sm text-destructive">{loadError}</p>}
                 {loaded && !loading && !loadError && (
@@ -191,7 +193,8 @@ export function ConflictResolveDialog({ conflicts, state, onResolved, onClose }:
                     )}
                   </>
                 )}
-              </div>
+                </div>
+              </ScrollArea>
 
               {loaded && !loading && !loadError && (
                 <div className="flex flex-wrap gap-2 border-t px-4 py-3">

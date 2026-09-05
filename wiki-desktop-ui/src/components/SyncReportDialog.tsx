@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import type { SyncReport } from "@/lib/sync-engine";
 import {
   Upload,
@@ -141,7 +142,7 @@ export function SyncReportDialog({ report, onClose, onNavigate }: Props) {
         </div>
 
         {/* 明细列表 */}
-        <div className="min-h-0 flex-1 overflow-auto px-4 py-2">
+        <ScrollArea className="min-h-0 flex-1 px-4 py-2">
           {report.items.length === 0 ? (
             <p className="py-6 text-center text-sm text-muted-foreground">无需同步，已是最新</p>
           ) : (
@@ -189,7 +190,7 @@ export function SyncReportDialog({ report, onClose, onNavigate }: Props) {
               })}
             </ul>
           )}
-        </div>
+        </ScrollArea>
 
         <div className="flex justify-end border-t px-4 py-3">
           <Button type="button" onClick={onClose}>

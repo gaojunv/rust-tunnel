@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { deleteFolder, listNotes, renameFolder, searchNotes } from "@/api/tauri";
 import type { NoteSummary, SearchHitDto, VaultInfo } from "@/api/types";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
@@ -337,31 +338,33 @@ export function WikiSidebar({
         {isSearching && <p className="mt-2 text-xs text-muted-foreground">搜索：{trimmed}</p>}
         {/* 标签过滤 chip 行（横向滚动，单选） */}
         {tagChips.length > 0 && (
-          <div className="mt-2 flex gap-1.5 overflow-x-auto pb-1 scrollbar-thin">
-            {tagChips.map(({ tag, count }) => {
-              const active = activeTag === tag;
-              return (
-                <button
-                  key={tag}
-                  type="button"
-                  onClick={() => setActiveTag((prev) => (prev === tag ? null : tag))}
-                  className="shrink-0"
-                  aria-pressed={active}
-                  aria-label={`按标签 ${tag} 过滤`}
-                >
-                  <Badge variant={active ? "default" : "secondary"} className="gap-1 px-2 py-0.5 text-xs">
-                    {tag}
-                    <span className="text-[10px] opacity-70">{count}</span>
-                  </Badge>
-                </button>
-              );
-            })}
-          </div>
+          <ScrollArea orientation="horizontal" className="mt-2 h-8">
+            <div className="flex gap-1.5 pb-1">
+              {tagChips.map(({ tag, count }) => {
+                const active = activeTag === tag;
+                return (
+                  <button
+                    key={tag}
+                    type="button"
+                    onClick={() => setActiveTag((prev) => (prev === tag ? null : tag))}
+                    className="shrink-0"
+                    aria-pressed={active}
+                    aria-label={`按标签 ${tag} 过滤`}
+                  >
+                    <Badge variant={active ? "default" : "secondary"} className="gap-1 px-2 py-0.5 text-xs">
+                      {tag}
+                      <span className="text-[10px] opacity-70">{count}</span>
+                    </Badge>
+                  </button>
+                );
+              })}
+            </div>
+          </ScrollArea>
         )}
       </div>
 
       {/* 列表：搜索态保持平铺，非搜索态用文件夹树 */}
-      <div className="flex-1 overflow-y-auto px-2 pb-3">
+      <ScrollArea className="flex-1 px-2 pb-3">
         {isSearching ? (
           hits === null ? (
             <p className="px-2 py-6 text-center text-sm text-muted-foreground">搜索中…</p>
@@ -401,7 +404,7 @@ export function WikiSidebar({
             onDeleteFolder={handleDeleteFolder}
           />
         )}
-      </div>
+      </ScrollArea>
 
       {newOpen && (
         <NoteFormDialog

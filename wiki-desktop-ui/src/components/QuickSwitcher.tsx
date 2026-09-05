@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { listNotes } from "@/api/tauri";
 import type { NoteSummary } from "@/api/types";
 import { fuzzyScore, matchIndices } from "@/lib/fuzzy";
@@ -181,7 +182,7 @@ export function QuickSwitcher({ open, onClose, onSelect }: Props) {
           />
         </div>
 
-        <div className="max-h-[50vh] overflow-y-auto">
+        <ScrollArea className="max-h-[50vh]">
           {notes === null ? (
             <p className="px-4 py-10 text-center text-sm text-muted-foreground">加载中…</p>
           ) : scored.length === 0 ? (
@@ -226,7 +227,7 @@ export function QuickSwitcher({ open, onClose, onSelect }: Props) {
               })}
             </ul>
           )}
-        </div>
+        </ScrollArea>
 
         <div className="border-t border-border/60 px-3 py-1.5 text-xs text-muted-foreground">
           ↑↓ 选择 · Enter 打开 · Esc 关闭

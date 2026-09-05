@@ -4,6 +4,7 @@ import {
   useImperativeHandle,
   useRef,
   useMemo,
+  useState,
   type RefObject,
 } from "react";
 import { EditorState } from "@codemirror/state";
@@ -22,6 +23,7 @@ import { languages } from "@codemirror/language-data";
 import { search } from "@codemirror/search";
 import { Prec } from "@codemirror/state";
 import { cn } from "@/lib/utils";
+import { OverlayScrollbar } from "@/components/ui/scroll-area";
 import { wikiTheme, wikiSyntaxHighlighting } from "@/lib/codemirror/theme";
 import {
   toggleBold,
@@ -100,6 +102,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
 
     const initialDocRef = useRef(initialDoc);
     const placeholderRef = useRef(placeholder);
+    // CM 的 scrollDOM 在 view 创建后才可用，用于挂 OverlayScrollbar
+    const [scrollDOM, setScrollDOM] = useState<HTMLElement | null>(null);
+    const scrollDOMRef = useRef<HTMLElement | null>(null);
+    (scrollDOMRef as React.MutableRefObject<HTMLElement | null>).current = scrollDOM;
 
     // keep latest completions getter stable but allow refresh via closure ref
     const completionSource = useMemo(
@@ -265,15 +271,22 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
 
       const view = new EditorView({ state, parent });
       viewRef.current = view;
+      // 回填 scrollDOM 给 OverlayScrollbar
+      setScrollDOM(view.scrollDOM as HTMLElement);
 
       return () => {
         view.destroy();
         viewRef.current = null;
+        setScrollDOM(null);
       };
       // mount once; initialDoc changes handled by parent remounting via key={noteKey}
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    return <div ref={containerRef} className={cn("min-h-0 flex-1 overflow-hidden", className)} />;
+    return (
+      <div ref={containerRef} className={cn("relative min-h-0 flex-1 overflow-hidden", className)}>
+        <OverlayScrollbar containerRef={scrollDOMRef} />
+      </div>
+    );
   },
 );
