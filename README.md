@@ -1,5 +1,7 @@
 # Rust Tunnel
 
+**简体中文** | [English](README_EN.md)
+
 基于 Rust 的客户端-服务器内网穿透与边缘代理平台，配有 React/TypeScript 管理界面。服务器运行在公网，通过加密控制通道将流量转发到内网客户端；同时内置 Shadowsocks / Trojan 代理、反向代理（含直连与隧道两类后端）、嵌入式 DNS / Mesh 服务发现、ACME 自动证书、SQLite 持久化、实时可观测性，以及 LLM 网关（含 RAG 知识库）与 AI Agent 工作台（ACP 为主路径，隧道内工具执行）。
 
 ## 功能特性
