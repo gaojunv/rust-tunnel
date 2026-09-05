@@ -3,6 +3,7 @@ import { Streamdown, CodeBlockCopyButton, type Components } from "streamdown";
 import { cjk } from "@streamdown/cjk";
 import "streamdown/styles.css";
 import { transformWikilinks, parseWikilinkHref } from "@/lib/wikilink";
+import { AttachmentImg } from "@/components/AttachmentImg";
 
 // —— 代码块：单层带语言头的容器 + 官方复制按钮 ——
 const PreFrame: Components["pre"] = ({ children }) => {
@@ -107,7 +108,7 @@ export function MarkdownPreview({ content, onNavigate }: Props) {
       className={MD_CLASS}
       plugins={{ cjk }}
       linkSafety={{ enabled: false }}
-      components={{ a: anchor, pre: PreFrame, code: PlainCode, table: Table }}
+      components={{ a: anchor, pre: PreFrame, code: PlainCode, table: Table, img: AttachmentImg }}
     >
       {transformed}
     </Streamdown>

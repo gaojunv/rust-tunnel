@@ -7977,6 +7977,7 @@ dependencies = [
 name = "rust-tunnel-wiki-serve"
 version = "0.4.0"
 dependencies = [
+ "chrono",
  "petgraph",
  "rust-tunnel-wiki-core",
  "serde",

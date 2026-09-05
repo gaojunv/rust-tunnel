@@ -19,8 +19,8 @@ use rust_tunnel_wiki_core::graph::LinkGraph;
 use rust_tunnel_wiki_core::vault::{Vault, VaultScanner};
 
 use crate::dto::{
-    DeleteFolderResult, FailedEntry, GraphDto, GraphEdge, GraphNode, MovedEntry, NoteDto,
-    NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
+    AttachmentDto, DeleteFolderResult, FailedEntry, GraphDto, GraphEdge, GraphNode, MovedEntry,
+    NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
 };
 use crate::error::{IpcError, IpcResult};
 
@@ -640,6 +640,169 @@ pub fn list_notes_full(root: &Path) -> IpcResult<Vec<NoteDto>> {
 }
 
 // ---------------------------------------------------------------------------
+// 附件（assets）
+// ---------------------------------------------------------------------------
+
+/// 附件大小上限（10 MiB）。
+const ATTACHMENT_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// 附件根目录名。
+const ASSETS_DIR: &str = "assets";
+
+/// 将 `file_name` 的扩展名规整为小写字母数字、至多 10 字符，无有效扩展名时返回 `"bin"`。
+fn sanitize_extension(file_name: &str) -> String {
+    let raw_ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .trim();
+    // 若 file_name 不含 '.' 则 rsplit 拿到的是整个 file_name，需判断是否真的有 '.'
+    let has_dot = file_name.contains('.');
+    let candidate = if has_dot { raw_ext } else { "" };
+    let mut out = String::new();
+    for ch in candidate.chars() {
+        if out.len() >= 10 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    if out.is_empty() {
+        "bin".to_owned()
+    } else {
+        out
+    }
+}
+
+/// 生成 UTC 时间戳 `yyyymmdd-hhmmss`。
+fn utc_timestamp() -> String {
+    // 优先用 `chrono`（workspace 已有），无额外依赖时回退到 SystemTime 的 unix 秒占位。
+    // 此 crate 已通过 Cargo.toml 引入 `chrono`，故直接使用。
+    chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+/// 计算 `(note_key, file_name, data)` 的 8 字符小写 hex 哈希（`DefaultHasher`）。
+fn hash8(note_key: &str, file_name: &str, data: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    note_key.hash(&mut h);
+    file_name.hash(&mut h);
+    data.hash(&mut h);
+    let v = h.finish();
+    // 取低 32 位，格式化为 8 位小写 hex
+    format!("{v:016x}")[8..16].to_owned()
+}
+
+/// 保存附件到 `<root>/assets/<sanitized-note-key>/<ts>-<hash8>.<ext>`。
+///
+/// `note_key` 复用现有 `validate_key_or_prefix` 校验（空 / `..` / 绝对路径等均拒绝），
+/// 规整后将 `/` 替换为 `-` 作为子目录名。`file_name` 的扩展名经 [`sanitize_extension`]
+/// 规整。`data` 超过 10 MiB 时拒绝。写入采用 tmp+rename 原子模式。
+///
+/// 返回的 `rel_path` 为 vault 根相对路径且不含前导 `/`，如
+/// `assets/docs-a/20260905-153012-ab12cd34.png`。
+///
+/// # Errors
+///
+/// - `note_key` 非法时返回 [`IpcError::PathTraversal`]
+/// - `data` 超限时返回 [`IpcError::InvalidArgument`]
+/// - `root` 不存在时返回 [`IpcError::VaultNotFound`]
+/// - IO 失败时返回 [`IpcError::Io`]
+pub fn save_attachment(
+    root: &Path,
+    note_key: &str,
+    file_name: &str,
+    data: &[u8],
+) -> IpcResult<AttachmentDto> {
+    if data.len() > ATTACHMENT_MAX_BYTES {
+        return Err(IpcError::InvalidArgument(format!(
+            "附件过大：{} 字节，上限 {ATTACHMENT_MAX_BYTES} 字节",
+            data.len()
+        )));
+    }
+    if !root.exists() {
+        return Err(IpcError::VaultNotFound(root.display().to_string()));
+    }
+    let normalized_key = validate_key_or_prefix(note_key)?;
+    let sanitized_key = normalized_key.replace('/', "-");
+    let ext = sanitize_extension(file_name);
+    let ts = utc_timestamp();
+    let h8 = hash8(&normalized_key, file_name, data);
+    let file = format!("{ts}-{h8}.{ext}");
+    let dir = root.join(ASSETS_DIR).join(&sanitized_key);
+    fs::create_dir_all(&dir).map_err(IpcError::Io)?;
+    let target = dir.join(&file);
+    let rel_path = format!("{ASSETS_DIR}/{sanitized_key}/{file}");
+    // 原子写入：tmp+rename（与 write_sync_state 同风格）
+    let tmp = dir.join(format!("{file}.tmp-{}", std::process::id()));
+    fs::write(&tmp, data).map_err(IpcError::Io)?;
+    if let Err(err) = fs::rename(&tmp, &target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(IpcError::Io(err));
+    }
+    Ok(AttachmentDto { rel_path })
+}
+
+/// 读取附件 `<root>/<rel_path>`，校验路径不逃逸 `<root>/assets/`。
+///
+/// 拒绝绝对路径与任何 `..` 段；词法检查 `rel_path` 必须位于 `assets/` 之下；
+/// 若文件存在则进一步 `canonicalize` 校验（防御 symlink 逃逸）。
+///
+/// # Errors
+///
+/// - 路径非法 / 逃逸时返回 [`IpcError::PathTraversal`]
+/// - 文件不存在时返回 [`IpcError::InvalidArgument`]
+/// - IO 失败时返回 [`IpcError::Io`]
+pub fn read_attachment(root: &Path, rel_path: &str) -> IpcResult<Vec<u8>> {
+    if rel_path.is_empty() || rel_path.trim().is_empty() {
+        return Err(IpcError::PathTraversal("空 rel_path".to_owned()));
+    }
+    if Path::new(rel_path).is_absolute() {
+        return Err(IpcError::PathTraversal(format!("绝对路径：{rel_path}")));
+    }
+    let normalized = rel_path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return Err(IpcError::PathTraversal(format!("绝对路径：{rel_path}")));
+    }
+    if normalized.contains(':') {
+        return Err(IpcError::PathTraversal(format!("非法路径：{rel_path}")));
+    }
+    if normalized.split('/').any(|seg| seg == "..") {
+        return Err(IpcError::PathTraversal(format!("路径逃逸：{rel_path}")));
+    }
+    if normalized.split('/').any(str::is_empty) {
+        return Err(IpcError::PathTraversal(format!("非法路径：{rel_path}")));
+    }
+    // 必须位于 assets/ 之下
+    if normalized != ASSETS_DIR && !normalized.starts_with(&format!("{ASSETS_DIR}/")) {
+        return Err(IpcError::PathTraversal(format!(
+            "附件路径必须位于 {ASSETS_DIR}/ 之下：{rel_path}"
+        )));
+    }
+    let candidate = root.join(&normalized);
+    // 词法前缀检查
+    let assets_root = root.join(ASSETS_DIR);
+    if !candidate.starts_with(&assets_root) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 assets 之外：{rel_path}")));
+    }
+    if !candidate.exists() {
+        return Err(IpcError::InvalidArgument(format!("附件不存在：{rel_path}")));
+    }
+    if !candidate.is_file() {
+        return Err(IpcError::InvalidArgument(format!("附件不存在：{rel_path}")));
+    }
+    // 防御 symlink 逃逸：canonicalize 后仍需在 assets 之内
+    let canon_assets = assets_root.canonicalize().map_err(IpcError::Io)?;
+    let canon_target = candidate.canonicalize().map_err(IpcError::Io)?;
+    if !canon_target.starts_with(&canon_assets) {
+        return Err(IpcError::PathTraversal(format!("逃逸到 assets 之外：{rel_path}")));
+    }
+    fs::read(&canon_target).map_err(IpcError::Io)
+}
+
+// ---------------------------------------------------------------------------
 // 重命名 / 文件夹操作辅助
 // ---------------------------------------------------------------------------
 
@@ -1127,6 +1290,15 @@ mod tests {
             fs::create_dir_all(parent).expect("mkdir");
         }
         fs::write(&path, content).expect("write");
+    }
+
+    /// 取路径扩展名（小写），无扩展名返回空串。
+    fn ext_of(p: &str) -> String {
+        Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_owned()
     }
 
     #[test]
@@ -1815,7 +1987,7 @@ mod tests {
         assert!(merged.contains("just body"));
         let fm = rust_tunnel_wiki_core::frontmatter::parse_frontmatter(&merged);
         assert_eq!(
-            fm.ref_id.as_ref().map(|r| r.as_str()),
+            fm.ref_id.as_ref().map(rust_tunnel_wiki_core::RefId::as_str),
             Some("n-abc123def456")
         );
     }
@@ -1834,10 +2006,10 @@ mod tests {
         assert!(merged.contains("n-abc123def456"));
         assert!(!merged.contains("old/ref"));
         assert!(merged.contains("title:"));
-        assert!(merged.contains("T"));
+        assert!(merged.contains('T'));
         let fm = rust_tunnel_wiki_core::frontmatter::parse_frontmatter(&merged);
         assert_eq!(
-            fm.ref_id.as_ref().map(|r| r.as_str()),
+            fm.ref_id.as_ref().map(rust_tunnel_wiki_core::RefId::as_str),
             Some("n-abc123def456")
         );
     }
@@ -1857,10 +2029,10 @@ mod tests {
         assert!(merged.contains("n-abc123def456"));
         assert!(!merged.contains("中文"));
         // title 应保留
-        assert!(merged.contains("T"));
+        assert!(merged.contains('T'));
         let fm_after = rust_tunnel_wiki_core::frontmatter::parse_frontmatter(&merged);
         assert_eq!(
-            fm_after.ref_id.as_ref().map(|r| r.as_str()),
+            fm_after.ref_id.as_ref().map(rust_tunnel_wiki_core::RefId::as_str),
             Some("n-abc123def456")
         );
         assert!(fm_after.extra.get("ref").is_none(), "extra 中不应残留 ref");
@@ -1868,7 +2040,7 @@ mod tests {
         let raw2 = "---\ntitle: T\n---\nbody";
         let mut fm2 = rust_tunnel_wiki_core::frontmatter::parse_frontmatter(raw2);
         // 手造一个 extra 含 ref 的场景（模拟旧文件非法 ref 残留在 extra）
-        if let serde_json::Value::Object(ref mut map) = fm2.extra {
+        if let serde_json::Value::Object(ref mut _map) = fm2.extra {
             // 空 extra 时先确保是对象
         }
         // 直接用含 extra 的 frontmatter 合并
@@ -1891,7 +2063,7 @@ mod tests {
         assert!(merged.contains("n-abc123def456"));
         let fm = rust_tunnel_wiki_core::frontmatter::parse_frontmatter(&merged);
         assert_eq!(
-            fm.ref_id.as_ref().map(|r| r.as_str()),
+            fm.ref_id.as_ref().map(rust_tunnel_wiki_core::RefId::as_str),
             Some("n-abc123def456")
         );
         assert_eq!(fm.title.as_deref(), Some("MyTitle"));
@@ -1929,5 +2101,205 @@ mod tests {
         let res = set_note_ref(dir.path(), "nope", "n-abc123def456");
         assert!(res.is_err());
         assert!(matches!(res, Err(IpcError::NoteNotFound(_))));
+    }
+
+    // ---- attachment ----
+
+    #[test]
+    fn attachment_happy_path_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = b"fake image data";
+        let dto = save_attachment(dir.path(), "docs/a", "photo.png", data).expect("save");
+        assert!(
+            dto.rel_path.starts_with("assets/docs-a/"),
+            "rel_path 前缀错误：{}",
+            dto.rel_path
+        );
+        assert!(!dto.rel_path.starts_with('/'), "不应含前导 /");
+        assert_eq!(ext_of(&dto.rel_path), "png", "扩展名应为 png：{}", dto.rel_path);
+        // 格式：assets/docs-a/<ts>-<hash8>.png  (ts = yyyymmdd-hhmmss, hash8 = 8 hex)
+        let file = dto.rel_path.rsplit('/').next().expect("file");
+        let dot = file.rfind('.').expect("dot");
+        let stem = &file[..dot];
+        let dash = stem.rfind('-').expect("dash");
+        let ts = &stem[..dash];
+        let h8 = &stem[dash + 1..];
+        assert_eq!(ts.len(), 15, "ts 长度应为 15：{ts}");
+        assert_eq!(ts.chars().filter(|c| *c == '-').count(), 1);
+        assert_eq!(h8.len(), 8, "hash8 长度应为 8：{h8}");
+        assert!(h8.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "hash8 应为小写 hex：{h8}");
+        // 磁盘文件存在且内容一致
+        assert!(dir.path().join(&dto.rel_path).is_file(), "文件应存在：{}", dto.rel_path);
+        let read_back = read_attachment(dir.path(), &dto.rel_path).expect("read");
+        assert_eq!(read_back, data);
+        // 不残留 tmp 文件
+        let has_tmp = fs::read_dir(dir.path().join("assets/docs-a"))
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!has_tmp, "不应残留 tmp 文件");
+    }
+
+    #[test]
+    fn attachment_traversal_rejection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = b"hello";
+        // save_attachment：非法 note_key 应拒绝
+        for bad_key in ["../x", "..", "", "   ", "/absolute", "a/../b", "a:b"] {
+            let res = save_attachment(dir.path(), bad_key, "a.png", data);
+            assert!(res.is_err(), "应拒绝非法 note_key {bad_key:?} 实际 {res:?}");
+        }
+        // read_attachment：绝对路径 / .. / 非 assets 前缀均拒绝
+        let bad_paths = [
+            "/assets/a/b.png",
+            "../assets/a.png",
+            "assets/../x",
+            "assets//a.png",
+            "notes/a.png",
+            "assets",
+            // 仅 assets 目录本身（无文件名）也应拒绝（非文件）
+        ];
+        for bad in bad_paths {
+            let res = read_attachment(dir.path(), bad);
+            assert!(res.is_err(), "应拒绝非法 rel_path {bad:?} 实际 {res:?}");
+        }
+        // 正常保存后，尝试用逃逸 rel_path 读取应拒绝
+        let dto = save_attachment(dir.path(), "note1", "a.png", data).expect("save ok");
+        for bad in [
+            format!("{}/../note1/{}", dto.rel_path.rsplit('/').next().unwrap_or("x"), dto.rel_path),
+            "assets/note1/../../etc/passwd".to_owned(),
+            "/assets/note1/a.png".to_owned(),
+        ] {
+            let res = read_attachment(dir.path(), &bad);
+            assert!(res.is_err(), "应拒绝逃逸 rel_path {bad:?} 实际 {res:?}");
+        }
+    }
+
+    #[test]
+    fn attachment_note_key_sanitization_slash_to_dash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dto = save_attachment(dir.path(), "docs/a", "a.png", b"data").expect("save");
+        assert!(dto.rel_path.starts_with("assets/docs-a/"), "docs/a → docs-a：{}", dto.rel_path);
+        // 单级 key 不含 '/'
+        let dto2 = save_attachment(dir.path(), "single", "a.png", b"data2").expect("save2");
+        assert!(dto2.rel_path.starts_with("assets/single/"), "single → single：{}", dto2.rel_path);
+        // 多级
+        let dto3 = save_attachment(dir.path(), "a/b/c", "a.png", b"data3").expect("save3");
+        assert!(dto3.rel_path.starts_with("assets/a-b-c/"), "a/b/c → a-b-c：{}", dto3.rel_path);
+    }
+
+    #[test]
+    fn attachment_size_cap_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 超过 10 MiB
+        let big = vec![0u8; 10 * 1024 * 1024 + 1];
+        let res = save_attachment(dir.path(), "note", "a.png", &big);
+        assert!(matches!(res, Err(IpcError::InvalidArgument(_))), "应超限：{res:?}");
+        // 未创建文件
+        let assets_dir = dir.path().join("assets");
+        if assets_dir.exists() {
+            let count = fs::read_dir(&assets_dir)
+                .map(|it| {
+                    it.filter_map(Result::ok)
+                        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                        .count()
+                })
+                .unwrap_or(0);
+            // 若 assets 已存在但超限写入未创建文件，则其下不应有文件（可能仅空目录）
+            // 更严格：递归检查
+            let has_any_file = fs::read_dir(&assets_dir).is_ok_and(|it| {
+                it.filter_map(Result::ok).any(|_| true)
+            });
+            // 若有文件则说明超限写入未被拒绝
+            if has_any_file {
+                // 递归统计文件数
+                let mut file_count = 0usize;
+                let mut stack = vec![assets_dir.clone()];
+                while let Some(d) = stack.pop() {
+                    if let Ok(rd) = fs::read_dir(&d) {
+                        for e in rd.filter_map(Result::ok) {
+                            let ft = e.file_type().ok();
+                            if ft.is_some_and(|f| f.is_dir()) {
+                                stack.push(e.path());
+                            } else if ft.is_some_and(|f| f.is_file()) {
+                                file_count += 1;
+                            }
+                        }
+                    }
+                }
+                assert_eq!(file_count, 0, "超限不应创建文件");
+            }
+            assert_eq!(count, 0, "超限不应创建文件（顶层）");
+        }
+        // 刚好 10 MiB 应通过
+        let exact = vec![0u8; 10 * 1024 * 1024];
+        let dto = save_attachment(dir.path(), "note", "a.png", &exact).expect("exact 10MiB 应通过");
+        assert!(dto.rel_path.starts_with("assets/note/"));
+    }
+
+    #[test]
+    fn attachment_missing_file_read_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("assets/note1")).expect("mkdir");
+        let res = read_attachment(dir.path(), "assets/note1/20260905-120000-abcd1234.png");
+        assert!(matches!(res, Err(IpcError::InvalidArgument(_))), "缺失文件应 InvalidArgument：{res:?}");
+        // 根不存在时也应报错（文件不存在分支）
+        let res2 = read_attachment(dir.path(), "assets/missing/20260905-120000-abcd1234.png");
+        assert!(res2.is_err(), "缺失应报错：{res2:?}");
+    }
+
+    #[test]
+    fn attachment_extension_handling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 正常扩展名归一为小写
+        let dto = save_attachment(dir.path(), "n1", "photo.PNG", b"data").expect("PNG");
+        assert_eq!(ext_of(&dto.rel_path), "png", "PNG→png：{}", dto.rel_path);
+        // 超长扩展名截断至 10 字符（字母数字）
+        let dto2 = save_attachment(dir.path(), "n1", "file.abcdefghijk123", b"data").expect("long ext");
+        let ext2 = dto2.rel_path.rsplit('.').next().expect("ext2");
+        assert_eq!(ext2.len(), 10, "超长扩展名应截断至 10：{ext2}");
+        assert!(ext2.chars().all(|c| c.is_ascii_alphanumeric()), "扩展名应仅 alnum：{ext2}");
+        // 非 alnum 字符被剔除，空则回退 bin
+        let dto3 = save_attachment(dir.path(), "n1", "file.!!!", b"data").expect("!!! ext");
+        assert_eq!(ext_of(&dto3.rel_path), "bin", "!!! → bin：{}", dto3.rel_path);
+        // 无扩展名回退 bin
+        let dto4 = save_attachment(dir.path(), "n1", "noext", b"data").expect("noext");
+        assert_eq!(ext_of(&dto4.rel_path), "bin", "noext → bin：{}", dto4.rel_path);
+        // 空 file_name 回退 bin
+        let dto5 = save_attachment(dir.path(), "n1", "", b"data").expect("empty file_name");
+        assert_eq!(ext_of(&dto5.rel_path), "bin", "empty → bin：{}", dto5.rel_path);
+        // 含路径分隔符的 file_name：扩展名仍取最后一段的后缀
+        let dto6 = save_attachment(dir.path(), "n1", "path/to/file.jpeg", b"data").expect("path file_name");
+        assert_eq!(ext_of(&dto6.rel_path), "jpeg", "path/to/file.jpeg → jpeg：{}", dto6.rel_path);
+    }
+
+    #[test]
+    fn attachment_missing_root_errors() {
+        let missing = Path::new("/non/existent/wiki-attach-root-xyz-999");
+        let res = save_attachment(missing, "note", "a.png", b"data");
+        assert!(matches!(res, Err(IpcError::VaultNotFound(_))), "缺失 root 应 VaultNotFound：{res:?}");
+    }
+
+    #[test]
+    fn attachment_symlink_escape_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dto = save_attachment(dir.path(), "note1", "a.png", b"data").expect("save");
+        // 若平台支持 symlink，构造一个指向 vault 外的 symlink 并验证 read_attachment 拒绝
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_file = outside.path().join("secret.bin");
+        fs::write(&outside_file, b"secret").expect("write outside");
+        let link_path = dir.path().join("assets/note1/link.png");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside_file, &link_path).expect("symlink");
+            let res = read_attachment(dir.path(), "assets/note1/link.png");
+            assert!(
+                matches!(res, Err(IpcError::PathTraversal(_))),
+                "symlink 逃逸应拒绝：{res:?}"
+            );
+        }
+        // 正常文件仍可读
+        let read_back = read_attachment(dir.path(), &dto.rel_path).expect("normal read");
+        assert_eq!(read_back, b"data");
     }
 }

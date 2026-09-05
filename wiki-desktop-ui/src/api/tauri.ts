@@ -56,6 +56,19 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
       return mockVault.writeSyncState(args?.["json"] as string) as unknown as T;
     case "set_note_ref":
       return mockVault.setNoteRef(args?.["key"] as string, args?.["refId"] as string) as unknown as T;
+    case "save_attachment": {
+      const data = args?.["data"] as number[] | undefined;
+      const bytes = data ? new Uint8Array(data) : new Uint8Array();
+      return mockVault.saveAttachment(
+        args?.["noteKey"] as string,
+        args?.["fileName"] as string,
+        bytes,
+      ) as unknown as T;
+    }
+    case "read_attachment": {
+      const raw = mockVault.readAttachment(args?.["relPath"] as string) as unknown as Uint8Array;
+      return Array.from(raw) as unknown as T;
+    }
     default:
       throw new Error(`未知命令: ${cmd}`);
   }
@@ -128,4 +141,20 @@ export function writeSyncState(json: string): Promise<void> {
 
 export function setNoteRef(key: string, ref: string): Promise<NoteDto> {
   return call<NoteDto>("set_note_ref", { key, refId: ref });
+}
+
+export function saveAttachment(
+  noteKey: string,
+  fileName: string,
+  data: Uint8Array,
+): Promise<{ rel_path: string }> {
+  return call<{ rel_path: string }>("save_attachment", {
+    noteKey,
+    fileName,
+    data: Array.from(data),
+  });
+}
+
+export function readAttachment(relPath: string): Promise<Uint8Array> {
+  return call<number[]>("read_attachment", { relPath }).then((arr) => new Uint8Array(arr));
 }

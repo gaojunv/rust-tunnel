@@ -23,7 +23,8 @@ Tauri 的 `tauri::State<'_, T>` 只在 `tauri` feature 开启时存在，且
 */
 
 use crate::dto::{
-    DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
+    AttachmentDto, DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult,
+    SearchHitDto, VaultInfo,
 };
 use crate::error::IpcResult;
 use crate::state::AppState;
@@ -203,6 +204,33 @@ pub fn list_notes_full(state: &AppState) -> IpcResult<Vec<NoteDto>> {
 pub fn set_note_ref(state: &AppState, key: String, ref_id: String) -> IpcResult<NoteDto> {
     let root = state.root();
     vault_ops::set_note_ref(&root, &key, &ref_id)
+}
+
+/// 保存附件（`data` 为字节数组，透传到 `vault_ops`）。
+///
+/// # Errors
+///
+/// 透传 [`vault_ops::save_attachment`] 的错误。
+#[allow(clippy::needless_pass_by_value)]
+pub fn save_attachment(
+    state: &AppState,
+    note_key: String,
+    file_name: String,
+    data: Vec<u8>,
+) -> IpcResult<AttachmentDto> {
+    let root = state.root();
+    vault_ops::save_attachment(&root, &note_key, &file_name, &data)
+}
+
+/// 读取附件。
+///
+/// # Errors
+///
+/// 透传 [`vault_ops::read_attachment`] 的错误。
+#[allow(clippy::needless_pass_by_value)]
+pub fn read_attachment(state: &AppState, rel_path: String) -> IpcResult<Vec<u8>> {
+    let root = state.root();
+    vault_ops::read_attachment(&root, &rel_path)
 }
 
 #[cfg(test)]

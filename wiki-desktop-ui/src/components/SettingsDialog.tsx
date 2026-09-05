@@ -26,6 +26,8 @@ export function SettingsDialog({ onClose, onSync }: Props) {
   const [password, setPassword] = useState("");
   const [knowledgeId, setKnowledgeId] = useState(saved?.knowledgeId ?? "");
   const [propagateDeletes, setPropagateDeletes] = useState(saved?.propagateDeletes ?? false);
+  const [autoSyncAfterSave, setAutoSyncAfterSave] = useState(saved?.autoSyncAfterSave ?? true);
+  const [syncIntervalMinutes, setSyncIntervalMinutes] = useState(String(saved?.syncIntervalMinutes ?? 0));
 
   const [sources, setSources] = useState<KnowledgeSourceInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -104,9 +106,10 @@ export function SettingsDialog({ onClose, onSync }: Props) {
       setError("请选择知识容器");
       return;
     }
+    const mins = Math.max(0, Math.floor(Number(syncIntervalMinutes) || 0));
     setSaving(true);
     try {
-      saveSyncConfig({ baseUrl: url, knowledgeId, propagateDeletes });
+      saveSyncConfig({ baseUrl: url, knowledgeId, propagateDeletes, autoSyncAfterSave, syncIntervalMinutes: mins });
       setSaving(false);
       onClose();
     } catch (e: unknown) {
@@ -114,7 +117,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
     }
-  }, [baseUrl, knowledgeId, propagateDeletes, onClose]);
+  }, [baseUrl, knowledgeId, propagateDeletes, autoSyncAfterSave, syncIntervalMinutes, onClose]);
 
   const handleSyncClick = useCallback(() => {
     const url = baseUrl.trim();
@@ -122,15 +125,16 @@ export function SettingsDialog({ onClose, onSync }: Props) {
       setError("请先完成服务器地址与知识容器配置并登录");
       return;
     }
+    const mins = Math.max(0, Math.floor(Number(syncIntervalMinutes) || 0));
     // 保存配置后触发同步
     try {
-      saveSyncConfig({ baseUrl: url, knowledgeId, propagateDeletes });
+      saveSyncConfig({ baseUrl: url, knowledgeId, propagateDeletes, autoSyncAfterSave, syncIntervalMinutes: mins });
     } catch {
       // 忽略存储异常
     }
     onClose();
     onSync();
-  }, [baseUrl, knowledgeId, propagateDeletes, onClose, onSync]);
+  }, [baseUrl, knowledgeId, propagateDeletes, autoSyncAfterSave, syncIntervalMinutes, onClose, onSync]);
 
   const canSync = loggedIn && !!knowledgeId && !loading;
 
@@ -210,6 +214,32 @@ export function SettingsDialog({ onClose, onSync }: Props) {
               <span className="block text-xs text-muted-foreground">开启后，本地删除笔记会同步删除服务端页面</span>
             </span>
           </label>
+
+          <label className="flex items-start gap-2 rounded-md border p-3">
+            <input
+              type="checkbox"
+              checked={autoSyncAfterSave}
+              onChange={(e) => setAutoSyncAfterSave(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span className="flex-1">
+              <span className="block text-xs font-medium">保存后自动同步</span>
+              <span className="block text-xs text-muted-foreground">开启后，保存笔记 30 秒后自动同步</span>
+            </span>
+          </label>
+
+          <div>
+            <label className="block text-xs font-medium text-muted-foreground">定时同步间隔（分钟，0 为关闭）</label>
+            <Input
+              type="number"
+              min={0}
+              step={1}
+              value={syncIntervalMinutes}
+              onChange={(e) => setSyncIntervalMinutes(e.target.value)}
+              placeholder="0"
+              className="mt-1.5"
+            />
+          </div>
         </div>
 
         <div className="mt-6 flex justify-between gap-2">

@@ -1,8 +1,22 @@
-import { useCallback, useEffect, useState } from "react";
-import { ChevronLeft, ChevronRight, Loader2, Maximize2, Minus, Search, Settings, Square, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  AlertCircle,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  CloudOff,
+  Loader2,
+  Maximize2,
+  Minus,
+  Search,
+  Settings,
+  Square,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { isTauri } from "@/api/tauri";
+import type { SyncStatus } from "@/lib/use-sync";
 
 type Props = {
   dirty?: boolean;
@@ -13,10 +27,127 @@ type Props = {
   onOpenSwitcher?: () => void;
   onOpenSettings?: () => void;
   syncing?: boolean;
+  syncStatus?: SyncStatus;
+  onSyncNow?: () => void;
 };
 
 function isMac(): boolean {
   return typeof navigator !== "undefined" && navigator.userAgent.includes("Mac OS X");
+}
+
+function formatLastSync(lastSyncAt: number | null): string {
+  if (!lastSyncAt) return "尚未同步";
+  const diff = Date.now() - lastSyncAt;
+  if (diff < 60_000) return "刚刚同步";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `上次同步 ${mins} 分钟前`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `上次同步 ${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  return `上次同步 ${days} 天前`;
+}
+
+function SyncWidget({ status, onSyncNow }: { status: SyncStatus; onSyncNow?: () => void }) {
+  const tooltip = useMemo(() => {
+    switch (status.phase) {
+      case "syncing":
+        return "同步中…";
+      case "offline":
+        return "离线，将自动重试";
+      case "error":
+        return status.lastError ?? "同步失败";
+      case "idle": {
+        if (status.pendingCount != null && status.pendingCount > 0) return `${status.pendingCount} 篇待上传`;
+        return formatLastSync(status.lastSyncAt);
+      }
+      default:
+        return "";
+    }
+  }, [status]);
+
+  if (status.phase === "disabled") return null;
+
+  if (status.phase === "syncing") {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="size-8"
+        disabled
+        aria-label="同步中"
+        title={tooltip}
+      >
+        <Loader2 className="size-4 animate-spin" />
+      </Button>
+    );
+  }
+
+  if (status.phase === "offline") {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="size-8"
+        onClick={onSyncNow}
+        aria-label="离线"
+        title={tooltip}
+      >
+        <CloudOff className="size-4 text-muted-foreground" />
+      </Button>
+    );
+  }
+
+  if (status.phase === "error") {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="size-8"
+        onClick={onSyncNow}
+        aria-label="同步失败"
+        title={tooltip}
+      >
+        <AlertCircle className="size-4 text-amber-500" />
+      </Button>
+    );
+  }
+
+  // idle
+  if (status.pendingCount != null && status.pendingCount > 0) {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="relative size-8"
+        onClick={onSyncNow}
+        aria-label={`${status.pendingCount} 篇待上传`}
+        title={tooltip}
+      >
+        <CloudOff className="size-4 text-amber-500" />
+        <span className="absolute -right-0.5 -top-0.5 flex min-w-[14px] justify-center rounded-full bg-amber-500 px-1 text-[10px] font-medium leading-none text-white">
+          {status.pendingCount > 99 ? "99+" : String(status.pendingCount)}
+        </span>
+      </Button>
+    );
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className="size-8"
+      onClick={onSyncNow}
+      aria-label="已同步"
+      title={tooltip}
+    >
+      <Check className="size-4 text-green-600" />
+    </Button>
+  );
 }
 
 export function TitleBar({
@@ -28,6 +159,8 @@ export function TitleBar({
   onOpenSwitcher,
   onOpenSettings,
   syncing = false,
+  syncStatus,
+  onSyncNow,
 }: Props) {
   const [maximized, setMaximized] = useState(false);
   const showWindowControls = isTauri;
@@ -80,7 +213,6 @@ export function TitleBar({
   const handleToggleMaximize = useCallback(async () => {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().toggleMaximize();
-    // onResized will sync state; optimistically flip afterwards
     void refreshMaximized();
   }, [refreshMaximized]);
 
@@ -112,12 +244,11 @@ export function TitleBar({
     [handleToggleMaximize],
   );
 
+  const syncingEffective = syncing || syncStatus?.phase === "syncing";
+
   return (
     <div
       className="flex h-10 shrink-0 select-none items-center border-b border-border bg-background"
-      // Manual dragging via startDragging() — do NOT use data-tauri-drag-region:
-      // the injected region listener captures bubbled mousedown from child buttons
-      // and causes mis-drags when clicking window controls.
       onMouseDown={handleMouseDown}
       onDoubleClick={handleDoubleClick}
     >
@@ -174,6 +305,7 @@ export function TitleBar({
             <Search className="size-4" />
           </Button>
         )}
+        {syncStatus && <SyncWidget status={syncStatus} onSyncNow={onSyncNow} />}
         {onOpenSettings && (
           <Button
             type="button"
@@ -181,11 +313,10 @@ export function TitleBar({
             size="icon"
             className="size-8"
             onClick={onOpenSettings}
-            disabled={syncing}
             aria-label="同步设置"
             title="同步设置"
           >
-            {syncing ? <Loader2 className="size-4 animate-spin" /> : <Settings className="size-4" />}
+            <Settings className="size-4" />
           </Button>
         )}
         <ThemeToggle />
@@ -227,6 +358,7 @@ export function TitleBar({
           </>
         )}
       </div>
+      {syncingEffective && !syncStatus && <span className="sr-only">同步中</span>}
     </div>
   );
 }

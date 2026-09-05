@@ -43,6 +43,8 @@ export interface SyncConfig {
   baseUrl: string;
   knowledgeId: string;
   propagateDeletes: boolean;
+  autoSyncAfterSave?: boolean;
+  syncIntervalMinutes?: number;
 }
 
 const SYNC_CONFIG_KEY = "wiki.sync.config.v1";
@@ -258,7 +260,7 @@ export function createServerApi(baseUrl: string, knowledgeId: string): ServerApi
 // —— 同步配置持久化 ——
 
 /**
- * 加载同步配置
+ * 加载同步配置（容错逐字段解析，新增字段带默认值）
  */
 export function loadSyncConfig(): SyncConfig | null {
   try {
@@ -266,10 +268,19 @@ export function loadSyncConfig(): SyncConfig | null {
     if (!raw) return null;
     const obj = JSON.parse(raw) as Record<string, unknown>;
     if (typeof obj["baseUrl"] !== "string" || typeof obj["knowledgeId"] !== "string") return null;
+    const autoSyncRaw = obj["autoSyncAfterSave"];
+    const intervalRaw = obj["syncIntervalMinutes"];
+    const autoSyncAfterSave = typeof autoSyncRaw === "boolean" ? autoSyncRaw : true;
+    let syncIntervalMinutes = 0;
+    if (typeof intervalRaw === "number" && Number.isFinite(intervalRaw) && intervalRaw >= 0) {
+      syncIntervalMinutes = Math.floor(intervalRaw);
+    }
     return {
       baseUrl: String(obj["baseUrl"]),
       knowledgeId: String(obj["knowledgeId"]),
       propagateDeletes: Boolean(obj["propagateDeletes"]),
+      autoSyncAfterSave,
+      syncIntervalMinutes,
     };
   } catch {
     return null;
@@ -282,6 +293,11 @@ export function loadSyncConfig(): SyncConfig | null {
 export function saveSyncConfig(cfg: SyncConfig): void {
   try {
     localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg));
+    try {
+      window.dispatchEvent(new CustomEvent("wiki:syncConfigChanged"));
+    } catch {
+      // 忽略
+    }
   } catch {
     // 隐私模式忽略
   }
