@@ -255,20 +255,21 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         value: &str,
         timeout: Duration,
     ) -> AcmeResult<()> {
-        use trust_dns_resolver::config::{
-            NameServerConfig, Protocol, ResolverConfig, ResolverOpts,
-        };
-        use trust_dns_resolver::TokioAsyncResolver;
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        use hickory_resolver::Resolver;
 
         // Build resolver with Google DNS + Alibaba DNS
-        let mut config = ResolverConfig::new();
-        if let Ok(addr) = "8.8.8.8:53".parse() {
-            config.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
+        let mut config = ResolverConfig::default();
+        if let Ok(ip) = "8.8.8.8".parse() {
+            config.add_name_server(NameServerConfig::udp(ip));
         }
-        if let Ok(addr) = "223.5.5.5:53".parse() {
-            config.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
+        if let Ok(ip) = "223.5.5.5".parse() {
+            config.add_name_server(NameServerConfig::udp(ip));
         }
-        let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
+        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .build()
+            .map_err(|e| AcmeError::Dns(format!("failed to build DNS resolver: {e}")))?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         let poll_interval = DNS_POLL_INTERVAL;
@@ -289,13 +290,19 @@ impl DnsChallengeSolver for AliyunDnsSolver {
 
             match resolver.txt_lookup(domain).await {
                 Ok(lookup) => {
+                    use hickory_proto::rr::RData;
+                    let answers = lookup.answers();
                     let mut found_count = 0;
-                    for txt in lookup.iter() {
-                        found_count += 1;
-                        let txt_str = txt.to_string();
-                        if txt_str == value {
-                            info!("DNS TXT record confirmed for {}: {}", domain, value);
-                            return Ok(());
+                    for record in answers {
+                        if let RData::TXT(txt) = &record.data {
+                            for chunk in &*txt.txt_data {
+                                found_count += 1;
+                                let txt_str = String::from_utf8_lossy(chunk).to_string();
+                                if txt_str == value {
+                                    info!("DNS TXT record confirmed for {}: {}", domain, value);
+                                    return Ok(());
+                                }
+                            }
                         }
                     }
                     debug!(
