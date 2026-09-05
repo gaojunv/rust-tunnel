@@ -76,7 +76,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 前端产物必须先于 Rust 构建存在（tauri.conf.json 的 frontendDist 指向
       # ../../wiki-desktop-ui/dist，该路径以 tauri.conf.json 所在目录为基准）。
