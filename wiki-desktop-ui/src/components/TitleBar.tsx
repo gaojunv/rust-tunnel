@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronLeft, ChevronRight, Maximize2, Minus, Search, Square, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Loader2, Maximize2, Minus, Search, Settings, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { isTauri } from "@/api/tauri";
@@ -11,6 +11,8 @@ type Props = {
   onBack?: () => void;
   onForward?: () => void;
   onOpenSwitcher?: () => void;
+  onOpenSettings?: () => void;
+  syncing?: boolean;
 };
 
 function isMac(): boolean {
@@ -24,6 +26,8 @@ export function TitleBar({
   onBack,
   onForward,
   onOpenSwitcher,
+  onOpenSettings,
+  syncing = false,
 }: Props) {
   const [maximized, setMaximized] = useState(false);
   const showWindowControls = isTauri;
@@ -168,6 +172,20 @@ export function TitleBar({
             title="快速切换 (Ctrl+K)"
           >
             <Search className="size-4" />
+          </Button>
+        )}
+        {onOpenSettings && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8"
+            onClick={onOpenSettings}
+            disabled={syncing}
+            aria-label="同步设置"
+            title="同步设置"
+          >
+            {syncing ? <Loader2 className="size-4 animate-spin" /> : <Settings className="size-4" />}
           </Button>
         )}
         <ThemeToggle />

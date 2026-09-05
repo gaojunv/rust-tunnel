@@ -31,6 +31,9 @@ pub mod error;
 /// 统一知识容器路由（双索引容器 + 文档 + 页面 + 检索 + SSE，仅 rag feature）。
 #[cfg(feature = "rag")]
 pub mod knowledge;
+/// JWT 保护的 LLM 中继路由（wiki 桌面端复用管理面登录态，仅 rag feature）。
+#[cfg(feature = "rag")]
+pub mod llm_relay;
 /// LLM 网关与模型组路由。
 pub mod llm;
 /// 登录与健康检查路由。
@@ -600,6 +603,8 @@ pub async fn run_api_server(
         public_routes = public_routes.merge(agent::memory::public_router());
         // Skill 库管理路由（skills CRUD + toggle）
         protected_routes = protected_routes.merge(agent::skills::protected_router());
+        // LLM 中继路由（wiki 桌面端复用管理面 JWT 透传网关，仅 rag feature）
+        protected_routes = protected_routes.merge(llm_relay::protected_router());
     }
 
     // Only apply auth middleware if password is set
@@ -712,11 +717,10 @@ pub async fn run_api_server(
                 }
             });
         }
-    } else {
-        // Plain HTTP — original behavior
-        let listener = tokio::net::TcpListener::bind(&api_addr).await?;
-        tracing::info!("API server listening on {}", api_addr);
-        axum::serve(listener, app).await?;
-        Ok(())
     }
+    // Plain HTTP — original behavior（仅当未配置 TLS 时到达；TLS 分支为无限循环永不返回）
+    let listener = tokio::net::TcpListener::bind(&api_addr).await?;
+    tracing::info!("API server listening on {}", api_addr);
+    axum::serve(listener, app).await?;
+    Ok(())
 }

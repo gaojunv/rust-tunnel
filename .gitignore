@@ -38,3 +38,6 @@ crates/wiki-serve/gen/schemas/
 
 # 本地临时文件
 nohup.out
+
+# vite/vitest 缓存（从仓库根跑 vitest 时产生）
+**/.vite/

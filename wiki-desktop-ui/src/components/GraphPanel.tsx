@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Network, Link2, Unlink, AlertTriangle } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { getGraph, getNote } from "@/api/tauri";
-import type { GraphDto } from "@/api/types";
+import { getNote } from "@/api/tauri";
+import { useGraph } from "@/lib/use-graph";
 
 type Props = {
   selectedKey: string | null;
@@ -21,22 +21,8 @@ function extractLinks(body: string): string[] {
 }
 
 export function GraphPanel({ selectedKey, refreshToken, onNavigate, onCreate }: Props) {
-  const [graph, setGraph] = useState<GraphDto | null>(null);
+  const { graph } = useGraph(refreshToken);
   const [body, setBody] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    getGraph()
-      .then((g) => {
-        if (!cancelled) setGraph(g);
-      })
-      .catch(() => {
-        if (!cancelled) setGraph(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshToken]);
 
   useEffect(() => {
     if (!selectedKey) {

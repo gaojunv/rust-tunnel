@@ -9,6 +9,8 @@ export type NoteHistory = {
   forward: () => void;
   remove: (key: string) => void;
   replace: (oldKey: string, newKey: string) => void;
+  replacePrefix: (oldPrefix: string, newPrefix: string) => void;
+  removePrefix: (prefix: string) => void;
 };
 
 export function useNoteHistory(): NoteHistory {
@@ -60,6 +62,32 @@ export function useNoteHistory(): NoteHistory {
     setFuture((f) => f.map((k) => (k === oldKey ? newKey : k)));
   }, []);
 
+  const removePrefix = useCallback((prefix: string) => {
+    const match = (k: string) => k === prefix || k.startsWith(prefix + "/");
+    setPast((p) => p.filter((k) => !match(k)));
+    setFuture((f) => f.filter((k) => !match(k)));
+    setCurrent((c) => (c && match(c) ? null : c));
+  }, []);
+
+  const replacePrefix = useCallback((oldPrefix: string, newPrefix: string) => {
+    if (oldPrefix === newPrefix) return;
+    const mapKey = (k: string): string => {
+      if (k === oldPrefix) return newPrefix;
+      if (k.startsWith(oldPrefix + "/")) return newPrefix + k.slice(oldPrefix.length);
+      return k;
+    };
+    const dedupAdjacent = (arr: string[]): string[] => {
+      const out: string[] = [];
+      for (const k of arr) {
+        if (out.length === 0 || out[out.length - 1] !== k) out.push(k);
+      }
+      return out;
+    };
+    setCurrent((c) => (c ? mapKey(c) : c));
+    setPast((p) => dedupAdjacent(p.map(mapKey)));
+    setFuture((f) => dedupAdjacent(f.map(mapKey)));
+  }, []);
+
   return useMemo(
     () => ({
       current,
@@ -70,7 +98,9 @@ export function useNoteHistory(): NoteHistory {
       forward,
       remove,
       replace,
+      replacePrefix,
+      removePrefix,
     }),
-    [current, canBack, canForward, navigate, back, forward, remove, replace],
+    [current, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix],
   );
 }
