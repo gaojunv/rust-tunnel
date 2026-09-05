@@ -181,6 +181,21 @@ pub fn list_notes_full(state: tauri::State<'_, AppState>) -> IpcResult<Vec<NoteD
     commands::list_notes_full(&state)
 }
 
+/// 设置笔记的 `ref`（校验后写回 frontmatter）。
+///
+/// # Errors
+///
+/// 透传 [`commands::set_note_ref`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn set_note_ref(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    ref_id: String,
+) -> IpcResult<NoteDto> {
+    commands::set_note_ref(&state, key, ref_id)
+}
+
 /// 启动 Tauri 应用.
 ///
 /// 首启时确保 vault 根目录存在且非空（空 vault 写入 `welcome.md`），随后
@@ -198,19 +213,20 @@ pub fn run() -> tauri::Result<()> {
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
+            delete_folder,
+            delete_note,
+            get_graph,
+            get_note,
             get_vault_info,
             list_notes,
-            get_note,
-            save_note,
-            delete_note,
-            search_notes,
-            get_graph,
-            rename_note,
-            rename_folder,
-            delete_folder,
+            list_notes_full,
             read_sync_state,
-            write_sync_state,
-            list_notes_full
+            rename_folder,
+            rename_note,
+            save_note,
+            search_notes,
+            set_note_ref,
+            write_sync_state
         ])
         .run(tauri::generate_context!())
 }

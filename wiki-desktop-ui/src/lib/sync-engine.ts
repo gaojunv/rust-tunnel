@@ -6,6 +6,12 @@
 import { toRemoteRef } from "./ref-id";
 import type { RemotePageSummary, ServerApi } from "../api/server";
 
+/** 冲突副本检测：最后一段匹配 /\.conflict-\d{8}-\d{6}$/（模块级导出） */
+export function isConflictCopyKey(key: string): boolean {
+  const lastSeg = key.split("/").pop() ?? key;
+  return /\.conflict-\d{8}-\d{6}$/.test(lastSeg);
+}
+
 /** 本地笔记（调用方负责读取并计算 contentHash） */
 export interface LocalNote {
   key: string;
@@ -111,15 +117,9 @@ export function planSync(input: {
   const seenLocal = new Set<string>();
   const actions: Action[] = [];
 
-  // 冲突副本检测：最后一段匹配 /\.conflict-\d{8}-\d{6}$/
-  const isConflictCopy = (key: string): boolean => {
-    const lastSeg = key.split("/").pop() ?? key;
-    return /\.conflict-\d{8}-\d{6}$/.test(lastSeg);
-  };
-
   for (const note of local) {
     // 1. 冲突副本直接跳过（防无限传播）
-    if (isConflictCopy(note.key)) {
+    if (isConflictCopyKey(note.key)) {
       actions.push({ kind: "skip-conflict-copy", key: note.key });
       // 冲突副本本身仍视为已见，避免被误删判定
       seenLocal.add(note.key);

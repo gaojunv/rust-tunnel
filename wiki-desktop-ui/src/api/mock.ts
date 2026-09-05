@@ -1,5 +1,6 @@
 import type { DeleteFolderResult, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, GraphDto, VaultInfo } from "./types";
 import type { KnowledgeSourceInfo, RemotePage } from "./server";
+import { normalizeRemoteRef } from "../lib/ref-id";
 
 // —— 工具：从 body 中提取 [[wikilink]] ——
 function extractLinks(body: string): string[] {
@@ -314,6 +315,17 @@ export const mockVault = {
   getGraph(): GraphDto {
     return buildGraph();
   },
+
+  setNoteRef(key: string, refId: string): NoteDto {
+    const n = store.get(key);
+    if (!n) throw new Error(`笔记不存在: ${key}`);
+    // 复用与 Rust `RefId::parse` 对齐的校验（trim+lowercase 归一）
+    const s = normalizeRemoteRef(refId);
+    if (s == null) throw new Error(`非法 ref: ${refId}`);
+    const updated: NoteDto = { ...n, ref_id: s, modified: nowSec() };
+    store.set(key, updated);
+    return { ...updated };
+  },
 };
 
 export type MockCommand =
@@ -329,7 +341,8 @@ export type MockCommand =
   | "delete_folder"
   | "list_notes_full"
   | "read_sync_state"
-  | "write_sync_state";
+  | "write_sync_state"
+  | "set_note_ref";
 
 // —— 内存假服务器（仅用于非 Tauri 环境的 fetch 拦截） ——
 

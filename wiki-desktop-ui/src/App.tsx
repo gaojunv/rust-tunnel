@@ -7,7 +7,7 @@ import { RightPanel } from "@/components/RightPanel";
 import { AiChatPanel } from "@/components/ai/AiChatPanel";
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
-import { getNote, listNotesFull, readSyncState, saveNote, vaultInfo, writeSyncState } from "@/api/tauri";
+import { getNote, listNotesFull, readSyncState, saveNote, setNoteRef, vaultInfo, writeSyncState } from "@/api/tauri";
 import type { VaultInfo } from "@/api/types";
 import { useNoteHistory } from "@/lib/use-note-history";
 import { QuickSwitcher } from "@/components/QuickSwitcher";
@@ -16,6 +16,7 @@ import { SyncReportDialog } from "@/components/SyncReportDialog";
 import { createServerApi, loadSyncConfig } from "@/api/server";
 import { AuthExpiredError, clearToken } from "@/lib/server-auth";
 import { emptySyncState, hashNote, planSync, runSync, type LocalNote, type SyncReport, type SyncState } from "@/lib/sync-engine";
+import { ensureCompatibleRefs } from "@/lib/compat-refs";
 
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix } =
@@ -200,6 +201,11 @@ export default function App() {
       } catch {
         state = emptySyncState(cfg.knowledgeId);
       }
+
+      await ensureCompatibleRefs(local, async (key, ref) => {
+        const dto = await setNoteRef(key, ref);
+        return { modified: dto.modified };
+      });
 
       const serverApi = createServerApi(cfg.baseUrl, cfg.knowledgeId);
       const remote = await serverApi.listAllPages();
