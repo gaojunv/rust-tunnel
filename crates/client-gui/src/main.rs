@@ -19,6 +19,15 @@ use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
 
+fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
+    let bytes: &[u8] = include_bytes!("../icons/icon.png");
+    let Some((rgba, w, h)) = tray::load_icon_rgba(bytes) else {
+        tracing::warn!("窗口图标解码失败，回退为系统默认图标");
+        return None;
+    };
+    Some(std::sync::Arc::new(egui::IconData { rgba, width: w, height: h }))
+}
+
 struct GuiApp {
     app_state: Arc<app::AppState>,
     settings: ui::settings::SettingsState,
@@ -318,10 +327,16 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([480.0, 520.0])
-        .with_min_inner_size([380.0, 400.0])
-        .with_visible(true);
+    let viewport = {
+        let mut vp = egui::ViewportBuilder::default()
+            .with_inner_size([480.0, 520.0])
+            .with_min_inner_size([380.0, 400.0])
+            .with_visible(true);
+        if let Some(icon) = load_window_icon() {
+            vp = vp.with_icon(icon);
+        }
+        vp
+    };
 
     let options = eframe::NativeOptions {
         viewport,

@@ -34,6 +34,9 @@ tray-icon = { version = "0.19" }
 muda = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[build-dependencies]
+embed-resource = "3"
+
 # keyring 3.x 没有 default feature——不显式选 store 会静默退化成进程内 mock
 # （Entry::new/set_password 全返回 Ok，但重启即丢）。按平台声明原生后端。
 #

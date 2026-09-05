@@ -39,7 +39,7 @@ pub mod ids {
     pub const QUIT: &str = "quit";
 }
 
-fn load_icon_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+pub(crate) fn load_icon_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());

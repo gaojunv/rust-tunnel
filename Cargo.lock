@@ -7690,6 +7690,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "embed-resource",
  "image",
  "keyring",
  "muda 0.15.3",
