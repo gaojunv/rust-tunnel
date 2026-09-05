@@ -27,7 +27,7 @@ export default function LoginPage() {
       const data = await login.mutateAsync(password);
       localStorage.setItem('auth_token', data.token);
       navigate('/dashboard');
-    } catch (err) {
+    } catch {
       setError(t('login.loginFailed'));
     }
   };

@@ -1,6 +1,41 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-sidebar: hsl(var(--sidebar));
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+  --shadow-glow: 0 0 24px hsl(var(--primary) / 0.25);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  /* container 配置：center + 2xl 断点（原 tailwind.config.js 的 theme.container） */
+  --container-2xl: 1400px;
+}
 
 @layer base {
   :root {
@@ -63,11 +98,7 @@
 
   html {
     color-scheme: light;
-    /* 防 iOS 橡皮筋滚动/下拉刷新干扰 h-dvh 非滚动布局（/agent 页外层永不滚动，
-       橡皮筋只会让布局抖动） */
     overscroll-behavior-y: none;
-    /* 细滚动条样式：供 ScrollArea 内部或其他局部滚动容器使用。
-       主滚动已迁移到 AppLayout 的 ScrollArea，html 不再强制 overflow-y: scroll。 */
     scrollbar-width: thin;
     scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
   }
@@ -76,7 +107,6 @@
     color-scheme: dark;
   }
 
-  /* WebKit / Chromium：细滚动条 + 透明轨道，降低 gutter 区域的视觉存在感 */
   ::-webkit-scrollbar {
     width: 8px;
     height: 8px;
@@ -107,11 +137,9 @@
       sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    /* 去掉 iOS 点击灰闪（tap 高亮） */
     -webkit-tap-highlight-color: transparent;
   }
 
-  /* 深色模式下的环境辉光背景：顶部青色 + 底部紫色，营造监控台氛围 */
   html.dark body {
     background-image:
       radial-gradient(ellipse 90% 55% at 50% -20%, hsl(199 89% 55% / 0.09), transparent),
@@ -119,7 +147,6 @@
     background-attachment: fixed;
   }
 
-  /* 移动端（< 768px，小屏省 GPU 合成层与绘制开销，大面积光晕在小屏上为视觉噪音）去掉环境辉光径向渐变 */
   @media (max-width: 767px) {
     html.dark body {
       background-image: none;
@@ -127,42 +154,17 @@
   }
 }
 
-/* Radix Select/Dialog 打开时通过 react-remove-scroll-bar 给 body 加
-   margin-right 补偿滚动条宽度（gapMode: 'margin'，inline <style> 注入到
-   head 末尾）。但 html 已用 scrollbar-gutter: stable 预留槽位（html 宽度
-   不变），再补偿反而让内容右移 → 抖动。
-   注意两点：
-   1) 必须放在 @layer 外。Radix 注入的是非 layered 样式，按 CSS 层级规则
-      非 layered 优先级高于 layered，写在 @layer base 里会被压制。
-   2) 选择器必须比 Radix 的 `body[data-scroll-locked]` 更具体。Radix 的
-      <style> 标签插入到 head 末尾（声明顺序后于 index.css），如果特异性
-      相同会按顺序输给 Radix。`html body[data-scroll-locked]` 多一级元素
-      选择器，特异性更高 → 胜出。 */
 html body[data-scroll-locked] {
   margin-right: 0 !important;
   padding-right: 0 !important;
 }
 
-/* 移动端横向溢出防护（根因修复）。
-   Radix ScrollArea 的 viewport 内部包裹层是 `display: table; min-width: 100%`
-   （内联样式）。在 table 布局下，内容块（AppLayout 的 <main>）会被当作匿名
-   table-cell，其宽度 = 内容固有宽度 → 任意一个过宽的子元素（长 token / 表格 /
-   recharts SVG）都会把整页撑宽，即使 viewport 本身 overflow-x: hidden 也会导致
-   内容被裁掉。这里把包裹层改回普通 block（保持 min-width: 100% 让内容填满
-   viewport 宽度），切断「内容最小宽度 → 整页宽度」的放大链：过宽子元素只会
-   被 viewport 裁切（表格自身的 overflow-x-auto 等局部滚动容器不受影响），
-   页面始终等于视口宽度。
-   必须写在 @layer 外 + !important：Radix 的内联 style 是普通声明，任意
-   !important 都能压过它（与下面 Radix 滚动锁补偿同理）。 */
 [data-radix-scroll-area-viewport] > div {
   display: block !important;
   min-width: 100% !important;
   width: 100% !important;
 }
 
-/* iOS Safari 移动端去顶部留边：有刘海/动态岛的机型视口已从刘海下方开始，
-   无需再用 env(safe-area-inset-top) 额外垫高，直接贴顶。仅 iOS 生效
-   （-webkit-touch-callout 仅 Safari 支持），安卓/桌面不受影响。 */
 @supports (-webkit-touch-callout: none) {
   @media (max-width: 767px) {
     header {
@@ -178,17 +180,14 @@ html body[data-scroll-locked] {
 }
 
 @layer utilities {
-  /* 玻璃拟态卡片表面（配合 Card 的 border-border 使用，明暗主题均安全） */
   .glass-card {
     @apply bg-card/70 backdrop-blur-xl;
   }
 
-  /* 标题渐变文字 */
   .text-gradient {
     @apply bg-gradient-to-r from-foreground to-muted-foreground bg-clip-text text-transparent;
   }
 
-  /* 品牌标题极光渐变流光：靛蓝→紫→青循环流动 + 亮度呼吸（Aurora Tunnel 品牌文字专用） */
   .text-aurora {
     background-image: linear-gradient(
       90deg,
@@ -206,7 +205,6 @@ html body[data-scroll-locked] {
       aurora-text-breathe 4s ease-in-out infinite;
   }
 
-  /* 卡片极光光晕：PageHeader 风格的大面积柔和光晕，hover 时三色流转 */
   .card-aurora {
     position: relative;
     transition: box-shadow 0.3s ease, color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
@@ -215,7 +213,6 @@ html body[data-scroll-locked] {
       0 8px 24px -12px hsl(var(--primary) / 0.15);
   }
 
-  /* hover：多层 box-shadow 模拟三色光晕 */
   .card-aurora:hover {
     box-shadow:
       inset 0 1px 0 0 hsl(var(--foreground) / 0.05),
@@ -225,7 +222,6 @@ html body[data-scroll-locked] {
     animation: card-aurora-glow 6s ease-in-out infinite;
   }
 
-  /* 光晕颜色流动动画：通过改变 box-shadow 颜色实现 */
   @keyframes card-aurora-glow {
     0%, 100% {
       box-shadow:
@@ -250,12 +246,10 @@ html body[data-scroll-locked] {
     }
   }
 
-  /* Logo 光环呼吸：外发光缓慢明暗（叠加在 shadow-glow 之上，动画化 box-shadow） */
   .logo-glow-breathe {
     animation: logo-glow-breathe 3s ease-in-out infinite;
   }
 
-  /* 页头光影流动：底部流光渐变线（primary → 紫 → 青 循环流动） */
   .header-light-flow {
     background-image: linear-gradient(
       90deg,
@@ -269,9 +263,6 @@ html body[data-scroll-locked] {
     animation: header-flow 8s linear infinite;
   }
 
-
-
-  /* 极光光斑基础样式：PageHeader 氛围背景（颜色由 Tailwind bg- 类提供） */
   .aurora-blob {
     position: absolute;
     border-radius: 9999px;
@@ -280,7 +271,6 @@ html body[data-scroll-locked] {
     will-change: transform;
   }
 
-  /* 光斑缓慢漂移动画（主/副两个方向，错峰循环） */
   .animate-aurora {
     animation: aurora-drift 16s ease-in-out infinite;
   }
@@ -289,7 +279,6 @@ html body[data-scroll-locked] {
     animation: aurora-drift-alt 20s ease-in-out infinite;
   }
 
-  /* 页头卡片细网格纹理：径向遮罩让网格向边缘淡出 */
   .grid-texture {
     background-image:
       linear-gradient(to right, hsl(var(--foreground) / 0.045) 1px, transparent 1px),
@@ -299,10 +288,6 @@ html body[data-scroll-locked] {
     -webkit-mask-image: radial-gradient(ellipse 85% 90% at 30% 0%, black 30%, transparent 78%);
   }
 
-  /* AI 工作台「运行中」输入框边框（替代原消息流丝带）：主题色
-     （primary/chart-2/chart-3）渐变沿边框循环流动。双层背景——padding-box
-     实色盖住容器底色，border-box 渐变透过 transparent 边框显示为彩色描边；
-     与 focus-within ring、shadow-md 叠加不冲突。 */
   .agent-input-running {
     border-color: transparent;
     background:
@@ -319,10 +304,6 @@ html body[data-scroll-locked] {
     animation: agent-input-border-flow 2.4s linear infinite;
   }
 
-  /* Effort 离散滑条（ModeEffortPicker 面板内）。轨道与滑块只能用 vendor 伪元素
-     定制——Tailwind 无对应工具类，accent-color 也管不了轨道粗细与滑块描边。
-     取色全走 CSS 变量，明暗主题自动跟随；滑块描边用 popover 底色，压在刻度点
-     上时仍能看出边界。 */
   .effort-slider {
     -webkit-appearance: none;
     appearance: none;
@@ -336,9 +317,6 @@ html body[data-scroll-locked] {
     opacity: 0.5;
   }
 
-  /* 原生轨道透明：input 叠在 z-10 层，不透明轨道会遮住下层的填充条/档位圆点
-     （轨道、填充、圆点全部由 ModeEffortPicker 内的叠加层绘制，input 只留 thumb
-     与命中区）。轨道高度保留——webkit thumb 的负 margin 对齐依赖它。 */
   .effort-slider::-webkit-slider-runnable-track {
     height: 0.25rem;
     background: transparent;
@@ -350,7 +328,6 @@ html body[data-scroll-locked] {
     box-sizing: border-box;
     height: 0.75rem;
     width: 0.75rem;
-    /* webkit 下 thumb 以轨道顶边对齐，负 margin 把它压回轨道中线 */
     margin-top: -0.25rem;
     border: 2px solid hsl(var(--popover));
     border-radius: 9999px;
@@ -373,7 +350,6 @@ html body[data-scroll-locked] {
     box-shadow: 0 1px 2px hsl(var(--foreground) / 0.25);
   }
 
-  /* 焦点环画在滑块上（外层 outline 会围住整条轨道，视觉太重） */
   .effort-slider:focus-visible {
     outline: none;
   }
@@ -398,28 +374,23 @@ html body[data-scroll-locked] {
     }
   }
 
-  /* 移动端（< 768px）去掉发光/光晕装饰：纯视觉效果，小屏上省 GPU/合成层开销且避免大面积光晕噪音；CSS 断点无 hydration 闪烁、集中一处便于维护 */
   @media (max-width: 767px) {
-    /* 卡片极光光晕：去掉 box-shadow 与 hover 流转动画，保留边框与背景 */
     .card-aurora,
     .card-aurora:hover {
       box-shadow: none !important;
       animation: none !important;
     }
 
-    /* Logo 呼吸外发光：去掉动画与阴影 */
     .logo-glow-breathe {
       box-shadow: none !important;
       animation: none !important;
     }
 
-    /* 极光光斑与页头底部流光线为整块装饰元素：直接隐藏最干净 */
     .aurora-blob,
     .header-light-flow {
       display: none !important;
     }
 
-    /* 光斑漂移动画：与上条互补，兜底隐藏后仍停动画 */
     .animate-aurora,
     .animate-aurora-alt {
       animation: none !important;
@@ -428,73 +399,36 @@ html body[data-scroll-locked] {
 }
 
 @keyframes aurora-text-flow {
-  from {
-    background-position: 0% 50%;
-  }
-  to {
-    background-position: 200% 50%;
-  }
+  from { background-position: 0% 50%; }
+  to { background-position: 200% 50%; }
 }
 
-/* 输入框边框渐变流动（200% 背景位循环，仅作用于 border-box 层） */
 @keyframes agent-input-border-flow {
-  from {
-    background-position: 0 0, 0% 0;
-  }
-  to {
-    background-position: 0 0, -200% 0;
-  }
+  from { background-position: 0 0, 0% 0; }
+  to { background-position: 0 0, -200% 0; }
 }
 
 @keyframes aurora-text-breathe {
-  0%,
-  100% {
-    filter: brightness(1);
-  }
-  50% {
-    filter: brightness(1.12);
-  }
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.12); }
 }
 
 @keyframes logo-glow-breathe {
-  0%,
-  100% {
-    box-shadow: 0 0 24px hsl(var(--primary) / 0.25);
-  }
-  50% {
-    box-shadow: 0 0 32px hsl(var(--primary) / 0.45);
-  }
+  0%, 100% { box-shadow: 0 0 24px hsl(var(--primary) / 0.25); }
+  50% { box-shadow: 0 0 32px hsl(var(--primary) / 0.45); }
 }
 
 @keyframes aurora-drift {
-  0%,
-  100% {
-    transform: translate(0, 0) scale(1);
-    opacity: 0.7;
-  }
-  50% {
-    transform: translate(26px, 18px) scale(1.14);
-    opacity: 1;
-  }
+  0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.7; }
+  50% { transform: translate(26px, 18px) scale(1.14); opacity: 1; }
 }
 
 @keyframes aurora-drift-alt {
-  0%,
-  100% {
-    transform: translate(0, 0) scale(1.05);
-    opacity: 0.7;
-  }
-  50% {
-    transform: translate(-22px, -16px) scale(0.94);
-    opacity: 1;
-  }
+  0%, 100% { transform: translate(0, 0) scale(1.05); opacity: 0.7; }
+  50% { transform: translate(-22px, -16px) scale(0.94); opacity: 1; }
 }
 
 @keyframes header-flow {
-  from {
-    background-position: 0% 50%;
-  }
-  to {
-    background-position: 200% 50%;
-  }
+  from { background-position: 0% 50%; }
+  to { background-position: 200% 50%; }
 }

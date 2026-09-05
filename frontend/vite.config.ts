@@ -1,24 +1,27 @@
 /// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [tailwindcss(), react()],
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
+        manualChunks(id) {
           // react 核心生态内容稳定，单独拆 chunk 利于长期缓存
-          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
+          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom') || id.includes('node_modules/react-router-dom')) {
+            return 'react-vendor'
+          }
         },
       },
     },
   },
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   server: {

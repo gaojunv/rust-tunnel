@@ -101,7 +101,8 @@ export const EntityTypePanel = ({ type, titleLabel, snapshots }: EntityTypePanel
                     labelFormatter={(_value, payload) => {
                       // 修复：shadcn wrapper 在 label 为 number（时间戳）时会误取
                       // 首个 series 的 label；这里直接从 payload 取时间戳。
-                      const ts = payload?.[0]?.payload?.time as number | undefined;
+                      const arr = payload as Array<{ payload?: { time?: number } }> | undefined
+                      const ts = arr?.[0]?.payload?.time as number | undefined;
                       return ts ? new Date(ts).toLocaleString() : '';
                     }}
                     formatter={(value, name) => {

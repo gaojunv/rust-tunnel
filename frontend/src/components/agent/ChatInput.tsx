@@ -13,7 +13,7 @@ export interface ChatInputProps {
   setRefs: React.Dispatch<React.SetStateAction<string[]>>;
   workspaceId: string;
   slashCommands: SlashCommand[];
-  textareaRef: React.RefObject<HTMLTextAreaElement>;
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   onSend: () => void;
   placeholder?: string;
 }

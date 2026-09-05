@@ -5,10 +5,9 @@ import {
 } from '../useApprovalMutation';
 
 /** 审批对话框所需的最小状态：summary 为后端给出的 git 命令摘要。 */
-export interface GitApprovalState extends ApprovalState {}
+export type GitApprovalState = ApprovalState;
 
-export interface UseGitMutationResult<TArgs extends unknown[]>
-  extends UseApprovalMutationResult<TArgs> {}
+export type UseGitMutationResult<TArgs extends unknown[]> = UseApprovalMutationResult<TArgs>;
 
 /**
  * git 写操作 mutation：泛化审批 hook 的 git 特化包装。
