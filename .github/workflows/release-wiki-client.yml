@@ -83,7 +83,7 @@ jobs:
       # 构建方式与 release-server.yml 的前端一节一致：cd 进目录 npm ci + npm run build，
       # cwd 明确、不依赖任何工具对相对路径的推断。
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
