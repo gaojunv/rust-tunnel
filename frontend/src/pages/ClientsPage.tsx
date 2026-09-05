@@ -56,29 +56,33 @@ export default function ClientsPage() {
             {auth?.client_token ?? '...'}
           </code>
           {!confirmRotate ? (
-            <button
-              className="rounded bg-amber-500 px-3 py-1 text-sm text-white hover:bg-amber-600"
+            <Button
+              size="sm"
+              variant="outline"
+              className="border-amber-500/30 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
               onClick={() => setConfirmRotate(true)}
             >
               {t('clients.rotate')}
-            </button>
+            </Button>
           ) : (
             <div className="flex items-center gap-2 text-sm">
               <span className="text-muted-foreground">
                 {t('clients.rotateConfirm')}
               </span>
-              <button
-                className="rounded bg-red-500 px-3 py-1 text-sm text-white hover:bg-red-600"
+              <Button
+                size="sm"
+                variant="destructive"
                 onClick={() => rotate.mutate()}
               >
                 {t('clients.confirm')}
-              </button>
-              <button
-                className="text-sm text-muted-foreground hover:text-foreground"
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
                 onClick={() => setConfirmRotate(false)}
               >
                 {t('common.cancel')}
-              </button>
+              </Button>
             </div>
           )}
         </div>
@@ -141,15 +145,19 @@ export default function ClientsPage() {
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex gap-2">
-                      <button
-                        className="rounded bg-muted px-2.5 py-1 text-xs font-medium text-muted-foreground hover:text-foreground disabled:opacity-40"
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2.5 text-xs"
                         disabled={!c.online}
                         onClick={() => kick.mutate(c.name)}
                       >
                         {t('clients.kick')}
-                      </button>
-                      <button
-                        className="rounded bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive hover:bg-destructive/20 disabled:opacity-40"
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2.5 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
                         disabled={c.referenced_by_rules > 0}
                         title={
                           c.referenced_by_rules > 0
@@ -169,7 +177,7 @@ export default function ClientsPage() {
                         }}
                       >
                         {t('clients.delete')}
-                      </button>
+                      </Button>
                     </div>
                   </td>
                 </tr>

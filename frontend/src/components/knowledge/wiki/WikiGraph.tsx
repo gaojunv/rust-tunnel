@@ -405,6 +405,7 @@ export default function WikiGraph({ nodes, edges, loading, onNodeClick }: Props)
                 transition: filter 150ms;
               }
               .wiki-node:hover circle { filter: brightness(0.92); }
+              html.dark .wiki-node:hover circle, .dark .wiki-node:hover circle { filter: brightness(1.2); }
               .wiki-node-locked circle { stroke: hsl(var(--primary)); stroke-width: 3; }
               .wiki-node-label { fill: hsl(var(--muted-foreground)); font-size: 10px; }
             `}</style>

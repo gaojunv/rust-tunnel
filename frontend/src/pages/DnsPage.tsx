@@ -24,7 +24,9 @@ import DnsConfigCard from '@/components/dns/DnsConfigCard';
 import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
+import { getApiErrorMessage } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
+import { toast } from 'sonner';
 import { Plus, Trash2 } from 'lucide-react';
 
 export default function DnsPage() {
@@ -58,6 +60,9 @@ export default function DnsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dns-records'] });
     },
+    onError: (err: unknown) => {
+      toast.error(t('dns.deleteFailed', { error: getApiErrorMessage(err) }));
+    },
   });
 
   const handleAdd = (e: React.FormEvent) => {
@@ -88,8 +93,9 @@ export default function DnsPage() {
             </DialogHeader>
             <form onSubmit={handleAdd} className="space-y-4">
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('dns.name')}</label>
+                <label htmlFor="dns-name" className="text-sm font-medium">{t('dns.name')}</label>
                 <Input
+                  id="dns-name"
                   value={newRecord.name}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, name: e.target.value })
@@ -99,8 +105,9 @@ export default function DnsPage() {
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('dns.type')}</label>
+                <label htmlFor="dns-type" className="text-sm font-medium">{t('dns.type')}</label>
                 <select
+                  id="dns-type"
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   value={newRecord.record_type}
                   onChange={(e) =>
@@ -113,8 +120,9 @@ export default function DnsPage() {
                 </select>
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('dns.value')}</label>
+                <label htmlFor="dns-value" className="text-sm font-medium">{t('dns.value')}</label>
                 <Input
+                  id="dns-value"
                   value={newRecord.value}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, value: e.target.value })

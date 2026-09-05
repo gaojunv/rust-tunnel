@@ -214,6 +214,7 @@ export default function DashboardPage() {
                       <Button
                         variant="ghost"
                         size="icon"
+                        aria-label={t('dashboard.clientList.viewDetails', { name: client.name })}
                         className="h-8 w-8 text-muted-foreground hover:text-foreground"
                         onClick={() => navigate(`/clients/${client.name}`)}
                       >

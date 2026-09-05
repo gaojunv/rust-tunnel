@@ -130,6 +130,7 @@
   },
   "login": {
     "subtitle": "Enter your password to continue",
+    "passwordLabel": "Password",
     "passwordPlaceholder": "Password",
     "signIn": "Login",
     "signingIn": "Logging in...",
@@ -165,7 +166,8 @@
       "version": "Version",
       "referenced": "Referenced",
       "actions": "Actions",
-      "empty": "No clients registered"
+      "empty": "No clients registered",
+      "viewDetails": "View details for {{name}}"
     }
   },
   "clients": {
@@ -245,6 +247,7 @@
         "actions": "Actions"
       },
       "deleteConfirm": "Delete proxy rule \"{{name}}\"?",
+      "actionsMenu": "Proxy rule actions",
       "backendCount": "{{count}} backends"
     },
     "certStatus": {
@@ -407,6 +410,7 @@
     "config": {
       "title": "ACME Configuration",
       "edit": "Edit",
+      "toggleDetails": "Toggle ACME details",
       "fields": {
         "serverUrl": "Server URL",
         "email": "Email",
@@ -449,7 +453,8 @@
       "deleteConfirm": "Delete certificate for \"{{domain}}\"?",
       "actions": {
         "renew": "Renew",
-        "delete": "Delete"
+        "delete": "Delete",
+        "menu": "Certificate actions"
       }
     },
     "consumers": {
@@ -538,6 +543,7 @@
     "adding": "Adding...",
     "failedAdd": "Failed to add record. Please try again.",
     "confirmDelete": "Delete DNS record \"{{name}}\"?",
+    "deleteFailed": "Failed to delete DNS record: {{error}}",
     "config": {
       "title": "DNS Configuration",
       "tunnelDomain": "Tunnel Domain",
@@ -585,6 +591,12 @@
       "unsaved": "Unsaved changes"
     },
     "providerCard": {
+      "expand": "Expand provider",
+      "collapse": "Collapse provider",
+      "editProvider": "Edit provider",
+      "deleteProvider": "Delete provider",
+      "editModel": "Edit model",
+      "deleteModel": "Delete model",
       "baseUrl": "Base URL: {{url}}",
       "anthropicUrl": "Anthropic URL: {{url}}",
       "modelNamePlaceholder": "Model name (e.g., deepseek-chat)",
@@ -621,6 +633,7 @@
       "empty": "No API keys created yet.",
       "unnamed": "Unnamed",
       "revokeConfirm": "Revoke this API key?",
+      "revoke": "Revoke API key",
       "dismiss": "Dismiss",
       "kbBind": "Bind Knowledge Base",
       "kbNone": "None",
@@ -641,6 +654,9 @@
         "halfOpen": "Probing",
         "open": "Open {{secs}}s"
       },
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "removeMember": "Remove member",
       "nameRequired": "Group name is required",
       "saveError": "Save failed: {{error}}"
     },
@@ -1122,6 +1138,7 @@
     "contextUsageTooltip": "Context usage: {{used}} / {{size}} tokens",
     "contextCompactHint": "Click to compact context",
     "turnDuration": "Last turn took",
+    "tasks": "Tasks",
     "plan": "Plan",
     "toolFailed": "Failed",
     "exitCode": "exit {{code}}",

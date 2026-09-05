@@ -228,13 +228,14 @@ export default function LogsPage() {
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-2">
             <Switch
+              id="llm-logging-switch"
               checked={llmLogging?.enabled ?? true}
               onCheckedChange={(checked) => setLlmLogging(checked)}
               disabled={isToggling}
             />
-            <span className="text-sm text-muted-foreground">
+            <label htmlFor="llm-logging-switch" className="text-sm text-muted-foreground cursor-pointer">
               {t('logs.llmLogging')}
-            </span>
+            </label>
           </div>
           <Select value={serverLogLevel} onValueChange={handleServerLogLevelChange}>
             <SelectTrigger className="w-[130px]">
@@ -414,7 +415,7 @@ export default function LogsPage() {
           {isPaused && (
             <Badge
               variant="outline"
-              className="border-amber-500/25 bg-amber-500/10 text-amber-500"
+              className="border-amber-500/25 bg-amber-500/10 text-amber-600 dark:text-amber-400"
             >
               {t('logs.footer.paused')}
             </Badge>

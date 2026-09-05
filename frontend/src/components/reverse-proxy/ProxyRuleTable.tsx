@@ -186,7 +186,7 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
                   <TableCell>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon">
+                        <Button variant="ghost" size="icon" aria-label={t('reverseProxy.table.actionsMenu')}>
                           <MoreHorizontal className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>

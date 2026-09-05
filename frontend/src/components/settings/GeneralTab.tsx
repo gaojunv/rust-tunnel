@@ -120,7 +120,7 @@ export default function GeneralTab() {
                 />
               </p>
               {!acmeStatus?.enabled && (
-                <p className="mt-2 text-amber-500">
+                <p className="mt-2 text-amber-600 dark:text-amber-400">
                   ⚠ {t('settings.general.acmeWarning')}
                 </p>
               )}

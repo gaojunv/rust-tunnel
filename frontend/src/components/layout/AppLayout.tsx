@@ -1,5 +1,6 @@
 import { Suspense, useCallback } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { Header, MobileMenuFab } from './Header';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
@@ -8,6 +9,7 @@ import { AgentNotificationsProvider } from '@/notifications/NotificationProvider
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 
 export default function AppLayout() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
   // 移动端（< md）不渲染页头：菜单按钮由 MobileMenuFab 悬浮在右上角，
@@ -37,7 +39,7 @@ export default function AppLayout() {
     <Suspense
       fallback={
         <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
-          Loading…
+          {t('common.loading')}
         </div>
       }
     >

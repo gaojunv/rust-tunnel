@@ -51,7 +51,7 @@ export function PageHeader({ title, description, children, className }: PageHead
         )}
       </div>
 
-      <div className="relative">
+      <div className="relative pr-12 sm:pr-0">
         {/* flex + items-center：让 TitleEffectSwitch 的三种模式（纯 inline span /
             inline-block 包 canvas）都以 flex item 形式布局，高度计算一致，
             避免切换 titleEffect 时 h1 行盒受 baseline/strut 影响而轻微变化。 */}

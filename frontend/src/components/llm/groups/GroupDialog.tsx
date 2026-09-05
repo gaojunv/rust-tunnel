@@ -179,15 +179,16 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
                   <span className="ml-2 text-xs text-muted-foreground">{m.provider_name}</span>
                 </span>
                 {breakerBadge(m.model_id)}
-                <Button size="icon" variant="ghost" onClick={() => move(i, -1)} disabled={i === 0}>
+                <Button size="icon" variant="ghost" aria-label={t('llm.groups.moveUp')} onClick={() => move(i, -1)} disabled={i === 0}>
                   <ArrowUp className="h-4 w-4" />
                 </Button>
-                <Button size="icon" variant="ghost" onClick={() => move(i, 1)} disabled={i === members.length - 1}>
+                <Button size="icon" variant="ghost" aria-label={t('llm.groups.moveDown')} onClick={() => move(i, 1)} disabled={i === members.length - 1}>
                   <ArrowDown className="h-4 w-4" />
                 </Button>
                 <Button
                   size="icon"
                   variant="ghost"
+                  aria-label={t('llm.groups.removeMember')}
                   onClick={() => setMembers(members.filter((_, j) => j !== i))}
                 >
                   <Trash2 className="h-4 w-4" />

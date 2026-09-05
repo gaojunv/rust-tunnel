@@ -130,6 +130,7 @@
   },
   "login": {
     "subtitle": "输入密码即可继续",
+    "passwordLabel": "密码",
     "passwordPlaceholder": "密码",
     "signIn": "登录",
     "signingIn": "登录中...",
@@ -165,7 +166,8 @@
       "version": "版本",
       "referenced": "被引用",
       "actions": "操作",
-      "empty": "暂无注册的客户端"
+      "empty": "暂无注册的客户端",
+      "viewDetails": "查看 {{name}} 详情"
     }
   },
   "clients": {
@@ -245,7 +247,8 @@
         "actions": "操作"
       },
       "deleteConfirm": "删除代理规则「{{name}}」？",
-      "backendCount": "{{count}} 个后端"
+      "backendCount": "{{count}} 个后端",
+      "actionsMenu": "代理规则操作"
     },
     "certStatus": {
       "none": {
@@ -433,7 +436,8 @@
         "tosError": "必须同意服务条款才能启用 ACME",
         "saveError": "保存配置失败，请重试。",
         "save": "保存配置"
-      }
+      },
+      "toggleDetails": "切换 ACME 详情"
     },
     "certificates": {
       "title": "证书",
@@ -449,7 +453,8 @@
       "deleteConfirm": "删除证书「{{domain}}」？",
       "actions": {
         "renew": "续期",
-        "delete": "删除"
+        "delete": "删除",
+        "menu": "证书操作"
       }
     },
     "consumers": {
@@ -538,6 +543,7 @@
     "adding": "添加中...",
     "failedAdd": "添加记录失败，请重试。",
     "confirmDelete": "删除 DNS 记录「{{name}}」？",
+    "deleteFailed": "删除 DNS 记录失败：{{error}}",
     "config": {
       "title": "DNS 配置",
       "tunnelDomain": "隧道域名后缀",
@@ -596,7 +602,13 @@
       "protocolResponses": "Responses",
       "deleteProviderConfirm": "删除此供应商及其所有模型？",
       "deleteModelConfirm": "删除模型「{{name}}」？",
-      "addModel": "添加"
+      "addModel": "添加",
+      "expand": "展开供应商",
+      "collapse": "收起供应商",
+      "editProvider": "编辑供应商",
+      "deleteProvider": "删除供应商",
+      "editModel": "编辑模型",
+      "deleteModel": "删除模型"
     },
     "providerDialog": {
       "editTitle": "编辑供应商",
@@ -625,7 +637,8 @@
       "kbBind": "绑定知识库",
       "kbNone": "无",
       "kbDeleted": "已删除",
-      "bindError": "绑定失败：{{error}}"
+      "bindError": "绑定失败：{{error}}",
+      "revoke": "撤销 API 密钥"
     },
     "groups": {
       "add": "新建模型组",
@@ -642,7 +655,10 @@
         "open": "熔断中 {{secs}}s"
       },
       "nameRequired": "请输入组名",
-      "saveError": "保存失败：{{error}}"
+      "saveError": "保存失败：{{error}}",
+      "moveUp": "上移",
+      "moveDown": "下移",
+      "removeMember": "移除成员"
     },
     "usage": {
       "stats": {
@@ -1317,7 +1333,8 @@
     "gitMoreActions": "更多操作",
     "githubViewLogsLabel": "查看日志",
     "githubLogs": "日志",
-    "githubSearchLogsPlaceholder": "搜索日志…"
+    "githubSearchLogsPlaceholder": "搜索日志…",
+    "tasks": "任务"
   },
   "logs": {
     "title": "日志",
