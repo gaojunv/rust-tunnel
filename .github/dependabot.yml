@@ -9,14 +9,13 @@ updates:
       time: "09:00"
       timezone: Asia/Shanghai
     open-pull-requests-limit: 10
-    # 组内只聚合 minor/patch（pre-1.0 的 minor 视为 major，自动排除）；
-    # major 升级以独立 PR 出现，作为需要代码迁移的显式待办。
+    # cargo 组只聚合 patch：本仓库大量核心依赖为 0.x（axum/rustls/sqlx/eframe…），
+    # 其 minor 段变化即破坏性升级，进组必然编不过，让它们以独立 PR 显式出现。
     groups:
       rust-dependencies:
         patterns:
           - "*"
         update-types:
-          - minor
           - patch
 
   # 管理前端
@@ -35,6 +34,12 @@ updates:
         update-types:
           - minor
           - patch
+    # eslint-plugin-react-refresh 0.5 要求 eslint ≥9，当前 eslint 8；
+    # 待工具链整体升级（eslint 10 + typescript-eslint 8）后移除此忽略。
+    ignore:
+      - dependency-name: eslint-plugin-react-refresh
+        versions:
+          - "0.5.x"
 
   # Wiki 桌面端 UI
   - package-ecosystem: npm
