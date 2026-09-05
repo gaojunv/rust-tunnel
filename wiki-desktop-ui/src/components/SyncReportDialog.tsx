@@ -34,6 +34,7 @@ function ActionIcon({ kind }: { kind: string }) {
       return <Download className="size-4 shrink-0 text-green-600" />;
     case "conflict-local-wins":
     case "conflict-remote-wins":
+    case "conflict-pending":
       return <AlertTriangle className="size-4 shrink-0 text-amber-600" />;
     case "restore-remote":
       return <RotateCcw className="size-4 shrink-0 text-purple-600" />;
@@ -61,6 +62,8 @@ function kindLabel(kind: string): string {
       return "冲突（本地胜）";
     case "conflict-remote-wins":
       return "冲突（远端胜）";
+    case "conflict-pending":
+      return "冲突（待解决）";
     case "restore-remote":
       return "恢复远端";
     case "delete-remote":
@@ -112,6 +115,9 @@ export function SyncReportDialog({ report, onClose, onNavigate }: Props) {
         {/* 头部 */}
         <div className="border-b px-4 py-3">
           <h2 className="text-sm font-semibold">同步报告</h2>
+          {report.conflicts > 0 && (
+            <p className="mt-1 text-xs text-amber-600">{report.conflicts} 个冲突待解决</p>
+          )}
           {/* 计数行 */}
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="rounded bg-blue-100 px-2 py-0.5 text-blue-700 dark:bg-blue-900 dark:text-blue-200">
@@ -142,7 +148,7 @@ export function SyncReportDialog({ report, onClose, onNavigate }: Props) {
             <ul className="space-y-1.5">
               {report.items.map((item, idx) => {
                 const isConflict =
-                  item.action.kind === "conflict-local-wins" || item.action.kind === "conflict-remote-wins";
+                  item.action.kind === "conflict-local-wins" || item.action.kind === "conflict-remote-wins" || item.action.kind === "conflict-pending";
                 // 跳过类与普通项：key 可点击（含 .conflict- 副本 key 同样可点击）
                 const keyClickable = true;
                 return (

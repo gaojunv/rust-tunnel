@@ -94,6 +94,7 @@ export type Action =
   | { kind: "download"; key: string; ref: string }
   | { kind: "conflict-local-wins"; key: string; ref: string }
   | { kind: "conflict-remote-wins"; key: string; ref: string }
+  | { kind: "conflict-pending"; key: string; ref: string; localModified: number; remoteUpdatedAt: string }
   | { kind: "restore-remote"; key: string; ref: string }
   | { kind: "delete-remote"; key: string; ref: string }
   | { kind: "drop-state"; key: string }
@@ -109,8 +110,9 @@ export function planSync(input: {
   remote: RemotePageSummary[];
   state: SyncState;
   propagateDeletes: boolean;
+  deferConflicts?: boolean;
 }): Action[] {
-  const { local, remote, state, propagateDeletes } = input;
+  const { local, remote, state, propagateDeletes, deferConflicts = false } = input;
   const remoteByRef = new Map<string, RemotePageSummary>();
   for (const r of remote) remoteByRef.set(r.ref, r);
 
@@ -152,6 +154,14 @@ export function planSync(input: {
       // 首次见面
       if (r == null) {
         actions.push({ kind: "upload", key: note.key, ref });
+      } else if (deferConflicts) {
+        actions.push({
+          kind: "conflict-pending",
+          key: note.key,
+          ref,
+          localModified: note.modified,
+          remoteUpdatedAt: r.updated_at,
+        });
       } else {
         const localWins = note.modified >= parseRemoteTime(r.updated_at);
         actions.push({
@@ -179,6 +189,14 @@ export function planSync(input: {
           actions.push({ kind: "upload", key: note.key, ref });
         } else if (!localChanged && remoteChanged) {
           actions.push({ kind: "download", key: note.key, ref });
+        } else if (deferConflicts) {
+          actions.push({
+            kind: "conflict-pending",
+            key: note.key,
+            ref,
+            localModified: note.modified,
+            remoteUpdatedAt: r.updated_at,
+          });
         } else {
           // 都变 → 冲突，新的赢（相等算本地赢）
           const localWins = note.modified >= parseRemoteTime(r.updated_at);
@@ -372,6 +390,11 @@ export async function runSync(
             localHash: note.contentHash,
             remoteUpdatedAt: result.updated_at,
           };
+          report.items.push({ action, ok: true });
+          report.conflicts++;
+          break;
+        }
+        case "conflict-pending": {
           report.items.push({ action, ok: true });
           report.conflicts++;
           break;

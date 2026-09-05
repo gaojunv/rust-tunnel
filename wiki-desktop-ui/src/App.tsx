@@ -7,16 +7,14 @@ import { RightPanel } from "@/components/RightPanel";
 import { AiChatPanel } from "@/components/ai/AiChatPanel";
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
-import { getNote, listNotesFull, readSyncState, saveNote, setNoteRef, vaultInfo, writeSyncState } from "@/api/tauri";
+import { getNote, saveNote, vaultInfo } from "@/api/tauri";
 import type { VaultInfo } from "@/api/types";
 import { useNoteHistory } from "@/lib/use-note-history";
 import { QuickSwitcher } from "@/components/QuickSwitcher";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { SyncReportDialog } from "@/components/SyncReportDialog";
-import { createServerApi, loadSyncConfig } from "@/api/server";
-import { AuthExpiredError, clearToken } from "@/lib/server-auth";
-import { emptySyncState, hashNote, planSync, runSync, type LocalNote, type SyncReport, type SyncState } from "@/lib/sync-engine";
-import { ensureCompatibleRefs } from "@/lib/compat-refs";
+import { ConflictResolveDialog } from "@/components/ConflictResolveDialog";
+import { useSync } from "@/lib/use-sync";
 
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix } =
@@ -27,10 +25,28 @@ export default function App() {
   const [editorDirty, setEditorDirty] = useState(false);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [report, setReport] = useState<SyncReport | null>(null);
   const editorRef = useRef<NoteEditorHandle>(null);
   const previewContainerRef = useRef<HTMLDivElement | null>(null);
+  const bumpRefreshToken = useCallback(() => setRefreshToken((n) => n + 1), []);
+  const {
+    status: syncStatus,
+    report,
+    setReport,
+    syncNow,
+    scheduleAutoSync,
+    pendingConflicts,
+    syncState,
+    clearPendingConflict,
+  } = useSync({
+    flushSave: () => editorRef.current?.flushSave() ?? Promise.resolve(),
+    onRefresh: bumpRefreshToken,
+    editorOpenKey: selectedKey,
+    refreshToken,
+    onNeedSettings: () => setSettingsOpen(true),
+  });
+  const syncing = syncStatus.phase === "syncing";
+  const [reportDialogOpen, setReportDialogOpen] = useState(false);
+  const [conflictOpen, setConflictOpen] = useState(false);
 
   const reloadVault = useCallback(() => {
     vaultInfo()
@@ -47,41 +63,42 @@ export default function App() {
   }, [refreshToken, reloadVault]);
 
   const handleNavigate = useCallback(
-    (nextKey: string) => {
-      if (editorDirty) {
-        const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
-        if (!ok) return;
+    async (nextKey: string) => {
+      try {
+        await editorRef.current?.flushSave();
+      } catch {
+        if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
       }
       navigate(nextKey);
-      setEditorDirty(false);
       setMode("preview");
     },
-    [editorDirty, navigate],
+    [navigate],
   );
 
-  const handleBack = useCallback(() => {
-    if (editorDirty) {
-      const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
-      if (!ok) return;
+  const handleBack = useCallback(async () => {
+    try {
+      await editorRef.current?.flushSave();
+    } catch {
+      if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
     }
     back();
-    setEditorDirty(false);
     setMode("preview");
-  }, [editorDirty, back]);
+  }, [back]);
 
-  const handleForward = useCallback(() => {
-    if (editorDirty) {
-      const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
-      if (!ok) return;
+  const handleForward = useCallback(async () => {
+    try {
+      await editorRef.current?.flushSave();
+    } catch {
+      if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
     }
     forward();
-    setEditorDirty(false);
     setMode("preview");
-  }, [editorDirty, forward]);
+  }, [forward]);
 
   const handleSaved = useCallback(() => {
     setRefreshToken((n) => n + 1);
-  }, []);
+    scheduleAutoSync();
+  }, [scheduleAutoSync]);
 
   const handleDeleted = useCallback(
     (deletedKey?: string) => {
@@ -110,9 +127,10 @@ export default function App() {
 
   const handleCreateNote = useCallback(
     async (key: string, title: string) => {
-      if (editorDirty) {
-        const ok = window.confirm("有未保存的改动，确定要切换笔记吗？未保存的内容会丢失。");
-        if (!ok) return;
+      try {
+        await editorRef.current?.flushSave();
+      } catch {
+        if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
       }
       try {
         await saveNote(key, "", title);
@@ -124,7 +142,7 @@ export default function App() {
         window.alert(msg);
       }
     },
-    [editorDirty, navigate],
+    [navigate],
   );
 
   const handleRenamed = useCallback(
@@ -154,92 +172,6 @@ export default function App() {
     [removePrefix],
   );
 
-  // 同步主流程
-  const handleSync = useCallback(async () => {
-    if (editorDirty) {
-      window.alert("有未保存的改动，请先保存后再同步。");
-      return;
-    }
-    const cfg = loadSyncConfig();
-    if (!cfg?.baseUrl || !cfg?.knowledgeId) {
-      setSettingsOpen(true);
-      return;
-    }
-
-    setSyncing(true);
-    try {
-      const notes = await listNotesFull();
-      const local: LocalNote[] = [];
-      const localByKey = new Map<string, LocalNote>();
-      for (const dto of notes) {
-        const h = await hashNote(dto.title, dto.body);
-        const ln: LocalNote = {
-          key: dto.key,
-          refId: (dto.ref_id as string | null | undefined) ?? null,
-          title: dto.title,
-          body: dto.body,
-          modified: dto.modified,
-          contentHash: h,
-        };
-        local.push(ln);
-        localByKey.set(dto.key, ln);
-      }
-
-      let state: SyncState;
-      try {
-        const raw = await readSyncState();
-        if (!raw) {
-          state = emptySyncState(cfg.knowledgeId);
-        } else {
-          const parsed = JSON.parse(raw) as SyncState;
-          if (!parsed || parsed.knowledgeId !== cfg.knowledgeId || parsed.version !== 1) {
-            state = emptySyncState(cfg.knowledgeId);
-          } else {
-            state = parsed;
-          }
-        }
-      } catch {
-        state = emptySyncState(cfg.knowledgeId);
-      }
-
-      await ensureCompatibleRefs(local, async (key, ref) => {
-        const dto = await setNoteRef(key, ref);
-        return { modified: dto.modified };
-      });
-
-      const serverApi = createServerApi(cfg.baseUrl, cfg.knowledgeId);
-      const remote = await serverApi.listAllPages();
-
-      const plan = planSync({ local, remote, state, propagateDeletes: cfg.propagateDeletes });
-      const io = {
-        local: {
-          writeNote: async (key: string, title: string, body: string) => {
-            const dto = await saveNote(key, body, title);
-            return { modified: dto.modified };
-          },
-        },
-        remote: serverApi,
-        now: () => Math.floor(Date.now() / 1000),
-      };
-      const syncReport = await runSync(plan, { localByKey, io, state });
-
-      await writeSyncState(JSON.stringify(state));
-      setRefreshToken((n) => n + 1);
-      setReport(syncReport);
-    } catch (e: unknown) {
-      if (e instanceof AuthExpiredError) {
-        clearToken(cfg.baseUrl);
-        window.alert("登录已过期，请重新登录");
-        setSettingsOpen(true);
-      } else {
-        const msg = e instanceof Error ? e.message : String(e);
-        window.alert(`同步失败：${msg}`);
-      }
-    } finally {
-      setSyncing(false);
-    }
-  }, [editorDirty]);
-
   // 全局导航快捷键
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -263,10 +195,10 @@ export default function App() {
       if (!isAlt && !isCtrl) return;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        handleBack();
+        void handleBack();
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        handleForward();
+        void handleForward();
       }
     };
     window.addEventListener("keydown", handler);
@@ -291,27 +223,56 @@ export default function App() {
     editorRef.current?.scrollToLine(line);
   }, []);
 
+
+  const manualSyncPendingRef = useRef(false);
+  const handleManualSync = useCallback(() => {
+    manualSyncPendingRef.current = true;
+    void syncNow();
+  }, [syncNow]);
+  useEffect(() => {
+    if (!report) {
+      setReportDialogOpen(false);
+      return;
+    }
+    if (pendingConflicts.length > 0) {
+      setConflictOpen(true);
+      return;
+    }
+    if (manualSyncPendingRef.current) {
+      manualSyncPendingRef.current = false;
+      setReportDialogOpen(true);
+      return;
+    }
+    if (report.errors > 0 || report.conflicts > 0) {
+      setReportDialogOpen(true);
+    }
+  }, [report, pendingConflicts.length]);
+  useEffect(() => {
+    if (pendingConflicts.length > 0) setConflictOpen(true);
+  }, [pendingConflicts.length]);
   return (
     <div className="flex h-screen flex-col bg-background">
       <TitleBar
         dirty={editorDirty}
         canBack={canBack}
         canForward={canForward}
-        onBack={handleBack}
-        onForward={handleForward}
+        onBack={() => void handleBack()}
+        onForward={() => void handleForward()}
         onOpenSwitcher={() => setSwitcherOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
         syncing={syncing}
+        syncStatus={syncStatus}
+        onSyncNow={() => void handleManualSync()}
       />
 
       <div className="flex min-h-0 flex-1">
         <aside className="w-[300px] shrink-0 border-r bg-sidebar max-[900px]:w-[260px]">
           <WikiSidebar
             selectedKey={selectedKey}
-            onSelect={handleNavigate}
+            onSelect={(k) => void handleNavigate(k)}
             refreshToken={refreshToken}
             vaultInfo={vault}
-            onCreateNote={handleCreateNote}
+            onCreateNote={(k, t) => void handleCreateNote(k, t)}
             onFolderChanged={handleFolderChanged}
             onHistoryReplacePrefix={handleHistoryReplacePrefix}
             onHistoryRemovePrefix={handleHistoryRemovePrefix}
@@ -328,7 +289,7 @@ export default function App() {
             onSaved={handleSaved}
             onDeleted={handleDeleted}
             onDirtyChange={setEditorDirty}
-            onNavigate={handleNavigate}
+            onNavigate={(k) => void handleNavigate(k)}
             onCreate={handleCreated}
             onRenamed={handleRenamed}
             onOpenSettings={() => setSettingsOpen(true)}
@@ -343,7 +304,7 @@ export default function App() {
               <GraphPanel
                 selectedKey={selectedKey}
                 refreshToken={refreshToken}
-                onNavigate={handleNavigate}
+                onNavigate={(k) => void handleNavigate(k)}
                 onCreate={handleCreated}
               />
             }
@@ -358,7 +319,7 @@ export default function App() {
               <BacklinksPanel
                 selectedKey={selectedKey}
                 refreshToken={refreshToken}
-                onNavigate={handleNavigate}
+                onNavigate={(k) => void handleNavigate(k)}
               />
             }
             tocPanel={
@@ -377,13 +338,21 @@ export default function App() {
       <QuickSwitcher
         open={switcherOpen}
         onClose={() => setSwitcherOpen(false)}
-        onSelect={handleNavigate}
+        onSelect={(k) => void handleNavigate(k)}
       />
       {settingsOpen && (
-        <SettingsDialog onClose={() => setSettingsOpen(false)} onSync={() => void handleSync()} />
+        <SettingsDialog onClose={() => setSettingsOpen(false)} onSync={() => void handleManualSync()} />
       )}
-      {report && (
-        <SyncReportDialog report={report} onClose={() => setReport(null)} onNavigate={handleNavigate} />
+      {conflictOpen && pendingConflicts.length > 0 && syncState && (
+        <ConflictResolveDialog
+          conflicts={pendingConflicts}
+          state={syncState}
+          onResolved={(k) => { clearPendingConflict(k); bumpRefreshToken(); }}
+          onClose={() => { setConflictOpen(false); bumpRefreshToken(); }}
+        />
+      )}
+      {reportDialogOpen && report && !(conflictOpen && pendingConflicts.length > 0) && (
+        <SyncReportDialog report={report} onClose={() => { setReportDialogOpen(false); setReport(null); }} onNavigate={(k) => void handleNavigate(k)} />
       )}
     </div>
   );

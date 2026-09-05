@@ -11,7 +11,8 @@
 
 use crate::commands;
 use crate::dto::{
-    DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo,
+    AttachmentDto, DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult,
+    SearchHitDto, VaultInfo,
 };
 use crate::error::IpcResult;
 use crate::state::AppState;
@@ -196,6 +197,33 @@ pub fn set_note_ref(
     commands::set_note_ref(&state, key, ref_id)
 }
 
+/// 读取附件。
+///
+/// # Errors
+///
+/// 透传 [`commands::read_attachment`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn read_attachment(state: tauri::State<'_, AppState>, rel_path: String) -> IpcResult<Vec<u8>> {
+    commands::read_attachment(&state, rel_path)
+}
+
+/// 保存附件。
+///
+/// # Errors
+///
+/// 透传 [`commands::save_attachment`] 的错误。
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn save_attachment(
+    state: tauri::State<'_, AppState>,
+    note_key: String,
+    file_name: String,
+    data: Vec<u8>,
+) -> IpcResult<AttachmentDto> {
+    commands::save_attachment(&state, note_key, file_name, data)
+}
+
 /// 启动 Tauri 应用.
 ///
 /// 首启时确保 vault 根目录存在且非空（空 vault 写入 `welcome.md`），随后
@@ -220,9 +248,11 @@ pub fn run() -> tauri::Result<()> {
             get_vault_info,
             list_notes,
             list_notes_full,
+            read_attachment,
             read_sync_state,
             rename_folder,
             rename_note,
+            save_attachment,
             save_note,
             search_notes,
             set_note_ref,

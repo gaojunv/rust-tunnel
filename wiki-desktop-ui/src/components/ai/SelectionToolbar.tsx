@@ -1,6 +1,3 @@
-/**
- * 选区浮动工具条 —— 挂在 NoteEditor 编辑态，随选区出现，mirror-div 定位
- */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -10,29 +7,25 @@ import { chatStream } from "@/lib/ai-client";
 import { getAiConfig } from "@/lib/ai-config";
 import { loadSyncConfig } from "@/api/server";
 import { getToken } from "@/lib/server-auth";
-import { measureCaretInTextarea } from "@/lib/caret-position";
 import { Streamdown } from "streamdown";
 import "streamdown/styles.css";
+import type { SelectionSource } from "@/lib/selection-source";
 
 type Props = {
-  textareaRef: React.RefObject<HTMLTextAreaElement>;
+  source: SelectionSource;
   containerRef: React.RefObject<HTMLDivElement>;
   noteTitle: string;
   noteBody: string;
   noteKey: string | null;
-  onReplaceSelection: (text: string) => void;
-  onInsertAfterSelection: (text: string) => void;
   onOpenSettings: () => void;
 };
 
 export function SelectionToolbar({
-  textareaRef,
+  source,
   containerRef,
   noteTitle,
   noteBody,
   noteKey,
-  onReplaceSelection,
-  onInsertAfterSelection,
   onOpenSettings,
 }: Props) {
   const [visible, setVisible] = useState(false);
@@ -45,83 +38,79 @@ export function SelectionToolbar({
   const [error, setError] = useState<string | null>(null);
 
   const updateSelection = useCallback(() => {
-    const ta = textareaRef.current;
-    if (!ta) {
+    const sel = source.getSelection();
+    if (!sel) {
       setVisible(false);
       setSelection(null);
       return;
     }
-    const start = ta.selectionStart ?? 0;
-    const end = ta.selectionEnd ?? 0;
-    if (start === end) {
-      setVisible(false);
-      setSelection(null);
-      return;
-    }
-    const text = ta.value.slice(start, end);
-    if (!text.trim()) {
-      setVisible(false);
-      setSelection(null);
-      return;
-    }
-    setSelection({ text, start, end });
-    // 定位：mirror-div 法，相对容器
+    setSelection(sel);
     try {
-      const caret = measureCaretInTextarea(ta, end);
-      const container = containerRef.current;
-      if (container) {
-        const cRect = container.getBoundingClientRect();
-        const taRect = ta.getBoundingClientRect();
-        // caret 相对 textarea 内容区，换算到容器坐标
-        const top = taRect.top - cRect.top + caret.top - 36;
-        const left = taRect.left - cRect.left + caret.left;
-        // 边界收敛：尽量不超出容器
-        const clampedLeft = Math.max(4, Math.min(left, container.clientWidth - 160));
-        const clampedTop = Math.max(4, top);
-        setPos({ top: clampedTop, left: clampedLeft });
+      const caret = source.getCaretRect(sel.end);
+      if (caret) {
+        const cRect = containerRef.current?.getBoundingClientRect();
+        let top: number;
+        let left: number;
+        if (cRect && containerRef.current) {
+          // caret is already container-relative from the adapter
+          top = caret.top - 36;
+          left = caret.left;
+          const clampedLeft = Math.max(4, Math.min(left, containerRef.current.clientWidth - 160));
+          const clampedTop = Math.max(4, top);
+          setPos({ top: clampedTop, left: clampedLeft });
+        } else {
+          setPos({ top: caret.top - 36, left: caret.left });
+        }
       } else {
-        setPos({ top: caret.top - 36, left: caret.left });
+        setPos(null);
       }
     } catch {
       setPos(null);
     }
     setVisible(true);
-  }, [textareaRef, containerRef]);
+  }, [source, containerRef]);
 
   const handleSelect = useCallback(() => {
-    // 选区变化后下一帧再测，避免 selectionStart 尚未更新
     requestAnimationFrame(() => updateSelection());
   }, [updateSelection]);
 
-  // 监听 textarea 事件
+  // polling-based selection detection — CM does not emit textarea select/mouseup events reliably
+  // requestAnimationFrame polling is cheap and torn down when selection is stable
   useEffect(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const onMouseUp = () => handleSelect();
-    const onKeyUp = () => handleSelect();
-    const onSelect = () => handleSelect();
-    const onBlur = () => {
-      // 失焦延迟隐藏，避免点击工具条时先失焦
-      setTimeout(() => {
-        const active = document.activeElement;
-        // 若焦点仍在工具条内则不隐藏
-        if (active && containerRef.current?.contains(active as Node)) return;
-        // 否则若仍有选区则保留，切换笔记时由 noteKey 变化隐藏
-      }, 150);
+    let raf: number | null = null;
+    let lastKey = "";
+    const tick = () => {
+      const sel = source.getSelection();
+      const key = sel ? `${sel.start}:${sel.end}` : "";
+      if (key !== lastKey) {
+        lastKey = key;
+        handleSelect();
+      }
+      raf = requestAnimationFrame(tick);
     };
-    ta.addEventListener("mouseup", onMouseUp);
-    ta.addEventListener("keyup", onKeyUp);
-    ta.addEventListener("select", onSelect);
-    ta.addEventListener("blur", onBlur);
+    // use mouseup/keyup as cheaper triggers plus a light interval fallback
+    const onAny = () => handleSelect();
+    window.addEventListener("mouseup", onAny);
+    window.addEventListener("keyup", onAny);
+    // lightweight poll only while component mounted — rAF but throttled via key check so no visual jitter
+    raf = requestAnimationFrame(tick);
+    const interval = window.setInterval(() => {
+      const sel = source.getSelection();
+      const key = sel ? `${sel.start}:${sel.end}` : "";
+      if (key !== lastKey) {
+        lastKey = key;
+        updateSelection();
+      }
+    }, 300);
     return () => {
-      ta.removeEventListener("mouseup", onMouseUp);
-      ta.removeEventListener("keyup", onKeyUp);
-      ta.removeEventListener("select", onSelect);
-      ta.removeEventListener("blur", onBlur);
+      window.removeEventListener("mouseup", onAny);
+      window.removeEventListener("keyup", onAny);
+      if (raf !== null) cancelAnimationFrame(raf);
+      clearInterval(interval);
     };
-  }, [textareaRef, containerRef, handleSelect]);
+  }, [source, handleSelect, updateSelection]);
 
-  // 切换笔记隐藏
+  // reset on note switch
   useEffect(() => {
     setVisible(false);
     setSelection(null);
@@ -172,7 +161,7 @@ export function SelectionToolbar({
         }
       } catch (e: unknown) {
         if ((e as Error)?.name === "AbortError" || ac.signal.aborted) {
-          // 中止
+          // aborted
         } else {
           const msg = e instanceof Error ? e.message : String(e);
           setError(msg);
@@ -186,7 +175,7 @@ export function SelectionToolbar({
     [selection, noteTitle, noteBody, onOpenSettings],
   );
 
-  // Esc 关闭结果/中止流
+  // Esc
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -203,6 +192,18 @@ export function SelectionToolbar({
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [streaming, resultOpen, visible]);
+
+  const handleReplace = useCallback(() => {
+    if (!selection || !result) return;
+    source.replaceRange(selection.start, selection.end, result);
+    setResultOpen(false);
+  }, [selection, result, source]);
+
+  const handleInsertAfter = useCallback(() => {
+    if (!selection || !result) return;
+    source.insertAt(selection.end, "\n" + result);
+    setResultOpen(false);
+  }, [selection, result, source]);
 
   if (!visible || !selection) return null;
 
@@ -251,10 +252,10 @@ export function SelectionToolbar({
             <p className="text-xs text-muted-foreground">暂无结果</p>
           )}
           <div className="mt-3 flex gap-2">
-            <Button type="button" size="sm" className="h-7 text-xs" disabled={!result || streaming} onClick={() => { if (result) onReplaceSelection(result); setResultOpen(false); }}>
+            <Button type="button" size="sm" className="h-7 text-xs" disabled={!result || streaming} onClick={handleReplace}>
               替换选区
             </Button>
-            <Button type="button" variant="outline" size="sm" className="h-7 text-xs" disabled={!result || streaming} onClick={() => { if (result) onInsertAfterSelection("\n" + result); setResultOpen(false); }}>
+            <Button type="button" variant="outline" size="sm" className="h-7 text-xs" disabled={!result || streaming} onClick={handleInsertAfter}>
               插入其后
             </Button>
             <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setResultOpen(false)}>

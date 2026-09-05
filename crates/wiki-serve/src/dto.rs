@@ -179,3 +179,10 @@ pub struct DeleteFolderResult {
     /// 失败的条目。
     pub failed: Vec<FailedEntry>,
 }
+
+/// 附件 DTO（`rel_path` 为 vault 根相对路径，不含前导 `/`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentDto {
+    /// 相对路径，如 `assets/docs-a/20260905-153012-ab12cd34.png`。
+    pub rel_path: String,
+}

@@ -48,11 +48,12 @@ describe("ensureCompatibleRefs", () => {
 
   it("refId 空且 key 不兼容时调用 setRef 且更新 note", async () => {
     const notes = [note({ key: "数据库", refId: null, body: "hello", modified: 1000 })];
-    const setRef = vi.fn(async () => ({ modified: 12345 }));
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const setRef = vi.fn(async (_key: string, _ref: string) => ({ modified: 12345 }));
     const n = await ensureCompatibleRefs(notes, setRef);
     expect(n).toBe(1);
     expect(setRef).toHaveBeenCalledTimes(1);
-    const ref = setRef.mock.calls[0][1] as string;
+    const ref = setRef.mock.calls[0][1];
     expect(ref).toMatch(/^n-[0-9a-f]{12}$/);
     expect(notes[0].refId).toBe(ref);
     expect(notes[0].modified).toBe(12345);

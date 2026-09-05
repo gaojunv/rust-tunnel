@@ -23,6 +23,7 @@ tauri = ["dep:tauri", "dep:tauri-build"]
 
 [dependencies]
 rust-tunnel-wiki-core = { path = "../wiki-core" }
+chrono = { workspace = true }
 petgraph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

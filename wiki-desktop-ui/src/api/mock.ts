@@ -121,6 +121,36 @@ const store = new Map<string, NoteDto>(SEED.map((n) => [n.key, { ...n }]));
 // 同步状态内存存储（对应 read_sync_state / write_sync_state）
 let syncStateJson: string | null = null;
 
+// —— 附件内存存储（save_attachment / read_attachment 的 mock） ——
+const attachmentStore = new Map<string, Uint8Array>();
+let attachmentSeq = 0;
+
+function sanitizeExt(fileName: string): string {
+  const hasDot = fileName.includes(".");
+  const rawExt = hasDot ? (fileName.split(".").pop() ?? "") : "";
+  let out = "";
+  for (const ch of rawExt.trim()) {
+    if (out.length >= 10) break;
+    if (/[A-Za-z0-9]/.test(ch)) out += ch.toLowerCase();
+  }
+  return out || "bin";
+}
+
+function sanitizeKey(noteKey: string): string {
+  return noteKey.replace(/\//g, "-");
+}
+
+function mockAttachmentRelPath(noteKey: string, fileName: string): string {
+  const sanitizedKey = sanitizeKey(noteKey);
+  const ext = sanitizeExt(fileName || "pasted.png");
+  // deterministic-ish：时间戳（mm 占位）+ 递增序号 hex，避免在测试中依赖随机
+  const now = new Date();
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  const ts = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+  const h8 = (attachmentSeq++).toString(16).padStart(8, "0").slice(-8);
+  return `assets/${sanitizedKey}/${ts}-${h8}.${ext}`;
+}
+
 function toSummary(n: NoteDto): NoteSummary {
   return { key: n.key, title: n.title, tags: [...n.tags], modified: n.modified };
 }
@@ -312,6 +342,34 @@ export const mockVault = {
     return { deleted, failed };
   },
 
+  saveAttachment(noteKey: string, fileName: string, data: Uint8Array): { rel_path: string } {
+    // 复用与 Rust validate_key_or_prefix 对齐的简易校验（空 / .. / 绝对路径）
+    if (!noteKey || !noteKey.trim()) throw new Error("空 key");
+    if (noteKey.startsWith("/")) throw new Error(`绝对路径：${noteKey}`);
+    if (noteKey.split("/").some((s) => s === ".." || s === "")) throw new Error(`非法路径：${noteKey}`);
+    const relPath = mockAttachmentRelPath(noteKey, fileName || "pasted.png");
+    attachmentStore.set(relPath, new Uint8Array(data));
+    return { rel_path: relPath };
+  },
+
+  readAttachment(relPath: string): Uint8Array {
+    // 与 Rust 侧一致：非法路径按 “路径逃逸/非法路径”抛错，不存在按 “附件不存在”抛错
+    if (!relPath || !relPath.trim()) throw new Error("空 rel_path");
+    if (relPath.startsWith("/")) throw new Error(`绝对路径：${relPath}`);
+    if (relPath.includes("..")) throw new Error(`路径逃逸：${relPath}`);
+    if (relPath.includes(":")) throw new Error(`非法路径：${relPath}`);
+    if (relPath !== "assets" && !relPath.startsWith("assets/")) throw new Error(`附件路径必须位于 assets/ 之下：${relPath}`);
+    const v = attachmentStore.get(relPath);
+    if (!v) throw new Error(`附件不存在：${relPath}`);
+    return new Uint8Array(v);
+  },
+
+  /** 测试辅助：清空附件存储 */
+  __clearAttachments(): void {
+    attachmentStore.clear();
+    attachmentSeq = 0;
+  },
+
   getGraph(): GraphDto {
     return buildGraph();
   },
@@ -342,7 +400,9 @@ export type MockCommand =
   | "list_notes_full"
   | "read_sync_state"
   | "write_sync_state"
-  | "set_note_ref";
+  | "set_note_ref"
+  | "save_attachment"
+  | "read_attachment";
 
 // —— 内存假服务器（仅用于非 Tauri 环境的 fetch 拦截） ——
 
