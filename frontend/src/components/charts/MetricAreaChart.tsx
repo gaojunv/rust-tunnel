@@ -119,7 +119,7 @@ export const MetricAreaChart = ({
             strokeDasharray="4 4"
             label={
               thresholdLabel
-                ? { value: thresholdLabel, position: 'insideTopRight', fontSize: 10 }
+                ? { value: thresholdLabel, position: 'insideTopRight', fontSize: 10, fill: 'hsl(var(--muted-foreground))' }
                 : undefined
             }
           />
