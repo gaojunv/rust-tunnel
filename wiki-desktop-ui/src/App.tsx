@@ -7,6 +7,7 @@ import { RightPanel } from "@/components/RightPanel";
 import { AiChatPanel } from "@/components/ai/AiChatPanel";
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
+import { PanelResizer } from "@/components/PanelResizer";
 import { getNote, saveNote, vaultInfo } from "@/api/tauri";
 import type { VaultInfo } from "@/api/types";
 import { useNoteHistory } from "@/lib/use-note-history";
@@ -15,6 +16,14 @@ import { SettingsDialog } from "@/components/SettingsDialog";
 import { SyncReportDialog } from "@/components/SyncReportDialog";
 import { ConflictResolveDialog } from "@/components/ConflictResolveDialog";
 import { useSync } from "@/lib/use-sync";
+import {
+  PANEL_LIMITS,
+  defaultRightCollapsed,
+  loadPanelLayout,
+  resolveDragWidth,
+  savePanelLayout,
+  type PanelLayout,
+} from "@/lib/panel-layout";
 
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix } =
@@ -47,6 +56,59 @@ export default function App() {
   const syncing = syncStatus.phase === "syncing";
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
   const [conflictOpen, setConflictOpen] = useState(false);
+
+  // 侧栏布局：宽度/折叠 + 拖拽态（拖拽中禁用 width 过渡）
+  const [layout, setLayout] = useState<PanelLayout>(() => {
+    const loaded = loadPanelLayout();
+    try {
+      const raw = window.localStorage.getItem("wiki.layout.v1");
+      if (raw == null) return loaded;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (typeof parsed.rightCollapsed !== "boolean") {
+        return { ...loaded, rightCollapsed: defaultRightCollapsed(window.innerWidth) };
+      }
+      return loaded;
+    } catch {
+      return loaded;
+    }
+  });
+  const [draggingSide, setDraggingSide] = useState<"left" | "right" | null>(null);
+
+  useEffect(() => {
+    savePanelLayout(layout);
+  }, [layout]);
+
+  const toggleLeft = useCallback(() => {
+    setLayout((prev) => ({ ...prev, leftCollapsed: !prev.leftCollapsed }));
+  }, []);
+  const toggleRight = useCallback(() => {
+    setLayout((prev) => ({ ...prev, rightCollapsed: !prev.rightCollapsed }));
+  }, []);
+
+  const handleDragLeft = useCallback((rawWidth: number) => {
+    const r = resolveDragWidth("left", rawWidth);
+    if (r.collapsed) {
+      setLayout((prev) => ({ ...prev, leftCollapsed: true }));
+      return;
+    }
+    setLayout((prev) => ({ ...prev, leftCollapsed: false, leftWidth: r.width }));
+  }, []);
+
+  const handleDragRight = useCallback((rawWidth: number) => {
+    const r = resolveDragWidth("right", rawWidth);
+    if (r.collapsed) {
+      setLayout((prev) => ({ ...prev, rightCollapsed: true }));
+      return;
+    }
+    setLayout((prev) => ({ ...prev, rightCollapsed: false, rightWidth: r.width }));
+  }, []);
+
+  const handleResetLeft = useCallback(() => {
+    setLayout((prev) => ({ ...prev, leftCollapsed: false, leftWidth: PANEL_LIMITS.left.defaultWidth }));
+  }, []);
+  const handleResetRight = useCallback(() => {
+    setLayout((prev) => ({ ...prev, rightCollapsed: false, rightWidth: PANEL_LIMITS.right.defaultWidth }));
+  }, []);
 
   const reloadVault = useCallback(() => {
     vaultInfo()
@@ -172,9 +234,33 @@ export default function App() {
     [removePrefix],
   );
 
-  // 全局导航快捷键
+  // 全局快捷键：导航 + 侧栏折叠
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // 侧栏折叠快捷键（在输入框内不触发）
+      const target = e.target as HTMLElement | null;
+      const inInput =
+        target != null && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+      if (!inInput) {
+        const isMod = e.ctrlKey || e.metaKey;
+        const lower = e.key.toLowerCase();
+        if (isMod && lower === "b") {
+          if (e.altKey) {
+            if (!document.querySelector("[data-modal-open]")) {
+              e.preventDefault();
+              toggleRight();
+              return;
+            }
+          } else {
+            if (!document.querySelector("[data-modal-open]")) {
+              e.preventDefault();
+              toggleLeft();
+              return;
+            }
+          }
+        }
+      }
+
       if ((e.ctrlKey || e.metaKey) && !e.altKey) {
         const lower = e.key.toLowerCase();
         if (lower === "k" || lower === "p") {
@@ -203,7 +289,7 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [handleBack, handleForward, switcherOpen]);
+  }, [handleBack, handleForward, switcherOpen, toggleLeft, toggleRight]);
 
   const handleAiInsert = useCallback((text: string) => {
     editorRef.current?.insertAtCursor(text);
@@ -222,7 +308,6 @@ export default function App() {
   const handleScrollToLine = useCallback((line: number) => {
     editorRef.current?.scrollToLine(line);
   }, []);
-
 
   const manualSyncPendingRef = useRef(false);
   const handleManualSync = useCallback(() => {
@@ -263,20 +348,52 @@ export default function App() {
         syncing={syncing}
         syncStatus={syncStatus}
         onSyncNow={() => void handleManualSync()}
+        leftVisible={!layout.leftCollapsed}
+        rightVisible={!layout.rightCollapsed}
+        onToggleLeft={toggleLeft}
+        onToggleRight={toggleRight}
       />
 
       <div className="flex min-h-0 flex-1">
-        <aside className="w-[300px] shrink-0 border-r bg-sidebar max-[900px]:w-[260px]">
-          <WikiSidebar
-            selectedKey={selectedKey}
-            onSelect={(k) => void handleNavigate(k)}
-            refreshToken={refreshToken}
-            vaultInfo={vault}
-            onCreateNote={(k, t) => void handleCreateNote(k, t)}
-            onFolderChanged={handleFolderChanged}
-            onHistoryReplacePrefix={handleHistoryReplacePrefix}
-            onHistoryRemovePrefix={handleHistoryRemovePrefix}
-          />
+        <aside
+          className={`relative shrink-0 overflow-hidden bg-sidebar ${layout.leftCollapsed ? "" : "border-r"} ${draggingSide ? "" : "transition-[width] duration-200"}`}
+          style={{ width: layout.leftCollapsed ? 0 : layout.leftWidth }}
+          aria-hidden={layout.leftCollapsed}
+        >
+          <div
+            className="h-full w-full overflow-hidden"
+            style={{
+              width: layout.leftCollapsed ? 0 : layout.leftWidth,
+              minWidth: layout.leftCollapsed ? 0 : layout.leftWidth,
+            }}
+          >
+            <WikiSidebar
+              selectedKey={selectedKey}
+              onSelect={(k) => void handleNavigate(k)}
+              refreshToken={refreshToken}
+              vaultInfo={vault}
+              onCreateNote={(k, t) => void handleCreateNote(k, t)}
+              onFolderChanged={handleFolderChanged}
+              onHistoryReplacePrefix={handleHistoryReplacePrefix}
+              onHistoryRemovePrefix={handleHistoryRemovePrefix}
+            />
+          </div>
+          {!layout.leftCollapsed && (
+            <PanelResizer
+              side="left"
+              currentWidth={layout.leftWidth}
+              dragging={draggingSide === "left"}
+              onDrag={(w) => {
+                if (draggingSide !== "left") setDraggingSide("left");
+                handleDragLeft(w);
+              }}
+              onDragEnd={() => setDraggingSide(null)}
+              onReset={handleResetLeft}
+            />
+          )}
+          <span className="sr-only" aria-hidden>
+            左侧栏
+          </span>
         </aside>
 
         <main className="min-w-0 flex-1 overflow-hidden bg-background">
@@ -298,41 +415,66 @@ export default function App() {
           />
         </main>
 
-        <aside className="hidden w-[320px] shrink-0 border-l bg-sidebar xl:block">
-          <RightPanel
-            graphPanel={
-              <GraphPanel
-                selectedKey={selectedKey}
-                refreshToken={refreshToken}
-                onNavigate={(k) => void handleNavigate(k)}
-                onCreate={handleCreated}
-              />
-            }
-            aiPanel={
-              <AiChatPanel
-                onInsert={handleAiInsert}
-                getCurrentNote={getCurrentNoteForAi}
-                onOpenSettings={() => setSettingsOpen(true)}
-              />
-            }
-            backlinksPanel={
-              <BacklinksPanel
-                selectedKey={selectedKey}
-                refreshToken={refreshToken}
-                onNavigate={(k) => void handleNavigate(k)}
-              />
-            }
-            tocPanel={
-              <TocPanel
-                noteKey={selectedKey}
-                getCurrentNote={getCurrentNoteForAi}
-                refreshToken={refreshToken}
-                mode={mode}
-                onScrollToLine={handleScrollToLine}
-                previewContainerRef={previewContainerRef as React.RefObject<HTMLElement | null>}
-              />
-            }
-          />
+        <aside
+          className={`relative hidden shrink-0 overflow-hidden bg-sidebar xl:flex xl:flex-col ${layout.rightCollapsed ? "" : "border-l"} ${draggingSide ? "" : "transition-[width] duration-200"}`}
+          style={{ width: layout.rightCollapsed ? 0 : layout.rightWidth }}
+          aria-hidden={layout.rightCollapsed}
+        >
+          <div
+            className="flex h-full w-full flex-col overflow-hidden"
+            style={{
+              width: layout.rightCollapsed ? 0 : layout.rightWidth,
+              minWidth: layout.rightCollapsed ? 0 : layout.rightWidth,
+            }}
+          >
+            <RightPanel
+              graphPanel={
+                <GraphPanel
+                  selectedKey={selectedKey}
+                  refreshToken={refreshToken}
+                  onNavigate={(k) => void handleNavigate(k)}
+                  onCreate={handleCreated}
+                />
+              }
+              aiPanel={
+                <AiChatPanel
+                  onInsert={handleAiInsert}
+                  getCurrentNote={getCurrentNoteForAi}
+                  onOpenSettings={() => setSettingsOpen(true)}
+                />
+              }
+              backlinksPanel={
+                <BacklinksPanel
+                  selectedKey={selectedKey}
+                  refreshToken={refreshToken}
+                  onNavigate={(k) => void handleNavigate(k)}
+                />
+              }
+              tocPanel={
+                <TocPanel
+                  noteKey={selectedKey}
+                  getCurrentNote={getCurrentNoteForAi}
+                  refreshToken={refreshToken}
+                  mode={mode}
+                  onScrollToLine={handleScrollToLine}
+                  previewContainerRef={previewContainerRef as React.RefObject<HTMLElement | null>}
+                />
+              }
+            />
+          </div>
+          {!layout.rightCollapsed && (
+            <PanelResizer
+              side="right"
+              currentWidth={layout.rightWidth}
+              dragging={draggingSide === "right"}
+              onDrag={(w) => {
+                if (draggingSide !== "right") setDraggingSide("right");
+                handleDragRight(w);
+              }}
+              onDragEnd={() => setDraggingSide(null)}
+              onReset={handleResetRight}
+            />
+          )}
         </aside>
       </div>
       <QuickSwitcher
@@ -340,19 +482,30 @@ export default function App() {
         onClose={() => setSwitcherOpen(false)}
         onSelect={(k) => void handleNavigate(k)}
       />
-      {settingsOpen && (
-        <SettingsDialog onClose={() => setSettingsOpen(false)} onSync={() => void handleManualSync()} />
-      )}
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onSync={() => void handleManualSync()} />}
       {conflictOpen && pendingConflicts.length > 0 && syncState && (
         <ConflictResolveDialog
           conflicts={pendingConflicts}
           state={syncState}
-          onResolved={(k) => { clearPendingConflict(k); bumpRefreshToken(); }}
-          onClose={() => { setConflictOpen(false); bumpRefreshToken(); }}
+          onResolved={(k) => {
+            clearPendingConflict(k);
+            bumpRefreshToken();
+          }}
+          onClose={() => {
+            setConflictOpen(false);
+            bumpRefreshToken();
+          }}
         />
       )}
       {reportDialogOpen && report && !(conflictOpen && pendingConflicts.length > 0) && (
-        <SyncReportDialog report={report} onClose={() => { setReportDialogOpen(false); setReport(null); }} onNavigate={(k) => void handleNavigate(k)} />
+        <SyncReportDialog
+          report={report}
+          onClose={() => {
+            setReportDialogOpen(false);
+            setReport(null);
+          }}
+          onNavigate={(k) => void handleNavigate(k)}
+        />
       )}
     </div>
   );

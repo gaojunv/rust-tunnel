@@ -2,6 +2,7 @@ import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardR
 import { Eye, Pencil, Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { OverlayScrollbar } from "@/components/ui/scroll-area";
 import { getNote, saveNote, deleteNote, renameNote, listNotes, saveAttachment } from "@/api/tauri";
 import type { NoteDto, NoteSummary } from "@/api/types";
 import { MarkdownPreview } from "@/components/MarkdownPreview";
@@ -13,6 +14,7 @@ import { MarkdownEditor, type MarkdownEditorHandle } from "@/components/editor/M
 import { EditorToolbar } from "@/components/editor/EditorToolbar";
 import { EditorView } from "@codemirror/view";
 import type { SelectionSource } from "@/lib/selection-source";
+import { readScrollPos, writeScrollPos } from "@/lib/scroll-memory";
 
 export interface NoteEditorHandle {
   insertAtCursor(text: string): void;
@@ -59,8 +61,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   const [renameOpen, setRenameOpen] = useState(false);
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
 
-  const scrollPos = useRef({ edit: 0, preview: 0 });
   const previewScrollRef = useRef<HTMLDivElement>(null);
+  const previewProgressRef = useRef<HTMLDivElement>(null);
   const rafPreview = useRef<number | null>(null);
   const rafEdit = useRef<number | null>(null);
   const cmRef = useRef<MarkdownEditorHandle>(null);
@@ -374,18 +376,35 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     }
   }, [computeDirtyNow, executeSave]);
 
+  // 预览进度条：直接改 DOM 宽度，避免 rerender
+  const syncPreviewProgress = useCallback(() => {
+    const el = previewScrollRef.current;
+    const bar = previewProgressRef.current;
+    if (!el || !bar) return;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max <= 0) {
+      bar.style.width = "0%";
+      bar.style.opacity = "0";
+      return;
+    }
+    bar.style.opacity = "1";
+    const pct = (el.scrollTop / max) * 100;
+    bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  }, []);
+
   // Ctrl/Cmd+E 切换模式
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!noteKey) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "e") {
         e.preventDefault();
-        // save edit scroll before leaving edit
+        // 保存当前侧滚动到记忆
+        const k = noteKeyRef.current ?? "";
         if (mode === "edit") {
           const v = cmRef.current?.view();
-          if (v) scrollPos.current.edit = v.scrollDOM.scrollTop;
+          if (v) writeScrollPos(k, "edit", v.scrollDOM.scrollTop);
         } else if (previewScrollRef.current) {
-          scrollPos.current.preview = previewScrollRef.current.scrollTop;
+          writeScrollPos(k, "preview", previewScrollRef.current.scrollTop);
         }
         onModeChange(mode === "edit" ? "preview" : "edit");
       }
@@ -396,16 +415,20 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
 
   // 模式切换时恢复滚动位置 — rAF deferred so CM has laid out
   useEffect(() => {
+    const k = noteKeyRef.current ?? "";
+    const pos = readScrollPos(k);
     const id = requestAnimationFrame(() => {
       if (mode === "edit") {
         const view = cmRef.current?.view();
-        if (view) view.scrollDOM.scrollTop = scrollPos.current.edit;
+        if (view) view.scrollDOM.scrollTop = pos.edit;
       } else if (previewScrollRef.current) {
-        previewScrollRef.current.scrollTop = scrollPos.current.preview;
+        previewScrollRef.current.scrollTop = pos.preview;
+        // 同步进度条到恢复后位置
+        syncPreviewProgress();
       }
     });
     return () => cancelAnimationFrame(id);
-  }, [mode]);
+  }, [mode, syncPreviewProgress]);
 
   // 编辑态：监听 CM scrollDOM（rAF 节流）。view 可能在 effect 首次执行时尚未创建，用 rAF 重试一次。
   useEffect(() => {
@@ -423,7 +446,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         if (rafEdit.current !== null) return;
         rafEdit.current = requestAnimationFrame(() => {
           rafEdit.current = null;
-          scrollPos.current.edit = el.scrollTop;
+          writeScrollPos(noteKeyRef.current ?? "", "edit", el.scrollTop);
         });
       };
       el.addEventListener("scroll", onScroll);
@@ -440,9 +463,20 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     if (rafPreview.current !== null) return;
     rafPreview.current = requestAnimationFrame(() => {
       rafPreview.current = null;
-      if (previewScrollRef.current) scrollPos.current.preview = previewScrollRef.current.scrollTop;
+      const el = previewScrollRef.current;
+      if (el) {
+        writeScrollPos(noteKeyRef.current ?? "", "preview", el.scrollTop);
+        syncPreviewProgress();
+      }
     });
-  }, []);
+  }, [syncPreviewProgress]);
+
+  // 预览内容变化后校准进度条（首帧与内容增高时）
+  useEffect(() => {
+    if (mode !== "preview") return;
+    const id = requestAnimationFrame(() => syncPreviewProgress());
+    return () => cancelAnimationFrame(id);
+  }, [mode, body, syncPreviewProgress]);
 
   const handleDelete = async () => {
     if (!noteKey) return;
@@ -546,6 +580,17 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       },
     };
   }, []);
+
+  // 底栏统计：字符/词/行（由 body 派生）
+  const bodyStats = useMemo(() => {
+    const chars = [...body].length;
+    const trimmed = body.trim();
+    const words = trimmed === "" ? 0 : trimmed.split(/\s+/).length;
+    const lines = body === "" ? 0 : body.split("\n").length;
+    return { chars, words, lines };
+  }, [body]);
+
+  const isBodyEmpty = body.trim() === "";
 
   // —— 命令句柄 ——
   useImperativeHandle(
@@ -731,38 +776,42 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       {/* 编辑区：preview 模式下 hidden 但保持挂载，保留撤销历史与选区 */}
       <div className={`flex min-h-0 flex-1 flex-col ${isEdit ? "" : "hidden"}`}>
         <div className="px-4 pt-3">
-          <Input
-            id="note-title"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="笔记标题"
-            className="border-0 bg-transparent px-0 text-xl font-semibold shadow-none focus-visible:ring-0"
-          />
+          <div className="mx-auto w-full max-w-[760px]">
+            <Input
+              id="note-title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="笔记标题"
+              className="border-0 bg-transparent px-0 text-xl font-semibold shadow-none focus-visible:ring-0"
+            />
+          </div>
         </div>
         <div ref={editorContentRef} className="relative mt-3 flex min-h-0 flex-1 flex-col px-4 pb-3">
-          <MarkdownEditor
-            ref={cmRef}
-            initialDoc={bodyAtMountRef.current}
-            onDocChanged={setBody}
-            onSave={() => void flushSave()}
-            getCompletionNotes={getCompletionNotes}
-            onPasteImage={async (file) => {
-              if (!noteKey) return null;
-              try {
-                const bytes = new Uint8Array(await file.arrayBuffer());
-                const name = file.name || "pasted.png";
-                const { rel_path } = await saveAttachment(noteKey, name, bytes);
-                return `/${rel_path}`;
-              } catch (e: unknown) {
-                const msg = e instanceof Error ? e.message : String(e);
-                setError(msg || "图片保存失败");
-                return null;
-              }
-            }}
-            onImageError={(msg) => setError(msg)}
-            placeholder="在此输入正文…（Markdown，支持 [[wikilink]]）"
-            className="min-h-0 flex-1"
-          />
+          <div className="mx-auto flex min-h-0 w-full max-w-[760px] flex-1 flex-col">
+            <MarkdownEditor
+              ref={cmRef}
+              initialDoc={bodyAtMountRef.current}
+              onDocChanged={setBody}
+              onSave={() => void flushSave()}
+              getCompletionNotes={getCompletionNotes}
+              onPasteImage={async (file) => {
+                if (!noteKey) return null;
+                try {
+                  const bytes = new Uint8Array(await file.arrayBuffer());
+                  const name = file.name || "pasted.png";
+                  const { rel_path } = await saveAttachment(noteKey, name, bytes);
+                  return `/${rel_path}`;
+                } catch (e: unknown) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  setError(msg || "图片保存失败");
+                  return null;
+                }
+              }}
+              onImageError={(msg) => setError(msg)}
+              placeholder="在此输入正文…（Markdown，支持 [[wikilink]]）"
+              className="min-h-0 flex-1"
+            />
+          </div>
           {isEdit && (
             <SelectionToolbar
               source={selectionSource}
@@ -776,20 +825,58 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         </div>
       </div>
 
-      {/* 预览区：edit 模式下 hidden */}
-      <div
-        ref={previewScrollRef}
-        onScroll={handlePreviewScroll}
-        className={`flex min-h-0 flex-1 flex-col overflow-auto px-4 py-3 ${isEdit ? "hidden" : ""}`}
-      >
-        <h1 className="text-xl font-semibold">{title || note?.title || noteKey}</h1>
-        {note && (note.aliases.length > 0 || note.tags.length > 0) && (
-          <p className="mt-1 text-xs text-muted-foreground">
-            {note.aliases.length > 0 && <>别名: {note.aliases.join(", ")} </>}
-            {note.tags.length > 0 && <>标签: {note.tags.join(", ")}</>}
-          </p>
-        )}
-        <MarkdownPreview content={body} onNavigate={onNavigate} />
+      {/* 预览区：edit 模式下 hidden — 原 overflow-auto 改为隐藏原生条 + 自绘悬浮条 */}
+      <div className={`relative flex min-h-0 flex-1 flex-col ${isEdit ? "hidden" : ""}`}>
+        {/* 阅读进度条：零 rerender，直接改 width */}
+        <div className="pointer-events-none absolute left-0 right-0 top-0 z-10 h-0.5 overflow-hidden">
+          <div
+            ref={previewProgressRef}
+            className="h-full bg-primary transition-[width] duration-75"
+            style={{ width: "0%", opacity: 0 }}
+          />
+        </div>
+        <div
+          ref={previewScrollRef}
+          onScroll={handlePreviewScroll}
+          className="no-native-scrollbar flex min-h-0 flex-1 flex-col overflow-auto px-4 py-3"
+        >
+          {isBodyEmpty ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 py-16 text-center">
+              <FileText className="size-8 text-muted-foreground/40" />
+              <p className="text-sm text-muted-foreground">这篇笔记还没有内容</p>
+              <p className="text-xs text-muted-foreground">按 Ctrl+E 开始编辑</p>
+            </div>
+          ) : (
+            <div
+              key={`${noteKey}-${mode}`}
+              className="mx-auto w-full max-w-[760px] animate-in fade-in duration-150"
+            >
+              <h1 className="text-xl font-semibold">{title || note?.title || noteKey}</h1>
+              {note && (note.aliases.length > 0 || note.tags.length > 0) && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {note.aliases.length > 0 && <>别名: {note.aliases.join(", ")} </>}
+                  {note.tags.length > 0 && <>标签: {note.tags.join(", ")}</>}
+                </p>
+              )}
+              <MarkdownPreview content={body} onNavigate={onNavigate} />
+            </div>
+          )}
+        </div>
+        <OverlayScrollbar containerRef={previewScrollRef} />
+      </div>
+
+      {/* 底部状态栏：仅在正常笔记视图展示 */}
+      <div className="flex h-7 shrink-0 items-center gap-3 border-t border-border/60 px-3 text-xs text-muted-foreground">
+        <span className="shrink-0">{isEdit ? "编辑" : "预览"}</span>
+        <span className="shrink-0">
+          {bodyStats.chars} 字符 · {bodyStats.words} 词 · {bodyStats.lines} 行
+        </span>
+        <span className="min-w-0 flex-1 truncate text-center">
+          {noteKey ? <code className="rounded bg-muted px-1 py-0.5">{noteKey}</code> : null}
+        </span>
+        <span className="shrink-0">
+          {saving ? "保存中…" : dirty ? "有未保存的改动" : "已保存"}
+        </span>
       </div>
 
       {renameOpen && noteKey && (

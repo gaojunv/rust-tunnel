@@ -1,3 +1,4 @@
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { buildDiffRows } from "@/lib/diff-rows";
 
 type Props = {
@@ -17,7 +18,7 @@ export function DiffView({ localText, remoteText, localLabel = "本地", remoteL
   }
   const rows = buildDiffRows(localText, remoteText);
   return (
-    <div className="overflow-auto rounded border">
+    <ScrollArea className="rounded border" orientation="both">
       <div className="min-w-[520px]">
         <div className="sticky top-0 z-[1] grid grid-cols-2 border-b bg-muted text-xs font-medium">
           <div className="border-r px-2 py-1">{localLabel}</div>
@@ -52,6 +53,6 @@ export function DiffView({ localText, remoteText, localLabel = "本地", remoteL
           })}
         </div>
       </div>
-    </div>
+    </ScrollArea>
   );
 }

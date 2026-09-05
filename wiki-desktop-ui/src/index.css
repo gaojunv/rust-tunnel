@@ -99,4 +99,26 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+
+  /* 选区：主色半透明，亮暗主题一致 */
+  ::selection {
+    background: hsl(var(--primary) / 0.3);
+  }
+}
+
+/* 自绘悬浮滚动条：隐藏原生条（Firefox/IE + WebKit），保留滚动功能 */
+.no-native-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-native-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* task list checkbox 着色兜底（若 tailwind arbitrary variant 未生效） */
+.md-preview input[type="checkbox"] {
+  accent-color: hsl(var(--primary));
 }

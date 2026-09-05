@@ -8,6 +8,8 @@ import {
   Loader2,
   Maximize2,
   Minus,
+  PanelLeft,
+  PanelRight,
   Search,
   Settings,
   Square,
@@ -29,6 +31,10 @@ type Props = {
   syncing?: boolean;
   syncStatus?: SyncStatus;
   onSyncNow?: () => void;
+  leftVisible?: boolean;
+  rightVisible?: boolean;
+  onToggleLeft?: () => void;
+  onToggleRight?: () => void;
 };
 
 function isMac(): boolean {
@@ -161,6 +167,10 @@ export function TitleBar({
   syncing = false,
   syncStatus,
   onSyncNow,
+  leftVisible = true,
+  rightVisible = true,
+  onToggleLeft,
+  onToggleRight,
 }: Props) {
   const [maximized, setMaximized] = useState(false);
   const showWindowControls = isTauri;
@@ -254,6 +264,20 @@ export function TitleBar({
     >
       {/* Left cluster */}
       <div className={`flex items-center gap-0.5 ${mac ? "pl-[76px]" : "pl-2"}`}>
+        {onToggleLeft && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className={`size-8 ${leftVisible ? "text-foreground" : "text-muted-foreground"}`}
+            onClick={onToggleLeft}
+            aria-label="切换侧栏"
+            aria-pressed={leftVisible}
+            title="切换侧栏 (Ctrl+B)"
+          >
+            <PanelLeft className="size-4" />
+          </Button>
+        )}
         <Button
           type="button"
           variant="ghost"
@@ -292,6 +316,20 @@ export function TitleBar({
 
       {/* Right cluster */}
       <div className="flex items-center gap-0 pr-1">
+        {onToggleRight && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className={`size-8 ${rightVisible ? "text-foreground" : "text-muted-foreground"}`}
+            onClick={onToggleRight}
+            aria-label="切换右侧面板"
+            aria-pressed={rightVisible}
+            title="切换右侧面板 (Ctrl+Alt+B)"
+          >
+            <PanelRight className="size-4" />
+          </Button>
+        )}
         {onOpenSwitcher && (
           <Button
             type="button"

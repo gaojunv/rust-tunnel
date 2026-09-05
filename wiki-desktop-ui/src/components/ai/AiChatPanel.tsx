@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Send, Square, Settings2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { chatStream, listRelayModels, type ChatMessage } from "@/lib/ai-client";
 import { buildChatMessages } from "@/lib/ai-prompts";
 import { loadSyncConfig } from "@/api/server";
@@ -241,8 +242,9 @@ export function AiChatPanel({ onInsert, getCurrentNote, onOpenSettings }: Props)
         携带当前笔记
       </label>
 
-      {/* 消息列表 */}
-      <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-3 overflow-auto rounded-md border bg-card p-3">
+      {/* 消息列表：listRef 指向 ScrollArea 的 viewport（真实滚动元素），自动滚到底部才生效 */}
+      <ScrollArea className="flex min-h-0 flex-1 rounded-md border bg-card" viewportRef={listRef}>
+        <div className="flex flex-col gap-3 p-3">
         {messages.length === 0 ? (
           <p className="text-xs text-muted-foreground">输入问题开始对话，AI 会参考当前笔记内容作答。</p>
         ) : (
@@ -268,7 +270,8 @@ export function AiChatPanel({ onInsert, getCurrentNote, onOpenSettings }: Props)
           ))
         )}
         {error && <p className="rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</p>}
-      </div>
+        </div>
+      </ScrollArea>
 
       {/* 输入区 */}
       <div className="flex gap-2">
