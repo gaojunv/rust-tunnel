@@ -31,6 +31,7 @@ import { MessageStream } from "@/components/agent/MessageStream";
 import { ThreadList } from "@/components/agent/ThreadList";
 import { createAllowlist, allowlistHas, allowlistAdd } from "@/lib/agent/allowlist";
 import type { Allowlist } from "@/lib/agent/allowlist";
+import { setAiModel } from "@/lib/ai-config";
 
 function isTauriEnv(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -384,8 +385,15 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
           // ignore
         }
       }
+      if (next && String(agentSettings?.authMode ?? "gateway") === "gateway") {
+        try {
+          setAiModel(next);
+        } catch {
+          // ignore storage errors
+        }
+      }
     },
-    [vaultRoot],
+    [vaultRoot, agentSettings?.authMode],
   );
 
   const handleSend = useCallback(async () => {
@@ -622,11 +630,13 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
             vaultRoot={vaultRoot}
             activeThreadId={view.threadId || null}
             isRunning={isRunning}
+            authMode={String(agentSettings?.authMode ?? "gateway")}
             onSelectThread={handleSelectThread}
             onNewThread={handleNewThread}
             onArchived={handleArchived}
             model={selectedModel}
             onModelChange={handleModelChange}
+            onOpenSettings={onOpenSettings}
           />
         </div>
       ) : (

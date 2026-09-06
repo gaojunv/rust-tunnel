@@ -4,7 +4,6 @@ import { WikiSidebar } from "@/components/WikiSidebar";
 import { NoteEditor, type NoteEditorHandle } from "@/components/NoteEditor";
 import { GraphPanel } from "@/components/GraphPanel";
 import { RightPanel } from "@/components/RightPanel";
-import { AiChatPanel } from "@/components/ai/AiChatPanel";
 import { AgentPanel } from "@/components/agent/AgentPanel";
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
@@ -441,13 +440,6 @@ export default function App() {
                   refreshToken={refreshToken}
                   onNavigate={(k) => void handleNavigate(k)}
                   onCreate={handleCreated}
-                />
-              }
-              aiPanel={
-                <AiChatPanel
-                  onInsert={handleAiInsert}
-                  getCurrentNote={getCurrentNoteForAi}
-                  onOpenSettings={() => setSettingsOpen(true)}
                 />
               }
               backlinksPanel={

@@ -1,27 +1,25 @@
 /**
- * 右栏 Tab 容器 —— graph / ai / backlinks / toc / agent 五面板，保持挂载以避免重复拉取与状态丢失
+ * 右栏 Tab 容器 —— graph / backlinks / toc / agent 四面板，保持挂载以避免重复拉取与状态丢失
  */
 import { useEffect, useState } from "react";
-import { Network, Sparkles, Link2, List, Bot } from "lucide-react";
+import { Network, Link2, List, Bot } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 type Props = {
   graphPanel: React.ReactNode;
-  aiPanel: React.ReactNode;
   backlinksPanel: React.ReactNode;
   tocPanel: React.ReactNode;
   agentPanel: React.ReactNode;
 };
 
 const STORAGE_KEY = "wiki.rightpanel.tab.v1";
-type TabId = "graph" | "ai" | "backlinks" | "toc" | "agent";
+type TabId = "graph" | "backlinks" | "toc" | "agent";
 
 function loadTab(): TabId {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (
       raw === "graph" ||
-      raw === "ai" ||
       raw === "backlinks" ||
       raw === "toc" ||
       raw === "agent"
@@ -33,7 +31,7 @@ function loadTab(): TabId {
   return "graph";
 }
 
-export function RightPanel({ graphPanel, aiPanel, backlinksPanel, tocPanel, agentPanel }: Props) {
+export function RightPanel({ graphPanel, backlinksPanel, tocPanel, agentPanel }: Props) {
   const [tab, setTab] = useState<TabId>(() => loadTab());
 
   useEffect(() => {
@@ -59,19 +57,6 @@ export function RightPanel({ graphPanel, aiPanel, backlinksPanel, tocPanel, agen
         >
           <Network className="size-3.5" />
           图谱
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("ai")}
-          className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
-            tab === "ai" ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
-          }`}
-          aria-label="AI 助手"
-          title="AI 助手"
-          aria-pressed={tab === "ai"}
-        >
-          <Sparkles className="size-3.5" />
-          AI 助手
         </button>
         <button
           type="button"
@@ -116,9 +101,6 @@ export function RightPanel({ graphPanel, aiPanel, backlinksPanel, tocPanel, agen
       <div className="min-h-0 flex-1 overflow-hidden">
         <div className={tab === "graph" ? "h-full" : "hidden"}>
           <ScrollArea className="h-full">{graphPanel}</ScrollArea>
-        </div>
-        <div className={tab === "ai" ? "h-full" : "hidden"}>
-          <ScrollArea className="h-full">{aiPanel}</ScrollArea>
         </div>
         <div className={tab === "backlinks" ? "h-full" : "hidden"}>
           <ScrollArea className="h-full">{backlinksPanel}</ScrollArea>
