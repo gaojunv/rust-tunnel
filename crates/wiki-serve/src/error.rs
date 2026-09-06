@@ -32,6 +32,9 @@ pub enum IpcError {
     #[cfg(not(feature = "search"))]
     #[error("检索错误：{0}")]
     Search(String),
+    /// agent 错误。
+    #[error("agent 错误：{0}")]
+    Agent(String),
 }
 
 impl serde::Serialize for IpcError {

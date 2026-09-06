@@ -27,6 +27,10 @@ on:
 permissions:
   contents: read
 
+# 侧车 pin：必须与 wiki-desktop-ui/scripts/vendor-codex-types.sh 的 CODEX_VERSION 默认值保持一致
+env:
+  CODEX_VERSION: rust-v0.153.4
+
 jobs:
   # 版本目录名只算一次，build 与 finalize 共用 —— 三处各算一遍迟早会算出不一样的结果
   resolve-version:
@@ -117,6 +121,69 @@ jobs:
       - name: Install Tauri CLI
         run: npm install -g @tauri-apps/cli@^2
 
+      # Codex sidecar：按 matrix.target 下载对应平台的 codex-app-server 二进制
+      # 资产命名：codex-app-server-<target>.tar.gz（macOS/Linux）/ codex-app-server-<target>.exe.zip（Windows）
+      # 注意：macOS x86_64 为交叉编译，必须下载 x86_64 的 codex（以 matrix.target 为准，而非 runner 架构）
+      - name: Download codex-app-server sidecar
+        shell: bash
+        env:
+          CODEX_VERSION: ${{ env.CODEX_VERSION }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          version="${CODEX_VERSION}"
+          base="https://github.com/openai/codex/releases/download/${version}"
+          out_dir="crates/wiki-serve/binaries"
+          mkdir -p "${out_dir}"
+          if [[ "${target}" == "x86_64-pc-windows-msvc" ]]; then
+            asset="codex-app-server-${target}.exe.zip"
+            url="${base}/${asset}"
+            echo "Downloading ${url}"
+            curl -fSL "${url}" -o /tmp/codex-sidecar.zip
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -o /tmp/codex-sidecar.zip -d /tmp/codex-sidecar
+            else
+              powershell -NoProfile -Command "Expand-Archive -Force /tmp/codex-sidecar.zip /tmp/codex-sidecar"
+            fi
+            # 解压后二进制可能位于子目录，搜索首个可执行文件
+            bin_src="$(find /tmp/codex-sidecar -type f -name 'codex-app-server*' | head -n 1)"
+            if [[ -z "${bin_src}" ]]; then
+              echo "::error::no binary found after unzip: ${asset}"
+              ls -R /tmp/codex-sidecar || true
+              exit 1
+            fi
+            dest="${out_dir}/codex-app-server-${target}.exe"
+            cp "${bin_src}" "${dest}"
+            chmod 755 "${dest}" 2>/dev/null || true
+            echo "Sidecar: ${dest} ($(wc -c < "${dest}") bytes)"
+            # Windows runner 的 bash 内仍可尝试 --version（若为原生 Windows 二进制则跳过校验）
+            if file "${dest}" 2>/dev/null | grep -qi "PE32"; then
+              echo "Windows PE binary copied, skip --version check on this runner"
+            else
+              "${dest}" --version || echo "::warning::sidecar --version check failed (may be cross-platform binary)"
+            fi
+          else
+            asset="codex-app-server-${target}.tar.gz"
+            url="${base}/${asset}"
+            echo "Downloading ${url}"
+            curl -fSL "${url}" -o /tmp/codex-sidecar.tar.gz
+            tar tzf /tmp/codex-sidecar.tar.gz | head -n 20
+            mkdir -p /tmp/codex-sidecar
+            tar xzf /tmp/codex-sidecar.tar.gz -C /tmp/codex-sidecar
+            bin_src="$(find /tmp/codex-sidecar -type f -name 'codex-app-server*' | head -n 1)"
+            if [[ -z "${bin_src}" ]]; then
+              echo "::error::no binary found after untar: ${asset}"
+              ls -R /tmp/codex-sidecar || true
+              exit 1
+            fi
+            dest="${out_dir}/codex-app-server-${target}"
+            install -m 755 "${bin_src}" "${dest}"
+            echo "Sidecar: ${dest} ($(wc -c < "${dest}") bytes)"
+            "${dest}" --version
+          fi
+          echo "--- ${out_dir}/ ---"
+          ls -lh "${out_dir}/"
+
       # tauri feature 默认关闭（门控整条 Tauri 依赖链，让无 GUI 系统库的机器也能
       # cargo test），打包时必须显式 -f tauri。cwd 必须是 tauri.conf.json 所在目录。
       #
@@ -173,6 +240,18 @@ jobs:
           case "${BUNDLES}" in *dmg*)  pick dmg  dmg "wiki-desktop-${PLATFORM}.dmg" ;; esac
           case "${BUNDLES}" in *msi*)  pick msi  msi "wiki-desktop-${PLATFORM}.msi" ;; esac
           case "${BUNDLES}" in *nsis*) pick nsis exe "wiki-desktop-${PLATFORM}-setup.exe" ;; esac
+
+          echo "--- sidecar check ---"
+          sidecar="crates/wiki-serve/binaries/codex-app-server-${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+            sidecar="${sidecar}.exe"
+          fi
+          if [[ ! -f "${sidecar}" ]]; then
+            echo "::error::sidecar not found at ${sidecar} (download step may have failed)"
+            ls -R crates/wiki-serve/binaries || true
+            exit 1
+          fi
+          echo "Sidecar present: ${sidecar} ($(wc -c < "${sidecar}") bytes)"
 
           echo "--- upload/ ---"
           ls -lh upload

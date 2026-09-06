@@ -5,6 +5,7 @@ import { NoteEditor, type NoteEditorHandle } from "@/components/NoteEditor";
 import { GraphPanel } from "@/components/GraphPanel";
 import { RightPanel } from "@/components/RightPanel";
 import { AiChatPanel } from "@/components/ai/AiChatPanel";
+import { AgentPanel } from "@/components/agent/AgentPanel";
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
 import { PanelResizer } from "@/components/PanelResizer";
@@ -158,6 +159,12 @@ export default function App() {
   }, [forward]);
 
   const handleSaved = useCallback(() => {
+    setRefreshToken((n) => n + 1);
+    scheduleAutoSync();
+  }, [scheduleAutoSync]);
+
+  // Agent 触发的 vault 变更：同 handleSaved 路径（刷新 + 自动同步）
+  const handleAgentVaultChanged = useCallback(() => {
     setRefreshToken((n) => n + 1);
     scheduleAutoSync();
   }, [scheduleAutoSync]);
@@ -458,6 +465,15 @@ export default function App() {
                   mode={mode}
                   onScrollToLine={handleScrollToLine}
                   previewContainerRef={previewContainerRef as React.RefObject<HTMLElement | null>}
+                />
+              }
+              agentPanel={
+                <AgentPanel
+                  onInsertToNote={handleAiInsert}
+                  vaultRoot={vault?.root ?? null}
+                  onVaultChanged={handleAgentVaultChanged}
+                  flushSave={() => editorRef.current?.flushSave() ?? Promise.resolve()}
+                  onOpenSettings={() => setSettingsOpen(true)}
                 />
               }
             />

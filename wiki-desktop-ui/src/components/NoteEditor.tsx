@@ -93,6 +93,42 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   }, [refreshToken]);
   const getCompletionNotes = useCallback(() => notesRef.current as unknown as { key: string; title: string; tags?: string[]; modified?: number }[], []);
 
+  // 外部刷新（refreshToken 自增）时的脏保护：若当前笔记 dirty 且磁盘已被外部（agent）修改，弹确认框
+  const doReloadNote = useCallback(
+    (targetKey: string) => {
+      let cancelled = false;
+      setLoading(true);
+      setError(null);
+      hasLoadedRef.current = false;
+      getNote(targetKey)
+        .then((data) => {
+          if (cancelled) return;
+          setNote(data);
+          setTitle(data.title);
+          setBody(data.body);
+          bodyAtMountRef.current = data.body;
+          hasLoadedRef.current = true;
+          const view = cmRef.current?.view();
+          if (view && view.state.doc.toString() !== data.body) {
+            view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: data.body } });
+          }
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setNote(null);
+          hasLoadedRef.current = true;
+          setError(e instanceof Error ? e.message : String(e));
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    },
+    [],
+  );
+
   useEffect(() => {
     if (!noteKey) {
       setNote(null);
@@ -104,37 +140,60 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       onDirtyChange(false);
       return;
     }
+    // 首次加载（noteKey 变化）直接重载
+    return doReloadNote(noteKey);
+  }, [noteKey, onDirtyChange, doReloadNote]);
+
+  // refreshToken 驱动的外部重载：带脏保护
+  useEffect(() => {
+    if (!noteKey) return;
+    if (refreshToken == null) return;
+    // 跳过首次 mount（noteKey 变化已触发 doReloadNote，且 refreshToken 初值为 0）
+    // 用 hasLoadedRef 判断是否已完成首次加载；未完成则不处理 refreshToken
+    if (!hasLoadedRef.current) return;
+    // 判断是否 dirty（用 ref 避免闭包 stale）
+    const isDirty = (() => {
+      const n = noteRef.current;
+      if (!n) return false;
+      const v = cmRef.current?.view();
+      const curBody = v ? v.state.doc.toString() : bodyRef.current;
+      const curTitle = titleRef.current;
+      return curTitle !== n.title || curBody !== n.body;
+    })();
+    if (!isDirty) {
+      // 非 dirty 直接重载
+      doReloadNote(noteKey);
+      return;
+    }
+    // dirty：先探测磁盘是否已被外部修改
     let cancelled = false;
-    setLoading(true);
-    setError(null);
-    hasLoadedRef.current = false;
     getNote(noteKey)
-      .then((data) => {
+      .then((remote) => {
         if (cancelled) return;
-        setNote(data);
-        setTitle(data.title);
-        setBody(data.body);
-        bodyAtMountRef.current = data.body;
+        const n = noteRef.current;
+        if (!n) return;
+        const changedOnDisk = remote.body !== n.body || remote.title !== n.title;
+        if (!changedOnDisk) return;
+        const ok = window.confirm("磁盘已被 Agent 修改，重新加载？未保存的改动将丢失。");
+        if (!ok) return;
+        if (cancelled) return;
+        setNote(remote);
+        setTitle(remote.title);
+        setBody(remote.body);
+        bodyAtMountRef.current = remote.body;
         hasLoadedRef.current = true;
-        // sync CM doc after async load — MarkdownEditor mounted with "" before load
         const view = cmRef.current?.view();
-        if (view && view.state.doc.toString() !== data.body) {
-          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: data.body } });
+        if (view && view.state.doc.toString() !== remote.body) {
+          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: remote.body } });
         }
       })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setNote(null);
-        hasLoadedRef.current = true;
-        setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+      .catch(() => {
+        // 探测失败不阻塞
       });
     return () => {
       cancelled = true;
     };
-  }, [noteKey, onDirtyChange]);
+  }, [refreshToken, noteKey, doReloadNote]);
 
   const dirty = note ? title !== note.title || body !== note.body : false;
 

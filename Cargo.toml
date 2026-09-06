@@ -102,6 +102,7 @@ agent-client-protocol = { version = "2", features = ["unstable_elicitation"] }
 libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
+open = "5"
 
 # ── 桌面笔记骨架（wiki-core / wiki-serve）──────────────────────────
 # 仅这两个 crate 使用；未挂到根 package 的 dependencies，故不影响既有
