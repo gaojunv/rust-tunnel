@@ -1,5 +1,6 @@
 /**
  * 右栏 Tab 容器 —— graph / backlinks / toc / agent 四面板，保持挂载以避免重复拉取与状态丢失
+ * agent 面板内部自滚：容器 h-full flex flex-col，无外层与内部双层滚动
  */
 import { useEffect, useState } from "react";
 import { Network, Link2, List, Bot } from "lucide-react";
@@ -44,7 +45,7 @@ export function RightPanel({ graphPanel, backlinksPanel, tocPanel, agentPanel }:
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-1 border-b border-border/60 px-2 py-1.5">
+      <div className="flex items-center gap-1 border-b border-border/50 px-2 py-1.5">
         <button
           type="button"
           onClick={() => setTab("graph")}
@@ -108,8 +109,8 @@ export function RightPanel({ graphPanel, backlinksPanel, tocPanel, agentPanel }:
         <div className={tab === "toc" ? "h-full" : "hidden"}>
           <ScrollArea className="h-full">{tocPanel}</ScrollArea>
         </div>
-        <div className={tab === "agent" ? "h-full" : "hidden"}>
-          <ScrollArea className="h-full">{agentPanel}</ScrollArea>
+        <div className={tab === "agent" ? "flex h-full flex-col overflow-hidden" : "hidden"}>
+          {agentPanel}
         </div>
       </div>
     </div>

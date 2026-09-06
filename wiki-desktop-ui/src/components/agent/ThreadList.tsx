@@ -4,6 +4,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { threadArchive, threadList, threadResume, threadRead } from "@/lib/agent/client";
 import { listThreads, archiveThread } from "@/lib/agent/store";
 import type { AgentThreadRecord } from "@/lib/agent/store";
@@ -220,7 +221,8 @@ export function ThreadList({
       {error && <p className="rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</p>}
       {!isRunning && <p className="text-xs text-muted-foreground">Agent 未运行，启动后可查看会话。</p>}
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-auto">
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="flex flex-col gap-3 pr-1">
         {/* 本地关联区 */}
         <div>
           <p className="mb-1 text-[11px] font-medium text-muted-foreground">本 vault 会话（{localThreads.length}）</p>
@@ -301,7 +303,8 @@ export function ThreadList({
             })}
           </ul>
         </div>
-      </div>
+        </div>
+      </ScrollArea>
 
       <p className="text-[11px] text-muted-foreground">
         回填策略：resume 优先，失败则仅切本地 threadId 续聊；threadRead items 结构复杂时简化为不回填历史，留注释续聊。

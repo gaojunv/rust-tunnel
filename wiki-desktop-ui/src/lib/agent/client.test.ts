@@ -108,6 +108,26 @@ describe("agent client", () => {
     await expect(fresh.getStatus()).rejects.toThrow("仅桌面端可用");
     const unlisten = await fresh.onAgentNotification(() => {});
     expect(typeof unlisten).toBe("function");
+    const unlistenParse = await fresh.onParseError(() => {});
+    expect(typeof unlistenParse).toBe("function");
+  });
+
+  it("onParseError 透传 agent:parse-error 载荷", async () => {
+    const events: Array<{ event: string; cb: (e: { payload: unknown }) => void }> = [];
+    mockListen.mockImplementation(async (event: string, cb: (e: { payload: unknown }) => void) => {
+      events.push({ event, cb });
+      return () => {};
+    });
+    const payload = { line: "not-json", error: "expected value at line 1 column 1" };
+    let received: { line: string; error: string } | null = null;
+    const unlisten = await client.onParseError((p) => {
+      received = p;
+    });
+    expect(typeof unlisten).toBe("function");
+    const sub = events.find((e) => e.event === "agent:parse-error");
+    expect(sub).toBeDefined();
+    sub?.cb({ payload });
+    expect(received).toEqual(payload);
   });
 
   it("typed wrappers 映射正确", async () => {

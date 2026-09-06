@@ -39,6 +39,12 @@ impl CodexProcess {
             .collect()
     }
 
+    /// 克隆 stderr 环形缓冲句柄（供 exit-watcher 与初始化失败路径共享）.
+    #[must_use]
+    pub fn stderr_tail_handle(&self) -> std::sync::Arc<std::sync::Mutex<VecDeque<String>>> {
+        std::sync::Arc::clone(&self.stderr_tail)
+    }
+
     /// 取子进程 id.
     #[must_use]
     pub fn id(&self) -> Option<u32> {

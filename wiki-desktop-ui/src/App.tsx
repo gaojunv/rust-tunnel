@@ -466,6 +466,8 @@ export default function App() {
                   onVaultChanged={handleAgentVaultChanged}
                   flushSave={() => editorRef.current?.flushSave() ?? Promise.resolve()}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  noteKey={selectedKey}
+                  getCurrentNote={getCurrentNoteForAi}
                 />
               }
             />

@@ -233,6 +233,7 @@ impl AgentManager {
     ///
     /// 内部 `Mutex` 中毒时通过 `PoisonError::into_inner` 恢复，不会 panic.
     #[allow(clippy::needless_pass_by_value, reason = "Arc 克隆语义需要拥有所有权")]
+    #[allow(clippy::too_many_lines, reason = "start 含校验与线程启动结果等待，拆分会降低可读性")]
     pub fn start(&mut self, sink: Arc<dyn AgentEventSink>) -> Result<AgentStatus, String> {
         {
             let st = self
@@ -256,10 +257,41 @@ impl AgentManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentStatus::Starting;
         sink.on_status(AgentStatus::Starting);
 
+        // 统一早退：设置 Exited + 广播 + 熔断（不借用 self 的闭包形态避免 E0501）
+        let app_config_dir_for_early = self.app_config_dir.clone();
+        let sink_for_early = Arc::clone(&sink);
+        let status_for_early = Arc::clone(&self.status);
+        // 抽为局部函数，通过可变引用更新 failure 计数
+        let do_fail_early = |mgr: &mut Self, reason: String| -> Result<AgentStatus, String> {
+            let count = mgr.record_failure();
+            let reason_out = if count >= 3 {
+                format!("{reason}（连续失败 {count} 次，已熔断需人工介入）")
+            } else {
+                reason.clone()
+            };
+            let st = AgentStatus::Exited {
+                code: None,
+                stderr_tail: Vec::new(),
+                reason: reason_out.clone(),
+            };
+            *status_for_early
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+            sink_for_early.on_status(st);
+            Err(reason_out)
+        };
+
         // 1) 加载 settings
-        let settings_path = AgentSettings::default_path(&self.app_config_dir);
-        let settings =
-            AgentSettings::load(&settings_path).map_err(|e| format!("加载 settings 失败：{e}"))?;
+        let settings_path = AgentSettings::default_path(&app_config_dir_for_early);
+        let settings = match AgentSettings::load(&settings_path) {
+            Ok(s) => s,
+            Err(e) => return do_fail_early(self, format!("加载 settings 失败：{e}")),
+        };
+
+        // 1.5) 启动前校验（网关地址 / 所选 auth 对应 key）
+        if let Err(reason) = settings.validate() {
+            return do_fail_early(self, reason);
+        }
 
         // 2) resolve 二进制
         let override_path = settings
@@ -267,12 +299,15 @@ impl AgentManager {
             .as_deref()
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty());
-        let resolved = resolve::resolve_binary_live(override_path.as_deref(), None)
-            .ok_or_else(|| "未找到 codex 二进制（sidecar/覆盖/PATH 均未命中）".to_owned())?;
+        let Some(resolved) = resolve::resolve_binary_live(override_path.as_deref(), None) else {
+            return do_fail_early(self, "未找到 codex 二进制（sidecar/覆盖/PATH 均未命中）".to_owned());
+        };
 
         // 3) CODEX_HOME 渲染
-        let codex_home = CodexHome::default_dir(&self.app_config_dir);
-        CodexHome::ensure(&codex_home, &settings).map_err(|e| format!("渲染 CODEX_HOME 失败：{e}"))?;
+        let codex_home = CodexHome::default_dir(&app_config_dir_for_early);
+        if let Err(e) = CodexHome::ensure(&codex_home, &settings) {
+            return do_fail_early(self, format!("渲染 CODEX_HOME 失败：{e}"));
+        }
 
         // 4) 启动独立 runtime 线程
         let app_config_dir = self.app_config_dir.clone();
@@ -319,14 +354,27 @@ impl AgentManager {
                 } else {
                     e.clone()
                 };
+                // 保留线程侧已写入的 stderr_tail（如 initialize 失败携带的尾部），避免空 tail 覆盖
+                let existing_tail = self
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let tail = if let AgentStatus::Exited { stderr_tail, .. } = existing_tail {
+                    stderr_tail
+                } else {
+                    Vec::new()
+                };
+                let st = AgentStatus::Exited {
+                    code: None,
+                    stderr_tail: tail,
+                    reason: reason.clone(),
+                };
                 *self
                     .status
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentStatus::Exited {
-                    code: None,
-                    stderr_tail: Vec::new(),
-                    reason: reason.clone(),
-                };
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                sink.on_status(st);
                 Err(reason)
             }
             Err(_) => {
@@ -337,14 +385,16 @@ impl AgentManager {
                 } else {
                     base.clone()
                 };
-                *self
-                    .status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentStatus::Exited {
+                let st = AgentStatus::Exited {
                     code: None,
                     stderr_tail: Vec::new(),
                     reason: msg.clone(),
                 };
+                *self
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                sink.on_status(st);
                 Err(msg)
             }
         }
@@ -365,8 +415,9 @@ impl AgentManager {
             let cmd = AgentCommand::Stop { reply: reply_tx };
             // 同步阻塞发送（cmd_tx 为 tokio mpsc，需 runtime；此处用 blocking_send 需 handle）
             // 但 AgentManager::stop 可能在同步上下文调用，需用 try_send 或阻塞
-            // 简化：若 send 失败则直接标记 Stopped
-            if tx.try_send(cmd).is_err() {
+            if let Err(err) = tx.try_send(cmd) {
+                // 通道满或已关闭：记 warn 并回退为停止
+                eprintln!("agent stop: 命令通道发送失败（{err}），回退为立即停止");
                 *self
                     .status
                     .lock()
@@ -534,13 +585,9 @@ impl AgentManager {
                     self.0.on_server_request(id, method, params);
                 }
                 fn on_status(&self, status: jsonrpc::JsonRpcStatus) {
-                    if let jsonrpc::JsonRpcStatus::Exited { code, reason } = status {
-                        self.0.on_status(AgentStatus::Exited {
-                            code,
-                            stderr_tail: Vec::new(),
-                            reason,
-                        });
-                    }
+                    // 退出状态仅由 exit-watcher 以含 stderr_tail 的 Exited 统一发出，
+                    // 忽略 JSON-RPC 读循环的空 tail Exited 以避免竞态覆盖。
+                    let _ = status;
                 }
                 fn on_parse_error(&self, line: String, error: String) {
                     self.0.on_parse_error(line, error);
@@ -560,26 +607,58 @@ impl AgentManager {
                 Ok(p) => p,
                 Err(e) => {
                     let msg = format!("spawn 失败：{e}");
-                    let _ = start_tx.send(Err(msg.clone()));
+                    let st = AgentStatus::Exited {
+                        code: None,
+                        // spawn 前无子进程可采 tail，仅以 reason 传递原因
+                        stderr_tail: Vec::new(),
+                        reason: msg.clone(),
+                    };
                     *status_arc
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentStatus::Exited {
-                        code: None,
-                        stderr_tail: Vec::new(),
-                        reason: msg,
-                    };
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                    sink.on_status(st);
+                    let _ = start_tx.send(Err(msg));
                     return;
                 }
             };
 
+            // 缓存 tail 句柄，供 stdout/stdin 缺失及 initialize 失败路径携带 stderr 尾部
+            let stderr_tail_handle = proc.stderr_tail_handle();
+            let snapshot_tail = || {
+                stderr_tail_handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<String>>()
+            };
+
             let Some(stdout) = proc.take_stdout() else {
                 let msg = "子进程 stdout 不可用".to_owned();
-                let _ = start_tx.send(Err(msg.clone()));
+                let st = AgentStatus::Exited {
+                    code: None,
+                    stderr_tail: snapshot_tail(),
+                    reason: msg.clone(),
+                };
+                *status_arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                sink.on_status(st);
+                let _ = start_tx.send(Err(msg));
                 return;
             };
             let Some(stdin) = proc.take_stdin() else {
                 let msg = "子进程 stdin 不可用".to_owned();
-                let _ = start_tx.send(Err(msg.clone()));
+                let st = AgentStatus::Exited {
+                    code: None,
+                    stderr_tail: snapshot_tail(),
+                    reason: msg.clone(),
+                };
+                *status_arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                sink.on_status(st);
+                let _ = start_tx.send(Err(msg));
                 return;
             };
 
@@ -643,26 +722,32 @@ impl AgentManager {
                 }
                 Ok(Err(e)) => {
                     let msg = format!("initialize 失败：{e}");
-                    *status_arc
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentStatus::Exited {
+                    let tail = snapshot_tail();
+                    let st = AgentStatus::Exited {
                         code: None,
-                        stderr_tail: Vec::new(),
+                        stderr_tail: tail,
                         reason: msg.clone(),
                     };
+                    *status_arc
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                    sink.on_status(st);
                     let _ = start_tx.send(Err(msg));
                     exit_handle.abort();
                     return;
                 }
                 Err(_) => {
                     let msg = "initialize 超时（10s）".to_owned();
-                    *status_arc
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = AgentStatus::Exited {
+                    let tail = snapshot_tail();
+                    let st = AgentStatus::Exited {
                         code: None,
-                        stderr_tail: Vec::new(),
+                        stderr_tail: tail,
                         reason: msg.clone(),
                     };
+                    *status_arc
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = st.clone();
+                    sink.on_status(st);
                     let _ = start_tx.send(Err(msg));
                     exit_handle.abort();
                     return;
@@ -827,5 +912,100 @@ mod tests {
         mgr.stop().expect("stop");
         assert_eq!(mgr.consecutive_failures(), 0, "stop 后应清零");
         assert_eq!(mgr.status_snapshot(), AgentStatus::Stopped);
+    }
+
+    #[test]
+    fn start_early_failure_sets_exited_and_broadcasts_and_fuses() {
+        // 预启动失败：网关模式缺 base_url，在 Starting 后应落 Exited+广播+熔断计数
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mgr = AgentManager::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        // 先写入缺 base_url 的网关设置（未过 validate）
+        let bad = AgentSettings {
+            enabled: true,
+            auth_mode: crate::agent::config::AuthMode::Gateway,
+            gateway_base_url: None,
+            gateway_api_key: Some("k".to_owned()),
+            ..AgentSettings::default()
+        };
+        mgr.save_settings(&bad).expect("save bad");
+        // 重置计数到 0 后用 CollectAgentSink 捕获广播
+        let sink = std::sync::Arc::new(CollectAgentSink::default());
+        let sink_dyn: std::sync::Arc<dyn AgentEventSink> = sink.clone();
+        let err = mgr.start(sink_dyn).expect_err("应因网关地址缺失失败");
+        assert!(err.contains("网关模式需要在设置中填写网关地址"), "实际：{err}");
+        assert_eq!(mgr.consecutive_failures(), 1);
+        let statuses = sink.statuses.lock().expect("lock").clone();
+        // 应依次 Starting -> Exited
+        assert!(
+            statuses.contains(&AgentStatus::Starting),
+            "应广播 Starting，实际：{statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|s| matches!(s, AgentStatus::Exited { reason, .. } if reason.contains("网关模式"))),
+            "应广播 Exited，实际：{statuses:?}"
+        );
+        assert!(
+            matches!(mgr.status_snapshot(), AgentStatus::Exited { .. }),
+            "快照应为 Exited"
+        );
+
+        // 连续失败至熔断
+        for _ in 0..2 {
+            let sink2: std::sync::Arc<dyn AgentEventSink> = std::sync::Arc::new(NoopAgentSink);
+            let _ = mgr.start(sink2);
+        }
+        assert_eq!(mgr.consecutive_failures(), 3);
+        let sink3: std::sync::Arc<dyn AgentEventSink> = std::sync::Arc::new(NoopAgentSink);
+        let e2 = mgr.start(sink3).expect_err("熔断后应拒");
+        assert!(e2.contains("熔断"), "实际：{e2}");
+    }
+
+    #[test]
+    fn start_missing_key_is_early_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mgr = AgentManager::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        // 网关模式缺 key
+        let bad = AgentSettings {
+            enabled: true,
+            auth_mode: crate::agent::config::AuthMode::Gateway,
+            gateway_base_url: Some("https://gw.example.com".to_owned()),
+            gateway_api_key: None,
+            ..AgentSettings::default()
+        };
+        mgr.save_settings(&bad).expect("save");
+        let sink: std::sync::Arc<dyn AgentEventSink> = std::sync::Arc::new(NoopAgentSink);
+        let err = mgr.start(sink).expect_err("缺 key 应失败");
+        assert!(err.contains("网关模式未配置 API Key"), "实际：{err}");
+
+        // OpenAI 模式缺 key
+        let bad2 = AgentSettings {
+            enabled: true,
+            auth_mode: crate::agent::config::AuthMode::OpenaiKey,
+            openai_api_key: None,
+            ..AgentSettings::default()
+        };
+        let mut mgr2 = AgentManager::new(dir.path().join("mgr2"), dir.path().join("vault2"));
+        std::fs::create_dir_all(dir.path().join("mgr2")).expect("mkdir");
+        mgr2.save_settings(&bad2).expect("save2");
+        let sink2: std::sync::Arc<dyn AgentEventSink> = std::sync::Arc::new(NoopAgentSink);
+        let err2 = mgr2.start(sink2).expect_err("缺 openai key 应失败");
+        assert!(err2.contains("OpenAI Key 模式未配置 API Key"), "实际：{err2}");
+
+        // ChatGPT 无需 key（但会因缺二进制而报另一错，说明校验通过）
+        let chat = AgentSettings {
+            enabled: true,
+            auth_mode: crate::agent::config::AuthMode::ChatGpt,
+            ..AgentSettings::default()
+        };
+        let mut mgr3 = AgentManager::new(dir.path().join("mgr3"), dir.path().join("vault3"));
+        std::fs::create_dir_all(dir.path().join("mgr3")).expect("mkdir3");
+        mgr3.save_settings(&chat).expect("save chat");
+        let sink3: std::sync::Arc<dyn AgentEventSink> = std::sync::Arc::new(NoopAgentSink);
+        let err3 = mgr3.start(sink3).expect_err("chatgpt 缺二进制应走 resolve 失败");
+        // 校验已过，错误应为二进制缺失而非 key 缺失
+        assert!(
+            err3.contains("未找到 codex 二进制") || err3.contains("二进制"),
+            "实际：{err3}"
+        );
     }
 }

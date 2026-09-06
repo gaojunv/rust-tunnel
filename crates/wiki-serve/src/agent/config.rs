@@ -163,6 +163,43 @@ impl AgentSettings {
     pub fn default_path(app_config_dir: &Path) -> PathBuf {
         app_config_dir.join("agent-settings.json")
     }
+
+    /// 启动前校验（网关地址与所选认证模式的 key）.
+    ///
+    /// # Errors
+    ///
+    /// 校验失败时返回中文错误字符串。
+    pub fn validate(&self) -> Result<(), String> {
+        match self.auth_mode {
+            AuthMode::Gateway => {
+                let has_base = self
+                    .gateway_base_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_base {
+                    return Err("网关模式需要在设置中填写网关地址".to_owned());
+                }
+                let has_key = self
+                    .gateway_api_key
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_key {
+                    return Err("网关模式未配置 API Key，请打开设置".to_owned());
+                }
+            }
+            AuthMode::OpenaiKey => {
+                let has_key = self
+                    .openai_api_key
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_key {
+                    return Err("OpenAI Key 模式未配置 API Key，请打开设置".to_owned());
+                }
+            }
+            AuthMode::ChatGpt => {}
+        }
+        Ok(())
+    }
 }
 
 /// `CODEX_HOME` 管理：渲染 `config.toml`.
@@ -198,10 +235,18 @@ impl CodexHome {
                 // `name` 为 codex 0.153+ 新必填字段（对应 provider 显示名）；缺省则触发
                 // `model_providers.tunnel: provider name must not be empty` 校验。
                 out.push_str("name = \"tunnel\"\n");
+                // 网关地址缺省时不再回退 OpenAI 官方地址（拿非 OpenAI key 打官方既错又危险），
+                // 启动前由 `AgentSettings::validate` 拦截；此处二次兜底报错，杜绝静默默认。
                 let base_url = settings
                     .gateway_base_url
                     .as_deref()
-                    .unwrap_or("https://api.openai.com/v1");
+                    .filter(|u| !u.trim().is_empty())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "网关模式需要在设置中填写网关地址",
+                        )
+                    })?;
                 let esc_url = toml_escape(base_url);
                 let _ = writeln!(out, "base_url = \"{esc_url}\"");
                 out.push_str("env_key = \"WIKI_TUNNEL_LLM_KEY\"\n");
@@ -424,9 +469,11 @@ mod tests {
             gateway_base_url: None,
             ..Default::default()
         };
-        let path = CodexHome::ensure(&base, &settings).expect("ensure");
-        let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("https://api.openai.com/v1"), "默认 base_url：{content}");
+        let err = CodexHome::ensure(&base, &settings).expect_err("缺 gatewayBaseUrl 应报错");
+        assert!(
+            err.to_string().contains("网关模式需要在设置中填写网关地址"),
+            "应提示网关地址缺失，实际：{err}"
+        );
     }
 
     #[test]
@@ -494,11 +541,71 @@ mod tests {
     fn config_ensure_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().join("codex-home");
-        let s = AgentSettings::default();
+        let s = AgentSettings {
+            auth_mode: AuthMode::Gateway,
+            gateway_base_url: Some("https://gw.example.com".to_owned()),
+            gateway_api_key: Some("k".to_owned()),
+            ..AgentSettings::default()
+        };
         let p1 = CodexHome::ensure(&base, &s).expect("first");
         let c1 = std::fs::read_to_string(&p1).expect("read1");
         let p2 = CodexHome::ensure(&base, &s).expect("second");
         let c2 = std::fs::read_to_string(&p2).expect("read2");
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn validate_gateway_modes() {
+        // 缺 base_url
+        let mut s = AgentSettings {
+            auth_mode: AuthMode::Gateway,
+            gateway_base_url: None,
+            gateway_api_key: Some("k".to_owned()),
+            ..AgentSettings::default()
+        };
+        let e = s.validate().expect_err("缺 base_url 应错");
+        assert!(e.contains("网关模式需要在设置中填写网关地址"), "实际：{e}");
+
+        // 空白 base_url 亦错
+        s.gateway_base_url = Some("   ".to_owned());
+        assert!(s.validate().is_err());
+
+        // 缺 key
+        s.gateway_base_url = Some("https://gw.example.com".to_owned());
+        s.gateway_api_key = None;
+        let e2 = s.validate().expect_err("缺 gateway key 应错");
+        assert!(e2.contains("网关模式未配置 API Key"), "实际：{e2}");
+
+        // 空白 key 亦错
+        s.gateway_api_key = Some("  ".to_owned());
+        assert!(s.validate().is_err());
+
+        s.gateway_api_key = Some("tok".to_owned());
+        assert!(s.validate().is_ok());
+
+        // chatgpt 无需 key
+        let chat = AgentSettings {
+            auth_mode: AuthMode::ChatGpt,
+            gateway_base_url: None,
+            gateway_api_key: None,
+            openai_api_key: None,
+            ..AgentSettings::default()
+        };
+        assert!(chat.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_openai_key_modes() {
+        let mut s = AgentSettings {
+            auth_mode: AuthMode::OpenaiKey,
+            openai_api_key: None,
+            ..AgentSettings::default()
+        };
+        let e = s.validate().expect_err("缺 openai key 应错");
+        assert!(e.contains("OpenAI Key 模式未配置 API Key"), "实际：{e}");
+        s.openai_api_key = Some("   ".to_owned());
+        assert!(s.validate().is_err());
+        s.openai_api_key = Some("sk-xxx".to_owned());
+        assert!(s.validate().is_ok());
     }
 }
