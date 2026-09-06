@@ -174,3 +174,8 @@ GitHub Actions 工作流：
 
 部署使用 systemd（`contrib/rust-tunnel-server.service`），配置模板 `contrib/config.toml.template`。
 两个归档目录经 `client_dist_dir` / `wiki_dist_dir` 交给服务端只读，Web「下载」页分两个分区展示。
+
+### Wiki Desktop 额外说明
+
+- `crates/wiki-serve` 含 Codex agent 侧车（`agent/{mod,bridge,jsonrpc,process,config,resolve}`，`bridge` 为唯一 `#[cfg(feature=\"tauri\")]` 文件，`resolve` 解析链 sidecar→override→PATH + 熔断计数）。
+- `wiki-desktop-ui/src/lib/agent/types/` 为 vendor 官方 TS 类型（pin `rust-v0.153.4`，脚本 `wiki-desktop-ui/scripts/vendor-codex-types.sh` 为单一事实来源，与 workflow `env.CODEX_VERSION` 同步）。

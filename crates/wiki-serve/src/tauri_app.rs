@@ -9,6 +9,10 @@
 //! `&state` 传入。`run()` 负责首启自举（`ensure_vault_ready`）、`manage` 状态
 //! 并装配 `generate_handler!` / `generate_context!`。
 
+use tauri::Manager as _;
+
+use crate::agent::bridge::resolve_app_config_dir;
+use crate::agent::AgentManager;
 use crate::commands;
 use crate::dto::{
     AttachmentDto, DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult,
@@ -238,7 +242,18 @@ pub fn run() -> tauri::Result<()> {
     if let Err(err) = crate::vault_ops::ensure_vault_ready(&root) {
         eprintln!("failed to ensure vault ready at {}: {err}", root.display());
     }
+    // vault 根在 setup 闭包中使用，需克隆一份避免借用冲突
+    let vault_root_for_agent = root.clone();
     tauri::Builder::default()
+        .setup(move |app| {
+            let app_config_dir = resolve_app_config_dir(app.handle());
+            let agent_manager = std::sync::Arc::new(std::sync::Mutex::new(AgentManager::new(
+                app_config_dir,
+                vault_root_for_agent,
+            )));
+            app.manage(agent_manager);
+            Ok(())
+        })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             delete_folder,
@@ -256,7 +271,16 @@ pub fn run() -> tauri::Result<()> {
             save_note,
             search_notes,
             set_note_ref,
-            write_sync_state
+            write_sync_state,
+            crate::agent::bridge::agent_get_status,
+            crate::agent::bridge::agent_start,
+            crate::agent::bridge::agent_stop,
+            crate::agent::bridge::agent_detect_binary,
+            crate::agent::bridge::agent_request,
+            crate::agent::bridge::agent_respond,
+            crate::agent::bridge::agent_get_settings,
+            crate::agent::bridge::agent_save_settings,
+            crate::agent::bridge::agent_open_external
         ])
         .run(tauri::generate_context!())
 }

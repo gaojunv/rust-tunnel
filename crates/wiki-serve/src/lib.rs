@@ -35,6 +35,8 @@ pub mod state;
 pub mod tauri_app;
 /// Vault 纯逻辑操作（不依赖 `tauri`）。
 pub mod vault_ops;
+/// Codex app-server agent transport 层（除 `bridge` 外不依赖 `tauri`）。
+pub mod agent;
 
 #[cfg(feature = "tauri")]
 pub use tauri_app::run;

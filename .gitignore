@@ -41,3 +41,8 @@ nohup.out
 
 # vite/vitest 缓存（从仓库根跑 vitest 时产生）
 **/.vite/
+
+# wiki codex sidecar 二进制（由 CI download step 填充，不入库）
+crates/wiki-serve/binaries/
+!crates/wiki-serve/binaries/.gitkeep
+!crates/wiki-serve/binaries/codex-app-server-x86_64-unknown-linux-gnu

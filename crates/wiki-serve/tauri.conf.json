@@ -19,7 +19,10 @@
         "decorations": false,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 12, "y": 10 }
+        "trafficLightPosition": {
+          "x": 12,
+          "y": 10
+        }
       }
     ],
     "withGlobalTauri": true,
@@ -36,6 +39,9 @@
       "icons/128x128@2x.png",
       "icons/icon.png",
       "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/codex-app-server"
     ]
   }
 }
