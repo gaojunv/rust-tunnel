@@ -17,10 +17,9 @@ import {
   accountLoginStart,
   getAuthStatus,
   openExternal,
-  modelList,
   onAgentNotification,
 } from "@/lib/agent/client";
-import type { Model } from "@/lib/agent/types/v2/Model";
+import { listAvailableModels, type ModelOption } from "@/lib/agent/models";
 import {
   createInitialAuthFlowState,
   reduceAuthFlow,
@@ -87,7 +86,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
   const [binaryError, setBinaryError] = useState<string | null>(null);
 
   // 模型
-  const [models, setModels] = useState<Model[]>([]);
+  const [models, setModels] = useState<ModelOption[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
   const isAgentRunning = agentStatus?.phase === "running";
@@ -196,23 +195,25 @@ export function SettingsDialog({ onClose, onSync }: Props) {
     };
   }, []);
 
-  // 模型列表：running 时拉取
+  // 模型列表：gateway 模式不依赖 running，其余模式仅 running 时拉取
+  const settingsAuthMode = String(agentSettings?.authMode ?? "gateway");
   useEffect(() => {
-    if (!isTauri || !isAgentRunning) return;
+    if (!isTauri) return;
+    const isGateway = settingsAuthMode === "gateway";
+    if (!isGateway && !isAgentRunning) return;
     let cancelled = false;
     setModelsLoading(true);
     setModelsError(null);
-    // ModelListParams 为可选，传空对象以触发默认分页
-    modelList({ cursor: null, limit: null, includeHidden: null } as unknown as Parameters<typeof modelList>[0])
-      .then((resp) => {
+    listAvailableModels(settingsAuthMode)
+      .then((list) => {
         if (cancelled) return;
-        const data = (resp as unknown as { data?: Model[] })?.data ?? [];
-        setModels(Array.isArray(data) ? data : []);
+        setModels(list);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
         const msg = e instanceof Error ? e.message : String(e);
         setModelsError(msg);
+        setModels([]);
       })
       .finally(() => {
         if (!cancelled) setModelsLoading(false);
@@ -220,7 +221,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [isAgentRunning]);
+  }, [isAgentRunning, settingsAuthMode]);
 
   // ChatGPT：订阅 account/login/completed 提前结束轮询
   const setupLoginNotificationListener = useCallback(async () => {
@@ -733,7 +734,27 @@ export function SettingsDialog({ onClose, onSync }: Props) {
 
                 <div>
                   <label className="block text-xs font-medium text-muted-foreground">模型</label>
-                  {isAgentRunning ? (
+                  {settingsAuthMode === "gateway" ? (
+                    <>
+                      {modelsLoading ? (
+                        <p className="mt-1.5 text-xs text-muted-foreground">加载模型列表…</p>
+                      ) : (
+                        <select
+                          value={String(agentSettings.model ?? "")}
+                          onChange={(e) => updateAgent({ model: e.target.value || null })}
+                          className="mt-1.5 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                        >
+                          <option value="">{models.length === 0 ? "无模型" : "默认模型"}</option>
+                          {models.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {modelsError && <p className="mt-1.5 text-xs text-destructive">加载失败：{modelsError}</p>}
+                    </>
+                  ) : isAgentRunning ? (
                     <>
                       {modelsLoading ? (
                         <p className="mt-1.5 text-xs text-muted-foreground">加载模型列表…</p>
@@ -746,7 +767,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
                           <option value="">默认模型</option>
                           {models.map((m) => (
                             <option key={m.id} value={m.id}>
-                              {m.displayName || m.id} {m.id !== m.displayName ? `(${m.id})` : ""}
+                              {m.label}
                             </option>
                           ))}
                         </select>

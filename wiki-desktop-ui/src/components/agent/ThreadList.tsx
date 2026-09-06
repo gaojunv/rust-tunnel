@@ -4,21 +4,23 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { modelList, threadArchive, threadList, threadResume, threadRead } from "@/lib/agent/client";
+import { threadArchive, threadList, threadResume, threadRead } from "@/lib/agent/client";
 import { listThreads, archiveThread } from "@/lib/agent/store";
 import type { AgentThreadRecord } from "@/lib/agent/store";
-import type { Model } from "@/lib/agent/types/v2/Model";
 import type { Thread } from "@/lib/agent/types/v2/Thread";
+import { listAvailableModels, type ModelOption } from "@/lib/agent/models";
 
 type Props = {
   vaultRoot: string | null;
   activeThreadId: string | null;
   isRunning: boolean;
+  authMode: string;
   onSelectThread: (threadId: string, hydrated: { thread: Thread } | null) => void;
   onNewThread: () => void;
   onArchived: (threadId: string) => void;
   model: string | null;
   onModelChange: (model: string | null) => void;
+  onOpenSettings?: () => void;
 };
 
 function formatTime(ts: number): string {
@@ -34,17 +36,20 @@ export function ThreadList({
   vaultRoot,
   activeThreadId,
   isRunning,
+  authMode,
   onSelectThread,
   onNewThread,
   onArchived,
   model,
   onModelChange,
+  onOpenSettings,
 }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [remoteThreads, setRemoteThreads] = useState<Thread[]>([]);
-  const [models, setModels] = useState<Model[]>([]);
+  const [models, setModels] = useState<ModelOption[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
   const [localVersion, setLocalVersion] = useState(0);
 
   const localThreads = useMemo<AgentThreadRecord[]>(() => {
@@ -82,17 +87,19 @@ export function ThreadList({
   }, [isRunning]);
 
   const refreshModels = useCallback(async () => {
-    if (!isRunning) return;
+    const isGateway = authMode === "gateway";
+    if (!isGateway && !isRunning) return;
     setModelsLoading(true);
+    setModelsError(null);
     try {
-      const res = await modelList({});
-      setModels(res.data ?? []);
-    } catch {
-      // 忽略，保留空列表
+      const list = await listAvailableModels(authMode);
+      setModels(list);
+    } catch (e: unknown) {
+      setModelsError(e instanceof Error ? e.message : String(e));
     } finally {
       setModelsLoading(false);
     }
-  }, [isRunning]);
+  }, [authMode, isRunning]);
 
   useEffect(() => {
     void refreshRemote();
@@ -179,12 +186,12 @@ export function ThreadList({
           value={model ?? ""}
           onChange={(e) => onModelChange(e.target.value || null)}
           className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs"
-          disabled={modelsLoading || !isRunning}
+          disabled={modelsLoading || (authMode !== "gateway" && !isRunning)}
         >
           <option value="">{modelsLoading ? "加载模型…" : models.length === 0 ? "无模型" : "选择模型"}</option>
           {models.map((m) => (
-            <option key={m.id} value={m.model || m.id}>
-              {m.displayName ? `${m.displayName} (${m.model || m.id})` : m.model || m.id}
+            <option key={m.id} value={m.id}>
+              {m.label}
             </option>
           ))}
         </select>
@@ -192,6 +199,16 @@ export function ThreadList({
           新建会话
         </Button>
       </div>
+      {modelsError && (
+        <div className="flex items-center gap-2">
+          <p className="flex-1 text-xs text-destructive">{modelsError}</p>
+          {onOpenSettings && (
+            <Button type="button" variant="outline" size="sm" className="h-6 shrink-0 px-2 text-xs" onClick={onOpenSettings}>
+              打开设置
+            </Button>
+          )}
+        </div>
+      )}
 
       <div className="flex items-center justify-between">
         <p className="text-xs font-medium">会话列表</p>
