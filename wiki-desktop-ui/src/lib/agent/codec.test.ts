@@ -141,6 +141,90 @@ describe("reduceAgentEvent", () => {
     expect(s.activeTurnId).toBe("turn-1");
   });
 
+  it("turn/completed 携带 turn.error 时追加 error item（TurnError 结构）", () => {
+    let s = createInitialView("t1");
+    s = { ...s, activeTurnId: "turn-9", status: "running" };
+    s = reduceAgentEvent(
+      s,
+      notif("item/started", { item: { type: "agentMessage", id: "a1", text: "partial" } }),
+    );
+    s = reduceAgentEvent(
+      s,
+      notif("turn/completed", {
+        turn: {
+          id: "turn-9",
+          status: "failed",
+          error: {
+            message: "上游请求失败",
+            codexErrorInfo: "rateLimitExceeded",
+            additionalDetails: "请在 60 秒后重试",
+            misalignment: null,
+          },
+        },
+      }),
+    );
+    expect(s.activeTurnId).toBeNull();
+    expect(s.status).toBe("idle");
+    const err = s.items.find((i) => i.kind === "error");
+    expect(err).toMatchObject({
+      kind: "error",
+      id: "error-turn-9",
+      message: "上游请求失败\n请在 60 秒后重试",
+    });
+    // 流式项正常收尾，但错误被显式展示（非静默）
+    expect(s.items.find((i) => i.id === "a1")).toMatchObject({ kind: "agentMessage", complete: true });
+  });
+
+  it("turn/completed 顶层 params.error（字符串）同样生成 error item", () => {
+    let s = createInitialView("t1");
+    s = { ...s, activeTurnId: "turn-9", status: "running" };
+    s = reduceAgentEvent(s, notif("turn/completed", { turn: { id: "turn-9" }, error: "连接中断" }));
+    const err = s.items.find((i) => i.kind === "error");
+    expect(err).toMatchObject({ kind: "error", message: "连接中断" });
+  });
+
+  it("同一 turn 重复 error 不重复追加", () => {
+    let s = createInitialView("t1");
+    s = { ...s, activeTurnId: "turn-9", status: "running" };
+    s = reduceAgentEvent(
+      s,
+      notif("turn/completed", { turn: { id: "turn-9" }, error: "boom" }),
+    );
+    const before = s.items.filter((i) => i.kind === "error").length;
+    // 后续事件若再带同一 turn 错误（理论不发生）不追加
+    s = { ...s, activeTurnId: "turn-9", status: "running" };
+    s = reduceAgentEvent(
+      s,
+      notif("turn/completed", { turn: { id: "turn-9" }, error: "boom" }),
+    );
+    expect(s.items.filter((i) => i.kind === "error").length).toBe(before);
+  });
+
+  it("无 error 的 turn/completed 不生成 error item", () => {
+    let s = createInitialView("t1");
+    s = { ...s, activeTurnId: "turn-9", status: "running" };
+    s = reduceAgentEvent(s, notif("turn/completed", { turn: { id: "turn-9", error: null } }));
+    expect(s.items.some((i) => i.kind === "error")).toBe(false);
+  });
+
+  it("顶层 error 通知（ErrorNotification）生成 error item", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(
+      s,
+      notif("error", {
+        error: { message: "模型限流", additionalDetails: null },
+        willRetry: true,
+        threadId: "t1",
+        turnId: "turn-5",
+      }),
+    );
+    expect(s.items.find((i) => i.kind === "error")).toMatchObject({
+      kind: "error",
+      id: "error-turn-5",
+      message: "模型限流",
+    });
+  });
+
   it("fileChange 全生命周期：started/delta/completed", () => {
     let s = createInitialView("t1");
     s = reduceAgentEvent(

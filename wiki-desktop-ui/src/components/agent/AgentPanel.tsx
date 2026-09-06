@@ -1,11 +1,12 @@
 /**
- * Agent 面板 —— M2 完整版 + M3 引导联动
+ * Agent 面板 —— M2 完整版 + M3 引导联动 + Codex CLI 风格 + 上下文注入 + 错误横幅 + ScrollArea
  * 审批弹窗 + MessageStream + ThreadList + vault 一致性闭环
  * M3：未启用/认证缺失/exited 摘要引导，onOpenSettings 联动
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, Send, Square, AlertTriangle, List as ListIcon, MessageSquare, Settings } from "lucide-react";
+import { Bot, Send, Square, AlertTriangle, List as ListIcon, MessageSquare, Settings, X, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   getStatus,
   start,
@@ -16,11 +17,12 @@ import {
   agentRespond,
   onAgentNotification,
   onAgentStatus,
+  onParseError,
   onServerRequest,
   getSettings,
   getAuthStatus,
 } from "@/lib/agent/client";
-import type { AgentSettingsDto, AgentStatusDto } from "@/lib/agent/client";
+import type { AgentSettingsDto, AgentStatusDto, ParseErrorPayload } from "@/lib/agent/client";
 import { createInitialView, reduceAgentEvent, reduceServerRequest, resolveServerRequest } from "@/lib/agent/codec";
 import type { AgentThreadView, ApprovalRequestView } from "@/lib/agent/codec";
 import { addThread, listThreads, updateThreadModel } from "@/lib/agent/store";
@@ -32,9 +34,21 @@ import { ThreadList } from "@/components/agent/ThreadList";
 import { createAllowlist, allowlistHas, allowlistAdd } from "@/lib/agent/allowlist";
 import type { Allowlist } from "@/lib/agent/allowlist";
 import { setAiModel } from "@/lib/ai-config";
+import type { NoteDto } from "@/api/types";
+
+const NOTE_CONTEXT_LIMIT = 8000;
+const NOTE_CONTEXT_TRUNCATED_HINT = "（内容已截断）";
+const PARSE_ERROR_DEDUP_MS = 3000;
 
 function isTauriEnv(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function buildNotePrefix(key: string, body: string): string {
+  const needsTrunc = body.length > NOTE_CONTEXT_LIMIT;
+  const snapshot = needsTrunc ? body.slice(0, NOTE_CONTEXT_LIMIT) : body;
+  const truncatedMark = needsTrunc ? `\n${NOTE_CONTEXT_TRUNCATED_HINT}` : "";
+  return `[当前打开的笔记: ${key}.md（vault 根目录相对路径，可用文件工具直接读写）]\n<note_content>\n${snapshot}${truncatedMark}\n</note_content>`;
 }
 
 function getAuthMissingHint(settings: AgentSettingsDto | null, chatAuthed: boolean | null): string | null {
@@ -56,17 +70,44 @@ function getAuthMissingHint(settings: AgentSettingsDto | null, chatAuthed: boole
   return null;
 }
 
+function formatTokenUsage(tokenUsage: unknown): string | null {
+  if (tokenUsage == null || typeof tokenUsage !== "object") return null;
+  const u = tokenUsage as Record<string, unknown>;
+  // 标准 ThreadTokenUsage：{ total: { totalTokens, inputTokens, outputTokens }, last: {...} }
+  const total = u["total"] as Record<string, unknown> | undefined;
+  if (total && typeof total["totalTokens"] === "number") {
+    const t = total["totalTokens"] as number;
+    const input = typeof total["inputTokens"] === "number" ? (total["inputTokens"] as number) : null;
+    const output = typeof total["outputTokens"] === "number" ? (total["outputTokens"] as number) : null;
+    if (input != null && output != null) return `tokens ${t} (in ${input} / out ${output})`;
+    return `tokens ${t}`;
+  }
+  // 兼容扁平
+  if (typeof u["totalTokens"] === "number") return `tokens ${u["totalTokens"] as number}`;
+  return null;
+}
+
 type Props = {
   onInsertToNote: (text: string) => void;
   vaultRoot: string | null;
   onVaultChanged: () => void;
   flushSave: () => Promise<void>;
   onOpenSettings?: () => void;
+  noteKey?: string | null;
+  getCurrentNote?: () => Promise<NoteDto | null>;
 };
 
 type PanelMode = "threadList" | "conversation";
 
-export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSave, onOpenSettings }: Props) {
+export function AgentPanel({
+  onInsertToNote,
+  vaultRoot,
+  onVaultChanged,
+  flushSave,
+  onOpenSettings,
+  noteKey = null,
+  getCurrentNote,
+}: Props) {
   const isDesktop = isTauriEnv();
 
   const [status, setStatus] = useState<AgentStatusDto | null>(null);
@@ -77,6 +118,7 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorDetails, setErrorDetails] = useState<string | null>(null);
   const [queue, setQueue] = useState<ApprovalRequestView[]>([]);
   const [allowlist] = useState<Allowlist>(() => createAllowlist());
   const [allowlistVersion, setAllowlistVersion] = useState(0);
@@ -84,6 +126,7 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [agentSettings, setAgentSettings] = useState<AgentSettingsDto | null>(null);
   const [chatAuthed, setChatAuthed] = useState<boolean | null>(null);
+  const [noteContextEnabled, setNoteContextEnabled] = useState(true);
 
   const fileChangeInTurnRef = useRef(false);
   const allowlistRef = useRef(allowlist);
@@ -92,10 +135,16 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
   }, [allowlist]);
 
   const listRef = useRef<HTMLDivElement>(null);
+  const parseErrorDedupRef = useRef<{ key: string; at: number } | null>(null);
   const viewRef = useRef(view);
   useEffect(() => {
     viewRef.current = view;
   }, [view]);
+
+  // 切笔记后 chip 跟随更新并重置为附加状态
+  useEffect(() => {
+    if (noteKey) setNoteContextEnabled(true);
+  }, [noteKey]);
 
   useEffect(() => {
     if (!vaultRoot || !view.threadId) return;
@@ -163,6 +212,7 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
     let unlistenStatus: (() => void) | null = null;
     let unlistenNotif: (() => void) | null = null;
     let unlistenReq: (() => void) | null = null;
+    let unlistenParse: (() => void) | null = null;
     let cancelled = false;
 
     void onAgentStatus((s) => {
@@ -171,6 +221,22 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
       if (s.phase === "exited" || s.phase === "stopped") {
         setView((prev) => ({ ...prev, status: "idle", activeTurnId: null }));
         setQueue([]);
+        // B.3：在会话视图时设置错误横幅（避免静默 exited）
+        if (s.phase === "exited" && viewRef.current.threadId) {
+          const reason = typeof s.reason === "string" && s.reason.trim() ? s.reason.trim() : null;
+          const lastErr = typeof s.lastError === "string" && s.lastError.trim() ? s.lastError.trim() : null;
+          const code = typeof s.code === "number" ? `（退出码 ${s.code}）` : "";
+          const msg = reason ?? lastErr ?? `Agent 已退出${code}`;
+          setError(msg);
+          const tails: string[] = [];
+          if (Array.isArray(s.stderr_tail) && s.stderr_tail.length > 0) tails.push(...(s.stderr_tail as string[]));
+          if (Array.isArray((s as Record<string, unknown>)["stderrTail"])) {
+            const alt = (s as Record<string, unknown>)["stderrTail"] as string[];
+            if (alt.length > 0 && tails.length === 0) tails.push(...alt);
+          }
+          if (tails.length > 0) setErrorDetails(tails.slice(-40).join("\n"));
+          else setErrorDetails(null);
+        }
       }
     }).then((fn) => {
       unlistenStatus = fn;
@@ -206,6 +272,28 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
       unlistenNotif = fn;
     });
 
+    void onParseError((payload: ParseErrorPayload) => {
+      if (cancelled) return;
+      // 去抖/去重：同 payload 短时间内不重复刷屏
+      const key = `${payload.error}::${payload.line.slice(0, 120)}`;
+      const now = Date.now();
+      const prev = parseErrorDedupRef.current;
+      if (prev && prev.key === key && now - prev.at < PARSE_ERROR_DEDUP_MS) return;
+      parseErrorDedupRef.current = { key, at: now };
+      // 仅在有会话上下文时打到会话内横幅，避免空会话刷屏
+      setError(`解析错误：${payload.error}`);
+      setErrorDetails(payload.line.length > 800 ? `${payload.line.slice(0, 800)}…` : payload.line);
+      // 同时注入一条 error item 便于会话内留痕
+      setView((prev) => {
+        if (!prev.threadId) return prev;
+        const next = reduceAgentEvent(prev, { method: "error", params: { error: { message: payload.error, additionalDetails: payload.line.slice(0, 400), codexErrorInfo: null, misalignment: null }, willRetry: false, threadId: prev.threadId, turnId: prev.activeTurnId ?? "" } } as unknown as ServerNotification);
+        // reduceAgentEvent 对 error 通知的处理由 codec 完成
+        return next;
+      });
+    }).then((fn) => {
+      unlistenParse = fn;
+    });
+
     void onServerRequest((req: { id: unknown; method: string; params: unknown }) => {
       if (cancelled) return;
       if (allowlistHas(allowlistRef.current, req.method, req.params)) {
@@ -231,7 +319,10 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
               return agentRespond(req.id, { decision: "acceptForSession" as const });
           }
         };
-        void sendAuto().catch(() => {});
+        void sendAuto().catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          setError(`自动批准失败：${msg}`);
+        });
         return;
       }
       setQueue((prev) => reduceServerRequest(prev, { id: req.id, method: req.method, params: req.params }));
@@ -244,6 +335,7 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
       unlistenStatus?.();
       unlistenNotif?.();
       unlistenReq?.();
+      unlistenParse?.();
     };
   }, [isDesktop, onVaultChanged]);
 
@@ -262,7 +354,10 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
         }
       }
       setQueue((prev) => resolveServerRequest(prev, id));
-      void agentRespond(id, result, errorVal).catch(() => {});
+      void agentRespond(id, result, errorVal).catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(`审批响应失败：${msg}`);
+      });
     },
     [queue, bumpAllowlist],
   );
@@ -352,6 +447,8 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
         setView((prev) => ({ ...prev, threadId, activeTurnId: null, status: "idle" }));
       }
       setPanelMode("conversation");
+      setError(null);
+      setErrorDetails(null);
       if (vaultRoot && selectedModel) {
         try {
           updateThreadModel(vaultRoot, threadId, selectedModel);
@@ -365,6 +462,8 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
 
   const handleNewThread = useCallback(() => {
     setView((prev) => ({ ...prev, threadId: "", items: [], activeTurnId: null, status: "idle" }));
+    setError(null);
+    setErrorDetails(null);
     setPanelMode("conversation");
   }, []);
 
@@ -396,6 +495,21 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
     [vaultRoot, agentSettings?.authMode],
   );
 
+  const buildTurnText = useCallback(
+    async (rawText: string): Promise<string> => {
+      if (!noteContextEnabled || !noteKey || !getCurrentNote) return rawText;
+      try {
+        const note = await getCurrentNote();
+        if (!note || typeof note.body !== "string") return rawText;
+        const prefix = buildNotePrefix(note.key ?? noteKey, note.body);
+        return `${prefix}\n\n${rawText}`;
+      } catch {
+        return rawText;
+      }
+    },
+    [noteContextEnabled, noteKey, getCurrentNote],
+  );
+
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || sending) return;
@@ -405,12 +519,15 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
       return;
     }
     setError(null);
+    setErrorDetails(null);
     try {
       await flushSave();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       console.warn("[agent] flushSave 失败：", msg);
     }
+
+    const finalText = await buildTurnText(text);
 
     setSending(true);
     setView((prev) => {
@@ -455,12 +572,12 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
         await turnSteer({
           threadId,
           expectedTurnId: cur.activeTurnId,
-          input: [{ type: "text", text, text_elements: [] }],
+          input: [{ type: "text", text: finalText, text_elements: [] }],
         });
       } else {
         await turnStart({
           threadId,
-          input: [{ type: "text", text, text_elements: [] }],
+          input: [{ type: "text", text: finalText, text_elements: [] }],
           ...(modelForStart ? { model: modelForStart } : {}),
         });
       }
@@ -472,7 +589,7 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
         if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
       });
     }
-  }, [input, sending, flushSave, vaultRoot, selectedModel, agentSettings, chatAuthed]);
+  }, [input, sending, flushSave, vaultRoot, selectedModel, agentSettings, chatAuthed, buildTurnText]);
 
   const handleInterrupt = useCallback(async () => {
     const cur = viewRef.current;
@@ -598,14 +715,18 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
     );
   }
 
+  const tokenText = formatTokenUsage(view.tokenUsage);
+  const turnStateLabel = view.activeTurnId ? (view.status === "running" ? "运行中" : "思考中") : "空闲";
+  const showNoteChip = Boolean(noteKey && noteContextEnabled);
+
   return (
-    <div className="flex h-full flex-col gap-2 p-3">
-      <div className="flex items-center gap-1">
+    <div className="flex h-full flex-col gap-0">
+      <div className="flex items-center gap-1 border-b border-border/50 px-2 py-1.5">
         <Button
           type="button"
           variant={panelMode === "conversation" ? "secondary" : "ghost"}
           size="sm"
-          className="h-7 gap-1.5 text-xs"
+          className="h-7 gap-1.5 rounded-md text-xs"
           onClick={() => setPanelMode("conversation")}
         >
           <MessageSquare className="size-3.5" />
@@ -615,17 +736,19 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
           type="button"
           variant={panelMode === "threadList" ? "secondary" : "ghost"}
           size="sm"
-          className="h-7 gap-1.5 text-xs"
+          className="h-7 gap-1.5 rounded-md text-xs"
           onClick={() => setPanelMode("threadList")}
         >
           <ListIcon className="size-3.5" />
           列表
         </Button>
-        <span className="ml-auto truncate text-[11px] text-muted-foreground">{view.threadId ? view.threadId.slice(0, 8) : "新会话"}</span>
+        <span className="ml-auto truncate font-mono text-[11px] text-muted-foreground">
+          {view.threadId ? view.threadId.slice(0, 8) : "新会话"}
+        </span>
       </div>
 
       {panelMode === "threadList" ? (
-        <div className="min-h-0 flex-1 overflow-hidden rounded-md border">
+        <div className="min-h-0 flex-1 overflow-hidden">
           <ThreadList
             vaultRoot={vaultRoot}
             activeThreadId={view.threadId || null}
@@ -641,39 +764,107 @@ export function AgentPanel({ onInsertToNote, vaultRoot, onVaultChanged, flushSav
         </div>
       ) : (
         <>
-          <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-3 overflow-auto rounded-md border bg-card p-3">
-            <MessageStream items={view.items} activeTurnId={view.activeTurnId} onInsertToNote={onInsertToNote} />
-            {error && <p className="rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</p>}
+          {error && (
+            <div className="mx-2 mt-2 overflow-hidden rounded-md border border-red-500/25 bg-red-500/10">
+              <div className="flex gap-2 px-2.5 py-2">
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-red-600 dark:text-red-400" />
+                <div className="min-w-0 flex-1">
+                  <p className="whitespace-pre-wrap break-words text-xs font-medium text-red-700 dark:text-red-300">{error}</p>
+                  {errorDetails && (
+                    <details className="mt-1.5">
+                      <summary className="cursor-pointer text-[11px] text-red-700/80 dark:text-red-300/80">查看详情</summary>
+                      <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-black/5 px-2 py-1.5 font-mono text-[11px] dark:bg-white/5">
+                        {errorDetails.slice(0, 4000)}
+                      </pre>
+                    </details>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setError(null);
+                    setErrorDetails(null);
+                  }}
+                  className="shrink-0 rounded p-1 text-red-700/70 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300/70"
+                  aria-label="关闭"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          <ScrollArea className="min-h-0 flex-1" viewportRef={listRef}>
+            <div className="px-3 py-2">
+              <MessageStream items={view.items} activeTurnId={view.activeTurnId} onInsertToNote={onInsertToNote} />
+            </div>
+          </ScrollArea>
+
+          {showNoteChip && (
+            <div className="mx-2 mb-1 flex">
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border bg-muted/60 px-2.5 py-1 text-[11px] text-muted-foreground">
+                <FileText className="size-3 shrink-0" />
+                <span className="max-w-[14rem] truncate font-mono">{noteKey}.md</span>
+                <button
+                  type="button"
+                  onClick={() => setNoteContextEnabled(false)}
+                  className="ml-0.5 rounded-full p-0.5 hover:bg-accent hover:text-foreground"
+                  aria-label="移除上下文"
+                  title="本次会话不再附加此笔记"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            </div>
+          )}
+
+          <div className="border-t border-border/40 px-2 pb-2 pt-2">
+            <div className="flex gap-2">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={view.activeTurnId ? "输入追加消息，Enter 发送（steer），Esc 中断" : "输入消息，Enter 发送，Shift+Enter 换行"}
+                className="max-h-28 min-h-[44px] flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                rows={2}
+              />
+              {view.activeTurnId ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  className="size-9 shrink-0"
+                  onClick={() => void handleInterrupt()}
+                  aria-label="中断"
+                  title="中断（Esc）"
+                >
+                  <Square className="size-3.5" />
+                </Button>
+              ) : (
+                <Button type="button" size="icon" className="size-9 shrink-0" onClick={() => void handleSend()} disabled={!input.trim()} aria-label="发送">
+                  <Send className="size-4" />
+                </Button>
+              )}
+            </div>
+            {view.activeTurnId && <p className="mt-1.5 text-[11px] text-muted-foreground">Agent 正在执行… 可输入追加消息或按 Esc 中断</p>}
           </div>
 
-          <div className="flex gap-2">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={view.activeTurnId ? "输入追加消息，Enter 发送（steer），Esc 中断" : "输入消息，Enter 发送，Shift+Enter 换行"}
-              className="max-h-28 min-h-[44px] flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              rows={2}
-            />
-            {view.activeTurnId ? (
-              <Button
-                type="button"
-                variant="secondary"
-                size="icon"
-                className="size-9 shrink-0"
-                onClick={() => void handleInterrupt()}
-                aria-label="中断"
-                title="中断（Esc）"
-              >
-                <Square className="size-3.5" />
-              </Button>
-            ) : (
-              <Button type="button" size="icon" className="size-9 shrink-0" onClick={() => void handleSend()} disabled={!input.trim()} aria-label="发送">
-                <Send className="size-4" />
-              </Button>
+          {/* 底部状态栏：模型 · token · 回合状态（等宽小字 + 上分隔线） */}
+          <div className="flex items-center gap-2 border-t border-border/50 bg-muted/30 px-2.5 py-1 font-mono text-[11px] text-muted-foreground">
+            <span className="min-w-0 flex-1 truncate" title={selectedModel ?? undefined}>
+              {selectedModel ?? "未选模型"}
+            </span>
+            {tokenText && (
+              <>
+                <span className="shrink-0 text-border">·</span>
+                <span className="shrink-0 truncate" title={tokenText}>
+                  {tokenText}
+                </span>
+              </>
             )}
+            <span className="shrink-0 text-border">·</span>
+            <span className={`shrink-0 ${view.activeTurnId ? "text-amber-600 dark:text-amber-400" : ""}`}>{turnStateLabel}</span>
           </div>
-          {view.activeTurnId && <p className="text-[11px] text-muted-foreground">Agent 正在执行… 可输入追加消息或按 Esc 中断</p>}
         </>
       )}
 

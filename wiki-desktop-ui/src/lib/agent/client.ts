@@ -292,6 +292,22 @@ export async function onAgentStatus(cb: (s: AgentStatusDto) => void): Promise<Un
   return unlisten;
 }
 
+/** codex stdout 行解析失败的载荷（Rust 侧 bridge 发射 `agent:parse-error`） */
+export type ParseErrorPayload = {
+  line: string;
+  error: string;
+};
+
+export async function onParseError(cb: (p: ParseErrorPayload) => void): Promise<UnlistenFn> {
+  if (!isTauriEnv()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<ParseErrorPayload>("agent:parse-error", (event) => {
+    const p = event.payload as ParseErrorPayload;
+    cb(p);
+  });
+  return unlisten;
+}
+
 // —— 状态与设置 ——
 
 export async function getStatus(): Promise<AgentStatusDto> {

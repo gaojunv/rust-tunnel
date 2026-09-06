@@ -25,6 +25,7 @@ export type ItemView =
       status: string;
     }
   | { kind: "plan"; id: string; text: string }
+  | { kind: "error"; id: string; message: string }
   | { kind: "unknown"; id: string; raw: unknown };
 
 export type AgentThreadView = {
@@ -174,6 +175,38 @@ function updateItemById(
   const next = [...items];
   next[idx] = updater(next[idx]);
   return next;
+}
+
+// —— error 提取 ——
+
+/**
+ * 从各类 error 形态中提取可展示文本（纯函数）：
+ * - 字符串：直接使用
+ * - TurnError：`{ message, additionalDetails, ... }`
+ * - 其余对象：尝试 `message` 字段
+ */
+function extractErrorText(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === "string") {
+    const t = value.trim();
+    return t || null;
+  }
+  if (typeof value === "object") {
+    const o = value as Record<string, unknown>;
+    const msg = o["message"];
+    if (typeof msg === "string" && msg.trim()) {
+      const add = o["additionalDetails"];
+      const detail = typeof add === "string" && add.trim() ? add.trim() : "";
+      return detail ? `${msg.trim()}\n${detail}` : msg.trim();
+    }
+  }
+  return null;
+}
+
+/** 生成（或复用）一条 error item；已存在同 id 的 error 则不重复追加 */
+function appendErrorItem(items: ItemView[], id: string, message: string): ItemView[] {
+  if (items.some((it) => it.kind === "error" && it.id === id)) return items;
+  return [...items, { kind: "error", id, message }];
 }
 
 // —— 主 reducer ——
@@ -340,17 +373,18 @@ export function reduceAgentEvent(
         return { ...state, items: upsertItem(state.items, finalized) };
       }
       case "turn/completed": {
-        const turn = (params as Record<string, unknown>)?.["turn"] as Record<string, unknown> | undefined;
+        const paramsObj = (params as Record<string, unknown>) ?? {};
+        const turn = paramsObj["turn"] as Record<string, unknown> | undefined;
         const turnId =
           (turn?.["id"] as string | undefined) ??
-          (params as Record<string, unknown>)?.["turnId"] as string | undefined;
+          (paramsObj["turnId"] as string | undefined);
         // 仅当完成的 turn 是活跃 turn 时清空
         if (turnId && state.activeTurnId && turnId !== state.activeTurnId) {
           // 忽略非活跃 turn 的完成
           return state;
         }
         // 将未完成的 streaming 项标记为完成
-        const finalizedItems = state.items.map((it) => {
+        let finalizedItems = state.items.map((it) => {
           if (it.kind === "agentMessage" && !it.complete) return { ...it, complete: true };
           if (it.kind === "reasoning" && !it.complete) return { ...it, complete: true } as ItemView;
           if (it.kind === "commandExecution" && it.status === "inProgress")
@@ -359,11 +393,33 @@ export function reduceAgentEvent(
             return { ...it, status: "completed" } as ItemView;
           return it;
         });
+        // 若 turn 携带 error（TurnError 或 params.error 顶层字段），追加 error item 而非静默收尾
+        const errValue = paramsObj["error"] ?? turn?.["error"];
+        const errMsg = extractErrorText(errValue);
+        if (errMsg) {
+          finalizedItems = appendErrorItem(
+            finalizedItems,
+            `error-${turnId ?? "turn"}`,
+            errMsg,
+          );
+        }
         return {
           ...state,
           items: finalizedItems,
           activeTurnId: null,
           status: "idle",
+        };
+      }
+      case "error": {
+        // ACP 顶层 error 通知（ErrorNotification: { error: TurnError, turnId, ... }）
+        const paramsObj = (params as Record<string, unknown>) ?? {};
+        const errValue = paramsObj["error"];
+        const errMsg = extractErrorText(errValue);
+        if (!errMsg) return state;
+        const turnId = paramsObj["turnId"] as string | undefined;
+        return {
+          ...state,
+          items: appendErrorItem(state.items, `error-${turnId ?? "notification"}`, errMsg),
         };
       }
       case "thread/tokenUsage/updated": {
