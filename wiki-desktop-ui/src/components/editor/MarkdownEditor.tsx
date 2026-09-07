@@ -7,7 +7,7 @@ import {
   useState,
   type RefObject,
 } from "react";
-import { EditorState } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import {
   EditorView,
   keymap,
@@ -41,6 +41,7 @@ import {
   type NoteSummaryLike,
 } from "@/lib/codemirror/wikilink-source";
 import { insertImageMarkdown } from "@/lib/codemirror/format-commands";
+import { livePreview, wikilinkNavFacet } from "@/lib/codemirror/live-preview/index";
 
 export type MarkdownEditorProps = {
   initialDoc: string;
@@ -49,6 +50,8 @@ export type MarkdownEditorProps = {
   getCompletionNotes?: () => NoteSummaryLike[];
   onPasteImage?: (file: File) => Promise<string | null>;
   onImageError?: (message: string) => void;
+  onNavigateWikilink?: (key: string) => void;
+  livePreviewEnabled?: boolean;
   placeholder?: string;
   className?: string;
 };
@@ -86,6 +89,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       getCompletionNotes,
       onPasteImage,
       onImageError,
+      onNavigateWikilink,
+      livePreviewEnabled = true,
       placeholder,
       className,
     },
@@ -99,6 +104,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
     const onPasteImageRef = useLatest(onPasteImage);
     const onImageErrorRef = useLatest(onImageError);
     const getCompletionNotesRef = useLatest(getCompletionNotes);
+    const onNavigateWikilinkRef = useLatest(onNavigateWikilink);
+
+    // Live Preview Compartment：reconfigure 重配保留撤销历史；放在 wikiSyntaxHighlighting 之后
+    const lpCompartment = useMemo(() => new Compartment(), []);
 
     const initialDocRef = useRef(initialDoc);
     const placeholderRef = useRef(placeholder);
@@ -224,6 +233,11 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
         highlightActiveLine(),
         markdown({ base: markdownLanguage, codeLanguages: languages }),
         wikiSyntaxHighlighting,
+        // Live Preview 置于 wikiSyntaxHighlighting 之后：highlight 管内容级样式，
+        // 本层只管结构级装饰（widget/隐藏标记/行背景）。初始为空，由下方开关 effect
+        // 经 Compartment.reconfigure 装配/卸载（保留撤销历史）。
+        wikilinkNavFacet.of((key) => onNavigateWikilinkRef.current?.(key)),
+        lpCompartment.of([]),
         autocompletion({
           override: [completionSource],
           icons: false,
@@ -282,6 +296,15 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       // mount once; initialDoc changes handled by parent remounting via key={noteKey}
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Live Preview 开关：Compartment.reconfigure 保留撤销历史
+    useEffect(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch({
+        effects: lpCompartment.reconfigure(livePreviewEnabled ? livePreview() : []),
+      });
+    }, [livePreviewEnabled, lpCompartment]);
 
     return (
       <div ref={containerRef} className={cn("relative min-h-0 flex-1 overflow-hidden", className)}>

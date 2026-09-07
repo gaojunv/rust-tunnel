@@ -15,6 +15,7 @@ import { EditorToolbar } from "@/components/editor/EditorToolbar";
 import { EditorView } from "@codemirror/view";
 import type { SelectionSource } from "@/lib/selection-source";
 import { readScrollPos, writeScrollPos } from "@/lib/scroll-memory";
+import { loadEditorPrefs, saveEditorPrefs } from "@/lib/editor-prefs";
 
 export interface NoteEditorHandle {
   insertAtCursor(text: string): void;
@@ -60,6 +61,15 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   const [error, setError] = useState<string | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+  // Live Preview 开关：默认开启，切换时写 localStorage
+  const [livePreview, setLivePreview] = useState<boolean>(() => loadEditorPrefs().livePreview);
+  const toggleLivePreview = useCallback(() => {
+    setLivePreview((prev) => {
+      const next = !prev;
+      saveEditorPrefs({ livePreview: next });
+      return next;
+    });
+  }, []);
 
   const previewScrollRef = useRef<HTMLDivElement>(null);
   const previewProgressRef = useRef<HTMLDivElement>(null);
@@ -828,7 +838,13 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           <Trash2 className="size-4" />
         </Button>
       </div>
-      {isEdit && <EditorToolbar getView={() => cmRef.current?.view() ?? null} />}
+      {isEdit && (
+        <EditorToolbar
+          getView={() => cmRef.current?.view() ?? null}
+          livePreview={livePreview}
+          onToggleLivePreview={toggleLivePreview}
+        />
+      )}
 
       {error && <p className="mx-3 mt-3 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
 
@@ -853,6 +869,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
               onDocChanged={setBody}
               onSave={() => void flushSave()}
               getCompletionNotes={getCompletionNotes}
+              livePreviewEnabled={livePreview}
+              onNavigateWikilink={onNavigate}
               onPasteImage={async (file) => {
                 if (!noteKey) return null;
                 try {

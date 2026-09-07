@@ -12,6 +12,7 @@ import {
   ListChecks,
   Table,
   Link,
+  Wand,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -31,6 +32,8 @@ import {
 type Props = {
   getView: () => EditorView | null;
   className?: string;
+  livePreview?: boolean;
+  onToggleLivePreview?: () => void;
 };
 
 type Tool = {
@@ -40,7 +43,7 @@ type Tool = {
   run: (view: EditorView) => boolean;
 };
 
-export function EditorToolbar({ getView, className }: Props) {
+export function EditorToolbar({ getView, className, livePreview, onToggleLivePreview }: Props) {
   const tools: Tool[] = [
     { label: "Bold", icon: <Bold className="h-4 w-4" />, title: "粗体 (Ctrl+B)", run: toggleBold },
     { label: "Italic", icon: <Italic className="h-4 w-4" />, title: "斜体 (Ctrl+I)", run: toggleItalic },
@@ -119,6 +122,20 @@ export function EditorToolbar({ getView, className }: Props) {
           {tool.icon}
         </Button>
       ))}
+      <div className="mx-1 h-4 w-px bg-border" />
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8"
+        title={livePreview ? "关闭 Live Preview（还原 Markdown 源码）" : "开启 Live Preview（边写边渲染）"}
+        aria-label="Live Preview"
+        aria-pressed={livePreview}
+        data-live-preview-on={livePreview || undefined}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => onToggleLivePreview?.()}
+      >
+        <Wand className={`h-4 w-4 ${livePreview ? "" : "text-muted-foreground/60"}`} />
+      </Button>
     </div>
   );
 }

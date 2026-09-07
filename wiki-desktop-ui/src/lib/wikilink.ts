@@ -30,42 +30,87 @@ function fenceInfo(line: string): { ch: string; len: number } | null {
   return { ch, len };
 }
 
-// 将单行中非代码区间的 wikilink 替换为 markdown 链接
-function replaceWikilinksInLine(line: string): string {
-  // 先找出行内反引号区间（成对反引号之内的内容为代码，不转换）
-  // 规则：连续 1 个或多个反引号作为定界符，匹配最短闭合
+/**
+ * A wikilink occurrence within a single line, positions absolute in the doc.
+ * The whole `[[target|label]]` / `[[target]]` source span is [from, to).
+ */
+export type WikilinkSpan = {
+  /** absolute offset of the opening `[[` */
+  from: number;
+  /** absolute offset just past the closing `]]` */
+  to: number;
+  /** target key (trimmed, unescaped source text) */
+  target: string;
+  /** display label (defaults to target when no `|label` part) */
+  label: string;
+};
+
+// 找出单行中非行内代码区间的 wikilink 区间。
+// 行内反引号区间规则（与 transformWikilinks 历史行为一致）：
+// 连续 1 个或多个反引号作为定界符，匹配最短闭合；未闭合时剩余都算代码
+// （CommonMark 语义下未闭合行内码延伸到行尾）。
+// 注意：不感知围栏（``` / ~~~）——那由调用方按行级上下文决定（live-preview 用 lezer 树判断）。
+function collectCodeSpans(line: string): Array<[number, number]> {
   const codeSpans: Array<[number, number]> = [];
-  {
-    let i = 0;
-    while (i < line.length) {
-      if (line[i] !== "`") {
-        i++;
-        continue;
-      }
-      let openLen = 0;
-      while (i + openLen < line.length && line[i + openLen] === "`") openLen++;
-      const openEnd = i + openLen;
-      const closeIdx = line.indexOf("`".repeat(openLen), openEnd);
-      if (closeIdx === -1) break; // 未闭合，剩余都算代码（CommonMark 语义下未闭合行内码延伸到行尾）
-      codeSpans.push([i, closeIdx + openLen]);
-      i = closeIdx + openLen;
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] !== "`") {
+      i++;
+      continue;
     }
+    let openLen = 0;
+    while (i + openLen < line.length && line[i + openLen] === "`") openLen++;
+    const openEnd = i + openLen;
+    const closeIdx = line.indexOf("`".repeat(openLen), openEnd);
+    if (closeIdx === -1) break; // 未闭合 → 到行尾都算代码
+    codeSpans.push([i, closeIdx + openLen]);
+    i = closeIdx + openLen;
   }
+  return codeSpans;
+}
+
+// 将单行中非代码区间的 wikilink 替换为 markdown 链接（与 transformWikilinks 使用同一扫描语义）
+function replaceWikilinksInLine(line: string): string {
+  const spans = scanWikilinksInLine(line, 0);
+  if (spans.length === 0) return line;
+  let out = "";
+  let cursor = 0;
+  for (const sp of spans) {
+    out += line.slice(cursor, sp.from);
+    const href = `${WIKILINK_PREFIX}${encodeURIComponent(sp.target)}`;
+    // 先转义反斜杠再转义 ]，否则 "\]" 会被改写成 "\\]" 反而破坏 markdown 链接结构
+    const safeLabel = sp.label.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
+    out += `[${safeLabel}](${href})`;
+    cursor = sp.to;
+  }
+  out += line.slice(cursor);
+  return out;
+}
+
+/**
+ * Scan a single physical line for wikilinks, skipping inline-code (backtick)
+ * spans. Positions are absolute (relative to the line plus `baseOffset`).
+ * Fence awareness is intentionally absent — callers decide per-line context.
+ *
+ * Behavioral notes (preserving the pre-existing transformWikilinks rules):
+ * - Empty `[[ ]]` or target-less `[[|label]]` matches are not emitted (kept raw).
+ * - The first `]]` closes a match (no support for `]]` inside a target).
+ */
+export function scanWikilinksInLine(line: string, baseOffset: number): WikilinkSpan[] {
+  const spans: WikilinkSpan[] = [];
+  const codeSpans = collectCodeSpans(line);
 
   function inCode(pos: number): boolean {
     for (const [s, e] of codeSpans) if (pos >= s && pos < e) return true;
     return false;
   }
 
-  // 逐字符扫描 [[ ... ]]，遇到位于 code span 内的则跳过
-  let out = "";
   let i = 0;
   while (i < line.length) {
     if (inCode(i)) {
       // 跳到该代码区间末尾
       for (const [s, e] of codeSpans) {
         if (i >= s && i < e) {
-          out += line.slice(i, e);
           i = e;
           break;
         }
@@ -75,14 +120,12 @@ function replaceWikilinksInLine(line: string): string {
     if (line[i] === "[" && line[i + 1] === "[") {
       const close = line.indexOf("]]", i + 2);
       if (close === -1) {
-        out += line[i];
         i++;
         continue;
       }
       const inner = line.slice(i + 2, close);
       if (!inner.trim()) {
         // 空内容，保持原样
-        out += line.slice(i, close + 2);
         i = close + 2;
         continue;
       }
@@ -90,21 +133,16 @@ function replaceWikilinksInLine(line: string): string {
       const target = (bar === -1 ? inner : inner.slice(0, bar)).trim();
       const label = (bar === -1 ? inner : inner.slice(bar + 1)).trim() || target;
       if (!target) {
-        out += line.slice(i, close + 2);
         i = close + 2;
         continue;
       }
-      const href = `${WIKILINK_PREFIX}${encodeURIComponent(target)}`;
-      // 先转义反斜杠再转义 ]，否则 "\]" 会被改写成 "\\]" 反而破坏 markdown 链接结构
-      const safeLabel = label.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
-      out += `[${safeLabel}](${href})`;
+      spans.push({ from: baseOffset + i, to: baseOffset + close + 2, target, label });
       i = close + 2;
       continue;
     }
-    out += line[i];
     i++;
   }
-  return out;
+  return spans;
 }
 
 export function transformWikilinks(md: string): string {
