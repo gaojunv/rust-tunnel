@@ -74,7 +74,7 @@ webpki-roots = "1.0"
 rustls-native-certs = "0.8"
 time = "0.3"
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
-md-5 = "0.10"
+md-5 = "0.11"
 # PDF 文本层提取（纯 Rust，无系统动态库依赖；nom_parser 提供 load/extract_text）
 lopdf = { version = "0.32", default-features = false, features = ["nom_parser"] }
 # OOXML（docx/xlsx/pptx）解包：仅 deflate（miniz_oxide 纯 Rust），不开 bzip2/zstd/aes
