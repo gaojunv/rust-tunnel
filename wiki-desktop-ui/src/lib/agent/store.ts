@@ -10,6 +10,10 @@ export type AgentThreadRecord = {
   title: string;
   createdAt: number;
   model?: string | null;
+  /** 审批/沙箱预设 key（只读/自动/全权，命名对齐后续 ModeBar） */
+  mode?: string;
+  /** 推理强度（null = 跟随模型默认） */
+  effort?: string | null;
   pinnedNoteKey?: string | null;
   archived?: boolean;
 };
@@ -99,6 +103,17 @@ export function archiveThread(vaultRoot: string, threadId: string): void {
   saveRaw(shape);
 }
 
+export function unarchiveThread(vaultRoot: string, threadId: string): void {
+  const key = vaultHash(vaultRoot);
+  const shape = loadRaw();
+  const bucket = Array.isArray(shape[key]) ? (shape[key] as AgentThreadRecord[]) : [];
+  const idx = bucket.findIndex((it) => it.threadId === threadId);
+  if (idx === -1) return;
+  bucket[idx] = { ...bucket[idx], archived: false };
+  shape[key] = bucket;
+  saveRaw(shape);
+}
+
 export function removeThread(vaultRoot: string, threadId: string): void {
   const key = vaultHash(vaultRoot);
   const shape = loadRaw();
@@ -125,6 +140,32 @@ export function updateThreadModel(
 export function getThreadModel(vaultRoot: string, threadId: string): string | null {
   const rec = listThreads(vaultRoot).find((it) => it.threadId === threadId);
   return rec?.model ?? null;
+}
+
+export function updateThreadMode(vaultRoot: string, threadId: string, mode: string): void {
+  const key = vaultHash(vaultRoot);
+  const shape = loadRaw();
+  const bucket = Array.isArray(shape[key]) ? (shape[key] as AgentThreadRecord[]) : [];
+  const idx = bucket.findIndex((it) => it.threadId === threadId);
+  if (idx === -1) return;
+  bucket[idx] = { ...bucket[idx], mode };
+  shape[key] = bucket;
+  saveRaw(shape);
+}
+
+export function updateThreadEffort(
+  vaultRoot: string,
+  threadId: string,
+  effort: string | null,
+): void {
+  const key = vaultHash(vaultRoot);
+  const shape = loadRaw();
+  const bucket = Array.isArray(shape[key]) ? (shape[key] as AgentThreadRecord[]) : [];
+  const idx = bucket.findIndex((it) => it.threadId === threadId);
+  if (idx === -1) return;
+  bucket[idx] = { ...bucket[idx], effort };
+  shape[key] = bucket;
+  saveRaw(shape);
 }
 
 // 测试辅助：清空

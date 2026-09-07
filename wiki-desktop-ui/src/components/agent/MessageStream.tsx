@@ -383,7 +383,9 @@ export function MessageStream({ items, activeTurnId, onInsertToNote }: Props) {
           case "unknown":
             return <UnknownItem key={item.id} item={item} />;
           default: {
-            const unknownItem = item as Extract<ItemView, { kind: "unknown" }>;
+            // 最小兼容（2A）：codec 新增 system kind 后 default 分支收窄为 system，
+            // 先经 unknown 中转保持既有行为不变；system 的正式渲染由 2C 接线。
+            const unknownItem = item as unknown as Extract<ItemView, { kind: "unknown" }>;
             return <UnknownItem key={unknownItem.id} item={unknownItem} />;
           }
         }

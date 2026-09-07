@@ -26,7 +26,14 @@ export type ItemView =
     }
   | { kind: "plan"; id: string; text: string }
   | { kind: "error"; id: string; message: string }
+  | { kind: "system"; id: string; text: string; tone?: "info" | "warn" }
   | { kind: "unknown"; id: string; raw: unknown };
+
+/** turn 级聚合 diff（`turn/diff/updated` 最新快照，按 turnId 存放） */
+export type TurnDiffView = {
+  turnId: string;
+  diff: string;
+};
 
 export type AgentThreadView = {
   threadId: string;
@@ -34,6 +41,10 @@ export type AgentThreadView = {
   activeTurnId?: string | null;
   status: string;
   tokenUsage?: unknown;
+  /** turn 聚合 diff 快照（2A' Diff 审查的数据源；与 fileChange item 解耦） */
+  turnDiffs: TurnDiffView[];
+  /** 账户限流快照（`account/rateLimits/updated` 原样存放，仅状态栏消费） */
+  rateLimits?: unknown;
 };
 
 export type TokenUsageView = unknown;
@@ -45,6 +56,8 @@ export function createInitialView(threadId = ""): AgentThreadView {
     activeTurnId: null,
     status: "idle",
     tokenUsage: null,
+    turnDiffs: [],
+    rateLimits: null,
   };
 }
 
@@ -177,6 +190,43 @@ function updateItemById(
   return next;
 }
 
+// —— 历史回填：Turn[] → 只读 ItemView[] ——
+
+/**
+ * 历史回填映射（2C「resume 旧会话」数据源）。
+ * 将 `thread/turns/list` 返回的历史 Turn 按 turn 顺序、turn 内 item 顺序展开为只读 ItemView；
+ * 复用 threadItemToView，无法还原的类型（hookPrompt/mcpToolCall 等 → unknown）一律跳过；
+ * 畸形条目容错（跳过不抛错）。
+ *
+ * 输入用 codec 一贯的宽松结构类型（避免在此 import vendor Turn；vendor Turn 天然可赋值）。
+ */
+export type HydratableTurn = {
+  id?: string | null;
+  items?: Array<Record<string, unknown>> | null;
+};
+
+export function hydrateTurnsToItems(turns: readonly HydratableTurn[]): ItemView[] {
+  if (!Array.isArray(turns)) return [];
+  const out: ItemView[] = [];
+  for (const turn of turns) {
+    if (!turn || typeof turn !== "object") continue; // 畸形 turn：跳过
+    const items = (turn as { items?: unknown }).items;
+    if (!Array.isArray(items)) continue;
+    for (const raw of items) {
+      try {
+        if (raw == null || typeof raw !== "object") continue; // 畸形 item：跳过
+        const view = threadItemToView(raw);
+        if (view.kind === "unknown") continue; // 无法还原的类型：跳过/降级
+        out.push(view);
+      } catch {
+        // 容错：单项异常不影响整段回填
+        continue;
+      }
+    }
+  }
+  return out;
+}
+
 // —— error 提取 ——
 
 /**
@@ -209,6 +259,87 @@ function appendErrorItem(items: ItemView[], id: string, message: string): ItemVi
   return [...items, { kind: "error", id, message }];
 }
 
+// —— system 通知 ——
+
+/** upsert 一条 system item；同 id 已存在则替换（去重），否则追加 */
+function upsertSystemItem(
+  items: ItemView[],
+  id: string,
+  text: string,
+  tone: "info" | "warn",
+): ItemView[] {
+  const idx = items.findIndex((it) => it.kind === "system" && it.id === id);
+  if (idx === -1) return [...items, { kind: "system", id, text, tone }];
+  const next = [...items];
+  next[idx] = { kind: "system", id, text, tone };
+  return next;
+}
+
+/** model/rerouted 原因枚举转中文（未知取值回退原文） */
+function rerouteReasonText(reason: unknown): string {
+  if (reason === "highRiskCyberActivity") return "高风险网络活动";
+  return typeof reason === "string" && reason ? reason : "未知原因";
+}
+
+/**
+ * 将 system 类通知映射为 { id, text, tone }；无法构造文案时返回 null。
+ * 幂等：同 id 且内容一致的通知到达时由调用方跳过，避免消息流重复刷屏。
+ */
+function systemItemFromEvent(
+  method: string,
+  params: Record<string, unknown>,
+): { id: string; text: string; tone: "info" | "warn" } | null {
+  const detail =
+    typeof params["details"] === "string" && params["details"]
+      ? (params["details"] as string)
+      : "";
+  const turnId = typeof params["turnId"] === "string" ? (params["turnId"] as string) : null;
+  const textOf = (key: "message" | "summary"): string =>
+    typeof params[key] === "string" && params[key] ? (params[key] as string) : "";
+
+  if (method === "warning") {
+    const text = textOf("message");
+    if (!text) return null;
+    const threadId = typeof params["threadId"] === "string" ? (params["threadId"] as string) : null;
+    const body = detail ? `${text}\n${detail}` : text;
+    return { id: threadId ? `system-warning-${threadId}` : "system-warning", text: body, tone: "warn" };
+  }
+  if (method === "configWarning") {
+    const text = textOf("summary");
+    if (!text) return null;
+    const path =
+      typeof params["path"] === "string" && params["path"] ? (params["path"] as string) : "";
+    const body = text + (path ? `（${path}）` : "") + (detail ? `\n${detail}` : "");
+    return { id: "system-configWarning", text: body, tone: "warn" };
+  }
+  if (method === "deprecationNotice") {
+    const text = textOf("summary");
+    if (!text) return null;
+    const body = detail ? `${text}\n${detail}` : text;
+    return { id: "system-deprecationNotice", text: body, tone: "warn" };
+  }
+  if (method === "model/rerouted") {
+    const fromModel =
+      typeof params["fromModel"] === "string" && params["fromModel"]
+        ? (params["fromModel"] as string)
+        : "原模型";
+    const toModel =
+      typeof params["toModel"] === "string" && params["toModel"]
+        ? (params["toModel"] as string)
+        : "新模型";
+    const body = `模型已从 ${fromModel} 切换为 ${toModel}：${rerouteReasonText(params["reason"])}`;
+    return { id: `system-model-rerouted-${turnId ?? "turn"}`, text: body, tone: "info" };
+  }
+  if (method === "thread/compacted") {
+    return {
+      id: `system-thread-compacted-${turnId ?? "thread"}`,
+      text: "对话上下文已压缩整理，更早内容保留为摘要",
+      tone: "info",
+    };
+  }
+  return null;
+}
+
 // —— 主 reducer ——
 
 export function reduceAgentEvent(
@@ -234,8 +365,9 @@ export function reduceAgentEvent(
         return {
           ...state,
           threadId,
-          // 新 thread 清空旧消息
+          // 新 thread 清空旧消息与 turn 聚合 diff（rateLimits 为账户级，保留）
           items: [],
+          turnDiffs: [],
           activeTurnId: null,
           status: "idle",
         };
@@ -430,29 +562,43 @@ export function reduceAgentEvent(
         // vault 一致性需要感知文件变更，状态本身不变，由 AgentPanel 侧收紧 refresh 条件
         return state;
       }
+      case "account/rateLimits/updated": {
+        // 稀疏限流更新：原样存放快照供状态栏 title 提示，不刷消息流（2D）
+        const rl = (params as Record<string, unknown>)?.["rateLimits"] as unknown;
+        if (rl == null) return state;
+        return { ...state, rateLimits: rl };
+      }
+      case "warning":
+      case "configWarning":
+      case "model/rerouted":
+      case "thread/compacted":
+      case "deprecationNotice": {
+        // system 通知 → 消息流 system item（此前被静默吞掉，不再丢弃）
+        const sys = systemItemFromEvent(method, (params as Record<string, unknown>) ?? {});
+        if (!sys) return state;
+        const existing = state.items.find((it) => it.kind === "system" && it.id === sys.id);
+        // 同 id 且内容一致：不产生新状态（幂等去重）
+        if (existing && existing.kind === "system" && existing.text === sys.text) return state;
+        return { ...state, items: upsertSystemItem(state.items, sys.id, sys.text, sys.tone) };
+      }
       case "turn/diff/updated": {
-        const diff = (params as Record<string, unknown>)?.["diff"] as string | undefined;
-        if (typeof diff !== "string" || !diff) return state;
-        // 将 turn 维度的聚合 diff 合并到最近一个 fileChange 项的 diff 尾部（若存在），便于 MessageStream 预览
-        // 若不存在 fileChange，则忽略（不新增 unknown）
-        if (state.items.length === 0) return state;
-        // 找最后一个 fileChange
-        let idx = -1;
-        for (let i = state.items.length - 1; i >= 0; i--) {
-          if (state.items[i].kind === "fileChange") { idx = i; break; }
+        // turn 级聚合 diff 按 turnId 存入 turnDiffs（与 fileChange item 解耦；
+        // 旧 hack「append 到最后一个 fileChange」已迁移删除：MessageStream 仅用
+        // fileChange 自身 diff 做预览，删除后既有展示不受影响）。
+        // 通知携带的是该 turn 最新全量快照，同 turnId 重复到达时替换（内容一致则直接返回原状态）。
+        const paramsObj = (params as Record<string, unknown>) ?? {};
+        const diff = paramsObj["diff"] as string | undefined;
+        const turnId =
+          (paramsObj["turnId"] as string | undefined) ?? state.activeTurnId ?? undefined;
+        if (typeof diff !== "string" || !diff || !turnId) return state;
+        const idx = state.turnDiffs.findIndex((t) => t.turnId === turnId);
+        if (idx !== -1) {
+          if (state.turnDiffs[idx].diff === diff) return state;
+          const next = [...state.turnDiffs];
+          next[idx] = { turnId, diff };
+          return { ...state, turnDiffs: next };
         }
-        if (idx === -1) return state;
-        const next = [...state.items];
-        const prev = next[idx] as Extract<typeof next[number], { kind: "fileChange" }>;
-        // 避免重复追加：若 diff 已是后缀则跳过
-        if (prev.files.length > 0 && prev.files[0].diff.endsWith(diff)) return state;
-        const files = [...prev.files];
-        if (files.length > 0) {
-          files[0] = { ...files[0], diff: (files[0].diff ? files[0].diff + "\n" : "") + diff };
-        }
-        (next as unknown as Array<Record<string, unknown>>)[idx] = { ...prev, files } as unknown as Record<string, unknown>;
-        // 归一化回 ItemView
-        return { ...state, items: next as typeof state.items };
+        return { ...state, turnDiffs: [...state.turnDiffs, { turnId, diff }] };
       }
       case "turn/plan/updated": {
         const plan = (params as Record<string, unknown>)?.["plan"] as unknown;

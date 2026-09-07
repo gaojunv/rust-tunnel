@@ -209,6 +209,136 @@ describe("agent client", () => {
     expect(mockInvoke).toHaveBeenCalledWith("agent_open_external", { url: "https://example.com/auth" });
   });
 
+  it("新方法名/参数映射（threadRevert/setName/delete/unarchive/compact/review/turns/items/fs）", async () => {
+    mockInvoke.mockResolvedValue({});
+    await client.threadRevert({ threadId: "t1", beforeTurnId: "turn-9" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/revert",
+      params: { threadId: "t1", beforeTurnId: "turn-9" },
+    });
+    await client.threadSetName({ threadId: "t1", name: "新会话" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/name/set",
+      params: { threadId: "t1", name: "新会话" },
+    });
+    await client.threadDelete({ threadId: "t1" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/delete",
+      params: { threadId: "t1" },
+    });
+    await client.threadUnarchive({ threadId: "t1" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/unarchive",
+      params: { threadId: "t1" },
+    });
+    await client.threadCompactStart({ threadId: "t1" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/compact/start",
+      params: { threadId: "t1" },
+    });
+    await client.reviewStart({ threadId: "t1", target: { type: "uncommittedChanges" } });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "review/start",
+      params: { threadId: "t1", target: { type: "uncommittedChanges" } },
+    });
+    await client.threadTurnsList({ threadId: "t1", cursor: null, limit: 50, sortDirection: "asc", itemsView: "full" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/turns/list",
+      params: { threadId: "t1", cursor: null, limit: 50, sortDirection: "asc", itemsView: "full" },
+    });
+    await client.threadItemsList({ threadId: "t1", turnId: "turn-1", cursor: null, limit: 50, sortDirection: "asc" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "thread/items/list",
+      params: { threadId: "t1", turnId: "turn-1", cursor: null, limit: 50, sortDirection: "asc" },
+    });
+    await client.fsReadFile({ path: "/vault/a.md" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "fs/readFile",
+      params: { path: "/vault/a.md" },
+    });
+    await client.fsWriteFile({ path: "/vault/a.md", dataBase64: "aGk=" });
+    expect(mockInvoke).toHaveBeenLastCalledWith("agent_request", {
+      method: "fs/writeFile",
+      params: { path: "/vault/a.md", dataBase64: "aGk=" },
+    });
+  });
+
+  it("fs/readFile 是幂等的（-32001 重试），fs/writeFile 不重试", async () => {
+    const backpressure = { code: -32001, message: "backpressure" };
+    client.__setSleep(async () => {});
+    mockInvoke
+      .mockRejectedValueOnce(backpressure)
+      .mockResolvedValueOnce({ dataBase64: "aGk=" });
+    const res = await client.fsReadFile({ path: "/vault/a.md" });
+    expect(res).toEqual({ dataBase64: "aGk=" });
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+
+    mockInvoke.mockReset();
+    mockInvoke.mockRejectedValue(backpressure);
+    await expect(client.fsWriteFile({ path: "/vault/a.md", dataBase64: "eA==" })).rejects.toEqual(
+      backpressure,
+    );
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("写方法（threadRevert/threadSetName/threadDelete/unarchive/compact/review）-32001 不重试", async () => {
+    const backpressure = { code: -32001, message: "backpressure" };
+    const delays: number[] = [];
+    client.__setSleep(async (ms: number) => {
+      delays.push(ms);
+    });
+    mockInvoke.mockRejectedValue(backpressure);
+    await expect(client.threadRevert({ threadId: "t1", beforeTurnId: "x" })).rejects.toEqual(backpressure);
+    await expect(client.threadSetName({ threadId: "t1", name: "n" })).rejects.toEqual(backpressure);
+    await expect(client.threadDelete({ threadId: "t1" })).rejects.toEqual(backpressure);
+    await expect(client.threadUnarchive({ threadId: "t1" })).rejects.toEqual(backpressure);
+    await expect(client.threadCompactStart({ threadId: "t1" })).rejects.toEqual(backpressure);
+    await expect(
+      client.reviewStart({ threadId: "t1", target: { type: "uncommittedChanges" } }),
+    ).rejects.toEqual(backpressure);
+    // 每个方法各调用 1 次（mockInvoke 累计），退避 sleep 从未触发
+    expect(mockInvoke).toHaveBeenCalledTimes(6);
+    expect(delays).toEqual([]);
+  });
+
+  it("thread/turns/list 与 thread/items/list 是幂等的（-32001 重试）", async () => {
+    const backpressure = { code: -32001, message: "backpressure" };
+    client.__setSleep(async () => {});
+    mockInvoke
+      .mockRejectedValueOnce(backpressure)
+      .mockResolvedValueOnce({ data: [], nextCursor: null, backwardsCursor: null });
+    const turns = await client.threadTurnsList({ threadId: "t1" });
+    expect((turns as unknown as Record<string, unknown>)["data"]).toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+
+    mockInvoke.mockReset();
+    mockInvoke
+      .mockRejectedValueOnce(backpressure)
+      .mockResolvedValueOnce({ data: [], nextCursor: null, backwardsCursor: null });
+    const items = await client.threadItemsList({ threadId: "t1" });
+    expect((items as unknown as Record<string, unknown>)["data"]).toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("base64 编解码 UTF-8 往返（中文/emoji）与 fsReadFileText", async () => {
+    const text = "你好世界 ✓ emoji 🎉 mixed ASCII";
+    const encoded = client.encodeUtf8ToBase64(text);
+    expect(client.decodeBase64ToUtf8(encoded)).toBe(text);
+    // 纯 ASCII 兼容
+    expect(client.decodeBase64ToUtf8(client.encodeUtf8ToBase64("hello"))).toBe("hello");
+    // 空串
+    expect(client.decodeBase64ToUtf8(client.encodeUtf8ToBase64(""))).toBe("");
+
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ dataBase64: encoded });
+    const back = await client.fsReadFileText("/vault/a.md");
+    expect(back).toBe(text);
+    expect(mockInvoke).toHaveBeenCalledWith("agent_request", {
+      method: "fs/readFile",
+      params: { path: "/vault/a.md" },
+    });
+  });
+
   it("getSettings/detectBinary/getStatus/start/stop", async () => {
     mockInvoke.mockResolvedValue({ enabled: false, authMode: "gateway" });
     const s = await client.getSettings();

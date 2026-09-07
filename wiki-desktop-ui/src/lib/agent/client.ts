@@ -30,11 +30,31 @@ import type { FuzzyFileSearchParams } from "./types/FuzzyFileSearchParams";
 import type { FuzzyFileSearchResponse } from "./types/FuzzyFileSearchResponse";
 import type { LoginAccountParams } from "./types/v2/LoginAccountParams";
 import type { LoginAccountResponse } from "./types/v2/LoginAccountResponse";
+import type { ThreadRevertParams } from "./types/v2/ThreadRevertParams";
+import type { ThreadRevertResponse } from "./types/v2/ThreadRevertResponse";
+import type { ThreadSetNameParams } from "./types/v2/ThreadSetNameParams";
+import type { ThreadSetNameResponse } from "./types/v2/ThreadSetNameResponse";
+import type { ThreadDeleteParams } from "./types/v2/ThreadDeleteParams";
+import type { ThreadDeleteResponse } from "./types/v2/ThreadDeleteResponse";
+import type { ThreadUnarchiveParams } from "./types/v2/ThreadUnarchiveParams";
+import type { ThreadUnarchiveResponse } from "./types/v2/ThreadUnarchiveResponse";
+import type { ThreadCompactStartParams } from "./types/v2/ThreadCompactStartParams";
+import type { ThreadCompactStartResponse } from "./types/v2/ThreadCompactStartResponse";
+import type { ReviewStartParams } from "./types/v2/ReviewStartParams";
+import type { ReviewStartResponse } from "./types/v2/ReviewStartResponse";
+import type { ThreadTurnsListParams } from "./types/v2/ThreadTurnsListParams";
+import type { ThreadTurnsListResponse } from "./types/v2/ThreadTurnsListResponse";
+import type { ThreadItemsListParams } from "./types/v2/ThreadItemsListParams";
+import type { ThreadItemsListResponse } from "./types/v2/ThreadItemsListResponse";
+import type { FsReadFileParams } from "./types/v2/FsReadFileParams";
+import type { FsReadFileResponse } from "./types/v2/FsReadFileResponse";
+import type { FsWriteFileParams } from "./types/v2/FsWriteFileParams";
+import type { FsWriteFileResponse } from "./types/v2/FsWriteFileResponse";
 
 // 仅桌面端可用错误文案，与现有中文 UI 一致
 const DESKTOP_ONLY_MSG = "仅桌面端可用";
 
-// 幂等只读方法集合：-32001 背压时允许重试
+// 幂等只读方法集合：-32001 背压时允许重试（写方法永不重试）
 const IDEMPOTENT_METHODS = new Set<string>([
   "thread/list",
   "model/list",
@@ -45,6 +65,7 @@ const IDEMPOTENT_METHODS = new Set<string>([
   "thread/items/list",
   "thread/loaded/list",
   "config/read",
+  "fs/readFile",
 ]);
 
 export type UnlistenFn = () => void;
@@ -240,6 +261,96 @@ export function fuzzyFileSearch(params: FuzzyFileSearchParams): Promise<FuzzyFil
 
 export function accountLoginStart(params: LoginAccountParams): Promise<LoginAccountResponse> {
   return agentRequest<LoginAccountResponse>("account/login/start", params);
+}
+
+/**
+ * 只回滚对话历史，不回滚文件（vendor 语义，见 ThreadRevertParams 注释）。
+ * UI 必须拆成「回滚对话」与「还原文件改动」两个显式动作。
+ */
+export function threadRevert(params: ThreadRevertParams): Promise<ThreadRevertResponse> {
+  return agentRequest<ThreadRevertResponse>("thread/revert", params);
+}
+
+/** 会话重命名（wire 方法名为 thread/name/set） */
+export function threadSetName(params: ThreadSetNameParams): Promise<ThreadSetNameResponse> {
+  return agentRequest<ThreadSetNameResponse>("thread/name/set", params);
+}
+
+/** 会话删除（写方法，-32001 不重试） */
+export function threadDelete(params: ThreadDeleteParams): Promise<ThreadDeleteResponse> {
+  return agentRequest<ThreadDeleteResponse>("thread/delete", params);
+}
+
+/** 取消归档 */
+export function threadUnarchive(params: ThreadUnarchiveParams): Promise<ThreadUnarchiveResponse> {
+  return agentRequest<ThreadUnarchiveResponse>("thread/unarchive", params);
+}
+
+/** 开始压缩上下文（写方法，-32001 不重试） */
+export function threadCompactStart(
+  params: ThreadCompactStartParams,
+): Promise<ThreadCompactStartResponse> {
+  return agentRequest<ThreadCompactStartResponse>("thread/compact/start", params);
+}
+
+/**
+ * 启动代码审查（写方法，-32001 不重试）。
+ * target 支持 uncommittedChanges/baseBranch/commit/custom 等 vendor 定义的形状。
+ */
+export function reviewStart(params: ReviewStartParams): Promise<ReviewStartResponse> {
+  return agentRequest<ReviewStartResponse>("review/start", params);
+}
+
+/** 历史回填：分页列出 turn（读方法，-32001 可重试） */
+export function threadTurnsList(
+  params: ThreadTurnsListParams,
+): Promise<ThreadTurnsListResponse> {
+  return agentRequest<ThreadTurnsListResponse>("thread/turns/list", params);
+}
+
+/** 历史回填：分页列出 item（读方法，-32001 可重试） */
+export function threadItemsList(
+  params: ThreadItemsListParams,
+): Promise<ThreadItemsListResponse> {
+  return agentRequest<ThreadItemsListResponse>("thread/items/list", params);
+}
+
+/** 读主机文件（读方法，-32001 可重试；内容为 base64） */
+export function fsReadFile(params: FsReadFileParams): Promise<FsReadFileResponse> {
+  return agentRequest<FsReadFileResponse>("fs/readFile", params);
+}
+
+/** 写主机文件（写方法，-32001 不重试） */
+export function fsWriteFile(params: FsWriteFileParams): Promise<FsWriteFileResponse> {
+  return agentRequest<FsWriteFileResponse>("fs/writeFile", params);
+}
+
+// —— base64 编解码（UTF-8 安全，btoa/atob 兼容写法） ——
+
+/** UTF-8 文本 → base64（btoa 仅接受 latin1，先经 TextEncoder 转字节） */
+export function encodeUtf8ToBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/** base64 → UTF-8 文本 */
+export function decodeBase64ToUtf8(dataBase64: string): string {
+  const binary = atob(dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+/** 读文件并直接解码为 UTF-8 文本（Diff 审查等场景用） */
+export async function fsReadFileText(path: FsReadFileParams["path"]): Promise<string> {
+  const res = await fsReadFile({ path });
+  return decodeBase64ToUtf8(res.dataBase64);
 }
 
 export async function agentRespond(id: unknown, result?: unknown, error?: unknown): Promise<void> {

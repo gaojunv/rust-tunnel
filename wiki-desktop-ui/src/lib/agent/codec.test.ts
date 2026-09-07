@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   createInitialView,
+  hydrateTurnsToItems,
   reduceAgentEvent,
   reduceServerRequest,
   resolveServerRequest,
@@ -255,7 +256,7 @@ describe("reduceAgentEvent", () => {
     expect(s.items.find((i) => i.id === "f1")).toMatchObject({ kind: "fileChange", status: "completed" });
   });
 
-  it("turn/diff/updated 合并到最近 fileChange", () => {
+  it("turn/diff/updated 写入 turnDiffs（与 fileChange 解耦，不再改动 fileChange）", () => {
     let s = createInitialView("t1");
     s = reduceAgentEvent(
       s,
@@ -263,13 +264,62 @@ describe("reduceAgentEvent", () => {
         item: { type: "fileChange", id: "f1", changes: [{ path: "x.md", kind: "update", diff: "base" }], status: "inProgress" },
       }),
     );
-    s = reduceAgentEvent(s, notif("turn/diff/updated", { diff: "++added" }));
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "++added" }));
+    expect(s.turnDiffs).toEqual([{ turnId: "turn-1", diff: "++added" }]);
+    // fileChange 自身 diff 不被改动（MessageStream 预览来源不变）
     const f = s.items.find((i) => i.id === "f1") as Extract<(typeof s.items)[number], { kind: "fileChange" }>;
-    expect(f.files[0].diff).toContain("++added");
-    // 重复相同 diff 不追加
-    const before = f.files[0].diff;
-    s = reduceAgentEvent(s, notif("turn/diff/updated", { diff: "++added" }));
-    expect((s.items.find((i) => i.id === "f1") as Extract<(typeof s.items)[number], { kind: "fileChange" }>).files[0].diff).toBe(before);
+    expect(f.files[0].diff).toBe("base");
+  });
+
+  it("turn/diff/updated 同 turnId 重复通知替换内容、不同 turnId 各自累积", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "v1" }));
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "v2" }));
+    expect(s.turnDiffs).toEqual([{ turnId: "turn-1", diff: "v2" }]);
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-2", diff: "other" }));
+    expect(s.turnDiffs).toEqual([
+      { turnId: "turn-1", diff: "v2" },
+      { turnId: "turn-2", diff: "other" },
+    ]);
+  });
+
+  it("turn/diff/updated 内容一致时返回原状态；无 turnId（且无活跃 turn）时忽略", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "v1" }));
+    const same = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "v1" }));
+    expect(same).toBe(s);
+    // 无 turnId 且无 activeTurnId：忽略（不新增）
+    const ignored = reduceAgentEvent(s, notif("turn/diff/updated", { diff: "zzz" }));
+    expect(ignored).toBe(s);
+    expect(ignored.turnDiffs.length).toBe(1);
+  });
+
+  it("turn/diff/updated 以 activeTurnId 兜底 turnId；空 diff 忽略", () => {
+    let s = createInitialView("t1");
+    s = { ...s, activeTurnId: "turn-9", status: "running" };
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { diff: "snapshot" }));
+    expect(s.turnDiffs).toEqual([{ turnId: "turn-9", diff: "snapshot" }]);
+    const before = s;
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-9", diff: "" }));
+    expect(s).toBe(before);
+  });
+
+  it("无 fileChange 时 turn/diff/updated 仍记录（旧 hack 会丢失）", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "d" }));
+    expect(s.turnDiffs.length).toBe(1);
+    expect(s.items.length).toBe(0);
+  });
+
+  it("thread/started 切换 thread 时清空 turnDiffs（同 thread 保留）", () => {
+    let s = createInitialView("t-old");
+    s = reduceAgentEvent(s, notif("turn/diff/updated", { turnId: "turn-1", diff: "d" }));
+    expect(s.turnDiffs.length).toBe(1);
+    const same = reduceAgentEvent(s, notif("thread/started", { thread: { id: "t-old" } }));
+    expect(same.turnDiffs.length).toBe(1);
+    const next = reduceAgentEvent(s, notif("thread/started", { thread: { id: "t-new" } }));
+    expect(next.turnDiffs).toEqual([]);
+    expect(next.items).toEqual([]);
   });
 
   it("turn/plan/updated 聚合为 checklist", () => {
@@ -310,6 +360,205 @@ describe("reduceAgentEvent", () => {
     let s = createInitialView("t1");
     const next = reduceAgentEvent(s, notif("fs/changed", { watchId: "w1", changedPaths: ["/a.md"] }));
     expect(next).toBe(s);
+  });
+
+  it("warning 通知生成 tone=warn system item", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(
+      s,
+      notif("warning", { threadId: "t1", message: "配置目录不可写，已降级为只读" }),
+    );
+    const sys = s.items.find((i) => i.kind === "system");
+    expect(sys).toMatchObject({
+      kind: "system",
+      id: "system-warning-t1",
+      text: "配置目录不可写，已降级为只读",
+      tone: "warn",
+    });
+  });
+
+  it("warning 重复相同到达只保留一条（upsert 去重）", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(s, notif("warning", { threadId: null, message: "同一提示" }));
+    const first = s;
+    s = reduceAgentEvent(s, notif("warning", { threadId: null, message: "同一提示" }));
+    expect(s.items.filter((i) => i.kind === "system").length).toBe(1);
+    expect(s).toBe(first);
+    // 内容变化则替换（仍单条）
+    s = reduceAgentEvent(s, notif("warning", { threadId: null, message: "新提示" }));
+    expect(s.items.filter((i) => i.kind === "system").length).toBe(1);
+    expect(s.items.find((i) => i.kind === "system")).toMatchObject({ text: "新提示" });
+  });
+
+  it("configWarning 带 path/details 生成 warn system item", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(
+      s,
+      notif("configWarning", {
+        summary: "未知字段",
+        details: "将忽略该配置项",
+        path: "/vault/.codex/config.toml",
+        range: null,
+      }),
+    );
+    const sys = s.items.find((i) => i.kind === "system");
+    expect(sys).toMatchObject({
+      kind: "system",
+      text: "未知字段（/vault/.codex/config.toml）\n将忽略该配置项",
+      tone: "warn",
+    });
+  });
+
+  it("model/rerouted 生成 tone=info system item（含模型切换文案）", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(
+      s,
+      notif("model/rerouted", {
+        threadId: "t1",
+        turnId: "turn-9",
+        fromModel: "model-a",
+        toModel: "model-b",
+        reason: "highRiskCyberActivity",
+      }),
+    );
+    const sys = s.items.find((i) => i.kind === "system");
+    expect(sys).toMatchObject({
+      kind: "system",
+      id: "system-model-rerouted-turn-9",
+      text: "模型已从 model-a 切换为 model-b：高风险网络活动",
+      tone: "info",
+    });
+  });
+
+  it("thread/compacted 生成 tone=info system item", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(s, notif("thread/compacted", { threadId: "t1", turnId: "turn-3" }));
+    const sys = s.items.find((i) => i.kind === "system");
+    expect(sys).toMatchObject({
+      kind: "system",
+      id: "system-thread-compacted-turn-3",
+      text: "对话上下文已压缩整理，更早内容保留为摘要",
+      tone: "info",
+    });
+  });
+
+  it("deprecationNotice 生成 tone=warn system item", () => {
+    let s = createInitialView("t1");
+    s = reduceAgentEvent(
+      s,
+      notif("deprecationNotice", { summary: "命令已弃用", details: "请改用新语法" }),
+    );
+    const sys = s.items.find((i) => i.kind === "system");
+    expect(sys).toMatchObject({
+      kind: "system",
+      text: "命令已弃用\n请改用新语法",
+      tone: "warn",
+    });
+  });
+
+  it("warning 无 message/summary 时不生成 system item（model/rerouted 例外）", () => {
+    let s = createInitialView("t1");
+    const same = reduceAgentEvent(s, notif("warning", { threadId: null, message: "" }));
+    expect(same).toBe(s);
+    expect(same.items.some((i) => i.kind === "system")).toBe(false);
+  });
+
+  it("account/rateLimits/updated 原样写入 rateLimits", () => {
+    let s = createInitialView("t1");
+    const rl = { limitId: "l1", limitName: "gpt-5", primary: { kind: "rpm" }, secondary: null };
+    s = reduceAgentEvent(s, notif("account/rateLimits/updated", { rateLimits: rl }));
+    expect(s.rateLimits).toEqual(rl);
+    // null 载荷不改变
+    s = { ...s, rateLimits: rl };
+    const same = reduceAgentEvent(s, notif("account/rateLimits/updated", { rateLimits: null }));
+    expect(same).toBe(s);
+  });
+});
+
+describe("hydrateTurnsToItems（历史回填）", () => {
+  it("按 turn 顺序展开并映射可还原类型", () => {
+    const turns = [
+      {
+        id: "turn-1",
+        items: [
+          { type: "userMessage", id: "u1", content: [{ type: "text", text: "hi" }], clientId: null },
+          { type: "agentMessage", id: "a1", text: "hello", phase: null, memoryCitation: null, delivery: null, questions: null },
+        ],
+      },
+      {
+        id: "turn-2",
+        items: [
+          {
+            type: "fileChange",
+            id: "f1",
+            changes: [{ path: "x.md", kind: "update", diff: "d" }],
+            status: "completed",
+          },
+          {
+            type: "commandExecution",
+            id: "c1",
+            command: "echo hi",
+            cwd: "/vault",
+            aggregatedOutput: "hi\n",
+            status: "completed",
+          },
+          { type: "reasoning", id: "r1", summary: ["think"], content: [] },
+        ],
+      },
+    ];
+    const views = hydrateTurnsToItems(turns);
+    expect(views.map((v) => v.kind)).toEqual([
+      "userMessage",
+      "agentMessage",
+      "fileChange",
+      "commandExecution",
+      "reasoning",
+    ]);
+    expect(views[0]).toMatchObject({ kind: "userMessage", id: "u1", text: "hi" });
+    expect(views[1]).toMatchObject({ kind: "agentMessage", id: "a1", text: "hello" });
+    expect(views[3]).toMatchObject({ kind: "commandExecution", id: "c1", command: "echo hi" });
+  });
+
+  it("跳过 hookPrompt 等无法还原类型与畸形条目", () => {
+    const turns = [
+      null,
+      "junk",
+      42,
+      {
+        id: "turn-1",
+        items: [
+          { type: "hookPrompt", id: "h1", fragments: [] },
+          { type: "mcpToolCall", id: "m1" },
+          null,
+          "bad",
+          { type: "userMessage", id: "u2", content: [{ type: "text", text: "ok" }], clientId: null },
+          { type: "mysteryNewType", id: "x1" },
+        ],
+      },
+      { id: "turn-2", items: [] },
+      { id: "turn-3" },
+    ] as unknown as Parameters<typeof hydrateTurnsToItems>[0];
+    const views = hydrateTurnsToItems(turns);
+    // 只保留能还原的 userMessage
+    expect(views).toHaveLength(1);
+    expect(views[0]).toMatchObject({ kind: "userMessage", id: "u2", text: "ok" });
+  });
+
+  it("空数组与非数组返回空", () => {
+    expect(hydrateTurnsToItems([])).toEqual([]);
+    expect(hydrateTurnsToItems(null as unknown as Parameters<typeof hydrateTurnsToItems>[0])).toEqual([]);
+    expect(hydrateTurnsToItems(undefined as unknown as Parameters<typeof hydrateTurnsToItems>[0])).toEqual([]);
+  });
+
+  it("返回的列表为 ItemView[]（含 complete 语义字段）", () => {
+    const turns = [
+      {
+        id: "turn-1",
+        items: [{ type: "agentMessage", id: "a1", text: "done", phase: null, memoryCitation: null, delivery: null, questions: null }],
+      },
+    ] as unknown as Parameters<typeof hydrateTurnsToItems>[0];
+    const views = hydrateTurnsToItems(turns);
+    expect(views[0]).toMatchObject({ kind: "agentMessage", complete: false });
   });
 });
 
