@@ -83,7 +83,7 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 quick-xml = { version = "0.31", features = ["escape-html"] }
 similar = "2"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 hmac = "0.12"
 hex = "0.4"
 aes-gcm = "0.10"
