@@ -204,6 +204,7 @@ pub async fn run_subagent_loop(
             &req_body,
             true,
             None,
+            Some(sub_rt.session_id.as_str()),
         )
         .await;
 
@@ -523,6 +524,7 @@ pub async fn run_subagent_loop(
         &req_body,
         false,
         None,
+        Some(sub_rt.session_id.as_str()),
     )
     .await;
     match outcome {

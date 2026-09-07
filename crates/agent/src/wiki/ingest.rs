@@ -86,6 +86,7 @@ async fn call_wiki_llm(llm: &LlmState, model: &str, batch_text: &str) -> Result<
         &req_body,
         false,
         None,
+        None, // wiki 摄入是批量任务，无会话概念，不注入会话标识
     )
     .await;
     let resp = match outcome {

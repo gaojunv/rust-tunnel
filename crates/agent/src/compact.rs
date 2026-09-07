@@ -171,7 +171,7 @@ pub async fn force_compact(
     let rendered = render_for_summary(&segment);
 
     // 摘要 LLM 调用：同会话模型、非流式、无 tools
-    let summary = summarize(llm, &rt.model, &rendered).await;
+    let summary = summarize(llm, &rt.model, &rendered, &rt.session_id).await;
 
     let replacement = match summary {
         Ok(s) => format!("[上下文摘要] {s}"),
@@ -228,7 +228,12 @@ pub async fn force_compact(
     Ok(true)
 }
 
-async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<String, String> {
+async fn summarize(
+    llm: &Arc<LlmState>,
+    model: &str,
+    rendered: &str,
+    session_id: &str,
+) -> Result<String, String> {
     let chain = crate::llm::router::resolve_with_failover(llm, model)
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
@@ -256,6 +261,7 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         &req_body,
         false,
         None,
+        Some(session_id),
     )
     .await;
     let (resp, candidate, failed_over) = match outcome {

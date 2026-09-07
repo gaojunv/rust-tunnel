@@ -165,7 +165,7 @@ async fn do_distill(memory: MemoryState, snapshot: DistillSnapshot, trigger: Str
     } else {
         s.distill_model.clone()
     };
-    let text = match call_distill_llm(&memory.llm, &model, &rendered).await {
+    let text = match call_distill_llm(&memory.llm, &model, &rendered, &snapshot.session_id).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(session_id = %snapshot.session_id, error = %e, "distill LLM call failed");
@@ -303,7 +303,12 @@ tags 最多 3 个；confidence 为 0 到 1 的数值，表示你对这条事实�
 
 /// 非流式无 tools LLM 调用（抄 title.rs 的 resolve_with_failover +
 /// build_upstream_body + execute_with_failover 模式）。
-async fn call_distill_llm(llm: &LlmState, model: &str, rendered: &str) -> Result<String, String> {
+async fn call_distill_llm(
+    llm: &LlmState,
+    model: &str,
+    rendered: &str,
+    session_id: &str,
+) -> Result<String, String> {
     let chain = crate::llm::router::resolve_with_failover(llm, model)
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
@@ -330,6 +335,7 @@ async fn call_distill_llm(llm: &LlmState, model: &str, rendered: &str) -> Result
         &req_body,
         false,
         None,
+        Some(session_id),
     )
     .await;
     let resp = match outcome {

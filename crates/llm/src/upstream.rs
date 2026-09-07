@@ -236,7 +236,15 @@ pub async fn call_upstream(
     request: &ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let req_body = build_upstream_body(request);
-    call_upstream_with_body(client, base_url, api_key, &req_body, "v1/chat/completions").await
+    call_upstream_with_body(
+        client,
+        base_url,
+        api_key,
+        &req_body,
+        "v1/chat/completions",
+        None,
+    )
+    .await
 }
 
 /// 用已构造好的请求体调用上游。
@@ -244,6 +252,9 @@ pub async fn call_upstream(
 /// `path` 为上游 API 路径（如 `"v1/chat/completions"` 或 `"v1/responses"`）。
 /// 调用方（handler）先用 `build_upstream_body` 构造 body、写入完整请求日志，
 /// 再走这里发送——保证日志内容与实际发送的请求体一致。
+///
+/// `opencode_session` 非 None 时注入 `x-opencode-session` 头
+/// （opencode Go 2026-09-06 起强制，缺失报 400 MissingSessionID）。
 ///
 /// # Errors
 /// 上游连接失败或返回非 2xx 时返回 `(StatusCode, message)`。
@@ -253,6 +264,7 @@ pub async fn call_upstream_with_body(
     api_key: &str,
     req_body: &serde_json::Value,
     path: &str,
+    opencode_session: Option<&str>,
 ) -> Result<Response, (StatusCode, String)> {
     let url = format!(
         "{}/{}",
@@ -260,11 +272,14 @@ pub async fn call_upstream_with_body(
         path.trim_start_matches('/')
     );
 
-    let req = client
+    let mut req = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(req_body);
+    if let Some(session) = opencode_session {
+        req = req.header("x-opencode-session", session);
+    }
 
     let resp = req.send().await.map_err(|e| {
         (
@@ -500,6 +515,7 @@ pub async fn call_upstream_stream_guarded(
     api_key: &str,
     req_body: &serde_json::Value,
     path: &str,
+    opencode_session: Option<&str>,
 ) -> Result<Response, (StatusCode, String)> {
     use futures_util::StreamExt;
 
@@ -508,19 +524,20 @@ pub async fn call_upstream_stream_guarded(
         base_url.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    let resp = client
+    let mut req = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
-        .json(req_body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream connection failed: {e}"),
-            )
-        })?;
+        .json(req_body);
+    if let Some(session) = opencode_session {
+        req = req.header("x-opencode-session", session);
+    }
+    let resp = req.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream connection failed: {e}"),
+        )
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -655,9 +672,13 @@ fn deterministic_failure(status: StatusCode) -> Option<crate::down::FailureKind>
 /// `/v1/messages` 直通（原始 Anthropic body，model 替换为候选名）；否则走下方
 /// ChatCompletions / Responses 转换分支。直通失败的处理（retryable/确定性/4xx）
 /// 与转换分支完全一致——组内可混合直通与转换候选并互相故障转移。
+///
+/// `opencode_session` 非 None 时注入 `x-opencode-session` 头（HTTP 入口经
+/// `PreparedRequest.opencode_session` 传递，agent runner 路径传会话 id）。
 #[allow(
     clippy::too_many_lines,
-    reason = "故障转移主循环：熔断/确定性失败跳过、畸形响应原地重试与 retryable/确定性分流，集中一处便于审计"
+    clippy::too_many_arguments,
+    reason = "故障转移主循环：熔断/确定性失败跳过、畸形响应原地重试与 retryable/确定性分流，集中一处便于审计；参数含发送策略所需的完整路由上下文"
 )]
 pub async fn execute_with_failover(
     client: &Client,
@@ -667,6 +688,7 @@ pub async fn execute_with_failover(
     req_body: &serde_json::Value,
     stream: bool,
     anthropic_body: Option<&serde_json::Value>,
+    opencode_session: Option<&str>,
 ) -> FailoverOutcome {
     let mut attempts = 0usize;
     let mut last_err: Option<(StatusCode, String)> = None;
@@ -738,6 +760,7 @@ pub async fn execute_with_failover(
                         "/v1/messages",
                         &raw,
                         stream,
+                        opencode_session,
                     )
                     .await,
                     true,
@@ -756,6 +779,7 @@ pub async fn execute_with_failover(
                                 &cand.provider.api_key,
                                 &body,
                                 "v1/chat/completions",
+                                opencode_session,
                             )
                             .await
                         } else {
@@ -765,6 +789,7 @@ pub async fn execute_with_failover(
                                 &cand.provider.api_key,
                                 &body,
                                 "v1/chat/completions",
+                                opencode_session,
                             )
                             .await
                         }
@@ -780,6 +805,7 @@ pub async fn execute_with_failover(
                                 &cand.provider.api_key,
                                 &body,
                                 "v1/responses",
+                                opencode_session,
                             )
                             .await
                         } else {
@@ -789,6 +815,7 @@ pub async fn execute_with_failover(
                                 &cand.provider.api_key,
                                 &body,
                                 "v1/responses",
+                                opencode_session,
                             )
                             .await
                         };
@@ -930,6 +957,8 @@ pub async fn execute_with_failover(
 /// 认证策略：同时支持 `x-api-key`（Anthropic 原生）和 `Authorization: Bearer`（OpenAI 风格）。
 /// 先尝试 `x-api-key`，若返回 401 则回退到 Bearer 头重试。
 ///
+/// `opencode_session` 非 None 时注入 `x-opencode-session` 头（含 401 回退重试）。
+///
 /// # Errors
 /// 上游连接失败或返回非 2xx 时返回 `(StatusCode, message)`。
 pub async fn call_upstream_raw(
@@ -939,6 +968,7 @@ pub async fn call_upstream_raw(
     path: &str,
     body: &serde_json::Value,
     is_stream: bool,
+    opencode_session: Option<&str>,
 ) -> Result<Response, (StatusCode, String)> {
     let url = format!(
         "{}/{}",
@@ -947,37 +977,39 @@ pub async fn call_upstream_raw(
     );
 
     // 先用 x-api-key 头尝试
-    let resp = client
+    let mut req = client
         .post(&url)
         .header("x-api-key", api_key)
         .header("Content-Type", "application/json")
         .header("anthropic-version", "2023-06-01")
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream connection failed: {e}"),
-            )
-        })?;
+        .json(body);
+    if let Some(session) = opencode_session {
+        req = req.header("x-opencode-session", session);
+    }
+    let resp = req.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream connection failed: {e}"),
+        )
+    })?;
 
     // 如果 401，回退到 Bearer 头重试
     let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        client
+        let mut retry = client
             .post(&url)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Upstream connection failed: {e}"),
-                )
-            })?
+            .json(body);
+        if let Some(session) = opencode_session {
+            retry = retry.header("x-opencode-session", session);
+        }
+        retry.send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream connection failed: {e}"),
+            )
+        })?
     } else {
         resp
     };
@@ -1530,6 +1562,7 @@ mod tests {
             "k",
             &req_body,
             "v1/chat/completions",
+        None,
         )
         .await
         .unwrap();
@@ -1559,6 +1592,7 @@ mod tests {
             "k",
             &req_body,
             "v1/chat/completions",
+        None,
         )
         .await
         .unwrap_err();
@@ -1591,6 +1625,7 @@ mod tests {
             "k",
             &req_body,
             "v1/chat/completions",
+        None,
         )
         .await
         .unwrap_err();
@@ -1633,6 +1668,7 @@ mod tests {
             "k",
             &req_body,
             "v1/chat/completions",
+        None,
         )
         .await
         .unwrap();
@@ -1771,6 +1807,88 @@ mod tests {
         let _ = sock.read(&mut buf).await;
     }
 
+    /// 起一个 mock 上游：读请求头到 `captured` 后回 200（写_http Content-Type 固定
+    /// event-stream，但 body 为合法 JSON，body 校验只看是否合法 JSON 与 usage 结构，
+    /// 此处 response 内容无关紧要）。
+    async fn start_capture_upstream(
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> String {
+        start_behavior_upstream(move |mut s| {
+            let cap = captured.clone();
+            Box::pin(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = s.read(&mut buf).await;
+                let txt = String::from_utf8_lossy(&buf).to_string();
+                *cap.lock().unwrap() = txt;
+                write_http(&mut s, "200 OK", ok_json_response_body()).await;
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_failover_injects_opencode_session_header_when_present() {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(String::new()));
+        let url = start_capture_upstream(captured.clone()).await;
+        let breakers = crate::breaker::ModelBreakers::new();
+        let known = crate::down::KnownFailures::new();
+        let chain = test_chain(&[(&url, "m", "id")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+            Some("sess-abc"),
+        )
+        .await;
+        assert!(
+            matches!(out, FailoverOutcome::Success { .. }),
+            "上游注入后应成功"
+        );
+        let req = captured.lock().unwrap();
+        assert!(
+            req.to_lowercase().contains("x-opencode-session: sess-abc"),
+            "上游请求应含 x-opencode-session 头，实际: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failover_no_opencode_session_header_when_absent() {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(String::new()));
+        let url = start_capture_upstream(captured.clone()).await;
+        let breakers = crate::breaker::ModelBreakers::new();
+        let known = crate::down::KnownFailures::new();
+        let chain = test_chain(&[(&url, "m", "id")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(out, FailoverOutcome::Success { .. }),
+            "无会话标识调用应正常"
+        );
+        let req = captured.lock().unwrap();
+        assert!(
+            !req.to_lowercase().contains("x-opencode-session"),
+            "未传会话标识时不应带头，实际: {req}"
+        );
+    }
+
     #[tokio::test]
     async fn test_failover_first_candidate_500_then_success() {
         let bad = start_behavior_upstream(|mut s| {
@@ -1800,6 +1918,7 @@ mod tests {
             &body,
             true,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -1853,6 +1972,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted {
@@ -1911,6 +2031,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted {
@@ -1967,6 +2088,7 @@ mod tests {
                 &body,
                 false,
                 None,
+            None,
             )
             .await;
         }
@@ -1984,6 +2106,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
@@ -2011,6 +2134,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted {
@@ -2064,6 +2188,7 @@ mod tests {
             &body,
             true,
             None,
+        None,
         )
         .await;
         let ttfb = started.elapsed();
@@ -2120,6 +2245,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted {
@@ -2171,6 +2297,7 @@ mod tests {
             "k",
             &req_body,
             "v1/chat/completions",
+        None,
         )
         .await
         .unwrap_err();
@@ -2269,6 +2396,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -2293,6 +2421,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
@@ -2336,6 +2465,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted { status, .. } = out else {
@@ -2353,6 +2483,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted {
@@ -2382,6 +2513,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         assert!(matches!(out, FailoverOutcome::Exhausted { .. }));
@@ -2420,6 +2552,7 @@ mod tests {
                 &body,
                 false,
                 None,
+            None,
             )
             .await;
             let FailoverOutcome::Exhausted { status, .. } = out else {
@@ -2532,6 +2665,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -2630,6 +2764,7 @@ mod tests {
             &body,
             true,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success { resp, .. } = out else {
@@ -2750,6 +2885,7 @@ mod tests {
             &body,
             true,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -2914,6 +3050,7 @@ mod tests {
             &req_body,
             false,
             Some(&anthropic_body),
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3042,6 +3179,7 @@ mod tests {
             &req_body,
             false,
             Some(&anthropic_body),
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3076,6 +3214,7 @@ mod tests {
             &req_body,
             false,
             Some(&anthropic_body),
+        None,
         )
         .await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
@@ -3126,6 +3265,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3184,6 +3324,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3242,6 +3383,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3303,6 +3445,7 @@ mod tests {
             &body,
             true,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3363,6 +3506,7 @@ mod tests {
             &body,
             true,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Success {
@@ -3407,6 +3551,7 @@ mod tests {
             &body,
             false,
             None,
+        None,
         )
         .await;
         let FailoverOutcome::Exhausted {

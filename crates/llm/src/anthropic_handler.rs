@@ -477,6 +477,8 @@ pub async fn handle_messages(
 
     let message_count = request.messages.len();
     let has_tools = request.tools.is_some();
+    // 在 body 被 move 进 anthropic_body 之前提取 opencode 会话标识。
+    let opencode_session = super::pipeline::extract_opencode_session(&headers, &body);
     let prepared = super::pipeline::PreparedRequest {
         request,
         message_count,
@@ -485,6 +487,7 @@ pub async fn handle_messages(
         // 原始 Anthropic 请求体：配了 anthropic_base_url 的候选用它直发 /v1/messages
         // （循环内替换 model 为候选真实名），其余候选仍走下方转换分支。
         anthropic_body: Some(body),
+        opencode_session,
     };
     super::pipeline::run_execution(
         &state,

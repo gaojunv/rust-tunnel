@@ -45,6 +45,43 @@ pub struct PreparedRequest {
     /// 原始 Anthropic 请求体（仅 anthropic 入口设置；openai/responses 入口为 None）。
     /// 配了 `anthropic_base_url` 的候选用它直发 `/v1/messages`（model 替换为候选名）。
     pub anthropic_body: Option<serde_json::Value>,
+    /// opencode 会话标识（`extract_opencode_session` 提取；三入口均设置）。
+    /// 非 None 时上游请求注入 `x-opencode-session` 头（opencode Go 2026-09-06 起强制，
+    /// 缺失报 400 MissingSessionID）。
+    pub opencode_session: Option<String>,
+}
+
+/// `x-opencode-session` 值的最大长度（防异常客户端注入超长值）。
+const OPENCODE_SESSION_MAX_LEN: usize = 128;
+
+/// 从入站请求提取 opencode 会话标识：显式 `x-opencode-session` 头优先
+/// （客户端可经 Claude Code 的 `ANTHROPIC_CUSTOM_HEADERS` 注入）；
+/// 否则取 body 的 `metadata.user_id`（Claude Code 恒发，含 per-session uuid）
+/// 或 `user` 字段（OpenAI/Responses 客户端）；均无则 None。
+pub fn extract_opencode_session(headers: &HeaderMap, body: &serde_json::Value) -> Option<String> {
+    fn normalize(v: &str) -> Option<String> {
+        let t = v.trim();
+        if t.is_empty() {
+            return None;
+        }
+        Some(t.chars().take(OPENCODE_SESSION_MAX_LEN).collect())
+    }
+    if let Some(v) = headers
+        .get("x-opencode-session")
+        .and_then(|h| h.to_str().ok())
+        .and_then(normalize)
+    {
+        return Some(v);
+    }
+    body.get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(Value::as_str)
+        .and_then(normalize)
+        .or_else(|| {
+            body.get("user")
+                .and_then(Value::as_str)
+                .and_then(normalize)
+        })
 }
 
 /// 认证网关 API key；失败时记录用量日志并返回 401 响应。
@@ -312,6 +349,7 @@ pub async fn run_execution(
         &openai_body,
         request.stream,
         prepared.anthropic_body.as_ref(),
+        prepared.opencode_session.as_deref(),
     )
     .await;
     match outcome {
@@ -417,7 +455,7 @@ mod tests {
     use super::*;
     use crate::openai_handler::LlmHandlerState;
     use crate::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -450,6 +488,83 @@ mod tests {
         h
     }
 
+    // ── extract_opencode_session ───────────────────────────────
+
+    fn header_with(kv: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in kv {
+            let name = HeaderName::from_bytes(k.as_bytes()).unwrap();
+            h.insert(name, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn opencode_session_prefers_explicit_header() {
+        let body = json!({
+            "metadata": {"user_id": "user_abc_account__session_body-id"},
+            "user": "body-user"
+        });
+        let headers = header_with(&[("x-opencode-session", "header-session")]);
+        assert_eq!(
+            extract_opencode_session(&headers, &body).as_deref(),
+            Some("header-session")
+        );
+    }
+
+    #[test]
+    fn opencode_session_falls_back_to_metadata_user_id() {
+        let body = json!({"metadata": {"user_id": "user_abc_account__session_meta-id"}});
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_opencode_session(&headers, &body).as_deref(),
+            Some("user_abc_account__session_meta-id")
+        );
+    }
+
+    #[test]
+    fn opencode_session_falls_back_to_user_field() {
+        let body = json!({"user": "openai-user-id"});
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_opencode_session(&headers, &body).as_deref(),
+            Some("openai-user-id")
+        );
+    }
+
+    #[test]
+    fn opencode_session_missing_returns_none() {
+        assert_eq!(extract_opencode_session(&HeaderMap::new(), &json!({})), None);
+        assert_eq!(
+            extract_opencode_session(&HeaderMap::new(), &json!({"model": "m"})),
+            None
+        );
+        // 非字符串字段忽略
+        assert_eq!(
+            extract_opencode_session(&HeaderMap::new(), &json!({"metadata": {"user_id": 42}})),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_session_whitespace_header_falls_back_to_body() {
+        let body = json!({"metadata": {"user_id": "meta-id"}});
+        let headers = header_with(&[("x-opencode-session", "   ")]);
+        assert_eq!(
+            extract_opencode_session(&headers, &body).as_deref(),
+            Some("meta-id")
+        );
+    }
+
+    #[test]
+    fn opencode_session_truncates_overlong_value() {
+        let body = json!({});
+        let long = "s".repeat(300);
+        let headers = header_with(&[("x-opencode-session", &long)]);
+        let got = extract_opencode_session(&headers, &body).unwrap();
+        assert_eq!(got.len(), 128);
+    }
+
     fn make_request(
         model: &str,
         messages: Vec<ChatMessage>,
@@ -479,6 +594,7 @@ mod tests {
             has_tools: false,
             compat_enabled: false,
             anthropic_body: None,
+            opencode_session: None,
         };
         assert_eq!(pr.request.model, "gpt-4");
         assert_eq!(pr.message_count, 1);
@@ -497,6 +613,7 @@ mod tests {
             has_tools: false,
             compat_enabled: false,
             anthropic_body: Some(body.clone()),
+            opencode_session: None,
         };
         assert!(pr.anthropic_body.is_some());
         assert_eq!(pr.anthropic_body.unwrap()["model"], "claude-3");
@@ -515,6 +632,7 @@ mod tests {
             has_tools: true,
             compat_enabled: true,
             anthropic_body: None,
+            opencode_session: None,
         };
         assert_eq!(pr.message_count, 5);
         assert!(pr.has_tools);
@@ -532,6 +650,7 @@ mod tests {
             has_tools: false,
             compat_enabled: false,
             anthropic_body: None,
+            opencode_session: None,
         };
         assert!(pr.request.stream);
         assert_eq!(pr.request.model, "model-x");

@@ -130,6 +130,7 @@ async fn generate_title_inner(
         &body,
         false,
         None,
+        Some(session_id),
     )
     .await;
     let crate::llm::upstream::FailoverOutcome::Success {

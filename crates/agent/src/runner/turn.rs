@@ -390,6 +390,7 @@ pub async fn run_agent_turn(
             &req_body,
             true,
             None,
+            Some(rt.session_id.as_str()),
         )
         .await;
 
@@ -506,6 +507,7 @@ pub async fn run_agent_turn(
                                 &req_body,
                                 true,
                                 None,
+                                Some(rt.session_id.as_str()),
                             )
                             .await;
                             match retry {
