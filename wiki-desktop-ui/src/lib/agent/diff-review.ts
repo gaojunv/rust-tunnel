@@ -15,7 +15,45 @@
 
 import { parsePatch, reversePatch, applyPatch, formatPatch } from "diff";
 import type { StructuredPatch } from "diff";
-import { join, normalize, isAbsolute, sep } from "path";
+/**
+ * 最小 POSIX 路径工具（替代 node:path）。
+ * 说明：本文件所有路径在调用前已把反斜杠统一为正斜杠（见 resolveDiffPath），
+ * 且仅用 `join`（join+normalize）、`normalize`（`.`/`..` 归一）、`isAbsolute`（`/` 或盘符开头）、
+ * `sep`（`"/"` 字面量）。node:path 在浏览器 bundle 下被 vite 外置导致构建失败
+ * （2E 集成 DiffReviewDialog 后首次进入 bundle），故以内联实现替换，行为与 POSIX 语义一致。
+ */
+const sep = "/";
+
+function isAbsolute(p: string): boolean {
+  return p.startsWith("/") || /^[A-Za-z]:\//.test(p);
+}
+
+/** POSIX normalize：合并多余 `/`，消解 `.`/`..`（`..` 到根即停，不上溢） */
+export function posixNormalize(p: string): string {
+  if (!p) return "";
+  const absolute = p.startsWith("/");
+  const trailing = p.endsWith("/") && p.length > 1;
+  const parts = p.split("/");
+  const out: string[] = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  const joined = out.join("/");
+  if (absolute) return `/${joined}${trailing && joined ? "/" : ""}`;
+  return joined || (trailing ? "/" : "");
+}
+
+const normalize = posixNormalize;
+
+/** POSIX join：拼接后归一（空段忽略） */
+function join(...parts: string[]): string {
+  return posixNormalize(parts.filter((s) => s !== "").join("/"));
+}
 
 // —— FilePatch：单文件可操作补丁 ——
 
