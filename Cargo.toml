@@ -84,7 +84,7 @@ quick-xml = { version = "0.31", features = ["escape-html"] }
 similar = "2"
 sha1 = "0.10"
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 aes-gcm = "0.10"
 hickory-proto = "0.26"
