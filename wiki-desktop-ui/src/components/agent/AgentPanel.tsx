@@ -4,7 +4,7 @@
  * M3：未启用/认证缺失/exited 摘要引导，onOpenSettings 联动
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, Send, Square, AlertTriangle, List as ListIcon, MessageSquare, Settings, X, FileText } from "lucide-react";
+import { Bot, Send, Square, AlertTriangle, List as ListIcon, MessageSquare, Settings, X, FileText, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -14,6 +14,7 @@ import {
   turnSteer,
   turnInterrupt,
   threadStart,
+  threadSetName,
   agentRespond,
   onAgentNotification,
   onAgentStatus,
@@ -24,13 +25,13 @@ import {
 } from "@/lib/agent/client";
 import type { AgentSettingsDto, AgentStatusDto, ParseErrorPayload } from "@/lib/agent/client";
 import { createInitialView, reduceAgentEvent, reduceServerRequest, resolveServerRequest } from "@/lib/agent/codec";
-import type { AgentThreadView, ApprovalRequestView } from "@/lib/agent/codec";
-import { addThread, listThreads, updateThreadModel } from "@/lib/agent/store";
+import type { AgentThreadView, ApprovalRequestView, ItemView } from "@/lib/agent/codec";
+import { addThread, listThreads, updateThreadModel, updateThreadTitle } from "@/lib/agent/store";
 import type { ServerNotification } from "@/lib/agent/types";
-import type { Thread } from "@/lib/agent/types/v2/Thread";
 import { ApprovalDialog } from "@/components/agent/ApprovalDialog";
 import { MessageStream } from "@/components/agent/MessageStream";
 import { ThreadList } from "@/components/agent/ThreadList";
+import type { ThreadResumeResult } from "@/components/agent/ThreadList";
 import { createAllowlist, allowlistHas, allowlistAdd } from "@/lib/agent/allowlist";
 import type { Allowlist } from "@/lib/agent/allowlist";
 import { setAiModel } from "@/lib/ai-config";
@@ -119,6 +120,11 @@ export function AgentPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
+  const [threadTitle, setThreadTitle] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameSaving, setRenameSaving] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const [queue, setQueue] = useState<ApprovalRequestView[]>([]);
   const [allowlist] = useState<Allowlist>(() => createAllowlist());
   const [allowlistVersion, setAllowlistVersion] = useState(0);
@@ -140,6 +146,11 @@ export function AgentPanel({
   useEffect(() => {
     viewRef.current = view;
   }, [view]);
+  // 长时间监听的事件回调内取 vaultRoot：避免把 vaultRoot 放进 effect 依赖导致频繁重订阅
+  const vaultRootRef = useRef(vaultRoot);
+  useEffect(() => {
+    vaultRootRef.current = vaultRoot;
+  }, [vaultRoot]);
 
   // 切笔记后 chip 跟随更新并重置为附加状态
   useEffect(() => {
@@ -247,6 +258,23 @@ export function AgentPanel({
       const method = (n as unknown as { method: string }).method;
       setView((prev) => reduceAgentEvent(prev, n));
       const params = (n as unknown as { params: unknown }).params as Record<string, unknown> | null | undefined;
+      // 2C：thread/name/updated → 同步头部显示名 + 本地 store 标题（含 codex 侧自动标题）
+      if (method === "thread/name/updated") {
+        const p = (params ?? {}) as { threadId?: unknown; threadName?: unknown };
+        const tid = typeof p["threadId"] === "string" ? (p["threadId"] as string) : null;
+        const nm = typeof p["threadName"] === "string" && p["threadName"].trim() ? p["threadName"].trim() : null;
+        if (tid && nm) {
+          if (viewRef.current.threadId === tid) setThreadTitle(nm);
+          const vr = vaultRootRef.current;
+          if (vr) {
+            try {
+              updateThreadTitle(vr, tid, nm);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
       if (method === "item/started") {
         const item = (params as Record<string, unknown>)?.["item"] as Record<string, unknown> | undefined;
         if (item?.["type"] === "fileChange") fileChangeInTurnRef.current = true;
@@ -414,37 +442,56 @@ export function AgentPanel({
     };
   }, [isDesktop, agentSettings?.authMode]);
 
+  /** resume 成功时用回填 items 替换占位；顶部插「摘要回放」system 分隔 */
   const handleSelectThread = useCallback(
-    (threadId: string, hydrated: { thread: Thread } | null) => {
-      if (hydrated?.thread) {
-        const thread = hydrated.thread;
-        try {
-          const turns = (thread as unknown as { turns?: unknown[] }).turns;
-          if (Array.isArray(turns) && turns.length > 0) {
-            setView((prev) => ({
-              ...prev,
-              threadId,
-              items:
-                prev.threadId === threadId
-                  ? prev.items
-                  : [
-                      {
-                        kind: "unknown" as const,
-                        id: `resume-note-${Date.now()}`,
-                        raw: { note: "已恢复会话，历史消息未回填，可直接续聊", threadId },
-                      },
-                    ],
-              activeTurnId: null,
-              status: "idle",
-            }));
-          } else {
-            setView((prev) => ({ ...prev, threadId, activeTurnId: null, status: "idle" }));
+    (threadId: string, resumed: ThreadResumeResult | null) => {
+      const now = Date.now();
+      const divider: ItemView = {
+        kind: "system",
+        id: `history-divider-${now}`,
+        text: "以下为历史消息（摘要回放，只读）",
+        tone: "info",
+      };
+      const backfilled = resumed?.items ?? [];
+      const title = resumed?.title ?? null;
+      if (resumed) {
+        const items = backfilled.length > 0 ? [divider, ...backfilled] : [];
+        setView((prev) => ({
+          ...prev,
+          threadId,
+          // 同会话重入时保留当前流内消息，避免回退覆盖新回合
+          items: prev.threadId === threadId ? prev.items : items,
+          activeTurnId: null,
+          status: "idle",
+        }));
+        setThreadTitle(title);
+        if (vaultRoot && title) {
+          try {
+            updateThreadTitle(vaultRoot, threadId, title);
+          } catch {
+            // ignore
           }
-        } catch {
-          setView((prev) => ({ ...prev, threadId, activeTurnId: null, status: "idle" }));
         }
       } else {
-        setView((prev) => ({ ...prev, threadId, activeTurnId: null, status: "idle" }));
+        // resume 失败仅本地切 threadId：清空消息流（无历史可展示）
+        setView((prev) => ({
+          ...prev,
+          threadId,
+          items: prev.threadId === threadId ? prev.items : [],
+          activeTurnId: null,
+          status: "idle",
+        }));
+        // 保留本地已存标题，若无则回退 id 短码（由头部渲染决定）
+        if (vaultRoot) {
+          try {
+            const rec = listThreads(vaultRoot).find((r) => r.threadId === threadId);
+            setThreadTitle(rec?.title ?? null);
+          } catch {
+            setThreadTitle(null);
+          }
+        } else {
+          setThreadTitle(null);
+        }
       }
       setPanelMode("conversation");
       setError(null);
@@ -462,6 +509,9 @@ export function AgentPanel({
 
   const handleNewThread = useCallback(() => {
     setView((prev) => ({ ...prev, threadId: "", items: [], activeTurnId: null, status: "idle" }));
+    setThreadTitle(null);
+    setRenameOpen(false);
+    setRenameError(null);
     setError(null);
     setErrorDetails(null);
     setPanelMode("conversation");
@@ -470,8 +520,69 @@ export function AgentPanel({
   const handleArchived = useCallback((threadId: string) => {
     if (viewRef.current.threadId === threadId) {
       setView((prev) => ({ ...prev, threadId: "", items: [], activeTurnId: null, status: "idle" }));
+      setThreadTitle(null);
+      setRenameOpen(false);
+      setRenameError(null);
     }
   }, []);
+
+  /** 删除的是当前会话时切回列表（随后用户可新建），非当前则无需改动视图 */
+  const handleThreadDeleted = useCallback((threadId: string) => {
+    if (viewRef.current.threadId === threadId) {
+      setView((prev) => ({ ...prev, threadId: "", items: [], activeTurnId: null, status: "idle" }));
+      setThreadTitle(null);
+      setRenameOpen(false);
+      setRenameError(null);
+      setPanelMode("threadList");
+    }
+  }, []);
+
+  /** 头部重命名：弹窗确认 → thread/name/set → 本地 store 同步 */
+  const handleOpenRename = useCallback(() => {
+    const cur = viewRef.current.threadId;
+    if (!cur) return;
+    const localTitle =
+      vaultRoot != null
+        ? (() => {
+            try {
+              return listThreads(vaultRoot).find((r) => r.threadId === cur)?.title ?? "";
+            } catch {
+              return "";
+            }
+          })()
+        : "";
+    const init = threadTitle ?? localTitle;
+    setRenameDraft(init || "");
+    setRenameError(null);
+    setRenameOpen(true);
+  }, [vaultRoot, threadTitle]);
+
+  const handleSaveRename = useCallback(async () => {
+    const cur = viewRef.current.threadId;
+    const name = renameDraft.trim();
+    if (!cur || !name) {
+      setRenameError("名称不能为空");
+      return;
+    }
+    setRenameSaving(true);
+    setRenameError(null);
+    try {
+      await threadSetName({ threadId: cur, name });
+      setThreadTitle(name);
+      if (vaultRoot) {
+        try {
+          updateThreadTitle(vaultRoot, cur, name);
+        } catch {
+          // ignore
+        }
+      }
+      setRenameOpen(false);
+    } catch (e: unknown) {
+      setRenameError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRenameSaving(false);
+    }
+  }, [renameDraft, vaultRoot]);
 
   const handleModelChange = useCallback(
     (next: string | null) => {
@@ -547,6 +658,8 @@ export function AgentPanel({
         const res = await threadStart({ ...(modelForStart ? { model: modelForStart } : {}) });
         threadId = res.thread.id;
         setView((prev) => ({ ...prev, threadId }));
+        // 新会话头部直接落标题（body 前 32 字），重命名后再以最新为准
+        setThreadTitle(text.slice(0, 32) || "新会话");
         if (vaultRoot) {
           try {
             const title = text.slice(0, 32) || "新会话";
@@ -742,10 +855,66 @@ export function AgentPanel({
           <ListIcon className="size-3.5" />
           列表
         </Button>
-        <span className="ml-auto truncate font-mono text-[11px] text-muted-foreground">
-          {view.threadId ? view.threadId.slice(0, 8) : "新会话"}
+        <span className="ml-auto flex min-w-0 items-center gap-1 font-mono text-[11px] text-muted-foreground">
+          <span className="truncate" title={view.threadId || "新会话"}>
+            {view.threadId ? (threadTitle || view.threadId.slice(0, 8)) : "新会话"}
+          </span>
+          {view.threadId && (
+            <button
+              type="button"
+              onClick={handleOpenRename}
+              className="shrink-0 rounded p-0.5 hover:bg-accent hover:text-foreground"
+              aria-label="重命名会话"
+              title="重命名会话"
+            >
+              <Pencil className="size-3" />
+            </button>
+          )}
         </span>
       </div>
+
+      {renameOpen && view.threadId && (
+        <div className="mx-2 mt-2 rounded-md border bg-card p-2.5">
+          <p className="text-xs font-medium">重命名会话</p>
+          <div className="mt-1.5 flex items-center gap-2">
+            <input
+              autoFocus
+              value={renameDraft}
+              onChange={(e) => setRenameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveRename();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setRenameOpen(false);
+                  setRenameError(null);
+                }
+              }}
+              placeholder="输入会话名称"
+              maxLength={80}
+              className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+            <Button type="button" size="sm" className="h-8" onClick={() => void handleSaveRename()} disabled={renameSaving || !renameDraft.trim()}>
+              {renameSaving ? "保存中…" : "保存"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-8"
+              onClick={() => {
+                setRenameOpen(false);
+                setRenameError(null);
+              }}
+            >
+              取消
+            </Button>
+          </div>
+          {renameError && <p className="mt-1.5 text-xs text-destructive">{renameError}</p>}
+        </div>
+      )}
 
       {panelMode === "threadList" ? (
         <div className="min-h-0 flex-1 overflow-hidden">
@@ -757,6 +926,7 @@ export function AgentPanel({
             onSelectThread={handleSelectThread}
             onNewThread={handleNewThread}
             onArchived={handleArchived}
+            onDeleted={handleThreadDeleted}
             model={selectedModel}
             onModelChange={handleModelChange}
             onOpenSettings={onOpenSettings}

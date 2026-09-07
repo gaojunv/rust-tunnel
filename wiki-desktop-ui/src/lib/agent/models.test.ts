@@ -35,7 +35,7 @@ describe("listAvailableModels", () => {
     vi.clearAllMocks();
   });
 
-  it("gateway 模式正常返回 relay 模型映射", async () => {
+  it("gateway 模式正常返回 relay 模型映射（无 efforts 元数据）", async () => {
     mockedLoadSyncConfig.mockReturnValue({
       baseUrl: "https://example.com",
       knowledgeId: "k1",
@@ -50,8 +50,8 @@ describe("listAvailableModels", () => {
 
     expect(mockedListRelayModels).toHaveBeenCalledWith("https://example.com");
     expect(res).toEqual([
-      { id: "gpt-4o", label: "gpt-4o" },
-      { id: "o1-mini", label: "o1-mini" },
+      { id: "gpt-4o", label: "gpt-4o", efforts: [], defaultEffort: null },
+      { id: "o1-mini", label: "o1-mini", efforts: [], defaultEffort: null },
     ]);
     expect(mockedModelList).not.toHaveBeenCalled();
   });
@@ -100,9 +100,9 @@ describe("listAvailableModels", () => {
 
     expect(mockedModelList).toHaveBeenCalledWith({});
     expect(res).toEqual([
-      { id: "m1-model", label: "M1 (m1-model)" },
-      { id: "m2", label: "m2" },
-      { id: "m3", label: "m3" },
+      { id: "m1-model", label: "M1 (m1-model)", efforts: [], defaultEffort: null },
+      { id: "m2", label: "m2", efforts: [], defaultEffort: null },
+      { id: "m3", label: "m3", efforts: [], defaultEffort: null },
     ]);
     expect(mockedListRelayModels).not.toHaveBeenCalled();
   });
@@ -116,7 +116,7 @@ describe("listAvailableModels", () => {
     const res = await listAvailableModels("chatgpt");
 
     expect(mockedModelList).toHaveBeenCalledWith({});
-    expect(res).toEqual([{ id: "gpt-4o", label: "GPT 4o (gpt-4o)" }]);
+    expect(res).toEqual([{ id: "gpt-4o", label: "GPT 4o (gpt-4o)", efforts: [], defaultEffort: null }]);
   });
 
   it("gateway relay 返回空数组时返回空列表", async () => {
@@ -130,5 +130,85 @@ describe("listAvailableModels", () => {
 
     const res = await listAvailableModels("gateway");
     expect(res).toEqual([]);
+  });
+
+  it("非 gateway：supportedReasoningEfforts/defaultReasoningEffort 映射到 efforts", async () => {
+    mockedModelList.mockResolvedValue({
+      data: [
+        {
+          id: "g1",
+          model: "gpt-5",
+          displayName: "GPT 5",
+          hidden: false,
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low", description: "快速、低开销" },
+            { reasoningEffort: "medium", description: "" },
+            { reasoningEffort: "high", description: "深度推理" },
+          ],
+          defaultReasoningEffort: "medium",
+        } as unknown as Record<string, unknown>,
+      ],
+      nextCursor: null,
+    } as unknown as Awaited<ReturnType<typeof modelList>>);
+
+    const res = await listAvailableModels("openai-key");
+
+    expect(res).toEqual([
+      {
+        id: "gpt-5",
+        label: "GPT 5 (gpt-5)",
+        efforts: [
+          { effort: "low", description: "快速、低开销" },
+          // 空 description 被丢弃，只保留 effort
+          { effort: "medium" },
+          { effort: "high", description: "深度推理" },
+        ],
+        defaultEffort: "medium",
+      },
+    ]);
+  });
+
+  it("非 gateway：缺失元数据字段时 efforts 为空、defaultEffort 为 null", async () => {
+    mockedModelList.mockResolvedValue({
+      data: [{ id: "m", model: "m", displayName: "", hidden: false } as unknown as Record<string, unknown>],
+      nextCursor: null,
+    } as unknown as Awaited<ReturnType<typeof modelList>>);
+
+    const res = await listAvailableModels("openai-key");
+
+    expect(res).toEqual([{ id: "m", label: "m", efforts: [], defaultEffort: null }]);
+  });
+
+  it("非 gateway：畸形 efforts 条目被过滤（缺 reasoningEffort / 非字符串）", async () => {
+    mockedModelList.mockResolvedValue({
+      data: [
+        {
+          id: "m",
+          model: "m",
+          displayName: "",
+          hidden: false,
+          supportedReasoningEfforts: [
+            { reasoningEffort: "", description: "空" },
+            { description: "无 effort 键" },
+            { reasoningEffort: 42, description: "非字符串" },
+            null,
+            { reasoningEffort: "high", description: "深度" },
+          ],
+          defaultReasoningEffort: 42,
+        } as unknown as Record<string, unknown>,
+      ],
+      nextCursor: null,
+    } as unknown as Awaited<ReturnType<typeof modelList>>);
+
+    const res = await listAvailableModels("openai-key");
+
+    expect(res).toEqual([
+      {
+        id: "m",
+        label: "m",
+        efforts: [{ effort: "high", description: "深度" }],
+        defaultEffort: null,
+      },
+    ]);
   });
 });

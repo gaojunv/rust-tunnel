@@ -7,7 +7,7 @@
  * - fileChange：• edit <文件> + 计数，DiffView 保持
  * - plan/unknown：保留 Checklist/JSON
  * - error：红色左边条横幅
- * - 任务 C/D/B.4
+ * - system：居中弱色分隔线（info 弱化 / warn 警示色），历史回填分隔等
  */
 import { useEffect, useRef, useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -329,6 +329,24 @@ function renderError(item: Extract<ItemView, { kind: "error" }>) {
   );
 }
 
+function SystemItem({ item }: { item: Extract<ItemView, { kind: "system" }> }) {
+  // 居中弱色分隔线；tone=warn（warning/configWarning 等）用警示色，info 用弱化小字
+  const warn = item.tone === "warn";
+  return (
+    <div
+      key={item.id}
+      className={`flex w-full select-none items-center gap-2 py-1.5 ${
+        warn ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground"
+      }`}
+      aria-live="polite"
+    >
+      <span aria-hidden className={`h-px min-w-0 flex-1 ${warn ? "bg-amber-500/40" : "bg-border/60"}`} />
+      <span className="min-w-0 shrink truncate text-center text-[11px] leading-none">{item.text}</span>
+      <span aria-hidden className={`h-px min-w-0 flex-1 ${warn ? "bg-amber-500/40" : "bg-border/60"}`} />
+    </div>
+  );
+}
+
 function UnknownItem({ item }: { item: Extract<ItemView, { kind: "unknown" }> }) {
   const [open, setOpen] = useState(false);
   return (
@@ -380,14 +398,11 @@ export function MessageStream({ items, activeTurnId, onInsertToNote }: Props) {
             return <PlanItem key={item.id} item={item} />;
           case "error":
             return renderError(item);
+          case "system":
+            return <SystemItem key={item.id} item={item} />;
           case "unknown":
             return <UnknownItem key={item.id} item={item} />;
-          default: {
-            // 最小兼容（2A）：codec 新增 system kind 后 default 分支收窄为 system，
-            // 先经 unknown 中转保持既有行为不变；system 的正式渲染由 2C 接线。
-            const unknownItem = item as unknown as Extract<ItemView, { kind: "unknown" }>;
-            return <UnknownItem key={unknownItem.id} item={unknownItem} />;
-          }
+          // ItemView 各 kind 已全部覆盖，穷尽 switch；新增 kind 时此处会缺返回分支而编译报错
         }
       })}
       <div ref={bottomRef} />
