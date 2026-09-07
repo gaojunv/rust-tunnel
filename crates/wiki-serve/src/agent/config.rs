@@ -63,6 +63,34 @@ pub enum SandboxMode {
     ReadOnly,
 }
 
+/// Codex 自定义 provider 的 wire 协议（仅网关模式生效）.
+///
+/// codex 侧对应 `[model_providers.*]` 下的 `wire_api` 字段：
+/// `responses` 请求 `POST {base_url}/responses`，`chat` 请求 `POST {base_url}/chat/completions`。
+/// `OpenaiKey`/`ChatGpt` 模式使用 codex 内置 provider，wire 协议由 codex 决定，不渲染该字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WireApi {
+    /// OpenAI Responses API（默认，`/v1/responses`）.
+    #[default]
+    #[serde(rename = "responses")]
+    Responses,
+    /// Chat Completions API（`/v1/chat/completions`）.
+    #[serde(rename = "chat")]
+    Chat,
+}
+
+impl WireApi {
+    /// codex config.toml 中的 `wire_api` 值.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::Chat => "chat",
+        }
+    }
+}
+
 fn default_approval() -> ApprovalPolicy {
     ApprovalPolicy::OnRequest
 }
@@ -81,9 +109,9 @@ pub struct AgentSettings {
     /// 认证模式.
     #[serde(default)]
     pub auth_mode: AuthMode,
-    /// 网关基址（如 `http://127.0.0.1:PORT` 或 `http://127.0.0.1:PORT/v1`，均可；codex 侧最终请求 `POST {base_url}/responses`，
-    /// 因此 `base_url` 已含 `v1` 与不含 `v1` 都会被正确拼接为 `POST .../responses` 或 `POST .../v1/responses`，假上游需同时监听两条路径）.
-
+    /// 网关基址（如 `http://127.0.0.1:PORT` 或 `http://127.0.0.1:PORT/v1`，均可；codex 侧最终请求路径由 [`WireApi`] 决定
+    /// —— `POST {base_url}/responses` 或 `POST {base_url}/chat/completions`，因此 `base_url` 已含 `v1` 与不含 `v1`
+    /// 都会被正确拼接，假上游需同时监听两条路径）.
     #[serde(default)]
     pub gateway_base_url: Option<String>,
     /// 网关 API Key（敏感，不落 `config.toml`，仅经 env 注入）.
@@ -104,6 +132,9 @@ pub struct AgentSettings {
     /// 二进制覆盖路径.
     #[serde(default)]
     pub codex_path_override: Option<String>,
+    /// wire 协议（默认 `responses`；仅网关模式渲染进 config.toml）.
+    #[serde(default)]
+    pub wire_api: WireApi,
 }
 
 impl Default for AgentSettings {
@@ -118,6 +149,7 @@ impl Default for AgentSettings {
             approval_policy: ApprovalPolicy::OnRequest,
             sandbox_mode: SandboxMode::WorkspaceWrite,
             codex_path_override: None,
+            wire_api: WireApi::Responses,
         }
     }
 }
@@ -250,7 +282,7 @@ impl CodexHome {
                 let esc_url = toml_escape(base_url);
                 let _ = writeln!(out, "base_url = \"{esc_url}\"");
                 out.push_str("env_key = \"WIKI_TUNNEL_LLM_KEY\"\n");
-                out.push_str("wire_api = \"responses\"\n");
+                let _ = writeln!(out, "wire_api = \"{}\"", settings.wire_api.as_str());
                 // 审批与沙箱
                 let approval = match settings.approval_policy {
                     ApprovalPolicy::OnRequest => "on-request",
@@ -366,6 +398,7 @@ mod tests {
             approval_policy: ApprovalPolicy::Untrusted,
             sandbox_mode: SandboxMode::DangerFullAccess,
             codex_path_override: Some("/tmp/codex".to_owned()),
+            wire_api: WireApi::Responses,
         };
         let v = serde_json::to_value(&s).expect("value");
         assert_eq!(v.get("enabled").and_then(serde_json::Value::as_bool), Some(true));
@@ -418,6 +451,35 @@ mod tests {
             parsed.get("model_provider").and_then(|v| v.as_str()),
             Some("tunnel")
         );
+    }
+
+    #[test]
+    fn config_toml_gateway_mode_wire_api_chat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("codex-home");
+        let settings = AgentSettings {
+            enabled: true,
+            auth_mode: AuthMode::Gateway,
+            gateway_base_url: Some("https://gw.example.com/v1".to_owned()),
+            gateway_api_key: Some("secret-key".to_owned()),
+            wire_api: WireApi::Chat,
+            ..Default::default()
+        };
+        let path = CodexHome::ensure(&base, &settings).expect("ensure");
+        let content = std::fs::read_to_string(&path).expect("read");
+        assert!(content.contains("wire_api = \"chat\""), "wire_api：{content}");
+        assert!(!content.contains("wire_api = \"responses\""), "wire_api 不应为 responses：{content}");
+    }
+
+    #[test]
+    fn wire_api_backward_compat_default() {
+        // 旧 settings 文件无 wireApi 字段，反序列化应回退 Responses
+        let json = r#"{"enabled":true,"authMode":"gateway"}"#;
+        let s: AgentSettings = serde_json::from_str(json).expect("de");
+        assert_eq!(s.wire_api, WireApi::Responses);
+        // 序列化应为 camelCase 的 wireApi
+        let v = serde_json::to_value(&s).expect("ser");
+        assert_eq!(v.get("wireApi").and_then(serde_json::Value::as_str), Some("responses"));
     }
 
     #[test]
@@ -517,6 +579,7 @@ mod tests {
             approval_policy: ApprovalPolicy::Never,
             sandbox_mode: SandboxMode::ReadOnly,
             codex_path_override: Some("/usr/local/bin/codex".to_owned()),
+            wire_api: WireApi::Chat,
         };
         original.save(&path).expect("save");
         let loaded = AgentSettings::load(&path).expect("load");

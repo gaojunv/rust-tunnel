@@ -228,6 +228,55 @@ pub fn save_attachment(
     commands::save_attachment(&state, note_key, file_name, data)
 }
 
+/// 应用启动时按设置自动启动 agent（后台线程，避免阻塞 setup）.
+///
+/// 预检全部通过才调用 [`AgentManager::start`]，任一不满足则静默跳过——
+/// `start` 内部失败会累积连续失败计数（满 3 次熔断，需保存设置或显式 stop 清零），
+/// 预检可避免「网关地址未配/二进制缺失」这类长期不满足的状态在每次启动应用时
+/// 白白消耗熔断计数。预检与 `start` 内部校验存在重复，竞态窗口可忽略。
+fn spawn_agent_autostart(
+    app: &tauri::App,
+    agent_manager: std::sync::Arc<std::sync::Mutex<AgentManager>>,
+) {
+    let app_config_dir = resolve_app_config_dir(app.handle());
+    let app_handle = app.handle().clone();
+    std::thread::spawn(move || {
+        let settings_path = crate::agent::AgentSettings::default_path(&app_config_dir);
+        let settings = match crate::agent::AgentSettings::load(&settings_path) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("agent 自动启动跳过：加载 settings 失败（{err}）");
+                return;
+            }
+        };
+        if !settings.enabled {
+            return;
+        }
+        if let Err(reason) = settings.validate() {
+            eprintln!("agent 自动启动跳过：{reason}");
+            return;
+        }
+        let override_path = settings
+            .codex_path_override
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty());
+        if crate::agent::resolve::resolve_binary_live(override_path.as_deref(), None).is_none() {
+            eprintln!("agent 自动启动跳过：未找到 codex 二进制（sidecar/覆盖/PATH 均未命中）");
+            return;
+        }
+        let sink: std::sync::Arc<dyn crate::agent::AgentEventSink> =
+            std::sync::Arc::new(crate::agent::bridge::TauriEventSink(app_handle));
+        let mut guard = agent_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 失败仅记日志：错误状态已随 `agent:status` 事件广播，前端面板会展示
+        if let Err(err) = guard.start(sink) {
+            eprintln!("agent 自动启动失败：{err}");
+        }
+    });
+}
+
 /// 启动 Tauri 应用.
 ///
 /// 首启时确保 vault 根目录存在且非空（空 vault 写入 `welcome.md`），随后
@@ -251,7 +300,8 @@ pub fn run() -> tauri::Result<()> {
                 app_config_dir,
                 vault_root_for_agent,
             )));
-            app.manage(agent_manager);
+            app.manage(agent_manager.clone());
+            spawn_agent_autostart(app, agent_manager);
             Ok(())
         })
         .manage(state)

@@ -174,6 +174,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
           approvalPolicy: "on-request",
           sandboxMode: "workspace-write",
           codexPathOverride: null,
+          wireApi: "responses",
         };
         setAgentSettings(fallback);
         setInitialAgentJson(JSON.stringify(fallback));
@@ -690,7 +691,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
                         placeholder={gatewayPlaceholder}
                         className="mt-1.5"
                       />
-                      <p className="mt-1 text-xs text-muted-foreground">需服务端 LLM 网关暴露 /v1/responses，默认取同步服务器地址</p>
+                      <p className="mt-1 text-xs text-muted-foreground">默认取同步服务器地址；实际请求路径由下方「接口协议」决定</p>
                     </div>
                     <div>
                       <label className="block text-xs font-medium text-muted-foreground">网关 API Key</label>
@@ -702,6 +703,18 @@ export function SettingsDialog({ onClose, onSync }: Props) {
                         className="mt-1.5"
                       />
                       <p className="mt-1 text-xs text-muted-foreground">在服务端「LLM 网关 → API Keys」页签发</p>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-muted-foreground">接口协议</label>
+                      <select
+                        value={String(agentSettings.wireApi ?? "responses")}
+                        onChange={(e) => updateAgent({ wireApi: e.target.value })}
+                        className="mt-1.5 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                      >
+                        <option value="responses">Responses API（/v1/responses，默认）</option>
+                        <option value="chat">Chat Completions（/v1/chat/completions）</option>
+                      </select>
+                      <p className="mt-1 text-xs text-muted-foreground">仅网关模式生效；所选协议的端点需服务端 LLM 网关支持</p>
                     </div>
                   </>
                 )}

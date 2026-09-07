@@ -81,6 +81,8 @@ export type AgentSettingsDto = {
   approvalPolicy: string;
   sandboxMode: string;
   codexPathOverride?: string | null;
+  /** wire 协议（仅网关模式生效）："responses"（默认，/v1/responses）| "chat"（/v1/chat/completions） */
+  wireApi?: string;
   [key: string]: unknown;
 };
 
