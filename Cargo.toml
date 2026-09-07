@@ -92,7 +92,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
 x509-parser = "0.16"
-base64 = "0.22"
+base64 = "0.23"
 urlencoding = "2.1"
 hickory-resolver = "0.26"
 # ACP 协议 crate：unstable_elicitation 提供 AskUserQuestion 表单（elicitation/create）
