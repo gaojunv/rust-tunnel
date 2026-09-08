@@ -32,10 +32,14 @@ struct GuiApp {
     app_state: Arc<app::AppState>,
     settings: ui::settings::SettingsState,
     selected_tab: usize,
+    /// 托盘句柄（保持 `TrayIcon` 生命周期，随窗口同生共死）。
+    tray: Option<tray::TrayHandle>,
+    /// 上次已应用到托盘的状态（变化时才刷新，避免每帧写菜单）。
+    last_tray_state: Option<tray::TrayState>,
 }
 
 impl GuiApp {
-    fn new(app_state: Arc<app::AppState>) -> Self {
+    fn new(app_state: Arc<app::AppState>, tray: Option<tray::TrayHandle>) -> Self {
         let settings = app_state
             .config_snapshot()
             .as_ref()
@@ -45,6 +49,8 @@ impl GuiApp {
             app_state,
             settings,
             selected_tab: 0,
+            tray,
+            last_tray_state: None,
         }
     }
 }
@@ -90,6 +96,15 @@ impl eframe::App for GuiApp {
         }
 
         let status = self.app_state.status_rx.borrow().clone();
+
+        // 托盘状态菜单/Tooltip 随连接态刷新（首次帧也应用一次，启动时可能已连接）。
+        let tray_state = tray::TrayState::from_status(&status);
+        if self.last_tray_state != Some(tray_state) {
+            if let Some(handle) = self.tray.as_ref() {
+                tray::update_tray_for_status(handle, &status);
+            }
+            self.last_tray_state = Some(tray_state);
+        }
 
         egui::TopBottomPanel::top("tabs")
             .show_separator_line(false)
@@ -314,8 +329,8 @@ fn main() -> anyhow::Result<()> {
     spawn_runtime(app_state.clone(), status_tx, log_buffer, reconnect_flag);
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，
-    // 此处先构建托盘（持有生命周期），再起 eframe。
-    let _tray: Option<tray_icon::TrayIcon> = match tray::build_tray() {
+    // 此处先构建托盘（句柄随 GuiApp 持有生命周期），再起 eframe。
+    let tray: Option<tray::TrayHandle> = match tray::build_tray() {
         Ok(t) => Some(t),
         Err(e) => {
             tracing::warn!("托盘初始化失败（无桌面环境时可忽略）：{e}");
@@ -348,7 +363,7 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             fonts::setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(GuiApp::new(app_state)))
+            Ok(Box::new(GuiApp::new(app_state, tray)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;

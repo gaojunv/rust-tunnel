@@ -4,7 +4,6 @@ use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 /// 托盘连接态（决定图标与菜单文案）。
-#[allow(dead_code, reason = "托盘三态图标将在后续批次切图标时启用")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayState {
     /// 已连接。
@@ -16,13 +15,24 @@ pub enum TrayState {
 }
 
 impl TrayState {
-    fn from_status(status: &rust_tunnel_client::ClientStatus) -> Self {
+    /// 从客户端状态推导托盘态。
+    #[must_use]
+    pub fn from_status(status: &rust_tunnel_client::ClientStatus) -> Self {
         if status.connected {
             Self::Connected
         } else if status.last_error.is_some() {
             Self::Reconnecting
         } else {
             Self::Offline
+        }
+    }
+
+    /// 状态短标签（用于 tooltip 后缀）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "已连接",
+            Self::Reconnecting => "重连中",
+            Self::Offline => "离线",
         }
     }
 }
@@ -47,14 +57,24 @@ pub(crate) fn load_icon_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 fn offline_icon_bytes() -> &'static [u8] {
-    // 优先用导出的图标，回退用通用 icon
-    include_bytes!("../icons/icon.png")
+    // 托盘图标（白色 glyph + 透明底，macOS 以 template 模式自适应深浅色）
+    include_bytes!("../icons/tray-icon@2x.png")
 }
 
-/// 构造托盘图标与菜单，返回可持久持有的 `TrayIcon`（调用方需持有其生命周期）。
+/// 托盘句柄：`TrayIcon` 生存期 + 可动态改写的菜单项。
 ///
-/// 图标三态通过 `tray.set_icon(...)` 切换；此处先以离线态创建。
-pub fn build_tray() -> anyhow::Result<TrayIcon> {
+/// `muda::MenuItem` 是引用计数句柄，`clone` 后可通过原句柄 `set_text` 更新菜单文案。
+pub struct TrayHandle {
+    /// 托盘图标（调用方/持有方需保持其生命周期）。
+    pub icon: TrayIcon,
+    /// 菜单首行的只读状态项。
+    pub status_item: MenuItem,
+}
+
+/// 构造托盘图标与菜单，返回可持久持有的句柄（调用方需持有其生命周期）。
+///
+/// 图标三态可通过 `handle.icon.set_icon(...)` 切换；此处先以离线态创建。
+pub fn build_tray() -> anyhow::Result<TrayHandle> {
     let status_item = MenuItem::with_id("status", "● 离线", false, None);
     let show_item = MenuItem::with_id(ids::SHOW, "打开面板…", true, None);
     let settings_item = MenuItem::with_id(ids::SETTINGS, "设置…", true, None);
@@ -81,26 +101,49 @@ pub fn build_tray() -> anyhow::Result<TrayIcon> {
     };
 
     let tray = TrayIconBuilder::new()
-        .with_tooltip("rust-tunnel")
+        .with_tooltip("rust-tunnel — 离线")
         .with_icon(icon)
+        .with_icon_as_template(true)
         .with_menu(Box::new(menu))
         .build()?;
 
     // 消费未处理的菜单事件（避免堆积）；托盘点击由 muda 统一分发。
     let _ = MenuEvent::receiver();
 
-    Ok(tray)
+    Ok(TrayHandle {
+        icon: tray,
+        status_item,
+    })
 }
 
+/// 错误文案在托盘菜单中展示的最大字符数（超出截断）。
+const MAX_ERROR_CHARS: usize = 24;
+
 /// 根据最新状态刷新托盘 tooltip 与状态菜单文案。
-/// 映射子菜单本期仅在小窗口内展示，托盘保持轻量。
-#[allow(dead_code, reason = "托盘映射子菜单在小窗口稳定后接入")]
-pub fn update_tray_for_status(_tray: &TrayIcon, status: &rust_tunnel_client::ClientStatus) {
-    // TODO: picks different icon per TrayState via set_icon, and rebuilds
-    // the mapping submenu from status.mapping_summary when needed.
-    // Left minimal for now to keep the tray lightweight and avoid
-    // reconstructing muda submenus on every status update.
-    let _state = TrayState::from_status(status);
+pub fn update_tray_for_status(handle: &TrayHandle, status: &rust_tunnel_client::ClientStatus) {
+    let state = TrayState::from_status(status);
+    let text = match state {
+        TrayState::Connected => "● 已连接".to_string(),
+        TrayState::Reconnecting => match status.last_error.as_deref() {
+            Some(err) => {
+                // 取首行、过长截断，避免菜单项被超长错误撑宽。
+                let first_line = err.lines().next().unwrap_or(err);
+                let brief: String = first_line.chars().take(MAX_ERROR_CHARS).collect();
+                if first_line.chars().count() > MAX_ERROR_CHARS {
+                    format!("● 重连中：{brief}…")
+                } else {
+                    format!("● 重连中：{brief}")
+                }
+            }
+            None => "● 重连中".to_string(),
+        },
+        TrayState::Offline => "● 离线".to_string(),
+    };
+    handle.status_item.set_text(&text);
+    let tooltip = format!("rust-tunnel — {}", state.label());
+    if let Err(e) = handle.icon.set_tooltip(Some(tooltip)) {
+        tracing::warn!("托盘 tooltip 更新失败：{e}");
+    }
 }
 
 /// 轮询 `MenuEvent` 队列，返回待 eframe 侧处理的动作。
