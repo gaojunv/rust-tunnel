@@ -185,6 +185,14 @@ pub fn forward(
         if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", gateway.api_key)) {
             headers.insert(header::AUTHORIZATION, v);
         }
+        // ACP 通道经控制通道只透传 method/path/body，客户端原始 HTTP 头全部丢失，
+        // 网关 `extract_opencode_session` 拿不到显式头；opencode Go 上游又强制要求
+        // `x-opencode-session`（缺失即 400）。agent `session_id` 稳定且 per-session
+        // 唯一，满足上游按会话路由的要求，此处直接注入。
+        // `HeaderValue::from_str` 仅借用 `session_id`，不影响其后 tracing 日志的使用。
+        if let Ok(v) = HeaderValue::from_str(&session_id) {
+            headers.insert("x-opencode-session", v);
+        }
         let resp = if is_models {
             openai_handler::handle_list_models(State(handler_state), headers).await
         } else if is_messages {
@@ -718,6 +726,80 @@ mod tests {
             last.status >= 500,
             "disabled-provider model must fall back to workspace model → upstream 5xx, got {}",
             last.status
+        );
+    }
+
+    /// 验证 `forward()` 向上游请求注入 `x-opencode-session` 头（ACP 通道丢失
+    /// 客户端 HTTP 头，opencode Go 强制要求该头；session_id 稳定满足路由要求）。
+    #[tokio::test]
+    async fn test_forward_injects_opencode_session_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let db = Database::new(":memory:").await.unwrap();
+        let session_id = "acp-sess-42";
+
+        // mock 上游：读取请求头原始字节，回 200 OK。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            loop {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            {
+                let mut cap = captured_clone.lock().await;
+                cap.extend_from_slice(&buf);
+            }
+            // 空 JSON body 回复——handler 需要合法 JSON
+            let resp_body = b"{}";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n",
+                resp_body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(resp_body).await;
+        });
+
+        save_provider_model(&db, "model-h", &format!("http://{addr}"), true).await;
+        seed_configured_session(&db, session_id, "model-h").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            session_id.into(),
+            "req-h".into(),
+            gw,
+            "/v1/chat/completions".into(),
+            br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"stream":false}"#
+                .to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        assert!(
+            chunks.last().unwrap().done,
+            "stream must end with done=true"
+        );
+
+        // 断言上游请求包含 x-opencode-session 头（小写比较）
+        let captured_guard = captured.lock().await;
+        let raw_request = String::from_utf8_lossy(&captured_guard);
+        let header_present = raw_request
+            .lines()
+            .any(|line| line.to_lowercase() == "x-opencode-session: acp-sess-42");
+        assert!(
+            header_present,
+            "upstream request must contain x-opencode-session header, raw: {raw_request}"
         );
     }
 
