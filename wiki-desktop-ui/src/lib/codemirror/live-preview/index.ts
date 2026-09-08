@@ -18,6 +18,8 @@ import {
   CodeFooterWidget,
   FrontmatterWidget,
   CalloutWidget,
+  MathWidget,
+  BulletWidget,
 } from "./widgets";
 import { livePreviewTheme } from "./theme";
 import { isAttachmentSrc } from "@/lib/attachments";
@@ -46,7 +48,7 @@ export { wikilinkNavFacet } from "./widgets";
  * - `line` → `Decoration.line`
  * - `mark` → `Decoration.mark`
  * - `hide` → `Decoration.replace({})`（零宽，不占位）
- * - `checkbox` / `hr` / `wikilink` / `image` / `mdlink` / `table` / `codeheader` / `codefooter` / `callout`
+ * - `checkbox` / `hr` / `wikilink` / `image` / `mdlink` / `table` / `codeheader` / `codefooter` / `callout` / `mathblock` / `mathinline` / `bullet`
  *   → `Decoration.replace({ widget })`
  * - `highlight` → 两个 `==` 分别 `Decoration.replace({})`，内容 `Decoration.mark`
  *
@@ -179,6 +181,32 @@ function buildDecoSet(view: EditorView): { decos: DecorationSet; specs: DecoSpec
               widget: new FrontmatterWidget(spec.propCount, view, spec.from),
               block: true,
             }),
+          });
+          break;
+        case "mathblock":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({
+              widget: new MathWidget(spec.tex, true, view, spec.from),
+              block: true,
+            }),
+          });
+          break;
+        case "mathinline":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({
+              widget: new MathWidget(spec.tex, false, view, spec.from),
+            }),
+          });
+          break;
+        case "bullet":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({ widget: new BulletWidget() }),
           });
           break;
       }

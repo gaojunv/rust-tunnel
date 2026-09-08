@@ -172,21 +172,26 @@ describe("computeLivePreviewSpecs", () => {
     expect(specs).toEqual([{ kind: "hr", from: 6, to: 9 }]);
   });
 
-  it("有序列表 ListMark 弱化 + 无序列表", () => {
+  it("无序列表 → bullet spec，有序列表 → mark spec", () => {
     const doc = "- a\n1. b\n";
     const state = makeState(doc, [{ anchor: doc.length }]);
-    const specs = ofKind(full(state), "mark");
-    expect(specs).toEqual([
-      { kind: "mark", from: 0, to: 1, cls: LP_CLASS.listMark },
-      { kind: "mark", from: 4, to: 6, cls: LP_CLASS.listMark },
-    ]);
+    // 无序标记 `-` 发射 bullet
+    const bullets = ofKind(full(state), "bullet");
+    expect(bullets).toEqual([{ kind: "bullet", from: 0, to: 1 }]);
+    // 有序标记 `1.` 发射 listMark dim
+    const marks = ofKind(full(state), "mark");
+    expect(marks).toEqual([{ kind: "mark", from: 4, to: 6, cls: LP_CLASS.listMark }]);
   });
 
-  it("围栏代码块：每行背景 class；块内 [[...]] 不渲染 wikilink", () => {
+  it("围栏代码块：每行背景 class + 末行圆角 class；块内 [[...]] 不渲染 wikilink", () => {
     const doc = "```js\n[[not-a-link]]\ncode\n```\n";
     const state = makeState(doc, [{ anchor: doc.length }]);
     const specs = full(state);
-    expect(ofKind(specs, "line").map((s) => (s as { line: number }).line)).toEqual([1, 2, 3, 4]);
+    // 所有代码行（含末行）都有 codeLine class，外加末行 codeLastLine class
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    expect(lineSpecs.map((s) => s.line)).toEqual([1, 2, 3, 4, 3]);
+    // 末行（闭围栏前一行 = 第 3 行）额外有 codeLastLine class
+    expect(lineSpecs).toContainEqual({ kind: "line", line: 3, cls: LP_CLASS.codeLastLine });
     expect(ofKind(specs, "wikilink")).toEqual([]);
   });
 
@@ -396,9 +401,39 @@ describe("markdown link rendering", () => {
     expect(ofKind(full(state), "mdlink")).toEqual([]);
   });
 
-  it("ref-style link [text][ref] → no mdlink spec", () => {
+  it("ref-style link [text][ref] with definition → mdlink spec", () => {
     const doc = "A [text][ref] B\n\n[ref]: http://x.com\n";
     const state = makeState(doc, [{ anchor: doc.length }]);
+    const links = ofKind(full(state), "mdlink") as Extract<DecoSpec, { kind: "mdlink" }>[];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ text: "text", url: "http://x.com" });
+  });
+
+  it("ref-style link [text][ref] without definition → no mdlink spec", () => {
+    const doc = "A [text][ref] B\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "mdlink")).toEqual([]);
+  });
+
+  it("ref-style link case-insensitive （[Text][REF] 命中 [ref]: 定义）", () => {
+    const doc = "A [Text][REF] B\n\n[ref]: http://x.com\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const links = ofKind(full(state), "mdlink") as Extract<DecoSpec, { kind: "mdlink" }>[];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ text: "Text", url: "http://x.com" });
+  });
+
+  it("collapsed ref-style link [text][] → ref=text 查表", () => {
+    const doc = "A [guide][] B\n\n[guide]: http://g.com\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const links = ofKind(full(state), "mdlink") as Extract<DecoSpec, { kind: "mdlink" }>[];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ text: "guide", url: "http://g.com" });
+  });
+
+  it("ref-style link 光标在行内 → 还原为源码", () => {
+    const doc = "A [text][ref] B\n\n[ref]: http://x.com\n";
+    const state = makeState(doc, [{ anchor: 6 }]); // 光标在 [text] 内
     expect(ofKind(full(state), "mdlink")).toEqual([]);
   });
 });
@@ -489,8 +524,10 @@ describe("code block header/footer", () => {
     const specs = full(state);
     expect(ofKind(specs, "codeheader")).toHaveLength(1);
     expect(ofKind(specs, "codefooter")).toHaveLength(1);
-    // code block lines still get background class
-    expect(ofKind(specs, "line").map((s) => (s as Extract<DecoSpec, { kind: "line" }>).line)).toEqual([1, 2, 3]);
+    // code block lines still get background class + 末行圆角 class
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    expect(lineSpecs.map((s) => s.line).sort()).toEqual([1, 2, 2, 3]);
+    expect(lineSpecs).toContainEqual({ kind: "line", line: 2, cls: LP_CLASS.codeLastLine });
   });
 
   it("wikilink inside code block → not rendered as wikilink", () => {
@@ -908,5 +945,207 @@ describe("inline constructs inside headings", () => {
     const specs = full(state);
     const highlights = ofKind(specs, "highlight") as Extract<DecoSpec, { kind: "highlight" }>[];
     expect(highlights).toHaveLength(1);
+  });
+});
+
+// ── KaTeX 数学渲染测试 ──────────────────────────────────────────────────────
+
+describe("KaTeX math rendering", () => {
+  it("单行块 $$x^2$$ → mathblock spec", () => {
+    const doc = "$$x^2$$\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const blocks = ofKind(full(state), "mathblock") as Extract<DecoSpec, { kind: "mathblock" }>[];
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({ kind: "mathblock", from: 0, to: 7, tex: "x^2" });
+  });
+
+  it("多行块 $$...$$ → mathblock spec，tex 包含中间行", () => {
+    const doc = "$$\na+b\nc\n$$\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const blocks = ofKind(full(state), "mathblock") as Extract<DecoSpec, { kind: "mathblock" }>[];
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].tex).toBe("a+b\nc");
+    expect(blocks[0].from).toBe(0);
+    // 实现中 rangeTo = innerLine.from + trimEnd 长度（含行尾 $$ 前导空白）
+    expect(doc.slice(blocks[0].from, blocks[0].to)).toBe("$$\na+b\nc\n$$");
+  });
+
+  it("行内 $e=mc^2$ → mathinline spec", () => {
+    const doc = "有 $e=mc^2$ 个定理\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const inlines = ofKind(full(state), "mathinline") as Extract<DecoSpec, { kind: "mathinline" }>[];
+    expect(inlines).toHaveLength(1);
+    expect(inlines[0]).toMatchObject({ kind: "mathinline", from: 2, to: 10, tex: "e=mc^2" });
+  });
+
+  it("货币 $5 和 $10 不误伤（闭 $ 后紧跟数字）", () => {
+    const doc = "价格 $5 和 $10 共 $15\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "mathinline")).toEqual([]);
+  });
+
+  it("行内码 `$x$` 不渲染为数学", () => {
+    const doc = "用 `$x$` 表示\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "mathinline")).toEqual([]);
+  });
+
+  it("代码块内 $...$ 不渲染为数学", () => {
+    const doc = "```\n$\na\n$\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "mathinline")).toEqual([]);
+  });
+
+  it("光标触碰块级公式行 → 还原为源码", () => {
+    const doc = "$$x^2$$\n\ntail\n";
+    const state = makeState(doc, [{ anchor: 2 }]); // 光标在 $$ 行
+    expect(ofKind(full(state), "mathblock")).toEqual([]);
+  });
+
+  it("光标触碰行内公式 → 还原为源码", () => {
+    const doc = "a $x^2$ b\n\ntail\n";
+    const state = makeState(doc, [{ anchor: 5 }]); // 光标在 $x^2$ 内
+    expect(ofKind(full(state), "mathinline")).toEqual([]);
+  });
+
+  it("未闭合 $$ 不渲染为数学块", () => {
+    const doc = "$$\na\nb\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "mathblock")).toEqual([]);
+  });
+
+  it("块级公式 $x$ 单行带空格 → tex trim", () => {
+    const doc = "$$  x^2  $$\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const blocks = ofKind(full(state), "mathblock") as Extract<DecoSpec, { kind: "mathblock" }>[];
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].tex).toBe("x^2");
+  });
+});
+
+// ── 无序列表 bullet 测试 ────────────────────────────────────────────────────
+
+describe("bullet rendering", () => {
+  it("- a → bullet spec", () => {
+    const doc = "- a\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const bullets = ofKind(full(state), "bullet") as Extract<DecoSpec, { kind: "bullet" }>[];
+    expect(bullets).toEqual([{ kind: "bullet", from: 0, to: 1 }]);
+  });
+
+  it("+ a → bullet spec", () => {
+    const doc = "+ a\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const bullets = ofKind(full(state), "bullet") as Extract<DecoSpec, { kind: "bullet" }>[];
+    expect(bullets).toHaveLength(1);
+  });
+
+  it("* a → bullet spec", () => {
+    const doc = "* a\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const bullets = ofKind(full(state), "bullet") as Extract<DecoSpec, { kind: "bullet" }>[];
+    expect(bullets).toHaveLength(1);
+  });
+
+  it("1. a → mark spec（有序列表保持 listMark）", () => {
+    const doc = "1. a\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "bullet")).toEqual([]);
+    const marks = ofKind(full(state), "mark");
+    expect(marks).toHaveLength(1);
+    expect((marks[0] as Extract<DecoSpec, { kind: "mark" }>).cls).toBe(LP_CLASS.listMark);
+  });
+
+  it("光标触碰 bullet 行 → 还原为源码", () => {
+    const doc = "- a\n";
+    const state = makeState(doc, [{ anchor: 0 }]);
+    expect(ofKind(full(state), "bullet")).toEqual([]);
+  });
+});
+
+// ── wikilink `#` 显示优化测试 ───────────────────────────────────────────────
+
+describe("wikilink # display optimization", () => {
+  it("[[a#b]] → label 'a > b'（target 原样保留）", () => {
+    const doc = "[[a#b]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const wikilinks = ofKind(full(state), "wikilink") as Extract<DecoSpec, { kind: "wikilink" }>[];
+    expect(wikilinks).toHaveLength(1);
+    expect(wikilinks[0]).toMatchObject({ target: "a#b", label: "a > b" });
+  });
+
+  it("[[a#b#c]] → label 'a > b > c'（多级）", () => {
+    const doc = "[[a#b#c]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const wikilinks = ofKind(full(state), "wikilink") as Extract<DecoSpec, { kind: "wikilink" }>[];
+    expect(wikilinks).toHaveLength(1);
+    expect(wikilinks[0]).toMatchObject({ target: "a#b#c", label: "a > b > c" });
+  });
+
+  it("[[page|custom]] → label 'custom'（有别名时改写不生效）", () => {
+    const doc = "[[page|custom]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const wikilinks = ofKind(full(state), "wikilink") as Extract<DecoSpec, { kind: "wikilink" }>[];
+    expect(wikilinks).toHaveLength(1);
+    expect(wikilinks[0]).toMatchObject({ target: "page", label: "custom" });
+  });
+
+  it("[[bare]] → label 'bare'（无 # 无别名，保持原样）", () => {
+    const doc = "[[bare]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const wikilinks = ofKind(full(state), "wikilink") as Extract<DecoSpec, { kind: "wikilink" }>[];
+    expect(wikilinks).toHaveLength(1);
+    expect(wikilinks[0]).toMatchObject({ target: "bare", label: "bare" });
+  });
+});
+
+// ── 图片尺寸语法测试 ───────────────────────────────────────────────────────
+
+describe("image size syntax", () => {
+  it("![a|300](x.png) → image spec width=300 alt='a'", () => {
+    const doc = "![a|300](x.png)\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({ alt: "a", src: "x.png", width: 300 });
+  });
+
+  it("![a|100x50](x.png) → width=100 height=50", () => {
+    const doc = "![a|100x50](x.png)\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({ alt: "a", width: 100, height: 50 });
+  });
+
+  it("![[p.png|250]] embed → image spec width=250", () => {
+    const doc = "![[p.png|250]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({ src: "assets/p.png", width: 250 });
+  });
+
+  it("![alt](src) 无尺寸后缀 → width/height undefined", () => {
+    const doc = "![alt](x.png)\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({ alt: "alt" });
+    expect((imgs[0] as Extract<DecoSpec, { kind: "image" }>).width).toBeUndefined();
+  });
+});
+
+// ── 代码块末行圆角（未闭合代码块）测试 ──────────────────────────────────────
+
+describe("unclosed code block last line", () => {
+  it("未闭合代码块 → 末行 = FencedCode 末行获得 codeLastLine class", () => {
+    const doc = "```js\ncode1\ncode2\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const lineSpecs = ofKind(full(state), "line") as Extract<DecoSpec, { kind: "line" }>[];
+    // lezer 将尾换行也纳入 FencedCode 节点，endLine=4；末行同时有 codeLine 和 codeLastLine
+    const lastLines = lineSpecs.filter((s) => s.cls === LP_CLASS.codeLastLine);
+    expect(lastLines).toHaveLength(1);
+    expect(lineSpecs).toContainEqual({ kind: "line", line: lastLines[0].line, cls: LP_CLASS.codeLine });
   });
 });

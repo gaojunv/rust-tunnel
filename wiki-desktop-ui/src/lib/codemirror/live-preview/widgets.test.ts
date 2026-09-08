@@ -11,7 +11,9 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import {
+  BulletWidget,
   CalloutWidget,
+  MathWidget,
   renderTableCellInline,
   TableWidget,
   wikilinkNavFacet,
@@ -206,6 +208,99 @@ describe("TableWidget with inline rendering", () => {
       const raw = "| a |\n|---|\n| x |";
       expect(new TableWidget(raw, view).eq(new TableWidget(raw, view))).toBe(true);
       expect(new TableWidget(raw, view).eq(new TableWidget("| b |", view))).toBe(false);
+    } finally {
+      view.destroy();
+    }
+  });
+});
+
+// ── MathWidget 测试（jsdom）───────────────────────────────────────────────────
+
+describe("MathWidget", () => {
+  it("displayMode block → 渲染 .katex 节点 + cm-lp-math-block class", () => {
+    const view = makeView();
+    try {
+      const w = new MathWidget("x^2", true, view, 0);
+      const el = w.toDOM() as HTMLElement;
+      expect(el.className).toContain("cm-lp-math");
+      expect(el.className).toContain("cm-lp-math-block");
+      expect(el.querySelector(".katex")).not.toBeNull();
+      expect(el.style.cursor).toBe("pointer");
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("inline → .cm-lp-math 不含 block class", () => {
+    const view = makeView();
+    try {
+      const w = new MathWidget("e=mc^2", false, view, 2);
+      const el = w.toDOM() as HTMLElement;
+      expect(el.className).toBe("cm-lp-math");
+      expect(el.querySelector(".katex")).not.toBeNull();
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("点击 → dispatch selection at from", () => {
+    const view = makeView();
+    try {
+      // mockImplementation：from=5 超出空文档，穿透调用会抛 RangeError
+      const dispatchSpy = vi.spyOn(view, "dispatch").mockImplementation(() => {});
+      const w = new MathWidget("x", false, view, 5);
+      const el = w.toDOM();
+      el.click();
+      expect(dispatchSpy).toHaveBeenCalledWith({ selection: { anchor: 5 } });
+      dispatchSpy.mockRestore();
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("eq 比较 tex + displayMode", () => {
+    const view = makeView();
+    try {
+      const a = new MathWidget("x", true, view, 0);
+      const b = new MathWidget("x", true, view, 1); // from 不同，仍相等（eq 不比较 from）
+      const c = new MathWidget("x", false, view, 0);
+      const d = new MathWidget("y", true, view, 0);
+      expect(a.eq(b)).toBe(true);
+      expect(a.eq(c)).toBe(false);
+      expect(a.eq(d)).toBe(false);
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("eq 对非 MathWidget 返回 false", () => {
+    const view = makeView();
+    try {
+      const w = new MathWidget("x", true, view, 0);
+      expect(w.eq(new BulletWidget())).toBe(false);
+    } finally {
+      view.destroy();
+    }
+  });
+});
+
+// ── BulletWidget 测试（jsdom）────────────────────────────────────────────────
+
+describe("BulletWidget", () => {
+  it("toDOM → .cm-lp-bullet + 文本 '•'", () => {
+    const el = new BulletWidget().toDOM() as HTMLElement;
+    expect(el.className).toBe("cm-lp-bullet");
+    expect(el.textContent).toBe("•");
+  });
+
+  it("eq 对相同/不同 BulletWidget 结果一致", () => {
+    expect(new BulletWidget().eq(new BulletWidget())).toBe(true);
+  });
+
+  it("eq 对非 BulletWidget 返回 false", () => {
+    const view = makeView();
+    try {
+      expect(new BulletWidget().eq(new MathWidget("x", false, view, 0))).toBe(false);
     } finally {
       view.destroy();
     }

@@ -142,7 +142,7 @@ export const wikiHighlightStyle = HighlightStyle.define([
   { tag: tags.strikethrough, textDecoration: "line-through" },
   { tag: tags.link, color: "hsl(var(--primary))", textDecoration: "underline", textUnderlineOffset: "2px" },
   { tag: tags.url, color: "hsl(var(--primary))" },
-  { tag: tags.quote, color: "hsl(var(--muted-foreground))", fontStyle: "italic" },
+  { tag: tags.quote, color: "hsl(var(--muted-foreground))" },
   {
     tag: tags.monospace,
     fontFamily:

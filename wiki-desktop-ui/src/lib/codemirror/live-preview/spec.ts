@@ -29,6 +29,7 @@ export const LP_CLASS = {
   quote: "cm-lp-quote",
   listMark: "cm-lp-listmark",
   codeLine: "cm-lp-codeblock-line",
+  codeLastLine: "cm-lp-codeblock-last",
 } as const;
 
 /**
@@ -45,6 +46,9 @@ export const LP_CLASS = {
  * - `codeheader`: 代码块开围栏行（含语言标签）替换为细条 widget
  * - `codefooter`: 代码块闭围栏行替换为零高度 widget
  * - `frontmatter`: YAML frontmatter 区块折叠为单行 muted 细条 widget
+ * - `mathblock`: 块级数学 `$$...$$` 替换为 KaTeX widget
+ * - `mathinline`: 行内数学 `$...$` 替换为 KaTeX widget
+ * - `bullet`: 无序列表标记 `-`/`+`/`*` 替换为圆点 widget
  */
 export type DecoSpec =
   | { kind: "line"; line: number; cls: string }
@@ -53,14 +57,17 @@ export type DecoSpec =
   | { kind: "checkbox"; from: number; to: number; checked: boolean }
   | { kind: "hr"; from: number; to: number }
   | { kind: "wikilink"; from: number; to: number; target: string; label: string }
-  | { kind: "image"; from: number; to: number; alt: string; src: string; block: boolean }
+  | { kind: "image"; from: number; to: number; alt: string; src: string; block: boolean; width?: number; height?: number }
   | { kind: "mdlink"; from: number; to: number; text: string; url: string }
   | { kind: "table"; from: number; to: number; raw: string }
   | { kind: "codeheader"; from: number; to: number; lang: string }
   | { kind: "codefooter"; from: number; to: number }
   | { kind: "frontmatter"; from: number; to: number; propCount: number }
   | { kind: "callout"; from: number; to: number; calloutType: string; title: string }
-  | { kind: "highlight"; from: number; to: number; markFrom: number; markTo: number };
+  | { kind: "highlight"; from: number; to: number; markFrom: number; markTo: number }
+  | { kind: "mathblock"; from: number; to: number; tex: string }
+  | { kind: "mathinline"; from: number; to: number; tex: string }
+  | { kind: "bullet"; from: number; to: number };
 
 type SelRange = { from: number; to: number };
 
@@ -204,6 +211,119 @@ function embedFileName(target: string): string {
 }
 
 /**
+ * 图片尺寸后缀 `|W` / `|WxH`（必须带 `|` 前缀，如 `alt|300`）。
+ * 返回宽度/高度与去掉后缀的前段文本。
+ */
+function splitImageSize(text: string): { width: number; height?: number; rest: string } | null {
+  const m = /\|(\d+)(?:x(\d+))?$/.exec(text);
+  if (!m) return null;
+  return {
+    width: Number(m[1]),
+    height: m[2] !== undefined ? Number(m[2]) : undefined,
+    rest: text.slice(0, m.index),
+  };
+}
+
+/**
+ * 纯数字尺寸 `W` / `WxH`（无 `|` 前缀）。
+ * 用于 `![[img.png|300]]` 的 label 侧（target 经 `|` 切分后已不含尺寸段，
+ * 尺寸落在 label 上，如 label === "300" / "300x200"）。
+ */
+function parseBareSize(text: string): { width: number; height?: number } | null {
+  const m = /^(\d+)(?:x(\d+))?$/.exec(text.trim());
+  if (!m) return null;
+  return {
+    width: Number(m[1]),
+    height: m[2] !== undefined ? Number(m[2]) : undefined,
+  };
+}
+
+/**
+ * 引用式链接定义表惰性构建：遍历 doc 全文，按行匹配
+ * `^\s{0,3}\[([^\]]+)\]:\s*(\S+)(?:\s+["'(].*)?$`，返回 Map<小写key, url>。
+ */
+function buildRefDefs(doc: { lines: number; line(n: number): { text: string } }): Map<string, string> {
+  const map = new Map<string, string>();
+  const re = /^\s{0,3}\[([^\]]+)\]:\s*(\S+)(?:\s+["'(].*)?$/;
+  for (let n = 1; n <= doc.lines; n++) {
+    const m = re.exec(doc.line(n).text);
+    if (m) {
+      map.set(m[1].toLowerCase().trim(), m[2]);
+    }
+  }
+  return map;
+}
+
+/**
+ * 扫描单行中非代码区间的行内数学 `$...$`。
+ * - `$$` 不算行内（跳过连续 `$$`）
+ * - 开 `$` 后紧邻非空白，闭 `$` 前紧邻非空白
+ * - 闭 `$` 后不能紧跟数字
+ * - 不在 codeSpan 内
+ * 返回匹配数组，各条目 from/to 覆盖两个 `$` 符号本身。
+ */
+function scanInlineMathInLine(
+  line: string,
+  baseOffset: number,
+): Array<{ from: number; to: number; tex: string }> {
+  const results: Array<{ from: number; to: number; tex: string }> = [];
+
+  // 收集行内代码区间（反引号对）
+  const codeSpans: Array<[number, number]> = [];
+  let ci = 0;
+  while (ci < line.length) {
+    if (line[ci] !== "`") { ci++; continue; }
+    let openLen = 0;
+    while (ci + openLen < line.length && line[ci + openLen] === "`") openLen++;
+    const openEnd = ci + openLen;
+    const closeIdx = line.indexOf("`".repeat(openLen), openEnd);
+    if (closeIdx === -1) break;
+    codeSpans.push([ci, closeIdx + openLen]);
+    ci = closeIdx + openLen;
+  }
+  function inCode(pos: number): boolean {
+    for (const [s, e] of codeSpans) if (pos >= s && pos < e) return true;
+    return false;
+  }
+
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] !== "$") { i++; continue; }
+    // 跳过代码区间内的 $
+    if (inCode(i)) { i++; continue; }
+    // $$ 不算行内——跳过连续 $$
+    if (i + 1 < line.length && line[i + 1] === "$") { i += 2; continue; }
+    // 开 $ 后紧邻非空白
+    if (i + 1 >= line.length || /\s/.test(line[i + 1])) { i++; continue; }
+    // 向后找闭 $
+    let j = i + 2;
+    let found = false;
+    while (j < line.length) {
+      if (line[j] !== "$") { j++; continue; }
+      // 跳过代码区间
+      if (inCode(j)) { j++; continue; }
+      // 闭 $ 前紧邻非空白
+      if (/\s/.test(line[j - 1])) { j++; continue; }
+      // 闭 $ 后不能紧跟数字
+      if (j + 1 < line.length && /\d/.test(line[j + 1])) { j++; continue; }
+      found = true;
+      break;
+    }
+    if (!found) { i++; continue; }
+    const tex = line.slice(i + 1, j);
+    if (tex.length > 0) {
+      results.push({
+        from: baseOffset + i,
+        to: baseOffset + j + 1,
+        tex,
+      });
+    }
+    i = j + 1;
+  }
+  return results;
+}
+
+/**
  * 计算 [from, to) 区间内的 Live Preview 装饰 spec。
  * 调用方只对 `view.visibleRanges` 逐段调用；返回顺序为文档顺序（line 按行号，
  * 其余按 from 递增——同一 from 下 hide 先于 widget，视图层据此稳定建集）。
@@ -311,6 +431,8 @@ export function computeLivePreviewSpecs(
   const codeRanges: Array<{ from: number; to: number }> = [];
   // 表格区间：表格整体被 widget 替换时，内部的 wikilink/image 不单独渲染
   const tableRanges: Array<{ from: number; to: number }> = [];
+  // 引用式链接定义表（惰性构建：第一次遇到无 URL 的 Link 节点时填充）
+  let refDefs: Map<string, string> | null = null;
 
   function nodeMarks(node: SyntaxNodeRef): readonly SyntaxNode[] {
     return node.node.getChildren("HeaderMark");
@@ -404,7 +526,13 @@ export function computeLivePreviewSpecs(
       if (name === "ListMark") {
         const line = doc.lineAt(node.from);
         if (!touchesLine(sel, line.from, line.to)) {
-          specs.push({ kind: "mark", from: node.from, to: node.to, cls: LP_CLASS.listMark });
+          const markText = doc.sliceString(node.from, node.to).trim();
+          // 无序列表标记：`-`、`+`、`*`（单字符且不含数字）
+          if (markText.length === 1 && "-+*".includes(markText)) {
+            specs.push({ kind: "bullet", from: node.from, to: node.to });
+          } else {
+            specs.push({ kind: "mark", from: node.from, to: node.to, cls: LP_CLASS.listMark });
+          }
         }
         return;
       }
@@ -433,6 +561,25 @@ export function computeLivePreviewSpecs(
           pushLine(ln, LP_CLASS.codeLine);
         }
 
+        // 代码块末行圆角 class：最后一个内容行（闭围栏前一行）
+        const codeMarks = node.node.getChildren("CodeMark");
+        let lastContentLine: number;
+        if (codeMarks.length >= 2) {
+          // 有闭围栏：末行 = 闭围栏行号 - 1
+          const closingMark = codeMarks[codeMarks.length - 1];
+          const closingLineNum = doc.lineAt(closingMark.from).number;
+          lastContentLine = closingLineNum - 1;
+        } else {
+          // 无闭围栏（未闭合）：末行 = endLine
+          lastContentLine = endLine;
+        }
+        if (lastContentLine >= startLine && lastContentLine <= endLine) {
+          const lastContentLineObj = doc.line(lastContentLine);
+          if (lastContentLineObj.from <= node.to) {
+            pushLine(lastContentLine, LP_CLASS.codeLastLine);
+          }
+        }
+
         // 开围栏行 widget（``` + 可选语言标签）
         const openingMark = node.node.getChild("CodeMark");
         if (openingMark) {
@@ -450,7 +597,6 @@ export function computeLivePreviewSpecs(
         }
 
         // 闭围栏行 widget（最后一个 ```）
-        const codeMarks = node.node.getChildren("CodeMark");
         if (codeMarks.length >= 2) {
           const closingMark = codeMarks[codeMarks.length - 1];
           const closingLine = doc.lineAt(closingMark.from);
@@ -515,9 +661,19 @@ export function computeLivePreviewSpecs(
 
         // alt 文本：![ 和 ] 之间
         const linkMarks = node.node.getChildren("LinkMark");
-        const alt = linkMarks.length >= 2
+        let alt = linkMarks.length >= 2
           ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
           : "";
+
+        // 图片尺寸语法：alt 末尾 `|W` 或 `|WxH`（去掉后缀，前段作 alt）
+        let imgWidth: number | undefined;
+        let imgHeight: number | undefined;
+        const sizeInfo = splitImageSize(alt);
+        if (sizeInfo) {
+          imgWidth = sizeInfo.width;
+          imgHeight = sizeInfo.height;
+          alt = sizeInfo.rest.trimEnd();
+        }
 
         const isAttachment = isAttachmentSrc(src);
         const resolvedSrc = isAttachment ? normalizeAttachmentSrc(src) : src;
@@ -544,6 +700,7 @@ export function computeLivePreviewSpecs(
           alt,
           src: resolvedSrc,
           block: isBlock,
+          ...(imgWidth !== undefined ? { width: imgWidth, height: imgHeight } : {}),
         });
         return false;
       }
@@ -553,7 +710,45 @@ export function computeLivePreviewSpecs(
         if (inRanges(node.from, headingSuppressRanges)) return false;
         if (inRanges(node.from, tableRanges)) return false;
         const urlNode = node.node.getChild("URL");
-        if (!urlNode) return; // 引用式 [text][ref] 无 URL 子节点，跳过
+
+        // 引用式链接 [text][ref]：无 URL 子节点，用 LinkLabel 作 ref key 查定义表
+        if (!urlNode) {
+          const linkMarks = node.node.getChildren("LinkMark");
+          const text = linkMarks.length >= 2
+            ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
+            : "";
+          if (!text) return;
+
+          // ref key 取自 LinkLabel 子节点（`[ref]` 去括号）；缺省/空时回退用 text
+          // （折叠式 `[text][]` 即以 text 作 key，符合 CommonMark 语义）
+          const refLabelNode = node.node.getChild("LinkLabel");
+          let refKey = text;
+          if (refLabelNode) {
+            const rawRef = doc.sliceString(refLabelNode.from, refLabelNode.to);
+            const stripped = rawRef.startsWith("[") && rawRef.endsWith("]")
+              ? rawRef.slice(1, -1)
+              : rawRef;
+            if (stripped.trim()) refKey = stripped;
+          }
+
+          // 惰性构建引用定义表
+          if (refDefs === null) refDefs = buildRefDefs(doc);
+          const url = refDefs.get(refKey.toLowerCase().trim());
+          if (!url) return; // 未找到定义，不发射
+
+          // 光标/选区进入该行 → 完整显示源码
+          const line = doc.lineAt(node.from);
+          if (touchesLine(sel, line.from, line.to)) return false;
+
+          specs.push({
+            kind: "mdlink",
+            from: node.from,
+            to: node.to,
+            text,
+            url,
+          });
+          return false;
+        }
 
         // 光标/选区进入该行 → 完整显示源码；否则整节点替换为链接 widget
         // （widget 覆盖 [text](url) 全区间，无需再隐藏标记符）
@@ -642,6 +837,16 @@ export function computeLivePreviewSpecs(
           // alt 用文件名（去扩展名）：剥掉可能的目录前缀
           const baseName = fileName.includes("/") ? fileName.slice(fileName.lastIndexOf("/") + 1) : fileName;
           const alt = baseName.replace(/\.[^.]+$/, "");
+
+          // embed 图片尺寸语法：sp.label 为 `|` 后段（如 "300" / "300x200"）
+          let embWidth: number | undefined;
+          let embHeight: number | undefined;
+          const embSizeInfo = parseBareSize(sp.label);
+          if (embSizeInfo) {
+            embWidth = embSizeInfo.width;
+            embHeight = embSizeInfo.height;
+          }
+
           // block = 独占段落（仅含 `![[...]]`，无前后文本）
           const isBlock = line.from === embFrom && line.to === embTo;
           specs.push({
@@ -651,15 +856,20 @@ export function computeLivePreviewSpecs(
             alt,
             src,
             block: isBlock,
+            ...(embWidth !== undefined ? { width: embWidth, height: embHeight } : {}),
           });
         } else {
           // 非图片嵌入（笔记）：暂退化为 wikilink
+          let embLabel = sp.label;
+          if (sp.label === sp.target && sp.target.includes("#")) {
+            embLabel = sp.target.split("#").join(" > ");
+          }
           specs.push({
             kind: "wikilink",
             from: embFrom,
             to: embTo,
             target: sp.target,
-            label: sp.label,
+            label: embLabel,
           });
         }
         continue;
@@ -668,12 +878,19 @@ export function computeLivePreviewSpecs(
 
       // 光标/选区进入（含 [[ / ]] 两侧各 2 字符外扩）即还原为源码
       if (touchesSpan(sel, sp.from, sp.to, 2)) continue;
+
+      // 无别名且 target 含 `#` 时，label 改写为 `a > b > c` 展示路径
+      let displayLabel = sp.label;
+      if (sp.label === sp.target && sp.target.includes("#")) {
+        displayLabel = sp.target.split("#").join(" > ");
+      }
+
       specs.push({
         kind: "wikilink",
         from: sp.from,
         to: sp.to,
         target: sp.target,
-        label: sp.label,
+        label: displayLabel,
       });
     }
   }
@@ -702,6 +919,114 @@ export function computeLivePreviewSpecs(
       hide(hl.markTo, hl.markTo + 2);
       // 内容区间加 highlight mark class
       specs.push({ kind: "highlight", from: hl.innerFrom, to: hl.innerTo, markFrom: hl.markFrom, markTo: hl.markTo });
+    }
+  }
+
+  // ── 数学块 `$$...$$` 行扫描 ──────────────────────────────────
+  // 逐行扫描，跳过 codeRanges / tableRanges / fmRange，收集 mathBlockLines
+  // （行号区间，后续行内 `$...$` 扫描跳过这些行）
+  const mathBlockLines: Array<{ start: number; end: number }> = [];
+  for (let ln = startLineNo; ln <= endLineNo; ln++) {
+    const line = doc.line(ln);
+    // 跳过 frontmatter 区间
+    if (fmRange && line.from >= fmRange.from && line.from <= fmRange.to) continue;
+    // 跳过表格区间
+    if (inRanges(line.from, tableRanges)) continue;
+    // 跳过代码区间
+    if (inRanges(line.from, codeRanges)) continue;
+
+    const trimmedStart = line.text.trimStart();
+    if (!trimmedStart.startsWith("$$")) continue;
+
+    // 计算 `$$` 开标记的绝对位置（跳过前置空白）
+    const leadingSpaces = line.text.length - line.text.trimStart().length;
+    const openPos = line.from + leadingSpaces;
+
+    // 单行块：`$$...$$` 在同一行闭合
+    const afterOpen = trimmedStart.slice(2); // $$ 后的文本
+    if (afterOpen.trimEnd().endsWith("$$")) {
+      // 单行 `$$ expr $$`：closePos = 行尾 `$$` 之后
+      const lineTextTrimmed = line.text.trimEnd();
+      const closeOffset = lineTextTrimmed.length;
+      const rangeFrom = openPos;
+      const rangeTo = line.from + closeOffset;
+
+      // 提取 tex：去掉首尾 $$ 的内容
+      const inner = line.text.slice(leadingSpaces + 2, line.from + closeOffset - line.from - 2);
+      const tex = inner.trim();
+
+      mathBlockLines.push({ start: ln, end: ln });
+
+      // 光标/选区触碰该块行时还原
+      if (touchesLine(sel, line.from, line.to)) continue;
+
+      specs.push({ kind: "mathblock", from: rangeFrom, to: rangeTo, tex });
+      continue;
+    }
+
+    // 多行块：向后找闭合 `$$` 行（首行 `$$` 之后到闭合行 `$$` 之前为 tex）
+    const blockFrom = openPos;
+    // 首行 tex：`$$` 之后到行尾
+    const firstLineTex = line.text.slice(leadingSpaces + 2);
+    // 中间行缓存（闭合行出现前逐行累积；找到闭合时 texParts = 首行 + 中间行 + 闭合行前段）
+    const middleParts: string[] = [];
+
+    for (let inner = ln + 1; inner <= endLineNo; inner++) {
+      const innerLine = doc.line(inner);
+      // 闭合搜索中止于 frontmatter 边界（未闭合 → 不发射）
+      if (fmRange && innerLine.from >= fmRange.from && innerLine.from <= fmRange.to) break;
+      const innerTrimmed = innerLine.text.trimEnd();
+      if (innerTrimmed.endsWith("$$")) {
+        // 闭合行：行首到尾部 `$$` 之前为 tex 末段
+        const closeLeadingSpaces = innerLine.text.length - innerLine.text.trimStart().length;
+        const closeLen = 2;
+        const closePre = innerLine.text.slice(closeLeadingSpaces, innerTrimmed.length - closeLen);
+        const tex = [firstLineTex, ...middleParts, closePre].join("\n").trim();
+
+        const rangeTo = innerLine.from + innerTrimmed.length;
+        mathBlockLines.push({ start: ln, end: inner });
+
+        // 光标/选区触碰该块任一行时还原
+        const blockStartLine = doc.lineAt(blockFrom).number;
+        let touched = false;
+        for (let bl = blockStartLine; bl <= inner; bl++) {
+          const blLine = doc.line(bl);
+          if (touchesLine(sel, blLine.from, blLine.to)) { touched = true; break; }
+        }
+        if (!touched) {
+          specs.push({ kind: "mathblock", from: blockFrom, to: rangeTo, tex });
+        }
+
+        ln = inner; // 跳过已处理的行
+        break;
+      }
+      middleParts.push(innerLine.text);
+    }
+    // 未找到闭合行：不加入 mathBlockRanges，不发射 spec
+  }
+
+  // ── 行内数学 `$...$` 行扫描：跳过 code / table / fm / mathBlock 区间 ──
+  for (let ln = startLineNo; ln <= endLineNo; ln++) {
+    const line = doc.line(ln);
+    // 跳过 frontmatter 区间
+    if (fmRange && line.from >= fmRange.from && line.from <= fmRange.to) continue;
+    // 跳过表格区间
+    if (inRanges(line.from, tableRanges)) continue;
+    // 跳过代码区间
+    if (inRanges(line.from, codeRanges)) continue;
+    // 跳过块级数学区间内的行
+    let inMathBlock = false;
+    for (const r of mathBlockLines) {
+      if (ln >= r.start && ln <= r.end) { inMathBlock = true; break; }
+    }
+    if (inMathBlock) continue;
+
+    const mathMatches = scanInlineMathInLine(line.text, line.from);
+    for (const m of mathMatches) {
+      if (m.to <= lo || m.from >= hi) continue;
+      // 还原：光标触碰 `$` 符号本身（pad=1）时不渲染
+      if (touchesSpan(sel, m.from, m.to, 1)) continue;
+      specs.push({ kind: "mathinline", from: m.from, to: m.to, tex: m.tex });
     }
   }
 

@@ -105,7 +105,6 @@ export const livePreviewTheme = EditorView.theme({
   },
   ".cm-lp-wikilink": {
     color: "hsl(var(--primary))",
-    textDecoration: "underline",
     textUnderlineOffset: "2px",
     cursor: "pointer",
     borderRadius: "3px",
@@ -113,10 +112,10 @@ export const livePreviewTheme = EditorView.theme({
   },
   ".cm-lp-wikilink:hover": {
     backgroundColor: "hsl(var(--accent))",
+    textDecoration: "underline",
   },
   ".cm-lp-mdlink": {
     color: "hsl(var(--primary))",
-    textDecoration: "underline",
     textUnderlineOffset: "2px",
     cursor: "pointer",
     borderRadius: "3px",
@@ -124,6 +123,7 @@ export const livePreviewTheme = EditorView.theme({
   },
   ".cm-lp-mdlink:hover": {
     backgroundColor: "hsl(var(--accent))",
+    textDecoration: "underline",
   },
   ".cm-lp-checkbox-input": {
     cursor: "pointer",
@@ -174,6 +174,38 @@ export const livePreviewTheme = EditorView.theme({
   },
   ".cm-lp-table tbody tr:nth-child(even)": {
     background: "hsl(var(--muted) / 0.3)",
+  },
+  ".cm-lp-table th": {
+    fontWeight: "600",
+  },
+  // ── 代码块尾行圆角（与 code-header 的上圆角配对）──
+  ".cm-lp-codeblock-last": {
+    borderRadius: "0 0 8px 8px",
+  },
+  // ── 数学公式（KaTeX）──
+  ".cm-lp-math": {
+    display: "inline",
+    verticalAlign: "middle",
+    cursor: "pointer",
+    padding: "0 2px",
+  },
+  ".cm-lp-math-block": {
+    display: "block",
+    textAlign: "center",
+    margin: "0.5em 0",
+  },
+  ".cm-lp-math-error": {
+    color: "hsl(var(--muted-foreground))",
+    fontFamily: "monospace",
+    fontSize: "0.9em",
+    fontStyle: "italic",
+  },
+  // ── 无序列表圆点 ──
+  ".cm-lp-bullet": {
+    color: "hsl(var(--primary))",
+    display: "inline-block",
+    width: "1em",
+    textAlign: "center",
   },
   ".cm-lp-frontmatter": {
     display: "flex",

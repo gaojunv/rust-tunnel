@@ -1,5 +1,7 @@
 import { Facet } from "@codemirror/state";
 import { EditorView, WidgetType } from "@codemirror/view";
+import katex from "katex";
+import "katex/dist/katex.min.css";
 
 /**
  * Live Preview 视图 widget 层。
@@ -736,6 +738,81 @@ export class CalloutWidget extends WidgetType {
     const label = document.createElement("span");
     label.textContent = this.title || capitalizeCalloutType(this.calloutType);
     el.appendChild(label);
+    return el;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+// ── 数学公式 widget ────────────────────────────────────────────────────────
+
+/**
+ * KaTeX 数学公式渲染。`$$...$$` 块级公式（displayMode）与 `$...$` 行内公式共用。
+ * 渲染失败时退化为等宽斜体原文显示（`cm-lp-math-error`）。
+ *
+ * 点击将光标移入源码区间，自然还原为公式源码。
+ */
+export class MathWidget extends WidgetType {
+  constructor(
+    readonly tex: string,
+    readonly displayMode: boolean,
+    private readonly view: EditorView,
+    private readonly from: number,
+  ) {
+    super();
+  }
+
+  eq(other: WidgetType): boolean {
+    return (
+      other instanceof MathWidget &&
+      other.tex === this.tex &&
+      other.displayMode === this.displayMode
+    );
+  }
+
+  toDOM(): HTMLElement {
+    const el = document.createElement("div");
+    el.className = this.displayMode ? "cm-lp-math cm-lp-math-block" : "cm-lp-math";
+    try {
+      el.innerHTML = katex.renderToString(this.tex, {
+        displayMode: this.displayMode,
+        throwOnError: false,
+      });
+    } catch {
+      el.textContent = this.tex;
+      el.classList.add("cm-lp-math-error");
+    }
+    el.style.cursor = "pointer";
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      this.view.dispatch({ selection: { anchor: this.from } });
+      this.view.focus();
+    });
+    return el;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+// ── 无序列表圆点 widget ────────────────────────────────────────────────────
+
+/**
+ * 无序列表标记（`-` / `+` / `*`）替换为统一样式的圆点。
+ * 纯展示，无交互（点击穿透由编辑器处理）。
+ */
+export class BulletWidget extends WidgetType {
+  eq(other: WidgetType): boolean {
+    return other instanceof BulletWidget;
+  }
+
+  toDOM(): HTMLElement {
+    const el = document.createElement("span");
+    el.className = "cm-lp-bullet";
+    el.textContent = "•";
     return el;
   }
 
