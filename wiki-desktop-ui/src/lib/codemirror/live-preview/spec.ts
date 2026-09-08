@@ -444,8 +444,10 @@ export function computeLivePreviewSpecs(
     enter(node) {
       const name = node.name;
 
-      // frontmatter 内部装饰一律抑制（无论折叠与否）
-      if (fmRange && inRanges(node.from, [{ from: fmRange.from, to: fmRange.to }])) {
+      // frontmatter 内部装饰一律抑制（无论折叠与否）。
+      // 注意必须用「完全包含」判定：fmRange 从文档 0 偏移开始，Document 根
+      // 节点的 from=0 也落在区间内——用 inRanges(node.from) 会把整棵树吞掉。
+      if (fmRange && node.from >= fmRange.from && node.to <= fmRange.to) {
         return false;
       }
 

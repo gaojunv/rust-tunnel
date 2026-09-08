@@ -12,7 +12,7 @@ import { EditorView } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { history } from "@codemirror/commands";
 import { wikiSyntaxHighlighting } from "../theme";
-import { livePreview, livePreviewPlugin, wikilinkNavFacet } from "./index";
+import { livePreview, livePreviewField, wikilinkNavFacet } from "./index";
 
 let view: EditorView | null = null;
 
@@ -46,9 +46,8 @@ describe("livePreview view adapter", () => {
     const v = mount("# Hello\n");
     // 光标默认在 0（标题行内）→ 标题行还原；把光标移到末尾再断言
     v.dispatch({ selection: { anchor: v.state.doc.length } });
-    const plugin = v.plugin(livePreviewPlugin);
-    expect(plugin).not.toBeNull();
-    const set = plugin!.decorations;
+    const field = v.state.field(livePreviewField);
+    const set = field.decos;
     // 至少包含开标记符的 hide 装饰（replace 空）
     let count = 0;
     const it = set.iter();
@@ -59,6 +58,37 @@ describe("livePreview view adapter", () => {
     expect(count).toBeGreaterThan(0);
     // DOM 层面：原文 "#" 不可见（被 replace 为空）
     expect(v.dom.textContent ?? "").not.toContain("#");
+  });
+
+  it("块级装饰（hr/table/frontmatter/mathblock）挂载不抛错", () => {
+    // 回归：CM6 禁止 ViewPlugin 提供 block 装饰
+    // （"Block decorations may not be specified via plugins"），必须经 StateField 提供
+    const doc = [
+      "---",
+      "ref: abc",
+      "---",
+      "",
+      "text",
+      "",
+      "---",
+      "",
+      "| a | b |",
+      "|---|---|",
+      "| 1 | 2 |",
+      "",
+      "$$",
+      "x^2",
+      "$$",
+      "",
+      "tail",
+      "",
+    ].join("\n");
+    const v = mount(doc);
+    v.dispatch({ selection: { anchor: doc.length } });
+    expect(v.dom.querySelector(".cm-lp-frontmatter")).not.toBeNull();
+    expect(v.dom.querySelector(".cm-lp-hr")).not.toBeNull();
+    expect(v.dom.querySelector(".cm-lp-table")).not.toBeNull();
+    expect(v.dom.querySelector(".cm-lp-math-block")).not.toBeNull();
   });
 
   it("checkbox 点击翻转原文", () => {
@@ -84,12 +114,10 @@ describe("livePreview view adapter", () => {
       parent: document.body,
     });
     view.dispatch({ selection: { anchor: view.state.doc.length } });
-    let plugin = view.plugin(livePreviewPlugin);
-    expect(plugin!.decorations.size).toBeGreaterThan(0);
+    expect(view.state.field(livePreviewField).decos.size).toBeGreaterThan(0);
     view.dispatch({ effects: compartment.reconfigure([]) });
-    plugin = view.plugin(livePreviewPlugin);
-    // 插件已卸载
-    expect(plugin).toBeNull();
+    // StateField 已卸载
+    expect(view.state.field(livePreviewField, false)).toBeUndefined();
     expect(view.dom.textContent ?? "").toContain("# Hello");
   });
 

@@ -168,8 +168,8 @@ describe("TableWidget with inline rendering", () => {
   it("单元格 **bold** 渲染为 <strong>（非纯文本）", () => {
     const view = makeView();
     try {
-      const w = new TableWidget("| a | b |\n|---|---|\n| **x** | y |", view);
-      const table = w.toDOM();
+      const w = new TableWidget("| a | b |\n|---|---|\n| **x** | y |");
+      const table = w.toDOM(view);
       const td = table.querySelectorAll("tbody td")[0];
       expect(td.querySelector("strong")?.textContent).toBe("x");
     } finally {
@@ -180,8 +180,8 @@ describe("TableWidget with inline rendering", () => {
   it("单元格 ==highlight== 渲染为 highlight span", () => {
     const view = makeView();
     try {
-      const w = new TableWidget("| a |\n|---|\n| ==h== |", view);
-      const table = w.toDOM();
+      const w = new TableWidget("| a |\n|---|\n| ==h== |");
+      const table = w.toDOM(view);
       const td = table.querySelector("tbody td");
       expect(td?.querySelector(".cm-lp-highlight")?.textContent).toBe("h");
     } finally {
@@ -192,8 +192,8 @@ describe("TableWidget with inline rendering", () => {
   it("单元格 XSS 安全：<img onerror> 原样文本", () => {
     const view = makeView();
     try {
-      const w = new TableWidget('| a |\n|---|\n| <img src=x onerror=alert(1)> |', view);
-      const table = w.toDOM();
+      const w = new TableWidget('| a |\n|---|\n| <img src=x onerror=alert(1)> |');
+      const table = w.toDOM(view);
       const td = table.querySelector("tbody td");
       expect(td?.querySelector("img")).toBeNull();
       expect(td?.textContent).toContain("<img");
@@ -206,8 +206,8 @@ describe("TableWidget with inline rendering", () => {
     const view = makeView();
     try {
       const raw = "| a |\n|---|\n| x |";
-      expect(new TableWidget(raw, view).eq(new TableWidget(raw, view))).toBe(true);
-      expect(new TableWidget(raw, view).eq(new TableWidget("| b |", view))).toBe(false);
+      expect(new TableWidget(raw).eq(new TableWidget(raw))).toBe(true);
+      expect(new TableWidget(raw).eq(new TableWidget("| b |"))).toBe(false);
     } finally {
       view.destroy();
     }
@@ -220,8 +220,8 @@ describe("MathWidget", () => {
   it("displayMode block → 渲染 .katex 节点 + cm-lp-math-block class", () => {
     const view = makeView();
     try {
-      const w = new MathWidget("x^2", true, view, 0);
-      const el = w.toDOM() as HTMLElement;
+      const w = new MathWidget("x^2", true, 0);
+      const el = w.toDOM(view) as HTMLElement;
       expect(el.className).toContain("cm-lp-math");
       expect(el.className).toContain("cm-lp-math-block");
       expect(el.querySelector(".katex")).not.toBeNull();
@@ -234,8 +234,8 @@ describe("MathWidget", () => {
   it("inline → .cm-lp-math 不含 block class", () => {
     const view = makeView();
     try {
-      const w = new MathWidget("e=mc^2", false, view, 2);
-      const el = w.toDOM() as HTMLElement;
+      const w = new MathWidget("e=mc^2", false, 2);
+      const el = w.toDOM(view) as HTMLElement;
       expect(el.className).toBe("cm-lp-math");
       expect(el.querySelector(".katex")).not.toBeNull();
     } finally {
@@ -248,8 +248,8 @@ describe("MathWidget", () => {
     try {
       // mockImplementation：from=5 超出空文档，穿透调用会抛 RangeError
       const dispatchSpy = vi.spyOn(view, "dispatch").mockImplementation(() => {});
-      const w = new MathWidget("x", false, view, 5);
-      const el = w.toDOM();
+      const w = new MathWidget("x", false, 5);
+      const el = w.toDOM(view);
       el.click();
       expect(dispatchSpy).toHaveBeenCalledWith({ selection: { anchor: 5 } });
       dispatchSpy.mockRestore();
@@ -261,10 +261,10 @@ describe("MathWidget", () => {
   it("eq 比较 tex + displayMode", () => {
     const view = makeView();
     try {
-      const a = new MathWidget("x", true, view, 0);
-      const b = new MathWidget("x", true, view, 1); // from 不同，仍相等（eq 不比较 from）
-      const c = new MathWidget("x", false, view, 0);
-      const d = new MathWidget("y", true, view, 0);
+      const a = new MathWidget("x", true, 0);
+      const b = new MathWidget("x", true, 1); // from 不同，仍相等（eq 不比较 from）
+      const c = new MathWidget("x", false, 0);
+      const d = new MathWidget("y", true, 0);
       expect(a.eq(b)).toBe(true);
       expect(a.eq(c)).toBe(false);
       expect(a.eq(d)).toBe(false);
@@ -276,7 +276,7 @@ describe("MathWidget", () => {
   it("eq 对非 MathWidget 返回 false", () => {
     const view = makeView();
     try {
-      const w = new MathWidget("x", true, view, 0);
+      const w = new MathWidget("x", true, 0);
       expect(w.eq(new BulletWidget())).toBe(false);
     } finally {
       view.destroy();
@@ -300,7 +300,7 @@ describe("BulletWidget", () => {
   it("eq 对非 BulletWidget 返回 false", () => {
     const view = makeView();
     try {
-      expect(new BulletWidget().eq(new MathWidget("x", false, view, 0))).toBe(false);
+      expect(new BulletWidget().eq(new MathWidget("x", false, 0))).toBe(false);
     } finally {
       view.destroy();
     }

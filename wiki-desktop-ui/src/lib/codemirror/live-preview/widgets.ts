@@ -6,7 +6,8 @@ import "katex/dist/katex.min.css";
 /**
  * Live Preview 视图 widget 层。
  * 纯展示/交互，不直接读语法树——消费 `spec.ts` 输出的结构化描述。
- * view 与区间经构造函数闭包传入（index.ts 在 `decorations(view)` 回调中创建）。
+ * 装饰由 StateField 提供（块级装饰不允许经 ViewPlugin），因此 widget 不再
+ * 持有 view——交互一律用 `toDOM(view)` 的入参。
  */
 
 /**
@@ -25,7 +26,6 @@ const CHECK_FULL = "[x]";
 export class CheckboxWidget extends WidgetType {
   constructor(
     readonly checked: boolean,
-    private readonly view: EditorView,
     private readonly from: number,
     private readonly to: number,
   ) {
@@ -41,7 +41,7 @@ export class CheckboxWidget extends WidgetType {
     );
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const box = document.createElement("input");
     box.type = "checkbox";
     box.className = "cm-lp-checkbox-input";
@@ -55,8 +55,8 @@ export class CheckboxWidget extends WidgetType {
       e.preventDefault();
       e.stopPropagation();
       const insert = this.checked ? CHECK_EMPTY : CHECK_FULL;
-      this.view.dispatch({ changes: { from: this.from, to: this.to, insert } });
-      this.view.focus();
+      view.dispatch({ changes: { from: this.from, to: this.to, insert } });
+      view.focus();
     });
     return box;
   }
@@ -76,7 +76,6 @@ export class WikilinkWidget extends WidgetType {
   constructor(
     readonly target: string,
     readonly label: string,
-    private readonly view: EditorView,
   ) {
     super();
   }
@@ -89,7 +88,7 @@ export class WikilinkWidget extends WidgetType {
     );
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const el = document.createElement("span");
     el.className = "cm-lp-wikilink";
     el.textContent = this.label;
@@ -98,7 +97,7 @@ export class WikilinkWidget extends WidgetType {
     el.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      const handler = this.view.state.facet(wikilinkNavFacet);
+      const handler = view.state.facet(wikilinkNavFacet);
       const fn = handler.length > 0 ? handler[handler.length - 1] : undefined;
       fn?.(this.target);
     });
@@ -145,9 +144,10 @@ export class ImageWidget extends WidgetType {
     readonly alt: string,
     readonly src: string,
     readonly isAttachment: boolean,
-    private readonly view: EditorView,
     private readonly from: number,
     readonly block: boolean,
+    readonly width?: number,
+    readonly height?: number,
   ) {
     super();
   }
@@ -157,11 +157,25 @@ export class ImageWidget extends WidgetType {
       other instanceof ImageWidget &&
       other.src === this.src &&
       other.alt === this.alt &&
-      other.block === this.block
+      other.block === this.block &&
+      other.width === this.width &&
+      other.height === this.height
     );
   }
 
-  toDOM(): HTMLElement {
+  /** Obsidian 尺寸语法 |W / |WxH 应用到 <img>；无尺寸时保持 maxWidth:100% */
+  private applySize(img: HTMLImageElement): void {
+    if (this.width != null) {
+      img.style.width = `${this.width}px`;
+      img.style.height = this.height != null ? `${this.height}px` : "auto";
+    } else {
+      img.style.maxWidth = "100%";
+    }
+    img.style.borderRadius = "6px";
+    img.style.cursor = "pointer";
+  }
+
+  toDOM(view: EditorView): HTMLElement {
     const wrap = document.createElement("span");
     wrap.className = "cm-lp-image-wrap";
     if (this.block) wrap.classList.add("cm-lp-image-block");
@@ -176,9 +190,7 @@ export class ImageWidget extends WidgetType {
       const img = document.createElement("img");
       img.className = "cm-lp-image";
       img.alt = this.alt;
-      img.style.maxWidth = "100%";
-      img.style.borderRadius = "6px";
-      img.style.cursor = "pointer";
+      this.applySize(img);
 
       // 先显示 placeholder，加载完成后替换
       wrap.appendChild(placeholder);
@@ -216,9 +228,7 @@ export class ImageWidget extends WidgetType {
       img.className = "cm-lp-image";
       img.src = this.src;
       img.alt = this.alt;
-      img.style.maxWidth = "100%";
-      img.style.borderRadius = "6px";
-      img.style.cursor = "pointer";
+      this.applySize(img);
       img.onerror = () => {
         img.replaceWith(placeholder);
         placeholder.textContent = this.alt || "broken";
@@ -230,8 +240,8 @@ export class ImageWidget extends WidgetType {
     wrap.style.cursor = "pointer";
     wrap.addEventListener("click", (e) => {
       e.preventDefault();
-      this.view.dispatch({ selection: { anchor: this.from } });
-      this.view.focus();
+      view.dispatch({ selection: { anchor: this.from } });
+      view.focus();
     });
 
     return wrap;
@@ -256,7 +266,6 @@ export class MdLinkWidget extends WidgetType {
   constructor(
     readonly text: string,
     readonly url: string,
-    private readonly view: EditorView,
   ) {
     super();
   }
@@ -269,7 +278,7 @@ export class MdLinkWidget extends WidgetType {
     );
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const el = document.createElement("span");
     el.className = "cm-lp-mdlink";
     el.textContent = this.text;
@@ -288,10 +297,10 @@ export class MdLinkWidget extends WidgetType {
         return;
       }
       // 普通点击：还原为源码（光标移入）
-      this.view.dispatch({
-        selection: { anchor: this.view.posAtCoords({ x: e.clientX, y: e.clientY }, false) ?? 0 },
+      view.dispatch({
+        selection: { anchor: view.posAtCoords({ x: e.clientX, y: e.clientY }, false) ?? 0 },
       });
-      this.view.focus();
+      view.focus();
     });
     return el;
   }
@@ -515,10 +524,7 @@ function parseTableAlign(cells: string[]): Array<"left" | "center" | "right"> {
  * 单元格内联格式通过 `renderTableCellInline` 渲染（粗体/行内码/链接/wikilink 等）。
  */
 export class TableWidget extends WidgetType {
-  constructor(
-    readonly raw: string,
-    private readonly view: EditorView,
-  ) {
+  constructor(readonly raw: string) {
     super();
   }
 
@@ -526,7 +532,7 @@ export class TableWidget extends WidgetType {
     return other instanceof TableWidget && other.raw === this.raw;
   }
 
-  toDOM(): HTMLTableElement {
+  toDOM(view: EditorView): HTMLTableElement {
     const lines = this.raw.split("\n").filter((l) => l.trim());
     if (lines.length === 0) {
       const t = document.createElement("table");
@@ -548,7 +554,7 @@ export class TableWidget extends WidgetType {
       }
     }
 
-    const navHandler = this.view.state.facet(wikilinkNavFacet);
+    const navHandler = view.state.facet(wikilinkNavFacet);
     const nav = navHandler.length > 0 ? navHandler[navHandler.length - 1] : undefined;
     const handlers: InlineHandlers = {
       onLink: (url) => { try { window.open(url, "_blank"); } catch { /* ignore */ } },
@@ -654,7 +660,6 @@ export class CodeFooterWidget extends WidgetType {
 export class FrontmatterWidget extends WidgetType {
   constructor(
     readonly propCount: number,
-    private readonly view: EditorView,
     private readonly from: number,
   ) {
     super();
@@ -667,7 +672,7 @@ export class FrontmatterWidget extends WidgetType {
     );
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const el = document.createElement("div");
     el.className = "cm-lp-frontmatter";
     const label = this.propCount === 1 ? "1 property" : `${this.propCount} properties`;
@@ -675,8 +680,8 @@ export class FrontmatterWidget extends WidgetType {
     el.addEventListener("click", (e) => {
       e.preventDefault();
       // 光标移入 frontmatter 区间起点 → 还原为源码
-      this.view.dispatch({ selection: { anchor: this.from } });
-      this.view.focus();
+      view.dispatch({ selection: { anchor: this.from } });
+      view.focus();
     });
     return el;
   }
@@ -758,7 +763,6 @@ export class MathWidget extends WidgetType {
   constructor(
     readonly tex: string,
     readonly displayMode: boolean,
-    private readonly view: EditorView,
     private readonly from: number,
   ) {
     super();
@@ -772,7 +776,7 @@ export class MathWidget extends WidgetType {
     );
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const el = document.createElement("div");
     el.className = this.displayMode ? "cm-lp-math cm-lp-math-block" : "cm-lp-math";
     try {
@@ -787,8 +791,8 @@ export class MathWidget extends WidgetType {
     el.style.cursor = "pointer";
     el.addEventListener("click", (e) => {
       e.preventDefault();
-      this.view.dispatch({ selection: { anchor: this.from } });
-      this.view.focus();
+      view.dispatch({ selection: { anchor: this.from } });
+      view.focus();
     });
     return el;
   }
