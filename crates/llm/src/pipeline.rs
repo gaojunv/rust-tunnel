@@ -54,10 +54,19 @@ pub struct PreparedRequest {
 /// `x-opencode-session` 值的最大长度（防异常客户端注入超长值）。
 const OPENCODE_SESSION_MAX_LEN: usize = 128;
 
-/// 从入站请求提取 opencode 会话标识：显式 `x-opencode-session` 头优先
-/// （客户端可经 Claude Code 的 `ANTHROPIC_CUSTOM_HEADERS` 注入）；
-/// 否则取 body 的 `metadata.user_id`（Claude Code 恒发，含 per-session uuid）
-/// 或 `user` 字段（OpenAI/Responses 客户端）；均无则 None。
+/// 从入站请求提取 opencode 会话标识，按以下优先级依次尝试：
+///
+/// 1. **`x-opencode-session` 请求头** — 客户端可经 Claude Code 的
+///    `ANTHROPIC_CUSTOM_HEADERS` 注入。
+/// 2. **`body.metadata.user_id`** — Claude Code 恒发，含 per-session uuid。
+/// 3. **`body.prompt_cache_key`** — Codex（pin rust-v0.153.4）的每个 Responses
+///    请求体都无条件携带此字段，值为 per 会话稳定的 session_id。wiki 桌面端
+///    （Tauri）内嵌 Codex sidecar 直连网关时，Codex 不发 `x-opencode-session`
+///    头且 body 无 `metadata.user_id`，此字段是唯一的会话粒度标识，避免上游
+///    opencode Go 因缺失 `x-opencode-session` 而返回 400 MissingSessionID。
+/// 4. **`body.user`** — OpenAI/Responses 客户端（用户粒度，优先级低于会话粒度）。
+///
+/// 所有来源均经 `normalize`（trim + 空值丢弃 + 128 字符截断）。
 pub fn extract_opencode_session(headers: &HeaderMap, body: &serde_json::Value) -> Option<String> {
     fn normalize(v: &str) -> Option<String> {
         let t = v.trim();
@@ -77,6 +86,11 @@ pub fn extract_opencode_session(headers: &HeaderMap, body: &serde_json::Value) -
         .and_then(|m| m.get("user_id"))
         .and_then(Value::as_str)
         .and_then(normalize)
+        .or_else(|| {
+            body.get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .and_then(normalize)
+        })
         .or_else(|| {
             body.get("user")
                 .and_then(Value::as_str)
@@ -529,6 +543,29 @@ mod tests {
         assert_eq!(
             extract_opencode_session(&headers, &body).as_deref(),
             Some("openai-user-id")
+        );
+    }
+
+    #[test]
+    fn opencode_session_falls_back_to_prompt_cache_key() {
+        let body = json!({"model": "codex-model", "prompt_cache_key": "ses_codex-session-id"});
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_opencode_session(&headers, &body).as_deref(),
+            Some("ses_codex-session-id")
+        );
+    }
+
+    #[test]
+    fn opencode_session_prefers_metadata_user_id_over_prompt_cache_key() {
+        let body = json!({
+            "metadata": {"user_id": "user_abc_account__session_meta-id"},
+            "prompt_cache_key": "ses_codex-session-id"
+        });
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_opencode_session(&headers, &body).as_deref(),
+            Some("user_abc_account__session_meta-id")
         );
     }
 
