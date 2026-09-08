@@ -306,3 +306,202 @@ describe("computeLivePreviewSpecs", () => {
     expect(ofKind(specs, "mark")).toEqual([]);
   });
 });
+
+// ── 图片渲染测试 ─────────────────────────────────────────────────────────────
+
+describe("image rendering", () => {
+  it("block image (standalone paragraph) → image spec with block:true", () => {
+    const doc = "![photo](assets/one.jpg)\n\nsome text\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({
+      kind: "image",
+      from: 0,
+      to: 24,
+      alt: "photo",
+      src: "assets/one.jpg",
+      block: true,
+    });
+  });
+
+  it("inline image (paragraph with surrounding text) → image spec with block:false", () => {
+    const doc = "text ![pic](http://a.com/i.png) more\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({
+      kind: "image",
+      from: 5,
+      to: 31,
+      alt: "pic",
+      src: "http://a.com/i.png",
+      block: false,
+    });
+  });
+
+  it("image inside heading → heading handler runs, no image spec emitted", () => {
+    const doc = "# T ![a](http://x.com)\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    expect(ofKind(specs, "image")).toEqual([]);
+  });
+
+  it("cursor on image line → no image spec (source shown)", () => {
+    const doc = "text ![pic](http://a.com/i.png) more\n";
+    // cursor inside image range (position 15)
+    const state = makeState(doc, [{ anchor: 15 }]);
+    expect(ofKind(full(state), "image")).toEqual([]);
+  });
+
+  it("angle-bracket URL → src stripped of <>", () => {
+    const doc = "![a](<http://x.com/a b.png>)\n\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs[0]).toMatchObject({ src: "http://x.com/a b.png" });
+  });
+
+  it("image inside code block not rendered as image", () => {
+    const doc = "```\n![not-an-image](url)\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "image")).toEqual([]);
+  });
+});
+
+// ── Markdown 链接渲染测试 ────────────────────────────────────────────────────
+
+describe("markdown link rendering", () => {
+  it("inline link → mdlink spec covering the whole node (no hide specs inside)", () => {
+    const doc = "A [click here](https://example.com) B\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const links = ofKind(specs, "mdlink") as Extract<DecoSpec, { kind: "mdlink" }>[];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({
+      kind: "mdlink",
+      from: 2,
+      to: 35,
+      text: "click here",
+      url: "https://example.com",
+    });
+    // widget 整体替换 [text](url)，区间内不应再有 hide 装饰（避免 replace 嵌套冲突）
+    const hides = ofKind(specs, "hide") as Extract<DecoSpec, { kind: "hide" }>[];
+    const insideHides = hides.filter((h) => h.from >= links[0].from && h.to <= links[0].to);
+    expect(insideHides).toEqual([]);
+  });
+
+  it("cursor on link line → no mdlink spec (source shown)", () => {
+    const doc = "A [link](http://x.com) B\n";
+    const state = makeState(doc, [{ anchor: 10 }]);
+    expect(ofKind(full(state), "mdlink")).toEqual([]);
+  });
+
+  it("ref-style link [text][ref] → no mdlink spec", () => {
+    const doc = "A [text][ref] B\n\n[ref]: http://x.com\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "mdlink")).toEqual([]);
+  });
+});
+
+// ── 表格渲染测试 ─────────────────────────────────────────────────────────────
+
+describe("table rendering", () => {
+  it("table → table spec with correct raw text", () => {
+    const doc = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const tables = ofKind(full(state), "table") as Extract<DecoSpec, { kind: "table" }>[];
+    expect(tables).toHaveLength(1);
+    expect(tables[0]).toMatchObject({
+      kind: "table",
+      from: 0,
+      to: 29,
+    });
+    expect(tables[0].raw).toBe("| a | b |\n|---|---|\n| 1 | 2 |");
+  });
+
+  it("cursor inside table → no table spec (source shown)", () => {
+    const doc = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+    const state = makeState(doc, [{ anchor: 5 }]);
+    expect(ofKind(full(state), "table")).toEqual([]);
+  });
+
+  it("table with alignment → table spec emitted", () => {
+    const doc = "| l | c | r |\n|:---|:---:|---:|\n| x | y | z |\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "table")).toHaveLength(1);
+  });
+
+  it("wikilink inside table cell → not rendered as wikilink", () => {
+    const doc = "| [[w]] |\n|---|\n| x |\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "wikilink")).toEqual([]);
+  });
+
+  it("image inside table cell → not rendered as image", () => {
+    const doc = "| ![a](u) |\n|---|\n| x |\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "image")).toEqual([]);
+  });
+});
+
+// ── 代码块 header/footer 测试 ────────────────────────────────────────────────
+
+describe("code block header/footer", () => {
+  it("fenced code with lang → codeheader + codefooter specs", () => {
+    const doc = "```js\ncode here\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const headers = ofKind(specs, "codeheader") as Extract<DecoSpec, { kind: "codeheader" }>[];
+    expect(headers).toHaveLength(1);
+    expect(headers[0]).toMatchObject({ kind: "codeheader", lang: "js" });
+    expect(ofKind(specs, "codefooter")).toHaveLength(1);
+  });
+
+  it("fenced code without lang → codeheader with empty lang", () => {
+    const doc = "```\ncode\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const headers = ofKind(full(state), "codeheader") as Extract<DecoSpec, { kind: "codeheader" }>[];
+    expect(headers).toHaveLength(1);
+    expect(headers[0]).toMatchObject({ kind: "codeheader", lang: "" });
+  });
+
+  it("cursor on closing line → no codefooter (source shown), codeheader still emits", () => {
+    const doc = "```js\ncode here\n```\n";
+    // cursor on closing ``` line (line 3, position 17)
+    const state = makeState(doc, [{ anchor: 17 }]);
+    const specs = full(state);
+    expect(ofKind(specs, "codeheader")).toHaveLength(1);
+    expect(ofKind(specs, "codefooter")).toEqual([]);
+  });
+
+  it("cursor on opening line → no codeheader (source shown), codefooter still emits", () => {
+    const doc = "```js\ncode here\n```\n";
+    const state = makeState(doc, [{ anchor: 2 }]);
+    const specs = full(state);
+    expect(ofKind(specs, "codeheader")).toEqual([]);
+    expect(ofKind(specs, "codefooter")).toHaveLength(1);
+  });
+
+  it("cursor inside code body → both header and footer emit (code body not replaced)", () => {
+    const doc = "```js\ncode here\n```\n";
+    // cursor at position 10 (inside "code here")
+    const state = makeState(doc, [{ anchor: 10 }]);
+    const specs = full(state);
+    expect(ofKind(specs, "codeheader")).toHaveLength(1);
+    expect(ofKind(specs, "codefooter")).toHaveLength(1);
+    // code block lines still get background class
+    expect(ofKind(specs, "line").map((s) => (s as Extract<DecoSpec, { kind: "line" }>).line)).toEqual([1, 2, 3]);
+  });
+
+  it("wikilink inside code block → not rendered as wikilink", () => {
+    const doc = "```\n[[not-a-link]]\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "wikilink")).toEqual([]);
+  });
+
+  it("image syntax inside code block → not rendered as image", () => {
+    const doc = "```\n![not-an-image](url)\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "image")).toEqual([]);
+  });
+});

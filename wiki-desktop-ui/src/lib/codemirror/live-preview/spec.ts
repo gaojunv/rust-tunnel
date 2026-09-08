@@ -2,6 +2,7 @@ import type { EditorState } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
 import type { SyntaxNode, SyntaxNodeRef } from "@lezer/common";
 import { scanWikilinksInLine } from "@/lib/wikilink";
+import { isAttachmentSrc, normalizeAttachmentSrc } from "@/lib/attachments";
 
 /**
  * Live Preview 纯函数核心。
@@ -38,6 +39,11 @@ export const LP_CLASS = {
  * - `checkbox`: TaskMarker 替换为复选框 widget
  * - `hr`: 分隔线替换为 widget
  * - `wikilink`: `[[target|label]]` 替换为链接 widget
+ * - `image`: 图片替换为渲染 widget（block/inline）
+ * - `mdlink`: Markdown 链接 `[text](url)` 替换为渲染 widget
+ * - `table`: GFM 表格替换为 HTML table widget
+ * - `codeheader`: 代码块开围栏行（含语言标签）替换为细条 widget
+ * - `codefooter`: 代码块闭围栏行替换为零高度 widget
  */
 export type DecoSpec =
   | { kind: "line"; line: number; cls: string }
@@ -45,7 +51,12 @@ export type DecoSpec =
   | { kind: "hide"; from: number; to: number }
   | { kind: "checkbox"; from: number; to: number; checked: boolean }
   | { kind: "hr"; from: number; to: number }
-  | { kind: "wikilink"; from: number; to: number; target: string; label: string };
+  | { kind: "wikilink"; from: number; to: number; target: string; label: string }
+  | { kind: "image"; from: number; to: number; alt: string; src: string; block: boolean }
+  | { kind: "mdlink"; from: number; to: number; text: string; url: string }
+  | { kind: "table"; from: number; to: number; raw: string }
+  | { kind: "codeheader"; from: number; to: number; lang: string }
+  | { kind: "codefooter"; from: number; to: number };
 
 type SelRange = { from: number; to: number };
 
@@ -77,6 +88,17 @@ function touchesSpan(
 
 const ATX_RE = /^ATXHeading([1-6])$/;
 const SETEXT_RE = /^SetextHeading([12])$/;
+
+/** 判断节点是否在数组区间内。 */
+function inRanges(
+  pos: number,
+  ranges: readonly { from: number; to: number }[],
+): boolean {
+  for (const r of ranges) {
+    if (pos >= r.from && pos < r.to) return true;
+  }
+  return false;
+}
 
 /**
  * 计算 [from, to) 区间内的 Live Preview 装饰 spec。
@@ -166,6 +188,8 @@ export function computeLivePreviewSpecs(
 
   // 围栏代码块 / 行内码区间：其内的 [[...]] 不视为 wikilink（lezer 树判定）
   const codeRanges: Array<{ from: number; to: number }> = [];
+  // 表格区间：表格整体被 widget 替换时，内部的 wikilink/image 不单独渲染
+  const tableRanges: Array<{ from: number; to: number }> = [];
 
   function nodeMarks(node: SyntaxNodeRef): readonly SyntaxNode[] {
     return node.node.getChildren("HeaderMark");
@@ -180,13 +204,13 @@ export function computeLivePreviewSpecs(
       const atx = ATX_RE.exec(name);
       if (atx) {
         decorateAtx(node, atx[1]);
-        return;
+        return false;
       }
 
       const setext = SETEXT_RE.exec(name);
       if (setext) {
         decorateSetext(node, setext[1]);
-        return;
+        return false;
       }
 
       if (name === "Blockquote") {
@@ -239,6 +263,37 @@ export function computeLivePreviewSpecs(
           if (doc.line(ln).from > node.to) break;
           pushLine(ln, LP_CLASS.codeLine);
         }
+
+        // 开围栏行 widget（``` + 可选语言标签）
+        const openingMark = node.node.getChild("CodeMark");
+        if (openingMark) {
+          const langNode = node.node.getChild("CodeInfo");
+          const lang = langNode ? doc.sliceString(langNode.from, langNode.to) : "";
+          const openingLine = doc.lineAt(openingMark.from);
+          if (!touchesLine(sel, openingLine.from, openingLine.to)) {
+            specs.push({
+              kind: "codeheader",
+              from: openingLine.from,
+              to: openingLine.to,
+              lang,
+            });
+          }
+        }
+
+        // 闭围栏行 widget（最后一个 ```）
+        const codeMarks = node.node.getChildren("CodeMark");
+        if (codeMarks.length >= 2) {
+          const closingMark = codeMarks[codeMarks.length - 1];
+          const closingLine = doc.lineAt(closingMark.from);
+          if (!touchesLine(sel, closingLine.from, closingLine.to)) {
+            specs.push({
+              kind: "codefooter",
+              from: closingLine.from,
+              to: closingLine.to,
+            });
+          }
+        }
+
         return false;
       }
 
@@ -264,11 +319,107 @@ export function computeLivePreviewSpecs(
         return;
       }
 
+      // ── 图片：block（独占段落）/ inline ──────────────────────────────
+      if (name === "Image") {
+        // 跳过表格区间（表格 widget 已整体替换，内部不单独渲染图片）
+        if (inRanges(node.from, tableRanges)) return false;
+
+        const urlNode = node.node.getChild("URL");
+        const rawSrc = urlNode ? doc.sliceString(urlNode.from, urlNode.to) : "";
+        // 角括号 URL：<https://x.com/a b.png> —— 去掉外层尖括号
+        const src = rawSrc.startsWith("<") && rawSrc.endsWith(">")
+          ? rawSrc.slice(1, -1)
+          : rawSrc;
+
+        // alt 文本：![ 和 ] 之间
+        const linkMarks = node.node.getChildren("LinkMark");
+        const alt = linkMarks.length >= 2
+          ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
+          : "";
+
+        const isAttachment = isAttachmentSrc(src);
+        const resolvedSrc = isAttachment ? normalizeAttachmentSrc(src) : src;
+
+        // 判断 block vs inline：
+        // block = Image 是所属 Paragraph 的唯一内容（无其他文本/节点）
+        const parent = node.node.parent;
+        const isBlock = parent?.name === "Paragraph"
+          && parent.from === node.from
+          && parent.to === node.to;
+
+        // 还原判定：block 用段落行，inline 用节点区间
+        if (isBlock) {
+          const line = doc.lineAt(node.from);
+          if (touchesLine(sel, line.from, line.to)) return false;
+        } else {
+          if (touchesSpan(sel, node.from, node.to, 1)) return false;
+        }
+
+        specs.push({
+          kind: "image",
+          from: node.from,
+          to: node.to,
+          alt,
+          src: resolvedSrc,
+          block: isBlock,
+        });
+        return false;
+      }
+
+      // ── Markdown 链接 [text](url) ────────────────────────────────────
+      if (name === "Link") {
+        if (inRanges(node.from, tableRanges)) return false;
+        const urlNode = node.node.getChild("URL");
+        if (!urlNode) return; // 引用式 [text][ref] 无 URL 子节点，跳过
+
+        // 光标/选区进入该行 → 完整显示源码；否则整节点替换为链接 widget
+        // （widget 覆盖 [text](url) 全区间，无需再隐藏标记符）
+        const line = doc.lineAt(node.from);
+        if (touchesLine(sel, line.from, line.to)) return false;
+
+        const linkMarks = node.node.getChildren("LinkMark");
+        const text = linkMarks.length >= 2
+          ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
+          : "";
+        const url = doc.sliceString(urlNode.from, urlNode.to);
+        specs.push({
+          kind: "mdlink",
+          from: node.from,
+          to: node.to,
+          text,
+          url,
+        });
+        return false;
+      }
+
+      // ── Autolink <url>：隐藏尖括号（保留 URL 文本可见）─────────────────
+      if (name === "Autolink") {
+        if (inRanges(node.from, tableRanges)) return false;
+        const line = doc.lineAt(node.from);
+        if (touchesLine(sel, line.from, line.to)) return false;
+        for (const lm of node.node.getChildren("LinkMark")) hide(lm.from, lm.to);
+        return false;
+      }
+
+      // ── GFM 表格：整体替换为 HTML table widget ────────────────────────
+      if (name === "Table") {
+        const raw = doc.sliceString(node.from, node.to);
+        const tableStartLine = doc.lineAt(node.from);
+        const tableEndLine = doc.lineAt(Math.min(node.to, doc.length));
+        if (touchesLine(sel, tableStartLine.from, tableEndLine.to)) {
+          // 选区触碰表格行 → 还原为源码
+          return;
+        }
+        tableRanges.push({ from: node.from, to: node.to });
+        specs.push({ kind: "table", from: node.from, to: node.to, raw });
+        return false;
+      }
+
       return;
     },
   });
 
-  // wikilink 行扫描：跳过围栏/行内码区间（上一步收集的 lezer 区间）
+  // wikilink 行扫描：跳过围栏/行内码区间和表格区间（上一步收集的 lezer 区间）
   const startLineNo = doc.lineAt(lo).number;
   const endLineNo = doc.lineAt(Math.min(hi, doc.length)).number;
   for (let ln = startLineNo; ln <= endLineNo; ln++) {
@@ -284,6 +435,8 @@ export function computeLivePreviewSpecs(
         }
       }
       if (inCode) continue;
+      // 表格区间也跳过（表格 widget 整体替换时不渲染内部 wikilink）
+      if (inRanges(sp.from, tableRanges)) continue;
       // 光标/选区进入（含 [[ / ]] 两侧各 2 字符外扩）即还原为源码
       if (touchesSpan(sel, sp.from, sp.to, 2)) continue;
       specs.push({

@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef, useMemo } from "react";
-import { Eye, Pencil, Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
+import { Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { OverlayScrollbar } from "@/components/ui/scroll-area";
 import { getNote, saveNote, deleteNote, renameNote, listNotes, saveAttachment } from "@/api/tauri";
 import type { NoteDto, NoteSummary } from "@/api/types";
-import { MarkdownPreview } from "@/components/MarkdownPreview";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
 import { SelectionToolbar } from "@/components/ai/SelectionToolbar";
@@ -31,8 +29,6 @@ export interface NoteEditorHandle {
 
 type Props = {
   noteKey: string | null;
-  mode: "edit" | "preview";
-  onModeChange: (m: "edit" | "preview") => void;
   onSaved: () => void;
   onDeleted: (deletedKey?: string) => void;
   onDirtyChange: (dirty: boolean) => void;
@@ -41,7 +37,6 @@ type Props = {
   onRenamed?: (oldKey: string, newKey: string) => void;
   onOpenSettings?: () => void;
   refreshToken?: number;
-  previewContainerRef?: React.RefObject<HTMLDivElement | null>;
 };
 
 function isNotFoundError(msg: string): boolean {
@@ -49,8 +44,31 @@ function isNotFoundError(msg: string): boolean {
   return lower.includes("notfound") || lower.includes("not found") || msg.includes("笔记不存在");
 }
 
+/**
+ * 差异替换文档并保留选区：计算旧文档与新文本的公共前/后缀，
+ * 只 dispatch 中间差异区间（selection 经 CM change mapping 自然保留）；
+ * 文档相同时不 dispatch，避免视图重建与光标/焦点/撤销历史丢失。
+ */
+function replaceDocPreserveSelection(view: EditorView, text: string): void {
+  const old = view.state.doc.toString();
+  if (old === text) return;
+  let prefix = 0;
+  const minLen = Math.min(old.length, text.length);
+  while (prefix < minLen && old.charCodeAt(prefix) === text.charCodeAt(prefix)) prefix++;
+  let suffix = 0;
+  while (
+    suffix < minLen - prefix &&
+    old.charCodeAt(old.length - 1 - suffix) === text.charCodeAt(text.length - 1 - suffix)
+  ) {
+    suffix++;
+  }
+  view.dispatch({
+    changes: { from: prefix, to: old.length - suffix, insert: text.slice(prefix, text.length - suffix) },
+  });
+}
+
 export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEditor(
-  { noteKey, mode, onModeChange, onSaved, onDeleted, onDirtyChange, onNavigate, onCreate, onRenamed, onOpenSettings, refreshToken, previewContainerRef: externalPreviewRef },
+  { noteKey, onSaved, onDeleted, onDirtyChange, onNavigate, onCreate, onRenamed, onOpenSettings, refreshToken },
   ref,
 ) {
   const [note, setNote] = useState<NoteDto | null>(null);
@@ -71,9 +89,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     });
   }, []);
 
-  const previewScrollRef = useRef<HTMLDivElement>(null);
-  const previewProgressRef = useRef<HTMLDivElement>(null);
-  const rafPreview = useRef<number | null>(null);
   const rafEdit = useRef<number | null>(null);
   const cmRef = useRef<MarkdownEditorHandle>(null);
   const editorContentRef = useRef<HTMLDivElement>(null);
@@ -107,7 +122,9 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   const doReloadNote = useCallback(
     (targetKey: string) => {
       let cancelled = false;
-      setLoading(true);
+      // 仅初始加载（尚未持有笔记）时展示 loading；后台 reload 不再触发 loading，
+      // 编辑器保持挂载，避免 CM 视图卸载重建导致光标/焦点/撤销历史丢失
+      if (noteRef.current == null) setLoading(true);
       setError(null);
       hasLoadedRef.current = false;
       getNote(targetKey)
@@ -119,9 +136,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           bodyAtMountRef.current = data.body;
           hasLoadedRef.current = true;
           const view = cmRef.current?.view();
-          if (view && view.state.doc.toString() !== data.body) {
-            view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: data.body } });
-          }
+          if (view) replaceDocPreserveSelection(view, data.body);
         })
         .catch((e: unknown) => {
           if (cancelled) return;
@@ -171,9 +186,30 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       return curTitle !== n.title || curBody !== n.body;
     })();
     if (!isDirty) {
-      // 非 dirty 直接重载
-      doReloadNote(noteKey);
-      return;
+      // 非 dirty：先探测磁盘是否变化，未变化则完全跳过
+      // （不调 doReloadNote、不 setState），避免自动保存后的 refresh 打断编辑；
+      // 磁盘确实变化时直接应用新内容
+      let cancelled = false;
+      getNote(noteKey)
+        .then((remote) => {
+          if (cancelled) return;
+          const n = noteRef.current;
+          if (!n) return;
+          if (remote.body === n.body && remote.title === n.title) return;
+          setNote(remote);
+          setTitle(remote.title);
+          setBody(remote.body);
+          bodyAtMountRef.current = remote.body;
+          hasLoadedRef.current = true;
+          const view = cmRef.current?.view();
+          if (view) replaceDocPreserveSelection(view, remote.body);
+        })
+        .catch(() => {
+          // 探测失败不阻塞
+        });
+      return () => {
+        cancelled = true;
+      };
     }
     // dirty：先探测磁盘是否已被外部修改
     let cancelled = false;
@@ -193,9 +229,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         bodyAtMountRef.current = remote.body;
         hasLoadedRef.current = true;
         const view = cmRef.current?.view();
-        if (view && view.state.doc.toString() !== remote.body) {
-          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: remote.body } });
-        }
+        if (view) replaceDocPreserveSelection(view, remote.body);
       })
       .catch(() => {
         // 探测失败不阻塞
@@ -307,9 +341,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         titleRef.current = updated.title;
         setBody(updated.body);
         bodyRef.current = updated.body;
-        if (nowView && nowView.state.doc.toString() !== updated.body) {
-          nowView.dispatch({ changes: { from: 0, to: nowView.state.doc.length, insert: updated.body } });
-        }
+        // 服务端可能归一化内容：差异替换，保留光标/选区
+        if (nowView) replaceDocPreserveSelection(nowView, updated.body);
       } else {
         setNote(updated);
         noteRef.current = updated;
@@ -445,63 +478,19 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     }
   }, [computeDirtyNow, executeSave]);
 
-  // 预览进度条：直接改 DOM 宽度，避免 rerender
-  const syncPreviewProgress = useCallback(() => {
-    const el = previewScrollRef.current;
-    const bar = previewProgressRef.current;
-    if (!el || !bar) return;
-    const max = el.scrollHeight - el.clientHeight;
-    if (max <= 0) {
-      bar.style.width = "0%";
-      bar.style.opacity = "0";
-      return;
-    }
-    bar.style.opacity = "1";
-    const pct = (el.scrollTop / max) * 100;
-    bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-  }, []);
-
-  // Ctrl/Cmd+E 切换模式
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (!noteKey) return;
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "e") {
-        e.preventDefault();
-        // 保存当前侧滚动到记忆
-        const k = noteKeyRef.current ?? "";
-        if (mode === "edit") {
-          const v = cmRef.current?.view();
-          if (v) writeScrollPos(k, "edit", v.scrollDOM.scrollTop);
-        } else if (previewScrollRef.current) {
-          writeScrollPos(k, "preview", previewScrollRef.current.scrollTop);
-        }
-        onModeChange(mode === "edit" ? "preview" : "edit");
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [noteKey, mode, onModeChange]);
-
-  // 模式切换时恢复滚动位置 — rAF deferred so CM has laid out
+  // 笔记切换时恢复编辑侧滚动位置 — rAF deferred so CM has laid out
   useEffect(() => {
     const k = noteKeyRef.current ?? "";
     const pos = readScrollPos(k);
     const id = requestAnimationFrame(() => {
-      if (mode === "edit") {
-        const view = cmRef.current?.view();
-        if (view) view.scrollDOM.scrollTop = pos.edit;
-      } else if (previewScrollRef.current) {
-        previewScrollRef.current.scrollTop = pos.preview;
-        // 同步进度条到恢复后位置
-        syncPreviewProgress();
-      }
+      const view = cmRef.current?.view();
+      if (view) view.scrollDOM.scrollTop = pos;
     });
     return () => cancelAnimationFrame(id);
-  }, [mode, syncPreviewProgress]);
+  }, [noteKey]);
 
-  // 编辑态：监听 CM scrollDOM（rAF 节流）。view 可能在 effect 首次执行时尚未创建，用 rAF 重试一次。
+  // 编辑区：监听 CM scrollDOM（rAF 节流）。view 可能在 effect 首次执行时尚未创建，用 rAF 重试一次。
   useEffect(() => {
-    if (mode !== "edit") return;
     let cleanup: (() => void) | null = null;
     let rafAttach: number | null = null;
     const attach = () => {
@@ -515,7 +504,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         if (rafEdit.current !== null) return;
         rafEdit.current = requestAnimationFrame(() => {
           rafEdit.current = null;
-          writeScrollPos(noteKeyRef.current ?? "", "edit", el.scrollTop);
+          writeScrollPos(noteKeyRef.current ?? "", el.scrollTop);
         });
       };
       el.addEventListener("scroll", onScroll);
@@ -526,26 +515,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       if (rafAttach !== null) cancelAnimationFrame(rafAttach);
       cleanup?.();
     };
-  }, [mode, noteKey, loading]);
-
-  const handlePreviewScroll = useCallback(() => {
-    if (rafPreview.current !== null) return;
-    rafPreview.current = requestAnimationFrame(() => {
-      rafPreview.current = null;
-      const el = previewScrollRef.current;
-      if (el) {
-        writeScrollPos(noteKeyRef.current ?? "", "preview", el.scrollTop);
-        syncPreviewProgress();
-      }
-    });
-  }, [syncPreviewProgress]);
-
-  // 预览内容变化后校准进度条（首帧与内容增高时）
-  useEffect(() => {
-    if (mode !== "preview") return;
-    const id = requestAnimationFrame(() => syncPreviewProgress());
-    return () => cancelAnimationFrame(id);
-  }, [mode, body, syncPreviewProgress]);
+  }, [noteKey, loading]);
 
   const handleDelete = async () => {
     if (!noteKey) return;
@@ -586,9 +556,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         setBody(renamed.body);
         bodyRef.current = renamed.body;
         const view = cmRef.current?.view();
-        if (view && view.state.doc.toString() !== renamed.body) {
-          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: renamed.body } });
-        }
+        if (view) replaceDocPreserveSelection(view, renamed.body);
         setRenameOpen(false);
         onRenamed?.(noteKey, normalized);
       } catch (e: unknown) {
@@ -599,15 +567,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     },
     [noteKey, note, onRenamed],
   );
-
-  // 外部预览容器 ref 同步（用于 TocPanel 预览态跳转）
-  useEffect(() => {
-    if (!externalPreviewRef) return;
-    const el = previewScrollRef.current;
-    if (el) {
-      (externalPreviewRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
-    }
-  }, [mode, externalPreviewRef, noteKey]);
 
   // selection source adapter over CM view — stable via useMemo on cmRef/editorContentRef identity
   const selectionSource: SelectionSource = useMemo(() => {
@@ -659,8 +618,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     return { chars, words, lines };
   }, [body]);
 
-  const isBodyEmpty = body.trim() === "";
-
   // —— 命令句柄 ——
   useImperativeHandle(
     ref,
@@ -679,14 +636,12 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       insertAtCursor(text: string) {
         const view = cmRef.current?.view();
         if (!view) return;
-        if (mode === "preview") onModeChange("edit");
         view.dispatch(view.state.replaceSelection(text));
         view.focus();
       },
       replaceSelection(text: string) {
         const view = cmRef.current?.view();
         if (!view) return;
-        if (mode === "preview") onModeChange("edit");
         view.dispatch(view.state.replaceSelection(text));
         view.focus();
       },
@@ -702,7 +657,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       scrollToLine(line: number) {
         const view = cmRef.current?.view();
         if (!view) return;
-        if (mode === "preview") onModeChange("edit");
         const l = Math.min(line + 1, view.state.doc.lines);
         const pos = view.state.doc.line(l).from;
         view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: "start" }) });
@@ -714,14 +668,13 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           setBody((prev) => (prev ? prev + text : text));
           return;
         }
-        if (mode === "preview") onModeChange("edit");
         const end = view.state.doc.length;
         view.dispatch({ changes: { from: end, insert: text }, selection: { anchor: end + text.length } });
         view.focus();
       },
       flushSave,
     }),
-    [body, title, mode, onModeChange, flushSave],
+    [body, title, flushSave],
   );
 
   if (!noteKey) {
@@ -730,13 +683,14 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         <FileText className="size-10 text-muted-foreground/50" />
         <p className="text-sm font-medium">未选中笔记</p>
         <p className="max-w-sm text-sm text-muted-foreground">
-          从左侧列表选择一篇笔记开始阅读，或切换到编辑模式进行修改。
+          从左侧列表选择一篇笔记开始编辑。
         </p>
       </div>
     );
   }
 
-  if (loading) {
+  // 仅初始加载展示 loading；后台 reload 保持编辑器挂载，避免打断编辑
+  if (loading && note == null) {
     return <div className="p-6 text-sm text-muted-foreground">加载中…</div>;
   }
 
@@ -759,8 +713,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     return <div className="p-6 text-sm text-destructive">{error}</div>;
   }
 
-  const isEdit = mode !== "preview";
-
   return (
     <div className="flex h-full flex-col">
       {/* 工具栏 */}
@@ -779,29 +731,16 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         ) : dirty ? (
           <span className="mr-2 shrink-0 text-xs text-amber-600">有未保存的改动</span>
         ) : null}
-        {isEdit && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-8 shrink-0"
-            onClick={() => setLinkDialogOpen(true)}
-            title="AI 建议"
-            aria-label="AI 建议"
-          >
-            <Sparkles className="size-4" />
-          </Button>
-        )}
         <Button
           type="button"
           variant="ghost"
           size="icon"
           className="size-8 shrink-0"
-          onClick={() => onModeChange(isEdit ? "preview" : "edit")}
-          title={isEdit ? "预览 (Ctrl+E)" : "编辑 (Ctrl+E)"}
-          aria-label={isEdit ? "预览" : "编辑"}
+          onClick={() => setLinkDialogOpen(true)}
+          title="AI 建议"
+          aria-label="AI 建议"
         >
-          {isEdit ? <Eye className="size-4" /> : <Pencil className="size-4" />}
+          <Sparkles className="size-4" />
         </Button>
         <Button
           type="button"
@@ -838,18 +777,16 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           <Trash2 className="size-4" />
         </Button>
       </div>
-      {isEdit && (
-        <EditorToolbar
-          getView={() => cmRef.current?.view() ?? null}
-          livePreview={livePreview}
-          onToggleLivePreview={toggleLivePreview}
-        />
-      )}
+      <EditorToolbar
+        getView={() => cmRef.current?.view() ?? null}
+        livePreview={livePreview}
+        onToggleLivePreview={toggleLivePreview}
+      />
 
       {error && <p className="mx-3 mt-3 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
 
-      {/* 编辑区：preview 模式下 hidden 但保持挂载，保留撤销历史与选区 */}
-      <div className={`flex min-h-0 flex-1 flex-col ${isEdit ? "" : "hidden"}`}>
+      {/* 编辑区：恒为编辑态；空正文时编辑器照常渲染（CM placeholder 已有提示） */}
+      <div className="flex min-h-0 flex-1 flex-col">
         <div className="px-4 pt-3">
           <div className="mx-auto w-full max-w-[760px]">
             <Input
@@ -889,62 +826,20 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
               className="min-h-0 flex-1"
             />
           </div>
-          {isEdit && (
-            <SelectionToolbar
-              source={selectionSource}
-              containerRef={editorContentRef}
-              noteTitle={note?.title ?? title ?? noteKey}
-              noteBody={body}
-              noteKey={noteKey}
-              onOpenSettings={() => onOpenSettings?.()}
-            />
-          )}
-        </div>
-      </div>
-
-      {/* 预览区：edit 模式下 hidden — 原 overflow-auto 改为隐藏原生条 + 自绘悬浮条 */}
-      <div className={`relative flex min-h-0 flex-1 flex-col ${isEdit ? "hidden" : ""}`}>
-        {/* 阅读进度条：零 rerender，直接改 width */}
-        <div className="pointer-events-none absolute left-0 right-0 top-0 z-10 h-0.5 overflow-hidden">
-          <div
-            ref={previewProgressRef}
-            className="h-full bg-primary transition-[width] duration-75"
-            style={{ width: "0%", opacity: 0 }}
+          <SelectionToolbar
+            source={selectionSource}
+            containerRef={editorContentRef}
+            noteTitle={note?.title ?? title ?? noteKey}
+            noteBody={body}
+            noteKey={noteKey}
+            onOpenSettings={() => onOpenSettings?.()}
           />
         </div>
-        <div
-          ref={previewScrollRef}
-          onScroll={handlePreviewScroll}
-          className="no-native-scrollbar flex min-h-0 flex-1 flex-col overflow-auto px-4 py-3"
-        >
-          {isBodyEmpty ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 py-16 text-center">
-              <FileText className="size-8 text-muted-foreground/40" />
-              <p className="text-sm text-muted-foreground">这篇笔记还没有内容</p>
-              <p className="text-xs text-muted-foreground">按 Ctrl+E 开始编辑</p>
-            </div>
-          ) : (
-            <div
-              key={`${noteKey}-${mode}`}
-              className="mx-auto w-full max-w-[760px] animate-in fade-in duration-150"
-            >
-              <h1 className="text-xl font-semibold">{title || note?.title || noteKey}</h1>
-              {note && (note.aliases.length > 0 || note.tags.length > 0) && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {note.aliases.length > 0 && <>别名: {note.aliases.join(", ")} </>}
-                  {note.tags.length > 0 && <>标签: {note.tags.join(", ")}</>}
-                </p>
-              )}
-              <MarkdownPreview content={body} onNavigate={onNavigate} />
-            </div>
-          )}
-        </div>
-        <OverlayScrollbar containerRef={previewScrollRef} />
       </div>
 
       {/* 底部状态栏：仅在正常笔记视图展示 */}
       <div className="flex h-7 shrink-0 items-center gap-3 border-t border-border/60 px-3 text-xs text-muted-foreground">
-        <span className="shrink-0">{isEdit ? "编辑" : "预览"}</span>
+        <span className="shrink-0">编辑</span>
         <span className="shrink-0">
           {bodyStats.chars} 字符 · {bodyStats.words} 词 · {bodyStats.lines} 行
         </span>
@@ -978,7 +873,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           onInsertRef={(text) => {
             const view = cmRef.current?.view();
             if (!view) return;
-            if (mode === "preview") onModeChange("edit");
             view.dispatch(view.state.replaceSelection(text));
             view.focus();
           }}
@@ -989,7 +883,6 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
               setBody((prev) => prev + suffix);
               return;
             }
-            if (mode === "preview") onModeChange("edit");
             const end = view.state.doc.length;
             view.dispatch({ changes: { from: end, insert: suffix }, selection: { anchor: end + suffix.length } });
             view.focus();

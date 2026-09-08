@@ -12,12 +12,10 @@ type Props = {
   noteKey: string | null;
   getCurrentNote: () => Promise<NoteDto | null>;
   refreshToken: number;
-  mode: "edit" | "preview";
   onScrollToLine: (line: number) => void;
-  previewContainerRef: React.RefObject<HTMLElement | null>;
 };
 
-export function TocPanel({ noteKey, getCurrentNote, refreshToken, mode, onScrollToLine, previewContainerRef }: Props) {
+export function TocPanel({ noteKey, getCurrentNote, refreshToken, onScrollToLine }: Props) {
   const [items, setItems] = useState<TocItem[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -48,22 +46,8 @@ export function TocPanel({ noteKey, getCurrentNote, refreshToken, mode, onScroll
     };
   }, [noteKey, refreshToken, getCurrentNote]);
 
-  const handleClick = (item: TocItem, tocIndex: number) => {
-    if (mode === "preview") {
-      const container = previewContainerRef.current;
-      if (container) {
-        const headings = container.querySelectorAll("h1,h2,h3,h4,h5,h6");
-        const target = headings[tocIndex] as HTMLElement | undefined;
-        if (target) {
-          target.scrollIntoView({ behavior: "smooth", block: "start" });
-          return;
-        }
-      }
-      // 兜底：仍尝试按行跳转（若容器未挂载）
-      onScrollToLine(item.line);
-    } else {
-      onScrollToLine(item.line);
-    }
+  const handleClick = (item: TocItem) => {
+    onScrollToLine(item.line);
   };
 
   if (!noteKey) {
@@ -87,7 +71,7 @@ export function TocPanel({ noteKey, getCurrentNote, refreshToken, mode, onScroll
           <li key={`${item.line}-${idx}`}>
             <button
               type="button"
-              onClick={() => handleClick(item, idx)}
+              onClick={() => handleClick(item)}
               className="w-full rounded px-2 py-1 text-left text-xs hover:bg-accent/60"
               style={{ paddingLeft: 8 + (item.level - 1) * 12 }}
               title={item.text}

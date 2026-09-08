@@ -51,6 +51,23 @@ export const livePreviewTheme = EditorView.theme({
   ".cm-lp-codeblock-line": {
     backgroundColor: "hsl(var(--muted) / 0.5)",
   },
+  ".cm-lp-code-header": {
+    display: "flex",
+    alignItems: "center",
+    padding: "4px 12px",
+    background: "hsl(var(--muted) / 0.5)",
+    borderBottom: "1px solid hsl(var(--border))",
+    borderRadius: "8px 8px 0 0",
+    minHeight: "1.6em",
+  },
+  ".cm-lp-code-lang": {
+    fontSize: "0.75em",
+    color: "hsl(var(--muted-foreground))",
+    fontFamily: "monospace",
+  },
+  ".cm-lp-code-footer": {
+    height: "0",
+  },
   ".cm-lp-wikilink": {
     color: "hsl(var(--primary))",
     textDecoration: "underline",
@@ -62,6 +79,17 @@ export const livePreviewTheme = EditorView.theme({
   ".cm-lp-wikilink:hover": {
     backgroundColor: "hsl(var(--accent))",
   },
+  ".cm-lp-mdlink": {
+    color: "hsl(var(--primary))",
+    textDecoration: "underline",
+    textUnderlineOffset: "2px",
+    cursor: "pointer",
+    borderRadius: "3px",
+    padding: "0 1px",
+  },
+  ".cm-lp-mdlink:hover": {
+    backgroundColor: "hsl(var(--accent))",
+  },
   ".cm-lp-checkbox-input": {
     cursor: "pointer",
     marginRight: "0.25em",
@@ -71,5 +99,45 @@ export const livePreviewTheme = EditorView.theme({
     borderTop: "1px solid hsl(var(--border))",
     margin: "0.4em 0",
     height: "0",
+  },
+  ".cm-lp-image-wrap": {
+    display: "inline-block",
+    maxWidth: "100%",
+    cursor: "pointer",
+    lineHeight: "0",
+  },
+  ".cm-lp-image-block": {
+    display: "block",
+  },
+  ".cm-lp-image": {
+    maxWidth: "100%",
+    borderRadius: "6px",
+    display: "block",
+  },
+  ".cm-lp-image-ph": {
+    display: "inline-block",
+    padding: "8px 16px",
+    background: "hsl(var(--muted))",
+    borderRadius: "6px",
+    color: "hsl(var(--muted-foreground))",
+    fontSize: "0.85em",
+    lineHeight: "1.5",
+  },
+  ".cm-lp-table": {
+    borderCollapse: "collapse",
+    width: "100%",
+    margin: "0.5em 0",
+    fontSize: "0.9em",
+  },
+  ".cm-lp-table th, .cm-lp-table td": {
+    border: "1px solid hsl(var(--border))",
+    padding: "6px 13px",
+  },
+  ".cm-lp-table thead tr": {
+    borderBottom: "2px solid hsl(var(--border))",
+    background: "hsl(var(--muted))",
+  },
+  ".cm-lp-table tbody tr:nth-child(even)": {
+    background: "hsl(var(--muted) / 0.3)",
   },
 });

@@ -6,9 +6,29 @@ import {
   ViewUpdate,
   type DecorationSet,
 } from "@codemirror/view";
-import { computeLivePreviewSpecs } from "./spec";
-import { CheckboxWidget, HrWidget, WikilinkWidget } from "./widgets";
+import { computeLivePreviewSpecs, type DecoSpec } from "./spec";
+import {
+  CheckboxWidget,
+  HrWidget,
+  WikilinkWidget,
+  ImageWidget,
+  MdLinkWidget,
+  TableWidget,
+  CodeHeaderWidget,
+  CodeFooterWidget,
+} from "./widgets";
 import { livePreviewTheme } from "./theme";
+import { isAttachmentSrc } from "@/lib/attachments";
+
+/**
+ * 判断 image spec 的 src 是否是附件路径（由 spec.ts 中 normalizeAttachmentSrc 处理过）。
+ * spec.ts 会将附件路径 normalize 为 `assets/...` 格式，普通 URL 不会命中。
+ * 此处直接调用 isAttachmentSrc 检测——规范化后的路径仍以 `assets/` 开头，
+ * isAttachmentSrc 不会对 http(s)/data: URL 返回 true。
+ */
+function isImageAttachmentSpec(src: string): boolean {
+  return isAttachmentSrc(src);
+}
 
 export { wikilinkNavFacet } from "./widgets";
 
@@ -24,18 +44,21 @@ export { wikilinkNavFacet } from "./widgets";
  * - `line` → `Decoration.line`
  * - `mark` → `Decoration.mark`
  * - `hide` → `Decoration.replace({})`（零宽，不占位）
- * - `checkbox` / `hr` / `wikilink` → `Decoration.replace({ widget })`
+ * - `checkbox` / `hr` / `wikilink` / `image` / `mdlink` / `table` / `codeheader` / `codefooter`
+ *   → `Decoration.replace({ widget })`
  *
  * 隐藏区间与 widget 区间必须避免部分重叠：同一标题的 HeaderMark 分属不同
  * 区间，彼此不交叠；checkbox 与同行 ListMark 区间分离（`[ ]` vs `-`）。
  * 同一起点（如行首开标记与行装饰）由不同装饰通道承载，无冲突。
  */
-function buildDecoSet(view: EditorView): DecorationSet {
+function buildDecoSet(view: EditorView): { decos: DecorationSet; specs: DecoSpec[] } {
   const lineDecos: { line: number; deco: Decoration }[] = [];
   const inlineDecos: { from: number; to: number; deco: Decoration }[] = [];
+  const allSpecs: DecoSpec[] = [];
 
   for (const { from, to } of view.visibleRanges) {
     const specs = computeLivePreviewSpecs(view.state, from, to);
+    allSpecs.push(...specs);
     for (const spec of specs) {
       switch (spec.kind) {
         case "line":
@@ -72,6 +95,53 @@ function buildDecoSet(view: EditorView): DecorationSet {
             deco: Decoration.replace({ widget: new HrWidget(), block: true }),
           });
           break;
+        case "image":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({
+              widget: new ImageWidget(
+                spec.alt,
+                spec.src,
+                isImageAttachmentSpec(spec.src),
+                view,
+                spec.from,
+                spec.block,
+              ),
+              block: spec.block,
+            }),
+          });
+          break;
+        case "mdlink":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({
+              widget: new MdLinkWidget(spec.text, spec.url, view),
+            }),
+          });
+          break;
+        case "table":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({ widget: new TableWidget(spec.raw), block: true }),
+          });
+          break;
+        case "codeheader":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({ widget: new CodeHeaderWidget(spec.lang), block: true }),
+          });
+          break;
+        case "codefooter":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({ widget: new CodeFooterWidget(), block: true }),
+          });
+          break;
       }
     }
   }
@@ -88,25 +158,76 @@ function buildDecoSet(view: EditorView): DecorationSet {
     const pos = doc.line(line).from;
     ranges.push({ from: pos, to: pos, value: deco });
   }
-  return Decoration.set(ranges, true);
+  return { decos: Decoration.set(ranges, true), specs: allSpecs };
 }
 
 class LivePreviewPluginValue {
   decorations: DecorationSet;
+  /** 最近一次 buildDecoSet 的 specs，供 domEventHandlers 读取 */
+  specs: DecoSpec[] = [];
 
   constructor(view: EditorView) {
-    this.decorations = buildDecoSet(view);
+    const result = buildDecoSet(view);
+    this.decorations = result.decos;
+    this.specs = result.specs;
   }
 
   update(update: ViewUpdate): void {
     if (update.docChanged || update.selectionSet || update.viewportChanged) {
-      this.decorations = buildDecoSet(update.view);
+      const result = buildDecoSet(update.view);
+      this.decorations = result.decos;
+      this.specs = result.specs;
     }
   }
 }
 
+/**
+ * Cmd/Ctrl + 点击命中 mdlink → window.open(url)。
+ * 命中 image → 若为 http(s)/data: URL 也打开。
+ */
+function handleModClick(e: MouseEvent, view: EditorView): boolean {
+  if (!(e.metaKey || e.ctrlKey)) return false;
+  const plugin = view.plugin(livePreviewPlugin);
+  if (!plugin) return false;
+  const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
+  if (pos == null) return false;
+  for (const spec of plugin.specs) {
+    if (spec.kind === "line") continue;
+    if (pos < spec.from || pos >= spec.to) continue;
+    if (spec.kind === "mdlink") {
+      try {
+        window.open(spec.url, "_blank");
+      } catch {
+        // ignore — invalid URL
+      }
+      e.preventDefault();
+      return true;
+    }
+    if (spec.kind === "image") {
+      if (
+        spec.src.startsWith("http://") ||
+        spec.src.startsWith("https://") ||
+        spec.src.startsWith("data:")
+      ) {
+        try {
+          window.open(spec.src, "_blank");
+        } catch {
+          // ignore
+        }
+        e.preventDefault();
+        return true;
+      }
+      break; // attachment — don't open externally
+    }
+  }
+  return false;
+}
+
 export const livePreviewPlugin = ViewPlugin.fromClass(LivePreviewPluginValue, {
   decorations: (v) => v.decorations,
+  eventHandlers: {
+    click: handleModClick,
+  },
 });
 
 /**

@@ -28,14 +28,12 @@ import {
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix } =
     useNoteHistory();
-  const [mode, setMode] = useState<"edit" | "preview">("preview");
   const [refreshToken, setRefreshToken] = useState(0);
   const [vault, setVault] = useState<VaultInfo | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const editorRef = useRef<NoteEditorHandle>(null);
-  const previewContainerRef = useRef<HTMLDivElement | null>(null);
   const bumpRefreshToken = useCallback(() => setRefreshToken((n) => n + 1), []);
   const {
     status: syncStatus,
@@ -132,7 +130,6 @@ export default function App() {
         if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
       }
       navigate(nextKey);
-      setMode("preview");
     },
     [navigate],
   );
@@ -144,7 +141,6 @@ export default function App() {
       if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
     }
     back();
-    setMode("preview");
   }, [back]);
 
   const handleForward = useCallback(async () => {
@@ -154,7 +150,6 @@ export default function App() {
       if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
     }
     forward();
-    setMode("preview");
   }, [forward]);
 
   const handleSaved = useCallback(() => {
@@ -184,7 +179,6 @@ export default function App() {
         await saveNote(key, "", key);
         setRefreshToken((n) => n + 1);
         navigate(key);
-        setMode("edit");
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         window.alert(msg);
@@ -204,7 +198,6 @@ export default function App() {
         await saveNote(key, "", title);
         setRefreshToken((n) => n + 1);
         navigate(key);
-        setMode("edit");
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         window.alert(msg);
@@ -407,8 +400,6 @@ export default function App() {
             key={selectedKey ?? "__none__"}
             ref={editorRef}
             noteKey={selectedKey}
-            mode={mode}
-            onModeChange={setMode}
             onSaved={handleSaved}
             onDeleted={handleDeleted}
             onDirtyChange={setEditorDirty}
@@ -417,7 +408,6 @@ export default function App() {
             onRenamed={handleRenamed}
             onOpenSettings={() => setSettingsOpen(true)}
             refreshToken={refreshToken}
-            previewContainerRef={previewContainerRef}
           />
         </main>
 
@@ -454,9 +444,7 @@ export default function App() {
                   noteKey={selectedKey}
                   getCurrentNote={getCurrentNoteForAi}
                   refreshToken={refreshToken}
-                  mode={mode}
                   onScrollToLine={handleScrollToLine}
-                  previewContainerRef={previewContainerRef as React.RefObject<HTMLElement | null>}
                 />
               }
               agentPanel={
