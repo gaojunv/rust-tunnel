@@ -44,6 +44,7 @@ export const LP_CLASS = {
  * - `table`: GFM 表格替换为 HTML table widget
  * - `codeheader`: 代码块开围栏行（含语言标签）替换为细条 widget
  * - `codefooter`: 代码块闭围栏行替换为零高度 widget
+ * - `frontmatter`: YAML frontmatter 区块折叠为单行 muted 细条 widget
  */
 export type DecoSpec =
   | { kind: "line"; line: number; cls: string }
@@ -56,7 +57,8 @@ export type DecoSpec =
   | { kind: "mdlink"; from: number; to: number; text: string; url: string }
   | { kind: "table"; from: number; to: number; raw: string }
   | { kind: "codeheader"; from: number; to: number; lang: string }
-  | { kind: "codefooter"; from: number; to: number };
+  | { kind: "codefooter"; from: number; to: number }
+  | { kind: "frontmatter"; from: number; to: number; propCount: number };
 
 type SelRange = { from: number; to: number };
 
@@ -100,6 +102,40 @@ function inRanges(
   return false;
 }
 
+/** `![[...]]` 嵌入的图片扩展名（大小写不敏感）。 */
+const EMBED_IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico)$/i;
+
+/**
+ * frontmatter 区间检测（纯文本判定，不依赖语法树——lezer 无 frontmatter 扩展）。
+ * doc 第 1 行 trimEnd 后恰为 `---`，则向后找第一个 trimEnd 后为 `---`/`...` 的行
+ * 作结束（最多扫描 300 行防退化）。找到则返回 [line1.from, endLine.to]。
+ */
+const FM_MAX_SCAN_LINES = 300;
+
+function detectFrontmatterRange(doc: { lines: number; line(n: number): { text: string; from: number; to: number } }): { from: number; to: number } | null {
+  if (doc.lines < 2) return null;
+  const first = doc.line(1);
+  if (first.text.trimEnd() !== "---") return null;
+  const limit = Math.min(doc.lines, 1 + FM_MAX_SCAN_LINES);
+  for (let n = 2; n <= limit; n++) {
+    const t = doc.line(n).text.trimEnd();
+    if (t === "---" || t === "...") {
+      return { from: first.from, to: doc.line(n).to };
+    }
+  }
+  return null;
+}
+
+/**
+ * 从嵌入 target 提取纯文件名部分。`[[img.png|300]]` 的 target 经 bar 逻辑解析后
+ * 为 `img.png`，但若出现 `[[dir/a.png|300x200]]` 等形态，尺寸后缀位于 label 侧；
+ * 保险起见仍取 `|` 前段并 trim 后再判扩展名。
+ */
+function embedFileName(target: string): string {
+  const bar = target.indexOf("|");
+  return (bar === -1 ? target : target.slice(0, bar)).trim();
+}
+
 /**
  * 计算 [from, to) 区间内的 Live Preview 装饰 spec。
  * 调用方只对 `view.visibleRanges` 逐段调用；返回顺序为文档顺序（line 按行号，
@@ -123,6 +159,17 @@ export function computeLivePreviewSpecs(
 
   const sel = state.selection.ranges;
   const seenLine = new Set<string>();
+
+  // frontmatter 区间（纯文本判定）：无论折叠与否，其内部装饰一律抑制
+  // （开头的 `---` 会被 lezer 误判为 HorizontalRule，结尾 `---` 被误判为 Setext）。
+  const fmRange = detectFrontmatterRange(doc);
+  // frontmatter 自身折叠/还原判定：选区触碰区间首末行即还原
+  let fmCollapsed = false;
+  if (fmRange) {
+    const firstLine = doc.lineAt(fmRange.from);
+    const lastLine = doc.lineAt(fmRange.to);
+    if (!touchesLine(sel, firstLine.from, lastLine.to)) fmCollapsed = true;
+  }
 
   function pushLine(line: number, cls: string): void {
     const key = `${line}:${cls}`;
@@ -200,6 +247,11 @@ export function computeLivePreviewSpecs(
     to: hi,
     enter(node) {
       const name = node.name;
+
+      // frontmatter 内部装饰一律抑制（无论折叠与否）
+      if (fmRange && inRanges(node.from, [{ from: fmRange.from, to: fmRange.to }])) {
+        return false;
+      }
 
       const atx = ATX_RE.exec(name);
       if (atx) {
@@ -321,6 +373,16 @@ export function computeLivePreviewSpecs(
 
       // ── 图片：block（独占段落）/ inline ──────────────────────────────
       if (name === "Image") {
+        // 抑制 `![[...]]` 嵌入语法——由 wikilink 行扫描器统一处理。
+        // 此时 Image 无 URL 子节点（rawSrc 为空），仍会发射 src="" 的误 spec。
+        if (node.from < node.to) {
+          const raw = doc.sliceString(node.from, node.to);
+          if (
+            raw.startsWith("![[")
+            && raw.endsWith("]]")
+            && raw.length >= 6
+          ) return false;
+        }
         // 跳过表格区间（表格 widget 已整体替换，内部不单独渲染图片）
         if (inRanges(node.from, tableRanges)) return false;
 
@@ -419,11 +481,16 @@ export function computeLivePreviewSpecs(
     },
   });
 
-  // wikilink 行扫描：跳过围栏/行内码区间和表格区间（上一步收集的 lezer 区间）
+  // wikilink 行扫描：跳过围栏/行内码区间、表格区间和 frontmatter 区间
   const startLineNo = doc.lineAt(lo).number;
   const endLineNo = doc.lineAt(Math.min(hi, doc.length)).number;
   for (let ln = startLineNo; ln <= endLineNo; ln++) {
     const line = doc.line(ln);
+    // 跳过 frontmatter 区间内的行
+    if (fmRange && ln > 0) {
+      const lineFrom = line.from;
+      if (lineFrom >= fmRange.from && lineFrom <= fmRange.to) continue;
+    }
     const spans = scanWikilinksInLine(line.text, line.from);
     for (const sp of spans) {
       if (sp.to <= lo || sp.from >= hi) continue;
@@ -437,6 +504,47 @@ export function computeLivePreviewSpecs(
       if (inCode) continue;
       // 表格区间也跳过（表格 widget 整体替换时不渲染内部 wikilink）
       if (inRanges(sp.from, tableRanges)) continue;
+
+      // ── `![[...]]` 嵌入语法处理 ──────────────────────────────
+      if (sp.embed) {
+        // from 向前扩 1 吞掉 `!`，touchesSpan 判定也用扩后区间
+        const embFrom = sp.from - 1;
+        const embTo = sp.to;
+
+        if (touchesSpan(sel, embFrom, embTo, 2)) continue;
+
+        const fileName = embedFileName(sp.target);
+        const isImage = EMBED_IMAGE_EXT_RE.test(fileName);
+
+        if (isImage) {
+          const src = fileName.startsWith("assets/") ? fileName : `assets/${fileName}`;
+          // alt 用文件名（去扩展名）：剥掉可能的目录前缀
+          const baseName = fileName.includes("/") ? fileName.slice(fileName.lastIndexOf("/") + 1) : fileName;
+          const alt = baseName.replace(/\.[^.]+$/, "");
+          // block = 独占段落（仅含 `![[...]]`，无前后文本）
+          const isBlock = line.from === embFrom && line.to === embTo;
+          specs.push({
+            kind: "image",
+            from: embFrom,
+            to: embTo,
+            alt,
+            src,
+            block: isBlock,
+          });
+        } else {
+          // 非图片嵌入（笔记）：暂退化为 wikilink
+          specs.push({
+            kind: "wikilink",
+            from: embFrom,
+            to: embTo,
+            target: sp.target,
+            label: sp.label,
+          });
+        }
+        continue;
+      }
+      // ── 常规 wikilink ─────────────────────────────────────────
+
       // 光标/选区进入（含 [[ / ]] 两侧各 2 字符外扩）即还原为源码
       if (touchesSpan(sel, sp.from, sp.to, 2)) continue;
       specs.push({
@@ -445,6 +553,22 @@ export function computeLivePreviewSpecs(
         to: sp.to,
         target: sp.target,
         label: sp.label,
+      });
+    }
+  }
+
+  // ── frontmatter 折叠：选区不触碰时发射 spec ──────────────────────
+  if (fmRange && fmCollapsed) {
+    const firstLine = doc.lineAt(fmRange.from);
+    const lastLine = doc.lineAt(fmRange.to);
+    // 仅在可见区间内才发射
+    if (fmRange.from < hi && fmRange.to > lo) {
+      const propCount = Math.max(0, lastLine.number - firstLine.number - 1);
+      specs.push({
+        kind: "frontmatter",
+        from: fmRange.from,
+        to: fmRange.to,
+        propCount,
       });
     }
   }

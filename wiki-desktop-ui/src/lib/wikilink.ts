@@ -43,6 +43,8 @@ export type WikilinkSpan = {
   target: string;
   /** display label (defaults to target when no `|label` part) */
   label: string;
+  /** true when `[[` is immediately preceded by `!` (embed syntax: `![[...]]`) */
+  embed: boolean;
 };
 
 // 找出单行中非行内代码区间的 wikilink 区间。
@@ -136,7 +138,9 @@ export function scanWikilinksInLine(line: string, baseOffset: number): WikilinkS
         i = close + 2;
         continue;
       }
-      spans.push({ from: baseOffset + i, to: baseOffset + close + 2, target, label });
+      // embed 判定：`[[` 前一个字符是 `!`（from/to 不变，仍只覆盖 `[[...]]`）
+      const embed = i > 0 && line[i - 1] === "!";
+      spans.push({ from: baseOffset + i, to: baseOffset + close + 2, target, label, embed });
       i = close + 2;
       continue;
     }

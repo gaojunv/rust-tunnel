@@ -505,3 +505,161 @@ describe("code block header/footer", () => {
     expect(ofKind(full(state), "image")).toEqual([]);
   });
 });
+
+// ── ![[...]] 嵌入语法测试 ────────────────────────────────────────────────────
+
+describe("embed wikilink ![[...]]", () => {
+  it("standalone image embed → image spec with block:true", () => {
+    const doc = "![[assets/a.png]]\n\nsome text\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({
+      kind: "image",
+      from: 0,
+      to: 17,
+      alt: "a",
+      src: "assets/a.png",
+      block: true,
+    });
+  });
+
+  it("image embed with size suffix → image spec src=assets/b.jpg", () => {
+    const doc = "![[b.jpg|300]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({
+      kind: "image",
+      from: 0,
+      to: 14,
+      alt: "b",
+      src: "assets/b.jpg",
+      block: true,
+    });
+  });
+
+  it("non-image note embed → wikilink spec with from covering !", () => {
+    const doc = "![[某笔记]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const wikilinks = ofKind(full(state), "wikilink") as Extract<DecoSpec, { kind: "wikilink" }>[];
+    expect(wikilinks).toHaveLength(1);
+    expect(wikilinks[0]).toMatchObject({
+      kind: "wikilink",
+      from: 0, // from 覆盖 !（前移 1）
+      to: 8,   // ![[某笔记]] 共 8 字符
+      target: "某笔记",
+      label: "某笔记",
+    });
+  });
+
+  it("inline image embed → image spec block:false", () => {
+    const doc = "文字 ![[x.png]] 文字\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const imgs = ofKind(full(state), "image") as Extract<DecoSpec, { kind: "image" }>[];
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0]).toMatchObject({
+      kind: "image",
+      from: 3,   // ! 位置
+      to: 13,   // ]] 结束（![[x.png]] 共 10 字符，from=3 → to=13）
+      alt: "x",
+      src: "assets/x.png",
+      block: false,
+    });
+  });
+
+  it("cursor on embed → no spec (source shown)", () => {
+    const doc = "![[a.png]]\n\ntail\n";
+    // 光标在 ! 位置
+    const state1 = makeState(doc, [{ anchor: 0 }]);
+    expect(ofKind(full(state1), "image")).toEqual([]);
+    // 光标在 ] 位置（覆盖到 h i 0）
+    const state2 = makeState(doc, [{ anchor: 9 }]);
+    expect(ofKind(full(state2), "image")).toEqual([]);
+  });
+
+  it("image embed inside code block → not rendered", () => {
+    const doc = "```\n![[not-an-image.png]]\n```\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "image")).toEqual([]);
+  });
+
+  it("regular wikilink inside frontmatter → not rendered as wikilink", () => {
+    // frontmatter 内部 [[note]] 不渲染为 widget
+    const doc = "---\ntitle: hi\nref: [[note]]\n---\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "wikilink")).toEqual([]);
+  });
+});
+
+// ── frontmatter 折叠测试 ──────────────────────────────────────────────────────
+
+describe("frontmatter folding", () => {
+  it("valid frontmatter collapsed → single frontmatter spec, no hr/hide inside", () => {
+    const doc = "---\ntitle: hi\nauthor: me\n---\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const fms = ofKind(specs, "frontmatter") as Extract<DecoSpec, { kind: "frontmatter" }>[];
+    expect(fms).toHaveLength(1);
+    expect(fms[0]).toMatchObject({
+      kind: "frontmatter",
+      from: 0,
+      to: 28,
+      propCount: 2,
+    });
+    // frontmatter 内部不应有 hr（开头 `---` 误判为 HR）
+    expect(ofKind(specs, "hr")).toEqual([]);
+    // 也不应有 hide（Setext 等其他装饰）
+    expect(ofKind(specs, "hide")).toEqual([]);
+    // 也不应有 line class
+    expect(ofKind(specs, "line")).toEqual([]);
+  });
+
+  it("cursor inside frontmatter → no frontmatter spec, no HR false positive", () => {
+    const doc = "---\ntitle: hi\n---\nbody\n";
+    const state = makeState(doc, [{ anchor: 5 }]); // 光标在 frontmatter 第 2 行
+    const specs = full(state);
+    expect(ofKind(specs, "frontmatter")).toEqual([]);
+    // HR 误判也应被抑制（frontmatter 内部所有装饰都被跳过）
+    expect(ofKind(specs, "hr")).toEqual([]);
+  });
+
+  it("no closing --- → not detected as frontmatter", () => {
+    const doc = "---\ntitle: hi\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    expect(ofKind(specs, "frontmatter")).toEqual([]);
+  });
+
+  it("--- not on line 1 → not detected", () => {
+    const doc = "text\n---\ntitle: hi\n---\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    expect(ofKind(specs, "frontmatter")).toEqual([]);
+    // 中间 `---` 可能被 lezer 解析为 HR，但 frontmatter 不应干扰它
+  });
+
+  it("frontmatter with ... closing → detected", () => {
+    const doc = "---\ntitle: hi\n...\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const fms = ofKind(specs, "frontmatter") as Extract<DecoSpec, { kind: "frontmatter" }>[];
+    expect(fms).toHaveLength(1);
+    expect(fms[0]).toMatchObject({ propCount: 1 });
+  });
+
+  it("single-line frontmatter (--- ... ---) → propCount 0", () => {
+    const doc = "---\n---\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const fms = ofKind(specs, "frontmatter") as Extract<DecoSpec, { kind: "frontmatter" }>[];
+    expect(fms).toHaveLength(1);
+    expect(fms[0]).toMatchObject({ propCount: 0 });
+  });
+
+  it("frontmatter after body text → not detected (--- not on line 1)", () => {
+    const doc = "body text\n---\ntitle: hi\n---\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "frontmatter")).toEqual([]);
+  });
+});

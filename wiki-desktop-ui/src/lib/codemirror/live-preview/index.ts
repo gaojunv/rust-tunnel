@@ -16,6 +16,7 @@ import {
   TableWidget,
   CodeHeaderWidget,
   CodeFooterWidget,
+  FrontmatterWidget,
 } from "./widgets";
 import { livePreviewTheme } from "./theme";
 import { isAttachmentSrc } from "@/lib/attachments";
@@ -140,6 +141,16 @@ function buildDecoSet(view: EditorView): { decos: DecorationSet; specs: DecoSpec
             from: spec.from,
             to: spec.to,
             deco: Decoration.replace({ widget: new CodeFooterWidget(), block: true }),
+          });
+          break;
+        case "frontmatter":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({
+              widget: new FrontmatterWidget(spec.propCount, view, spec.from),
+              block: true,
+            }),
           });
           break;
       }

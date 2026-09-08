@@ -140,4 +140,21 @@ export const livePreviewTheme = EditorView.theme({
   ".cm-lp-table tbody tr:nth-child(even)": {
     background: "hsl(var(--muted) / 0.3)",
   },
+  ".cm-lp-frontmatter": {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "4px 12px",
+    margin: "0.5em 0",
+    background: "hsl(var(--muted) / 0.4)",
+    borderRadius: "6px",
+    color: "hsl(var(--muted-foreground))",
+    fontSize: "0.8em",
+    fontFamily: "monospace",
+    cursor: "pointer",
+    userSelect: "none",
+  },
+  ".cm-lp-frontmatter:hover": {
+    background: "hsl(var(--muted) / 0.6)",
+  },
 });

@@ -447,3 +447,44 @@ export class CodeFooterWidget extends WidgetType {
     return true;
   }
 }
+
+// ── Frontmatter 折叠 widget ───────────────────────────────────────────────────
+
+/**
+ * YAML frontmatter 折叠为单行 muted 细条。
+ * 显示 `··· N properties ···`，点击将光标移入区间起点还原为源码。
+ */
+export class FrontmatterWidget extends WidgetType {
+  constructor(
+    readonly propCount: number,
+    private readonly view: EditorView,
+    private readonly from: number,
+  ) {
+    super();
+  }
+
+  eq(other: WidgetType): boolean {
+    return (
+      other instanceof FrontmatterWidget &&
+      other.propCount === this.propCount
+    );
+  }
+
+  toDOM(): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "cm-lp-frontmatter";
+    const label = this.propCount === 1 ? "1 property" : `${this.propCount} properties`;
+    el.textContent = `··· ${label} ···`;
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      // 光标移入 frontmatter 区间起点 → 还原为源码
+      this.view.dispatch({ selection: { anchor: this.from } });
+      this.view.focus();
+    });
+    return el;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
