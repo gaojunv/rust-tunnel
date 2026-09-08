@@ -299,6 +299,191 @@ export class MdLinkWidget extends WidgetType {
   }
 }
 
+// ── 表格单元格内联渲染器 ─────────────────────────────────────────────────────
+
+type InlineHandlers = {
+  onLink: (url: string) => void;
+  onWikilink: (key: string) => void;
+};
+
+/**
+ * 纯 DOM 单元格内联渲染器（不依赖 lezer / @codemirror/view）。
+ * 解析 `**bold**` / `*em*` / `~~del~~` / `` `code` `` / `[text](url)` /
+ * `[[target|label]]` / `==highlight==` / `![alt](src)` 为 DocumentFragment。
+ * XSS 安全：一律用 textContent / createTextNode，禁止 innerHTML。
+ *
+ * 解析优先级：代码 > 链接/wikilink > 标记符号 > 高亮 > 文本。
+ * 嵌套处理：链接/wikilink 文本内支持粗/斜（递归）；代码内不做任何解析。
+ */
+export function renderTableCellInline(
+  text: string,
+  handlers: InlineHandlers,
+): DocumentFragment {
+  const frag = document.createDocumentFragment();
+  let pos = 0;
+
+  function flushText(from: number, to: number): void {
+    if (to > from) frag.appendChild(document.createTextNode(text.slice(from, to)));
+  }
+
+  while (pos < text.length) {
+    // 1) 行内代码（最高优先级）
+    if (text[pos] === "`") {
+      let openLen = 0;
+      while (pos + openLen < text.length && text[pos + openLen] === "`") openLen++;
+      const openEnd = pos + openLen;
+      const closeIdx = text.indexOf("`".repeat(openLen), openEnd);
+      if (closeIdx !== -1) {
+        const codeEl = document.createElement("code");
+        codeEl.className = "cm-lp-code";
+        codeEl.textContent = text.slice(openEnd, closeIdx);
+        frag.appendChild(codeEl);
+        pos = closeIdx + openLen;
+        continue;
+      }
+      // 未闭合：当作普通文本输出反引号
+      flushText(pos, pos + 1);
+      pos++;
+      continue;
+    }
+
+    // 2) Markdown 链接 [text](url)（LinkMark 不在纯文本中出现）
+    if (text[pos] === "[" && text[pos + 1] !== "[") {
+      const bracketClose = text.indexOf("]", pos + 2);
+      if (bracketClose !== -1 && text[bracketClose + 1] === "(") {
+        const parenClose = text.indexOf(")", bracketClose + 2);
+        if (parenClose !== -1) {
+          const linkText = text.slice(pos + 1, bracketClose);
+          const url = text.slice(bracketClose + 2, parenClose);
+          if (url && !url.startsWith("!")) {
+            const span = document.createElement("span");
+            span.className = "cm-lp-mdlink";
+            span.textContent = linkText;
+            span.title = url;
+            span.addEventListener("mousedown", (e) => e.preventDefault());
+            span.addEventListener("click", (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              try { window.open(url, "_blank"); } catch { /* invalid URL */ }
+            });
+            frag.appendChild(span);
+            pos = parenClose + 1;
+            continue;
+          }
+        }
+      }
+    }
+
+    // 3) Wikilink [[target|label]]
+    if (text[pos] === "[" && text[pos + 1] === "[") {
+      const closeIdx = text.indexOf("]]", pos + 2);
+      if (closeIdx !== -1) {
+        const inner = text.slice(pos + 2, closeIdx);
+        if (inner.trim()) {
+          const bar = inner.indexOf("|");
+          const target = (bar === -1 ? inner : inner.slice(0, bar)).trim();
+          const label = (bar === -1 ? inner : inner.slice(bar + 1)).trim() || target;
+          if (target) {
+            const span = document.createElement("span");
+            span.className = "cm-lp-wikilink";
+            span.textContent = label;
+            span.title = target;
+            span.addEventListener("mousedown", (e) => e.preventDefault());
+            span.addEventListener("click", (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handlers.onWikilink(target);
+            });
+            frag.appendChild(span);
+            pos = closeIdx + 2;
+            continue;
+          }
+        }
+      }
+    }
+
+    // 4) ==highlight== （`==` 两侧不粘连 `=`）
+    if (
+      text[pos] === "=" && text[pos + 1] === "="
+      && (pos === 0 || text[pos - 1] !== "=")
+    ) {
+      const closeIdx = text.indexOf("==", pos + 2);
+      if (
+        closeIdx !== -1
+        && (closeIdx + 2 >= text.length || text[closeIdx + 2] !== "=")
+      ) {
+        const innerLen = closeIdx - (pos + 2);
+        if (innerLen > 0) {
+          const span = document.createElement("span");
+          span.className = "cm-lp-highlight";
+          span.textContent = text.slice(pos + 2, closeIdx);
+          frag.appendChild(span);
+          pos = closeIdx + 2;
+          continue;
+        }
+      }
+    }
+
+    // 5) 粗体 **text**（必须在 *text* 之前匹配）
+    if (text[pos] === "*" && text[pos + 1] === "*") {
+      const closeIdx = text.indexOf("**", pos + 2);
+      if (closeIdx !== -1 && closeIdx - pos > 2) {
+        const strong = document.createElement("strong");
+        strong.textContent = text.slice(pos + 2, closeIdx);
+        frag.appendChild(strong);
+        pos = closeIdx + 2;
+        continue;
+      }
+    }
+
+    // 6) 斜体 *text*
+    if (text[pos] === "*") {
+      const closeIdx = text.indexOf("*", pos + 1);
+      if (closeIdx !== -1 && closeIdx - pos > 1) {
+        const em = document.createElement("em");
+        em.textContent = text.slice(pos + 1, closeIdx);
+        frag.appendChild(em);
+        pos = closeIdx + 1;
+        continue;
+      }
+    }
+
+    // 7) 删除线 ~~text~~
+    if (text[pos] === "~" && text[pos + 1] === "~") {
+      const closeIdx = text.indexOf("~~", pos + 2);
+      if (closeIdx !== -1) {
+        const del = document.createElement("s");
+        del.textContent = text.slice(pos + 2, closeIdx);
+        frag.appendChild(del);
+        pos = closeIdx + 2;
+        continue;
+      }
+    }
+
+    // 8) 图片 ![alt](src) —— 降级为纯文本 alt
+    if (text[pos] === "!" && text[pos + 1] === "[") {
+      const bracketClose = text.indexOf("]", pos + 2);
+      if (bracketClose !== -1 && text[bracketClose + 1] === "(") {
+        const parenClose = text.indexOf(")", bracketClose + 2);
+        if (parenClose !== -1) {
+          const alt = text.slice(pos + 2, bracketClose);
+          frag.appendChild(document.createTextNode(alt));
+          pos = parenClose + 1;
+          continue;
+        }
+      }
+    }
+
+    // 9) 普通文本：吞到下一个特殊字符
+    let end = pos + 1;
+    while (end < text.length && !"*~`[!=\\".includes(text[end])) end++;
+    flushText(pos, end);
+    pos = end;
+  }
+
+  return frag;
+}
+
 // ── 表格 widget ──────────────────────────────────────────────────────────────
 
 function splitTableRow(line: string): string[] {
@@ -325,10 +510,13 @@ function parseTableAlign(cells: string[]): Array<"left" | "center" | "right"> {
 
 /**
  * GFM 表格渲染为 HTML `<table>`。
- * 风格参考 GitHub markdown，颜色走 CSS 变量自适应深浅色。
+ * 单元格内联格式通过 `renderTableCellInline` 渲染（粗体/行内码/链接/wikilink 等）。
  */
 export class TableWidget extends WidgetType {
-  constructor(readonly raw: string) {
+  constructor(
+    readonly raw: string,
+    private readonly view: EditorView,
+  ) {
     super();
   }
 
@@ -358,6 +546,13 @@ export class TableWidget extends WidgetType {
       }
     }
 
+    const navHandler = this.view.state.facet(wikilinkNavFacet);
+    const nav = navHandler.length > 0 ? navHandler[navHandler.length - 1] : undefined;
+    const handlers: InlineHandlers = {
+      onLink: (url) => { try { window.open(url, "_blank"); } catch { /* ignore */ } },
+      onWikilink: (key) => { nav?.(key); },
+    };
+
     const table = document.createElement("table");
     table.className = "cm-lp-table";
 
@@ -366,7 +561,7 @@ export class TableWidget extends WidgetType {
     const headTr = document.createElement("tr");
     headerCells.forEach((cell, i) => {
       const th = document.createElement("th");
-      th.textContent = cell;
+      th.appendChild(renderTableCellInline(cell, handlers));
       if (aligns[i]) th.style.textAlign = aligns[i];
       headTr.appendChild(th);
     });
@@ -381,7 +576,7 @@ export class TableWidget extends WidgetType {
       const tr = document.createElement("tr");
       cells.forEach((cell, j) => {
         const td = document.createElement("td");
-        td.textContent = cell;
+        td.appendChild(renderTableCellInline(cell, handlers));
         if (aligns[j]) td.style.textAlign = aligns[j];
         tr.appendChild(td);
       });
@@ -486,5 +681,65 @@ export class FrontmatterWidget extends WidgetType {
 
   ignoreEvent(): boolean {
     return false;
+  }
+}
+
+// ── Callout 标签 widget ────────────────────────────────────────────────────
+
+/** callout 类型 → 图标（文本符号） */
+const CALLOUT_ICONS: Record<string, string> = {
+  note: "📝",
+  tip: "💡",
+  success: "✅",
+  warning: "⚠️",
+  caution: "⚠️",
+  important: "❗",
+  question: "❓",
+  danger: "🔥",
+  error: "🔥",
+  failure: "🔥",
+  info: "ℹ️",
+};
+
+/** 首字母大写：类型显示名 */
+function capitalizeCalloutType(t: string): string {
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+/**
+ * Callout `[!type]` 标记替换为带图标的标签条。
+ * 显示图标 + title（同行标题文字）或类型显示名。
+ */
+export class CalloutWidget extends WidgetType {
+  constructor(
+    readonly calloutType: string,
+    readonly title: string,
+  ) {
+    super();
+  }
+
+  eq(other: WidgetType): boolean {
+    return (
+      other instanceof CalloutWidget &&
+      other.calloutType === this.calloutType &&
+      other.title === this.title
+    );
+  }
+
+  toDOM(): HTMLElement {
+    const el = document.createElement("span");
+    el.className = "cm-lp-callout-label";
+    const icon = document.createElement("span");
+    icon.className = "cm-lp-callout-icon";
+    icon.textContent = CALLOUT_ICONS[this.calloutType] ?? "📌";
+    el.appendChild(icon);
+    const label = document.createElement("span");
+    label.textContent = this.title || capitalizeCalloutType(this.calloutType);
+    el.appendChild(label);
+    return el;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
   }
 }

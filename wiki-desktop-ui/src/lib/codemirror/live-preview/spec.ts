@@ -58,7 +58,9 @@ export type DecoSpec =
   | { kind: "table"; from: number; to: number; raw: string }
   | { kind: "codeheader"; from: number; to: number; lang: string }
   | { kind: "codefooter"; from: number; to: number }
-  | { kind: "frontmatter"; from: number; to: number; propCount: number };
+  | { kind: "frontmatter"; from: number; to: number; propCount: number }
+  | { kind: "callout"; from: number; to: number; calloutType: string; title: string }
+  | { kind: "highlight"; from: number; to: number; markFrom: number; markTo: number };
 
 type SelRange = { from: number; to: number };
 
@@ -90,6 +92,71 @@ function touchesSpan(
 
 const ATX_RE = /^ATXHeading([1-6])$/;
 const SETEXT_RE = /^SetextHeading([12])$/;
+
+/** callout 首行匹配：引用块去 `>` 前缀后，检测 `[!type]` + 可选展开/折叠标记 + 标题 */
+const CALLOUT_RE = /^\[!([^\]]+)\]\s*[+-]?\s*(.*)/;
+
+/** 仅允许 [a-z0-9-] 的类型名（小写化后过滤，防注入） */
+function sanitizeCalloutType(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9-]/g, "");
+}
+
+/**
+ * 扫描单行中非行内代码区间的 `==highlight==` 配对。
+ * 返回各匹配的 (innerFrom, innerTo) —— 即 `==` 标记之间的纯内容区间。
+ */
+function scanHighlightsInLine(
+  line: string,
+  baseOffset: number,
+): Array<{ innerFrom: number; innerTo: number; markFrom: number; markTo: number }> {
+  const results: Array<{ innerFrom: number; innerTo: number; markFrom: number; markTo: number }> = [];
+  // 收集行内代码区间（同 wikilink.ts collectCodeSpans 逻辑）
+  const codeSpans: Array<[number, number]> = [];
+  let ci = 0;
+  while (ci < line.length) {
+    if (line[ci] !== "`") { ci++; continue; }
+    let openLen = 0;
+    while (ci + openLen < line.length && line[ci + openLen] === "`") openLen++;
+    const openEnd = ci + openLen;
+    const closeIdx = line.indexOf("`".repeat(openLen), openEnd);
+    if (closeIdx === -1) break;
+    codeSpans.push([ci, closeIdx + openLen]);
+    ci = closeIdx + openLen;
+  }
+  function inCode(pos: number): boolean {
+    for (const [s, e] of codeSpans) if (pos >= s && pos < e) return true;
+    return false;
+  }
+  let i = 0;
+  while (i < line.length - 3) {
+    if (inCode(i)) {
+      for (const [s, e] of codeSpans) { if (i >= s && i < e) { i = e; break; } }
+      continue;
+    }
+    if (line[i] === "=" && line[i + 1] === "=") {
+      // 避免 `===` 误匹配：左侧无 `=` 粘连
+      if (i > 0 && line[i - 1] === "=") { i++; continue; }
+      const openEnd = i + 2;
+      const closeIdx = line.indexOf("==", openEnd);
+      if (closeIdx === -1) break;
+      // 避免 `===` 误匹配：右侧闭合 `==` 后无 `=` 粘连
+      if (closeIdx + 2 < line.length && line[closeIdx + 2] === "=") { i = closeIdx + 1; continue; }
+      const innerLen = closeIdx - openEnd;
+      if (innerLen > 0) {
+        results.push({
+          innerFrom: baseOffset + openEnd,
+          innerTo: baseOffset + closeIdx,
+          markFrom: baseOffset + i,
+          markTo: baseOffset + closeIdx,
+        });
+      }
+      i = closeIdx + 2;
+      continue;
+    }
+    i++;
+  }
+  return results;
+}
 
 /** 判断节点是否在数组区间内。 */
 function inRanges(
@@ -159,6 +226,11 @@ export function computeLivePreviewSpecs(
 
   const sel = state.selection.ranges;
   const seenLine = new Set<string>();
+  /**
+   * 被光标触碰的标题节点区间：标题内行内构造（Strong/Emphasis/行内码/链接/图片）
+   * 在该区间内一律抑制，使标题还原语义与 decorateAtx 一致。
+   */
+  const headingSuppressRanges: Array<{ from: number; to: number }> = [];
 
   // frontmatter 区间（纯文本判定）：无论折叠与否，其内部装饰一律抑制
   // （开头的 `---` 会被 lezer 误判为 HorizontalRule，结尾 `---` 被误判为 Setext）。
@@ -217,12 +289,13 @@ export function computeLivePreviewSpecs(
     }
   }
 
-  /** Setext 标题：正文行加 class，下划线行整体隐藏。 */
-  function decorateSetext(node: SyntaxNodeRef, level: string): void {
+  /** Setext 标题：正文行加 class，下划线行整体隐藏。返回 true 表示光标在正文行（阻止子节点行内装饰）。 */
+  function decorateSetext(node: SyntaxNodeRef, level: string): boolean {
     const textLine = doc.lineAt(node.from);
     const underLine = doc.lineAt(Math.min(node.to, doc.length));
-    if (touchesLine(sel, textLine.from, textLine.to)) return;
-    if (touchesLine(sel, underLine.from, underLine.to)) return;
+    const textTouched = touchesLine(sel, textLine.from, textLine.to);
+    if (textTouched) return true;
+    if (touchesLine(sel, underLine.from, underLine.to)) return true;
     pushLine(textLine.number, LP_CLASS[`h${level}` as keyof typeof LP_CLASS]);
     // 下划线行：自首字符（含可能的缩进）到节点末尾整段隐藏
     const marks = nodeMarks(node);
@@ -231,6 +304,7 @@ export function computeLivePreviewSpecs(
     } else {
       hide(underLine.from, underLine.to);
     }
+    return false;
   }
 
   // 围栏代码块 / 行内码区间：其内的 [[...]] 不视为 wikilink（lezer 树判定）
@@ -255,23 +329,66 @@ export function computeLivePreviewSpecs(
 
       const atx = ATX_RE.exec(name);
       if (atx) {
+        // 光标在标题行时 decorateAtx 不发射装饰；此时记录区间抑制行内子节点
+        const line = doc.lineAt(node.from);
+        if (touchesLine(sel, line.from, line.to)) {
+          headingSuppressRanges.push({ from: node.from, to: node.to });
+        }
         decorateAtx(node, atx[1]);
-        return false;
+        return true; // 继续遍历子节点，但 touched 时被抑制
       }
 
       const setext = SETEXT_RE.exec(name);
       if (setext) {
-        decorateSetext(node, setext[1]);
-        return false;
+        const touched = decorateSetext(node, setext[1]);
+        if (touched) {
+          // 光标在 Setext 正文行：记录区间抑制行内子节点
+          headingSuppressRanges.push({ from: node.from, to: node.to });
+        }
+        return true;
       }
 
       if (name === "Blockquote") {
         const startLine = doc.lineAt(node.from).number;
         const endLine = doc.lineAt(Math.min(node.to, doc.length)).number;
+        // callout 检测：仅检查引用块第一行（去掉 `>` 和空格后匹配 `[!type]`）
+        let calloutInfo: { type: string; title: string; markFrom: number; markTo: number } | null = null;
+        const firstLine = doc.line(startLine);
+        const stripped = firstLine.text.replace(/^(\s*>)+\s*/, "");
+        const calloutMatch = CALLOUT_RE.exec(stripped);
+        if (calloutMatch) {
+          const sanitized = sanitizeCalloutType(calloutMatch[1]);
+          if (sanitized.length > 0) {
+            const firstLineStart = firstLine.from + (firstLine.text.length - firstLine.text.replace(/^(\s*>)+\s*/, "").length);
+            const markStart = firstLineStart + calloutMatch[0].indexOf("[");
+            let markEnd = markStart + calloutMatch[0].length - (calloutMatch[2] ?? "").length;
+            // 修剪 `[!type]` 标记与标题之间的空白：markEnd 只覆盖到 `+`/`-` 后缀
+            markEnd = firstLineStart + calloutMatch[0].slice(0, calloutMatch[0].length - (calloutMatch[2] ?? "").length).trimEnd().length;
+            const firstLineRevealed = touchesLine(sel, firstLine.from, firstLine.to);
+            if (!firstLineRevealed) {
+              calloutInfo = { type: sanitized, title: (calloutMatch[2] ?? "").trim(), markFrom: markStart, markTo: markEnd };
+            }
+          }
+        }
         for (let ln = startLine; ln <= endLine; ln++) {
           const line = doc.line(ln);
           if (line.from > node.to) break;
-          if (!touchesLine(sel, line.from, line.to)) pushLine(ln, LP_CLASS.quote);
+          if (!touchesLine(sel, line.from, line.to)) {
+            pushLine(ln, LP_CLASS.quote);
+            // callout 类型类：该引用块所有未还原行都追加
+            if (calloutInfo) pushLine(ln, `cm-lp-callout cm-lp-callout-${calloutInfo.type}`);
+          }
+        }
+        // 非还原时：第一行 `[!type]` 标记 hide + callout widget spec
+        if (calloutInfo) {
+          hide(calloutInfo.markFrom, calloutInfo.markTo);
+          specs.push({
+            kind: "callout",
+            from: calloutInfo.markFrom,
+            to: calloutInfo.markTo,
+            calloutType: calloutInfo.type,
+            title: calloutInfo.title,
+          });
         }
         return;
       }
@@ -355,6 +472,8 @@ export function computeLivePreviewSpecs(
         name === "Strikethrough" ||
         name === "InlineCode"
       ) {
+        // 标题行内构造 suppress：若光标在标题行，不发射行内装饰
+        if (inRanges(node.from, headingSuppressRanges)) return false;
         const marks = node.node
           .getChildren("EmphasisMark")
           .concat(
@@ -373,6 +492,7 @@ export function computeLivePreviewSpecs(
 
       // ── 图片：block（独占段落）/ inline ──────────────────────────────
       if (name === "Image") {
+        if (inRanges(node.from, headingSuppressRanges)) return false;
         // 抑制 `![[...]]` 嵌入语法——由 wikilink 行扫描器统一处理。
         // 此时 Image 无 URL 子节点（rawSrc 为空），仍会发射 src="" 的误 spec。
         if (node.from < node.to) {
@@ -430,6 +550,7 @@ export function computeLivePreviewSpecs(
 
       // ── Markdown 链接 [text](url) ────────────────────────────────────
       if (name === "Link") {
+        if (inRanges(node.from, headingSuppressRanges)) return false;
         if (inRanges(node.from, tableRanges)) return false;
         const urlNode = node.node.getChild("URL");
         if (!urlNode) return; // 引用式 [text][ref] 无 URL 子节点，跳过
@@ -554,6 +675,33 @@ export function computeLivePreviewSpecs(
         target: sp.target,
         label: sp.label,
       });
+    }
+  }
+
+  // ── `==highlight==` 行扫描：跳过围栏/行内码区间、表格区间和 frontmatter 区间 ──
+  for (let ln = startLineNo; ln <= endLineNo; ln++) {
+    const line = doc.line(ln);
+    if (fmRange && ln > 0) {
+      if (line.from >= fmRange.from && line.from <= fmRange.to) continue;
+    }
+    // 跳过表格区间内的行
+    if (inRanges(line.from, tableRanges)) continue;
+    const hlMatches = scanHighlightsInLine(line.text, line.from);
+    for (const hl of hlMatches) {
+      if (hl.innerTo <= lo || hl.innerFrom >= hi) continue;
+      // 跳过代码区间内的高亮
+      let inCode = false;
+      for (const r of codeRanges) {
+        if (hl.innerFrom < r.to && hl.innerTo > r.from) { inCode = true; break; }
+      }
+      if (inCode) continue;
+      // 还原：光标触碰内容区间（pad=2 包含两侧 `==` 标记）时不渲染
+      if (touchesSpan(sel, hl.innerFrom, hl.innerTo, 2)) continue;
+      // 隐藏两个 `==` 标记
+      hide(hl.markFrom, hl.markFrom + 2);
+      hide(hl.markTo, hl.markTo + 2);
+      // 内容区间加 highlight mark class
+      specs.push({ kind: "highlight", from: hl.innerFrom, to: hl.innerTo, markFrom: hl.markFrom, markTo: hl.markTo });
     }
   }
 

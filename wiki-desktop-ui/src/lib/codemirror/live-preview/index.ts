@@ -17,6 +17,7 @@ import {
   CodeHeaderWidget,
   CodeFooterWidget,
   FrontmatterWidget,
+  CalloutWidget,
 } from "./widgets";
 import { livePreviewTheme } from "./theme";
 import { isAttachmentSrc } from "@/lib/attachments";
@@ -45,8 +46,9 @@ export { wikilinkNavFacet } from "./widgets";
  * - `line` → `Decoration.line`
  * - `mark` → `Decoration.mark`
  * - `hide` → `Decoration.replace({})`（零宽，不占位）
- * - `checkbox` / `hr` / `wikilink` / `image` / `mdlink` / `table` / `codeheader` / `codefooter`
+ * - `checkbox` / `hr` / `wikilink` / `image` / `mdlink` / `table` / `codeheader` / `codefooter` / `callout`
  *   → `Decoration.replace({ widget })`
+ * - `highlight` → 两个 `==` 分别 `Decoration.replace({})`，内容 `Decoration.mark`
  *
  * 隐藏区间与 widget 区间必须避免部分重叠：同一标题的 HeaderMark 分属不同
  * 区间，彼此不交叠；checkbox 与同行 ListMark 区间分离（`[ ]` vs `-`）。
@@ -126,7 +128,33 @@ function buildDecoSet(view: EditorView): { decos: DecorationSet; specs: DecoSpec
           inlineDecos.push({
             from: spec.from,
             to: spec.to,
-            deco: Decoration.replace({ widget: new TableWidget(spec.raw), block: true }),
+            deco: Decoration.replace({ widget: new TableWidget(spec.raw, view), block: true }),
+          });
+          break;
+        case "callout":
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.replace({
+              widget: new CalloutWidget(spec.calloutType, spec.title),
+            }),
+          });
+          break;
+        case "highlight":
+          inlineDecos.push({
+            from: spec.markFrom,
+            to: spec.markFrom + 2,
+            deco: Decoration.replace({}),
+          });
+          inlineDecos.push({
+            from: spec.markTo,
+            to: spec.markTo + 2,
+            deco: Decoration.replace({}),
+          });
+          inlineDecos.push({
+            from: spec.from,
+            to: spec.to,
+            deco: Decoration.mark({ class: "cm-lp-highlight" }),
           });
           break;
         case "codeheader":

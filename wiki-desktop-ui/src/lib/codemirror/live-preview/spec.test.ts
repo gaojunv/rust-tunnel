@@ -663,3 +663,250 @@ describe("frontmatter folding", () => {
     expect(ofKind(full(state), "frontmatter")).toEqual([]);
   });
 });
+
+// ── Callout `> [!type]` 渲染测试 ─────────────────────────────────────────────
+
+describe("callout rendering", () => {
+  it("basic callout with title → callout spec + hide + line classes", () => {
+    const doc = "> [!note] Title\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const callouts = ofKind(specs, "callout") as Extract<DecoSpec, { kind: "callout" }>[];
+    expect(callouts).toHaveLength(1);
+    expect(callouts[0]).toMatchObject({
+      kind: "callout",
+      calloutType: "note",
+      title: "Title",
+    });
+    // hide 覆盖 `[!note]` 标记区间（不含标题文字）
+    const hides = ofKind(specs, "hide") as Extract<DecoSpec, { kind: "hide" }>[];
+    const markerHides = hides.filter((h) => doc.slice(h.from, h.to) === "[!note]");
+    expect(markerHides).toHaveLength(1);
+    // 行 class 含 callout
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    expect(lineSpecs.some((l) => l.cls.includes("cm-lp-callout"))).toBe(true);
+    expect(lineSpecs.some((l) => l.cls.includes("cm-lp-callout-note"))).toBe(true);
+  });
+
+  it("callout without title → callout spec with empty title", () => {
+    const doc = "> [!warning]\n> content\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const callouts = ofKind(specs, "callout") as Extract<DecoSpec, { kind: "callout" }>[];
+    expect(callouts).toHaveLength(1);
+    expect(callouts[0]).toMatchObject({ calloutType: "warning", title: "" });
+    // 第二行无 callout class
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    expect(lineSpecs.some((l) => l.line === 2 && l.cls.includes("cm-lp-callout"))).toBe(true);
+  });
+
+  it("multiline callout → all lines get callout class", () => {
+    const doc = "> [!note]\n> line1\n> line2\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    const calloutLines = lineSpecs.filter((l) => l.cls.includes("cm-lp-callout-note"));
+    expect(calloutLines.map((l) => l.line)).toEqual([1, 2, 3]);
+  });
+
+  it("cursor on callout first line → no callout spec (restored)", () => {
+    const doc = "> [!note] Title\n> content\n";
+    const state = makeState(doc, [{ anchor: 3 }]); // 光标在 callout 首行
+    const specs = full(state);
+    expect(ofKind(specs, "callout")).toEqual([]);
+    // 首行连 quote class 也不应有（整块还原）
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    expect(lineSpecs.some((l) => l.line === 1)).toBe(false);
+  });
+
+  it("non-first-line [!x] not recognized as callout", () => {
+    const doc = "> line1\n> [!note] here\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    // 第二行不是 callout 首行，不识别
+    expect(ofKind(specs, "callout")).toEqual([]);
+    // 但第二行仍有 quote class
+    const lineSpecs = ofKind(specs, "line") as Extract<DecoSpec, { kind: "line" }>[];
+    expect(lineSpecs).toContainEqual({ kind: "line", line: 2, cls: LP_CLASS.quote });
+  });
+
+  it("callout with expand marker + is sanitized type", () => {
+    const doc = "> [!tip]+\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const callouts = ofKind(specs, "callout") as Extract<DecoSpec, { kind: "callout" }>[];
+    expect(callouts[0]).toMatchObject({ calloutType: "tip", title: "" });
+  });
+
+  it("callout type sanitized: non-alnum chars stripped", () => {
+    const doc = "> [!My-Note!]\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const callouts = ofKind(specs, "callout") as Extract<DecoSpec, { kind: "callout" }>[];
+    expect(callouts[0]).toMatchObject({ calloutType: "my-note" });
+  });
+
+  it("plain quote (no callout marker) → no callout spec", () => {
+    const doc = "> just a quote\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    expect(ofKind(specs, "callout")).toEqual([]);
+    expect(ofKind(specs, "line")).toEqual([{ kind: "line", line: 1, cls: LP_CLASS.quote }]);
+  });
+});
+
+// ── ==highlight== 渲染测试 ───────────────────────────────────────────────────
+
+describe("==highlight== rendering", () => {
+  it("basic highlight pair → hide + highlight mark", () => {
+    const doc = "==hl==\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const highlights = ofKind(specs, "highlight") as Extract<DecoSpec, { kind: "highlight" }>[];
+    expect(highlights).toHaveLength(1);
+    expect(highlights[0]).toMatchObject({
+      from: 2,
+      to: 4,
+      markFrom: 0,
+      markTo: 4,
+    });
+    // 两个 `==` 都有 hide（positions 0-2, 4-6）
+    const hides = ofKind(specs, "hide") as Extract<DecoSpec, { kind: "hide" }>[];
+    const eqHides = hides.filter((h) => doc.slice(h.from, h.to) === "==");
+    expect(eqHides).toHaveLength(2);
+  });
+
+  it("highlight inside inline code → not rendered", () => {
+    const doc = "`==not hl==`\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("unclosed == → not rendered", () => {
+    const doc = "==unclosed\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("cursor touches highlight content (pad=2) → restored", () => {
+    const doc = "a ==hl== b\n\ntail\n";
+    // 光标在 `hl` 内部（位置 4）
+    const state = makeState(doc, [{ anchor: 4 }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("cursor touches highlight mark boundary → restored (pad=2)", () => {
+    const doc = "a ==hl== b\n\ntail\n";
+    // 光标紧贴 `==` 开标记右侧（位置 3）
+    const state = makeState(doc, [{ anchor: 3 }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("cursor away → highlight rendered", () => {
+    const doc = "==hl==\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const highlights = ofKind(full(state), "highlight") as Extract<DecoSpec, { kind: "highlight" }>[];
+    expect(highlights).toHaveLength(1);
+  });
+
+  it("multiple highlights on same line", () => {
+    const doc = "==a== and ==b==\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const highlights = ofKind(full(state), "highlight") as Extract<DecoSpec, { kind: "highlight" }>[];
+    expect(highlights).toHaveLength(2);
+  });
+
+  it("empty highlight == == → not rendered", () => {
+    const doc = "====\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("=== not treated as highlight (triple =)", () => {
+    const doc = "===not hl===\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("highlight inside table cell → not rendered (table widget handles)", () => {
+    const doc = "| ==hl== |\n|---|\n| x |\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+
+  it("highlight in frontmatter → not rendered", () => {
+    const doc = "---\ntitle: ==no==\n---\nbody\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    expect(ofKind(full(state), "highlight")).toEqual([]);
+  });
+});
+
+// ── 标题内行内构造测试 ───────────────────────────────────────────────────────
+
+describe("inline constructs inside headings", () => {
+  it("heading with bold + link → header mark hide + bold hide + mdlink spec", () => {
+    const doc = "# Title **bold** [link](http://x.com)\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    // 标题行 class
+    expect(specs).toContainEqual({ kind: "line", line: 1, cls: LP_CLASS.h1 });
+    // HeaderMark hide（`# `）
+    expect(specs).toContainEqual({ kind: "hide", from: 0, to: 2 });
+    // 粗体标记 hide（两个 `**`）
+    const hides = ofKind(specs, "hide") as Extract<DecoSpec, { kind: "hide" }>[];
+    const boldHides = hides.filter((h) => doc.slice(h.from, h.to) === "**");
+    expect(boldHides).toHaveLength(2);
+    // mdlink spec
+    const links = ofKind(specs, "mdlink") as Extract<DecoSpec, { kind: "mdlink" }>[];
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ text: "link", url: "http://x.com" });
+  });
+
+  it("cursor on heading line → all restored (no inline specs)", () => {
+    const doc = "# Title **bold**\n";
+    const state = makeState(doc, [{ anchor: 3 }]); // 光标在标题行
+    const specs = full(state);
+    expect(specs).toEqual([]);
+  });
+
+  it("setext heading with bold → bold marks hidden when cursor away", () => {
+    const doc = "Title **bold**\n===\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    // 标题行 class
+    expect(specs).toContainEqual({ kind: "line", line: 1, cls: LP_CLASS.h1 });
+    // 粗体标记 hide
+    const hides = ofKind(specs, "hide") as Extract<DecoSpec, { kind: "hide" }>[];
+    const boldHides = hides.filter((h) => doc.slice(h.from, h.to) === "**");
+    expect(boldHides).toHaveLength(2);
+  });
+
+  it("heading with inline code → code ranges tracked, no hide from highlight scan", () => {
+    const doc = "# Title `code`\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    // 标题行 class
+    expect(specs).toContainEqual({ kind: "line", line: 1, cls: LP_CLASS.h1 });
+    // 行内码标记 hide（` 反引号）
+    const hides = ofKind(specs, "hide") as Extract<DecoSpec, { kind: "hide" }>[];
+    const codeHides = hides.filter((h) => doc.slice(h.from, h.to) === "`");
+    expect(codeHides).toHaveLength(2);
+  });
+
+  it("heading with wikilink → wikilink spec emitted", () => {
+    const doc = "# [[target|label]]\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const wikilinks = ofKind(specs, "wikilink") as Extract<DecoSpec, { kind: "wikilink" }>[];
+    expect(wikilinks).toHaveLength(1);
+    expect(wikilinks[0]).toMatchObject({ target: "target", label: "label" });
+  });
+
+  it("heading with highlight → highlight rendered inside heading", () => {
+    const doc = "# Title ==hl==\n\ntail\n";
+    const state = makeState(doc, [{ anchor: doc.length }]);
+    const specs = full(state);
+    const highlights = ofKind(specs, "highlight") as Extract<DecoSpec, { kind: "highlight" }>[];
+    expect(highlights).toHaveLength(1);
+  });
+});
