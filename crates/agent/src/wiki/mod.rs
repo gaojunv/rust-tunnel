@@ -457,13 +457,13 @@ mod tests {
         .await
         .unwrap();
         // page_count 影响排序
-        db.wiki_upsert_page("g1", "p1", "t", "s", "c", false, None)
+        db.wiki_upsert_page("g1", "p1", "t", "s", "c", false, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("g1", "p2", "t", "s", "c", false, None)
+        db.wiki_upsert_page("g1", "p2", "t", "s", "c", false, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("w1a", "p1", "t", "s", "c", false, None)
+        db.wiki_upsert_page("w1a", "p1", "t", "s", "c", false, None, None)
             .await
             .unwrap();
 
@@ -528,10 +528,11 @@ mod tests {
             "内容含部署相关",
             false,
             None,
+            None,
         )
         .await
         .unwrap();
-        db.wiki_upsert_page("w1", "other/page", "其他", "摘要", "无关", false, None)
+        db.wiki_upsert_page("w1", "other/page", "其他", "摘要", "无关", false, None, None)
             .await
             .unwrap();
 
@@ -639,13 +640,13 @@ mod tests {
         })
         .await
         .unwrap();
-        db.wiki_upsert_page("w1b", "ws/page", "ws", "s", "ws content", false, None)
+        db.wiki_upsert_page("w1b", "ws/page", "ws", "s", "ws content", false, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("c1w", "cl/page", "cl", "s", "cl content", false, None)
+        db.wiki_upsert_page("c1w", "cl/page", "cl", "s", "cl content", false, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("g1", "gl/page", "gl", "s", "gl content", false, None)
+        db.wiki_upsert_page("g1", "gl/page", "gl", "s", "gl content", false, None, None)
             .await
             .unwrap();
         let out = wiki_search_from_agent(
@@ -711,10 +712,10 @@ mod tests {
         })
         .await
         .unwrap();
-        db.wiki_upsert_page("w1", "a/b", "A", "sum A", "content A", false, None)
+        db.wiki_upsert_page("w1", "a/b", "A", "sum A", "content A", false, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("w1", "c/d", "C", "sum C", "content C", false, None)
+        db.wiki_upsert_page("w1", "c/d", "C", "sum C", "content C", false, None, None)
             .await
             .unwrap();
 

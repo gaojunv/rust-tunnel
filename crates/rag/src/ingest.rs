@@ -497,6 +497,7 @@ async fn ingest_pages(
                 &body,
                 false,
                 Some(doc_id),
+                None,
             )
             .await
         {
@@ -1415,6 +1416,7 @@ mod tests {
             "手动摘要",
             "手动维护的内容",
             true,
+            None,
             None,
         )
         .await

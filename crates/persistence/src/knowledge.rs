@@ -1482,7 +1482,7 @@ mod tests {
             .await
             .unwrap();
         // 建一页（走 wiki DAO，验证 FTS 级联清理）
-        db.wiki_upsert_page("w1", "a/b", "T", "S", "hello world", false, Some("doc1"))
+        db.wiki_upsert_page("w1", "a/b", "T", "S", "hello world", false, Some("doc1"), None)
             .await
             .unwrap();
         let fts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_pages_fts")

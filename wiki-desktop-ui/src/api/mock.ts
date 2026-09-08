@@ -497,6 +497,7 @@ async function handleMockRequest(urlStr: string, init?: RequestInit): Promise<Re
       const title = String(parsed["title"] ?? ref);
       const content = String(parsed["content"] ?? "");
       const summary = String(parsed["summary"] ?? "");
+      const originKey = typeof parsed["origin_key"] === "string" ? parsed["origin_key"] : null;
       const page: RemotePage = {
         ref,
         title,
@@ -504,6 +505,7 @@ async function handleMockRequest(urlStr: string, init?: RequestInit): Promise<Re
         content,
         locked: false,
         updated_at: formatUtcNow(),
+        origin_key: originKey,
       };
       mockRemotePages.set(ref, page);
       return jsonResponse(page);

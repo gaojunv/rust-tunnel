@@ -102,6 +102,8 @@ pub struct AgentWikiPageRecord {
     pub use_count: i64,
     /// 最后使用时间，未使用为 None。
     pub last_used_at: Option<String>,
+    /// 同步客户端上传的原始本地 key（可空，供另一端还原路径）。
+    pub origin_key: Option<String>,
     /// 创建时间。
     pub created_at: String,
     /// 更新时间。
@@ -131,6 +133,8 @@ pub struct AgentWikiPageSummary {
     pub use_count: i64,
     /// 最后使用时间，未使用为 None。
     pub last_used_at: Option<String>,
+    /// 同步客户端上传的原始本地 key（可空，供另一端还原路径）。
+    pub origin_key: Option<String>,
     /// 创建时间。
     pub created_at: String,
     /// 更新时间。
@@ -202,6 +206,8 @@ pub struct WikiGraphEdge {
 impl Database {
     /// 页面 upsert：`locked=1` 的页不被覆盖；同事务同步 FTS 与边。
     /// `source_doc_id` 可空（手动页为 `None`）。
+    /// `origin_key` 为 `None` 时保留现值（`COALESCE` 语义），避免 ingest
+    /// 等调用方清空同步客户端写入的原始 key。
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // 保留：单调用点方法，Opts 化成本高
@@ -214,9 +220,10 @@ impl Database {
         content: &str,
         locked: bool,
         source_doc_id: Option<&str>,
+        origin_key: Option<&str>,
     ) -> Result<String, sqlx::Error> {
         let existing: Option<AgentWikiPageRecord> = sqlx::query_as(
-            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id = ? AND ref = ?",
         )
         .bind(wiki_id)
@@ -250,7 +257,7 @@ impl Database {
         if existing.is_some() {
             sqlx::query(
                 r"UPDATE knowledge_pages
-                   SET title = ?, summary = ?, content = ?, locked = ?, source_doc_id = ?, updated_at = datetime('now')
+                   SET title = ?, summary = ?, content = ?, locked = ?, source_doc_id = ?, origin_key = COALESCE(?, origin_key), updated_at = datetime('now')
                    WHERE id = ?",
             )
             .bind(title)
@@ -258,6 +265,7 @@ impl Database {
             .bind(content)
             .bind(i64::from(locked))
             .bind(source_doc_id)
+            .bind(origin_key)
             .bind(&page_id)
             .execute(&mut *tx)
             .await?;
@@ -273,8 +281,8 @@ impl Database {
                 .await?;
         } else {
             sqlx::query(
-                r"INSERT INTO knowledge_pages (id, source_id, ref, title, summary, content, locked, source_doc_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                r"INSERT INTO knowledge_pages (id, source_id, ref, title, summary, content, locked, source_doc_id, origin_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&page_id)
             .bind(wiki_id)
@@ -284,6 +292,7 @@ impl Database {
             .bind(content)
             .bind(i64::from(locked))
             .bind(source_doc_id)
+            .bind(origin_key)
             .execute(&mut *tx)
             .await?;
         }
@@ -354,7 +363,7 @@ impl Database {
         page_ref: &str,
     ) -> Result<Option<AgentWikiPageRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiPageRecord>(
-            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id = ? AND ref = ?",
         )
         .bind(wiki_id)
@@ -369,7 +378,7 @@ impl Database {
         id: &str,
     ) -> Result<Option<AgentWikiPageRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiPageRecord>(
-            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE id = ?",
         )
         .bind(id)
@@ -386,7 +395,7 @@ impl Database {
         page_ref: &str,
     ) -> Result<bool, sqlx::Error> {
         let existing: Option<AgentWikiPageRecord> = sqlx::query_as(
-            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id = ? AND ref = ?",
         )
         .bind(wiki_id)
@@ -443,7 +452,7 @@ impl Database {
         doc_id: &str,
     ) -> Result<u64, sqlx::Error> {
         let rows: Vec<AgentWikiPageRecord> = sqlx::query_as(
-            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id = ? AND source_doc_id = ? AND locked = 0",
         )
         .bind(wiki_id)
@@ -507,7 +516,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<AgentWikiPageSummary>, sqlx::Error> {
         let mut qb = sqlx::QueryBuilder::new(
-            "SELECT id, source_id, ref, title, summary, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id = ",
         );
         qb.push_bind(wiki_id);
@@ -552,7 +561,7 @@ impl Database {
     /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_graph(&self, wiki_id: &str) -> Result<WikiGraph, sqlx::Error> {
         let nodes: Vec<AgentWikiPageSummary> = sqlx::query_as(
-            "SELECT id, source_id, ref, title, summary, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id = ? ORDER BY ref",
         )
         .bind(wiki_id)
@@ -628,7 +637,7 @@ impl Database {
         let like = format!("%{q}%");
         if visible_wiki_ids.is_empty() {
             let rows: Vec<AgentWikiPageRecord> = sqlx::query_as(
-                "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+                "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
                  FROM knowledge_pages WHERE title LIKE ? OR summary LIKE ? OR content LIKE ? OR ref LIKE ? LIMIT ?",
             )
             .bind(&like)
@@ -652,7 +661,7 @@ impl Database {
                 .collect());
         }
         let mut qb = sqlx::QueryBuilder::new(
-            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
+            "SELECT id, source_id, ref, title, summary, content, locked, source_doc_id, use_count, last_used_at, origin_key, created_at, updated_at \
              FROM knowledge_pages WHERE source_id IN (",
         );
         let mut sep = qb.separated(", ");
@@ -868,6 +877,7 @@ mod tests {
             "内容含 [[other/ref]]",
             false,
             Some("doc1"),
+            None,
         )
         .await
         .unwrap();
@@ -881,6 +891,7 @@ mod tests {
             "摘要2",
             "手动内容",
             true,
+            None,
             None,
         )
         .await
@@ -901,6 +912,7 @@ mod tests {
             "x",
             false,
             Some("doc2"),
+            None,
         )
         .await
         .unwrap();
@@ -950,10 +962,11 @@ mod tests {
             "这里是部署相关内容",
             false,
             None,
+            None,
         )
         .await
         .unwrap();
-        db.wiki_upsert_page("w1", "p2", "其他", "摘要", "完全不相关的内容", false, None)
+        db.wiki_upsert_page("w1", "p2", "其他", "摘要", "完全不相关的内容", false, None, None)
             .await
             .unwrap();
 
@@ -991,10 +1004,11 @@ mod tests {
             "link to [[b]] and [[missing]]",
             false,
             None,
+            None,
         )
         .await
         .unwrap();
-        db.wiki_upsert_page("w1", "b", "B", "", "no links", false, None)
+        db.wiki_upsert_page("w1", "b", "B", "", "no links", false, None, None)
             .await
             .unwrap();
 
@@ -1012,13 +1026,13 @@ mod tests {
     async fn wiki_page_list_filters_and_bump() {
         let db = Database::new(":memory:").await.unwrap();
         db.ks_create(&pages_opts("w1", "wiki")).await.unwrap();
-        db.wiki_upsert_page("w1", "deploy/a", "A", "s", "c", false, None)
+        db.wiki_upsert_page("w1", "deploy/a", "A", "s", "c", false, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("w1", "deploy/b", "B", "s", "c", true, None)
+        db.wiki_upsert_page("w1", "deploy/b", "B", "s", "c", true, None, None)
             .await
             .unwrap();
-        db.wiki_upsert_page("w1", "other/c", "C", "s", "c", false, None)
+        db.wiki_upsert_page("w1", "other/c", "C", "s", "c", false, None, None)
             .await
             .unwrap();
 
@@ -1045,7 +1059,7 @@ mod tests {
     async fn wiki_fts_rowid_coupling() {
         let db = Database::new(":memory:").await.unwrap();
         db.ks_create(&pages_opts("w1", "wiki")).await.unwrap();
-        db.wiki_upsert_page("w1", "r1", "t", "s", "hello world unique123", false, None)
+        db.wiki_upsert_page("w1", "r1", "t", "s", "hello world unique123", false, None, None)
             .await
             .unwrap();
         // 更新同一 ref 应正确替换 FTS 行（旧 rowid 删除，新 rowid 插入）
@@ -1056,6 +1070,7 @@ mod tests {
             "s2",
             "hello world unique123 updated",
             false,
+            None,
             None,
         )
         .await
@@ -1085,10 +1100,10 @@ mod tests {
         db.kdoc_create("doc1", "w1", "a.md", "md", "sha256:x")
             .await
             .unwrap();
-        db.wiki_upsert_page("w1", "a/p1", "P1", "s", "c", false, Some("doc1"))
+        db.wiki_upsert_page("w1", "a/p1", "P1", "s", "c", false, Some("doc1"), None)
             .await
             .unwrap();
-        db.wiki_upsert_page("w1", "a/p2", "P2", "s", "c", true, Some("doc1"))
+        db.wiki_upsert_page("w1", "a/p2", "P2", "s", "c", true, Some("doc1"), None)
             .await
             .unwrap();
         let n = db.wiki_clear_pages_by_doc("w1", "doc1").await.unwrap();
@@ -1100,5 +1115,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fts_count, 1);
+    }
+
+    #[tokio::test]
+    async fn wiki_origin_key_write_read_and_coalesce() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.ks_create(&pages_opts("w1", "wiki")).await.unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "n-abc123def012",
+            "部署手册",
+            "s",
+            "c",
+            false,
+            None,
+            Some("项目/部署手册"),
+        )
+        .await
+        .unwrap();
+        let p = db
+            .wiki_get_page("w1", "n-abc123def012")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.origin_key.as_deref(), Some("项目/部署手册"));
+        let list = db
+            .wiki_list_pages("w1", None, None, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].origin_key.as_deref(), Some("项目/部署手册"));
+
+        // 二次 upsert 传 None → origin_key 保留（COALESCE 语义）
+        db.wiki_upsert_page("w1", "n-abc123def012", "部署手册", "s", "c2", false, None, None)
+            .await
+            .unwrap();
+        let p = db
+            .wiki_get_page("w1", "n-abc123def012")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.origin_key.as_deref(), Some("项目/部署手册"));
+
+        // 传新值 → 更新
+        db.wiki_upsert_page(
+            "w1",
+            "n-abc123def012",
+            "部署手册",
+            "s",
+            "c3",
+            false,
+            None,
+            Some("项目/新名"),
+        )
+        .await
+        .unwrap();
+        let p = db
+            .wiki_get_page("w1", "n-abc123def012")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.origin_key.as_deref(), Some("项目/新名"));
     }
 }

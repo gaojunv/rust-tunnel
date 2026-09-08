@@ -3,7 +3,7 @@
  * 方向判定严格按任务说明伪码实现
  */
 
-import { toRemoteRef } from "./ref-id";
+import { toRemoteRef, sanitizeOriginKey } from "./ref-id";
 import type { RemotePageSummary, ServerApi } from "../api/server";
 
 /** 冲突副本检测：最后一段匹配 /\.conflict-\d{8}-\d{6}$/（模块级导出） */
@@ -45,13 +45,21 @@ export function emptySyncState(knowledgeId: string): SyncState {
 }
 
 /**
- * 解析远端时间字符串 "YYYY-MM-DD HH:MM:SS" 为 epoch 秒（按 UTC）
- * 容错返回 0
+ * 解析远端时间字符串为 epoch 秒
+ * 兼容两种格式："YYYY-MM-DD HH:MM:SS"（空格分隔，视为 UTC）与 ISO 串
+ * （"2024-01-02T03:04:05Z" / 带小数秒 / 带 +08:00 这类时区偏移）
+ * trim 后若已含 T 或已带时区后缀（Z / ±hh:mm / ±hhmm）直接 Date.parse；
+ * 否则把空格换成 T 再追加 Z。非法/空返回 0
  */
 export function parseRemoteTime(s: string): number {
   try {
     if (!s || typeof s !== "string") return 0;
-    const iso = s.trim().replace(" ", "T") + "Z";
+    const t = s.trim();
+    if (t === "") return 0;
+    // 已是 ISO 形态（含 T 或已带时区后缀）→ 直接解析，避免重复追加 Z 导致 NaN
+    const hasT = t.includes("T");
+    const hasTz = /([Zz]|[+-]\d{2}:?\d{2})$/.test(t);
+    const iso = hasT || hasTz ? t : t.replace(" ", "T") + "Z";
     const ms = Date.parse(iso);
     if (Number.isNaN(ms)) return 0;
     return Math.floor(ms / 1000);
@@ -92,6 +100,7 @@ export async function hashNote(title: string, body: string): Promise<string> {
 export type Action =
   | { kind: "upload"; key: string; ref: string }
   | { kind: "download"; key: string; ref: string }
+  | { kind: "download-new"; key: string; ref: string }
   | { kind: "conflict-local-wins"; key: string; ref: string }
   | { kind: "conflict-remote-wins"; key: string; ref: string }
   | { kind: "conflict-pending"; key: string; ref: string; localModified: number; remoteUpdatedAt: string }
@@ -117,6 +126,8 @@ export function planSync(input: {
   for (const r of remote) remoteByRef.set(r.ref, r);
 
   const seenLocal = new Set<string>();
+  const claimedRefs = new Set<string>();
+  const localKeys = new Set<string>();
   const actions: Action[] = [];
 
   for (const note of local) {
@@ -141,6 +152,8 @@ export function planSync(input: {
     }
 
     seenLocal.add(note.key);
+    claimedRefs.add(ref);
+    localKeys.add(note.key);
 
     if (note.body.trim() === "") {
       actions.push({ kind: "skip-empty", key: note.key });
@@ -221,6 +234,37 @@ export function planSync(input: {
     }
   }
 
+  // 服务端独有页面 → 下载（本地新增覆盖不到的远端 ref）
+  for (const r of remote) {
+    // 已被本地笔记覆盖（主循环中 toRemoteRef 算出该 ref）
+    if (claimedRefs.has(r.ref)) continue;
+    // 已有同步条目 → 由"本地已删"分支（delete-remote/drop-state）处理
+    let tracked = false;
+    for (const key of Object.keys(state.entries)) {
+      if (state.entries[key].ref === r.ref) {
+        tracked = true;
+        break;
+      }
+    }
+    if (tracked) continue;
+    // 删除墓碑：本地删过且远端未变 → 不复活
+    if (state.skipped[r.ref] === r.updated_at) continue;
+    // key 选择：origin_key（安全时）优先还原原始路径，被本地占用则退到 ref，
+    // 两者都被占才跳过（本地笔记撞上的是别的 ref 的下载目标）
+    const preferred = r.origin_key ? sanitizeOriginKey(r.origin_key) : null;
+    const candidates = preferred != null && preferred !== r.ref ? [preferred, r.ref] : [r.ref];
+    const downloadKey = candidates.find((k) => !localKeys.has(k));
+    if (downloadKey == null) {
+      actions.push({
+        kind: "skip-incompatible",
+        key: preferred ?? r.ref,
+        reason: `远端页面 "${r.ref}"（origin_key: ${r.origin_key ?? "无"}）的可用本地 key 均被指向别的 ref 的笔记占用，跳过下载`,
+      });
+      continue;
+    }
+    actions.push({ kind: "download-new", key: downloadKey, ref: r.ref });
+  }
+
   return actions;
 }
 
@@ -246,6 +290,8 @@ export interface SyncReport {
 export interface SyncIO {
   local: {
     writeNote(key: string, title: string, body: string): Promise<{ modified: number }>;
+    /** 将 sticky ref 写进本地 frontmatter（下载新页面后），可选 */
+    setNoteRef?(key: string, ref: string): Promise<unknown>;
   };
   remote: ServerApi;
   now(): number; // epoch 秒
@@ -294,11 +340,13 @@ export async function runSync(
           const note = localByKey.get(action.key);
           if (!note) throw new Error(`本地笔记不存在: ${action.key}`);
           const title = truncTitle(note.title);
-          const result = await io.remote.putPage(action.ref, {
+          const uploadBody: { title: string; summary: string; content: string; origin_key?: string } = {
             title,
             summary: "",
             content: note.body,
-          });
+          };
+          if (note.key !== action.ref) uploadBody.origin_key = note.key;
+          const result = await io.remote.putPage(action.ref, uploadBody);
           // locked 检测
           if (result.content !== note.body) {
             report.items.push({ action, ok: false, detail: "locked-skipped" });
@@ -318,11 +366,13 @@ export async function runSync(
           const note = localByKey.get(action.key);
           if (!note) throw new Error(`本地笔记不存在: ${action.key}`);
           const title = truncTitle(note.title);
-          const result = await io.remote.putPage(action.ref, {
+          const restoreBody: { title: string; summary: string; content: string; origin_key?: string } = {
             title,
             summary: "",
             content: note.body,
-          });
+          };
+          if (note.key !== action.ref) restoreBody.origin_key = note.key;
+          const result = await io.remote.putPage(action.ref, restoreBody);
           if (result.content !== note.body) {
             report.items.push({ action, ok: false, detail: "locked-skipped" });
             report.errors++;
@@ -358,7 +408,29 @@ export async function runSync(
           report.deletedRemote++;
           break;
         }
+        case "download-new": {
+          const remotePage = await io.remote.getPage(action.ref);
+          if (!remotePage) throw new Error(`远端页面不存在: ${action.ref}`);
+          await io.local.writeNote(action.key, remotePage.title, remotePage.content);
+          // key≠ref 时写入 sticky ref，使后续同步收敛到 frontmatter ref
+          if (action.key !== action.ref && io.local.setNoteRef) {
+            try { await io.local.setNoteRef(action.key, action.ref); } catch (e) { console.warn("setNoteRef failed", e); }
+          }
+          const h = await hashNote(remotePage.title, remotePage.content);
+          state.entries[action.key] = {
+            ref: action.ref,
+            localHash: h,
+            remoteUpdatedAt: remotePage.updated_at,
+          };
+          delete state.skipped[action.ref];
+          report.items.push({ action, ok: true });
+          report.downloaded++;
+          break;
+        }
         case "drop-state": {
+          // 删除墓碑：记住远端 updated_at，防止下个周期当作 remote-only 重新下载回来
+          const entry = state.entries[action.key];
+          if (entry) state.skipped[entry.ref] = entry.remoteUpdatedAt;
           delete state.entries[action.key];
           report.items.push({ action, ok: true });
           report.skipped++;
@@ -375,11 +447,13 @@ export async function runSync(
           }
           // 再执行本地覆盖远端
           const title = truncTitle(note.title);
-          const result = await io.remote.putPage(action.ref, {
+          const conflictBody: { title: string; summary: string; content: string; origin_key?: string } = {
             title,
             summary: "",
             content: note.body,
-          });
+          };
+          if (note.key !== action.ref) conflictBody.origin_key = note.key;
+          const result = await io.remote.putPage(action.ref, conflictBody);
           if (result.content !== note.body) {
             report.items.push({ action, ok: false, detail: "locked-skipped" });
             report.errors++;

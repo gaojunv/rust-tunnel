@@ -42,6 +42,24 @@ describe("parseRemoteTime", () => {
     expect(parseRemoteTime("not-a-time")).toBe(0);
     expect(parseRemoteTime(null as unknown as string)).toBe(0);
   });
+  it("ISO 带 Z 直接解析（回归：不再追加第二个 Z）", () => {
+    const t = parseRemoteTime("2024-01-02T03:04:05Z");
+    expect(t).toBe(Math.floor(Date.parse("2024-01-02T03:04:05Z") / 1000));
+    expect(t).toBeGreaterThan(0);
+  });
+  it("ISO 小数秒", () => {
+    const t = parseRemoteTime("2024-01-02T03:04:05.123Z");
+    expect(t).toBe(Math.floor(Date.parse("2024-01-02T03:04:05.123Z") / 1000));
+  });
+  it("ISO 时区偏移", () => {
+    // 11:04:05+08:00 == 03:04:05Z
+    const t = parseRemoteTime("2024-01-02T11:04:05+08:00");
+    expect(t).toBe(Math.floor(Date.parse("2024-01-02T03:04:05Z") / 1000));
+  });
+  it("空格格式仍按 UTC 解析", () => {
+    const t = parseRemoteTime("2024-01-02 03:04:05");
+    expect(t).toBe(Math.floor(Date.parse("2024-01-02T03:04:05Z") / 1000));
+  });
 });
 
 describe("conflictCopyKey", () => {
@@ -268,6 +286,87 @@ describe("planSync 全分支", () => {
     // key "conflict-20240102-030405/a" 归一后为 "conflict-20240102-030405/a" 合法
     expect(actions[0].kind).not.toBe("skip-conflict-copy");
   });
+
+  // —— download-new（服务端独有页面）——
+
+  it("全新客户端：local=[], state 空, remote 有页面 → download-new", () => {
+    const actions = planSync({
+      local: [],
+      remote: [remote("foo", "2024-01-02T00:00:00Z"), remote("folder/note", "2024-01-02T00:00:00Z")],
+      state,
+      propagateDeletes: false,
+    });
+    expect(actions).toEqual([
+      { kind: "download-new", key: "foo", ref: "foo" },
+      { kind: "download-new", key: "folder/note", ref: "folder/note" },
+    ]);
+  });
+
+  it("remote-only 但 ref 已被本地笔记占用 → 不产生 download-new", () => {
+    // 本地笔记 key="foo" → ref="foo"，远端也有 ref="foo" → 应在主循环处理，不产生 download-new
+    const actions = planSync({
+      local: [note({ key: "foo", body: "local" })],
+      remote: [remote("foo", "2024-01-02T00:00:00Z")],
+      state,
+      propagateDeletes: false,
+    });
+    // 首次见面 + 远端已存在 → 冲突（local-wins 因为 modified=1000 > 0）
+    expect(actions.some((a) => a.kind === "download-new")).toBe(false);
+  });
+
+  it("墓碑跳过：state.skipped[ref] === remote.updated_at → 无 download-new", () => {
+    const rs = remote("foo", "2024-01-02T00:00:00Z");
+    state.skipped["foo"] = "2024-01-02T00:00:00Z";
+    const actions = planSync({
+      local: [],
+      remote: [rs],
+      state,
+      propagateDeletes: false,
+    });
+    expect(actions.length).toBe(0);
+  });
+
+  it("墓碑过期：state.skipped[ref] 为旧时间 → 仍产生 download-new", () => {
+    const rs = remote("foo", "2024-01-03T00:00:00Z");
+    state.skipped["foo"] = "2024-01-02T00:00:00Z";
+    const actions = planSync({
+      local: [],
+      remote: [rs],
+      state,
+      propagateDeletes: false,
+    });
+    expect(actions).toEqual([{ kind: "download-new", key: "foo", ref: "foo" }]);
+  });
+
+  it("key 碰撞：本地有 key=foo 但 frontmatter ref=bar，远端有 foo → skip-incompatible，不下载", () => {
+    const actions = planSync({
+      local: [note({ key: "foo", refId: "bar", body: "hello" })],
+      remote: [remote("foo", "2024-01-02T00:00:00Z")],
+      state,
+      propagateDeletes: false,
+    });
+    // 本地笔记 ref=bar，远端 ref=foo 不存在 → upload（bar 不存在于远端）
+    // 同时远端 ref=foo 撞上本地 key=foo → skip-incompatible
+    expect(actions[0]).toEqual({ kind: "upload", key: "foo", ref: "bar" });
+    expect(actions[1]).toEqual({
+      kind: "skip-incompatible",
+      key: "foo",
+      reason: '远端页面 "foo"（origin_key: 无）的可用本地 key 均被指向别的 ref 的笔记占用，跳过下载',
+    });
+  });
+
+  it("state.entries 有某 ref 但本地无笔记 → 不产生 download-new（走 delete-remote/drop-state）", () => {
+    state.entries["x"] = { ref: "foo", localHash: "h1", remoteUpdatedAt: "2024-01-02T00:00:00Z" };
+    const actions = planSync({
+      local: [],
+      remote: [remote("foo", "2024-01-02T00:00:00Z")],
+      state,
+      propagateDeletes: false,
+    });
+    // 本地已删 → drop-state（propagateDeletes=false）; 远端 ref=foo 有 tracked entry → 不产生 download-new
+    expect(actions).toEqual([{ kind: "drop-state", key: "x" }]);
+    expect(actions.some((a) => a.kind === "download-new")).toBe(false);
+  });
 });
 
 // —— runSync ——
@@ -367,7 +466,7 @@ describe("runSync", () => {
       knowledgeId: "kid",
       entries: {
         "a/b": { ref: "a/b", localHash: "h1", remoteUpdatedAt: "t1" },
-        "c/d": { ref: "c/d", localHash: "h2", remoteUpdatedAt: "t2" },
+        "c/d": { ref: "c/d", localHash: "h2", remoteUpdatedAt: "t2-start" },
       },
       skipped: {},
     };
@@ -383,6 +482,48 @@ describe("runSync", () => {
     expect(report.skipped).toBe(1);
     expect(state.entries["a/b"]).toBeUndefined();
     expect(state.entries["c/d"]).toBeUndefined();
+  });
+
+  it("drop-state 写墓碑：state.skipped[ref] === 原 entry.remoteUpdatedAt", async () => {
+    const state: SyncState = {
+      version: 1,
+      knowledgeId: "kid",
+      entries: {
+        "foo": { ref: "foo", localHash: "h1", remoteUpdatedAt: "2024-01-02T00:00:00Z" },
+      },
+      skipped: {},
+    };
+    const io = makeFakeIO();
+    const report = await runSync([{ kind: "drop-state", key: "foo" }], {
+      localByKey: new Map(),
+      io,
+      state,
+    });
+    expect(report.errors).toBe(0);
+    expect(state.entries["foo"]).toBeUndefined();
+    expect(state.skipped["foo"]).toBe("2024-01-02T00:00:00Z");
+  });
+
+  it("download-new 成功：写入本地、state.entries 更新、墓碑清除、downloaded 计数", async () => {
+    const state: SyncState = {
+      version: 1,
+      knowledgeId: "kid",
+      entries: {},
+      skipped: { foo: "2024-01-02T00:00:00Z" }, // 过期墓碑，远端有新内容
+    };
+    const io = makeFakeIO();
+    const report = await runSync([{ kind: "download-new", key: "foo", ref: "foo" }], {
+      localByKey: new Map(),
+      io,
+      state,
+    });
+    expect(report.errors).toBe(0);
+    expect(report.downloaded).toBe(1);
+    expect(io.written.has("foo")).toBe(true);
+    const expectedHash = await hashNote("title-foo", "remote content of foo");
+    expect(state.entries["foo"].localHash).toBe(expectedHash);
+    expect(state.entries["foo"].remoteUpdatedAt).toBe("2024-01-03 00:00:00");
+    expect(state.skipped["foo"]).toBeUndefined();
   });
 
   it("单条失败不中止后续", async () => {
@@ -598,5 +739,238 @@ describe("runSync", () => {
     expect(h1).toBe(h2);
     expect(h1).not.toBe(h3);
     expect(h1).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+// —— origin_key 相关测试 ——
+
+describe("planSync origin_key 优先还原", () => {
+  let state: SyncState;
+  beforeEach(() => {
+    state = emptySyncState("kid");
+  });
+
+  it("远端带 origin_key → download-new 用 origin_key 作 key", () => {
+    const r = remote("n-abc123def012", "2024-01-02T00:00:00Z", { origin_key: "项目/部署手册" });
+    const actions = planSync({
+      local: [],
+      remote: [r],
+      state,
+      propagateDeletes: false,
+    });
+    expect(actions).toEqual([
+      { kind: "download-new", key: "项目/部署手册", ref: "n-abc123def012" },
+    ]);
+  });
+
+  it("origin_key 被本地占用 → 退到 ref", () => {
+    // 本地笔记 key="project/manual"（通过 toRemoteRef，进入 localKeys），远端 ref=n-… 但 origin_key=project/manual
+    // → 远端 ref 未被 claimed/tracked → preferred="project/manual" 已被本地占，退到 ref="n-abc123def012"
+    const r = remote("n-abc123def012", "2024-01-02T00:00:00Z", { origin_key: "project/manual" });
+    const localNote = note({ key: "project/manual", body: "local body" });
+    const actions = planSync({
+      local: [localNote],
+      remote: [r],
+      state,
+      propagateDeletes: false,
+    });
+    // 本地笔记是首次见面 + 远端无该 ref → upload；远端是 remote-only → download-new 用退回的 ref
+    expect(actions).toEqual([
+      { kind: "upload", key: "project/manual", ref: "project/manual" },
+      { kind: "download-new", key: "n-abc123def012", ref: "n-abc123def012" },
+    ]);
+  });
+
+  it("origin_key 非法（绝对路径等）→ 退到 ref", () => {
+    const r = remote("n-abc123def012", "2024-01-02T00:00:00Z", { origin_key: "/etc/passwd" });
+    const actions = planSync({
+      local: [],
+      remote: [r],
+      state,
+      propagateDeletes: false,
+    });
+    expect(actions).toEqual([
+      { kind: "download-new", key: "n-abc123def012", ref: "n-abc123def012" },
+    ]);
+  });
+
+  it("origin_key 和 ref 都被本地占用 → skip-incompatible", () => {
+    // 远端 ref=n-xxx 与本地笔记 key 相同 → 被 claimedRefs 占 → 无 download-new
+    const localNote = note({ key: "n-abc123def012" }); // key=ref，小写合法
+    const r = remote("n-abc123def012", "2024-01-02T00:00:00Z", { origin_key: "project/manual" });
+    const actions = planSync({
+      local: [localNote],
+      remote: [r],
+      state,
+      propagateDeletes: false,
+    });
+    // 本地 key="n-abc123def012" → ref="n-abc123def012"，claimedRefs.add("n-abc123def012")
+    // 远端 ref="n-abc123def012" → claimedRefs.has → continue；无 download-new
+    expect(actions.some((a) => a.kind === "download-new")).toBe(false);
+  });
+
+  it("origin_key 为 null → 用 ref 作 key（与旧行为一致）", () => {
+    const r = remote("foo", "2024-01-02T00:00:00Z", { origin_key: null });
+    const actions = planSync({
+      local: [],
+      remote: [r],
+      state,
+      propagateDeletes: false,
+    });
+    expect(actions).toEqual([
+      { kind: "download-new", key: "foo", ref: "foo" },
+    ]);
+  });
+});
+
+describe("runSync origin_key 相关行为", () => {
+  it("download-new: key≠ref 时调用 setNoteRef", async () => {
+    const state: SyncState = {
+      version: 1,
+      knowledgeId: "kid",
+      entries: {},
+      skipped: {},
+    };
+    const setNoteRefMock = vi.fn(async () => ({}));
+    const io: SyncIO & { setNoteRefMock: typeof setNoteRefMock } = {
+      local: {
+        writeNote: vi.fn(async () => ({ modified: 9999 })),
+        setNoteRef: setNoteRefMock,
+      },
+      remote: {
+        listAllPages: vi.fn(async () => []),
+        getPage: vi.fn(async (ref: string) => ({
+          ref,
+          title: `title-${ref}`,
+          summary: "",
+          content: `remote content of ${ref}`,
+          locked: false,
+          updated_at: "2024-01-03 00:00:00",
+        })),
+        putPage: vi.fn(async () => ({
+          ref: "x",
+          title: "",
+          summary: "",
+          content: "",
+          locked: false,
+          updated_at: "",
+        })),
+        deletePage: vi.fn(async () => true),
+      },
+      now: () => Math.floor(Date.parse("2024-01-04T00:00:00Z") / 1000),
+      setNoteRefMock,
+    } as unknown as SyncIO & { setNoteRefMock: typeof setNoteRefMock };
+
+    await runSync(
+      [{ kind: "download-new", key: "项目/部署手册", ref: "n-abc123def012" }],
+      { localByKey: new Map(), io, state },
+    );
+    expect(setNoteRefMock).toHaveBeenCalledWith("项目/部署手册", "n-abc123def012");
+  });
+
+  it("download-new: key===ref 时不调用 setNoteRef", async () => {
+    const setNoteRefMock = vi.fn(async () => ({}));
+    const io = {
+      local: {
+        writeNote: vi.fn(async () => ({ modified: 9999 })),
+        setNoteRef: setNoteRefMock,
+      },
+      remote: {
+        listAllPages: vi.fn(async () => []),
+        getPage: vi.fn(async (ref: string) => ({
+          ref,
+          title: `title-${ref}`,
+          summary: "",
+          content: `content of ${ref}`,
+          locked: false,
+          updated_at: "2024-01-03 00:00:00",
+        })),
+        putPage: vi.fn(async () => ({
+          ref: "x",
+          title: "",
+          summary: "",
+          content: "",
+          locked: false,
+          updated_at: "",
+        })),
+        deletePage: vi.fn(async () => true),
+      },
+      now: () => 0,
+    } as unknown as SyncIO;
+    const state = emptySyncState("kid");
+    await runSync([{ kind: "download-new", key: "foo", ref: "foo" }], {
+      localByKey: new Map(),
+      io,
+      state,
+    });
+    expect(setNoteRefMock).not.toHaveBeenCalled();
+  });
+
+  it("upload: key≠ref 时 putPage body 含 origin_key", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const io = {
+      local: {
+        writeNote: vi.fn(async () => ({ modified: 9999 })),
+      },
+      remote: {
+        listAllPages: vi.fn(async () => []),
+        getPage: vi.fn(async () => null),
+        putPage: vi.fn(async (_ref: string, body: Record<string, unknown>) => {
+          capturedBody = body;
+          return {
+            ref: "n-abc123def012",
+            title: "",
+            summary: "",
+            content: (body as { content: string }).content,
+            locked: false,
+            updated_at: "2024-01-03 00:00:00",
+          };
+        }),
+        deletePage: vi.fn(async () => true),
+      },
+      now: () => 0,
+    } as unknown as SyncIO;
+    const n = note({ key: "项目/部署手册", title: "部署手册", body: "内容", contentHash: "h1" });
+    const state = emptySyncState("kid");
+    await runSync(
+      [{ kind: "upload", key: "项目/部署手册", ref: "n-abc123def012" }],
+      { localByKey: new Map([["项目/部署手册", n]]), io, state },
+    );
+    expect(capturedBody.origin_key).toBe("项目/部署手册");
+    expect(capturedBody.ref).toBeUndefined();
+  });
+
+  it("upload: key===ref 时 putPage body 不含 origin_key", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const io = {
+      local: {
+        writeNote: vi.fn(async () => ({ modified: 9999 })),
+      },
+      remote: {
+        listAllPages: vi.fn(async () => []),
+        getPage: vi.fn(async () => null),
+        putPage: vi.fn(async (_ref: string, body: Record<string, unknown>) => {
+          capturedBody = body;
+          return {
+            ref: "foo",
+            title: "",
+            summary: "",
+            content: (body as { content: string }).content,
+            locked: false,
+            updated_at: "2024-01-03 00:00:00",
+          };
+        }),
+        deletePage: vi.fn(async () => true),
+      },
+      now: () => 0,
+    } as unknown as SyncIO;
+    const n = note({ key: "foo", title: "foo", body: "content", contentHash: "h1" });
+    const state = emptySyncState("kid");
+    await runSync([{ kind: "upload", key: "foo", ref: "foo" }], {
+      localByKey: new Map([["foo", n]]),
+      io,
+      state,
+    });
+    expect(capturedBody.origin_key).toBeUndefined();
   });
 });

@@ -545,6 +545,7 @@ impl Database {
                 source_doc_id TEXT REFERENCES knowledge_docs(id) ON DELETE SET NULL,
                 use_count INTEGER NOT NULL DEFAULT 0,
                 last_used_at TEXT,
+                origin_key TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(source_id, ref)
@@ -900,12 +901,34 @@ impl Database {
         Self::migrate_agent_sessions_add_context_usage(pool).await?;
         Self::migrate_agent_sessions_add_spawn_error(pool).await?;
         Self::migrate_agent_pending_prompts(pool).await?;
+        Self::migrate_knowledge_pages_add_origin_key(pool).await?;
         Self::seed_builtin_roles(pool).await?;
 
         // 必须在最后：依赖 knowledge_* 新表已建，且 rag_documents 旧表若存在时先让
         // migrate_rag_documents_add_file_type 完成旧表的 file_type 回填，再统一迁移
         Self::migrate_unify_knowledge_sources(pool).await?;
 
+        Ok(())
+    }
+
+    /// `knowledge_pages` 补 `origin_key` 列（同步客户端上传的原始本地 key，
+    /// 供另一端 download-new 还原文件夹/文件名；可空，旧行缺省 NULL）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_knowledge_pages_add_origin_key(
+        pool: &Pool<Sqlite>,
+    ) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE knowledge_pages ADD COLUMN origin_key TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("knowledge_pages migration: origin_key column already exists");
+            }
+        }
         Ok(())
     }
 

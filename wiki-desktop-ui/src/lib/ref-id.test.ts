@@ -2,7 +2,7 @@
  * ref-id 契约测试 —— 对齐 Rust `normalize_wiki_ref` 用例
  */
 import { describe, it, expect } from "vitest";
-import { normalizeRemoteRef, toRemoteRef } from "./ref-id";
+import { normalizeRemoteRef, toRemoteRef, sanitizeOriginKey } from "./ref-id";
 
 describe("normalizeRemoteRef 契约", () => {
   it("基本合法形态", () => {
@@ -139,5 +139,94 @@ describe("deriveRefFromKey", () => {
     expect(ref).toMatch(/^n-[0-9a-f]{12}$/);
     const ref2 = await deriveRefFromKey("中文测试");
     expect(ref2).toMatch(/^n-[0-9a-f]{12}$/);
+  });
+});
+
+describe("sanitizeOriginKey", () => {
+  it("正常路径通过并归一化反斜杠", () => {
+    expect(sanitizeOriginKey("项目/部署手册")).toBe("项目/部署手册");
+    expect(sanitizeOriginKey("  a/b  ")).toBe("a/b");
+    expect(sanitizeOriginKey("foo\\bar")).toBe("foo/bar");
+    expect(sanitizeOriginKey("a\\b\\c")).toBe("a/b/c");
+  });
+
+  it("空串/纯空白 → null", () => {
+    expect(sanitizeOriginKey("")).toBeNull();
+    expect(sanitizeOriginKey("   ")).toBeNull();
+    expect(sanitizeOriginKey("\t\n")).toBeNull();
+  });
+
+  it("超过 200 字符 → null", () => {
+    const long200 = "a".repeat(200);
+    expect(sanitizeOriginKey(long200)).toBe(long200);
+    const long201 = "a".repeat(201);
+    expect(sanitizeOriginKey(long201)).toBeNull();
+  });
+
+  it("绝对路径 / 开头 → null", () => {
+    expect(sanitizeOriginKey("/etc/passwd")).toBeNull();
+    expect(sanitizeOriginKey("/foo")).toBeNull();
+  });
+
+  it("Windows 盘符 → null", () => {
+    expect(sanitizeOriginKey("C:\\Windows")).toBeNull();
+    expect(sanitizeOriginKey("D:/data")).toBeNull();
+  });
+
+  it("含非法字符 → null", () => {
+    expect(sanitizeOriginKey("a<b")).toBeNull();
+    expect(sanitizeOriginKey('a"b')).toBeNull();
+    expect(sanitizeOriginKey("a:b")).toBeNull();
+    expect(sanitizeOriginKey("a|b")).toBeNull();
+    expect(sanitizeOriginKey("a?b")).toBeNull();
+    expect(sanitizeOriginKey("a*b")).toBeNull();
+    expect(sanitizeOriginKey("a>b")).toBeNull();
+  });
+
+  it("控制字符（charCode < 32） → null", () => {
+    expect(sanitizeOriginKey("a\x00b")).toBeNull();
+    expect(sanitizeOriginKey("a\nb")).toBeNull();
+  });
+
+  it("段为 / / . / .. → null", () => {
+    expect(sanitizeOriginKey("./a")).toBeNull();
+    expect(sanitizeOriginKey("../a")).toBeNull();
+    expect(sanitizeOriginKey("a//b")).toBeNull();
+    expect(sanitizeOriginKey("a/.")).toBeNull();
+    expect(sanitizeOriginKey("a/..")).toBeNull();
+    expect(sanitizeOriginKey("a/./b")).toBeNull();
+    expect(sanitizeOriginKey("a/../b")).toBeNull();
+    // "..b" 只是普通段名，并非 ".."
+    expect(sanitizeOriginKey("a/..b")).toBe("a/..b");
+    expect(sanitizeOriginKey("a/.b")).toBe("a/.b");
+  });
+
+  it("段末空格或 . → null（trim 后生效，尾随空格被 trim 不算段末空格）", () => {
+    // trim 后 "a/b " → "a/b"，空格在最后一个段的尾部被 trim 去掉，不算段末空格
+    expect(sanitizeOriginKey("a/b ")).toBe("a/b");
+    // 段内空格允许（本地文件名合法），段末空格拒绝
+    expect(sanitizeOriginKey("a/b c")).toBe("a/b c");
+    // trim 只去掉整串首尾；非末段以空格或 . 结尾被拒
+    expect(sanitizeOriginKey("a/b /c")).toBeNull();
+    expect(sanitizeOriginKey("a/b./c")).toBeNull();
+    expect(sanitizeOriginKey("a/ foo")).toBe("a/ foo");
+    expect(sanitizeOriginKey("a/.")).toBeNull();
+    expect(sanitizeOriginKey("a/b.")).toBeNull();
+    expect(sanitizeOriginKey("a/.b")).toBe("a/.b");
+  });
+
+  it("Windows 保留名 → null", () => {
+    expect(sanitizeOriginKey("CON")).toBeNull();
+    expect(sanitizeOriginKey("con")).toBeNull();
+    expect(sanitizeOriginKey("CON.md")).toBeNull();
+    expect(sanitizeOriginKey("nul")).toBeNull();
+    expect(sanitizeOriginKey("PRN")).toBeNull();
+    expect(sanitizeOriginKey("AUX")).toBeNull();
+    expect(sanitizeOriginKey("COM1")).toBeNull();
+    expect(sanitizeOriginKey("COM9")).toBeNull();
+    expect(sanitizeOriginKey("LPT1")).toBeNull();
+    expect(sanitizeOriginKey("LPT9")).toBeNull();
+    expect(sanitizeOriginKey("a/CON")).toBeNull();
+    expect(sanitizeOriginKey("a/PRN.txt")).toBeNull();
   });
 });

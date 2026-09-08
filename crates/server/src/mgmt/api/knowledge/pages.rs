@@ -25,6 +25,7 @@ fn page_summary_json(p: &AgentWikiPageSummary) -> serde_json::Value {
         "source_doc_id": p.source_doc_id,
         "use_count": p.use_count,
         "last_used_at": p.last_used_at.as_ref().map(|t| normalize_db_datetime(t)),
+        "origin_key": p.origin_key,
         "created_at": normalize_db_datetime(&p.created_at),
         "updated_at": normalize_db_datetime(&p.updated_at),
     })
@@ -42,6 +43,7 @@ fn page_json(p: &AgentWikiPageRecord) -> serde_json::Value {
         "source_doc_id": p.source_doc_id,
         "use_count": p.use_count,
         "last_used_at": p.last_used_at.as_ref().map(|t| normalize_db_datetime(t)),
+        "origin_key": p.origin_key,
         "created_at": normalize_db_datetime(&p.created_at),
         "updated_at": normalize_db_datetime(&p.updated_at),
     })
@@ -70,6 +72,9 @@ pub struct PutPageRequest {
     #[serde(default)]
     pub summary: String,
     pub content: String,
+    /// 同步客户端上传的原始本地 key（可空，超过 512 字符视为无效）。
+    #[serde(default)]
+    pub origin_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +165,18 @@ pub async fn put_page(
     if body.summary.chars().count() > 200 {
         return (StatusCode::BAD_REQUEST, "summary too long (max 200)").into_response();
     }
+    let origin_key: Option<&str> = body
+        .origin_key
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    if origin_key.is_some_and(|k| k.chars().count() > 512) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "origin_key too long (max 512)",
+        )
+            .into_response();
+    }
     match rt
         .db
         .wiki_upsert_page(
@@ -170,6 +187,7 @@ pub async fn put_page(
             &body.content,
             true,
             None,
+            origin_key,
         )
         .await
     {

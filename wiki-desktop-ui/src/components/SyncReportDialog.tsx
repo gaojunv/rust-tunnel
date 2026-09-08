@@ -32,6 +32,7 @@ function ActionIcon({ kind }: { kind: string }) {
     case "upload":
       return <Upload className="size-4 shrink-0 text-blue-600" />;
     case "download":
+    case "download-new":
       return <Download className="size-4 shrink-0 text-green-600" />;
     case "conflict-local-wins":
     case "conflict-remote-wins":
@@ -59,6 +60,8 @@ function kindLabel(kind: string): string {
       return "上传";
     case "download":
       return "下载";
+    case "download-new":
+      return "下载（新增）";
     case "conflict-local-wins":
       return "冲突（本地胜）";
     case "conflict-remote-wins":

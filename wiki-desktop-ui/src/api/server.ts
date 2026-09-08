@@ -20,6 +20,8 @@ export interface RemotePageSummary {
   title: string;
   locked: boolean;
   updated_at: string;
+  /** 同步客户端上传的原始本地 key（可空） */
+  origin_key: string | null;
 }
 
 /** 远端完整页面 */
@@ -168,7 +170,7 @@ function toNumber(v: unknown): number {
 export interface ServerApi {
   listAllPages(): Promise<RemotePageSummary[]>;
   getPage(ref: string): Promise<RemotePage | null>;
-  putPage(ref: string, body: { title: string; summary: string; content: string }): Promise<RemotePage>;
+  putPage(ref: string, body: { title: string; summary: string; content: string; origin_key?: string }): Promise<RemotePage>;
   deletePage(ref: string): Promise<boolean>;
 }
 
@@ -180,6 +182,7 @@ function parsePageSummary(raw: unknown): RemotePageSummary {
     title: String(r["title"] ?? ""),
     locked: Boolean(r["locked"]),
     updated_at: String(r["updated_at"] ?? r["updatedAt"] ?? r["updated_at"] ?? ""),
+    origin_key: typeof r["origin_key"] === "string" ? r["origin_key"] : typeof r["originKey"] === "string" ? r["originKey"] : null,
   };
 }
 
@@ -193,6 +196,7 @@ function parsePage(raw: unknown): RemotePage {
     updated_at: String(r["updated_at"] ?? r["updatedAt"] ?? ""),
     summary: String(r["summary"] ?? ""),
     content: String(r["content"] ?? ""),
+    origin_key: typeof r["origin_key"] === "string" ? r["origin_key"] : typeof r["originKey"] === "string" ? r["originKey"] : null,
   };
 }
 
@@ -232,12 +236,19 @@ export function createServerApi(baseUrl: string, knowledgeId: string): ServerApi
 
     async putPage(
       ref: string,
-      body: { title: string; summary: string; content: string },
+      body: { title: string; summary: string; content: string; origin_key?: string },
     ): Promise<RemotePage> {
       const enc = encodeRef(ref);
+      // origin_key 仅在显式提供时序列化进 JSON
+      const payload: Record<string, string> = {
+        title: body.title,
+        summary: body.summary,
+        content: body.content,
+      };
+      if (body.origin_key !== undefined) payload.origin_key = body.origin_key;
       const data = await fetchJson<unknown>(baseUrl, `/api/knowledge/${encodedId}/pages/${enc}`, {
         method: "PUT",
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
       });
       return parsePage(data);
     },

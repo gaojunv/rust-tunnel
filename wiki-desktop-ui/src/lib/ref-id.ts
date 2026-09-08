@@ -50,6 +50,52 @@ export function toRemoteRef(key: string, frontmatterRef?: string | null): string
 }
 
 /**
+ * 校验/归一化服务端 `origin_key` 为安全的本地 key：
+ * - trim；空 → null；[...s].length > 200 → null
+ * - `\` → `/`
+ * - 拒绝：以 `/` 开头；`^[a-zA-Z]:` 盘符；含 `<>:"|?*` 或控制字符（charCode < 32）
+ * - 拒绝：任何 `/` 段为 `/`/`.`/`..`；段末为空格或 `.`（Windows 兼容）
+ * - 拒绝：最后一段（去扩展名、大小写不敏感）是 Windows 保留名
+ * 通过则返回归一化后的串
+ */
+export function sanitizeOriginKey(raw: string): string | null {
+  let s = raw.trim();
+  if (s.length === 0) return null;
+  // `\` → `/`
+  s = s.replace(/\\/g, "/");
+  // 字符数检查
+  if ([...s].length > 200) return null;
+  // 不允许绝对路径 / 盘符
+  if (s.startsWith("/")) return null;
+  if (/^[a-zA-Z]:/.test(s)) return null;
+  // 拒绝非法字符 + 控制字符
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 32) return null;
+    const ch = s[i];
+    if ("<>:\"|?*".includes(ch)) return null;
+  }
+  // 段检查
+  const segments = s.split("/");
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (seg === "" || seg === "." || seg === "..") return null;
+    if (seg.endsWith(" ") || seg.endsWith(".")) return null;
+  }
+  // Windows 保留名：最后一段（去扩展名，大小写不敏感）
+  const lastSeg = segments[segments.length - 1] ?? "";
+  const dotIdx = lastSeg.lastIndexOf(".");
+  const baseName = (dotIdx > 0 ? lastSeg.slice(0, dotIdx) : lastSeg).toUpperCase();
+  const RESERVED = new Set([
+    "CON", "PRN", "AUX", "NUL",
+    ...Array.from({ length: 9 }, (_, i) => `COM${i + 1}`),
+    ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`),
+  ]);
+  if (RESERVED.has(baseName)) return null;
+  return s;
+}
+
+/**
  * 派生确定性 ref：`n-` + SHA-256(UTF-8(key)) hex 的前 12 个字符
  * 与 sync-engine.ts 中 hashNote 的 crypto.subtle 用法一致
  */

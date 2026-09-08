@@ -348,6 +348,7 @@ export function useSync(opts: {
               const dto = await saveNote(key, body, title);
               return { modified: dto.modified };
             },
+            setNoteRef: (key: string, ref: string) => setNoteRef(key, ref),
           },
           remote: serverApi,
           now: () => Math.floor(Date.now() / 1000),
