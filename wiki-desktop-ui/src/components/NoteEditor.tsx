@@ -14,12 +14,16 @@ import { EditorView } from "@codemirror/view";
 import type { SelectionSource } from "@/lib/selection-source";
 import { readScrollPos, writeScrollPos } from "@/lib/scroll-memory";
 import { loadEditorPrefs, saveEditorPrefs } from "@/lib/editor-prefs";
+import { extractToc } from "@/lib/markdown-toc";
+import { toast } from "@/lib/toast";
 
 export interface NoteEditorHandle {
   insertAtCursor(text: string): void;
   replaceSelection(text: string): void;
   getSelection(): { text: string; start: number; end: number } | null;
   scrollToLine(line: number): void;
+  /** wikilink 锚点跳转：按标题文本找行并滚动；找不到返回 false（不抛错） */
+  scrollToHeading(heading: string): boolean;
   appendToBody(text: string): void;
   getBody(): string;
   getTitle(): string;
@@ -37,7 +41,38 @@ type Props = {
   onRenamed?: (oldKey: string, newKey: string) => void;
   onOpenSettings?: () => void;
   refreshToken?: number;
+  /** 目标笔记加载完成（含跨笔记锚点跳转后的首次加载）时通知 App */
+  onNoteLoaded?: (key: string) => void;
 };
+
+/**
+ * wikilink 锚点 `[[note#heading]]` 的标题定位：在 body 的 TOC 中找与 heading
+ * 文本最匹配的标题行（0-based），找不到返回 null。
+ * 匹配顺序：精确相等（大小写不敏感）→ 前缀互含 → 忽略标点空白后相等。
+ */
+export function findHeadingLine(body: string, heading: string): number | null {
+  const toc = extractToc(body);
+  if (toc.length === 0) return null;
+  const norm = (s: string): string => s.trim().toLowerCase();
+  const squash = (s: string): string =>
+    norm(s).replace(/[\s_.\-—,，。.、；;：:！!？?（）()【】[\]{}"'“”‘’]+/g, "");
+  const want = norm(heading);
+  if (!want) return null;
+  for (const item of toc) {
+    if (norm(item.text) === want) return item.line;
+  }
+  for (const item of toc) {
+    const t = norm(item.text);
+    if (t.startsWith(want) || want.startsWith(t)) return item.line;
+  }
+  const wantSq = squash(heading);
+  if (wantSq) {
+    for (const item of toc) {
+      if (squash(item.text) === wantSq) return item.line;
+    }
+  }
+  return null;
+}
 
 function isNotFoundError(msg: string): boolean {
   const lower = msg.toLowerCase();
@@ -67,10 +102,23 @@ function replaceDocPreserveSelection(view: EditorView, text: string): void {
   });
 }
 
+/** autosave 保存失败后的退避重试间隔：5s → 15s → 30s（封顶） */
+const SAVE_RETRY_DELAYS = [5000, 15000, 30000];
+
+/** 按失败次数取退避间隔（钳制到合法下标，超出后封顶到最后一段） */
+export function retryDelayForAttempt(attempt: number): number {
+  const i = Math.min(Math.max(attempt, 0), SAVE_RETRY_DELAYS.length - 1);
+  return SAVE_RETRY_DELAYS[i];
+}
+
 export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEditor(
-  { noteKey, onSaved, onDeleted, onDirtyChange, onNavigate, onCreate, onRenamed, onOpenSettings, refreshToken },
+  { noteKey, onSaved, onDeleted, onDirtyChange, onNavigate, onCreate, onRenamed, onOpenSettings, refreshToken, onNoteLoaded },
   ref,
 ) {
+  const onNoteLoadedRef = useRef(onNoteLoaded);
+  useEffect(() => {
+    onNoteLoadedRef.current = onNoteLoaded;
+  }, [onNoteLoaded]);
   const [note, setNote] = useState<NoteDto | null>(null);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -137,6 +185,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           hasLoadedRef.current = true;
           const view = cmRef.current?.view();
           if (view) replaceDocPreserveSelection(view, data.body);
+          onNoteLoadedRef.current?.(targetKey);
         })
         .catch((e: unknown) => {
           if (cancelled) return;
@@ -247,10 +296,19 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
 
   // ---------- autosave machinery ----------
   const autosaveTimerRef = useRef<number | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
+  const retryCountRef = useRef(0);
   const savingRef = useRef(false);
   const pendingSaveRef = useRef(false);
   const inFlightPromiseRef = useRef<Promise<void> | null>(null);
   const lastSaveErrorRef = useRef<unknown | null>(null);
+
+  const clearRetryTimer = useCallback(() => {
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  }, []);
 
   const noteRef = useRef<NoteDto | null>(null);
   useEffect(() => {
@@ -281,24 +339,27 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     onSavedRef.current = onSaved;
   }, [onSaved]);
 
-  // clear timer on unmount
+  // clear timers on unmount
   useEffect(() => {
     return () => {
       if (autosaveTimerRef.current !== null) {
         window.clearTimeout(autosaveTimerRef.current);
         autosaveTimerRef.current = null;
       }
+      clearRetryTimer();
     };
-  }, []);
-  // clear timer on noteKey change
+  }, [clearRetryTimer]);
+  // clear timers on noteKey change
   useEffect(() => {
     if (autosaveTimerRef.current !== null) {
       window.clearTimeout(autosaveTimerRef.current);
       autosaveTimerRef.current = null;
     }
+    clearRetryTimer();
+    retryCountRef.current = 0;
     pendingSaveRef.current = false;
     lastSaveErrorRef.current = null;
-  }, [noteKey]);
+  }, [noteKey, clearRetryTimer]);
 
   const computeDirtyNow = useCallback(() => {
     const n = noteRef.current;
@@ -353,6 +414,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     inFlightPromiseRef.current = p;
     try {
       await p;
+      // 保存成功：清掉失败态与重试计数（错误提示随之消失，autosave 恢复常态）
+      retryCountRef.current = 0;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -365,6 +428,41 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     }
   }, []);
 
+  // 指向最新 runSaveAfterPending 的 ref：供 scheduleSaveRetry 经 ref 调用，
+  // 避免 scheduleSaveRetry ↔ runSaveAfterPending 的 useCallback 循环依赖
+  //（循环依赖会让回调每 render 重建，进而不断重置 autosave debounce 计时器）。
+  const runSaveAfterPendingRef = useRef<(() => Promise<void>) | null>(null);
+
+  // 保存失败后安排指数退避重试（5s/15s/30s 封顶）。
+  // 仅在失败时调用；成功路径不需要它（autosave effect 本就是 dirty 驱动）。
+  const scheduleSaveRetry = useCallback(() => {
+    if (retryTimerRef.current !== null) return;
+    const delay = retryDelayForAttempt(retryCountRef.current);
+    retryTimerRef.current = window.setTimeout(() => {
+      retryTimerRef.current = null;
+      if (!noteKeyRef.current) return;
+      if (loadingRef.current) return;
+      if (!computeDirtyNow()) {
+        // 用户已撤销到干净：按成功处理，清掉失败态
+        retryCountRef.current = 0;
+        lastSaveErrorRef.current = null;
+        setError(null);
+        return;
+      }
+      if (savingRef.current) {
+        pendingSaveRef.current = true;
+        return;
+      }
+      const run = runSaveAfterPendingRef.current;
+      if (!run) return;
+      retryCountRef.current += 1;
+      void run().catch(() => {
+        // 仍然失败：继续下一轮退避；错误提示（error state）保持可见
+        scheduleSaveRetry();
+      });
+    }, delay);
+  }, [computeDirtyNow]);
+
   const runSaveAfterPending = useCallback(async () => {
     try {
       await executeSave();
@@ -372,22 +470,29 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         pendingSaveRef.current = false;
         if (!noteKeyRef.current) break;
         if (loadingRef.current) break;
-        if (errorRef.current) break;
         if (!computeDirtyNow()) break;
         await executeSave();
       }
     } catch {
       pendingSaveRef.current = false;
+      scheduleSaveRetry();
       throw lastSaveErrorRef.current ?? new Error("保存失败");
     }
-  }, [computeDirtyNow, executeSave]);
+  }, [computeDirtyNow, executeSave, scheduleSaveRetry]);
 
-  // autosave debounce effect
+  useEffect(() => {
+    runSaveAfterPendingRef.current = runSaveAfterPending;
+  }, [runSaveAfterPending]);
+
+  // autosave debounce effect。
+  // 注意：保存失败后 error 非空，但 effect 不再被 error 短路——
+  // 失败态下仍用 debounce 跟踪用户的新编辑；后台重试由 scheduleSaveRetry 负责；
+  // error 只有保存成功（executeSave 内）或用户撤销到干净（重试触发时）才清除，
+  // 因此状态栏的失败提示保持可见直到成功。
   useEffect(() => {
     if (!noteKey) return;
     if (!dirty) return;
     if (loading) return;
-    if (error) return;
     if (autosaveTimerRef.current !== null) {
       window.clearTimeout(autosaveTimerRef.current);
       autosaveTimerRef.current = null;
@@ -396,14 +501,13 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       autosaveTimerRef.current = null;
       if (!noteKeyRef.current) return;
       if (loadingRef.current) return;
-      if (errorRef.current) return;
       if (!computeDirtyNow()) return;
       if (savingRef.current) {
         pendingSaveRef.current = true;
         return;
       }
       void runSaveAfterPending().catch(() => {
-        // error already surfaced via setError
+        // error already surfaced via setError; retry scheduled inside
       });
     }, 1500);
     return () => {
@@ -412,13 +516,9 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         autosaveTimerRef.current = null;
       }
     };
-  }, [noteKey, dirty, loading, error, computeDirtyNow, runSaveAfterPending]);
+  }, [noteKey, dirty, loading, computeDirtyNow, runSaveAfterPending]);
 
-  const flushSave = useCallback(async () => {
-    if (autosaveTimerRef.current !== null) {
-      window.clearTimeout(autosaveTimerRef.current);
-      autosaveTimerRef.current = null;
-    }
+  const flushSaveInner = useCallback(async () => {
     if (savingRef.current && inFlightPromiseRef.current) {
       try {
         await inFlightPromiseRef.current;
@@ -477,6 +577,21 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       throw e;
     }
   }, [computeDirtyNow, executeSave]);
+
+  const flushSave = useCallback(async () => {
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+    // 手动保存接管：清掉后台重试（成功则无需重试；失败则下方统一重排）
+    clearRetryTimer();
+    try {
+      await flushSaveInner();
+    } catch (e) {
+      scheduleSaveRetry();
+      throw e;
+    }
+  }, [clearRetryTimer, flushSaveInner, scheduleSaveRetry]);
 
   // 笔记切换时恢复编辑侧滚动位置 — rAF deferred so CM has laid out
   useEffect(() => {
@@ -561,7 +676,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         onRenamed?.(noteKey, normalized);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        window.alert(msg);
+        toast.error(msg);
         throw e;
       }
     },
@@ -661,6 +776,20 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         const pos = view.state.doc.line(l).from;
         view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: "start" }) });
         view.focus();
+      },
+      scrollToHeading(heading: string) {
+        // 优先用 CM 视图中的最新文档（未保存的编辑也参与标题匹配）
+        const view = cmRef.current?.view();
+        const text = view ? view.state.doc.toString() : bodyRef.current;
+        const line = findHeadingLine(text, heading);
+        if (line === null) return false;
+        if (view) {
+          const l = Math.min(line + 1, view.state.doc.lines);
+          const pos = view.state.doc.line(l).from;
+          view.dispatch({ selection: { anchor: pos }, effects: EditorView.scrollIntoView(pos, { y: "start" }) });
+          view.focus();
+        }
+        return true;
       },
       appendToBody(text: string) {
         const view = cmRef.current?.view();
@@ -857,7 +986,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
           label="新标题"
           initial={noteKey}
           placeholder="输入新的 key，例如 folder/note"
-          hint="重命名不会自动更新其他笔记中的 [[链接]]"
+          hint="重命名会自动更新其他笔记中指向旧 key 的 [[链接]]"
           submitText="重命名"
           validate={validateNoteKey}
           onSubmit={handleRename}

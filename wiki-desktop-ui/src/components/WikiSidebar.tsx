@@ -5,12 +5,13 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { deleteFolder, listNotes, renameFolder, searchNotes } from "@/api/tauri";
+import { deleteFolder, deleteNote, getNote, listNotes, renameFolder, renameNote, searchNotes } from "@/api/tauri";
 import type { NoteSummary, SearchHitDto, VaultInfo } from "@/api/types";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { FolderTree } from "@/components/FolderTree";
 import { folderPathsOf } from "@/lib/folder-tree";
 import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
+import { toast } from "@/lib/toast";
 
 const EXPANDED_KEY = "wiki.folders.expanded.v1";
 
@@ -43,7 +44,15 @@ type Props = {
   onFolderChanged?: () => void;
   onHistoryReplacePrefix?: (oldPrefix: string, newPrefix: string) => void;
   onHistoryRemovePrefix?: (prefix: string) => void;
+  onHistoryReplace?: (oldKey: string, newKey: string) => void;
+  onHistoryRemove?: (key: string) => void;
 };
+
+/** 与 NoteEditor.isNotFoundError 同规则：判断 getNote 失败是否为"不存在" */
+function isNotFoundError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes("notfound") || lower.includes("not found") || msg.includes("笔记不存在");
+}
 
 export function WikiSidebar({
   selectedKey,
@@ -54,6 +63,8 @@ export function WikiSidebar({
   onFolderChanged,
   onHistoryReplacePrefix,
   onHistoryRemovePrefix,
+  onHistoryReplace,
+  onHistoryRemove,
 }: Props) {
   const [query, setQuery] = useState("");
   const [notes, setNotes] = useState<NoteSummary[]>([]);
@@ -61,6 +72,7 @@ export function WikiSidebar({
   const [newOpen, setNewOpen] = useState(false);
   const [createInFolder, setCreateInFolder] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<string | null>(null);
+  const [renameNoteTarget, setRenameNoteTarget] = useState<string | null>(null);
   const [showNewFolderHint, setShowNewFolderHint] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(() => loadExpanded());
   const [activeTag, setActiveTag] = useState<string | null>(null);
@@ -183,6 +195,13 @@ export function WikiSidebar({
     setNewOpen(true);
   }, []);
 
+  // 新建子文件夹：本质是引导用户在该文件夹下建首篇笔记，复用已有"新建文件夹"对话框
+  const handleCreateSubfolder = useCallback((folderPath: string) => {
+    setShowNewFolderHint(true);
+    setCreateInFolder(folderPath || null);
+    setNewOpen(false);
+  }, []);
+
   const handleRenameFolder = useCallback(
     async (folderPath: string, rawNewPrefix: string) => {
       const newPrefix = normalizeNoteKey(rawNewPrefix);
@@ -196,7 +215,7 @@ export function WikiSidebar({
       if (!ok) throw new Error("已取消");
       const res = await renameFolder(folderPath, newPrefix, true);
       if (res.failed.length > 0) {
-        window.alert(`部分失败：\n${res.failed.map((f) => `${f.key}: ${f.error}`).join("\n")}`);
+        toast.error(`部分失败：\n${res.failed.map((f) => `${f.key}: ${f.error}`).join("\n")}`);
       }
       // 展开新路径祖先
       // 展开新前缀的所有祖先 + 自身
@@ -255,7 +274,7 @@ export function WikiSidebar({
       if (!ok) return;
       const res = await deleteFolder(folderPath);
       if (res.failed.length > 0) {
-        window.alert(`部分失败：\n${res.failed.map((f) => `${f.key}: ${f.error}`).join("\n")}`);
+        toast.error(`部分失败：\n${res.failed.map((f) => `${f.key}: ${f.error}`).join("\n")}`);
       }
       // 清理展开状态中被删路径
       setExpanded((prev) => {
@@ -277,6 +296,64 @@ export function WikiSidebar({
     await handleRenameFolder(renameTarget, raw);
     setRenameTarget(null);
   };
+
+  // 笔记重命名：与 NoteEditor.handleRename 同模式（校验→判重→renameNote rewriteLinks=true）
+  const handleRenameNote = useCallback(
+    async (oldKey: string, raw: string) => {
+      const normalized = normalizeNoteKey(raw);
+      if (normalized === oldKey) return;
+      const err = validateNoteKey(raw);
+      if (err) throw new Error(err);
+      try {
+        await getNote(normalized);
+        throw new Error("已存在同名笔记");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!isNotFoundError(msg) && msg !== "已存在同名笔记") {
+          throw e;
+        }
+        if (msg === "已存在同名笔记") throw e;
+      }
+      await renameNote(oldKey, normalized, true);
+      // 自动展开新 key 祖先
+      const ancestors = folderPathsOf(normalized);
+      if (ancestors.length > 0) {
+        setExpanded((prev) => {
+          const next = new Set(prev);
+          for (const a of ancestors) next.add(a);
+          return next;
+        });
+      }
+      onHistoryReplace?.(oldKey, normalized);
+      onFolderChanged?.();
+    },
+    [onFolderChanged, onHistoryReplace],
+  );
+
+  const handleRenameNoteSubmit = async (raw: string) => {
+    if (!renameNoteTarget) return;
+    await handleRenameNote(renameNoteTarget, raw);
+    setRenameNoteTarget(null);
+  };
+
+  // 笔记删除：与 NoteEditor.handleDelete 同模式（window.confirm 确认）
+  const handleDeleteNote = useCallback(
+    async (key: string) => {
+      const title = notes.find((n) => n.key === key)?.title ?? key;
+      const ok = window.confirm(`确定删除「${title}」吗？此操作不可撤销。`);
+      if (!ok) return;
+      try {
+        await deleteNote(key);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        toast.error(msg);
+        return;
+      }
+      onHistoryRemove?.(key);
+      onFolderChanged?.();
+    },
+    [notes, onFolderChanged, onHistoryRemove],
+  );
 
   const renameValidate = (raw: string): string | null => validateNoteKey(raw);
 
@@ -400,8 +477,11 @@ export function WikiSidebar({
             onToggle={toggle}
             onSelectNote={onSelect}
             onCreateInFolder={handleCreateInFolder}
+            onCreateSubfolder={handleCreateSubfolder}
             onRenameFolder={(path) => setRenameTarget(path)}
             onDeleteFolder={handleDeleteFolder}
+            onRenameNote={(key) => setRenameNoteTarget(key)}
+            onDeleteNote={(key) => void handleDeleteNote(key)}
           />
         )}
       </ScrollArea>
@@ -436,10 +516,25 @@ export function WikiSidebar({
         />
       )}
 
+      {renameNoteTarget && (
+        <NoteFormDialog
+          title="重命名笔记"
+          label="新标题"
+          initial={renameNoteTarget}
+          placeholder="输入新的 key，例如 folder/note"
+          hint="重命名将自动更新其他笔记中的 [[链接]]"
+          submitText="重命名"
+          validate={renameValidate}
+          onSubmit={handleRenameNoteSubmit}
+          onClose={() => setRenameNoteTarget(null)}
+        />
+      )}
+
       {showNewFolderHint && (
         <NoteFormDialog
-          title="新建文件夹"
+          title={createInFolder ? `在 ${createInFolder} 新建子文件夹` : "新建文件夹"}
           label="文件夹路径"
+          initial={createInFolder ? `${createInFolder}/` : ""}
           placeholder="例如 folder/sub"
           hint="文件夹随首篇笔记创建；请输入 folder/note 形式的笔记路径来创建首篇笔记"
           submitText="去新建笔记"
@@ -451,7 +546,10 @@ export function WikiSidebar({
             setCreateInFolder(normalized);
             setNewOpen(true);
           }}
-          onClose={() => setShowNewFolderHint(false)}
+          onClose={() => {
+            setShowNewFolderHint(false);
+            setCreateInFolder(null);
+          }}
         />
       )}
     </div>

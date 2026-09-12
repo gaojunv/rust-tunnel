@@ -15,6 +15,8 @@ import { QuickSwitcher } from "@/components/QuickSwitcher";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { SyncReportDialog } from "@/components/SyncReportDialog";
 import { ConflictResolveDialog } from "@/components/ConflictResolveDialog";
+import { ToastHost } from "@/components/ToastHost";
+import { toast } from "@/lib/toast";
 import { useSync } from "@/lib/use-sync";
 import {
   PANEL_LIMITS,
@@ -25,9 +27,25 @@ import {
   type PanelLayout,
 } from "@/lib/panel-layout";
 
+/**
+ * 解析 wikilink 导航目标 `[[note#heading]]`：
+ * - 返回 `[noteKey, heading?]`，heading 为 `#` 之后的部分（可含多级 `#`）；
+ * - `[[#heading]]`（纯锚点）返回 `["", heading]`，调用方做同笔记内滚动；
+ * - 其他调用方（侧栏/搜索/图谱/报告）传的是纯 key，不含 `#`，原样返回。
+ */
+export function parseWikilinkTarget(target: string): [string, string | null] {
+  const hashIdx = target.indexOf("#");
+  if (hashIdx < 0) return [target, null];
+  const notePart = target.slice(0, hashIdx);
+  const heading = target.slice(hashIdx + 1).trim();
+  return [notePart, heading ? heading : null];
+}
+
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix } =
     useNoteHistory();
+  // 跨笔记锚点跳转的待滚动标题：navigate 到目标笔记后，NoteEditor 加载完成时消费
+  const [pendingAnchor, setPendingAnchor] = useState<{ key: string; heading: string } | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
   const [vault, setVault] = useState<VaultInfo | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
@@ -122,16 +140,31 @@ export default function App() {
     reloadVault();
   }, [refreshToken, reloadVault]);
 
+  // wikilink 锚点跳转 `[[note#heading]]` / `[[#heading]]`：
+  // 先拆出笔记部分做常规导航（纯 key 调用方不受影响），heading 部分经 pendingAnchor
+  // 在目标笔记加载后滚动到对应标题行；同笔记纯锚点直接滚动不切换。
   const handleNavigate = useCallback(
     async (nextKey: string) => {
+      const [notePart, heading] = parseWikilinkTarget(nextKey);
+      if (heading !== null && (notePart === "" || notePart === selectedKey)) {
+        // 同笔记内锚点：不切换笔记，直接滚动到标题行
+        try {
+          await editorRef.current?.scrollToHeading(heading);
+        } catch {
+          // 标题不存在时保持现状（scrollToHeading 内部静默）
+        }
+        return;
+      }
       try {
         await editorRef.current?.flushSave();
       } catch {
         if (!window.confirm("保存失败，仍要离开吗？未保存的改动将丢失。")) return;
       }
-      navigate(nextKey);
+      if (heading !== null) setPendingAnchor({ key: notePart, heading });
+      else setPendingAnchor(null);
+      navigate(notePart);
     },
-    [navigate],
+    [navigate, selectedKey],
   );
 
   const handleBack = useCallback(async () => {
@@ -163,6 +196,25 @@ export default function App() {
     scheduleAutoSync();
   }, [scheduleAutoSync]);
 
+  // 目标笔记加载完成后消费 pendingAnchor：滚动到锚点标题行。
+  // load 失败（笔记不存在等）时 NoteEditor 不调 onNoteLoaded，pendingAnchor 保留
+  // 到下一次成功加载——但若 key 已不匹配则丢弃，避免跳到无关笔记。
+  const handleNoteLoaded = useCallback(
+    (loadedKey: string) => {
+      if (!pendingAnchor) return;
+      if (pendingAnchor.key !== loadedKey) {
+        setPendingAnchor(null);
+        return;
+      }
+      setPendingAnchor(null);
+      // CM 视图挂载/布局需要一帧：rAF 后再滚动
+      requestAnimationFrame(() => {
+        editorRef.current?.scrollToHeading(pendingAnchor.heading);
+      });
+    },
+    [pendingAnchor],
+  );
+
   const handleDeleted = useCallback(
     (deletedKey?: string) => {
       const key = deletedKey ?? selectedKey;
@@ -181,7 +233,7 @@ export default function App() {
         navigate(key);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        window.alert(msg);
+        toast.error(msg);
       }
     },
     [navigate],
@@ -200,7 +252,7 @@ export default function App() {
         navigate(key);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        window.alert(msg);
+        toast.error(msg);
       }
     },
     [navigate],
@@ -275,6 +327,11 @@ export default function App() {
         }
       }
       if (document.querySelector("[data-modal-open]")) return;
+      // 历史导航（输入框/编辑器内不触发；已 preventDefault 的事件也不劫持，
+      // 避免劫持 CodeMirror 的按词跳转 Alt/Ctrl+←/→）
+      if (e.defaultPrevented) return;
+      const navTarget = e.target as HTMLElement | null;
+      if (navTarget?.closest?.(".cm-editor, input, textarea, [contenteditable]")) return;
       const isAlt = e.altKey && !e.ctrlKey && !e.metaKey;
       const isCtrl = e.ctrlKey && !e.metaKey && !e.altKey;
       if (!isAlt && !isCtrl) return;
@@ -408,6 +465,7 @@ export default function App() {
             onRenamed={handleRenamed}
             onOpenSettings={() => setSettingsOpen(true)}
             refreshToken={refreshToken}
+            onNoteLoaded={handleNoteLoaded}
           />
         </main>
 
@@ -505,6 +563,7 @@ export default function App() {
           onNavigate={(k) => void handleNavigate(k)}
         />
       )}
+      <ToastHost />
     </div>
   );
 }

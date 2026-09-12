@@ -1,16 +1,21 @@
 // 文件夹树组件：递归渲染，交互全部经 props 回调
+import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { buildTree, type TreeNode } from "@/lib/folder-tree";
 import type { NoteSummary } from "@/api/types";
+import { ContextMenu, ContextMenuItem } from "@/components/ContextMenu";
 import {
+  BookOpen,
   ChevronDown,
   ChevronRight,
   Clock3,
+  FilePlus,
   FileText,
   Folder,
   FolderOpen,
+  FolderPlus,
   Pencil,
   Plus,
   Trash2,
@@ -31,9 +36,15 @@ type Props = {
   onToggle: (path: string) => void;
   onSelectNote: (key: string) => void;
   onCreateInFolder: (folderPath: string) => void;
+  onCreateSubfolder: (folderPath: string) => void;
   onRenameFolder: (folderPath: string) => void;
   onDeleteFolder: (folderPath: string, noteCount: number) => void;
+  onRenameNote: (key: string) => void;
+  onDeleteNote: (key: string) => void;
 };
+
+/** 右键菜单锚点：viewport 坐标 */
+type MenuAnchor = { x: number; y: number };
 
 function FolderRow({
   node,
@@ -41,6 +52,7 @@ function FolderRow({
   isExpanded,
   onToggle,
   onCreateInFolder,
+  onCreateSubfolder,
   onRenameFolder,
   onDeleteFolder,
   children,
@@ -50,10 +62,13 @@ function FolderRow({
   isExpanded: boolean;
   onToggle: (path: string) => void;
   onCreateInFolder: (folderPath: string) => void;
+  onCreateSubfolder: (folderPath: string) => void;
   onRenameFolder: (folderPath: string) => void;
   onDeleteFolder: (folderPath: string, noteCount: number) => void;
   children: React.ReactNode;
 }) {
+  const [menu, setMenu] = useState<MenuAnchor | null>(null);
+  const closeMenu = () => setMenu(null);
   return (
     <li>
       <div
@@ -61,6 +76,10 @@ function FolderRow({
           "group flex items-center gap-1 rounded-md px-1 py-1 hover:bg-accent/60",
         )}
         style={{ paddingLeft: depth * 12 + 4 }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
       >
         <button
           type="button"
@@ -117,6 +136,43 @@ function FolderRow({
           </Button>
         </span>
       </div>
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} onClose={closeMenu}>
+          <ContextMenuItem
+            label="新建笔记"
+            icon={<FilePlus className="size-3.5 shrink-0 text-muted-foreground" />}
+            onSelect={() => {
+              closeMenu();
+              onCreateInFolder(node.path);
+            }}
+          />
+          <ContextMenuItem
+            label="新建子文件夹"
+            icon={<FolderPlus className="size-3.5 shrink-0 text-muted-foreground" />}
+            onSelect={() => {
+              closeMenu();
+              onCreateSubfolder(node.path);
+            }}
+          />
+          <ContextMenuItem
+            label="重命名"
+            icon={<Pencil className="size-3.5 shrink-0 text-muted-foreground" />}
+            onSelect={() => {
+              closeMenu();
+              onRenameFolder(node.path);
+            }}
+          />
+          <ContextMenuItem
+            label="删除"
+            danger
+            icon={<Trash2 className="size-3.5 shrink-0" />}
+            onSelect={() => {
+              closeMenu();
+              onDeleteFolder(node.path, node.noteCount);
+            }}
+          />
+        </ContextMenu>
+      )}
       {isExpanded && <ul className="space-y-0.5">{children}</ul>}
     </li>
   );
@@ -127,18 +183,28 @@ function NoteRow({
   depth,
   selectedKey,
   onSelectNote,
+  onRenameNote,
+  onDeleteNote,
 }: {
   node: Extract<TreeNode, { kind: "note" }>;
   depth: number;
   selectedKey: string | null;
   onSelectNote: (key: string) => void;
+  onRenameNote: (key: string) => void;
+  onDeleteNote: (key: string) => void;
 }) {
+  const [menu, setMenu] = useState<MenuAnchor | null>(null);
+  const closeMenu = () => setMenu(null);
   const isSelected = selectedKey === node.note.key;
   return (
     <li style={{ paddingLeft: depth * 12 + 4 }} className="pr-1">
       <button
         type="button"
         onClick={() => onSelectNote(node.note.key)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
         className={cn(
           "flex w-full flex-col gap-1 rounded-md border px-3 py-2 text-left transition-colors",
           isSelected ? "border-primary/40 bg-accent" : "border-transparent hover:bg-accent/60",
@@ -164,6 +230,35 @@ function NoteRow({
           {formatRelative(node.note.modified)}
         </span>
       </button>
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} onClose={closeMenu}>
+          <ContextMenuItem
+            label="打开"
+            icon={<BookOpen className="size-3.5 shrink-0 text-muted-foreground" />}
+            onSelect={() => {
+              closeMenu();
+              onSelectNote(node.note.key);
+            }}
+          />
+          <ContextMenuItem
+            label="重命名"
+            icon={<Pencil className="size-3.5 shrink-0 text-muted-foreground" />}
+            onSelect={() => {
+              closeMenu();
+              onRenameNote(node.note.key);
+            }}
+          />
+          <ContextMenuItem
+            label="删除"
+            danger
+            icon={<Trash2 className="size-3.5 shrink-0" />}
+            onSelect={() => {
+              closeMenu();
+              onDeleteNote(node.note.key);
+            }}
+          />
+        </ContextMenu>
+      )}
     </li>
   );
 }
@@ -175,8 +270,11 @@ export function FolderTree({
   onToggle,
   onSelectNote,
   onCreateInFolder,
+  onCreateSubfolder,
   onRenameFolder,
   onDeleteFolder,
+  onRenameNote,
+  onDeleteNote,
 }: Props) {
   const tree = buildTree(notes);
 
@@ -202,6 +300,7 @@ export function FolderTree({
             isExpanded={isExpanded}
             onToggle={onToggle}
             onCreateInFolder={onCreateInFolder}
+            onCreateSubfolder={onCreateSubfolder}
             onRenameFolder={onRenameFolder}
             onDeleteFolder={onDeleteFolder}
           >
@@ -216,6 +315,8 @@ export function FolderTree({
           depth={depth}
           selectedKey={selectedKey}
           onSelectNote={onSelectNote}
+          onRenameNote={onRenameNote}
+          onDeleteNote={onDeleteNote}
         />
       );
     });

@@ -14,6 +14,7 @@ import { ensureCompatibleRefs } from "@/lib/compat-refs";
 import { computePendingCount } from "@/lib/pending";
 import { conflictsFromReport, type PendingConflict } from "@/lib/conflict-resolve";
 import { listNotesFull, readSyncState, saveNote, setNoteRef, writeSyncState } from "@/api/tauri";
+import { toast } from "@/lib/toast";
 
 export type SyncPhase = "disabled" | "idle" | "syncing" | "offline" | "error";
 export type SyncStatus = {
@@ -390,18 +391,18 @@ export function useSync(opts: {
         if (e instanceof AuthExpiredError) {
           const cfg2 = loadSyncConfig();
           if (cfg2?.baseUrl) clearToken(cfg2.baseUrl);
-          window.alert("登录已过期，请重新登录");
+          toast.error("登录已过期，请重新登录");
           setStatus((s) => ({ ...s, phase: "disabled", lastError: "登录已过期" }));
           onNeedSettingsRef.current?.();
         } else if (isOfflineError(e)) {
           const msg = e instanceof Error ? e.message : String(e);
           setStatus((s) => ({ ...s, phase: "offline", lastError: msg || "离线" }));
           scheduleOfflineRetry();
-          if (!silent) window.alert(`同步失败：${e instanceof Error ? e.message : String(e)}`);
+          if (!silent) toast.error(`同步失败：${e instanceof Error ? e.message : String(e)}`);
         } else {
           const msg = e instanceof Error ? e.message : String(e);
           setStatus((s) => ({ ...s, phase: "error", lastError: msg }));
-          if (!silent) window.alert(`同步失败：${msg}`);
+          if (!silent) toast.error(`同步失败：${msg}`);
           else
             setReport({
               items: [],

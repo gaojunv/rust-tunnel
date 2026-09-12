@@ -8,6 +8,7 @@ import type { PendingConflict, Resolution } from "@/lib/conflict-resolve";
 import { applyResolution } from "@/lib/conflict-resolve";
 import { getNote, saveNote, writeSyncState } from "@/api/tauri";
 import { createServerApi, loadSyncConfig } from "@/api/server";
+import { toast } from "@/lib/toast";
 import { CheckCircle2 } from "lucide-react";
 
 type Props = {
@@ -97,7 +98,7 @@ export function ConflictResolveDialog({ conflicts, state, onResolved, onClose }:
       onResolved(selected.key);
       setMergeMode(false);
     } catch (e: unknown) {
-      window.alert(e instanceof Error ? e.message : String(e));
+      toast.error(e instanceof Error ? e.message : String(e));
     } finally {
       setResolving(false);
     }
