@@ -4,7 +4,12 @@ import {
   EditorView,
   type DecorationSet,
 } from "@codemirror/view";
-import { computeLivePreviewSpecs, type DecoSpec } from "./spec";
+import {
+  computeZonedSpecs,
+  filterZonedSpecs,
+  type DecoSpec,
+  type ZonedSpec,
+} from "./spec";
 import {
   CheckboxWidget,
   HrWidget,
@@ -58,12 +63,18 @@ export { wikilinkNavFacet } from "./widgets";
  *   → `Decoration.replace({ widget })`
  * - `highlight` → 两个 `==` 分别 `Decoration.replace({})`，内容 `Decoration.mark`
  */
-function buildDecoSet(state: EditorState): { decos: DecorationSet; specs: DecoSpec[] } {
+/**
+ * 由可见 spec 集构建装饰（纯映射，不做计算）。
+ * 选区变化时只重跑 `filterZonedSpecs` + 本函数，不再重走语法树/行扫描。
+ */
+function buildDecoSetFromSpecs(
+  state: EditorState,
+  specs: readonly DecoSpec[],
+): { decos: DecorationSet; specs: DecoSpec[] } {
   const lineDecos: { line: number; deco: Decoration }[] = [];
   const inlineDecos: { from: number; to: number; deco: Decoration }[] = [];
   const allSpecs: DecoSpec[] = [];
 
-  const specs = computeLivePreviewSpecs(state, 0, state.doc.length);
   allSpecs.push(...specs);
   for (const spec of specs) {
     switch (spec.kind) {
@@ -214,7 +225,7 @@ function buildDecoSet(state: EditorState): { decos: DecorationSet; specs: DecoSp
     }
   }
 
-  // Decoration.set(of, sort=true) 自带排序——computeLivePreviewSpecs 的返回
+  // Decoration.set(of, sort=true) 自带排序——spec 集的返回
   // 顺序不是全局按 from 排序（wikilink 最后收集），sort:true 兜底。
   const ranges: { from: number; to: number; value: Decoration }[] = inlineDecos.map(
     ({ from, to, deco }) => ({ from, to, value: deco }),
@@ -231,20 +242,45 @@ function buildDecoSet(state: EditorState): { decos: DecorationSet; specs: DecoSp
 
 interface LivePreviewState {
   decos: DecorationSet;
-  /** 最近一次 buildDecoSet 的 specs，供 Mod+Click 处理读取 */
+  /** 最近一次构建的可见 specs，供 Mod+Click 处理读取 */
   specs: DecoSpec[];
+  /** 文档内容对应的选择无关 spec 全集（文档不变时复用，选区变化只重过滤） */
+  zoned: ZonedSpec[];
+  /** 构建 zoned 时的文档对象（Text 不可变，引用比较即可判断文档是否变化） */
+  doc: EditorState["doc"];
+}
+
+/** 全量构建（含语法树遍历 + 行扫描），只在文档变化时调用。 */
+function rebuildAll(state: EditorState): LivePreviewState {
+  const zoned = computeZonedSpecs(state);
+  const specs = filterZonedSpecs(zoned, state.selection.ranges);
+  const { decos } = buildDecoSetFromSpecs(state, specs);
+  return { decos, specs, zoned, doc: state.doc };
+}
+
+/** 选区变化时增量更新：复用 zoned 全集，只重做过滤 + 装饰映射。 */
+function updateForSelection(value: LivePreviewState, state: EditorState): LivePreviewState {
+  const specs = filterZonedSpecs(value.zoned, state.selection.ranges);
+  const { decos } = buildDecoSetFromSpecs(state, specs);
+  return { decos, specs, zoned: value.zoned, doc: value.doc };
 }
 
 /**
- * Live Preview 装饰 StateField。docChanged / selection 变化时全量重算；
- * 其余事务原样保留（此时文档与选区均未变，旧装饰仍然有效）。
+ * Live Preview 装饰 StateField。
+ * - 文档变化时全量重算（语法树遍历 + 行扫描 + 过滤 + 装饰映射）；
+ * - 仅选区变化时增量更新（复用缓存的全集，只重做过滤 + 装饰映射）；
+ * - 文档与选区均未变时原样保留。
+ * 注意 `tr.selection` 是新选区对象（恒真值），必须用新旧选区比较判断变化。
  */
 export const livePreviewField = StateField.define<LivePreviewState>({
   create(state) {
-    return buildDecoSet(state);
+    return rebuildAll(state);
   },
   update(value, tr: Transaction) {
-    if (tr.docChanged || tr.selection) return buildDecoSet(tr.state);
+    if (tr.docChanged || tr.state.doc !== value.doc) return rebuildAll(tr.state);
+    if (!tr.startState.selection.eq(tr.state.selection)) {
+      return updateForSelection(value, tr.state);
+    }
     return value;
   },
   provide: (f) => EditorView.decorations.from(f, (v) => v.decos),
@@ -304,4 +340,4 @@ export function livePreview(): Extension {
   return [livePreviewField, livePreviewClickHandlers, livePreviewTheme];
 }
 
-export type { DecoSpec } from "./spec";
+export type { DecoSpec, ZonedSpec, RevealZone } from "./spec";

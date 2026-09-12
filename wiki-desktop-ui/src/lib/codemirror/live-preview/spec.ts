@@ -71,6 +71,70 @@ export type DecoSpec =
 
 type SelRange = { from: number; to: number };
 
+/** 空选区集（zoned 模式：全部 reveal 判定恒为"未触碰"）。 */
+const EMPTY_RANGES: readonly SelRange[] = [];
+
+/** 空判定区集（默认参数用，避免每次分配）。 */
+const EMPTY_ZONES: readonly RevealZone[] = [];
+
+/**
+ * Reveal 判定区（选择无关的纯位置区间；span 的 pad 在构造时已折入）。
+ * - `neg`: spec 可见要求选区与其中每一个都不相交（"任一相交即还原"，
+ *   对应具体计算中多个 `touches…` 守卫的"都不命中才发射"）。
+ * - `pos`: spec 可见要求选区与其中每一个都相交。仅行扫描使用：行扫描会逐行
+ *   经过表格行，而具体计算中 `tableRanges` 只收录未还原表格——表格还原时其
+ *   行落到扫描中、只受自身守卫约束。因此扫描命中的 spec 要求含它的表格
+ *   全部处于还原态（被选区触碰），否则（表格未还原）扫描行会被整行跳过。
+ */
+export interface RevealZone {
+  from: number;
+  to: number;
+}
+
+/** 带 reveal 判定区的 spec（`index.ts` 按选区过滤后得到与具体计算一致的子集）。 */
+export interface ZonedSpec {
+  spec: DecoSpec;
+  neg: RevealZone[];
+  pos: RevealZone[];
+}
+
+/** 区与选区集相交判定（`touchesLine` / `touchesSpan` 的公共形状）。 */
+export function zoneTouchedByRanges(
+  zone: RevealZone,
+  ranges: readonly SelRange[],
+): boolean {
+  for (const r of ranges) {
+    if (r.from <= zone.to && r.to >= zone.from) return true;
+  }
+  return false;
+}
+
+/** zoned spec 在给定选区下是否可见（与具体计算的发射条件等价）。 */
+export function isZonedSpecVisible(
+  zs: ZonedSpec,
+  ranges: readonly SelRange[],
+): boolean {
+  for (const z of zs.neg) {
+    if (zoneTouchedByRanges(z, ranges)) return false;
+  }
+  for (const z of zs.pos) {
+    if (!zoneTouchedByRanges(z, ranges)) return false;
+  }
+  return true;
+}
+
+/** 按选区过滤 zoned specs（保持原有顺序，结果与具体计算一致）。 */
+export function filterZonedSpecs(
+  zoned: readonly ZonedSpec[],
+  ranges: readonly SelRange[],
+): DecoSpec[] {
+  const out: DecoSpec[] = [];
+  for (const zs of zoned) {
+    if (isZonedSpecVisible(zs, ranges)) out.push(zs.spec);
+  }
+  return out;
+}
+
 /** 块级还原：任一选区与 [lineFrom, lineTo] 相交即还原该行。 */
 function touchesLine(ranges: readonly SelRange[], lineFrom: number, lineTo: number): boolean {
   for (const r of ranges) {
@@ -333,19 +397,103 @@ export function computeLivePreviewSpecs(
   from: number,
   to: number,
 ): DecoSpec[] {
+  return computeInner(state, from, to, null).specs;
+}
+
+/**
+ * 以选择无关形式计算全文装饰：返回全部"可能" spec，各附 reveal 判定区。
+ * 调用方按当前选区 `filterZonedSpecs` 过滤，得到与
+ * `computeLivePreviewSpecs(state, 0, doc.length)` 完全一致的子集
+ * （顺序一致）。同一文档内容下结果可缓存，选区变化时只重做过滤。
+ */
+export function computeZonedSpecs(state: EditorState): ZonedSpec[] {
+  return computeInner(state, 0, state.doc.length, { zoned: [] }).zoned ?? [];
+}
+
+interface ZonedSink {
+  zoned: ZonedSpec[];
+}
+
+interface ComputeResult {
+  specs: DecoSpec[];
+  zoned: ZonedSpec[] | null;
+}
+
+function computeInner(
+  state: EditorState,
+  from: number,
+  to: number,
+  sink: ZonedSink | null,
+): ComputeResult {
+  const zonedMode = sink !== null;
   const specs: DecoSpec[] = [];
+  const zoned: ZonedSpec[] = sink?.zoned ?? [];
   const doc = state.doc;
-  if (doc.length === 0) return specs;
+  if (doc.length === 0) return { specs, zoned: zonedMode ? zoned : null };
   const lo = Math.max(0, from);
   const hi = Math.min(doc.length, to);
-  if (lo >= hi) return specs;
+  if (lo >= hi) return { specs, zoned: zonedMode ? zoned : null };
 
   const tree = syntaxTree(state);
   // 语法树未就绪（无 markdown 解析器、空树等）→ 容错返回空，不抛错
-  if (tree.length === 0) return specs;
+  if (tree.length === 0) return { specs, zoned: zonedMode ? zoned : null };
 
-  const sel = state.selection.ranges;
+  // zoned 模式用空选区：全部 reveal 判定恒为"未触碰"，发射全集并记录判定区；
+  // 具体模式用真实选区，行为与旧实现逐行一致。
+  const sel: readonly SelRange[] = zonedMode ? EMPTY_RANGES : state.selection.ranges;
   const seenLine = new Set<string>();
+
+  /**
+   * 标题抑制区栈：进入 ATX/Setext 节点时压入其行区（zoned 模式），
+   * 后续同子树内发射的 spec 自动继承——对应具体计算中
+   * `headingSuppressRanges` 的合取抑制（标题不可嵌套，栈即抑制区）。
+   */
+  const negStack: RevealZone[] = [];
+
+  /**
+   * 发射一个 spec（具体模式直推数组；zoned 模式附判定区快照）。
+   * `ignoreStack`：旧逻辑不检查 `headingSuppressRanges` 的发射点
+   * （Autolink 一系）置 true，不继承标题抑制栈。
+   * `pos`：仅行扫描使用（表格还原态要求），树处理函数恒为空。
+   */
+  function emit(
+    spec: DecoSpec,
+    neg: readonly RevealZone[],
+    pos: readonly RevealZone[] = EMPTY_ZONES,
+    ignoreStack = false,
+  ): void {
+    if (zonedMode) {
+      zoned.push({
+        spec,
+        neg: ignoreStack ? [...neg] : [...negStack, ...neg],
+        pos: [...pos],
+      });
+    } else {
+      specs.push(spec);
+    }
+  }
+
+  /**
+   * 条件发射：具体模式下 `hit` 为真时跳过（还原）；zoned 模式下恒发射，
+   * 并把判定区记入栈快照。调用形状对应旧代码的
+   * `if (touches...(sel, ...)) return/continue; ...发射...`。
+   */
+  function guarded(
+    neg: readonly RevealZone[],
+    hit: boolean,
+    fn: () => void,
+  ): void {
+    if (zonedMode) {
+      for (const z of neg) negStack.push(z);
+      try {
+        fn();
+      } finally {
+        negStack.length -= neg.length;
+      }
+    } else if (!hit) {
+      fn();
+    }
+  }
   /**
    * 被光标触碰的标题节点区间：标题内行内构造（Strong/Emphasis/行内码/链接/图片）
    * 在该区间内一律抑制，使标题还原语义与 decorateAtx 一致。
@@ -363,15 +511,50 @@ export function computeLivePreviewSpecs(
     if (!touchesLine(sel, firstLine.from, lastLine.to)) fmCollapsed = true;
   }
 
-  function pushLine(line: number, cls: string): void {
+  function pushLine(
+    line: number,
+    cls: string,
+    neg: readonly RevealZone[] = EMPTY_ZONES,
+  ): void {
     const key = `${line}:${cls}`;
     if (seenLine.has(key)) return;
     seenLine.add(key);
-    specs.push({ kind: "line", line, cls });
+    emit({ kind: "line", line, cls }, neg);
   }
 
-  function hide(fromPos: number, toPos: number): void {
-    if (toPos > fromPos) specs.push({ kind: "hide", from: fromPos, to: toPos });
+  function hide(
+    fromPos: number,
+    toPos: number,
+    neg: readonly RevealZone[] = EMPTY_ZONES,
+    pos: readonly RevealZone[] = EMPTY_ZONES,
+    ignoreStack = false,
+  ): void {
+    if (toPos > fromPos) emit({ kind: "hide", from: fromPos, to: toPos }, neg, pos, ignoreStack);
+  }
+
+  /** 行区间判定区（对应 `touchesLine(sel, lineFrom, lineTo)`）。 */
+  function lineZone(lineFrom: number, lineTo: number): RevealZone {
+    return { from: lineFrom, to: lineTo };
+  }
+
+  /** 行内区间判定区，pad 已折入（对应 `touchesSpan(sel, from, to, pad)`）。 */
+  function spanZone(fromPos: number, toPos: number, pad: number): RevealZone {
+    return { from: fromPos - pad, to: toPos + pad };
+  }
+
+  /**
+   * 包含给定位置的表格判定区。只用于行扫描：行扫描会逐行经过表格行，
+   * 而 `tableRanges` 只收录未还原表格——命中行的 spec 要求含它的表格
+   * 全部处于还原态（见 `RevealZone` 的 pos 说明）。语法树遍历在 zoned
+   * 下不进入表格子树，树处理函数无需调用。具体模式恒返回空（走即时判定）。
+   */
+  function tablePosAt(pos: number): readonly RevealZone[] {
+    if (!zonedMode) return EMPTY_ZONES;
+    const out: RevealZone[] = [];
+    for (const r of tableRanges) {
+      if (pos >= r.from && pos < r.to) out.push({ from: r.from, to: r.to });
+    }
+    return out;
   }
 
   function isSpaceAt(pos: number): boolean {
@@ -385,44 +568,50 @@ export function computeLivePreviewSpecs(
    */
   function decorateAtx(node: SyntaxNodeRef, level: string): void {
     const line = doc.lineAt(node.from);
-    if (touchesLine(sel, line.from, line.to)) return;
-    pushLine(line.number, LP_CLASS[`h${level}` as keyof typeof LP_CLASS]);
+    const lz: RevealZone = lineZone(line.from, line.to);
+    guarded([lz], touchesLine(sel, line.from, line.to), () => {
+      pushLine(line.number, LP_CLASS[`h${level}` as keyof typeof LP_CLASS], [lz]);
 
-    const marks = nodeMarks(node);
-    if (marks.length === 0) return;
-    const opening = marks[0];
-    let contentStart = opening.to;
-    while (contentStart < node.to && isSpaceAt(contentStart)) contentStart++;
-    hide(opening.from, contentStart); // 开标记符 + 分隔空格
+      const marks = nodeMarks(node);
+      if (marks.length === 0) return;
+      const opening = marks[0];
+      let contentStart = opening.to;
+      while (contentStart < node.to && isSpaceAt(contentStart)) contentStart++;
+      hide(opening.from, contentStart, [lz]); // 开标记符 + 分隔空格
 
-    if (marks.length > 1) {
-      // 闭合 run 之前的空格一并隐藏
-      const closing = marks[marks.length - 1];
-      let hideFrom = closing.from;
-      while (hideFrom > contentStart && isSpaceAt(hideFrom - 1)) hideFrom--;
-      hide(hideFrom, node.to);
-    } else {
-      // 无闭合 run：隐藏行尾空格
-      let end = node.to;
-      while (end > contentStart && isSpaceAt(end - 1)) end--;
-      if (end < node.to) hide(end, node.to);
-    }
+      if (marks.length > 1) {
+        // 闭合 run 之前的空格一并隐藏
+        const closing = marks[marks.length - 1];
+        let hideFrom = closing.from;
+        while (hideFrom > contentStart && isSpaceAt(hideFrom - 1)) hideFrom--;
+        hide(hideFrom, node.to, [lz]);
+      } else {
+        // 无闭合 run：隐藏行尾空格
+        let end = node.to;
+        while (end > contentStart && isSpaceAt(end - 1)) end--;
+        if (end < node.to) hide(end, node.to, [lz]);
+      }
+    });
   }
 
   /** Setext 标题：正文行加 class，下划线行整体隐藏。返回 true 表示光标在正文行（阻止子节点行内装饰）。 */
   function decorateSetext(node: SyntaxNodeRef, level: string): boolean {
     const textLine = doc.lineAt(node.from);
     const underLine = doc.lineAt(Math.min(node.to, doc.length));
+    const zones: RevealZone[] = [
+      lineZone(textLine.from, textLine.to),
+      lineZone(underLine.from, underLine.to),
+    ];
     const textTouched = touchesLine(sel, textLine.from, textLine.to);
     if (textTouched) return true;
     if (touchesLine(sel, underLine.from, underLine.to)) return true;
-    pushLine(textLine.number, LP_CLASS[`h${level}` as keyof typeof LP_CLASS]);
+    pushLine(textLine.number, LP_CLASS[`h${level}` as keyof typeof LP_CLASS], zones);
     // 下划线行：自首字符（含可能的缩进）到节点末尾整段隐藏
     const marks = nodeMarks(node);
     if (marks.length > 0) {
-      hide(marks[0].from, node.to);
+      hide(marks[0].from, node.to, zones);
     } else {
-      hide(underLine.from, underLine.to);
+      hide(underLine.from, underLine.to, zones);
     }
     return false;
   }
@@ -458,12 +647,26 @@ export function computeLivePreviewSpecs(
         if (touchesLine(sel, line.from, line.to)) {
           headingSuppressRanges.push({ from: node.from, to: node.to });
         }
+        // zoned 模式：Autolink 不检查标题抑制（旧逻辑亦然），只对检查抑制的
+        // 行内构造（Strong/Emphasis/Strikethrough/InlineCode/Image/Link）
+        // 压栈记录标题行判定区。
+        if (zonedMode) negStack.push(lineZone(line.from, line.to));
         decorateAtx(node, atx[1]);
         return true; // 继续遍历子节点，但 touched 时被抑制
       }
 
       const setext = SETEXT_RE.exec(name);
       if (setext) {
+        const textLine = doc.lineAt(node.from);
+        const underLine = doc.lineAt(Math.min(node.to, doc.length));
+        if (zonedMode) {
+          // 同 ATX：只抑制检查 headingSuppressRanges 的行内构造；
+          // Autolink 的旧逻辑不检查，此处压栈需排除它（见 Autolink 处理）。
+          negStack.push(
+            lineZone(textLine.from, textLine.to),
+            lineZone(underLine.from, underLine.to),
+          );
+        }
         const touched = decorateSetext(node, setext[1]);
         if (touched) {
           // 光标在 Setext 正文行：记录区间抑制行内子节点
@@ -488,68 +691,83 @@ export function computeLivePreviewSpecs(
             let markEnd = markStart + calloutMatch[0].length - (calloutMatch[2] ?? "").length;
             // 修剪 `[!type]` 标记与标题之间的空白：markEnd 只覆盖到 `+`/`-` 后缀
             markEnd = firstLineStart + calloutMatch[0].slice(0, calloutMatch[0].length - (calloutMatch[2] ?? "").length).trimEnd().length;
+            // 首行被还原时整块 callout 语义消失（类型类/标记 hide/spec 都不发射）；
+            // zoned 模式下 sel 为空、判定恒为未触碰，行为与具体模式一致。
             const firstLineRevealed = touchesLine(sel, firstLine.from, firstLine.to);
             if (!firstLineRevealed) {
               calloutInfo = { type: sanitized, title: (calloutMatch[2] ?? "").trim(), markFrom: markStart, markTo: markEnd };
             }
           }
         }
+        const firstLineZone: RevealZone = lineZone(firstLine.from, firstLine.to);
         for (let ln = startLine; ln <= endLine; ln++) {
           const line = doc.line(ln);
           if (line.from > node.to) break;
-          if (!touchesLine(sel, line.from, line.to)) {
-            pushLine(ln, LP_CLASS.quote);
-            // callout 类型类：该引用块所有未还原行都追加
-            if (calloutInfo) pushLine(ln, `cm-lp-callout cm-lp-callout-${calloutInfo.type}`);
-          }
+          const lz: RevealZone = lineZone(line.from, line.to);
+          guarded([lz], touchesLine(sel, line.from, line.to), () => {
+            pushLine(ln, LP_CLASS.quote, [lz]);
+            // callout 类型类：首行未还原时，该引用块所有未还原行都追加；
+            // 首行还原则整块无 callout 语义（calloutInfo 为 null）。
+            // neg 区取"首行 × 本行"合取（任一还原即消失）。
+            if (calloutInfo) {
+              pushLine(
+                ln,
+                `cm-lp-callout cm-lp-callout-${calloutInfo.type}`,
+                ln === startLine ? [lz] : [firstLineZone, lz],
+              );
+            }
+          });
         }
         // 非还原时：第一行 `[!type]` 标记 hide + callout widget spec
         if (calloutInfo) {
-          hide(calloutInfo.markFrom, calloutInfo.markTo);
-          specs.push({
+          hide(calloutInfo.markFrom, calloutInfo.markTo, [firstLineZone]);
+          emit({
             kind: "callout",
             from: calloutInfo.markFrom,
             to: calloutInfo.markTo,
             calloutType: calloutInfo.type,
             title: calloutInfo.title,
-          });
+          }, [firstLineZone]);
         }
         return;
       }
 
       if (name === "HorizontalRule") {
         const line = doc.lineAt(node.from);
-        if (!touchesLine(sel, line.from, line.to)) {
-          specs.push({ kind: "hr", from: node.from, to: node.to });
-        }
+        const lz: RevealZone = lineZone(line.from, line.to);
+        guarded([lz], touchesLine(sel, line.from, line.to), () => {
+          emit({ kind: "hr", from: node.from, to: node.to }, [lz]);
+        });
         return false;
       }
 
       if (name === "ListMark") {
         const line = doc.lineAt(node.from);
-        if (!touchesLine(sel, line.from, line.to)) {
+        const lz: RevealZone = lineZone(line.from, line.to);
+        guarded([lz], touchesLine(sel, line.from, line.to), () => {
           const markText = doc.sliceString(node.from, node.to).trim();
           // 无序列表标记：`-`、`+`、`*`（单字符且不含数字）
           if (markText.length === 1 && "-+*".includes(markText)) {
-            specs.push({ kind: "bullet", from: node.from, to: node.to });
+            emit({ kind: "bullet", from: node.from, to: node.to }, [lz]);
           } else {
-            specs.push({ kind: "mark", from: node.from, to: node.to, cls: LP_CLASS.listMark });
+            emit({ kind: "mark", from: node.from, to: node.to, cls: LP_CLASS.listMark }, [lz]);
           }
-        }
+        });
         return;
       }
 
       if (name === "TaskMarker") {
         const line = doc.lineAt(node.from);
-        if (!touchesLine(sel, line.from, line.to)) {
+        const lz: RevealZone = lineZone(line.from, line.to);
+        guarded([lz], touchesLine(sel, line.from, line.to), () => {
           const text = doc.sliceString(node.from, node.to);
-          specs.push({
+          emit({
             kind: "checkbox",
             from: node.from,
             to: node.to,
             checked: text.toLowerCase().includes("x"),
-          });
-        }
+          }, [lz]);
+        });
         return false;
       }
 
@@ -588,27 +806,29 @@ export function computeLivePreviewSpecs(
           const langNode = node.node.getChild("CodeInfo");
           const lang = langNode ? doc.sliceString(langNode.from, langNode.to) : "";
           const openingLine = doc.lineAt(openingMark.from);
-          if (!touchesLine(sel, openingLine.from, openingLine.to)) {
-            specs.push({
+          const olz: RevealZone = lineZone(openingLine.from, openingLine.to);
+          guarded([olz], touchesLine(sel, openingLine.from, openingLine.to), () => {
+            emit({
               kind: "codeheader",
               from: openingLine.from,
               to: openingLine.to,
               lang,
-            });
-          }
+            }, [olz]);
+          });
         }
 
         // 闭围栏行 widget（最后一个 ```）
         if (codeMarks.length >= 2) {
           const closingMark = codeMarks[codeMarks.length - 1];
           const closingLine = doc.lineAt(closingMark.from);
-          if (!touchesLine(sel, closingLine.from, closingLine.to)) {
-            specs.push({
+          const clz: RevealZone = lineZone(closingLine.from, closingLine.to);
+          guarded([clz], touchesLine(sel, closingLine.from, closingLine.to), () => {
+            emit({
               kind: "codefooter",
               from: closingLine.from,
               to: closingLine.to,
-            });
-          }
+            }, [clz]);
+          });
         }
 
         return false;
@@ -631,14 +851,17 @@ export function computeLivePreviewSpecs(
         if (name === "InlineCode") codeRanges.push({ from: node.from, to: node.to });
         if (marks.length > 0) {
           const pad = marks[0].to - marks[0].from;
-          if (!touchesSpan(sel, node.from, node.to, pad)) {
-            for (const mk of marks) hide(mk.from, mk.to);
-          }
+          const sz: RevealZone = spanZone(node.from, node.to, pad);
+          guarded([sz], touchesSpan(sel, node.from, node.to, pad), () => {
+            for (const mk of marks) hide(mk.from, mk.to, [sz]);
+          });
         }
         return;
       }
 
       // ── 图片：block（独占段落）/ inline ──────────────────────────────
+      // 注意：表格抑制是"含该节点即跳过"（return false，不因子节点还原
+      // 而恢复）——zoned 下同样记为"含该表格即抑制"：neg 区取并集。
       if (name === "Image") {
         if (inRanges(node.from, headingSuppressRanges)) return false;
         // 抑制 `![[...]]` 嵌入语法——由 wikilink 行扫描器统一处理。
@@ -651,7 +874,8 @@ export function computeLivePreviewSpecs(
             && raw.length >= 6
           ) return false;
         }
-        // 跳过表格区间（表格 widget 已整体替换，内部不单独渲染图片）
+        // 跳过表格区间（表格 widget 已整体替换，内部不单独渲染图片）。
+        // zoned 下不进入表格子树，能访问到此处的节点必不在任何表格内，无需记区。
         if (inRanges(node.from, tableRanges)) return false;
 
         const urlNode = node.node.getChild("URL");
@@ -690,24 +914,37 @@ export function computeLivePreviewSpecs(
         // 还原判定：block 用段落行，inline 用节点区间
         if (isBlock) {
           const line = doc.lineAt(node.from);
-          if (touchesLine(sel, line.from, line.to)) return false;
+          const lz: RevealZone = lineZone(line.from, line.to);
+          guarded([lz], touchesLine(sel, line.from, line.to), () => {
+            emit({
+              kind: "image",
+              from: node.from,
+              to: node.to,
+              alt,
+              src: resolvedSrc,
+              block: isBlock,
+              ...(imgWidth !== undefined ? { width: imgWidth, height: imgHeight } : {}),
+            }, [lz]);
+          });
         } else {
-          if (touchesSpan(sel, node.from, node.to, 1)) return false;
+          const sz: RevealZone = spanZone(node.from, node.to, 1);
+          guarded([sz], touchesSpan(sel, node.from, node.to, 1), () => {
+            emit({
+              kind: "image",
+              from: node.from,
+              to: node.to,
+              alt,
+              src: resolvedSrc,
+              block: isBlock,
+              ...(imgWidth !== undefined ? { width: imgWidth, height: imgHeight } : {}),
+            }, [sz]);
+          });
         }
-
-        specs.push({
-          kind: "image",
-          from: node.from,
-          to: node.to,
-          alt,
-          src: resolvedSrc,
-          block: isBlock,
-          ...(imgWidth !== undefined ? { width: imgWidth, height: imgHeight } : {}),
-        });
         return false;
       }
 
       // ── Markdown 链接 [text](url) ────────────────────────────────────
+      // 注意：zoned 下不进入表格子树，能访问到此处的节点必不在任何表格内，无需记区。
       if (name === "Link") {
         if (inRanges(node.from, headingSuppressRanges)) return false;
         if (inRanges(node.from, tableRanges)) return false;
@@ -740,14 +977,15 @@ export function computeLivePreviewSpecs(
 
           // 光标/选区进入该行 → 完整显示源码
           const line = doc.lineAt(node.from);
-          if (touchesLine(sel, line.from, line.to)) return false;
-
-          specs.push({
-            kind: "mdlink",
-            from: node.from,
-            to: node.to,
-            text,
-            url,
+          const lz: RevealZone = lineZone(line.from, line.to);
+          guarded([lz], touchesLine(sel, line.from, line.to), () => {
+            emit({
+              kind: "mdlink",
+              from: node.from,
+              to: node.to,
+              text,
+              url,
+            }, [lz]);
           });
           return false;
         }
@@ -755,47 +993,80 @@ export function computeLivePreviewSpecs(
         // 光标/选区进入该行 → 完整显示源码；否则整节点替换为链接 widget
         // （widget 覆盖 [text](url) 全区间，无需再隐藏标记符）
         const line = doc.lineAt(node.from);
-        if (touchesLine(sel, line.from, line.to)) return false;
-
-        const linkMarks = node.node.getChildren("LinkMark");
-        const text = linkMarks.length >= 2
-          ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
-          : "";
-        const url = doc.sliceString(urlNode.from, urlNode.to);
-        specs.push({
-          kind: "mdlink",
-          from: node.from,
-          to: node.to,
-          text,
-          url,
+        const lz: RevealZone = lineZone(line.from, line.to);
+        guarded([lz], touchesLine(sel, line.from, line.to), () => {
+          const linkMarks = node.node.getChildren("LinkMark");
+          const text = linkMarks.length >= 2
+            ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
+            : "";
+          const url = doc.sliceString(urlNode.from, urlNode.to);
+          emit({
+            kind: "mdlink",
+            from: node.from,
+            to: node.to,
+            text,
+            url,
+          }, [lz]);
         });
         return false;
       }
 
       // ── Autolink <url>：隐藏尖括号（保留 URL 文本可见）─────────────────
+      // 注意：旧逻辑不检查 headingSuppressRanges——标题/集标题还原只通过
+      // 行判定隐式抑制（光标在标题行必触碰该行）；zoned 下同样只记行区。
+      // zoned 下不进入表格子树，能访问到此处的节点必不在任何表格内，无需记区。
       if (name === "Autolink") {
         if (inRanges(node.from, tableRanges)) return false;
         const line = doc.lineAt(node.from);
-        if (touchesLine(sel, line.from, line.to)) return false;
-        for (const lm of node.node.getChildren("LinkMark")) hide(lm.from, lm.to);
+        const lz: RevealZone = lineZone(line.from, line.to);
+        guarded([lz], touchesLine(sel, line.from, line.to), () => {
+          for (const lm of node.node.getChildren("LinkMark")) {
+            hide(lm.from, lm.to, [lz], EMPTY_ZONES, true);
+          }
+        });
         return false;
       }
 
       // ── GFM 表格：整体替换为 HTML table widget ────────────────────────
+      // 注意：进入子树与否取决于表格自身是否还原（还原 → `return` 继续遍历
+      // 子节点，行内构造各自判定；未还原 → `return false` 跳过子树）。
+      // zoned 下 sel 为空、表格恒未还原：恒收录自身 spec 且不进入子树。
+      // 树内构造（Image/Link/Autolink）在表格还原、遍历进入子树时发射，
+      // 此时其发射条件与"表格内"无关（`inRanges` 即时判定恒为假）——
+      // zoned 下复刻为"表格还原时重走子树"：见 computeInner 末尾的第二遍。
       if (name === "Table") {
         const raw = doc.sliceString(node.from, node.to);
         const tableStartLine = doc.lineAt(node.from);
         const tableEndLine = doc.lineAt(Math.min(node.to, doc.length));
-        if (touchesLine(sel, tableStartLine.from, tableEndLine.to)) {
-          // 选区触碰表格行 → 还原为源码
+        const tz: RevealZone = lineZone(tableStartLine.from, tableEndLine.to);
+        const tableTouched = touchesLine(sel, tableStartLine.from, tableEndLine.to);
+        if (zonedMode) {
+          // 恒收录自身 spec；子树留待第二遍（表格还原态）处理
+          tableRanges.push({ from: node.from, to: node.to });
+          emit({ kind: "table", from: node.from, to: node.to, raw }, [tz]);
+          return false;
+        }
+        if (tableTouched) {
+          // 选区触碰表格行 → 还原为源码（继续遍历子节点，行内构造各自判定）
           return;
         }
         tableRanges.push({ from: node.from, to: node.to });
-        specs.push({ kind: "table", from: node.from, to: node.to, raw });
+        emit({ kind: "table", from: node.from, to: node.to, raw }, [tz]);
         return false;
       }
 
       return;
+    },
+    leave(node) {
+      if (!zonedMode) return;
+      const name = node.name;
+      // 与 enter 中的压栈配对：ATX 压 1 个行区，Setext 压 2 个行区。
+      if (ATX_RE.test(name)) {
+        negStack.pop();
+      } else if (SETEXT_RE.test(name)) {
+        negStack.pop();
+        negStack.pop();
+      }
     },
   });
 
@@ -820,16 +1091,19 @@ export function computeLivePreviewSpecs(
         }
       }
       if (inCode) continue;
-      // 表格区间也跳过（表格 widget 整体替换时不渲染内部 wikilink）
-      if (inRanges(sp.from, tableRanges)) continue;
+      // 表格区间也跳过（表格 widget 整体替换时不渲染内部 wikilink）。
+      // 具体模式走即时判定；zoned 模式记"含该表格即抑制"的 neg 并集。
+      const spanTablePos = zonedMode ? tablePosAt(sp.from) : EMPTY_ZONES;
+      if (!zonedMode && inRanges(sp.from, tableRanges)) continue;
 
       // ── `![[...]]` 嵌入语法处理 ──────────────────────────────
       if (sp.embed) {
         // from 向前扩 1 吞掉 `!`，touchesSpan 判定也用扩后区间
         const embFrom = sp.from - 1;
         const embTo = sp.to;
+        const embZone: RevealZone = spanZone(embFrom, embTo, 2);
 
-        if (touchesSpan(sel, embFrom, embTo, 2)) continue;
+        if (!zonedMode && touchesSpan(sel, embFrom, embTo, 2)) continue;
 
         const fileName = embedFileName(sp.target);
         const isImage = EMBED_IMAGE_EXT_RE.test(fileName);
@@ -851,35 +1125,39 @@ export function computeLivePreviewSpecs(
 
           // block = 独占段落（仅含 `![[...]]`，无前后文本）
           const isBlock = line.from === embFrom && line.to === embTo;
-          specs.push({
-            kind: "image",
-            from: embFrom,
-            to: embTo,
-            alt,
-            src,
-            block: isBlock,
-            ...(embWidth !== undefined ? { width: embWidth, height: embHeight } : {}),
-          });
+          if (zonedMode || !touchesSpan(sel, embFrom, embTo, 2)) {
+            emit({
+              kind: "image",
+              from: embFrom,
+              to: embTo,
+              alt,
+              src,
+              block: isBlock,
+              ...(embWidth !== undefined ? { width: embWidth, height: embHeight } : {}),
+            }, [embZone], spanTablePos);
+          }
         } else {
           // 非图片嵌入（笔记）：暂退化为 wikilink
           let embLabel = sp.label;
           if (sp.label === sp.target && sp.target.includes("#")) {
             embLabel = sp.target.split("#").join(" > ");
           }
-          specs.push({
-            kind: "wikilink",
-            from: embFrom,
-            to: embTo,
-            target: sp.target,
-            label: embLabel,
-          });
+          if (zonedMode || !touchesSpan(sel, embFrom, embTo, 2)) {
+            emit({
+              kind: "wikilink",
+              from: embFrom,
+              to: embTo,
+              target: sp.target,
+              label: embLabel,
+            }, [embZone], spanTablePos);
+          }
         }
         continue;
       }
       // ── 常规 wikilink ─────────────────────────────────────────
 
       // 光标/选区进入（含 [[ / ]] 两侧各 2 字符外扩）即还原为源码
-      if (touchesSpan(sel, sp.from, sp.to, 2)) continue;
+      if (!zonedMode && touchesSpan(sel, sp.from, sp.to, 2)) continue;
 
       // 无别名且 target 含 `#` 时，label 改写为 `a > b > c` 展示路径
       let displayLabel = sp.label;
@@ -887,13 +1165,13 @@ export function computeLivePreviewSpecs(
         displayLabel = sp.target.split("#").join(" > ");
       }
 
-      specs.push({
+      emit({
         kind: "wikilink",
         from: sp.from,
         to: sp.to,
         target: sp.target,
         label: displayLabel,
-      });
+      }, [spanZone(sp.from, sp.to, 2)], spanTablePos);
     }
   }
 
@@ -903,8 +1181,10 @@ export function computeLivePreviewSpecs(
     if (fmRange && ln > 0) {
       if (line.from >= fmRange.from && line.from <= fmRange.to) continue;
     }
-    // 跳过表格区间内的行
-    if (inRanges(line.from, tableRanges)) continue;
+    // 跳过表格区间内的行（具体模式即时判定；zoned 模式记"含该表格即抑制"的 neg 并集）。
+    // 注意：判定用行首 line.from（与旧 `inRanges(line.from, …)` 逐字一致）。
+    const hlLineTablePos = zonedMode ? tablePosAt(line.from) : EMPTY_ZONES;
+    if (!zonedMode && inRanges(line.from, tableRanges)) continue;
     const hlMatches = scanHighlightsInLine(line.text, line.from);
     for (const hl of hlMatches) {
       if (hl.innerTo <= lo || hl.innerFrom >= hi) continue;
@@ -915,12 +1195,13 @@ export function computeLivePreviewSpecs(
       }
       if (inCode) continue;
       // 还原：光标触碰内容区间（pad=2 包含两侧 `==` 标记）时不渲染
-      if (touchesSpan(sel, hl.innerFrom, hl.innerTo, 2)) continue;
+      if (!zonedMode && touchesSpan(sel, hl.innerFrom, hl.innerTo, 2)) continue;
+      const hlNeg: RevealZone[] = [spanZone(hl.innerFrom, hl.innerTo, 2)];
       // 隐藏两个 `==` 标记
-      hide(hl.markFrom, hl.markFrom + 2);
-      hide(hl.markTo, hl.markTo + 2);
+      hide(hl.markFrom, hl.markFrom + 2, hlNeg, hlLineTablePos);
+      hide(hl.markTo, hl.markTo + 2, hlNeg, hlLineTablePos);
       // 内容区间加 highlight mark class
-      specs.push({ kind: "highlight", from: hl.innerFrom, to: hl.innerTo, markFrom: hl.markFrom, markTo: hl.markTo });
+      emit({ kind: "highlight", from: hl.innerFrom, to: hl.innerTo, markFrom: hl.markFrom, markTo: hl.markTo }, hlNeg, hlLineTablePos);
     }
   }
 
@@ -932,8 +1213,10 @@ export function computeLivePreviewSpecs(
     const line = doc.line(ln);
     // 跳过 frontmatter 区间
     if (fmRange && line.from >= fmRange.from && line.from <= fmRange.to) continue;
-    // 跳过表格区间
-    if (inRanges(line.from, tableRanges)) continue;
+    // 跳过表格区间（具体模式即时判定；zoned 模式记"含该表格即抑制"的 neg 并集）。
+    // 注意：判定用行首 line.from（与旧 `inRanges(line.from, …)` 逐字一致）。
+    const mbLineTablePos = zonedMode ? tablePosAt(line.from) : EMPTY_ZONES;
+    if (!zonedMode && inRanges(line.from, tableRanges)) continue;
     // 跳过代码区间
     if (inRanges(line.from, codeRanges)) continue;
 
@@ -960,9 +1243,10 @@ export function computeLivePreviewSpecs(
       mathBlockLines.push({ start: ln, end: ln });
 
       // 光标/选区触碰该块行时还原
-      if (touchesLine(sel, line.from, line.to)) continue;
+      if (!zonedMode && touchesLine(sel, line.from, line.to)) continue;
 
-      specs.push({ kind: "mathblock", from: rangeFrom, to: rangeTo, tex });
+      emit({ kind: "mathblock", from: rangeFrom, to: rangeTo, tex },
+        [lineZone(line.from, line.to)], mbLineTablePos);
       continue;
     }
 
@@ -988,15 +1272,24 @@ export function computeLivePreviewSpecs(
         const rangeTo = innerLine.from + innerTrimmed.length;
         mathBlockLines.push({ start: ln, end: inner });
 
-        // 光标/选区触碰该块任一行时还原
+        // 光标/选区触碰该块任一行时还原（zoned 模式：块内逐行记 neg 区）
         const blockStartLine = doc.lineAt(blockFrom).number;
-        let touched = false;
-        for (let bl = blockStartLine; bl <= inner; bl++) {
-          const blLine = doc.line(bl);
-          if (touchesLine(sel, blLine.from, blLine.to)) { touched = true; break; }
-        }
-        if (!touched) {
-          specs.push({ kind: "mathblock", from: blockFrom, to: rangeTo, tex });
+        if (zonedMode) {
+          const blockZones: RevealZone[] = [];
+          for (let bl = blockStartLine; bl <= inner; bl++) {
+            const blLine = doc.line(bl);
+            blockZones.push(lineZone(blLine.from, blLine.to));
+          }
+          emit({ kind: "mathblock", from: blockFrom, to: rangeTo, tex }, [...blockZones], mbLineTablePos);
+        } else {
+          let touched = false;
+          for (let bl = blockStartLine; bl <= inner; bl++) {
+            const blLine = doc.line(bl);
+            if (touchesLine(sel, blLine.from, blLine.to)) { touched = true; break; }
+          }
+          if (!touched) {
+            emit({ kind: "mathblock", from: blockFrom, to: rangeTo, tex }, EMPTY_ZONES);
+          }
         }
 
         ln = inner; // 跳过已处理的行
@@ -1012,8 +1305,9 @@ export function computeLivePreviewSpecs(
     const line = doc.line(ln);
     // 跳过 frontmatter 区间
     if (fmRange && line.from >= fmRange.from && line.from <= fmRange.to) continue;
-    // 跳过表格区间
-    if (inRanges(line.from, tableRanges)) continue;
+    // 跳过表格区间（具体模式即时判定；zoned 模式记"含该表格即抑制"的 neg 并集）
+    const miLineTablePos = zonedMode ? tablePosAt(line.from) : EMPTY_ZONES;
+    if (!zonedMode && inRanges(line.from, tableRanges)) continue;
     // 跳过代码区间
     if (inRanges(line.from, codeRanges)) continue;
     // 跳过块级数学区间内的行
@@ -1027,26 +1321,256 @@ export function computeLivePreviewSpecs(
     for (const m of mathMatches) {
       if (m.to <= lo || m.from >= hi) continue;
       // 还原：光标触碰 `$` 符号本身（pad=1）时不渲染
-      if (touchesSpan(sel, m.from, m.to, 1)) continue;
-      specs.push({ kind: "mathinline", from: m.from, to: m.to, tex: m.tex });
+      if (!zonedMode && touchesSpan(sel, m.from, m.to, 1)) continue;
+      emit({ kind: "mathinline", from: m.from, to: m.to, tex: m.tex },
+        [spanZone(m.from, m.to, 1)], miLineTablePos);
     }
   }
 
   // ── frontmatter 折叠：选区不触碰时发射 spec ──────────────────────
-  if (fmRange && fmCollapsed) {
+  // zoned 模式恒发射（fmCollapsed 的判定区显式记录）；具体模式保持旧逻辑。
+  if (fmRange && (zonedMode || fmCollapsed)) {
     const firstLine = doc.lineAt(fmRange.from);
     const lastLine = doc.lineAt(fmRange.to);
     // 仅在可见区间内才发射
     if (fmRange.from < hi && fmRange.to > lo) {
       const propCount = Math.max(0, lastLine.number - firstLine.number - 1);
-      specs.push({
+      emit({
         kind: "frontmatter",
         from: fmRange.from,
         to: fmRange.to,
         propCount,
-      });
+      }, zonedMode ? [lineZone(firstLine.from, lastLine.to)] : EMPTY_ZONES);
     }
   }
 
-  return specs;
+  // ── zoned 第二遍：表格还原态子树 ──────────────────────────────────
+  // 具体计算中表格还原（选区触碰表格）时会进入子树，子树内的 Image/Link/
+  // Autolink/行内强调按自身守卫发射（此时表格抑制判定恒为假），且发射顺序
+  // 位于表格 spec 之前（先序遍历：子树产物早于表格的 `return false` 结束点；
+  // 行扫描的 wikilink/highlight/math 系则位于整树遍历之后）。
+  // zoned 下 sel 为空，第一遍恒不进入子树；第二遍对每张表格单独重走其子树
+  // 收集产物（记 pos 区 = 该表格判定区 + 自身 neg 守卫），再把每块产物搬到
+  // 对应表格 spec 之前，使整体顺序与具体计算逐字一致。
+  // 行扫描不需第二遍（扫描天然逐行经过表格行，pos 区已在第一遍记录）。
+  if (zonedMode) {
+    for (const t of tableRanges) {
+      const collected: ZonedSpec[] = [];
+      collectRevealedTableSubtree(state, doc, t, collected);
+      if (collected.length > 0) {
+        const idx = zoned.findIndex(
+          (z) => z.spec.kind === "table" && z.spec.from === t.from && z.spec.to === t.to,
+        );
+        if (idx >= 0) {
+          zoned.splice(idx, 0, ...collected);
+        } else {
+          zoned.push(...collected);
+        }
+      }
+    }
+  }
+
+  return { specs, zoned: zonedMode ? zoned : null };
+}
+
+/**
+ * zoned 第二遍：重走单个表格的子树，收集"表格还原态"下子树内 Image/Link/
+ * Autolink 发射的 spec（附 pos 区 = 表格判定区 + 自身 neg 守卫）。
+ * 表格未还原时子树不被访问（第一遍 `return false`），因此此处只处理还原态。
+ */
+function collectRevealedTableSubtree(
+  state: EditorState,
+  doc: EditorState["doc"],
+  table: { from: number; to: number },
+  zoned: ZonedSpec[],
+): void {
+  const tree = syntaxTree(state);
+  const tableZone: RevealZone = (() => {
+    const startLine = doc.lineAt(table.from);
+    const endLine = doc.lineAt(Math.min(table.to, doc.length));
+    return { from: startLine.from, to: endLine.to };
+  })();
+  const sel: readonly SelRange[] = EMPTY_RANGES;
+  tree.iterate({
+    from: table.from,
+    to: table.to,
+    enter(node) {
+      // 表格还原态下进入子树：Strong/Emphasis/Strikethrough/InlineCode 的
+      // 标记 hide、Image/Link/Autolink 各自判定（表格抑制恒为假）。
+      // 收集顺序与第一遍一致（文档顺序），保证过滤后顺序与具体计算一致。
+      if (
+        node.name === "StrongEmphasis"
+        || node.name === "Emphasis"
+        || node.name === "Strikethrough"
+        || node.name === "InlineCode"
+      ) {
+        collectTableEmphasis(doc, node, tableZone, zoned);
+        return;
+      }
+      if (node.name === "Image") {
+        collectTableImage(doc, node, tableZone, sel, zoned);
+        return false;
+      }
+      if (node.name === "Link") {
+        collectTableLink(doc, node, tableZone, sel, zoned);
+        return false;
+      }
+      if (node.name === "Autolink") {
+        collectTableAutolink(doc, node, tableZone, sel, zoned);
+        return false;
+      }
+      return;
+    },
+  });
+}
+
+/**
+ * 表格还原态子树内的行内强调：标记 hide，自身 span 守卫记 neg、表格记 pos。
+ * （标题抑制不适用：标题内不可能出现表格。）
+ */
+function collectTableEmphasis(
+  _doc: EditorState["doc"],
+  node: SyntaxNodeRef,
+  tableZone: RevealZone,
+  zoned: ZonedSpec[],
+): void {
+  const marks = node.node
+    .getChildren("EmphasisMark")
+    .concat(
+      node.node.getChildren("StrikethroughMark"),
+      node.node.getChildren("CodeMark"),
+    );
+  if (marks.length === 0) return;
+  const pad = marks[0].to - marks[0].from;
+  const neg: RevealZone[] = [{ from: node.from - pad, to: node.to + pad }];
+  for (const mk of marks) {
+    if (mk.to > mk.from) {
+      zoned.push({
+        spec: { kind: "hide", from: mk.from, to: mk.to },
+        neg,
+        pos: [tableZone],
+      });
+    }
+  }
+}
+
+/** 表格还原态子树内的 Image：自身守卫（block 用行 / inline 用 span+1）。 */
+function collectTableImage(
+  doc: EditorState["doc"],
+  node: SyntaxNodeRef,
+  tableZone: RevealZone,
+  _sel: readonly SelRange[],
+  zoned: ZonedSpec[],
+): void {
+  // 抑制 `![[...]]` 嵌入语法（与第一遍一致，由行扫描统一处理）
+  if (node.from < node.to) {
+    const raw = doc.sliceString(node.from, node.to);
+    if (raw.startsWith("![[") && raw.endsWith("]]") && raw.length >= 6) return;
+  }
+  const urlNode = node.node.getChild("URL");
+  const rawSrc = urlNode ? doc.sliceString(urlNode.from, urlNode.to) : "";
+  const src = rawSrc.startsWith("<") && rawSrc.endsWith(">")
+    ? rawSrc.slice(1, -1)
+    : rawSrc;
+  const linkMarks = node.node.getChildren("LinkMark");
+  let alt = linkMarks.length >= 2
+    ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
+    : "";
+  let imgWidth: number | undefined;
+  let imgHeight: number | undefined;
+  const sizeInfo = splitImageSize(alt);
+  if (sizeInfo) {
+    imgWidth = sizeInfo.width;
+    imgHeight = sizeInfo.height;
+    alt = sizeInfo.rest.trimEnd();
+  }
+  const isAttachment = isAttachmentSrc(src);
+  const resolvedSrc = isAttachment ? normalizeAttachmentSrc(src) : src;
+  const parent = node.node.parent;
+  const isBlock = parent?.name === "Paragraph"
+    && parent.from === node.from
+    && parent.to === node.to;
+  const line = doc.lineAt(node.from);
+  // 还原态下恒发射（sel 为空），记自身守卫为 neg、表格为 pos
+  const neg: RevealZone[] = isBlock
+    ? [{ from: line.from, to: line.to }]
+    : [{ from: node.from - 1, to: node.to + 1 }];
+  zoned.push({
+    spec: {
+      kind: "image",
+      from: node.from,
+      to: node.to,
+      alt,
+      src: resolvedSrc,
+      block: isBlock,
+      ...(imgWidth !== undefined ? { width: imgWidth, height: imgHeight } : {}),
+    },
+    neg,
+    pos: [tableZone],
+  });
+}
+
+/** 表格还原态子树内的 Link（含引用式）：自身行守卫 + 表格 pos 区。 */
+function collectTableLink(
+  doc: EditorState["doc"],
+  node: SyntaxNodeRef,
+  tableZone: RevealZone,
+  _sel: readonly SelRange[],
+  zoned: ZonedSpec[],
+): void {
+  const urlNode = node.node.getChild("URL");
+  const line = doc.lineAt(node.from);
+  const neg: RevealZone[] = [{ from: line.from, to: line.to }];
+  const linkMarks = node.node.getChildren("LinkMark");
+  const text = linkMarks.length >= 2
+    ? doc.sliceString(linkMarks[0].to, linkMarks[1].from)
+    : "";
+  if (!urlNode) {
+    if (!text) return;
+    // 引用式：查定义表（与第一遍一致的惰性全表扫描）
+    const refLabelNode = node.node.getChild("LinkLabel");
+    let refKey = text;
+    if (refLabelNode) {
+      const rawRef = doc.sliceString(refLabelNode.from, refLabelNode.to);
+      const stripped = rawRef.startsWith("[") && rawRef.endsWith("]")
+        ? rawRef.slice(1, -1)
+        : rawRef;
+      if (stripped.trim()) refKey = stripped;
+    }
+    const url = buildRefDefs(doc).get(refKey.toLowerCase().trim());
+    if (!url) return;
+    zoned.push({
+      spec: { kind: "mdlink", from: node.from, to: node.to, text, url },
+      neg,
+      pos: [tableZone],
+    });
+    return;
+  }
+  const url = doc.sliceString(urlNode.from, urlNode.to);
+  zoned.push({
+    spec: { kind: "mdlink", from: node.from, to: node.to, text, url },
+    neg,
+    pos: [tableZone],
+  });
+}
+
+/** 表格还原态子树内的 Autolink：尖括号 hide，自身行守卫 + 表格 pos 区。 */
+function collectTableAutolink(
+  doc: EditorState["doc"],
+  node: SyntaxNodeRef,
+  tableZone: RevealZone,
+  _sel: readonly SelRange[],
+  zoned: ZonedSpec[],
+): void {
+  const line = doc.lineAt(node.from);
+  const neg: RevealZone[] = [{ from: line.from, to: line.to }];
+  for (const lm of node.node.getChildren("LinkMark")) {
+    if (lm.to > lm.from) {
+      zoned.push({
+        spec: { kind: "hide", from: lm.from, to: lm.to },
+        neg,
+        pos: [tableZone],
+      });
+    }
+  }
 }
