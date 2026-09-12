@@ -122,3 +122,76 @@
 .md-preview input[type="checkbox"] {
   accent-color: hsl(var(--primary));
 }
+
+/* wikilink 悬停预览 popover（hover-preview.ts 挂载到 body，fixed 定位） */
+.cm-lp-hover-popover {
+  position: fixed;
+  z-index: 100;
+  max-width: 320px;
+  max-height: 240px;
+  overflow: hidden;
+  padding: 10px 12px;
+  background: hsl(var(--popover));
+  color: hsl(var(--popover-foreground));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  box-shadow:
+    0 8px 24px hsl(0 0% 0% / 0.35),
+    0 2px 6px hsl(0 0% 0% / 0.25);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  user-select: none;
+  cursor: default;
+}
+
+.cm-lp-hover-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cm-lp-hover-summary {
+  color: hsl(var(--muted-foreground));
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: break-word;
+}
+
+.cm-lp-hover-empty {
+  font-style: italic;
+}
+
+.cm-lp-hover-missing {
+  margin-bottom: 8px;
+}
+
+.cm-lp-hover-loading {
+  font-style: italic;
+}
+
+.cm-lp-hover-loading-bar {
+  height: 1em;
+  border-radius: 4px;
+  background: hsl(var(--muted));
+}
+
+.cm-lp-hover-open {
+  display: inline-block;
+  padding: 2px 12px;
+  border-radius: calc(var(--radius) - 2px);
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+}
+
+.cm-lp-hover-open:hover {
+  opacity: 0.9;
+}

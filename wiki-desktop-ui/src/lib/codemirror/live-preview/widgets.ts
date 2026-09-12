@@ -2,6 +2,7 @@ import { Facet } from "@codemirror/state";
 import { EditorView, WidgetType } from "@codemirror/view";
 import katex from "katex";
 import "katex/dist/katex.min.css";
+import { attachWikilinkHover } from "./hover-preview";
 
 /**
  * Live Preview 视图 widget 层。
@@ -97,16 +98,30 @@ export class WikilinkWidget extends WidgetType {
     el.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      const handler = view.state.facet(wikilinkNavFacet);
-      const fn = handler.length > 0 ? handler[handler.length - 1] : undefined;
-      fn?.(this.target);
+      navigateWikilink(view, this.target);
     });
+    // 悬停预览（hover-preview.ts）：300ms 后弹出 popover；清理句柄挂元素上
+    const target = this.target;
+    const dom = el as HTMLElement & { __wlCleanup?: () => void };
+    dom.__wlCleanup = attachWikilinkHover(el, view, target, () => navigateWikilink(view, target));
     return el;
+  }
+
+  destroy(dom: HTMLElement): void {
+    (dom as HTMLElement & { __wlCleanup?: () => void }).__wlCleanup?.();
+    (dom as HTMLElement & { __wlCleanup?: () => void }).__wlCleanup = undefined;
   }
 
   ignoreEvent(): boolean {
     return false;
   }
+}
+
+/** 经 wikilinkNavFacet 回调导航（点击链接 / 预览「打开」共用）。 */
+function navigateWikilink(view: EditorView, target: string): void {
+  const handler = view.state.facet(wikilinkNavFacet);
+  const fn = handler.length > 0 ? handler[handler.length - 1] : undefined;
+  fn?.(target);
 }
 
 /**
