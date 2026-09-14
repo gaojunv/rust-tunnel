@@ -67,7 +67,9 @@ fn source_to_str(s: &ResolveSource) -> &'static str {
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn agent_get_status(manager: State<'_, Arc<Mutex<AgentManager>>>) -> IpcResult<AgentStatus> {
-    let guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Ok(guard.get_status())
 }
 
@@ -83,8 +85,33 @@ pub fn agent_start(
     manager: State<'_, Arc<Mutex<AgentManager>>>,
 ) -> IpcResult<AgentStatus> {
     let sink: Arc<dyn crate::agent::AgentEventSink> = Arc::new(TauriEventSink(app));
-    let mut guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.start(sink).map_err(crate::error::IpcError::Agent)
+    // 三阶段启动：持锁预检（快）→ 放锁等握手（最长 15s，锁空闲给 stop/request）→
+    // 持锁回写。旧代码全程持锁横跨握手，codex 卡死会冻结所有 agent 命令。
+    let pending = {
+        let mut guard = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .begin_start(Arc::clone(&sink))
+            .map_err(crate::error::IpcError::Agent)?
+    };
+    let Some(pending) = pending else {
+        // 幂等：已 Running/Starting，直接返回当前快照
+        let guard = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        return Ok(guard.get_status());
+    };
+    let epoch = pending.epoch;
+    let outcome = pending.wait_handshake();
+    {
+        let mut guard = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .complete_start(outcome, epoch, &sink)
+            .map_err(crate::error::IpcError::Agent)
+    }
 }
 
 /// 停止 agent.
@@ -95,7 +122,9 @@ pub fn agent_start(
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn agent_stop(manager: State<'_, Arc<Mutex<AgentManager>>>) -> IpcResult<()> {
-    let mut guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.stop().map_err(crate::error::IpcError::Agent)
 }
 
@@ -109,7 +138,9 @@ pub fn agent_stop(manager: State<'_, Arc<Mutex<AgentManager>>>) -> IpcResult<()>
 pub fn agent_detect_binary(
     manager: State<'_, Arc<Mutex<AgentManager>>>,
 ) -> IpcResult<Option<BinaryResolveDto>> {
-    let guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let res = guard.detect_binary().map(|r| BinaryResolveDto {
         path: r.path.display().to_string(),
         argv_prefix: r.argv_prefix,
@@ -131,7 +162,9 @@ pub fn agent_request(
     method: String,
     params: Option<Value>,
 ) -> IpcResult<Value> {
-    let guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .request_sync(method, params)
         .map_err(crate::error::IpcError::Agent)
@@ -150,7 +183,9 @@ pub fn agent_respond(
     result: Option<Value>,
     error: Option<Value>,
 ) -> IpcResult<()> {
-    let guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .respond_sync(id, result, error)
         .map_err(crate::error::IpcError::Agent)
@@ -166,7 +201,9 @@ pub fn agent_respond(
 pub fn agent_get_settings(
     manager: State<'_, Arc<Mutex<AgentManager>>>,
 ) -> IpcResult<AgentSettings> {
-    let guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.get_settings().map_err(crate::error::IpcError::Agent)
 }
 
@@ -181,8 +218,12 @@ pub fn agent_save_settings(
     manager: State<'_, Arc<Mutex<AgentManager>>>,
     settings: AgentSettings,
 ) -> IpcResult<()> {
-    let mut guard = manager.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.save_settings(&settings).map_err(crate::error::IpcError::Agent)
+    let mut guard = manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .save_settings(&settings)
+        .map_err(crate::error::IpcError::Agent)
 }
 
 /// 用系统默认浏览器打开外部 URL（OAuth 等）.

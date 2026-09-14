@@ -165,7 +165,8 @@ impl AgentSettings {
             return Ok(Self::default());
         }
         let data = std::fs::read_to_string(path)?;
-        let s: Self = serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let s: Self = serde_json::from_str(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(s)
     }
 
@@ -178,8 +179,10 @@ impl AgentSettings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, data.as_bytes())?;
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // 原子写：同目录临时文件 + rename，避免中途崩溃截断目标文件丢配置
+        atomic_write(path, data.as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -194,6 +197,20 @@ impl AgentSettings {
     #[must_use]
     pub fn default_path(app_config_dir: &Path) -> PathBuf {
         app_config_dir.join("agent-settings.json")
+    }
+
+    /// 熔断相关字段是否变化：二进制路径 / 认证模式 / 网关地址与 key /
+    /// OpenAI key 任一变化视为"用户显式变更 agent 路径/配置"。
+    ///
+    /// `enabled` / `model` / 审批 / 沙箱 / wire 协议不影响"能否启动"，
+    /// 其变化不清零熔断（避免自动保存绕过熔断）。
+    #[must_use]
+    pub fn fuse_relevant_changed(&self, other: &Self) -> bool {
+        self.codex_path_override != other.codex_path_override
+            || self.auth_mode != other.auth_mode
+            || self.gateway_base_url != other.gateway_base_url
+            || self.gateway_api_key != other.gateway_api_key
+            || self.openai_api_key != other.openai_api_key
     }
 
     /// 启动前校验（网关地址与所选认证模式的 key）.
@@ -336,7 +353,7 @@ impl CodexHome {
             }
         }
 
-        std::fs::write(&config_path, out.as_bytes())?;
+        atomic_write(&config_path, out.as_bytes())?;
         Ok(config_path)
     }
 
@@ -346,12 +363,20 @@ impl CodexHome {
         let mut env = HashMap::new();
         match settings.auth_mode {
             AuthMode::Gateway => {
-                if let Some(key) = settings.gateway_api_key.as_deref().filter(|s| !s.trim().is_empty()) {
+                if let Some(key) = settings
+                    .gateway_api_key
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
                     env.insert("WIKI_TUNNEL_LLM_KEY".to_owned(), key.to_owned());
                 }
             }
             AuthMode::OpenaiKey => {
-                if let Some(key) = settings.openai_api_key.as_deref().filter(|s| !s.trim().is_empty()) {
+                if let Some(key) = settings
+                    .openai_api_key
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
                     env.insert("OPENAI_API_KEY".to_owned(), key.to_owned());
                 }
             }
@@ -367,8 +392,51 @@ impl CodexHome {
     }
 }
 
+/// 同目录原子写：写 `.<name>.tmp.<pid>` 后 `rename` 替换（同文件系统保证原子性）.
+///
+/// 失败时尽力清理临时文件；`rename` 在 POSIX 同目录下为原子操作。
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径缺少文件名"))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = path.with_file_name(tmp_name);
+    let res = (|| {
+        std::fs::write(&tmp_path, data)?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+/// TOML 基本字符串转义：`\`、`"`、换行及全部 C0/C1 控制字符.
+///
+/// 旧实现仅处理 `\\` 与 `"`，含 `\n` 的字符串会产出非法 TOML（换行裸入基本字符串）。
+/// 基本字符串不允许出现裸控制字符（含换行），此处按 TOML 规范转义
+/// `\b \t \n \f \r \" \\`，其余控制字符用 `\uXXXX`。
 fn toml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c < '\u{20}') || ('\u{7F}'..='\u{9F}').contains(&c) => {
+                let _ = std::fmt::write(&mut out, format_args!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -401,17 +469,27 @@ mod tests {
             wire_api: WireApi::Responses,
         };
         let v = serde_json::to_value(&s).expect("value");
-        assert_eq!(v.get("enabled").and_then(serde_json::Value::as_bool), Some(true));
-        assert_eq!(v.get("authMode").and_then(serde_json::Value::as_str), Some("openai-key"));
+        assert_eq!(
+            v.get("enabled").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            v.get("authMode").and_then(serde_json::Value::as_str),
+            Some("openai-key")
+        );
         assert_eq!(
             v.get("gatewayBaseUrl").and_then(serde_json::Value::as_str),
             Some("https://example.com")
         );
         assert_eq!(
-            v.get("codexPathOverride").and_then(serde_json::Value::as_str),
+            v.get("codexPathOverride")
+                .and_then(serde_json::Value::as_str),
             Some("/tmp/codex")
         );
-        assert_eq!(v.get("approvalPolicy").and_then(serde_json::Value::as_str), Some("auto"));
+        assert_eq!(
+            v.get("approvalPolicy").and_then(serde_json::Value::as_str),
+            Some("auto")
+        );
         assert_eq!(
             v.get("sandboxMode").and_then(serde_json::Value::as_str),
             Some("danger-full-access")
@@ -435,12 +513,30 @@ mod tests {
         };
         let path = CodexHome::ensure(&base, &settings).expect("ensure");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.starts_with("# managed by wiki-desktop"), "头注释缺失：{content}");
-        assert!(content.contains("model_provider = \"tunnel\""), "网关 provider：{content}");
-        assert!(content.contains("base_url = \"https://gw.example.com/v1\""), "base_url：{content}");
-        assert!(content.contains("name = \"tunnel\""), "provider name：{content}");
-        assert!(content.contains("WIKI_TUNNEL_LLM_KEY"), "env_key：{content}");
-        assert!(content.contains("wire_api = \"responses\""), "wire_api：{content}");
+        assert!(
+            content.starts_with("# managed by wiki-desktop"),
+            "头注释缺失：{content}"
+        );
+        assert!(
+            content.contains("model_provider = \"tunnel\""),
+            "网关 provider：{content}"
+        );
+        assert!(
+            content.contains("base_url = \"https://gw.example.com/v1\""),
+            "base_url：{content}"
+        );
+        assert!(
+            content.contains("name = \"tunnel\""),
+            "provider name：{content}"
+        );
+        assert!(
+            content.contains("WIKI_TUNNEL_LLM_KEY"),
+            "env_key：{content}"
+        );
+        assert!(
+            content.contains("wire_api = \"responses\""),
+            "wire_api：{content}"
+        );
         assert!(content.contains("model = \"gpt-4o\""), "model：{content}");
         assert!(!content.contains("secret-key"), "密钥不应落盘：{content}");
         assert!(content.contains("approval_policy"), "审批策略：{content}");
@@ -467,8 +563,14 @@ mod tests {
         };
         let path = CodexHome::ensure(&base, &settings).expect("ensure");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("wire_api = \"chat\""), "wire_api：{content}");
-        assert!(!content.contains("wire_api = \"responses\""), "wire_api 不应为 responses：{content}");
+        assert!(
+            content.contains("wire_api = \"chat\""),
+            "wire_api：{content}"
+        );
+        assert!(
+            !content.contains("wire_api = \"responses\""),
+            "wire_api 不应为 responses：{content}"
+        );
     }
 
     #[test]
@@ -479,7 +581,10 @@ mod tests {
         assert_eq!(s.wire_api, WireApi::Responses);
         // 序列化应为 camelCase 的 wireApi
         let v = serde_json::to_value(&s).expect("ser");
-        assert_eq!(v.get("wireApi").and_then(serde_json::Value::as_str), Some("responses"));
+        assert_eq!(
+            v.get("wireApi").and_then(serde_json::Value::as_str),
+            Some("responses")
+        );
     }
 
     #[test]
@@ -495,9 +600,18 @@ mod tests {
         };
         let path = CodexHome::ensure(&base, &settings).expect("ensure");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("model_provider = \"openai\""), "openai provider：{content}");
-        assert!(!content.contains("WIKI_TUNNEL_LLM_KEY"), "网关 key 不应出现：{content}");
-        assert!(!content.contains("sk-xxx"), "openai key 不应落盘：{content}");
+        assert!(
+            content.contains("model_provider = \"openai\""),
+            "openai provider：{content}"
+        );
+        assert!(
+            !content.contains("WIKI_TUNNEL_LLM_KEY"),
+            "网关 key 不应出现：{content}"
+        );
+        assert!(
+            !content.contains("sk-xxx"),
+            "openai key 不应落盘：{content}"
+        );
         let parsed: toml::Value = content.parse().expect("toml parse");
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
@@ -516,10 +630,19 @@ mod tests {
         };
         let path = CodexHome::ensure(&base, &settings).expect("ensure");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(!content.contains("WIKI_TUNNEL_LLM_KEY"), "chatgpt 不应有 tunnel key：{content}");
-        assert!(!content.contains("OPENAI_API_KEY"), "chatgpt 不应有 openai key：{content}");
+        assert!(
+            !content.contains("WIKI_TUNNEL_LLM_KEY"),
+            "chatgpt 不应有 tunnel key：{content}"
+        );
+        assert!(
+            !content.contains("OPENAI_API_KEY"),
+            "chatgpt 不应有 openai key：{content}"
+        );
         // chatgpt 模式不写 model_provider
-        assert!(!content.contains("model_provider"), "chatgpt 不应写 model_provider：{content}");
+        assert!(
+            !content.contains("model_provider"),
+            "chatgpt 不应写 model_provider：{content}"
+        );
     }
 
     #[test]
@@ -546,7 +669,10 @@ mod tests {
             ..Default::default()
         };
         let env = CodexHome::child_env(&gw);
-        assert_eq!(env.get("WIKI_TUNNEL_LLM_KEY").map(String::as_str), Some("gw-secret"));
+        assert_eq!(
+            env.get("WIKI_TUNNEL_LLM_KEY").map(String::as_str),
+            Some("gw-secret")
+        );
         assert!(!env.contains_key("OPENAI_API_KEY"));
 
         let oa = AgentSettings {
@@ -555,7 +681,10 @@ mod tests {
             ..Default::default()
         };
         let env2 = CodexHome::child_env(&oa);
-        assert_eq!(env2.get("OPENAI_API_KEY").map(String::as_str), Some("sk-secret"));
+        assert_eq!(
+            env2.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-secret")
+        );
         assert!(!env2.contains_key("WIKI_TUNNEL_LLM_KEY"));
 
         let chat = AgentSettings {
@@ -655,6 +784,118 @@ mod tests {
             ..AgentSettings::default()
         };
         assert!(chat.validate().is_ok());
+    }
+
+    #[test]
+    fn toml_escape_control_chars() {
+        // 旧实现漏转义换行：含 \n 的字符串必须产出合法 TOML
+        assert_eq!(toml_escape("plain"), "plain");
+        assert_eq!(toml_escape("a\"b"), "a\\\"b");
+        assert_eq!(toml_escape("a\\b"), "a\\\\b");
+        assert_eq!(toml_escape("line1\nline2"), "line1\\nline2");
+        assert_eq!(toml_escape("a\tb\rc"), "a\\tb\\rc");
+        assert_eq!(toml_escape("x\x08y\x0Cz"), "x\\by\\fz");
+        assert_eq!(toml_escape("a\x01b\x7F"), "a\\u0001b\\u007F");
+        // 转义后嵌入 config.toml 必须可解析回原值
+        let evil = "model\nwith \"quotes\" and \\ backslash \r\n plus \x01";
+        let esc = toml_escape(evil);
+        assert!(!esc.contains('\n'), "转义后不应含裸换行：{esc:?}");
+        assert!(!esc.contains('\r'), "转义后不应含裸回车：{esc:?}");
+        let toml_src = format!("model = \"{esc}\"\n");
+        let parsed: toml::Value = toml_src.parse().expect("转义后 TOML 应合法");
+        assert_eq!(parsed.get("model").and_then(|v| v.as_str()), Some(evil));
+    }
+
+    #[test]
+    fn config_ensure_escapes_model_with_newline() {
+        // 端到端：含换行的 model 经 ensure 落盘仍是合法 TOML 且回读一致
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("codex-home");
+        let settings = AgentSettings {
+            auth_mode: AuthMode::Gateway,
+            gateway_base_url: Some("https://gw.example.com".to_owned()),
+            gateway_api_key: Some("k".to_owned()),
+            model: Some("bad\nmodel\"x".to_owned()),
+            ..AgentSettings::default()
+        };
+        let path = CodexHome::ensure(&base, &settings).expect("ensure");
+        let content = std::fs::read_to_string(&path).expect("read");
+        let parsed: toml::Value = content.parse().expect("config.toml 应合法");
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("bad\nmodel\"x")
+        );
+    }
+
+    #[test]
+    fn atomic_write_no_temp_left_and_content_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-settings.json");
+        let s = AgentSettings {
+            enabled: true,
+            model: Some("gpt-4o".to_owned()),
+            ..AgentSettings::default()
+        };
+        s.save(&path).expect("save");
+        let loaded = AgentSettings::load(&path).expect("load");
+        assert_eq!(loaded, s);
+        // 同目录不应残留临时文件
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok().map(|x| x.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件：{leftovers:?}");
+        // 覆盖保存同样原子且无残留
+        let s2 = AgentSettings {
+            enabled: false,
+            ..AgentSettings::default()
+        };
+        s2.save(&path).expect("save2");
+        assert_eq!(AgentSettings::load(&path).expect("load2"), s2);
+        let leftovers2: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir2")
+            .filter_map(|e| e.ok().map(|x| x.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers2.is_empty(),
+            "覆盖保存不应残留临时文件：{leftovers2:?}"
+        );
+    }
+
+    #[test]
+    fn fuse_relevant_changed_semantics() {
+        let base = AgentSettings::default();
+        // 完全相同：不清零（自动保存场景）
+        assert!(!base.fuse_relevant_changed(&base));
+        // 非熔断字段变化：不清零
+        let mut other = base.clone();
+        other.enabled = true;
+        other.model = Some("gpt-4o".to_owned());
+        other.approval_policy = ApprovalPolicy::Never;
+        other.sandbox_mode = SandboxMode::ReadOnly;
+        other.wire_api = WireApi::Chat;
+        assert!(
+            !base.fuse_relevant_changed(&other),
+            "非熔断字段变化不应清零熔断"
+        );
+        // 熔断相关字段任一变化：清零
+        let mut path_changed = base.clone();
+        path_changed.codex_path_override = Some("/usr/bin/codex".to_owned());
+        assert!(base.fuse_relevant_changed(&path_changed));
+        let mut url_changed = base.clone();
+        url_changed.gateway_base_url = Some("https://gw.example.com".to_owned());
+        assert!(base.fuse_relevant_changed(&url_changed));
+        let mut key_changed = base.clone();
+        key_changed.gateway_api_key = Some("tok".to_owned());
+        assert!(base.fuse_relevant_changed(&key_changed));
+        let mut openai_changed = base.clone();
+        openai_changed.openai_api_key = Some("sk-x".to_owned());
+        assert!(base.fuse_relevant_changed(&openai_changed));
+        let mut auth_changed = base.clone();
+        auth_changed.auth_mode = AuthMode::ChatGpt;
+        assert!(base.fuse_relevant_changed(&auth_changed));
     }
 
     #[test]

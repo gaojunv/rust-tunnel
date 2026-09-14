@@ -16,8 +16,14 @@ use std::sync::{
 };
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, oneshot};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{oneshot, Mutex};
+
+/// 单帧上限 16MiB：超限判连接死亡（`fail_all_pending` + `Exited`），防无界内存增长.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// parse-error 回传预览上限：只传前 512 字节（按字符边界）+ 原始长度，避免大帧多次全量拷贝.
+pub const PARSE_ERROR_PREVIEW_BYTES: usize = 512;
 
 /// 待处理请求映射：`id -> oneshot` 发送端.
 type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, JsonRpcError>>>;
@@ -47,6 +53,27 @@ impl std::fmt::Display for JsonRpcError {
 }
 
 impl std::error::Error for JsonRpcError {}
+
+/// parse-error 预览：前 `PARSE_ERROR_PREVIEW_BYTES` 字节（按字符边界截断）+ 原始字节长.
+fn parse_preview(line: &str) -> (String, usize) {
+    let len = line.len();
+    if len <= PARSE_ERROR_PREVIEW_BYTES {
+        return (line.to_owned(), len);
+    }
+    let mut end = PARSE_ERROR_PREVIEW_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (line[..end].to_owned(), len)
+}
+
+/// 全部 pending 以错误兑现（读循环内部用，不触 sink，避免与调用方 `on_status` 重复上报）.
+async fn fail_pending(pending: &Arc<Mutex<PendingMap>>, reason: String) {
+    let mut guard = pending.lock().await;
+    for (_, tx) in guard.drain() {
+        let _ = tx.send(Err(JsonRpcError(reason.clone())));
+    }
+}
 
 /// 事件接收端（由上层 `AgentManager` 注入）.
 pub trait JsonRpcSink: Send + Sync + 'static {
@@ -88,7 +115,10 @@ pub struct CollectSink {
 #[cfg(test)]
 impl JsonRpcSink for CollectSink {
     fn on_notification(&self, method: String, params: Option<Value>) {
-        self.notifications.lock().expect("lock").push((method, params));
+        self.notifications
+            .lock()
+            .expect("lock")
+            .push((method, params));
     }
     fn on_server_request(&self, id: Value, method: String, params: Option<Value>) {
         self.server_requests
@@ -124,11 +154,13 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     /// 以给定的读写 halves 与 sink 构造连接并启动读循环.
-    #[allow(clippy::too_many_lines, reason = "读循环与分帧逻辑集中在一处，拆分会降低可读性")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "读循环与分帧逻辑集中在一处，拆分会降低可读性"
+    )]
     pub fn new(reader: R, writer: W, sink: Arc<dyn JsonRpcSink>) -> Self {
         let writer = Arc::new(Mutex::new(writer));
-        let pending: Arc<Mutex<PendingMap>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let pending_clone = Arc::clone(&pending);
         let sink_clone = Arc::clone(&sink);
@@ -137,14 +169,14 @@ where
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = match reader.read_line(&mut line).await {
+                // `take` 上限 +1：读满 `MAX_FRAME_BYTES + 1` 且未见 `\n` 即超限。
+                // `Take` 按值消费 reader，读完用 `into_inner` 取回。
+                let mut limited = reader.take((MAX_FRAME_BYTES + 1) as u64);
+                let n = match limited.read_line(&mut line).await {
                     Ok(v) => v,
                     Err(err) => {
                         // 读错误视为退出
-                        let mut guard = pending_clone.lock().await;
-                        for (_, tx) in guard.drain() {
-                            let _ = tx.send(Err(JsonRpcError(format!("read error: {err}"))));
-                        }
+                        fail_pending(&pending_clone, format!("read error: {err}")).await;
                         sink_clone.on_status(JsonRpcStatus::Exited {
                             code: None,
                             reason: format!("read error: {err}"),
@@ -152,15 +184,29 @@ where
                         break;
                     }
                 };
+                reader = limited.into_inner();
                 if n == 0 {
                     // EOF
-                    let mut guard = pending_clone.lock().await;
-                    for (_, tx) in guard.drain() {
-                        let _ = tx.send(Err(JsonRpcError("connection closed (EOF)".to_owned())));
-                    }
+                    fail_pending(&pending_clone, "connection closed (EOF)".to_owned()).await;
                     sink_clone.on_status(JsonRpcStatus::Exited {
                         code: None,
                         reason: "EOF".to_owned(),
+                    });
+                    break;
+                }
+                if n > MAX_FRAME_BYTES {
+                    // 超限（含恰好 `MAX+1` 未见换行的情形）：连接已不可信，判死
+                    // 丢弃当前超限帧的剩余字节（含换行符），再 fail 全部 pending
+                    let mut discard = Vec::new();
+                    let _ = reader.read_until(b'\n', &mut discard).await;
+                    fail_pending(
+                        &pending_clone,
+                        format!("frame too large (>{MAX_FRAME_BYTES} bytes)"),
+                    )
+                    .await;
+                    sink_clone.on_status(JsonRpcStatus::Exited {
+                        code: None,
+                        reason: format!("frame too large (>{MAX_FRAME_BYTES} bytes)"),
                     });
                     break;
                 }
@@ -177,18 +223,25 @@ where
                 let value = match parsed {
                     Ok(v) => v,
                     Err(err) => {
-                        sink_clone.on_parse_error(trimmed.to_owned(), err.to_string());
+                        let (preview, len) = parse_preview(trimmed);
+                        sink_clone.on_parse_error(preview, format!("{err} (frame_len={len})"));
                         continue;
                     }
                 };
-                // 必须是 object
-                let Some(obj) = value.as_object() else {
-                    sink_clone.on_parse_error(trimmed.to_owned(), "not an object".to_owned());
+                // 必须是 object；`Map::remove` 逐个 move 取字段，全程零拷贝
+                // （旧代码 `method.to_owned()` + `params/id/result` 三处整棵 clone）。
+                let Value::Object(mut obj) = value else {
+                    let (preview, len) = parse_preview(trimmed);
+                    sink_clone.on_parse_error(preview, format!("not an object (frame_len={len})"));
                     continue;
                 };
-                let method = obj.get("method").and_then(|v| v.as_str()).map(ToOwned::to_owned);
-                let id = obj.get("id").cloned();
-                let params = obj.get("params").cloned();
+                // 非字符串 method 与旧 `and_then(as_str)` 语义一致：视为无 method
+                let method = match obj.remove("method") {
+                    Some(Value::String(m)) => Some(m),
+                    _ => None,
+                };
+                let id = obj.remove("id");
+                let params = obj.remove("params");
                 match (method, id) {
                     (Some(m), Some(id_val)) => {
                         // server → client request
@@ -211,11 +264,12 @@ where
                                 guard.remove(&num)
                             };
                             if let Some(tx) = tx_opt {
-                                // 区分 result / error
-                                if let Some(err_val) = obj.get("error") {
+                                // `method/id/params` 已 move 出，剩余 map 中按 key
+                                // move 取 `error`/`result`，无整棵 `Value::clone`。
+                                if let Some(err_val) = obj.remove("error") {
                                     let _ = tx.send(Err(JsonRpcError(err_val.to_string())));
-                                } else if let Some(res) = obj.get("result") {
-                                    let _ = tx.send(Ok(res.clone()));
+                                } else if let Some(res) = obj.remove("result") {
+                                    let _ = tx.send(Ok(res));
                                 } else {
                                     // 无 result 也无 error，视为 null
                                     let _ = tx.send(Ok(Value::Null));
@@ -228,8 +282,12 @@ where
                         }
                     }
                     (None, None) => {
-                        // 既无 method 也无 id，视为畸形行
-                        sink_clone.on_parse_error(trimmed.to_owned(), "missing method and id".to_owned());
+                        // 既无 method 也无 id，视为畸形行（只传预览 + 长度）
+                        let (preview, len) = parse_preview(trimmed);
+                        sink_clone.on_parse_error(
+                            preview,
+                            format!("missing method and id (frame_len={len})"),
+                        );
                     }
                 }
             }
@@ -249,7 +307,11 @@ where
     /// # Errors
     ///
     /// 写失败或对端关闭时返回 [`JsonRpcError`]。
-    pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, JsonRpcError> {
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, JsonRpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -264,14 +326,17 @@ where
         }
         let line = serde_json::to_string(&Value::Object(payload))
             .map_err(|e| JsonRpcError(e.to_string()))?;
+        // 单临界区写完 payload + `\n` 并 flush（与 respond/notify 一致；
+        // 旧代码分两次持写锁：payload 一次、flush 一次）。
         let write_res = {
             let mut guard = self.writer.lock().await;
-            let res = guard.write_all(line.as_bytes()).await;
-            if res.is_ok() {
-                res.and(guard.write_all(b"\n").await)
-            } else {
-                res
+            let res = async {
+                guard.write_all(line.as_bytes()).await?;
+                guard.write_all(b"\n").await?;
+                guard.flush().await
             }
+            .await;
+            res
         };
         if let Err(err) = write_res {
             // 写失败：移除 pending 并广播 Exited
@@ -279,19 +344,8 @@ where
                 let mut guard = self.pending.lock().await;
                 guard.remove(&id);
             }
-            // 尝试让 writer flush 失败也触发 pending 清理
             self.fail_all_pending(format!("write error: {err}")).await;
             return Err(JsonRpcError(format!("write error: {err}")));
-        }
-        // flush
-        {
-            let mut guard = self.writer.lock().await;
-            if let Err(err) = guard.flush().await {
-                self.fail_all_pending(format!("flush error: {err}")).await;
-                let mut g = self.pending.lock().await;
-                g.remove(&id);
-                return Err(JsonRpcError(format!("flush error: {err}")));
-            }
         }
         // 等待响应
         match rx.await {
@@ -330,7 +384,10 @@ where
             .write_all(b"\n")
             .await
             .map_err(|e| JsonRpcError(format!("write error: {e}")))?;
-        guard.flush().await.map_err(|e| JsonRpcError(format!("flush error: {e}")))?;
+        guard
+            .flush()
+            .await
+            .map_err(|e| JsonRpcError(format!("flush error: {e}")))?;
         Ok(())
     }
 
@@ -356,7 +413,10 @@ where
             .write_all(b"\n")
             .await
             .map_err(|e| JsonRpcError(format!("write error: {e}")))?;
-        guard.flush().await.map_err(|e| JsonRpcError(format!("flush error: {e}")))?;
+        guard
+            .flush()
+            .await
+            .map_err(|e| JsonRpcError(format!("flush error: {e}")))?;
         Ok(())
     }
 
@@ -370,10 +430,8 @@ where
         for (_, tx) in guard.drain() {
             let _ = tx.send(Err(JsonRpcError(reason.clone())));
         }
-        self.sink.on_status(JsonRpcStatus::Exited {
-            code: None,
-            reason,
-        });
+        self.sink
+            .on_status(JsonRpcStatus::Exited { code: None, reason });
     }
 
     /// 关闭写端（用于测试写关闭传播）.
@@ -478,7 +536,7 @@ mod tests {
         let (rb, wb) = duplex(8192);
         // 这里用 ra/wb 交叉：把 wa 的多帧写到 ra
         drop((rb, wb)); // 占位
-        // 重新搭建：a 从 ra 读，b 向 wa 写
+                        // 重新搭建：a 从 ra 读，b 向 wa 写
         let sink2 = collect_sink();
         let (dummy_r, dummy_w) = duplex(8192);
         let conn = JsonRpcConnection::new(ra, dummy_w, sink2.clone());
@@ -510,13 +568,17 @@ mod tests {
         let sink = collect_sink();
         let _conn = JsonRpcConnection::new(ra, dummy_w, sink.clone());
         // 拆两段写入同一帧
-        let full = serde_json::to_string(&json!({"method": "split", "params": {"x": 1}})).expect("ser");
+        let full =
+            serde_json::to_string(&json!({"method": "split", "params": {"x": 1}})).expect("ser");
         let (part1, part2) = full.split_at(full.len() / 2);
         wa.write_all(part1.as_bytes()).await.expect("p1");
         wa.flush().await.expect("flush1");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // 此时不应有完整 notification
-        assert!(sink.notifications.lock().expect("lock").is_empty(), "半帧不应触发");
+        assert!(
+            sink.notifications.lock().expect("lock").is_empty(),
+            "半帧不应触发"
+        );
         wa.write_all(part2.as_bytes()).await.expect("p2");
         wa.write_all(b"\n").await.expect("nl");
         wa.flush().await.expect("flush2");
@@ -533,7 +595,11 @@ mod tests {
         let (dummy_r, dummy_w) = duplex(8192);
         let sink = collect_sink();
         let _conn = JsonRpcConnection::new(ra, dummy_w, sink.clone());
-        let payload = format!("{}\r\n{}\r\n", json!({"method": "m1"}), json!({"method": "m2"}));
+        let payload = format!(
+            "{}\r\n{}\r\n",
+            json!({"method": "m1"}),
+            json!({"method": "m2"})
+        );
         wa.write_all(payload.as_bytes()).await.expect("write");
         wa.flush().await.expect("flush");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -581,10 +647,7 @@ mod tests {
             }
             writer.flush().await.expect("flush");
         });
-        let (res1, res2) = tokio::join!(
-            conn_c.request("m1", None),
-            conn_c.request("m2", None)
-        );
+        let (res1, res2) = tokio::join!(conn_c.request("m1", None), conn_c.request("m2", None));
         let v1 = res1.expect("r1 ok");
         let v2 = res2.expect("r2 ok");
         // 虽然 server 乱序回包，pending 仍应正确归位
@@ -651,8 +714,11 @@ mod tests {
             writer.flush().await.expect("flush");
         });
         // 注入一个未知 id 的响应到 ra（conn 的读取侧），验证 discard
-        let unknown_line = serde_json::to_string(&json!({"id": 12345, "result": "x"})).expect("ser");
-        wa.write_all(unknown_line.as_bytes()).await.expect("w unknown");
+        let unknown_line =
+            serde_json::to_string(&json!({"id": 12345, "result": "x"})).expect("ser");
+        wa.write_all(unknown_line.as_bytes())
+            .await
+            .expect("w unknown");
         wa.write_all(b"\n").await.expect("nl");
         wa.flush().await.expect("flush");
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -709,7 +775,6 @@ mod tests {
 
     #[tokio::test]
     async fn server_request_roundtrip_respond() {
-
         // 独立验证 respond：创建一对 duplex，手动写 response 行并让 request 归位
         let (c_read, s_write2) = duplex(8192);
         let (s_read2, c_write2) = duplex(8192);
@@ -729,8 +794,14 @@ mod tests {
             writer.write_all(b"\n").await.expect("nl");
             writer.flush().await.expect("flush");
         });
-        let res = conn.request("do/thing", Some(json!({"x": 1}))).await.expect("req ok");
-        assert_eq!(res.get("decision").and_then(|v| v.as_str()), Some("approved"));
+        let res = conn
+            .request("do/thing", Some(json!({"x": 1})))
+            .await
+            .expect("req ok");
+        assert_eq!(
+            res.get("decision").and_then(|v| v.as_str()),
+            Some("approved")
+        );
         server_task.await.expect("server task");
 
         // 验证 respond API 本身写入的格式能被对端解析为 response
@@ -752,7 +823,11 @@ mod tests {
         assert_eq!(v_b.get("result"), Some(&json!({"ok": true})));
         // error 形态
         conn_a2
-            .respond(json!("str-id"), None, Some(json!({"code": -1, "message": "fail"})))
+            .respond(
+                json!("str-id"),
+                None,
+                Some(json!({"code": -1, "message": "fail"})),
+            )
             .await
             .expect("respond error ok");
         line_b.clear();
@@ -772,7 +847,8 @@ mod tests {
         // 畸形行 + 正常 notification
         wa.write_all(b"not json at all\n").await.expect("w1");
         wa.write_all(b"{\"incomplete\":\n").await.expect("w2");
-        let good = serde_json::to_string(&json!({"method": "good", "params": {"ok": 1}})).expect("ser");
+        let good =
+            serde_json::to_string(&json!({"method": "good", "params": {"ok": 1}})).expect("ser");
         wa.write_all(good.as_bytes()).await.expect("w3");
         wa.write_all(b"\n").await.expect("nl");
         wa.flush().await.expect("flush");
@@ -808,7 +884,11 @@ mod tests {
         drop(s_read2);
         drop(s_write2);
         let res = req_fut.await.expect("join").expect_err("应因 EOF 失败");
-        assert!(res.0.contains("EOF") || res.0.contains("closed"), "错误应含 EOF/closed，实际 {}", res.0);
+        assert!(
+            res.0.contains("EOF") || res.0.contains("closed"),
+            "错误应含 EOF/closed，实际 {}",
+            res.0
+        );
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         let statuses = sink2.statuses.lock().expect("lock").clone();
         assert!(!statuses.is_empty(), "应有 Exited 状态");
@@ -854,7 +934,10 @@ mod tests {
         wa.write_all(b"\n").await.expect("nl");
         wa.flush().await.expect("flush");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(sink.parse_errors.lock().expect("lock").is_empty(), "空行不应算解析错误");
+        assert!(
+            sink.parse_errors.lock().expect("lock").is_empty(),
+            "空行不应算解析错误"
+        );
         let notifs = sink.notifications.lock().expect("lock").clone();
         assert_eq!(notifs.len(), 1);
         assert_eq!(notifs[0].0, "after_empty");
@@ -881,7 +964,14 @@ mod tests {
         let notifs = sink.notifications.lock().expect("lock").clone();
         assert_eq!(notifs.len(), 1);
         assert_eq!(notifs[0].0, "utf8");
-        assert_eq!(notifs[0].1.as_ref().and_then(|v| v.get("text")).and_then(|v| v.as_str()), Some("你好世界"));
+        assert_eq!(
+            notifs[0]
+                .1
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str()),
+            Some("你好世界")
+        );
         drop(dummy_r);
     }
 
@@ -905,7 +995,11 @@ mod tests {
             writer.flush().await.expect("flush");
         });
         let err = conn.request("m", None).await.expect_err("应为 error");
-        assert!(err.0.contains("backpressure") || err.0.contains("-32001"), "错误应含 backpressure，实际 {}", err.0);
+        assert!(
+            err.0.contains("backpressure") || err.0.contains("-32001"),
+            "错误应含 backpressure，实际 {}",
+            err.0
+        );
         server.await.expect("server");
     }
 
@@ -941,7 +1035,9 @@ mod tests {
         let sink = collect_sink();
         let conn = JsonRpcConnection::new(a_read, b_write, sink.clone());
         conn.notify("initialized", None).await.expect("notify");
-        conn.notify("custom/event", Some(json!({"x": 1}))).await.expect("notify2");
+        conn.notify("custom/event", Some(json!({"x": 1})))
+            .await
+            .expect("notify2");
         // 从 b_read 读两行
         let mut reader = BufReader::new(b_read);
         let mut line1 = String::new();
@@ -950,9 +1046,15 @@ mod tests {
         reader.read_line(&mut line2).await.expect("r2");
         let v1: Value = serde_json::from_str(line1.trim()).expect("j1");
         let v2: Value = serde_json::from_str(line2.trim()).expect("j2");
-        assert_eq!(v1.get("method").and_then(|v| v.as_str()), Some("initialized"));
+        assert_eq!(
+            v1.get("method").and_then(|v| v.as_str()),
+            Some("initialized")
+        );
         assert!(v1.get("id").is_none(), "notification 不应有 id");
-        assert_eq!(v2.get("method").and_then(|v| v.as_str()), Some("custom/event"));
+        assert_eq!(
+            v2.get("method").and_then(|v| v.as_str()),
+            Some("custom/event")
+        );
         assert_eq!(v2.get("params"), Some(&json!({"x": 1})));
         drop(a_write);
     }
@@ -975,6 +1077,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_preview_truncates_and_reports_len() {
+        let (preview, len) = super::parse_preview("short");
+        assert_eq!(preview, "short");
+        assert_eq!(len, 5);
+        // 超长：预览截断到 512B、长度为原始长度
+        let long = "x".repeat(2000);
+        let (preview2, len2) = super::parse_preview(&long);
+        assert_eq!(preview2.len(), super::PARSE_ERROR_PREVIEW_BYTES);
+        assert_eq!(len2, 2000);
+        // 多字节字符边界：不切断 UTF-8
+        let multi = "中".repeat(500);
+        let (preview3, len3) = super::parse_preview(&multi);
+        assert!(preview3.len() <= super::PARSE_ERROR_PREVIEW_BYTES);
+        assert!(
+            std::str::from_utf8(preview3.as_bytes()).is_ok(),
+            "预览必须保持字符边界"
+        );
+        assert_eq!(len3, multi.len());
+    }
+
+    #[tokio::test]
+    async fn oversize_frame_kills_connection_and_fails_pending() {
+        let (c_read, s_write) = duplex(64 * 1024);
+        let (s_read, c_write) = duplex(64 * 1024);
+        let sink = collect_sink();
+        let conn = JsonRpcConnection::new(c_read, c_write, sink.clone());
+        // 先发一个正常 request 制造 pending，再从 server 侧灌超限帧
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(s_read);
+            let mut writer = s_write;
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read req");
+            // 超限帧：16MB+100 字节无换行
+            let big = "y".repeat(super::MAX_FRAME_BYTES + 100);
+            writer.write_all(big.as_bytes()).await.expect("w big");
+            writer.write_all(b"\n").await.expect("nl");
+            writer.flush().await.expect("flush");
+            // 保持写端以便读侧处理
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let res = conn.request("m", None).await;
+        assert!(res.is_err(), "超限帧应使 pending 失败，实际 {res:?}");
+        let err = res.expect_err("err");
+        assert!(
+            err.0.contains("too large"),
+            "错误应提示 too large，实际 {}",
+            err.0
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let statuses = sink.statuses.lock().expect("lock").clone();
+        assert!(
+            statuses.iter().any(|s| matches!(s, JsonRpcStatus::Exited { reason, .. } if reason.contains("too large"))),
+            "应广播 frame too large 的 Exited，实际 {statuses:?}"
+        );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn zerocopy_parse_moves_large_params_without_clone() {
+        // 零拷贝等价性：大 params 经 remove/move 后原样到达 sink，无深拷贝也无丢失
+        let (ra, mut wa) = duplex(16384);
+        let (dummy_r, dummy_w) = duplex(16384);
+        let sink = collect_sink();
+        let _conn = JsonRpcConnection::new(ra, dummy_w, sink.clone());
+        let big_text = "z".repeat(8000);
+        let msg =
+            json!({"method": "big", "params": {"text": big_text}, "id": 1, "extra": [1, 2, 3]});
+        let s = serde_json::to_string(&msg).expect("ser");
+        wa.write_all(s.as_bytes()).await.expect("w");
+        wa.write_all(b"\n").await.expect("nl");
+        wa.flush().await.expect("flush");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 数字 id + method 走 server_request 分支（非 response），params 应完整 move 到达
+        let reqs = sink.server_requests.lock().expect("lock").clone();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1, "big");
+        assert_eq!(
+            reqs[0]
+                .2
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::len),
+            Some(8000)
+        );
+        // response 分支的 result move：构造带大 result 的响应归位 pending
+        let (c_read, s_write) = duplex(16384);
+        let (s_read, c_write) = duplex(16384);
+        let sink2 = collect_sink();
+        let conn2 = JsonRpcConnection::new(c_read, c_write, sink2.clone());
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(s_read);
+            let mut writer = s_write;
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read");
+            let v: Value = serde_json::from_str(line.trim()).expect("json");
+            let id = v.get("id").expect("id").clone();
+            let resp = json!({"id": id, "result": {"blob": "w".repeat(8000)}});
+            let s = serde_json::to_string(&resp).expect("ser");
+            writer.write_all(s.as_bytes()).await.expect("w");
+            writer.write_all(b"\n").await.expect("nl");
+            writer.flush().await.expect("flush");
+        });
+        let result_val = conn2.request("m", None).await.expect("req ok");
+        assert_eq!(
+            result_val
+                .get("blob")
+                .and_then(|v| v.as_str())
+                .map(str::len),
+            Some(8000)
+        );
+        server.await.expect("server");
+        drop(dummy_r);
+    }
+
+    #[tokio::test]
     async fn large_payload_single_frame() {
         let (ra, mut wa) = duplex(16384);
         let (dummy_r, dummy_w) = duplex(16384);
@@ -991,7 +1209,12 @@ mod tests {
         assert_eq!(notifs.len(), 1);
         assert_eq!(notifs[0].0, "big");
         assert_eq!(
-            notifs[0].1.as_ref().and_then(|v| v.get("text")).and_then(|v| v.as_str()).map(str::len),
+            notifs[0]
+                .1
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::len),
             Some(8000)
         );
         drop(dummy_r);
