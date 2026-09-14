@@ -385,8 +385,12 @@ export function WikiSidebar({
                     )}
                   >
                     <span className="line-clamp-1 text-sm font-medium">{h.title}</span>
-                    <span className="line-clamp-2 text-xs text-muted-foreground">{h.snippet}</span>
-                    <span className="text-xs text-muted-foreground">匹配分 {h.score.toFixed(1)}</span>
+                    <span className="truncate text-xs text-muted-foreground">{h.note_key}</span>
+                    {h.snippet && (
+                      <span className="line-clamp-2 whitespace-pre-wrap break-words text-xs text-muted-foreground">
+                        {h.snippet}
+                      </span>
+                    )}
                   </button>
                 </li>
               ))}
