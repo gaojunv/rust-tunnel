@@ -2,7 +2,8 @@ import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardR
 import { Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { getNote, saveNote, deleteNote, renameNote, listNotes, saveAttachment } from "@/api/tauri";
+import { getNote, saveNote, deleteNote, renameNote, listNotes, saveAttachment, onVaultFsChanged } from "@/api/tauri";
+import type { UnlistenFn } from "@/api/tauri";
 import type { NoteDto, NoteSummary } from "@/api/types";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
@@ -78,6 +79,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // vault 外部文件变更提示（watcher 事件驱动，非侵入 banner，见下方订阅 effect）
+  const [externalInfo, setExternalInfo] = useState<{ kind: "modified" | "deleted" } | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
   // Live Preview 开关：默认开启，切换时写 localStorage
@@ -169,6 +172,78 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     // 首次加载（noteKey 变化）直接重载
     return doReloadNote(noteKey);
   }, [noteKey, onDirtyChange, doReloadNote]);
+
+  // 应用内保存回声抑制：保存成功后 1s 内忽略该 key 的 watcher 事件
+  // （watcher 会把应用内写入也广播回来，内容一致时本可由对比过滤，
+  // 但删除→重建等边界下显式时间窗更稳妥）
+  const suppressEchoUntilRef = useRef<Map<string, number>>(new Map());
+  const markSelfSaved = useCallback((key: string) => {
+    suppressEchoUntilRef.current.set(key, Date.now() + 1000);
+  }, []);
+  const isEchoSuppressed = useCallback((key: string) => {
+    const until = suppressEchoUntilRef.current.get(key);
+    return until != null && Date.now() < until;
+  }, []);
+
+  // vault watcher 订阅：当前笔记被外部修改/删除时的增量处理。
+  // 与上方的 refreshToken 轮询探测互补：watcher 事件带变更 key，
+  // 只处理命中当前 noteKey 的事件；无关 key 的事件直接忽略（列表侧由 Sidebar 处理）。
+  useEffect(() => {
+    if (!noteKey) return;
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    onVaultFsChanged((keys) => {
+      if (cancelled) return;
+      if (!keys.includes(noteKey)) return;
+      if (isEchoSuppressed(noteKey)) return;
+      const n = noteRef.current;
+      if (!n) return;
+      // 先拿当前编辑态判断 dirty
+      const v = cmRef.current?.view();
+      const curBody = v ? v.state.doc.toString() : bodyRef.current;
+      const curTitle = titleRef.current;
+      const isDirty = curTitle !== n.title || curBody !== n.body;
+      // 拉取磁盘最新做内容对比；一致则静默忽略（echo 兜底）
+      getNote(noteKey)
+        .then((remote) => {
+          if (cancelled) return;
+          const base = noteRef.current;
+          if (!base) return;
+          if (remote.body === base.body && remote.title === base.title) return;
+          if (!isDirty) {
+            // 无未保存改动：自动重载
+            setNote(remote);
+            setTitle(remote.title);
+            setBody(remote.body);
+            bodyAtMountRef.current = remote.body;
+            hasLoadedRef.current = true;
+            const view = cmRef.current?.view();
+            if (view) replaceDocPreserveSelection(view, remote.body);
+            setExternalInfo(null);
+          } else {
+            // 有未保存改动：非侵入 banner，等待用户点「重新加载」
+            setExternalInfo({ kind: "modified" });
+          }
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!isDirty && isNotFoundError(msg)) setExternalInfo({ kind: "deleted" });
+        });
+    }).then((u) => {
+      if (!cancelled) unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [noteKey, isEchoSuppressed]);
+
+  const handleExternalReload = useCallback(() => {
+    if (!noteKey) return;
+    setExternalInfo(null);
+    doReloadNote(noteKey);
+  }, [noteKey, doReloadNote]);
 
   // refreshToken 驱动的外部重载：带脏保护
   useEffect(() => {
@@ -344,6 +419,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     }
     pendingSaveRef.current = false;
     lastSaveErrorRef.current = null;
+    setExternalInfo(null);
   }, [noteKey]);
 
   const computeDirtyNow = useCallback(() => {
@@ -375,6 +451,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     const p = (async () => {
       const updated = await saveNote(sentKey, sentBody, sentTitle.trim() || undefined);
       if (noteKeyRef.current !== sentKey) return;
+      markSelfSaved(sentKey);
       const nowView = cmRef.current?.view();
       const nowBody = nowView ? nowView.state.doc.toString() : bodyRef.current;
       const nowTitle = titleRef.current;
@@ -409,7 +486,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       setSaving(false);
       savingRef.current = false;
     }
-  }, []);
+  }, [markSelfSaved]);
 
   const runSaveAfterPending = useCallback(async () => {
     try {
@@ -830,6 +907,27 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       />
 
       {error && <p className="mx-3 mt-3 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
+
+      {/* vault 外部变更提示条（watcher 事件驱动；参考保存失败 banner 的非侵入样式） */}
+      {externalInfo?.kind === "modified" && (
+        <div className="mx-3 mt-3 flex items-center gap-2 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-600">
+          <span className="flex-1">文件已在磁盘上被修改（外部程序）。未保存的改动仍保留。</span>
+          <Button type="button" variant="outline" size="sm" onClick={handleExternalReload}>
+            重新加载
+          </Button>
+          <Button type="button" variant="ghost" size="sm" onClick={() => setExternalInfo(null)}>
+            忽略
+          </Button>
+        </div>
+      )}
+      {externalInfo?.kind === "deleted" && (
+        <div className="mx-3 mt-3 flex items-center gap-2 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-600">
+          <span className="flex-1">文件已在磁盘上被删除（外部程序）。当前内容仍保留在编辑器中。</span>
+          <Button type="button" variant="ghost" size="sm" onClick={() => setExternalInfo(null)}>
+            忽略
+          </Button>
+        </div>
+      )}
 
       {/* 编辑区：恒为编辑态；空正文时编辑器照常渲染（CM placeholder 已有提示） */}
       <div className="flex min-h-0 flex-1 flex-col">
