@@ -22,6 +22,20 @@ pub struct Vault {
     pub notes: Vec<NoteKey>,
 }
 
+/// 笔记的轻量元信息：键、文件路径与修改时间（不含正文）。
+///
+/// 由 [`Vault::scan_meta`] 产出：一次 walk 只做键推导与 `stat`，不读文件内容、
+/// 不做任何 comrak 解析，供摘要列表等路径使用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteMeta {
+    /// 笔记唯一键。
+    pub key: NoteKey,
+    /// 笔记文件绝对路径。
+    pub path: PathBuf,
+    /// 最后修改时间。
+    pub modified: SystemTime,
+}
+
 impl Vault {
     /// 扫描 `root` 目录并返回仅含键的 [`Vault`]（不读文件内容）。
     #[must_use]
@@ -43,46 +57,61 @@ impl Vault {
         Self::load_notes(root)
     }
 
-    /// 扫描 `root` 并加载全部笔记（`load` 的别名，等价方法）。
+    /// 只读目标单文件并解析为 [`Note`]（不扫描全 vault）。
+    ///
+    /// `key` 为 vault 内相对路径键（去扩展名，`/` 分隔）；依次尝试 `.md`
+    /// 与 `.markdown` 扩展名。文件不存在、非 Markdown 或 vault 之外时返回 `None`。
+    ///
+    /// 解析管线与 [`Vault::load_notes`] 单文件分支一致（含 frontmatter /
+    /// wikilinks / 元信息），同一文件两者结果相同。
     #[must_use]
-    pub fn load_notes(root: impl Into<PathBuf>) -> Vec<Note> {
+    pub fn load_one(root: &Path, key: &str) -> Option<Note> {
+        let normalized = key.replace('\\', "/");
+        // 复用扫描器的忽略规则：命中忽略段的 key 视为不存在
+        let scanner = VaultScanner::new(root);
+        if normalized.split('/').any(|seg| {
+            seg.starts_with('.') || scanner.ignore_patterns.iter().any(|pat| pat == seg)
+        }) {
+            return None;
+        }
+        for ext in ["md", "markdown"] {
+            let path = root.join(&normalized).with_extension(ext);
+            // 词法约束：不得逃出 root
+            if !path.starts_with(root) {
+                return None;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(note_key) = derive_note_key(root, &path) else {
+                continue;
+            };
+            if note_key.as_str() != normalized {
+                continue;
+            }
+            return Some(parse_note_file(&path, &note_key, &text, None));
+        }
+        None
+    }
+
+    /// 只扫描键与元信息（`modified`），不读文件内容、不做任何解析。
+    ///
+    /// 供 `list_notes` 等摘要路径使用：摘要 DTO 只需 key/title/tags/modified，
+    /// 其中 title 仍需读文件（见 [`Vault::scan_meta`] 的说明）——本函数返回
+    /// 键与 mtime，调用方按需再读单文件补 title/tags。
+    #[must_use]
+    pub fn scan_meta(root: impl Into<PathBuf>) -> Vec<NoteMeta> {
         let root = root.into();
         let scanner = VaultScanner::new(root.clone());
-        // 复用扫描器的忽略规则，避免两处 walk 逻辑漂移
         let ignore = scanner.ignore_patterns.clone();
-        let mut notes = Vec::new();
+        let mut out = Vec::new();
 
         if !root.exists() {
-            return notes;
+            return out;
         }
 
         let walker = WalkDir::new(&root).into_iter().filter_entry(|e| {
-            if e.depth() == 0 {
-                return true;
-            }
-            let file_name = e.file_name().to_string_lossy();
-            if file_name.starts_with('.') {
-                return false;
-            }
-            if e.file_type().is_dir() {
-                let name = file_name.to_string();
-                if ignore.iter().any(|pat| pat == &name) {
-                    return false;
-                }
-            }
-            // 路径中任意段命中忽略模式则剪枝
-            if let Ok(rel) = e.path().strip_prefix(&root) {
-                for comp in rel.components() {
-                    let seg = comp.as_os_str().to_string_lossy();
-                    if seg.starts_with('.') {
-                        return false;
-                    }
-                    if ignore.iter().any(|pat| pat == seg.as_ref()) {
-                        return false;
-                    }
-                }
-            }
-            true
+            filter_entry(&root, &ignore, e)
         });
 
         for entry in walker.filter_map(std::result::Result::ok) {
@@ -105,48 +134,176 @@ impl Vault {
             let Some(key) = derive_note_key(&root, entry.path()) else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let frontmatter = parse_frontmatter(&text);
-            let body = if let Some((_, end)) = extract_frontmatter_delimiter(&text) {
-                text[end..].trim_start_matches(['\n', '\r']).to_owned()
-            } else {
-                text.clone()
-            };
-            let wikilinks = extract_wikilinks(&body);
-            // 调用 markdown 桩以满足任务要求的依赖调用（当前为桩，返回空）
-            let _html = render_html(&body);
-            let _headings = extract_headings(&body);
-            let title = frontmatter.title.clone().unwrap_or_else(|| {
-                entry
-                    .path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(key.as_str())
-                    .to_owned()
-            });
+            // `DirEntry::metadata` 复用 walk 期间的 `stat` 缓存，不新增 syscall。
             let modified = entry
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(SystemTime::now());
-            notes.push(Note {
+            out.push(NoteMeta {
                 key,
-                ref_id: frontmatter.ref_id.clone(),
-                title,
-                aliases: frontmatter.aliases.clone(),
-                tags: frontmatter.tags.clone(),
-                body,
-                wikilinks,
-                frontmatter,
+                path: entry.path().to_owned(),
                 modified,
             });
         }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
+    }
+
+    /// 扫描 `root` 并加载全部笔记（`load` 的别名，等价方法）。
+    #[must_use]
+    pub fn load_notes(root: impl Into<PathBuf>) -> Vec<Note> {
+        let root = root.into();
+        let mut notes: Vec<Note> = Self::scan_meta(&root)
+            .into_iter()
+            .filter_map(|meta| {
+                std::fs::read_to_string(&meta.path).ok().map(|text| {
+                    parse_note_file(&meta.path, &meta.key, &text, Some(meta.modified))
+                })
+            })
+            .collect();
+        notes.sort_by(|a, b| a.key.cmp(&b.key));
+        notes
+    }
+
+    /// 扫描 `root` 并加载摘要所需的轻量笔记（跳过 wikilinks 与 markdown 解析）。
+    ///
+    /// 摘要 DTO（key/title/aliases/tags/ref_id/modified）不需要正文解析：
+    /// frontmatter 仍需解析（title/tags 可能来自 frontmatter），但跳过
+    /// `extract_wikilinks`（含 comrak）与 `render_html`/`extract_headings`。
+    /// `wikilinks` 字段置空——调用方不得将其用于链接图/断链等语义。
+    #[must_use]
+    pub fn load_notes_meta(root: impl Into<PathBuf>) -> Vec<Note> {
+        let root = root.into();
+        let mut notes: Vec<Note> = Self::scan_meta(&root)
+            .into_iter()
+            .filter_map(|meta| {
+                std::fs::read_to_string(&meta.path).ok().map(|text| {
+                    parse_note_file_meta(&meta.path, &meta.key, &text, Some(meta.modified))
+                })
+            })
+            .collect();
         notes.sort_by(|a, b| a.key.cmp(&b.key));
         notes
     }
 }
+
+/// walk `filter_entry` 的共享实现：隐藏段与忽略模式剪枝。
+///
+/// `Vault::load_notes`（经 [`Vault::scan_meta`]）与 [`VaultScanner::scan`]
+/// 复用同一规则，避免两处 walk 逻辑漂移。
+fn filter_entry(root: &Path, ignore: &[String], e: &walkdir::DirEntry) -> bool {
+    if e.depth() == 0 {
+        return true;
+    }
+    let file_name = e.file_name().to_string_lossy();
+    if file_name.starts_with('.') {
+        return false;
+    }
+    if e.file_type().is_dir() {
+        let name = file_name.to_string();
+        if ignore.iter().any(|pat| pat == &name) {
+            return false;
+        }
+    }
+    // 路径中任意段命中忽略模式则剪枝
+    if let Ok(rel) = e.path().strip_prefix(root) {
+        for comp in rel.components() {
+            let seg = comp.as_os_str().to_string_lossy();
+            if seg.starts_with('.') {
+                return false;
+            }
+            if ignore.iter().any(|pat| pat == seg.as_ref()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 解析单文件正文为摘要用 [`Note`]（frontmatter + 元信息，无正文解析）。
+///
+/// 与 [`parse_note_file`] 的区别：跳过 `extract_wikilinks`/`render_html`/
+/// `extract_headings`（零 comrak 解析），`wikilinks` 置空。摘要字段
+/// （title/aliases/tags/ref_id）与全量解析一致。
+fn parse_note_file_meta(
+    path: &Path,
+    key: &NoteKey,
+    text: &str,
+    modified: Option<SystemTime>,
+) -> Note {
+    let frontmatter = parse_frontmatter(text);
+    let body = if let Some((_, end)) = extract_frontmatter_delimiter(text) {
+        text[end..].trim_start_matches(['\n', '\r']).to_owned()
+    } else {
+        text.to_owned()
+    };
+    let title = frontmatter.title.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(key.as_str())
+            .to_owned()
+    });
+    let modified = modified.unwrap_or_else(|| {
+        path.metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::now())
+    });
+    Note {
+        key: key.clone(),
+        ref_id: frontmatter.ref_id.clone(),
+        title,
+        aliases: frontmatter.aliases.clone(),
+        tags: frontmatter.tags.clone(),
+        body,
+        wikilinks: Vec::new(),
+        frontmatter,
+        modified,
+    }
+}
+
+/// 解析单文件正文为 [`Note`]（frontmatter + wikilinks + 元信息）。
+///
+/// `modified` 优先用传入值（walk 期间已 `stat`），否则回退读文件 mtime；
+/// `load_notes` 与 [`Vault::load_one`] 复用同一函数，同一文件两者结果一致。
+/// wikilink 提取内部经单次 comrak 解析复用 AST。
+fn parse_note_file(path: &Path, key: &NoteKey, text: &str, modified: Option<SystemTime>) -> Note {
+    let frontmatter = parse_frontmatter(text);
+    let body = if let Some((_, end)) = extract_frontmatter_delimiter(text) {
+        text[end..].trim_start_matches(['\n', '\r']).to_owned()
+    } else {
+        text.to_owned()
+    };
+    let wikilinks = extract_wikilinks(&body);
+    // 调用 markdown 桩以满足任务要求的依赖调用（当前为桩，返回空）
+    let _html = render_html(&body);
+    let _headings = extract_headings(&body);
+    let title = frontmatter.title.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(key.as_str())
+            .to_owned()
+    });
+    let modified = modified.unwrap_or_else(|| {
+        path.metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::now())
+    });
+    Note {
+        key: key.clone(),
+        ref_id: frontmatter.ref_id.clone(),
+        title,
+        aliases: frontmatter.aliases.clone(),
+        tags: frontmatter.tags.clone(),
+        body,
+        wikilinks,
+        frontmatter,
+        modified,
+    }
+}
+
 
 /// 递归扫描 vault 根目录、发现 `.md`/`.markdown` 笔记的扫描器。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,33 +331,9 @@ impl VaultScanner {
         if !self.root.exists() {
             return keys;
         }
-        let walker = WalkDir::new(&self.root).into_iter().filter_entry(|e| {
-            if e.depth() == 0 {
-                return true;
-            }
-            let file_name = e.file_name().to_string_lossy();
-            if file_name.starts_with('.') {
-                return false;
-            }
-            if e.file_type().is_dir() {
-                let name = file_name.to_string();
-                if self.ignore_patterns.iter().any(|pat| pat == &name) {
-                    return false;
-                }
-            }
-            if let Ok(rel) = e.path().strip_prefix(&self.root) {
-                for comp in rel.components() {
-                    let seg = comp.as_os_str().to_string_lossy();
-                    if seg.starts_with('.') {
-                        return false;
-                    }
-                    if self.ignore_patterns.iter().any(|pat| pat == seg.as_ref()) {
-                        return false;
-                    }
-                }
-            }
-            true
-        });
+        let walker = WalkDir::new(&self.root)
+            .into_iter()
+            .filter_entry(|e| filter_entry(&self.root, &self.ignore_patterns, e));
 
         for entry in walker.filter_map(std::result::Result::ok) {
             if !entry.file_type().is_file() {
@@ -378,5 +511,61 @@ mod tests {
     fn scan_nonexistent_root_returns_empty() {
         let scanner = VaultScanner::new("/non/existent/path/xyz-12345");
         assert!(scanner.scan().is_empty());
+    }
+
+    #[test]
+    fn load_one_matches_full_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("hello.md"),
+            "---\ntitle: Hello\ntags:\n  - t1\n---\nBody [[world]]",
+        )
+        .expect("write");
+        fs::write(dir.path().join("world.md"), "plain").expect("write");
+        let all = Vault::load(dir.path());
+        let full = all.iter().find(|n| n.key.as_str() == "hello").expect("full");
+        let one = Vault::load_one(dir.path(), "hello").expect("one");
+        assert_eq!(one, *full);
+    }
+
+    #[test]
+    fn load_one_missing_and_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("ok.md"), "x").expect("write");
+        assert!(Vault::load_one(dir.path(), "missing").is_none());
+        // 忽略目录下的文件不可见
+        let obsidian = dir.path().join(".obsidian");
+        fs::create_dir_all(&obsidian).expect("mkdir");
+        fs::write(obsidian.join("x.md"), "x").expect("write");
+        assert!(Vault::load_one(dir.path(), ".obsidian/x").is_none());
+        // 逃逸 key 不得逃出 root
+        assert!(Vault::load_one(dir.path(), "../outside").is_none());
+    }
+
+    #[test]
+    fn load_one_markdown_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("alt.markdown"), "hello").expect("write");
+        let one = Vault::load_one(dir.path(), "alt").expect("one");
+        assert_eq!(one.key.as_str(), "alt");
+        assert!(one.body.contains("hello"));
+    }
+
+    #[test]
+    fn scan_meta_keys_match_scan_without_reading_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("b.md"), "body b").expect("write");
+        let sub = dir.path().join("a");
+        fs::create_dir_all(&sub).expect("mkdir");
+        fs::write(sub.join("c.markdown"), "body c").expect("write");
+        let metas = Vault::scan_meta(dir.path());
+        let keys: Vec<&str> = metas.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["a/c", "b"]);
+        for m in &metas {
+            assert!(m.path.is_file());
+        }
+        // 非 markdown 不计入
+        fs::write(dir.path().join("x.txt"), "x").expect("write");
+        assert_eq!(Vault::scan_meta(dir.path()).len(), 2);
     }
 }

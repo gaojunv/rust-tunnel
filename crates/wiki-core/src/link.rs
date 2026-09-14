@@ -112,7 +112,9 @@ pub fn parse_wikilink(text: &str) -> Option<WikiLink> {
 
 /// 内部扫描器：返回带字节区间的 wiki 链接（`start` 含 `!` 前缀，`end` 为开区间）。
 fn scan_wikilinks_with_spans(content: &str) -> Vec<(WikiLink, usize, usize)> {
-    let code_ranges = collect_code_ranges(content);
+    // 代码块区间经 `markdown::analyze_markdown` 单次 comrak 解析产出，
+    // 与标题提取复用同一 AST，避免重复全量解析。
+    let code_ranges = crate::markdown::code_ranges(content);
     let mut out = Vec::new();
     let mut pos = 0usize;
     let len = content.len();
@@ -263,12 +265,79 @@ pub fn rewrite_wikilinks(
     (result, count)
 }
 
+/// 笔记集合的预建查找表：`resolve_link` 的 O(1) 查表形态。
+///
+/// 一次性对全部 `NoteKey` 做小写归一并分组；[`LinkIndex::resolve`] 的匹配
+/// 顺序与语义与 [`resolve_link`] 逐个扫描一致（全路径优先、再 basename，
+/// 大小写不敏感），只是把每次的线性 `filter` 换成 HashMap 查表。
+#[derive(Debug, Clone, Default)]
+pub struct LinkIndex {
+    /// 小写全路径 → 全部同名笔记（大小写仅变体时可能多条）。
+    by_full: std::collections::HashMap<String, Vec<NoteKey>>,
+    /// 小写 basename → 全部同 basename 笔记。
+    by_basename: std::collections::HashMap<String, Vec<NoteKey>>,
+}
+
+impl LinkIndex {
+    /// 由笔记键集合预建查找表。
+    #[must_use]
+    pub fn new(all_notes: &[NoteKey]) -> Self {
+        let mut by_full: std::collections::HashMap<String, Vec<NoteKey>> =
+            std::collections::HashMap::with_capacity(all_notes.len());
+        let mut by_basename: std::collections::HashMap<String, Vec<NoteKey>> =
+            std::collections::HashMap::with_capacity(all_notes.len());
+        for key in all_notes {
+            let lower = key.as_str().to_lowercase();
+            by_full.entry(lower).or_default().push(key.clone());
+            let base = key
+                .as_str()
+                .rsplit('/')
+                .next()
+                .unwrap_or(key.as_str())
+                .to_lowercase();
+            by_basename.entry(base).or_default().push(key.clone());
+        }
+        Self {
+            by_full,
+            by_basename,
+        }
+    }
+
+    /// 将 `WikiLink` 解析到笔记集合（O(1) 查表，语义同 [`resolve_link`]）。
+    #[must_use]
+    pub fn resolve(&self, link: &WikiLink) -> ResolvedLink {
+        let target_lower = link.target.to_lowercase();
+        if let Some(full_matches) = self.by_full.get(&target_lower) {
+            if full_matches.len() == 1 {
+                if let Some(first) = full_matches.first() {
+                    return ResolvedLink::Resolved(first.clone());
+                }
+            } else if !full_matches.is_empty() {
+                return ResolvedLink::Ambiguous(full_matches.clone());
+            }
+        }
+        let target_basename = target_lower.rsplit('/').next().unwrap_or(&target_lower);
+        if let Some(base_matches) = self.by_basename.get(target_basename) {
+            if base_matches.len() == 1 {
+                if let Some(first) = base_matches.first() {
+                    return ResolvedLink::Resolved(first.clone());
+                }
+            } else if !base_matches.is_empty() {
+                return ResolvedLink::Ambiguous(base_matches.clone());
+            }
+        }
+        ResolvedLink::Broken(link.target.clone())
+    }
+}
+
 /// 将 `WikiLink` 解析到笔记集合。
 ///
 /// 三级匹配（大小写不敏感）：
 /// 1. 完整路径相等（`target` 与 `NoteKey` 全串相等）→ 唯一则 `Resolved`，多条则 `Ambiguous`
 /// 2. 否则按 `basename`（`/` 后最后一段）匹配 → 唯一则 `Resolved`，多条则 `Ambiguous`
 /// 3. 均无命中 → `Broken(target)`
+///
+/// 批量解析请用 [`LinkIndex`] 预建查找表（O(1)/条），语义与本函数一致。
 #[must_use]
 pub fn resolve_link(link: &WikiLink, all_notes: &[NoteKey]) -> ResolvedLink {
     let target_lower = link.target.to_lowercase();
@@ -306,77 +375,6 @@ pub fn resolve_link(link: &WikiLink, all_notes: &[NoteKey]) -> ResolvedLink {
         return ResolvedLink::Ambiguous(basename_matches);
     }
     ResolvedLink::Broken(link.target.clone())
-}
-
-fn compute_line_starts(content: &str) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(32);
-    starts.push(0);
-    for (idx, byte) in content.bytes().enumerate() {
-        if byte == b'\n' && idx < content.len() {
-            starts.push(idx + 1);
-        }
-    }
-    starts
-}
-
-fn byte_offset(
-    line_starts: &[usize],
-    content_len: usize,
-    line: usize,
-    column: usize,
-) -> Option<usize> {
-    if line == 0 || column == 0 {
-        return None;
-    }
-    let line_idx = line.checked_sub(1)?;
-    let line_start = *line_starts.get(line_idx)?;
-    let offset = line_start.checked_add(column.checked_sub(1)?)?;
-    if offset > content_len {
-        return None;
-    }
-    Some(offset)
-}
-
-fn collect_code_ranges(content: &str) -> Vec<(usize, usize)> {
-    use comrak::nodes::NodeValue;
-    use comrak::{Arena, Options};
-    let mut options = Options::default();
-    options.extension.front_matter_delimiter = Some("---".to_owned());
-    let arena = Arena::new();
-    let root = comrak::parse_document(&arena, content, &options);
-    let line_starts = compute_line_starts(content);
-    let content_len = content.len();
-    let mut ranges = Vec::new();
-    for node in root.descendants() {
-        let ast = node.data();
-        let is_code = matches!(ast.value, NodeValue::CodeBlock(_) | NodeValue::Code(_));
-        if !is_code {
-            continue;
-        }
-        let sp = ast.sourcepos;
-        if sp.start.line == 0 || sp.end.line == 0 {
-            continue;
-        }
-        let Some(start) = byte_offset(&line_starts, content_len, sp.start.line, sp.start.column)
-        else {
-            continue;
-        };
-        let Some(end_inclusive) =
-            byte_offset(&line_starts, content_len, sp.end.line, sp.end.column)
-        else {
-            continue;
-        };
-        let end_exclusive = end_inclusive.checked_add(1).unwrap_or(content_len);
-        let end_clamped = if end_exclusive > content_len {
-            content_len
-        } else {
-            end_exclusive
-        };
-        if start < end_clamped {
-            ranges.push((start, end_clamped));
-        }
-    }
-    ranges
 }
 
 fn is_in_code_range(pos: usize, ranges: &[(usize, usize)]) -> bool {
@@ -693,5 +691,57 @@ mod tests {
         let (out, n) = rewrite_wikilinks(content, &map);
         assert_eq!(n, 0);
         assert_eq!(out, content);
+    }
+
+    fn link_of(target: &str) -> WikiLink {
+        WikiLink {
+            target: target.to_owned(),
+            alias: None,
+            anchor: None,
+            embed: false,
+        }
+    }
+
+    #[test]
+    fn link_index_matches_scan_semantics() {
+        // 全路径 / basename 唯一 / basename 歧义 / 断链 / 大小写不敏感，
+        // 查表结果须与逐个扫描逐条一致。
+        let notes = vec![
+            NoteKey::new("a/B".to_owned()),
+            NoteKey::new("c/d".to_owned()),
+            NoteKey::new("x/B".to_owned()),
+        ];
+        let index = LinkIndex::new(&notes);
+        for target in ["a/b", "A/B", "d", "D", "b", "B", "missing", "a", "c/d"] {
+            let link = link_of(target);
+            assert_eq!(
+                index.resolve(&link),
+                resolve_link(&link, &notes),
+                "target={target} 查表与扫描语义须一致"
+            );
+        }
+        // 歧义 basename：b 同时命中 a/B 与 x/B
+        assert!(matches!(
+            index.resolve(&link_of("b")),
+            ResolvedLink::Ambiguous(_)
+        ));
+        // 全路径大小写不敏感唯一命中
+        assert_eq!(
+            index.resolve(&link_of("C/D")),
+            ResolvedLink::Resolved(NoteKey::new("c/d".to_owned()))
+        );
+        // 断链
+        assert_eq!(
+            index.resolve(&link_of("nope")),
+            ResolvedLink::Broken("nope".to_owned())
+        );
+    }
+
+    #[test]
+    fn link_index_empty_notes_all_broken() {
+        let notes: Vec<NoteKey> = Vec::new();
+        let index = LinkIndex::new(&notes);
+        let link = link_of("a");
+        assert_eq!(index.resolve(&link), ResolvedLink::Broken("a".to_owned()));
     }
 }
