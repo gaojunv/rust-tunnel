@@ -9,6 +9,9 @@
 //! `&state` 传入。`run()` 负责首启自举（`ensure_vault_ready`）、`manage` 状态
 //! 并装配 `generate_handler!` / `generate_context!`。
 
+use std::time::Duration;
+
+use tauri::Emitter as _;
 use tauri::Manager as _;
 
 use crate::agent::bridge::resolve_app_config_dir;
@@ -20,6 +23,9 @@ use crate::dto::{
 };
 use crate::error::IpcResult;
 use crate::state::AppState;
+use crate::watcher::{
+    collect_changed_keys, rel_of, ChangeBatcher, DEBOUNCE_WINDOW, VAULT_FS_CHANGED_EVENT,
+};
 
 /// 获取 vault 信息.
 ///
@@ -277,6 +283,93 @@ fn spawn_agent_autostart(
     });
 }
 
+/// vault 目录外部变更监听的运行时：`notify` 递归监听 + debounce 聚合 + `emit` 广播.
+///
+/// 在独立后台线程中运行：`notify` 回调把原始路径推入 [`ChangeBatcher`]，
+/// 轮询线程每 100ms 取出已过 [`DEBOUNCE_WINDOW`] 的批次，经
+/// [`collect_changed_keys`]（过滤隐藏/忽略目录/非 Markdown）后，
+/// 以 [`VAULT_FS_CHANGED_EVENT`] 事件（含变更 note key 数组）`emit` 给前端。
+///
+/// `notify` 回调与轮询线程共享 `batcher`（`Mutex`）；`RecommendedWatcher`
+/// 句柄由轮询线程持有，线程随进程退出而结束。监听失败（vault 根不存在等）
+/// 仅记日志，不阻塞应用启动。
+///
+/// # Panics
+///
+/// 内部 `Mutex` 仅在锁中毒时 `into_inner` 恢复，不会 panic。
+fn spawn_vault_watcher(app: &tauri::AppHandle, vault_root: std::path::PathBuf) {
+    use notify::{RecursiveMode, Watcher as _};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    if !vault_root.exists() {
+        eprintln!(
+            "vault watcher 跳过：根目录不存在（{}）",
+            vault_root.display()
+        );
+        return;
+    }
+    let batcher: Arc<Mutex<ChangeBatcher>> = Arc::new(Mutex::new(ChangeBatcher::new()));
+    let batcher_cb = batcher.clone();
+    let mut watcher = match notify::RecommendedWatcher::new(
+        move |res: Result<notify::Event, notify::Error>| {
+            let Ok(event) = res else {
+                return;
+            };
+            // 只关心内容/文件变动类事件，纯访问事件（Access）忽略以降噪
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            let now = Instant::now();
+            let Ok(mut guard) = batcher_cb.lock() else {
+                return;
+            };
+            for path in event.paths {
+                guard.push(path, now);
+            }
+        },
+        notify::Config::default(),
+    ) {
+        Ok(w) => w,
+        Err(err) => {
+            eprintln!("vault watcher 启动失败：{err}");
+            return;
+        }
+    };
+    if let Err(err) = watcher.watch(&vault_root, RecursiveMode::Recursive) {
+        eprintln!("vault watcher 监听失败（{}）：{err}", vault_root.display());
+        return;
+    }
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        // `watcher` 句柄随线程持有，线程结束即停止监听
+        let _watcher = watcher;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let due: Vec<std::path::PathBuf> = {
+                let Ok(mut guard) = batcher.lock() else {
+                    continue;
+                };
+                guard.take_due(Instant::now(), DEBOUNCE_WINDOW)
+            };
+            if due.is_empty() {
+                continue;
+            }
+            let rels: Vec<String> = due.iter().filter_map(|p| rel_of(&vault_root, p)).collect();
+            if rels.is_empty() {
+                continue;
+            }
+            let keys = collect_changed_keys(&vault_root, &rels);
+            if keys.is_empty() {
+                continue;
+            }
+            if let Err(err) = app_handle.emit(VAULT_FS_CHANGED_EVENT, &keys) {
+                eprintln!("vault watcher emit 失败：{err}");
+            }
+        }
+    });
+}
+
 /// 启动 Tauri 应用.
 ///
 /// 首启时确保 vault 根目录存在且非空（空 vault 写入 `welcome.md`），随后
@@ -293,6 +386,7 @@ pub fn run() -> tauri::Result<()> {
     }
     // vault 根在 setup 闭包中使用，需克隆一份避免借用冲突
     let vault_root_for_agent = root.clone();
+    let vault_root_for_watcher = root.clone();
     tauri::Builder::default()
         .setup(move |app| {
             let app_config_dir = resolve_app_config_dir(app.handle());
@@ -302,6 +396,8 @@ pub fn run() -> tauri::Result<()> {
             )));
             app.manage(agent_manager.clone());
             spawn_agent_autostart(app, agent_manager);
+            // vault 根运行期不可变更（`AppState::set_root` 无调用方），setup 时启动一次即可
+            spawn_vault_watcher(app.handle(), vault_root_for_watcher);
             Ok(())
         })
         .manage(state)

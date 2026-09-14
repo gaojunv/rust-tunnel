@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractToc } from "./markdown-toc";
+import { extractToc, resolveActiveTocIndex } from "./markdown-toc";
 
 describe("extractToc", () => {
   it("多级标题", () => {
@@ -49,5 +49,32 @@ describe("extractToc", () => {
     const body = "#标题\n# 真标题";
     const toc = extractToc(body);
     expect(toc).toEqual([{ level: 1, text: "真标题", line: 1 }]);
+  });
+});
+
+describe("resolveActiveTocIndex", () => {
+  it("光标在首个标题前返回 -1", () => {
+    const toc = extractToc("前言\n# A\n正文\n## B");
+    expect(resolveActiveTocIndex(toc, 0)).toBe(-1);
+  });
+
+  it("命中最后一个 line <= 光标行的标题", () => {
+    const toc = extractToc("# A\n正文\n正文\n## B\n正文");
+    expect(resolveActiveTocIndex(toc, 0)).toBe(0);
+    expect(resolveActiveTocIndex(toc, 2)).toBe(0);
+    expect(resolveActiveTocIndex(toc, 3)).toBe(1);
+    expect(resolveActiveTocIndex(toc, 99)).toBe(1);
+  });
+
+  it("cursorLine 为 null 或空大纲返回 -1", () => {
+    const toc = extractToc("# A");
+    expect(resolveActiveTocIndex(toc, null)).toBe(-1);
+    expect(resolveActiveTocIndex([], 5)).toBe(-1);
+  });
+
+  it("光标恰好落在标题行时命中该标题", () => {
+    const toc = extractToc("# A\n## B\n### C");
+    expect(resolveActiveTocIndex(toc, 1)).toBe(1);
+    expect(resolveActiveTocIndex(toc, 2)).toBe(2);
   });
 });

@@ -537,6 +537,7 @@ export default function App() {
         open={switcherOpen}
         onClose={() => setSwitcherOpen(false)}
         onSelect={(k) => void handleNavigate(k)}
+        onCreate={(k, t) => void handleCreateNote(k, t)}
       />
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onSync={() => void handleManualSync()} />}
       {conflictOpen && pendingConflicts.length > 0 && syncState && (

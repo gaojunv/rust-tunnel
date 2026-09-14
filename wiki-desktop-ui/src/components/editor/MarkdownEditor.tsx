@@ -46,6 +46,8 @@ import { livePreview, wikilinkNavFacet } from "@/lib/codemirror/live-preview/ind
 export type MarkdownEditorProps = {
   initialDoc: string;
   onDocChanged?: (doc: string) => void;
+  /** 选区/光标变化时触发（调用方自行从 view 读取行号，避免传参 stale） */
+  onCursorChanged?: () => void;
   onSave?: () => void;
   getCompletionNotes?: () => NoteSummaryLike[];
   onPasteImage?: (file: File) => Promise<string | null>;
@@ -85,6 +87,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
     {
       initialDoc,
       onDocChanged,
+      onCursorChanged,
       onSave,
       getCompletionNotes,
       onPasteImage,
@@ -100,6 +103,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
     const viewRef = useRef<EditorView | null>(null);
 
     const onDocChangedRef = useLatest(onDocChanged);
+    const onCursorChangedRef = useLatest(onCursorChanged);
     const onSaveRef = useLatest(onSave);
     const onPasteImageRef = useLatest(onPasteImage);
     const onImageErrorRef = useLatest(onImageError);
@@ -135,6 +139,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       const updateListener = EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           onDocChangedRef.current?.(update.state.doc.toString());
+        }
+        if (update.selectionSet && !update.docChanged) {
+          onCursorChangedRef.current?.();
         }
       });
 

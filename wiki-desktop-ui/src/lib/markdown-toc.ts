@@ -52,3 +52,17 @@ export function extractToc(body: string): TocItem[] {
   }
   return out;
 }
+
+/**
+ * 当前标题下标 —— items 中最后一个 line <= cursorLine 的标题；
+ * cursorLine 为 null/无标题/光标在首个标题之前时返回 -1。
+ */
+export function resolveActiveTocIndex(items: TocItem[], cursorLine: number | null): number {
+  if (cursorLine == null || items.length === 0) return -1;
+  let active = -1;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].line <= cursorLine) active = i;
+    else break;
+  }
+  return active;
+}

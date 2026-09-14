@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { DiffView } from "@/components/DiffView";
-import { Streamdown } from "streamdown";
+import { MarkdownBody } from "@/components/agent/MarkdownBody";
 import "streamdown/styles.css";
 import type { ItemView } from "@/lib/agent/codec";
 
@@ -81,9 +81,7 @@ function renderAgentMessage(
 ) {
   return (
     <div key={item.id} className="group w-full py-1">
-      <div className="prose prose-sm max-w-none dark:prose-invert [&_p]:my-2 [&_pre]:my-2">
-        <Streamdown>{item.text || (activeTurnId ? "…" : "")}</Streamdown>
-      </div>
+      <MarkdownBody text={item.text || (activeTurnId ? "…" : "")} streaming={!item.complete} />
       {item.complete && item.text && (
         <div className="mt-1 hidden group-hover:block">
           <Button

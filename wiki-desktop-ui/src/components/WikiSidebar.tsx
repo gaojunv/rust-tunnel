@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { deleteFolder, deleteNote, getNote, listNotes, renameFolder, renameNote, searchNotes } from "@/api/tauri";
+import { deleteFolder, deleteNote, getNote, listNotes, onVaultFsChanged, renameFolder, renameNote, searchNotes } from "@/api/tauri";
+import type { UnlistenFn } from "@/api/tauri";
 import type { NoteSummary, SearchHitDto, VaultInfo } from "@/api/types";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { FolderTree } from "@/components/FolderTree";
@@ -120,6 +121,22 @@ export function WikiSidebar({
     return hits.filter((h) => (tagMap.get(h.note_key) ?? []).includes(activeTag));
   }, [hits, notes, activeTag]);
 
+  // vault 外部文件变更：递增 fsTick，走下方同一加载通路刷新列表
+  const [fsTick, setFsTick] = useState(0);
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    onVaultFsChanged(() => {
+      if (!cancelled) setFsTick((t) => t + 1);
+    }).then((u) => {
+      if (!cancelled) unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   // 加载列表
   useEffect(() => {
     let cancelled = false;
@@ -133,7 +150,7 @@ export function WikiSidebar({
     return () => {
       cancelled = true;
     };
-  }, [refreshToken]);
+  }, [refreshToken, fsTick]);
 
   // 搜索（输入非空时展示 search_notes 结果）
   useEffect(() => {
@@ -462,8 +479,12 @@ export function WikiSidebar({
                     )}
                   >
                     <span className="line-clamp-1 text-sm font-medium">{h.title}</span>
-                    <span className="line-clamp-2 text-xs text-muted-foreground">{h.snippet}</span>
-                    <span className="text-xs text-muted-foreground">匹配分 {h.score.toFixed(1)}</span>
+                    <span className="truncate text-xs text-muted-foreground">{h.note_key}</span>
+                    {h.snippet && (
+                      <span className="line-clamp-2 whitespace-pre-wrap break-words text-xs text-muted-foreground">
+                        {h.snippet}
+                      </span>
+                    )}
                   </button>
                 </li>
               ))}

@@ -158,3 +158,22 @@ export function saveAttachment(
 export function readAttachment(relPath: string): Promise<Uint8Array> {
   return call<number[]>("read_attachment", { relPath }).then((arr) => new Uint8Array(arr));
 }
+
+// —— vault 外部文件变更订阅 ——
+//
+// Rust 侧 `spawn_vault_watcher`（crates/wiki-serve/src/tauri_app.rs）递归监听
+// vault 根目录，debounce ~300ms 后经 `vault:fs-changed` 事件广播变更 note key 数组。
+
+export const VAULT_FS_CHANGED_EVENT = "vault:fs-changed";
+
+export type UnlistenFn = () => void;
+
+/** 订阅 vault 外部文件变更；非 Tauri 环境（浏览器/mock）返回 no-op。 */
+export async function onVaultFsChanged(cb: (keys: string[]) => void): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<string[]>(VAULT_FS_CHANGED_EVENT, (event) => {
+    cb(Array.isArray(event.payload) ? event.payload : []);
+  });
+  return unlisten;
+}
