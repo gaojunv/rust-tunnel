@@ -14,6 +14,7 @@ import { EditorView } from "@codemirror/view";
 import type { SelectionSource } from "@/lib/selection-source";
 import { readScrollPos, writeScrollPos } from "@/lib/scroll-memory";
 import { loadEditorPrefs, saveEditorPrefs } from "@/lib/editor-prefs";
+import { publishNoteLiveContent, clearNoteLiveSnapshot } from "@/lib/note-live-content";
 
 export interface NoteEditorHandle {
   insertAtCursor(text: string): void;
@@ -280,6 +281,51 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   useEffect(() => {
     onSavedRef.current = onSaved;
   }, [onSaved]);
+
+  // ---------- live-content publish（TOC 实时刷新 + 当前标题高亮） ----------
+  // 文档变化（body state）与纯光标移动（CM selectionSet）都走同一调度：
+  // debounce 200ms 后发布 CM 当前 { body, cursorLine }；body 与光标行都无变化则跳过。
+  // NoteEditor 按 noteKey remount，timer 用 ref 持有、noteKey 变化/unmount 时清理。
+  const livePublishTimerRef = useRef<number | null>(null);
+  const lastPublishedRef = useRef<{ body: string; cursorLine: number | null } | null>(null);
+  const scheduleLivePublish = useCallback(() => {
+    if (!noteKeyRef.current) return;
+    if (livePublishTimerRef.current !== null) {
+      window.clearTimeout(livePublishTimerRef.current);
+    }
+    livePublishTimerRef.current = window.setTimeout(() => {
+      livePublishTimerRef.current = null;
+      const key = noteKeyRef.current;
+      if (!key) return;
+      const view = cmRef.current?.view();
+      const liveBody = view ? view.state.doc.toString() : bodyRef.current;
+      const cursorLine = view ? view.state.doc.lineAt(view.state.selection.main.head).number - 1 : null;
+      const prev = lastPublishedRef.current;
+      if (prev && prev.body === liveBody && prev.cursorLine === cursorLine) return;
+      lastPublishedRef.current = { body: liveBody, cursorLine };
+      publishNoteLiveContent({ noteKey: key, body: liveBody, cursorLine });
+    }, 200);
+  }, []);
+
+  // 文档内容变化（CM onDocChanged -> setBody）时调度发布
+  useEffect(() => {
+    if (!noteKey) return;
+    if (!hasLoadedRef.current) return;
+    scheduleLivePublish();
+  }, [body, noteKey, scheduleLivePublish]);
+
+  // 笔记切换时重置发布状态、清理旧快照
+  useEffect(() => {
+    lastPublishedRef.current = null;
+    if (noteKey) clearNoteLiveSnapshot(noteKey);
+    return () => {
+      if (livePublishTimerRef.current !== null) {
+        window.clearTimeout(livePublishTimerRef.current);
+        livePublishTimerRef.current = null;
+      }
+      if (noteKey) clearNoteLiveSnapshot(noteKey);
+    };
+  }, [noteKey]);
 
   // clear timer on unmount
   useEffect(() => {
@@ -804,6 +850,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
               ref={cmRef}
               initialDoc={bodyAtMountRef.current}
               onDocChanged={setBody}
+              onCursorChanged={scheduleLivePublish}
               onSave={() => void flushSave()}
               getCompletionNotes={getCompletionNotes}
               livePreviewEnabled={livePreview}
