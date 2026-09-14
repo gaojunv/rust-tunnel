@@ -71,6 +71,10 @@ impl SettingsState {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "设置面板单屏表单，拆分会割裂布局"
+)]
 pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(14, 12))

@@ -9,6 +9,7 @@ mod autostart;
 mod config_store;
 mod fonts;
 mod notify;
+mod prefs;
 mod tray;
 mod ui;
 
@@ -34,12 +35,14 @@ struct GuiApp {
     selected_tab: usize,
     /// 托盘句柄（保持 `TrayIcon` 生命周期，随窗口同生共死）。
     tray: Option<tray::TrayHandle>,
-    /// 上次已应用到托盘的状态（变化时才刷新，避免每帧写菜单）。
-    last_tray_state: Option<tray::TrayState>,
+    /// 上次已写入托盘的文案签名（首行/服务器行/tooltip），逐字段比较避免每帧写托盘。
+    last_tray_texts: Option<(String, String, String)>,
+    /// GUI 偏好（主题等），切换时落盘 gui.toml。
+    prefs: prefs::GuiPrefs,
 }
 
 impl GuiApp {
-    fn new(app_state: Arc<app::AppState>, tray: Option<tray::TrayHandle>) -> Self {
+    fn new(app_state: Arc<app::AppState>, tray: Option<tray::TrayHandle>, prefs: prefs::GuiPrefs) -> Self {
         let settings = app_state
             .config_snapshot()
             .as_ref()
@@ -50,25 +53,44 @@ impl GuiApp {
             settings,
             selected_tab: 0,
             tray,
-            last_tray_state: None,
+            last_tray_texts: None,
+            prefs,
         }
     }
 }
 
-impl eframe::App for GuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 关闭拦截：点 × 仅隐藏到托盘，不退出进程；仅托盘"退出"置 should_exit 后才真正关闭
-        if ctx.input(|i| i.viewport().close_requested()) {
-            let should_exit = self
-                .app_state
-                .should_exit
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if !should_exit {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                return;
-            }
+/// 应用主题偏好：egui 绘制 + 原生标题栏外观。
+fn apply_theme(ctx: &egui::Context, pref: prefs::ThemePref) {
+    ctx.set_theme(pref.to_egui());
+    let native = match pref {
+        prefs::ThemePref::System => egui::SystemTheme::SystemDefault,
+        prefs::ThemePref::Light => egui::SystemTheme::Light,
+        prefs::ThemePref::Dark => egui::SystemTheme::Dark,
+    };
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(native));
+}
+
+impl GuiApp {
+    /// 关闭拦截：点 × 仅隐藏到托盘，不退出进程；仅托盘"退出"置 should_exit 后才真正关闭。
+    /// 返回 true 表示已消费关闭请求，调用方直接 return。
+    fn intercept_close(&self, ctx: &egui::Context) -> bool {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return false;
         }
+        let should_exit = self
+            .app_state
+            .should_exit
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if should_exit {
+            return false;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    }
+
+    /// 消费托盘菜单动作队列并执行对应窗口/状态操作。
+    fn drain_tray_actions(&mut self, ctx: &egui::Context) {
         for action in tray::poll_menu_actions() {
             match action {
                 tray::TrayAction::Show => {
@@ -94,34 +116,91 @@ impl eframe::App for GuiApp {
                 }
             }
         }
+    }
 
-        let status = self.app_state.status_rx.borrow().clone();
-
-        // 托盘状态菜单/Tooltip 随连接态刷新（首次帧也应用一次，启动时可能已连接）。
-        let tray_state = tray::TrayState::from_status(&status);
-        if self.last_tray_state != Some(tray_state) {
-            if let Some(handle) = self.tray.as_ref() {
-                tray::update_tray_for_status(handle, &status);
-            }
-            self.last_tray_state = Some(tray_state);
+    /// 托盘状态菜单/Tooltip 随连接态刷新（逐字段比较，仅写入变化字段）。
+    fn refresh_tray(&mut self, status: &ClientStatus) {
+        let sig = (
+            tray::status_menu_text(status),
+            tray::server_menu_text(status),
+            tray::tooltip_text(status),
+        );
+        if self.last_tray_texts.as_ref() == Some(&sig) {
+            return;
         }
+        if let Some(handle) = self.tray.as_ref() {
+            let prev = self.last_tray_texts.as_ref();
+            if prev.map(|p| &p.0) != Some(&sig.0) {
+                handle.status_item.set_text(&sig.0);
+            }
+            if prev.map(|p| &p.1) != Some(&sig.1) {
+                handle.server_item.set_text(&sig.1);
+            }
+            if prev.map(|p| &p.2) != Some(&sig.2) {
+                if let Err(e) = handle.icon.set_tooltip(Some(sig.2.clone())) {
+                    tracing::warn!("托盘 tooltip 更新失败：{e}");
+                }
+            }
+        }
+        self.last_tray_texts = Some(sig);
+    }
 
+    /// Tab 栏右侧的主题切换按钮（循环三态，落盘 gui.toml）。
+    fn show_theme_button(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let cur = self.prefs.theme;
+            let effective = match ui.ctx().theme() {
+                egui::Theme::Dark => "深色",
+                egui::Theme::Light => "浅色",
+            };
+            let btn = ui
+                .small_button(format!("{} {}", cur.icon(), cur.label()))
+                .on_hover_text(format!(
+                    "切换主题（当前生效：{effective}，偏好：{}）",
+                    cur.label()
+                ));
+            if btn.clicked() {
+                let next = cur.next();
+                self.prefs.theme = next;
+                apply_theme(ui.ctx(), next);
+                if let Err(e) = prefs::save(&self.prefs) {
+                    tracing::warn!("GUI 偏好保存失败：{e}");
+                }
+            }
+        });
+    }
+
+    /// 顶部 Tab 栏（含右侧主题按钮）。
+    fn show_tabs(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("tabs")
             .show_separator_line(false)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate()
-                    {
+                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate() {
                         let sel = self.selected_tab == idx;
                         if ui.selectable_label(sel, *label).clicked() {
                             self.selected_tab = idx;
                         }
                     }
+                    self.show_theme_button(ui);
                 });
                 ui.add_space(2.0);
             });
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.intercept_close(ctx) {
+            return;
+        }
+        self.drain_tray_actions(ctx);
+
+        let status = self.app_state.status_rx.borrow().clone();
+        self.refresh_tray(&status);
+        self.show_tabs(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
@@ -363,7 +442,9 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             fonts::setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(GuiApp::new(app_state, tray)))
+            let prefs = prefs::load();
+            apply_theme(&cc.egui_ctx, prefs.theme);
+            Ok(Box::new(GuiApp::new(app_state, tray, prefs)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;

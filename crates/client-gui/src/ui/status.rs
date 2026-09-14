@@ -1,11 +1,24 @@
 use egui::Ui;
 use rust_tunnel_client::ClientStatus;
 
-fn status_dot(ui: &mut Ui, label: &str, connected: bool) {
-    let color = if connected {
-        egui::Color32::from_rgb(34, 170, 85)
-    } else {
-        egui::Color32::from_rgb(170, 170, 170)
+fn status_dot(ui: &mut Ui, label: &str, state: crate::tray::TrayState) {
+    let dark = ui.visuals().dark_mode;
+    let color = match state {
+        crate::tray::TrayState::Connected => {
+            if dark {
+                egui::Color32::from_rgb(80, 200, 120)
+            } else {
+                egui::Color32::from_rgb(20, 140, 70)
+            }
+        }
+        crate::tray::TrayState::Reconnecting => ui.visuals().warn_fg_color,
+        crate::tray::TrayState::Offline => {
+            if dark {
+                egui::Color32::from_rgb(130, 130, 130)
+            } else {
+                egui::Color32::from_rgb(150, 150, 150)
+            }
+        }
     };
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -20,15 +33,13 @@ pub fn show(ui: &mut Ui, status: &ClientStatus) {
         .show(ui, |ui| {
             ui.heading("连接状态");
             ui.add_space(6.0);
-            status_dot(
-                ui,
-                if status.connected {
-                    "已连接"
-                } else {
-                    "离线"
-                },
-                status.connected,
-            );
+            let tray_state = crate::tray::TrayState::from_status(status);
+            let label = match tray_state {
+                crate::tray::TrayState::Connected => "已连接",
+                crate::tray::TrayState::Reconnecting => "重连中",
+                crate::tray::TrayState::Offline => "离线",
+            };
+            status_dot(ui, label, tray_state);
             egui::Grid::new("status_grid")
                 .num_columns(2)
                 .spacing([12.0, 6.0])
@@ -69,7 +80,7 @@ pub fn show(ui: &mut Ui, status: &ClientStatus) {
                 });
             if let Some(e) = &status.last_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::from_rgb(200, 40, 40), format!("错误: {e}"));
+                ui.colored_label(ui.visuals().error_fg_color, format!("错误: {e}"));
             }
         });
     if !status.recent_tunnels.is_empty() {

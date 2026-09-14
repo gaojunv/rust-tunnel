@@ -69,6 +69,8 @@ pub struct TrayHandle {
     pub icon: TrayIcon,
     /// 菜单首行的只读状态项。
     pub status_item: MenuItem,
+    /// 菜单第二行的只读服务器项。
+    pub server_item: MenuItem,
 }
 
 /// 构造托盘图标与菜单，返回可持久持有的句柄（调用方需持有其生命周期）。
@@ -76,6 +78,7 @@ pub struct TrayHandle {
 /// 图标三态可通过 `handle.icon.set_icon(...)` 切换；此处先以离线态创建。
 pub fn build_tray() -> anyhow::Result<TrayHandle> {
     let status_item = MenuItem::with_id("status", "● 离线", false, None);
+    let server_item = MenuItem::with_id("server", "服务器：未配置", false, None);
     let show_item = MenuItem::with_id(ids::SHOW, "打开面板…", true, None);
     let settings_item = MenuItem::with_id(ids::SETTINGS, "设置…", true, None);
     let reconnect_item = MenuItem::with_id(ids::RECONNECT, "重连", true, None);
@@ -83,6 +86,7 @@ pub fn build_tray() -> anyhow::Result<TrayHandle> {
 
     let menu = Menu::with_items(&[
         &status_item,
+        &server_item,
         &PredefinedMenuItem::separator(),
         &show_item,
         &settings_item,
@@ -113,36 +117,95 @@ pub fn build_tray() -> anyhow::Result<TrayHandle> {
     Ok(TrayHandle {
         icon: tray,
         status_item,
+        server_item,
     })
 }
 
 /// 错误文案在托盘菜单中展示的最大字符数（超出截断）。
 const MAX_ERROR_CHARS: usize = 24;
 
-/// 根据最新状态刷新托盘 tooltip 与状态菜单文案。
-pub fn update_tray_for_status(handle: &TrayHandle, status: &rust_tunnel_client::ClientStatus) {
-    let state = TrayState::from_status(status);
-    let text = match state {
-        TrayState::Connected => "● 已连接".to_string(),
+/// 服务器地址在菜单中展示的最大字符数。
+const MAX_SERVER_CHARS: usize = 28;
+
+/// 服务器地址在 tooltip 中展示的最大字符数。
+const MAX_TOOLTIP_SERVER_CHARS: usize = 40;
+
+/// 截断字符串（按字符计数，超出补 …）。
+fn truncate_chars(s: &str, max: usize) -> String {
+    let chars: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        format!("{chars}…")
+    } else {
+        chars
+    }
+}
+
+/// 菜单首行文案：状态 + RTT + 活跃隧道数。
+#[must_use]
+pub fn status_menu_text(status: &rust_tunnel_client::ClientStatus) -> String {
+    match TrayState::from_status(status) {
+        TrayState::Connected => match status.rtt_ms {
+            Some(ms) => format!("● 已连接 · {ms:.0}ms · {} 活跃", status.active_tunnels),
+            None => format!("● 已连接 · {} 活跃", status.active_tunnels),
+        },
         TrayState::Reconnecting => match status.last_error.as_deref() {
             Some(err) => {
                 // 取首行、过长截断，避免菜单项被超长错误撑宽。
                 let first_line = err.lines().next().unwrap_or(err);
-                let brief: String = first_line.chars().take(MAX_ERROR_CHARS).collect();
-                if first_line.chars().count() > MAX_ERROR_CHARS {
-                    format!("● 重连中：{brief}…")
-                } else {
-                    format!("● 重连中：{brief}")
-                }
+                let brief = truncate_chars(first_line, MAX_ERROR_CHARS);
+                format!("● 重连中：{brief}")
             }
             None => "● 重连中".to_string(),
         },
         TrayState::Offline => "● 离线".to_string(),
-    };
-    handle.status_item.set_text(&text);
-    let tooltip = format!("rust-tunnel — {}", state.label());
-    if let Err(e) = handle.icon.set_tooltip(Some(tooltip)) {
-        tracing::warn!("托盘 tooltip 更新失败：{e}");
+    }
+}
+
+/// 菜单次行文案：服务器地址（截断 28 字符，空则显示未配置）。
+#[must_use]
+pub fn server_menu_text(status: &rust_tunnel_client::ClientStatus) -> String {
+    if status.server.is_empty() {
+        "服务器：未配置".to_string()
+    } else {
+        let server = truncate_chars(&status.server, MAX_SERVER_CHARS);
+        format!("服务器：{server}")
+    }
+}
+
+/// 托盘 tooltip（多行；Windows 限制 128 UTF-16 单元，Linux 不显示）。
+#[must_use]
+pub fn tooltip_text(status: &rust_tunnel_client::ClientStatus) -> String {
+    let state = TrayState::from_status(status);
+    let head = format!("rust-tunnel — {}", state.label());
+    match state {
+        TrayState::Connected => {
+            let server = truncate_chars(&status.server, MAX_TOOLTIP_SERVER_CHARS);
+            match status.rtt_ms {
+                Some(ms) => format!(
+                    "{head}\n服务器：{server}\nRTT：{ms:.0} ms · 活跃隧道：{}",
+                    status.active_tunnels
+                ),
+                None => format!(
+                    "{head}\n服务器：{server}\n活跃隧道：{}",
+                    status.active_tunnels
+                ),
+            }
+        }
+        TrayState::Reconnecting => match status.last_error.as_deref() {
+            Some(err) => {
+                let brief = err.lines().next().unwrap_or(err);
+                format!("{head}\n{brief}")
+            }
+            None => head,
+        },
+        TrayState::Offline => {
+            if status.server.is_empty() {
+                head
+            } else {
+                let server = truncate_chars(&status.server, MAX_TOOLTIP_SERVER_CHARS);
+                format!("{head}\n服务器：{server}")
+            }
+        }
     }
 }
 

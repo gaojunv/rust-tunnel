@@ -3,12 +3,12 @@ use std::sync::Arc;
 use egui::Ui;
 use rust_tunnel_client::LogBuffer;
 
-fn level_color(level: &str) -> egui::Color32 {
+fn level_color(level: &str, visuals: &egui::Visuals) -> Option<egui::Color32> {
     match level {
-        "ERROR" => egui::Color32::from_rgb(200, 40, 40),
-        "WARN" => egui::Color32::from_rgb(180, 140, 20),
-        "DEBUG" => egui::Color32::from_rgb(110, 110, 110),
-        _ => egui::Color32::from_rgb(50, 50, 50),
+        "ERROR" => Some(visuals.error_fg_color),
+        "WARN" => Some(visuals.warn_fg_color),
+        "DEBUG" => Some(visuals.weak_text_color()),
+        _ => None, // INFO 用默认文本色，深浅主题均可读
     }
 }
 
@@ -58,11 +58,12 @@ pub fn show(ui: &mut Ui, log_buffer: &Arc<LogBuffer>) {
                                     .weak()
                                     .monospace(),
                             );
-                            ui.label(
-                                egui::RichText::new(e.level.clone())
-                                    .small()
-                                    .color(level_color(&e.level)),
-                            );
+                            let mut level_text =
+                                egui::RichText::new(e.level.clone()).small();
+                            if let Some(c) = level_color(&e.level, ui.visuals()) {
+                                level_text = level_text.color(c);
+                            }
+                            ui.label(level_text);
                             ui.label(
                                 egui::RichText::new(format!("{} — {}", e.target, e.message))
                                     .small()
