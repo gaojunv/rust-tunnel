@@ -41,8 +41,10 @@ const emptyForm = {
 
 export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDialogProps) {
   const { t } = useTranslation();
-  const createMutation = useCreateProxyRule();
-  const updateMutation = useUpdateProxyRule();
+  // 错误（含端口冲突）内联展示在对话框内，豁免全局错误 toast；成功 toast 走 meta
+  const feedbackMeta = { muteErrorToast: true, successToast: 'common.toast.saved' } as const;
+  const createMutation = useCreateProxyRule(feedbackMeta);
+  const updateMutation = useUpdateProxyRule(feedbackMeta);
   const [form, setForm] = useState(emptyForm);
   const [conflictError, setConflictError] = useState<string | null>(null);
   const { data: clientsData = [] } = useQuery({

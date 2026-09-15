@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
-import { toast } from 'sonner';
 import {
   ArrowLeft,
   Loader2,
@@ -42,10 +41,8 @@ export default function SkillDetail({ skill, onBack, onDeleted }: Props) {
       () => {
         setError(null);
         deleteMutation.mutate(skill.id, {
-          onSuccess: () => {
-            toast.success(t('common.toast.deleted'));
-            onDeleted();
-          },
+          // 成功 toast 由 hook meta.successToast 全局发出
+          onSuccess: onDeleted,
           onError: (err) => {
             setError(t('skill.saveError', { error: getApiErrorMessage(err) }));
           },

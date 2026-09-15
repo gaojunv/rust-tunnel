@@ -26,10 +26,8 @@ vi.mock('@/api/agentModels', () => ({
   listAgentSelectableModels: api.listAgentSelectableModels,
 }));
 
-const toastSuccess = vi.fn();
-vi.mock('sonner', () => ({
-  toast: { success: (...a: unknown[]) => toastSuccess(...a), error: vi.fn() },
-}));
+// 成功/失败 toast 已迁移到全局 MutationCache（App.tsx）按 hook meta 发出，
+// 组件测试使用独立 QueryClient（无该缓存），不再断言 toast。
 
 const roleFixture: AgentRole = {
   id: 'r1',
@@ -66,7 +64,7 @@ describe('RoleDialog', () => {
     vi.clearAllMocks();
   });
 
-  it('编辑保存成功 → onClose 被调 + toast.success', async () => {
+  it('编辑保存成功 → onClose 被调', async () => {
     api.listAgentWorkspaces.mockResolvedValue([]);
     api.clientsApi.list.mockResolvedValue([]);
     api.listAgentSelectableModels.mockResolvedValue({ models: [], groups: [] });
@@ -79,9 +77,7 @@ describe('RoleDialog', () => {
     await screen.findByDisplayValue('code-reviewer');
     fireEvent.click(screen.getByText('common.save'));
     await waitFor(() => expect(api.updateRole).toHaveBeenCalled());
-    // onSuccess 回调里 toast + onClose
-    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith('common.toast.saved'));
-    expect(onClose).toHaveBeenCalled();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
 
   it('编辑保存失败 → 内联错误且弹窗不关闭', async () => {
@@ -95,10 +91,9 @@ describe('RoleDialog', () => {
     fireEvent.click(screen.getByText('common.save'));
     await waitFor(() => expect(screen.getByText('role.saveError')).toBeTruthy());
     expect(onClose).not.toHaveBeenCalled();
-    expect(toastSuccess).not.toHaveBeenCalled();
   });
 
-  it('新建保存成功 → onClose 被调 + toast.success', async () => {
+  it('新建保存成功 → onClose 被调', async () => {
     api.listAgentWorkspaces.mockResolvedValue([]);
     api.clientsApi.list.mockResolvedValue([]);
     api.listAgentSelectableModels.mockResolvedValue({ models: [], groups: [] });
@@ -109,8 +104,7 @@ describe('RoleDialog', () => {
     fireEvent.change(screen.getByLabelText('role.name'), { target: { value: 'new-role' } });
     fireEvent.click(screen.getByText('common.save'));
     await waitFor(() => expect(api.createRole).toHaveBeenCalled());
-    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith('common.toast.saved'));
-    expect(onClose).toHaveBeenCalled();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
 
   it('新建保存失败 → 内联错误且弹窗不关闭', async () => {

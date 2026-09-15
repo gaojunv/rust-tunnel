@@ -183,6 +183,10 @@
     "kickAndDelete": "踢出并删除",
     "kickDeleteConfirm": "踢出 {{name}} 并删除？",
     "deleteConfirm": "删除 {{name}}？",
+    "toast": {
+      "kicked": "已断开客户端连接",
+      "rotated": "令牌已轮换"
+    },
     "table": {
       "name": "名称",
       "status": "状态",

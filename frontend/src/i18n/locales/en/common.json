@@ -183,6 +183,10 @@
     "kickAndDelete": "Kick and delete",
     "kickDeleteConfirm": "Kick {{name}} and delete it?",
     "deleteConfirm": "Delete {{name}}?",
+    "toast": {
+      "kicked": "Client kicked",
+      "rotated": "Token rotated"
+    },
     "table": {
       "name": "Name",
       "status": "Status",

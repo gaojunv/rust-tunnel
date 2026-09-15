@@ -341,6 +341,8 @@ function FileView({
 
   const saveMutation = useMutation({
     mutationFn: (approved: boolean) => putFsFile(workspaceId, path, draft, approved),
+    // 409 转确认弹窗、其余错误内联 saveError 展示，豁免全局错误 toast
+    meta: { muteErrorToast: true },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['agent-fs-file', workspaceId, path] });
       queryClient.invalidateQueries({ queryKey: ['agent-git-status', workspaceId] });

@@ -7,7 +7,6 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
-import { toast } from 'sonner';
 import {
   ArrowLeft,
   Loader2,
@@ -83,10 +82,8 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
       () => {
         setError(null);
         deleteMutation.mutate(memory.id, {
-          onSuccess: () => {
-            toast.success(t('common.toast.deleted'));
-            onDeleted();
-          },
+          // 成功 toast 由 hook meta.successToast 全局发出
+          onSuccess: onDeleted,
           onError: (err) => {
             setError(t('memory.saveError', { error: getApiErrorMessage(err) }));
           },

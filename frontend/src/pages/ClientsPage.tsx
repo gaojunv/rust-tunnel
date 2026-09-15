@@ -29,6 +29,7 @@ export default function ClientsPage() {
 
   const rotate = useMutation({
     mutationFn: () => serverAuthApi.rotate(),
+    meta: { successToast: 'clients.toast.rotated' },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['server-auth'] });
       setConfirmRotate(false);
@@ -37,11 +38,13 @@ export default function ClientsPage() {
 
   const kick = useMutation({
     mutationFn: (name: string) => clientsApi.kick(name),
+    meta: { successToast: 'clients.toast.kicked' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
   });
 
   const remove = useMutation({
     mutationFn: (name: string) => clientsApi.remove(name),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
   });
 

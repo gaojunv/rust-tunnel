@@ -50,6 +50,8 @@ export function useApprovalMutation<TArgs extends unknown[]>(
   const mutation = useMutation({
     mutationFn: ({ approved, args }: { approved: boolean; args: TArgs }) =>
       mutationFn(approved, ...args),
+    // 409 走审批/升级弹窗、其余错误经 error state 内联（GithubMutationError 等），豁免全局错误 toast
+    meta: { muteErrorToast: true },
     onSuccess: () => {
       setError(null);
       options?.onSuccess?.();

@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useMutation, useQueryClient, type MutationMeta } from '@tanstack/react-query';
 import {
   api,
   login,
@@ -142,6 +142,7 @@ export function useUpdateShadowsocksConfig() {
   return useMutation({
     mutationFn: (config: { enabled: boolean; port: number; cipher: string }) =>
       updateShadowsocksConfig(config),
+    meta: { successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['shadowsocks-config'] });
       queryClient.invalidateQueries({ queryKey: ['stats'] });
@@ -167,6 +168,7 @@ export function useUpdateTrojanConfig() {
       fallback?: string;
       domain?: string;
     }) => updateTrojanConfig(config),
+    meta: { successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['trojan-config'] });
       queryClient.invalidateQueries({ queryKey: ['stats'] });
@@ -206,6 +208,8 @@ export function useLlmLogging() {
   });
   const mutation = useMutation({
     mutationFn: setLlmLogging,
+    // 失败时本地 onError 已回滚乐观更新（自解释），不再全局 toast
+    meta: { muteErrorToast: true },
     onMutate: async (enabled: boolean) => {
       // 取消进行中的查询，避免乐观更新与后台拉取竞态
       await queryClient.cancelQueries({ queryKey: ['llm-logging'] });
@@ -229,10 +233,12 @@ export function useProxyRules() {
   });
 }
 
-export function useCreateProxyRule() {
+/** 双场景：ProxyRuleDialog 内联展示错误并自带成功反馈时传 `{ muteErrorToast, successToast }`。 */
+export function useCreateProxyRule(meta?: MutationMeta) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: CreateProxyRuleRequest) => createProxyRule(data),
+    meta,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
       queryClient.invalidateQueries({ queryKey: ['stats'] });
@@ -240,11 +246,12 @@ export function useCreateProxyRule() {
   });
 }
 
-export function useUpdateProxyRule() {
+export function useUpdateProxyRule(meta?: MutationMeta) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: UpdateProxyRuleRequest }) =>
       updateProxyRule(id, data),
+    meta,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
       queryClient.invalidateQueries({ queryKey: ['stats'] });
@@ -256,6 +263,7 @@ export function useDeleteProxyRule() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteProxyRule(id),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
       queryClient.invalidateQueries({ queryKey: ['stats'] });
@@ -282,6 +290,8 @@ export function useUpdateAcmeConfig() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: UpdateAcmeConfigRequest) => updateAcmeConfig(data),
+    // AcmeConfigCard 对话框内联展示 isError
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['acme-config'] });
       queryClient.invalidateQueries({ queryKey: ['acme-status'] });
@@ -301,6 +311,8 @@ export function useRequestAcmeCertificate() {
   return useMutation({
     mutationFn: ({ domain, challengeType }: { domain: string; challengeType: string }) =>
       requestAcmeCertificate(domain, challengeType),
+    // AcmeRequestDialog 内联展示 isError
+    meta: { muteErrorToast: true },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
     },
@@ -321,6 +333,7 @@ export function useDeleteAcmeCertificate() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (domain: string) => deleteAcmeCertificate(domain),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
     },
@@ -339,6 +352,8 @@ export function useUpdateDnsProvider() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (config: DnsProviderConfig) => updateDnsProvider(config),
+    // DnsProviderConfigCard 对话框内联展示 isError
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dns-providers'] });
       queryClient.invalidateQueries({ queryKey: ['acme-config'] });
@@ -358,6 +373,8 @@ export function useChallengeStatus(domain: string) {
 export function useLogin() {
   return useMutation({
     mutationFn: (password: string) => login({ password } as LoginRequest),
+    // LoginPage 内联展示登录失败
+    meta: { muteErrorToast: true },
   });
 }
 
@@ -380,6 +397,7 @@ export function useUpdateReverseProxyConfig() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (config: ReverseProxySettings) => updateReverseProxyConfig(config),
+    meta: { successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
     },
@@ -397,6 +415,7 @@ export function useUpdateDnsConfig() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (config: DnsSettings) => updateDnsConfig(config),
+    meta: { successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings', 'dns'] });
     },
@@ -474,6 +493,8 @@ export function useUpdateLlmGatewayConfig() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (config: Partial<LlmGatewayConfig>) => updateLlmGatewayConfig(config),
+    // GatewayTab 内联展示保存错误（成功反馈也由其 successToast 统一）
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-gateway-config'] }),
   });
 }
@@ -484,18 +505,21 @@ export function useLlmProviders() {
   return useQuery({ queryKey: ['llm-providers'], queryFn: () => listLlmProviders() });
 }
 
-export function useCreateLlmProvider() {
+/** 双场景：ProviderDialog 内联展示错误时传 `{ muteErrorToast, successToast }`。 */
+export function useCreateLlmProvider(meta?: MutationMeta) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: CreateProviderRequest) => createLlmProvider(req),
+    meta,
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
   });
 }
 
-export function useUpdateLlmProvider() {
+export function useUpdateLlmProvider(meta?: MutationMeta) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string } & CreateProviderRequest) => updateLlmProvider(id, req),
+    meta,
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
   });
 }
@@ -512,6 +536,7 @@ export function useDeleteLlmProvider() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteLlmProvider(id),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
   });
 }
@@ -535,6 +560,7 @@ export function useAddModel() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ providerId, ...req }: { providerId: string } & CreateModelRequest) => addModel(providerId, req),
+    meta: { successToast: 'common.toast.saved' },
     // 新增模型后需刷新该 provider 的列表以及全部模型列表（GroupDialog 用 ['llm-models','all']）。
     // 仅刷新 ['llm-models', providerId] 会让 GroupDialog 的选模型下拉陈旧。
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
@@ -545,6 +571,7 @@ export function useUpdateModel() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string } & CreateModelRequest) => updateModel(id, req),
+    meta: { successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
   });
 }
@@ -553,6 +580,7 @@ export function useDeleteModel() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteModel(id),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
   });
 }
@@ -567,6 +595,8 @@ export function useCreateLlmApiKey() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (name: string) => createLlmApiKey(name),
+    // ApiKeyTable 内联展示错误；成功反馈为新密钥一次性展示对话框
+    meta: { muteErrorToast: true },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
   });
 }
@@ -583,6 +613,8 @@ export function useBindLlmApiKey() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, kbId }: { id: string; kbId: string | null }) => bindLlmApiKey(id, kbId),
+    // ApiKeyTable 内联展示绑定错误
+    meta: { muteErrorToast: true },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
   });
 }
@@ -591,6 +623,7 @@ export function useDeleteLlmApiKey() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteLlmApiKey(id),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
   });
 }
@@ -615,15 +648,19 @@ export function useCreateLlmModelGroup() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: { name: string; enabled?: boolean }) => createLlmModelGroup(req),
+    // GroupDialog 走 mutateAsync + catch 内联展示；成功反馈由同流程的 replaceMembers 统一 toast
+    meta: { muteErrorToast: true },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
   });
 }
 
-export function useUpdateLlmModelGroup() {
+/** 双场景：GroupDialog 内联 catch 传 muteErrorToast；GroupsTab 行内开关用默认全局错误 toast。 */
+export function useUpdateLlmModelGroup(meta?: MutationMeta) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string; name: string; enabled?: boolean }) =>
       updateLlmModelGroup(id, req),
+    meta,
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
   });
 }
@@ -632,6 +669,7 @@ export function useDeleteLlmModelGroup() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteLlmModelGroup(id),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
   });
 }
@@ -641,6 +679,8 @@ export function useReplaceGroupMembers() {
   return useMutation({
     mutationFn: ({ id, members }: { id: string; members: { model_id: string; priority: number }[] }) =>
       replaceGroupMembers(id, members),
+    // GroupDialog 保存流程的最后一环：成功 toast 由此统一发出（create/update 已被 mute）
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
   });
 }
@@ -649,6 +689,8 @@ export function useResetGroupBreaker() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => resetGroupBreaker(id),
+    // GroupDialog 内联展示重置错误
+    meta: { muteErrorToast: true },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
   });
 }
@@ -709,6 +751,8 @@ export function useCreateKnowledgeSource() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: CreateKnowledgeSourceRequest) => createKnowledgeSource(req),
+    // SourceDialog 内联展示提交错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['knowledge-sources'] }),
   });
 }
@@ -718,6 +762,7 @@ export function useUpdateKnowledgeSource() {
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string } & UpdateKnowledgeSourceRequest) =>
       updateKnowledgeSource(id, req),
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
       qc.invalidateQueries({ queryKey: ['knowledge-source', vars.id] });
@@ -732,6 +777,8 @@ export function useToggleKnowledgeSource() {
   return useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
       toggleKnowledgeSource(id, enabled),
+    // SourceDetail 内联横幅展示错误
+    meta: { muteErrorToast: true },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
       qc.invalidateQueries({ queryKey: ['knowledge-source', vars.id] });
@@ -743,6 +790,7 @@ export function useDeleteKnowledgeSource() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteKnowledgeSource(id),
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['knowledge-sources'] }),
   });
 }
@@ -773,6 +821,8 @@ export function useDeleteKnowledgeDoc() {
   return useMutation({
     mutationFn: ({ sourceId, docId }: { sourceId: string; docId: string }) =>
       deleteKnowledgeDoc(sourceId, docId),
+    // SourceDocsTab 内联 actionError 横幅
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['knowledge-docs', vars.sourceId] });
       qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
@@ -795,6 +845,8 @@ export function useReindexKnowledgeDoc() {
       docId: string;
       kind?: KnowledgeIndexKind;
     }) => reindexKnowledgeDoc(sourceId, docId, kind),
+    // SourceDocsTab 内联 actionError 横幅；索引进度由 SSE 反馈
+    meta: { muteErrorToast: true },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['knowledge-docs', vars.sourceId] });
       qc.invalidateQueries({ queryKey: ['knowledge-sources'] });
@@ -806,6 +858,8 @@ export function useTestEmbedding() {
   return useMutation({
     mutationFn: (req: { base_url: string; api_key: string; model: string; kb_id?: string }) =>
       testEmbedding(req),
+    // SourceDialog 内联展示测试结果（成功/失败皆内联）
+    meta: { muteErrorToast: true },
   });
 }
 
@@ -814,6 +868,8 @@ export function useKnowledgeQuery() {
   return useMutation({
     mutationFn: ({ sourceId, text }: { sourceId: string; text: string }) =>
       queryKnowledge(sourceId, text),
+    // SourceDetail 检索区按 isError 内联展示
+    meta: { muteErrorToast: true },
   });
 }
 
@@ -831,6 +887,8 @@ export function useCreateMemory() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: CreateMemoryRequest) => createMemory(req),
+    // MemoryDialog 内联展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memories'] }),
   });
 }
@@ -839,6 +897,8 @@ export function useUpdateMemory() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string } & UpdateMemoryRequest) => updateMemory(id, req),
+    // MemoryDetail 内联横幅展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-memories'] });
       qc.invalidateQueries({ queryKey: ['agent-memory', vars.id] });
@@ -850,6 +910,7 @@ export function useDeleteMemory() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteMemory(id),
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memories'] }),
   });
 }
@@ -858,6 +919,8 @@ export function usePinMemory() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => pinMemory(id),
+    // MemoryDetail 内联横幅展示错误
+    meta: { muteErrorToast: true },
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: ['agent-memories'] });
       qc.invalidateQueries({ queryKey: ['agent-memory', id] });
@@ -873,6 +936,8 @@ export function useUpdateMemorySettings() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: MemorySettingsRequest) => updateMemorySettings(req),
+    // MemorySettings/WikiSettings/SkillSettings/SharedEmbeddingSettings 均内联展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memory-settings'] }),
   });
 }
@@ -881,6 +946,8 @@ export function useTestMemoryEmbedding() {
   return useMutation({
     mutationFn: (req: { base_url: string; api_key: string; model: string }) =>
       testMemoryEmbedding(req),
+    // SharedEmbeddingSettings 内联展示测试结果
+    meta: { muteErrorToast: true },
   });
 }
 
@@ -888,6 +955,7 @@ export function useClearMemory() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => clearMemory(),
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memories'] }),
   });
 }
@@ -947,6 +1015,8 @@ export function useCreateSkill() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: CreateSkillRequest) => createSkill(req),
+    // SkillDialog 内联展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-skills'] }),
   });
 }
@@ -955,6 +1025,7 @@ export function useUpdateSkill() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string } & UpdateSkillRequest) => updateSkill(id, req),
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-skills'] });
       qc.invalidateQueries({ queryKey: ['agent-skill', vars.id] });
@@ -966,6 +1037,8 @@ export function useDeleteSkill() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteSkill(id),
+    // SkillDetail 内联横幅展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-skills'] }),
   });
 }
@@ -974,6 +1047,8 @@ export function useToggleSkill() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => toggleSkill(id),
+    // SkillDetail 内联横幅展示错误
+    meta: { muteErrorToast: true },
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: ['agent-skills'] });
       qc.invalidateQueries({ queryKey: ['agent-skill', id] });
@@ -995,6 +1070,8 @@ export function useCreateRole() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: CreateRoleRequest) => createRole(req),
+    // RoleDialog 内联展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-roles'] }),
   });
 }
@@ -1003,6 +1080,7 @@ export function useUpdateRole() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...req }: { id: string } & UpdateRoleRequest) => updateRole(id, req),
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-roles'] });
       qc.invalidateQueries({ queryKey: ['agent-role', vars.id] });
@@ -1014,6 +1092,8 @@ export function useDeleteRole() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteRole(id),
+    // RoleList 内联横幅展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-roles'] }),
   });
 }
@@ -1022,6 +1102,8 @@ export function useToggleRole() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => toggleRole(id),
+    // RoleList 内联横幅展示错误
+    meta: { muteErrorToast: true },
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: ['agent-roles'] });
       qc.invalidateQueries({ queryKey: ['agent-role', id] });
@@ -1071,6 +1153,8 @@ export function usePutWikiPage() {
   return useMutation({
     mutationFn: ({ wikiId, ref, req }: { wikiId: string; ref: string; req: import('../types').PutWikiPageRequest }) =>
       putWikiPage(wikiId, ref, req),
+    // WikiPageDialog 内联展示错误
+    meta: { muteErrorToast: true, successToast: 'common.toast.saved' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-wiki-pages', vars.wikiId] });
       qc.invalidateQueries({ queryKey: ['agent-wiki-page', vars.wikiId, vars.req.ref ?? vars.ref] });
@@ -1084,6 +1168,8 @@ export function useDeleteWikiPage() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ wikiId, ref }: { wikiId: string; ref: string }) => deleteWikiPage(wikiId, ref),
+    // WikiPagesTab 内联 actionError 横幅
+    meta: { muteErrorToast: true, successToast: 'common.toast.deleted' },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-wiki-pages', vars.wikiId] });
       qc.invalidateQueries({ queryKey: ['agent-wiki-page', vars.wikiId, vars.ref] });

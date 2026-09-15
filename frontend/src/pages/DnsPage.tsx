@@ -26,7 +26,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
 import { getApiErrorMessage } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
-import { toast } from 'sonner';
 import { Plus, Trash2 } from 'lucide-react';
 
 export default function DnsPage() {
@@ -48,6 +47,8 @@ export default function DnsPage() {
 
   const addMutation = useMutation({
     mutationFn: (data: AddDnsRecordRequest) => addDnsRecord(data),
+    // 对话框内联展示错误（含服务端明细），见下方 addMutation.isError 区块
+    meta: { muteErrorToast: true },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dns-records'] });
       setDialogOpen(false);
@@ -57,11 +58,9 @@ export default function DnsPage() {
 
   const deleteMutation = useMutation({
     mutationFn: (name: string) => deleteDnsRecord(name),
+    meta: { successToast: 'common.toast.deleted' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dns-records'] });
-    },
-    onError: (err: unknown) => {
-      toast.error(t('dns.deleteFailed', { error: getApiErrorMessage(err) }));
     },
   });
 
@@ -133,7 +132,7 @@ export default function DnsPage() {
               </div>
               {addMutation.isError && (
                 <p className="text-sm text-destructive">
-                  {t('dns.failedAdd')}
+                  {t('dns.failedAdd')}: {getApiErrorMessage(addMutation.error)}
                 </p>
               )}
               <Button type="submit" disabled={addMutation.isPending}>

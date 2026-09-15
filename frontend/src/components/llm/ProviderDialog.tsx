@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useCreateLlmProvider, useUpdateLlmProvider, useLlmProviders } from '@/api/hooks';
+import { ErrorBanner } from '@/components/shared/ErrorBanner';
 import type { ProviderType } from '@/types';
 
 interface Props { open: boolean; onClose: () => void; providerId: string | null; }
@@ -36,8 +37,10 @@ function mergeCompat(extraConfig: string | null | undefined, compat: boolean): s
 export default function ProviderDialog({ open, onClose, providerId }: Props) {
   const { t } = useTranslation();
   const { data: providers } = useLlmProviders();
-  const createMutation = useCreateLlmProvider();
-  const updateMutation = useUpdateLlmProvider();
+  // 错误内联展示在对话框底部（对话框保持打开），故豁免全局错误 toast；成功 toast 走 meta
+  const feedbackMeta = { muteErrorToast: true, successToast: 'common.toast.saved' } as const;
+  const createMutation = useCreateLlmProvider(feedbackMeta);
+  const updateMutation = useUpdateLlmProvider(feedbackMeta);
   const [name, setName] = useState('');
   const [providerType, setProviderType] = useState<ProviderType>('deepseek');
   const [baseUrl, setBaseUrl] = useState('');
@@ -90,6 +93,11 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
           </div>
         </div>
         <DialogFooter>
+          {(createMutation.isError || updateMutation.isError) && (
+            <div className="w-full sm:col-span-2">
+              <ErrorBanner error={createMutation.error ?? updateMutation.error} />
+            </div>
+          )}
           <Button variant="outline" onClick={onClose}>{t('common.cancel')}</Button>
           <Button onClick={() => {
             const req = { name, provider_type: providerType, base_url: baseUrl, api_key: apiKey, anthropic_base_url: anthropicBaseUrl || null, extra_config: mergeCompat(existing?.extra_config, compatToolHistory) };

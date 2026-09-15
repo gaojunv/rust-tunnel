@@ -7,7 +7,6 @@ import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
-import { toast } from 'sonner';
 import { getApiErrorMessage } from '@/api/client';
 import { useCreateRole, useUpdateRole, useClients, useAgentWorkspaces } from '@/api/hooks';
 import { listAgentSelectableModels } from '@/api/agentModels';
@@ -166,7 +165,8 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
       updateMutation.mutate(
         { id: role.id, ...req },
         {
-          onSuccess: () => { toast.success(t('common.toast.saved')); onClose(); },
+          // 成功 toast 由 hook meta.successToast 全局发出
+          onSuccess: onClose,
           onError: fail,
         },
       );
@@ -177,7 +177,7 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
         ...(scope === 'workspace' ? { workspace_id: workspaceId } : {}),
       };
       createMutation.mutate(req, {
-        onSuccess: () => { toast.success(t('common.toast.saved')); onClose(); },
+        onSuccess: onClose,
         onError: fail,
       });
     }

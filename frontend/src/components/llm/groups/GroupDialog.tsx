@@ -48,7 +48,8 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
   const { data: models } = useLlmAllModels();
   const { data: providers } = useLlmProviders();
   const createGroup = useCreateLlmModelGroup();
-  const updateGroup = useUpdateLlmModelGroup();
+  // 保存走 mutateAsync + catch 内联展示（本文件 catch 块），豁免全局错误 toast
+  const updateGroup = useUpdateLlmModelGroup({ muteErrorToast: true });
   const replaceMembers = useReplaceGroupMembers();
   const resetBreaker = useResetGroupBreaker();
 
