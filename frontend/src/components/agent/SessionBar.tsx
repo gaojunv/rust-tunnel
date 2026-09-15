@@ -10,14 +10,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import {
   listAgentSessions,
   deleteAgentSession,
@@ -55,7 +48,7 @@ function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew,
   const [error, setError] = useState<string | null>(null);
   // 受控打开态：删除时需先关闭下拉再弹确认 Dialog，避免两个浮层叠放
   const [menuOpen, setMenuOpen] = useState(false);
-  const [deletingSession, setDeletingSession] = useState<AgentSession | null>(null);
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const { data: sessions } = useQuery<AgentSession[]>({
     queryKey: ['agent-sessions', workspaceId],
     queryFn: () => listAgentSessions(workspaceId),
@@ -68,7 +61,6 @@ function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew,
   const translate = t as unknown as TranslateFn;
 
   const handleDelete = async (session: AgentSession) => {
-    setDeletingSession(null);
     try {
       await deleteAgentSession(session.id);
       setError(null);
@@ -250,9 +242,17 @@ function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew,
                         aria-label={t('agent.deleteSession')}
                         onClick={(e) => {
                           e.preventDefault();
-                          // 先关下拉再弹 Dialog：Dialog 覆盖在打开的菜单上会造成焦点/层级混乱
+                          // 先关下拉再弹确认 Dialog：两个浮层叠放会造成焦点/层级混乱
                           setMenuOpen(false);
-                          setDeletingSession(s);
+                          confirm(
+                            {
+                              title: t('agent.confirmDeleteSessionTitle'),
+                              description: t('agent.confirmDeleteSessionDesc', {
+                                title: s.title || t('agent.unnamedSession'),
+                              }),
+                            },
+                            () => void handleDelete(s),
+                          );
                         }}
                       >
                         <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -269,36 +269,16 @@ function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew,
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {/* 删除确认：替代 window.confirm，复用项目 Dialog 组件（错误走上方 error 状态） */}
-      <Dialog open={!!deletingSession} onOpenChange={(open) => {
-        if (!open) setDeletingSession(null);
-      }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('agent.confirmDeleteSessionTitle')}</DialogTitle>
-            <DialogDescription>
-              {deletingSession
-                ? t('agent.confirmDeleteSessionDesc', {
-                    title: deletingSession.title || t('agent.unnamedSession'),
-                  })
-                : ''}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeletingSession(null)}>
-              {t('common.cancel')}
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() => {
-                if (deletingSession) void handleDelete(deletingSession);
-              }}
-            >
-              {t('common.delete')}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* 删除确认：统一走 ConfirmDialog（删除失败走上方 error 内联提示） */}
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+        confirmLabel={t('common.delete')}
+        cancelLabel={t('common.cancel')}
+      />
     </div>
   );
 }

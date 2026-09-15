@@ -4,6 +4,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import { Skeleton } from '@/components/ui/skeleton';
+import { ErrorState } from '@/components/shared/ErrorState';
 import { useTrojanConfig, useUpdateTrojanConfig, useAcmeStatus } from '@/api/hooks';
 import { Info, ShieldCheck } from 'lucide-react';
 
@@ -53,7 +55,23 @@ export default function TrojanConfigCard() {
   };
 
   if (isLoading) {
-    return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <ShieldCheck className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('trojan.config.title')}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Skeleton className="h-9 w-full" />
+          <Skeleton className="h-9 w-full" />
+          <Skeleton className="h-9 w-2/3" />
+        </CardContent>
+      </Card>
+    );
   }
 
   if (isError) {
@@ -68,12 +86,7 @@ export default function TrojanConfigCard() {
           </div>
         </CardHeader>
         <CardContent>
-          <div className="flex flex-col items-center gap-3 py-10 text-center">
-            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-            <Button variant="outline" size="sm" onClick={() => void refetch()}>
-              {t('common.retry')}
-            </Button>
-          </div>
+          <ErrorState onRetry={() => void refetch()} />
         </CardContent>
       </Card>
     );

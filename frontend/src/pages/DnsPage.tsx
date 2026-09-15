@@ -26,7 +26,12 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
 import { getApiErrorMessage } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Skeleton } from '@/components/ui/skeleton';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorState } from '@/components/shared/ErrorState';
+import { cn } from '@/lib/utils';
 
 export default function DnsPage() {
   const { t } = useTranslation();
@@ -38,7 +43,7 @@ export default function DnsPage() {
     value: '',
   });
 
-  const { data: records, isLoading, isError, refetch } = useQuery({
+  const { data: records, isLoading, isError, isFetching, refetch } = useQuery({
     queryKey: ['dns-records'],
     queryFn: () => getDnsRecords(),
     refetchInterval: 15000,
@@ -79,6 +84,10 @@ export default function DnsPage() {
         title={t('dns.title')}
         description={t('dns.description')}
       >
+        <Button variant="outline" onClick={() => void refetch()} disabled={isFetching}>
+          <RefreshCw className={cn('mr-2 h-4 w-4', isFetching && 'animate-spin')} />
+          {t('common.refresh')}
+        </Button>
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogTrigger asChild>
             <Button>
@@ -105,18 +114,21 @@ export default function DnsPage() {
               </div>
               <div className="space-y-2">
                 <label htmlFor="dns-type" className="text-sm font-medium">{t('dns.type')}</label>
-                <select
-                  id="dns-type"
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                <Select
                   value={newRecord.record_type}
-                  onChange={(e) =>
-                    setNewRecord({ ...newRecord, record_type: e.target.value })
+                  onValueChange={(v) =>
+                    setNewRecord({ ...newRecord, record_type: v })
                   }
                 >
-                  <option value="A">A</option>
-                  <option value="AAAA">AAAA</option>
-                  <option value="CNAME">CNAME</option>
-                </select>
+                  <SelectTrigger id="dns-type" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="A">A</SelectItem>
+                    <SelectItem value="AAAA">AAAA</SelectItem>
+                    <SelectItem value="CNAME">CNAME</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               <div className="space-y-2">
                 <label htmlFor="dns-value" className="text-sm font-medium">{t('dns.value')}</label>
@@ -151,20 +163,15 @@ export default function DnsPage() {
         </CardHeader>
         <CardContent>
           {isLoading ? (
-            <div className="text-center py-8 text-muted-foreground">
-              {t('common.loading')}
+            <div className="space-y-3 py-2">
+              <Skeleton className="h-6 w-full" />
+              <Skeleton className="h-6 w-full" />
+              <Skeleton className="h-6 w-3/4" />
             </div>
           ) : isError ? (
-            <div className="flex flex-col items-center gap-3 py-8 text-center">
-              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-              <Button variant="outline" size="sm" onClick={() => void refetch()}>
-                {t('common.retry')}
-              </Button>
-            </div>
+            <ErrorState onRetry={() => void refetch()} />
           ) : !records?.length ? (
-            <div className="text-center py-8 text-muted-foreground">
-              {t('dns.empty')}
-            </div>
+            <EmptyState title={t('dns.empty')} />
           ) : (
             <Table>
               <TableHeader>

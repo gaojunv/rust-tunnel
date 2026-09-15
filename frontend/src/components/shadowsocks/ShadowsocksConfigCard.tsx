@@ -12,6 +12,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useShadowsocksConfig, useUpdateShadowsocksConfig } from '@/api/hooks';
+import { Skeleton } from '@/components/ui/skeleton';
+import { ErrorState } from '@/components/shared/ErrorState';
 import { Shield } from 'lucide-react';
 
 export default function ShadowsocksConfigCard() {
@@ -50,7 +52,23 @@ export default function ShadowsocksConfigCard() {
   };
 
   if (isLoading) {
-    return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Shield className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('shadowsocks.config.title')}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Skeleton className="h-9 w-full" />
+          <Skeleton className="h-9 w-full" />
+          <Skeleton className="h-9 w-2/3" />
+        </CardContent>
+      </Card>
+    );
   }
 
   if (isError) {
@@ -65,12 +83,7 @@ export default function ShadowsocksConfigCard() {
           </div>
         </CardHeader>
         <CardContent>
-          <div className="flex flex-col items-center gap-3 py-10 text-center">
-            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-            <Button variant="outline" size="sm" onClick={() => void refetch()}>
-              {t('common.retry')}
-            </Button>
-          </div>
+          <ErrorState onRetry={() => void refetch()} />
         </CardContent>
       </Card>
     );

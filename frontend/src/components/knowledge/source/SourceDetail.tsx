@@ -24,7 +24,7 @@ import {
   useKnowledgeQuery,
   useWikiGraph,
 } from '@/api/hooks';
-import { ConfirmDialog, useConfirm } from '@/components/llm/confirm';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import SourceDocsTab from './SourceDocsTab';
 import SourceDialog from './SourceDialog';
 import WikiPagesTab from '../wiki/WikiPagesTab';
@@ -291,6 +291,8 @@ export default function SourceDetail({ source, onBack, onDeleted }: Props) {
         onConfirm={confirmAndClose}
         onCancel={cancelConfirm}
         variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
       />
     </div>
   );

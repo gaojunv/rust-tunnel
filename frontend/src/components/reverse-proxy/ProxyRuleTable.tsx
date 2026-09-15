@@ -11,6 +11,9 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorState } from '@/components/shared/ErrorState';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -19,7 +22,6 @@ import {
 } from '@/components/ui/dropdown-menu';
 import {
   Clock,
-  Loader2,
   Lock,
   LockOpen,
   MoreHorizontal,
@@ -128,26 +130,15 @@ export function ProxyRuleTable({ rules, isLoading, isError, onRetry, onEdit, onT
       </CardHeader>
       <CardContent>
         {isLoading ? (
-          <div className="flex items-center justify-center gap-2 py-12 text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {t('common.loading')}
+          <div className="space-y-3 py-2">
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-3/4" />
           </div>
         ) : isError ? (
-          <div className="flex flex-col items-center gap-3 py-12 text-center">
-            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-            <Button variant="outline" size="sm" onClick={() => onRetry?.()}>
-              {t('common.retry')}
-            </Button>
-          </div>
+          <ErrorState onRetry={onRetry} />
         ) : rules.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
-            <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-muted text-muted-foreground">
-              <Network className="h-6 w-6" />
-            </div>
-            <p className="text-sm text-muted-foreground">
-              {t('reverseProxy.table.empty')}
-            </p>
-          </div>
+          <EmptyState icon={Network} title={t('reverseProxy.table.empty')} />
         ) : (
           <Table>
             <TableHeader>

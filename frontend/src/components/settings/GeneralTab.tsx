@@ -1,7 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation, Trans } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { Skeleton } from '@/components/ui/skeleton';
+import { ErrorState } from '@/components/shared/ErrorState';
 import { Switch } from '@/components/ui/switch';
 import {
   Select,
@@ -17,21 +19,34 @@ const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
 
 export default function GeneralTab() {
   const { t } = useTranslation();
-  const { data: settings, isLoading } = useSettings();
+  const { data: settings, isLoading, isError, refetch } = useSettings();
   const { data: acmeStatus } = useAcmeStatus();
 
   const [apiTls, setApiTls] = useState(false);
   const [apiDomain, setApiDomain] = useState('');
 
+  // initRef：仅在设置首次加载时回填表单，避免后续 refetch 覆盖用户编辑
+  // （仿 GatewayTab 防覆盖模式）。
+  const initRef = useRef(false);
   useEffect(() => {
-    if (settings) {
-      setApiTls(settings.api_tls ?? false);
-      setApiDomain(settings.api_domain ?? '');
-    }
+    if (!settings || initRef.current) return;
+    initRef.current = true;
+    setApiTls(settings.api_tls ?? false);
+    setApiDomain(settings.api_domain ?? '');
   }, [settings]);
 
   if (isLoading) {
-    return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
+    return (
+      <div className="space-y-6">
+        <Skeleton className="h-32 w-full rounded-lg" />
+        <Skeleton className="h-48 w-full rounded-lg" />
+        <Skeleton className="h-24 w-full rounded-lg" />
+      </div>
+    );
+  }
+
+  if (isError) {
+    return <ErrorState onRetry={() => void refetch()} />;
   }
 
   return (

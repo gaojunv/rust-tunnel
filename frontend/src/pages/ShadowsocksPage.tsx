@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { StatCard } from '@/components/shared/StatCard';
+import { ErrorBanner } from '@/components/shared/ErrorBanner';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { MetricAreaChart } from '@/components/charts/MetricAreaChart';
@@ -45,16 +46,7 @@ export default function ShadowsocksPage() {
 
       {/* Stats */}
       {summaryError && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          <span>{t('common.loadFailed')}</span>
-          <button
-            type="button"
-            onClick={() => void refetchSummary()}
-            className="shrink-0 font-medium underline underline-offset-4 hover:text-destructive/80"
-          >
-            {t('common.retry')}
-          </button>
-        </div>
+        <ErrorBanner onRetry={() => void refetchSummary()} />
       )}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         <StatCard

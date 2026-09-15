@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
+import { Card } from '@/components/ui/card';
+import { ErrorState } from '@/components/shared/ErrorState';
 import {
   listAgentWorkspaces,
   listAgentSessions,
@@ -291,12 +292,7 @@ export default function AgentPage() {
   if (workspacesError) {
     return (
       <Card className="flex h-full min-h-[320px] items-center justify-center md:min-h-[480px]">
-        <CardContent className="flex flex-col items-center gap-3 py-10 text-center">
-          <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-          <Button variant="outline" size="sm" onClick={() => void refetchWorkspaces()}>
-            {t('common.retry')}
-          </Button>
-        </CardContent>
+        <ErrorState onRetry={() => void refetchWorkspaces()} />
       </Card>
     );
   }

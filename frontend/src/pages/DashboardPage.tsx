@@ -10,11 +10,16 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
 import { StatCard } from '@/components/shared/StatCard';
 import { TrafficAreaChart } from '@/components/charts/TrafficAreaChart';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorBanner } from '@/components/shared/ErrorBanner';
+import { ErrorState } from '@/components/shared/ErrorState';
 import { useStatsSummary, useStatsStream, useClients } from '@/api/hooks';
 import { formatBytes } from '@/utils/format';
+import { cn } from '@/lib/utils';
 import {
   Users,
   Activity,
@@ -22,12 +27,13 @@ import {
   ArrowUp,
   ExternalLink,
   Network,
+  RefreshCw,
   Shield,
   Globe,
 } from 'lucide-react';
 
 function StatsOverview() {
-  const { data: summary, isLoading } = useStatsSummary();
+  const { data: summary, isLoading, isError, refetch } = useStatsSummary();
   const { t } = useTranslation();
   useStatsStream();
 
@@ -55,30 +61,33 @@ function StatsOverview() {
   ];
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
-      {cards.map((card) => (
-        <StatCard
-          key={card.title}
-          title={card.title}
-          value={
-            isLoading
-              ? '—'
-              : formatBytes(
-                  (card.entity?.total_bytes_in ?? 0) +
-                    (card.entity?.total_bytes_out ?? 0)
-                )
-          }
-          description={
-            isLoading
-              ? undefined
-              : t('dashboard.statsOverview.connections', {
-                  count: card.entity?.total_conns ?? 0,
-                  entities: card.entity?.entity_count ?? 0,
-                })
-          }
-          icon={card.icon}
-        />
-      ))}
+    <div className="space-y-4">
+      {isError && <ErrorBanner onRetry={() => void refetch()} />}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
+        {cards.map((card) => (
+          <StatCard
+            key={card.title}
+            title={card.title}
+            value={
+              isLoading || isError
+                ? '—'
+                : formatBytes(
+                    (card.entity?.total_bytes_in ?? 0) +
+                      (card.entity?.total_bytes_out ?? 0)
+                  )
+            }
+            description={
+              isLoading || isError
+                ? undefined
+                : t('dashboard.statsOverview.connections', {
+                    count: card.entity?.total_conns ?? 0,
+                    entities: card.entity?.entity_count ?? 0,
+                  })
+            }
+            icon={card.icon}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -86,8 +95,14 @@ function StatsOverview() {
 export default function DashboardPage() {
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const { data: clients = [], isLoading: clientsLoading, isError: clientsError, refetch: refetchClients } = useClients();
-  const { data: summary } = useStatsSummary();
+  const { data: clients = [], isLoading: clientsLoading, isError: clientsError, isFetching: clientsFetching, refetch: refetchClients } = useClients();
+  const { data: summary, isFetching: statsFetching, refetch: refetchStats } = useStatsSummary();
+
+  const refreshing = clientsFetching || statsFetching;
+  const refreshAll = () => {
+    void refetchClients();
+    void refetchStats();
+  };
 
   const connectedClients = clients.filter((c) => c.online).length;
   const entities = summary
@@ -102,7 +117,12 @@ export default function DashboardPage() {
       <PageHeader
         title={t('dashboard.title')}
         description={t('dashboard.description')}
-      />
+      >
+        <Button variant="outline" onClick={refreshAll} disabled={refreshing}>
+          <RefreshCw className={cn('mr-2 h-4 w-4', refreshing && 'animate-spin')} />
+          {t('common.refresh')}
+        </Button>
+      </PageHeader>
 
       {/* Unified Stats Overview */}
       <StatsOverview />
@@ -141,21 +161,15 @@ export default function DashboardPage() {
         </CardHeader>
         <CardContent>
           {clientsLoading ? (
-            <div className="py-12 text-center text-sm text-muted-foreground">
-              {t('common.loading')}
+            <div className="space-y-3 py-2">
+              <Skeleton className="h-6 w-full" />
+              <Skeleton className="h-6 w-full" />
+              <Skeleton className="h-6 w-3/4" />
             </div>
           ) : clientsError ? (
-            <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
-              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-              <Button variant="outline" size="sm" onClick={() => void refetchClients()}>
-                {t('common.retry')}
-              </Button>
-            </div>
+            <ErrorState onRetry={() => void refetchClients()} />
           ) : clients.length === 0 ? (
-            <div className="flex flex-col items-center justify-center gap-2 py-12 text-muted-foreground">
-              <Users className="h-8 w-8 opacity-40" />
-              <p className="text-sm">{t('dashboard.clientList.empty')}</p>
-            </div>
+            <EmptyState icon={Users} title={t('dashboard.clientList.empty')} />
           ) : (
             <Table>
               <TableHeader>

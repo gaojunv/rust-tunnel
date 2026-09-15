@@ -27,7 +27,7 @@ import {
   useTestEmbedding,
   useUpdateKnowledgeSource,
 } from '@/api/hooks';
-import { ConfirmDialog, useConfirm } from '@/components/llm/confirm';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import type {
   AgentMemoryScope,
   CreateKnowledgeSourceRequest,
@@ -634,6 +634,8 @@ export default function SourceDialog({ open, onClose, source = null, onCreated }
         onConfirm={confirmAndClose}
         onCancel={cancelConfirm}
         variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
       />
     </>
   );

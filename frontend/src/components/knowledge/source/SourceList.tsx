@@ -2,6 +2,10 @@ import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorState } from '@/components/shared/ErrorState';
+import { ErrorBanner } from '@/components/shared/ErrorBanner';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Database, FileStack } from 'lucide-react';
 import { useKnowledgeStream } from '@/api/hooks';
@@ -189,14 +193,16 @@ export default function SourceList({
         }
       />
 
-      {sources.length === 0 ? (
-        paged.loading && usingPaged ? (
-          <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
-        ) : (
-          <div className="rounded-lg border p-6 text-center text-sm text-muted-foreground">
-            {searching ? t('ks.noSearchResults') : t('ks.empty')}
-          </div>
-        )
+      {usingPaged && paged.loading ? (
+        <div className="space-y-2 py-1">
+          <Skeleton className="h-12 w-full" />
+          <Skeleton className="h-12 w-full" />
+          <Skeleton className="h-12 w-full" />
+        </div>
+      ) : usingPaged && paged.error && sources.length === 0 ? (
+        <ErrorState error={paged.error} onRetry={() => void paged.reload()} />
+      ) : sources.length === 0 ? (
+        <EmptyState title={searching ? t('ks.noSearchResults') : t('ks.empty')} />
       ) : (
         <>
           <div className="space-y-1">
@@ -204,6 +210,10 @@ export default function SourceList({
               <CompactRow key={s.id} s={s} selected={selectedId === s.id} onSelect={() => onSelect(s.id)} />
             ))}
           </div>
+          {/* 加载更多失败：保留已加载列表，用横幅提示并可重试 */}
+          {usingPaged && paged.error && (
+            <ErrorBanner className="mt-2" error={paged.error} onRetry={() => void paged.reload()} />
+          )}
           {usingPaged && <LoadMoreFooter loaded={sources.length} total={total} loading={paged.loadingMore} onLoadMore={paged.loadMore} />}
         </>
       )}
