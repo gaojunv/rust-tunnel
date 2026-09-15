@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -15,7 +15,7 @@ export default function TrojanConfigCard() {
     acme_wildcard: 'trojan.config.certSourceLabels.acme_wildcard',
     self_signed: 'trojan.config.certSourceLabels.self_signed',
   } as const;
-  const { data: tjConfig, isLoading } = useTrojanConfig();
+  const { data: tjConfig, isLoading, isError, refetch } = useTrojanConfig();
   const { data: acmeStatus } = useAcmeStatus();
   const updateTJ = useUpdateTrojanConfig();
 
@@ -25,14 +25,18 @@ export default function TrojanConfigCard() {
   const [tjFallback, setTjFallback] = useState('127.0.0.1:80');
   const [tjDomain, setTjDomain] = useState('');
 
+  // initRef：仅在配置首次加载时回填表单。`tjConfig` 是 react-query 缓存对象，
+  // 保存成功后 invalidate 引发的 refetch 会换新引用；若不设守卫，那次 refetch
+  // 会覆盖用户正在编辑的输入（仿 GatewayTab 防覆盖模式）。
+  const initRef = useRef(false);
   useEffect(() => {
-    if (tjConfig) {
-      setTjEnabled(tjConfig.enabled ?? false);
-      setTjPort(tjConfig.port?.toString() ?? '443');
-      setTjFallback(tjConfig.fallback ?? '127.0.0.1:80');
-      setTjDomain(tjConfig.domain ?? '');
-      // Password not returned from API for security
-    }
+    if (!tjConfig || initRef.current) return;
+    initRef.current = true;
+    setTjEnabled(tjConfig.enabled ?? false);
+    setTjPort(tjConfig.port?.toString() ?? '443');
+    setTjFallback(tjConfig.fallback ?? '127.0.0.1:80');
+    setTjDomain(tjConfig.domain ?? '');
+    // Password not returned from API for security
   }, [tjConfig]);
 
   const handleSaveTJ = () => {
@@ -50,6 +54,29 @@ export default function TrojanConfigCard() {
 
   if (isLoading) {
     return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
+  }
+
+  if (isError) {
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <ShieldCheck className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('trojan.config.title')}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-center gap-3 py-10 text-center">
+            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
   }
 
   const certSourceLabel = tjConfig?.cert_source
@@ -158,7 +185,7 @@ export default function TrojanConfigCard() {
           </div>
         </div>
 
-        <Button onClick={handleSaveTJ} disabled={updateTJ.isPending}>
+        <Button onClick={handleSaveTJ} disabled={updateTJ.isPending || !tjConfig}>
           {updateTJ.isPending ? t('common.saving') : t('trojan.config.save')}
         </Button>
       </CardContent>

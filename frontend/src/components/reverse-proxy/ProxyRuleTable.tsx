@@ -36,6 +36,8 @@ import type { ProxyRule } from '@/types';
 interface ProxyRuleTableProps {
   rules: ProxyRule[];
   isLoading: boolean;
+  isError?: boolean;
+  onRetry?: () => void;
   onEdit: (rule: ProxyRule) => void;
   onToggleEnabled: (rule: ProxyRule) => void;
 }
@@ -95,7 +97,7 @@ function CertStatusBadge({ status }: { status?: ProxyRule['cert_status'] }) {
   }
 }
 
-export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: ProxyRuleTableProps) {
+export function ProxyRuleTable({ rules, isLoading, isError, onRetry, onEdit, onToggleEnabled }: ProxyRuleTableProps) {
   const { t } = useTranslation();
   const deleteMutation = useDeleteProxyRule();
   const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
@@ -129,6 +131,13 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
           <div className="flex items-center justify-center gap-2 py-12 text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
             {t('common.loading')}
+          </div>
+        ) : isError ? (
+          <div className="flex flex-col items-center gap-3 py-12 text-center">
+            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => onRetry?.()}>
+              {t('common.retry')}
+            </Button>
           </div>
         ) : rules.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -16,7 +16,7 @@ import { Shield } from 'lucide-react';
 
 export default function ShadowsocksConfigCard() {
   const { t } = useTranslation();
-  const { data: ssConfig, isLoading } = useShadowsocksConfig();
+  const { data: ssConfig, isLoading, isError, refetch } = useShadowsocksConfig();
   const updateSS = useUpdateShadowsocksConfig();
 
   const [ssEnabled, setSsEnabled] = useState(false);
@@ -24,13 +24,17 @@ export default function ShadowsocksConfigCard() {
   const [ssCipher, setSsCipher] = useState('aes-256-gcm');
   const [ssPassword, setSsPassword] = useState('');
 
+  // initRef：仅在配置首次加载时回填表单。`ssConfig` 是 react-query 缓存对象，
+  // 保存成功后 invalidate 引发的 refetch 会换新引用；若不设守卫，那次 refetch
+  // 会覆盖用户正在编辑的输入（仿 GatewayTab 防覆盖模式）。
+  const initRef = useRef(false);
   useEffect(() => {
-    if (ssConfig) {
-      setSsEnabled(ssConfig.enabled ?? false);
-      setSsPort(ssConfig.port?.toString() ?? '8388');
-      setSsCipher(ssConfig.cipher ?? 'aes-256-gcm');
-      // Password not returned from API for security
-    }
+    if (!ssConfig || initRef.current) return;
+    initRef.current = true;
+    setSsEnabled(ssConfig.enabled ?? false);
+    setSsPort(ssConfig.port?.toString() ?? '8388');
+    setSsCipher(ssConfig.cipher ?? 'aes-256-gcm');
+    // Password not returned from API for security
   }, [ssConfig]);
 
   const handleSaveSS = () => {
@@ -47,6 +51,29 @@ export default function ShadowsocksConfigCard() {
 
   if (isLoading) {
     return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
+  }
+
+  if (isError) {
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Shield className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('shadowsocks.config.title')}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-center gap-3 py-10 text-center">
+            <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
   }
 
   return (
@@ -103,7 +130,7 @@ export default function ShadowsocksConfigCard() {
             </p>
           </div>
         </div>
-        <Button onClick={handleSaveSS} disabled={updateSS.isPending}>
+        <Button onClick={handleSaveSS} disabled={updateSS.isPending || !ssConfig}>
           {updateSS.isPending ? t('common.saving') : t('shadowsocks.config.save')}
         </Button>
       </CardContent>

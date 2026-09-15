@@ -38,7 +38,7 @@ export default function LLMPage() {
   );
   const [providerDialogOpen, setProviderDialogOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
-  const { data: providers, isLoading } = useLlmProviders();
+  const { data: providers, isLoading, isError, refetch } = useLlmProviders();
 
   return (
     <div className="space-y-6">
@@ -65,6 +65,13 @@ export default function LLMPage() {
             <div className="space-y-3">
               <Skeleton className="h-24 w-full rounded-lg" />
               <Skeleton className="h-24 w-full rounded-lg" />
+            </div>
+          ) : isError ? (
+            <div className="flex flex-col items-center gap-3 py-10 text-center">
+              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
+              <Button variant="outline" size="sm" onClick={() => void refetch()}>
+                {t('common.retry')}
+              </Button>
             </div>
           ) : !providers || providers.length === 0 ? (
             <Card>

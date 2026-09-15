@@ -11,8 +11,8 @@ import { Shield, ArrowDown, ArrowUp, Signal, Users } from 'lucide-react';
 
 export default function ShadowsocksPage() {
   const { t } = useTranslation();
-  const { data: config } = useShadowsocksConfig();
-  const { data: summary } = useStatsSummary();
+  const { data: config, isError: configError } = useShadowsocksConfig();
+  const { data: summary, isError: summaryError, refetch: refetchSummary } = useStatsSummary();
   const stats = summary?.shadowsocks;
 
   const port = config?.port;
@@ -44,25 +44,37 @@ export default function ShadowsocksPage() {
       />
 
       {/* Stats */}
+      {summaryError && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <span>{t('common.loadFailed')}</span>
+          <button
+            type="button"
+            onClick={() => void refetchSummary()}
+            className="shrink-0 font-medium underline underline-offset-4 hover:text-destructive/80"
+          >
+            {t('common.retry')}
+          </button>
+        </div>
+      )}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         <StatCard
           title={t('shadowsocks.stats.status')}
-          value={config?.enabled ? t('common.status.active') : t('common.status.inactive')}
+          value={configError ? '—' : (config?.enabled ? t('common.status.active') : t('common.status.inactive'))}
           icon={<Shield className="h-4 w-4" />}
         />
         <StatCard
           title={t('shadowsocks.stats.bytesIn')}
-          value={formatBytes(stats?.total_bytes_in ?? 0)}
+          value={summaryError ? '—' : formatBytes(stats?.total_bytes_in ?? 0)}
           icon={<ArrowDown className="h-4 w-4" />}
         />
         <StatCard
           title={t('shadowsocks.stats.bytesOut')}
-          value={formatBytes(stats?.total_bytes_out ?? 0)}
+          value={summaryError ? '—' : formatBytes(stats?.total_bytes_out ?? 0)}
           icon={<ArrowUp className="h-4 w-4" />}
         />
         <StatCard
           title={t('shadowsocks.stats.activeConnections')}
-          value={stats?.total_conns ?? 0}
+          value={summaryError ? '—' : (stats?.total_conns ?? 0)}
           icon={<Users className="h-4 w-4" />}
         />
       </div>

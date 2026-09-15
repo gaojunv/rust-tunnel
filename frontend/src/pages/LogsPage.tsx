@@ -29,6 +29,9 @@ import { cn } from '@/lib/utils';
 
 const LEVEL_OPTIONS = ['ALL', 'TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'] as const;
 
+// 日志条目上限：SSE 追加与"加载更早"前置均受此约束，防止长会话无界增长爆内存。
+const MAX_LOG_ENTRIES = 1000;
+
 const LEVEL_COLORS: Record<string, string> = {
   ERROR: 'bg-red-500/10 text-red-500 border-red-500/25',
   WARN: 'bg-amber-500/10 text-amber-500 border-amber-500/25',
@@ -139,7 +142,7 @@ export default function LogsPage() {
       setSseDisconnected(false);
       try {
         const entry: LogEntry = JSON.parse(e.data);
-        setLogs((prev) => [...prev, entry]);
+        setLogs((prev) => prev.length >= MAX_LOG_ENTRIES ? [...prev.slice(prev.length - MAX_LOG_ENTRIES + 1), entry] : [...prev, entry]);
       } catch {
         // Ignore malformed messages
       }
@@ -189,7 +192,7 @@ export default function LogsPage() {
         params.source = sourceFilter;
       }
       const olderLogs = await getLogs(params);
-      setLogs((prev) => [...olderLogs, ...prev]);
+      setLogs((prev) => { const next = [...olderLogs, ...prev]; return next.length > MAX_LOG_ENTRIES ? next.slice(0, MAX_LOG_ENTRIES) : next; });
       setHasMore(olderLogs.length >= 200);
     } catch {
       setLoadMoreError(true);

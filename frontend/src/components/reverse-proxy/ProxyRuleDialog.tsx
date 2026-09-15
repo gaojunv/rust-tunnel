@@ -44,12 +44,14 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
   const createMutation = useCreateProxyRule();
   const updateMutation = useUpdateProxyRule();
   const [form, setForm] = useState(emptyForm);
+  const [conflictError, setConflictError] = useState<string | null>(null);
   const { data: clientsData = [] } = useQuery({
     queryKey: ['clients'],
     queryFn: clientsApi.list,
   });
 
   useEffect(() => {
+    setConflictError(null);
     if (editingRule) {
       setForm({
         name: editingRule.name,
@@ -67,6 +69,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setConflictError(null);
 
     const data: CreateProxyRuleRequest = {
       name: form.name,
@@ -90,7 +93,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
         const details = (body.conflicts ?? [])
           .map((c) => c.reason)
           .join('; ');
-        alert(t('reverseProxy.dialog.conflictAlert', {
+        setConflictError(t('reverseProxy.dialog.conflictAlert', {
           error: body.error ?? t('reverseProxy.dialog.conflictDefault'),
           details: details || '',
         }));
@@ -115,6 +118,10 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
 
   const mutation = editingRule ? updateMutation : createMutation;
   const tcpBackend = form.routes?.[0]?.backends?.[0];
+  const submitError = conflictError
+    ?? (mutation.isError
+      ? t('reverseProxy.dialog.error', { action: editingRule ? t('reverseProxy.dialog.errorUpdate') : t('reverseProxy.dialog.errorCreate') })
+      : null);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -299,10 +306,10 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           </div>
 
           {/* Error */}
-          {mutation.isError && (
+          {submitError && (
             <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               <AlertTriangle className="h-4 w-4 shrink-0" />
-              {t('reverseProxy.dialog.error', { action: editingRule ? t('reverseProxy.dialog.errorUpdate') : t('reverseProxy.dialog.errorCreate') })}
+              {submitError}
             </div>
           )}
 
