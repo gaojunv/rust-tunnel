@@ -1,5 +1,4 @@
 import { useTranslation } from 'react-i18next';
-import { useQuery } from '@tanstack/react-query';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import {
@@ -10,7 +9,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AlertTriangle, Plus, Trash2 } from 'lucide-react';
-import { clientsApi } from '@/api/client';
+import { useClients } from '@/api/hooks';
 import type { Backend, BackendScheme, BackendProtocol } from '@/types';
 
 interface BackendFieldsProps {
@@ -20,10 +19,7 @@ interface BackendFieldsProps {
 
 export function BackendFields({ backends, onChange }: BackendFieldsProps) {
   const { t } = useTranslation();
-  const { data: clientsData = [] } = useQuery({
-    queryKey: ['clients'],
-    queryFn: clientsApi.list,
-  });
+  const { data: clientsData = [] } = useClients({ refetchInterval: false });
 
   const addBackend = () => {
     onChange([...backends, { kind: 'direct', addr: '', weight: 100, client_name: null }]);

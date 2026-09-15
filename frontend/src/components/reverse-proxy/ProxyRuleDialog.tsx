@@ -17,9 +17,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AlertTriangle } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
-import { clientsApi } from '@/api/client';
-import { useCreateProxyRule, useUpdateProxyRule } from '@/api/hooks';
+import { useCreateProxyRule, useUpdateProxyRule, useClients } from '@/api/hooks';
 import { HttpRouteFields } from './HttpRouteFields';
 import type { ProxyRule, RuleType, Route, ProxyTlsConfig, CreateProxyRuleRequest } from '@/types';
 
@@ -47,10 +45,8 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
   const updateMutation = useUpdateProxyRule(feedbackMeta);
   const [form, setForm] = useState(emptyForm);
   const [conflictError, setConflictError] = useState<string | null>(null);
-  const { data: clientsData = [] } = useQuery({
-    queryKey: ['clients'],
-    queryFn: clientsApi.list,
-  });
+  // 对话框只需一次快照：共享 ['clients'] 缓存但不参与轮询
+  const { data: clientsData = [] } = useClients({ refetchInterval: false });
 
   useEffect(() => {
     setConflictError(null);

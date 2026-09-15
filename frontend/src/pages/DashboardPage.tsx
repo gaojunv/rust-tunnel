@@ -1,5 +1,4 @@
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
@@ -14,8 +13,7 @@ import { Button } from '@/components/ui/button';
 import { StatCard } from '@/components/shared/StatCard';
 import { TrafficAreaChart } from '@/components/charts/TrafficAreaChart';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { clientsApi } from '@/api/client';
-import { useStatsSummary, useStatsStream } from '@/api/hooks';
+import { useStatsSummary, useStatsStream, useClients } from '@/api/hooks';
 import { formatBytes } from '@/utils/format';
 import {
   Users,
@@ -88,11 +86,7 @@ function StatsOverview() {
 export default function DashboardPage() {
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const { data: clients = [], isLoading: clientsLoading, isError: clientsError, refetch: refetchClients } = useQuery({
-    queryKey: ['clients', 'dashboard'],
-    queryFn: () => clientsApi.list(),
-    refetchInterval: 5000,
-  });
+  const { data: clients = [], isLoading: clientsLoading, isError: clientsError, refetch: refetchClients } = useClients();
   const { data: summary } = useStatsSummary();
 
   const connectedClients = clients.filter((c) => c.online).length;

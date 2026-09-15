@@ -965,8 +965,14 @@ export function useAgentWorkspaces() {
   return useQuery({ queryKey: ['agent-workspaces'], queryFn: () => listAgentWorkspaces() });
 }
 
-export function useClients() {
-  return useQuery({ queryKey: ['clients'], queryFn: () => clientsApi.list() });
+/** 客户端列表唯一数据源：全站共享 `['clients']` 缓存与 5s 轮询（切页不再闪 loading）。
+ *  对话框等不需轮询的场景传 `{ refetchInterval: false }`。失效统一 `queryKey: ['clients']`。 */
+export function useClients(options?: { refetchInterval?: number | false }) {
+  return useQuery({
+    queryKey: ['clients'],
+    queryFn: () => clientsApi.list(),
+    refetchInterval: options?.refetchInterval === undefined ? 5000 : options.refetchInterval,
+  });
 }
 
 /** 客户端二进制归档列表（服务端扫描 `client_dist_dir`，CI 推包后需重拉才可见）。 */

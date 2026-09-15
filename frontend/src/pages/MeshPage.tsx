@@ -10,8 +10,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useQuery } from '@tanstack/react-query';
-import { clientsApi } from '@/api/client';
+import { useClients } from '@/api/hooks';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 
@@ -40,11 +39,7 @@ const STATUS_LABEL_KEYS = {
 
 export default function MeshPage() {
   const { t } = useTranslation();
-  const { data: clients = [], isLoading, isError, refetch } = useQuery({
-    queryKey: ['clients', 'mesh'],
-    queryFn: () => clientsApi.list(),
-    refetchInterval: 5000,
-  });
+  const { data: clients = [], isLoading, isError, refetch } = useClients();
 
   return (
     <div className="space-y-6">

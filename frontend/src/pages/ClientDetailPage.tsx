@@ -3,8 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useQuery } from '@tanstack/react-query';
-import { clientsApi } from '@/api/client';
+import { useClients } from '@/api/hooks';
 import { ArrowLeft, Signal, Clock, Activity, Shield } from 'lucide-react';
 
 export default function ClientDetailPage() {
@@ -12,11 +11,7 @@ export default function ClientDetailPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
 
-  const { data: clients = [], isLoading, isError, refetch } = useQuery({
-    queryKey: ['clients', 'detail'],
-    queryFn: () => clientsApi.list(),
-    refetchInterval: 5000,
-  });
+  const { data: clients = [], isLoading, isError, refetch } = useClients();
 
   const client = clients.find((c) => c.name === name);
 

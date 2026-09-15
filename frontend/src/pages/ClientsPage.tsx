@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { clientsApi, serverAuthApi } from '@/api/client';
+import { useClients } from '@/api/hooks';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -15,11 +16,7 @@ export default function ClientsPage() {
     isLoading,
     isError,
     refetch,
-  } = useQuery({
-    queryKey: ['clients'],
-    queryFn: clientsApi.list,
-    refetchInterval: 5000,
-  });
+  } = useClients();
   const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const { data: auth } = useQuery({
     queryKey: ['server-auth'],
