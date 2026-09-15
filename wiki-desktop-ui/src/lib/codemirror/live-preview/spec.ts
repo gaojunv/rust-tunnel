@@ -229,7 +229,11 @@ function scanHighlightsInLine(
   return results;
 }
 
-/** 判断节点是否在数组区间内。 */
+/**
+ * 判断节点是否在数组区间内（线性扫描）。
+ * 只用于小数组（`headingSuppressRanges`：具体模式下仅含被选区触碰的标题，
+ * 通常 0-1 个；zoned 模式下为空）。大数组一律用下面的二分版本。
+ */
 function inRanges(
   pos: number,
   ranges: readonly { from: number; to: number }[],
@@ -238,6 +242,87 @@ function inRanges(
     if (pos >= r.from && pos < r.to) return true;
   }
   return false;
+}
+
+/**
+ * 二分：在按 `from` 升序排列的互不重叠区间中查找包含 `pos` 的区间下标。
+ * `codeRanges` / `tableRanges` 均按语法树遍历顺序追加，天然有序且互不重叠
+ * （围栏代码块 `return false` 不进子树，行内码不会落在围栏内；表格节点不嵌套）。
+ * 遍历中途调用也安全：已追加的前缀同样有序。未命中返回 -1。
+ */
+export function findContainingRange(
+  ranges: readonly { from: number; to: number }[],
+  pos: number,
+): number {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid].from <= pos) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (ans !== -1 && pos < ranges[ans].to) return ans;
+  return -1;
+}
+
+/** 二分点包含判定（`inRanges` 的有序大数组版本，O(log n)）。 */
+export function containsPos(
+  ranges: readonly { from: number; to: number }[],
+  pos: number,
+): boolean {
+  return findContainingRange(ranges, pos) !== -1;
+}
+
+/**
+ * 行号区间包含判定（二分，O(log n)）。
+ * 用于行扫描跳过 `mathBlockLines`（按 start 升序追加的互不重叠行号区间）。
+ */
+export function lineInRanges(
+  ranges: readonly { start: number; end: number }[],
+  line: number,
+): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid].start <= line) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans !== -1 && line <= ranges[ans].end;
+}
+
+/**
+ * 二分：是否存在与 `[from, to)` 相交的区间（有序互不重叠数组，O(log n)）。
+ * 用于行扫描中 span/match 与 `codeRanges` 的相交判定。
+ */
+export function hasOverlap(
+  ranges: readonly { from: number; to: number }[],
+  from: number,
+  to: number,
+): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid].to > from) {
+      ans = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return ans !== -1 && ranges[ans].from < to;
 }
 
 /** `![[...]]` 嵌入的图片扩展名（大小写不敏感）。 */
@@ -500,6 +585,14 @@ function computeInner(
    */
   const headingSuppressRanges: Array<{ from: number; to: number }> = [];
 
+  // 引用式链接定义表：computeInner 级缓存，全文只扫描一次，
+  // 第一遍（惰性）与 zoned 第二遍（表格还原态子树）复用。
+  let refDefs: Map<string, string> | null = null;
+  function getRefDefs(): Map<string, string> {
+    if (refDefs === null) refDefs = buildRefDefs(doc);
+    return refDefs;
+  }
+
   // frontmatter 区间（纯文本判定）：无论折叠与否，其内部装饰一律抑制
   // （开头的 `---` 会被 lezer 误判为 HorizontalRule，结尾 `---` 被误判为 Setext）。
   const fmRange = detectFrontmatterRange(doc);
@@ -550,11 +643,11 @@ function computeInner(
    */
   function tablePosAt(pos: number): readonly RevealZone[] {
     if (!zonedMode) return EMPTY_ZONES;
-    const out: RevealZone[] = [];
-    for (const r of tableRanges) {
-      if (pos >= r.from && pos < r.to) out.push({ from: r.from, to: r.to });
-    }
-    return out;
+    // 表格区间互不嵌套：命中至多一个，直接二分定位
+    const idx = findContainingRange(tableRanges, pos);
+    if (idx === -1) return EMPTY_ZONES;
+    const r = tableRanges[idx];
+    return [{ from: r.from, to: r.to }];
   }
 
   function isSpaceAt(pos: number): boolean {
@@ -620,8 +713,7 @@ function computeInner(
   const codeRanges: Array<{ from: number; to: number }> = [];
   // 表格区间：表格整体被 widget 替换时，内部的 wikilink/image 不单独渲染
   const tableRanges: Array<{ from: number; to: number }> = [];
-  // 引用式链接定义表（惰性构建：第一次遇到无 URL 的 Link 节点时填充）
-  let refDefs: Map<string, string> | null = null;
+  // 引用定义表用 computeInner 级缓存 getRefDefs()（全文只扫描一次）
 
   function nodeMarks(node: SyntaxNodeRef): readonly SyntaxNode[] {
     return node.node.getChildren("HeaderMark");
@@ -876,7 +968,7 @@ function computeInner(
         }
         // 跳过表格区间（表格 widget 已整体替换，内部不单独渲染图片）。
         // zoned 下不进入表格子树，能访问到此处的节点必不在任何表格内，无需记区。
-        if (inRanges(node.from, tableRanges)) return false;
+        if (containsPos(tableRanges, node.from)) return false;
 
         const urlNode = node.node.getChild("URL");
         const rawSrc = urlNode ? doc.sliceString(urlNode.from, urlNode.to) : "";
@@ -947,7 +1039,7 @@ function computeInner(
       // 注意：zoned 下不进入表格子树，能访问到此处的节点必不在任何表格内，无需记区。
       if (name === "Link") {
         if (inRanges(node.from, headingSuppressRanges)) return false;
-        if (inRanges(node.from, tableRanges)) return false;
+        if (containsPos(tableRanges, node.from)) return false;
         const urlNode = node.node.getChild("URL");
 
         // 引用式链接 [text][ref]：无 URL 子节点，用 LinkLabel 作 ref key 查定义表
@@ -970,9 +1062,8 @@ function computeInner(
             if (stripped.trim()) refKey = stripped;
           }
 
-          // 惰性构建引用定义表
-          if (refDefs === null) refDefs = buildRefDefs(doc);
-          const url = refDefs.get(refKey.toLowerCase().trim());
+          // 引用定义表：computeInner 级缓存，全文只扫描一次
+          const url = getRefDefs().get(refKey.toLowerCase().trim());
           if (!url) return; // 未找到定义，不发射
 
           // 光标/选区进入该行 → 完整显示源码
@@ -1016,7 +1107,7 @@ function computeInner(
       // 行判定隐式抑制（光标在标题行必触碰该行）；zoned 下同样只记行区。
       // zoned 下不进入表格子树，能访问到此处的节点必不在任何表格内，无需记区。
       if (name === "Autolink") {
-        if (inRanges(node.from, tableRanges)) return false;
+        if (containsPos(tableRanges, node.from)) return false;
         const line = doc.lineAt(node.from);
         const lz: RevealZone = lineZone(line.from, line.to);
         guarded([lz], touchesLine(sel, line.from, line.to), () => {
@@ -1083,18 +1174,11 @@ function computeInner(
     const spans = scanWikilinksInLine(line.text, line.from);
     for (const sp of spans) {
       if (sp.to <= lo || sp.from >= hi) continue;
-      let inCode = false;
-      for (const r of codeRanges) {
-        if (sp.from < r.to && sp.to > r.from) {
-          inCode = true;
-          break;
-        }
-      }
-      if (inCode) continue;
+      if (hasOverlap(codeRanges, sp.from, sp.to)) continue;
       // 表格区间也跳过（表格 widget 整体替换时不渲染内部 wikilink）。
       // 具体模式走即时判定；zoned 模式记"含该表格即抑制"的 neg 并集。
       const spanTablePos = zonedMode ? tablePosAt(sp.from) : EMPTY_ZONES;
-      if (!zonedMode && inRanges(sp.from, tableRanges)) continue;
+      if (!zonedMode && containsPos(tableRanges, sp.from)) continue;
 
       // ── `![[...]]` 嵌入语法处理 ──────────────────────────────
       if (sp.embed) {
@@ -1184,16 +1268,12 @@ function computeInner(
     // 跳过表格区间内的行（具体模式即时判定；zoned 模式记"含该表格即抑制"的 neg 并集）。
     // 注意：判定用行首 line.from（与旧 `inRanges(line.from, …)` 逐字一致）。
     const hlLineTablePos = zonedMode ? tablePosAt(line.from) : EMPTY_ZONES;
-    if (!zonedMode && inRanges(line.from, tableRanges)) continue;
+    if (!zonedMode && containsPos(tableRanges, line.from)) continue;
     const hlMatches = scanHighlightsInLine(line.text, line.from);
     for (const hl of hlMatches) {
       if (hl.innerTo <= lo || hl.innerFrom >= hi) continue;
       // 跳过代码区间内的高亮
-      let inCode = false;
-      for (const r of codeRanges) {
-        if (hl.innerFrom < r.to && hl.innerTo > r.from) { inCode = true; break; }
-      }
-      if (inCode) continue;
+      if (hasOverlap(codeRanges, hl.innerFrom, hl.innerTo)) continue;
       // 还原：光标触碰内容区间（pad=2 包含两侧 `==` 标记）时不渲染
       if (!zonedMode && touchesSpan(sel, hl.innerFrom, hl.innerTo, 2)) continue;
       const hlNeg: RevealZone[] = [spanZone(hl.innerFrom, hl.innerTo, 2)];
@@ -1216,9 +1296,9 @@ function computeInner(
     // 跳过表格区间（具体模式即时判定；zoned 模式记"含该表格即抑制"的 neg 并集）。
     // 注意：判定用行首 line.from（与旧 `inRanges(line.from, …)` 逐字一致）。
     const mbLineTablePos = zonedMode ? tablePosAt(line.from) : EMPTY_ZONES;
-    if (!zonedMode && inRanges(line.from, tableRanges)) continue;
+    if (!zonedMode && containsPos(tableRanges, line.from)) continue;
     // 跳过代码区间
-    if (inRanges(line.from, codeRanges)) continue;
+    if (containsPos(codeRanges, line.from)) continue;
 
     const trimmedStart = line.text.trimStart();
     if (!trimmedStart.startsWith("$$")) continue;
@@ -1307,15 +1387,11 @@ function computeInner(
     if (fmRange && line.from >= fmRange.from && line.from <= fmRange.to) continue;
     // 跳过表格区间（具体模式即时判定；zoned 模式记"含该表格即抑制"的 neg 并集）
     const miLineTablePos = zonedMode ? tablePosAt(line.from) : EMPTY_ZONES;
-    if (!zonedMode && inRanges(line.from, tableRanges)) continue;
+    if (!zonedMode && containsPos(tableRanges, line.from)) continue;
     // 跳过代码区间
-    if (inRanges(line.from, codeRanges)) continue;
-    // 跳过块级数学区间内的行
-    let inMathBlock = false;
-    for (const r of mathBlockLines) {
-      if (ln >= r.start && ln <= r.end) { inMathBlock = true; break; }
-    }
-    if (inMathBlock) continue;
+    if (containsPos(codeRanges, line.from)) continue;
+    // 跳过块级数学区间内的行（mathBlockLines 按 start 升序追加，二分）
+    if (lineInRanges(mathBlockLines, ln)) continue;
 
     const mathMatches = scanInlineMathInLine(line.text, line.from);
     for (const m of mathMatches) {
@@ -1354,15 +1430,30 @@ function computeInner(
   // 对应表格 spec 之前，使整体顺序与具体计算逐字一致。
   // 行扫描不需第二遍（扫描天然逐行经过表格行，pos 区已在第一遍记录）。
   if (zonedMode) {
+    // 表格 spec 下标索引：O(1) 定位插入点，消掉每表格 findIndex + splice 的 O(n²)。
+    // key = from（表格区间互不重叠，from 唯一）。
+    const tableIdxByFrom = new Map<number, number>();
+    for (let i = 0; i < zoned.length; i++) {
+      const z = zoned[i];
+      if (z.spec.kind === "table") tableIdxByFrom.set(z.spec.from, i);
+    }
+    // 后插的产物会推后下标：记录累计偏移量修正
+    let inserted = 0;
     for (const t of tableRanges) {
       const collected: ZonedSpec[] = [];
-      collectRevealedTableSubtree(state, doc, t, collected);
+      // 复用第一遍的 syntaxTree（tree 对象在函数顶部已持有），不重跑解析；
+      // 引用定义表复用 computeInner 级缓存 getRefDefs()，不重扫全文。
+      collectRevealedTableSubtree(tree, doc, t, getRefDefs(), collected);
       if (collected.length > 0) {
-        const idx = zoned.findIndex(
-          (z) => z.spec.kind === "table" && z.spec.from === t.from && z.spec.to === t.to,
-        );
-        if (idx >= 0) {
+        const baseIdx = tableIdxByFrom.get(t.from);
+        if (baseIdx !== undefined) {
+          const idx = baseIdx + inserted;
           zoned.splice(idx, 0, ...collected);
+          inserted += collected.length;
+          // 插入点之后（含自身）的表格下标后移
+          for (const [from, i] of tableIdxByFrom) {
+            if (i > baseIdx) tableIdxByFrom.set(from, i + collected.length);
+          }
         } else {
           zoned.push(...collected);
         }
@@ -1377,14 +1468,16 @@ function computeInner(
  * zoned 第二遍：重走单个表格的子树，收集"表格还原态"下子树内 Image/Link/
  * Autolink 发射的 spec（附 pos 区 = 表格判定区 + 自身 neg 守卫）。
  * 表格未还原时子树不被访问（第一遍 `return false`），因此此处只处理还原态。
+ * `tree` 复用第一遍的解析结果（不重跑 `syntaxTree`）；
+ * `refDefs` 复用 computeInner 级缓存（引用式链接不重扫全文）。
  */
-function collectRevealedTableSubtree(
-  state: EditorState,
+export function collectRevealedTableSubtree(
+  tree: ReturnType<typeof syntaxTree>,
   doc: EditorState["doc"],
   table: { from: number; to: number },
+  refDefs: Map<string, string>,
   zoned: ZonedSpec[],
 ): void {
-  const tree = syntaxTree(state);
   const tableZone: RevealZone = (() => {
     const startLine = doc.lineAt(table.from);
     const endLine = doc.lineAt(Math.min(table.to, doc.length));
@@ -1412,7 +1505,7 @@ function collectRevealedTableSubtree(
         return false;
       }
       if (node.name === "Link") {
-        collectTableLink(doc, node, tableZone, sel, zoned);
+        collectTableLink(doc, node, tableZone, sel, refDefs, zoned);
         return false;
       }
       if (node.name === "Autolink") {
@@ -1516,6 +1609,7 @@ function collectTableLink(
   node: SyntaxNodeRef,
   tableZone: RevealZone,
   _sel: readonly SelRange[],
+  refDefs: Map<string, string>,
   zoned: ZonedSpec[],
 ): void {
   const urlNode = node.node.getChild("URL");
@@ -1527,7 +1621,7 @@ function collectTableLink(
     : "";
   if (!urlNode) {
     if (!text) return;
-    // 引用式：查定义表（与第一遍一致的惰性全表扫描）
+    // 引用式：查定义表（复用 computeInner 级缓存，不重扫全文）
     const refLabelNode = node.node.getChild("LinkLabel");
     let refKey = text;
     if (refLabelNode) {
@@ -1537,7 +1631,7 @@ function collectTableLink(
         : rawRef;
       if (stripped.trim()) refKey = stripped;
     }
-    const url = buildRefDefs(doc).get(refKey.toLowerCase().trim());
+    const url = refDefs.get(refKey.toLowerCase().trim());
     if (!url) return;
     zoned.push({
       spec: { kind: "mdlink", from: node.from, to: node.to, text, url },

@@ -4,7 +4,17 @@
 import { describe, it, expect } from "vitest";
 import { EditorState, EditorSelection } from "@codemirror/state";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { computeLivePreviewSpecs, LP_CLASS, type DecoSpec } from "./spec";
+import {
+  computeLivePreviewSpecs,
+  computeZonedSpecs,
+  containsPos,
+  filterZonedSpecs,
+  findContainingRange,
+  hasOverlap,
+  lineInRanges,
+  LP_CLASS,
+  type DecoSpec,
+} from "./spec";
 
 function makeState(doc: string, sel?: { anchor: number; head?: number }[]): EditorState {
   return EditorState.create({
@@ -1147,5 +1157,124 @@ describe("unclosed code block last line", () => {
     const lastLines = lineSpecs.filter((s) => s.cls === LP_CLASS.codeLastLine);
     expect(lastLines).toHaveLength(1);
     expect(lineSpecs).toContainEqual({ kind: "line", line: lastLines[0].line, cls: LP_CLASS.codeLine });
+  });
+});
+
+// ── 二分查找 helper（findContainingRange / containsPos / hasOverlap / lineInRanges）──
+
+describe("range binary search helpers", () => {
+  it("findContainingRange：命中/边界/未命中", () => {
+    const ranges = [
+      { from: 0, to: 5 },
+      { from: 10, to: 15 },
+      { from: 20, to: 30 },
+    ];
+    expect(findContainingRange(ranges, 2)).toBe(0);
+    expect(findContainingRange(ranges, 0)).toBe(0);
+    expect(findContainingRange(ranges, 4)).toBe(0);
+    expect(findContainingRange(ranges, 5)).toBe(-1); // 右开
+    expect(findContainingRange(ranges, 7)).toBe(-1); // 缝隙
+    expect(findContainingRange(ranges, 10)).toBe(1);
+    expect(findContainingRange(ranges, 29)).toBe(2);
+    expect(findContainingRange(ranges, 30)).toBe(-1);
+    expect(findContainingRange([], 3)).toBe(-1);
+  });
+
+  it("containsPos 与线性 inRanges 语义一致（随机区间）", () => {
+    const ranges = [
+      { from: 0, to: 3 },
+      { from: 5, to: 8 },
+      { from: 8, to: 9 },
+      { from: 20, to: 100 },
+    ];
+    for (let pos = -1; pos <= 105; pos++) {
+      const expected = ranges.some((r) => pos >= r.from && pos < r.to);
+      expect(containsPos(ranges, pos)).toBe(expected);
+    }
+  });
+
+  it("hasOverlap：相交/相邻/分离", () => {
+    const ranges = [
+      { from: 10, to: 20 },
+      { from: 30, to: 40 },
+    ];
+    expect(hasOverlap(ranges, 0, 5)).toBe(false);
+    expect(hasOverlap(ranges, 0, 10)).toBe(false); // 相邻不算相交
+    expect(hasOverlap(ranges, 0, 11)).toBe(true);
+    expect(hasOverlap(ranges, 15, 25)).toBe(true);
+    expect(hasOverlap(ranges, 20, 30)).toBe(false); // 缝隙
+    expect(hasOverlap(ranges, 25, 35)).toBe(true);
+    expect(hasOverlap(ranges, 40, 50)).toBe(false); // 右开
+    expect(hasOverlap([], 0, 100)).toBe(false);
+  });
+
+  it("lineInRanges：行号区间包含", () => {
+    const ranges = [
+      { start: 2, end: 4 },
+      { start: 10, end: 10 },
+    ];
+    expect(lineInRanges(ranges, 1)).toBe(false);
+    expect(lineInRanges(ranges, 2)).toBe(true);
+    expect(lineInRanges(ranges, 4)).toBe(true);
+    expect(lineInRanges(ranges, 5)).toBe(false);
+    expect(lineInRanges(ranges, 10)).toBe(true);
+    expect(lineInRanges(ranges, 11)).toBe(false);
+  });
+
+  it("含多表格+多代码块文档：zoned 与具体计算仍一致", () => {
+    const doc = [
+      "```js",
+      "const a = 1;",
+      "```",
+      "",
+      "| a | b |",
+      "|---|---|",
+      "| [[x]] | `code` |",
+      "",
+      "```",
+      "[[not-a-link]]",
+      "```",
+      "",
+      "| c |",
+      "|---|",
+      "| [t](http://x.com) |",
+      "",
+      "tail $x^2$ end",
+      "",
+    ].join("\n");
+    const base = makeState(doc, [{ anchor: doc.length }]);
+    const zoned = computeZonedSpecs(base);
+    // 采样一批选区逐一对比
+    const positions = [0, 5, 15, 30, 50, 80, 100, doc.length];
+    for (const pos of positions) {
+      const sel = makeState(doc, [{ anchor: Math.min(pos, doc.length) }]);
+      const expected = computeLivePreviewSpecs(sel, 0, doc.length);
+      const actual = filterZonedSpecs(zoned, sel.selection.ranges);
+      expect(actual).toEqual(expected);
+    }
+  });
+
+  it("引用式链接：定义表缓存后第一遍/第二遍结果一致", () => {
+    const doc = [
+      "| a |",
+      "|---|",
+      "| [t][ref] |",
+      "",
+      "[ref]: http://example.com",
+      "",
+      "see [u][ref] here",
+      "",
+    ].join("\n");
+    const base = makeState(doc, [{ anchor: doc.length }]);
+    const zoned = computeZonedSpecs(base);
+    for (const pos of [0, 5, 12, doc.length]) {
+      const sel = makeState(doc, [{ anchor: Math.min(pos, doc.length) }]);
+      expect(filterZonedSpecs(zoned, sel.selection.ranges)).toEqual(
+        computeLivePreviewSpecs(sel, 0, doc.length),
+      );
+    }
+    // 引用式 mdlink 确实被发射（缓存路径命中）
+    const links = ofKind(filterZonedSpecs(zoned, base.selection.ranges), "mdlink");
+    expect(links.length).toBeGreaterThan(0);
   });
 });

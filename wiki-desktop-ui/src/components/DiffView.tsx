@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { buildDiffRows } from "@/lib/diff-rows";
 
@@ -8,15 +9,18 @@ type Props = {
   remoteLabel?: string;
 };
 
-export function DiffView({ localText, remoteText, localLabel = "本地", remoteLabel = "远端" }: Props) {
-  if (localText === remoteText) {
+export const DiffView = memo(function DiffView({ localText, remoteText, localLabel = "本地", remoteLabel = "远端" }: Props) {
+  const rows = useMemo(
+    () => (localText === remoteText ? null : buildDiffRows(localText, remoteText)),
+    [localText, remoteText],
+  );
+  if (rows === null) {
     return (
       <div className="rounded border bg-muted/30 px-4 py-6 text-center text-sm text-muted-foreground">
         内容一致，无差异
       </div>
     );
   }
-  const rows = buildDiffRows(localText, remoteText);
   return (
     <ScrollArea className="rounded border" orientation="both">
       <div className="min-w-[520px]">
@@ -55,4 +59,4 @@ export function DiffView({ localText, remoteText, localLabel = "本地", remoteL
       </div>
     </ScrollArea>
   );
-}
+});

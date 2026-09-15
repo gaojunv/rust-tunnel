@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -53,7 +53,7 @@ function formatLastSync(lastSyncAt: number | null): string {
   return `上次同步 ${days} 天前`;
 }
 
-function SyncWidget({ status, onSyncNow }: { status: SyncStatus; onSyncNow?: () => void }) {
+const SyncWidget = memo(function SyncWidget({ status, onSyncNow }: { status: SyncStatus; onSyncNow?: () => void }) {
   const tooltip = useMemo(() => {
     switch (status.phase) {
       case "syncing":
@@ -154,9 +154,9 @@ function SyncWidget({ status, onSyncNow }: { status: SyncStatus; onSyncNow?: () 
       <Check className="size-4 text-green-600" />
     </Button>
   );
-}
+});
 
-export function TitleBar({
+export const TitleBar = memo(function TitleBar({
   dirty = false,
   canBack = false,
   canForward = false,
@@ -399,4 +399,4 @@ export function TitleBar({
       {syncingEffective && !syncStatus && <span className="sr-only">同步中</span>}
     </div>
   );
-}
+});

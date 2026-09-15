@@ -74,41 +74,33 @@ export function SelectionToolbar({
     requestAnimationFrame(() => updateSelection());
   }, [updateSelection]);
 
-  // polling-based selection detection — CM does not emit textarea select/mouseup events reliably
-  // requestAnimationFrame polling is cheap and torn down when selection is stable
+  // 事件驱动的选区检测：无常驻 rAF 轮询。
+  // CM6 用 contenteditable，选区变化会触发 document selectionchange；
+  // mouseup/keyup 覆盖鼠标/键盘操作；1s interval 只做 key 比较兜底极端情况
+  // （变化时才 setState，无变化零开销）。
   useEffect(() => {
-    let raf: number | null = null;
     let lastKey = "";
-    const tick = () => {
+    const check = () => {
       const sel = source.getSelection();
       const key = sel ? `${sel.start}:${sel.end}` : "";
       if (key !== lastKey) {
         lastKey = key;
         handleSelect();
       }
-      raf = requestAnimationFrame(tick);
     };
-    // use mouseup/keyup as cheaper triggers plus a light interval fallback
     const onAny = () => handleSelect();
     window.addEventListener("mouseup", onAny);
     window.addEventListener("keyup", onAny);
-    // lightweight poll only while component mounted — rAF but throttled via key check so no visual jitter
-    raf = requestAnimationFrame(tick);
-    const interval = window.setInterval(() => {
-      const sel = source.getSelection();
-      const key = sel ? `${sel.start}:${sel.end}` : "";
-      if (key !== lastKey) {
-        lastKey = key;
-        updateSelection();
-      }
-    }, 300);
+    document.addEventListener("selectionchange", check);
+    check();
+    const interval = window.setInterval(check, 1000);
     return () => {
       window.removeEventListener("mouseup", onAny);
       window.removeEventListener("keyup", onAny);
-      if (raf !== null) cancelAnimationFrame(raf);
+      document.removeEventListener("selectionchange", check);
       clearInterval(interval);
     };
-  }, [source, handleSelect, updateSelection]);
+  }, [source, handleSelect]);
 
   // reset on note switch
   useEffect(() => {

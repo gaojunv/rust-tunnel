@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef, useMemo } from "react";
+import { useCallback, useDeferredValue, useEffect, useImperativeHandle, useRef, useState, forwardRef, useMemo } from "react";
 import { Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -364,7 +364,13 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     };
   }, [refreshToken, noteKey, doReloadNote]);
 
-  const dirty = note ? title !== note.title || body !== note.body : false;
+  // dirty 判定本身是 O(n) 全文比较（title/body vs note），memo 化避免每渲染重复比较。
+  // 注意：body 每键都变，dirty 仍每键重算一次——这是必要的（autosave/debounce 依赖它），
+  // 但其他无关 state 变化（saving/error/外部刷新等）触发的重渲染不再重复比较。
+  const dirty = useMemo(
+    () => (note ? title !== note.title || body !== note.body : false),
+    [note, title, body],
+  );
 
   useEffect(() => {
     onDirtyChange(dirty);
@@ -612,9 +618,14 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   // 失败态下仍用 debounce 跟踪用户的新编辑；后台重试由 scheduleSaveRetry 负责；
   // error 只有保存成功（executeSave 内）或用户撤销到干净（重试触发时）才清除，
   // 因此状态栏的失败提示保持可见直到成功。
+  //
+  // 依赖用值级 key [noteKey, title, body, loading] 而非 dirty 布尔：
+  // dirty 是派生布尔，首键后恒为 true，后续击键不再变化 → effect 不重跑 →
+  // timer 不重置 → 连续输入中途触发保存（旧 debounce 名存实亡的根因）。
+  // 值级依赖保证每次击键都重置 1500ms 计时器，停手后才保存。
+  // 体内仍以 computeDirtyNow() 做最终守卫（竞态下可能已干净）。
   useEffect(() => {
     if (!noteKey) return;
-    if (!dirty) return;
     if (loading) return;
     if (autosaveTimerRef.current !== null) {
       window.clearTimeout(autosaveTimerRef.current);
@@ -639,7 +650,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         autosaveTimerRef.current = null;
       }
     };
-  }, [noteKey, dirty, loading, computeDirtyNow, runSaveAfterPending]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [noteKey, title, body, loading]);
 
   const flushSaveInner = useCallback(async () => {
     if (savingRef.current && inFlightPromiseRef.current) {
@@ -847,15 +859,21 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     };
   }, []);
 
-  // 底栏统计：字符/词/行（由 body 派生）
+  // 底栏统计：字符/词/行（由 body 派生）。
+  // 每键 body 都变，全文扫描（spread + trim + split×2）若同步做会阻塞输入；
+  // 用 useDeferredValue 降优先级：紧急的输入/光标先渲染，统计随后跟上。
+  const deferredBodyForStats = useDeferredValue(body);
   const bodyStats = useMemo(() => {
-    const chars = [...body].length;
-    const trimmed = body.trim();
+    const chars = [...deferredBodyForStats].length;
+    const trimmed = deferredBodyForStats.trim();
     const words = trimmed === "" ? 0 : trimmed.split(/\s+/).length;
-    const lines = body === "" ? 0 : body.split("\n").length;
+    const lines = deferredBodyForStats === "" ? 0 : deferredBodyForStats.split("\n").length;
     return { chars, words, lines };
-  }, [body]);
+  }, [deferredBodyForStats]);
 
+  // body/title 的 ref 镜像，供命令句柄闭包读取最新值而不需要把 body/title
+  // 放进 useImperativeHandle 依赖（否则每键重建句柄；body 已有 bodyRef/titleRef 同步）。
+  // 注意 bodyRef/titleRef 在下方 effect 中与 state 同步，此处直接复用。
   // —— 命令句柄 ——
   useImperativeHandle(
     ref,
@@ -863,10 +881,10 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       getBody() {
         const view = cmRef.current?.view();
         if (view) return view.state.doc.toString();
-        return body;
+        return bodyRef.current;
       },
       getTitle() {
-        return title;
+        return titleRef.current;
       },
       getEditorView() {
         return cmRef.current?.view() ?? null;
@@ -926,7 +944,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       },
       flushSave,
     }),
-    [body, title, flushSave],
+    [flushSave],
   );
 
   if (!noteKey) {
@@ -1104,7 +1122,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
             source={selectionSource}
             containerRef={editorContentRef}
             noteTitle={note?.title ?? title ?? noteKey}
-            noteBody={body}
+            noteBody={deferredBodyForStats}
             noteKey={noteKey}
             onOpenSettings={() => onOpenSettings?.()}
           />
@@ -1142,7 +1160,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       {linkDialogOpen && (
         <LinkSuggestDialog
           noteTitle={note?.title ?? title ?? noteKey}
-          noteBody={body}
+          noteBody={deferredBodyForStats}
           onClose={() => setLinkDialogOpen(false)}
           onInsertRef={(text) => {
             const view = cmRef.current?.view();
@@ -1151,7 +1169,9 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
             view.focus();
           }}
           onAppendTag={(tagText) => {
-            const suffix = body.endsWith("\n") || body.length === 0 ? tagText : ` ${tagText}`;
+            // 以 CM 视图的最新文档为准（body state 可能落后一个 tick）
+            const cur = cmRef.current?.view()?.state.doc.toString() ?? bodyRef.current;
+            const suffix = cur.endsWith("\n") || cur.length === 0 ? tagText : ` ${tagText}`;
             const view = cmRef.current?.view();
             if (!view) {
               setBody((prev) => prev + suffix);

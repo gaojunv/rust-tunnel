@@ -1,15 +1,16 @@
-import { useCallback, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef } from "react";
 
 type Props = {
   side: "left" | "right";
   currentWidth: number;
   onDrag: (width: number) => void;
   onDragEnd: () => void;
+  onDragStart?: () => void;
   onReset: () => void;
   dragging?: boolean;
 };
 
-export function PanelResizer({ side, currentWidth, onDrag, onDragEnd, onReset, dragging = false }: Props) {
+export const PanelResizer = memo(function PanelResizer({ side, currentWidth, onDrag, onDragEnd, onDragStart, onReset, dragging = false }: Props) {
   const draggingRef = useRef(false);
   const startXRef = useRef(0);
   const startWidthRef = useRef(currentWidth);
@@ -22,12 +23,16 @@ export function PanelResizer({ side, currentWidth, onDrag, onDragEnd, onReset, d
 
   const onDragRef = useRef(onDrag);
   const onDragEndRef = useRef(onDragEnd);
+  const onDragStartRef = useRef(onDragStart);
   useEffect(() => {
     onDragRef.current = onDrag;
   }, [onDrag]);
   useEffect(() => {
     onDragEndRef.current = onDragEnd;
   }, [onDragEnd]);
+  useEffect(() => {
+    onDragStartRef.current = onDragStart;
+  }, [onDragStart]);
 
   const cleanupBody = useCallback(() => {
     document.body.style.removeProperty("user-select");
@@ -44,6 +49,7 @@ export function PanelResizer({ side, currentWidth, onDrag, onDragEnd, onReset, d
       if (e.button !== 0) return;
       e.preventDefault();
       draggingRef.current = true;
+      onDragStartRef.current?.();
       startXRef.current = e.clientX;
       startWidthRef.current = currentWidthRef.current;
       document.body.style.userSelect = "none";
@@ -84,15 +90,20 @@ export function PanelResizer({ side, currentWidth, onDrag, onDragEnd, onReset, d
     [side, cleanupBody],
   );
 
+  const handleDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      onReset();
+    },
+    [onReset],
+  );
+
   return (
     <div
       role="separator"
       aria-orientation="vertical"
       onPointerDown={handlePointerDown}
-      onDoubleClick={(e) => {
-        e.preventDefault();
-        onReset();
-      }}
+      onDoubleClick={handleDoubleClick}
       className="group absolute top-0 z-10 h-full w-[6px] cursor-col-resize touch-none"
       style={side === "left" ? { right: -3 } : { left: -3 }}
       title="拖拽调整宽度，双击恢复默认"
@@ -105,4 +116,4 @@ export function PanelResizer({ side, currentWidth, onDrag, onDragEnd, onReset, d
       />
     </div>
   );
-}
+});
