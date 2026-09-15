@@ -364,6 +364,12 @@ describe("reduceAgentEvent", () => {
     expect(next).toBe(s);
   });
 
+  it("item/reasoning/summaryPartAdded 走 default 兜底：不抛错且原样返回（回归：空分支已删）", () => {
+    let s = createInitialView("t1");
+    const next = reduceAgentEvent(s, notif("item/reasoning/summaryPartAdded", { itemId: "r1", part: {} }));
+    expect(next).toBe(s);
+  });
+
   it("warning 通知生成 tone=warn system item", () => {
     let s = createInitialView("t1");
     s = reduceAgentEvent(

@@ -77,12 +77,11 @@ export type AgentStatusDto = {
   code?: number | null;
   stderr_tail?: string[];
   reason?: string;
-  // 兼容后端契约可能扩展的字段
-  binary?: { path: string; source: string; version?: string | null };
-  codexHome?: string;
-  pid?: number | null;
+  // 以下为后端契约外的宽容字段（历史/兼容读取点，见 AgentPanel 对 stderrTail 的降级读取）：
+  // - stderrTail：camelCase 形态的 stderr 尾部（当前 Rust 侧实际为 snake_case，此为防御性读取）
+  // - lastError：旧契约残留，当前 Rust AgentStatus 无此字段
+  stderrTail?: string[];
   lastError?: string | null;
-  [key: string]: unknown;
 };
 
 export type BinaryResolveDto = {
@@ -104,7 +103,6 @@ export type AgentSettingsDto = {
   codexPathOverride?: string | null;
   /** wire 协议（仅网关模式生效）："responses"（默认，/v1/responses）| "chat"（/v1/chat/completions） */
   wireApi?: string;
-  [key: string]: unknown;
 };
 
 function isTauriEnv(): boolean {

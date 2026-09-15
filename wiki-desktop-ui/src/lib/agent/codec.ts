@@ -469,10 +469,6 @@ export function reduceAgentEvent(
           }),
         };
       }
-      case "item/reasoning/summaryPartAdded": {
-        // 仅占位：保证不抛错
-        return state;
-      }
       case "item/commandExecution/outputDelta":
       case "command/exec/outputDelta": {
         const itemId = (params as Record<string, unknown>)?.["itemId"] as string | undefined;

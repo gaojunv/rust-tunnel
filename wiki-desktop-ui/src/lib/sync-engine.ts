@@ -95,6 +95,28 @@ export async function hashNote(title: string, body: string): Promise<string> {
     .join("");
 }
 
+/**
+ * 并行 hash 的分批大小
+ * crypto.subtle.digest 是异步真并行（不占主线程），分批只为控制大库时的内存峰值
+ */
+export const HASH_BATCH_SIZE = 12;
+
+/**
+ * 并行计算一批笔记的 contentHash，结果顺序与输入一致
+ * 与逐个 await hashNote 顺序执行的结果完全等价
+ */
+export async function hashNotesBatch(notes: { title: string; body: string }[]): Promise<string[]> {
+  const out: string[] = new Array<string>(notes.length);
+  for (let start = 0; start < notes.length; start += HASH_BATCH_SIZE) {
+    const batch = notes.slice(start, start + HASH_BATCH_SIZE);
+    const hs = await Promise.all(batch.map((n) => hashNote(n.title, n.body)));
+    for (let i = 0; i < hs.length; i++) {
+      out[start + i] = hs[i];
+    }
+  }
+  return out;
+}
+
 // —— Action 定义 ——
 
 export type Action =
@@ -298,7 +320,18 @@ export interface SyncIO {
 }
 
 /**
- * 执行同步计划（逐条执行，单条失败不中止）
+ * runSync 的并发池大小
+ * 仅 upload/download/download-new/delete-remote 走并发；冲突类保持串行
+ */
+export const SYNC_POOL_SIZE = 5;
+
+/**
+ * 执行同步计划
+ * - upload/download/download-new/delete-remote：并发池执行（互不依赖，
+ *   state.entries 按 key 独立写入，墓碑 state.skipped 按 ref 独立写入，均无跨 key 读写）
+ * - conflict-local-wins/conflict-remote-wins：先读远端再写，必须串行
+ * - skip 类 / conflict-pending / drop-state：本地纯操作，串行处理
+ * 单条失败不中止其它条。report.items 按 plan 顺序排列（与全串行时一致）。
  */
 export async function runSync(
   plan: Action[],
@@ -326,105 +359,208 @@ export async function runSync(
     return chars.length > 64 ? chars.slice(0, 64).join("") : t;
   };
 
-  for (const action of plan) {
+  /** 单个 action 的执行结果（不直接写 report，由调用方按 plan 顺序汇总） */
+  interface ActionOutcome {
+    item: SyncItemResult;
+    uploaded: number;
+    downloaded: number;
+    conflicts: number;
+    restored: number;
+    deletedRemote: number;
+    skipped: number;
+    errors: number;
+  }
+
+  const okOutcome = (action: Action, extra?: Partial<ActionOutcome>): ActionOutcome => ({
+    item: { action, ok: true },
+    uploaded: 0,
+    downloaded: 0,
+    conflicts: 0,
+    restored: 0,
+    deletedRemote: 0,
+    skipped: 0,
+    errors: 0,
+    ...extra,
+  });
+  const failOutcome = (action: Action, detail: string): ActionOutcome => ({
+    item: { action, ok: false, detail },
+    uploaded: 0,
+    downloaded: 0,
+    conflicts: 0,
+    restored: 0,
+    deletedRemote: 0,
+    skipped: 0,
+    errors: 1,
+  });
+
+  /** restore-remote 与 upload 语义相同（本地覆盖远端），仅计数不同 */
+  const doUpload = async (
+    action: Extract<Action, { kind: "upload" }> | Extract<Action, { kind: "restore-remote" }>,
+    restored: boolean,
+  ): Promise<ActionOutcome> => {
+    try {
+      const note = localByKey.get(action.key);
+      if (!note) throw new Error(`本地笔记不存在: ${action.key}`);
+      const title = truncTitle(note.title);
+      const uploadBody: { title: string; summary: string; content: string; origin_key?: string } = {
+        title,
+        summary: "",
+        content: note.body,
+      };
+      if (note.key !== action.ref) uploadBody.origin_key = note.key;
+      const result = await io.remote.putPage(action.ref, uploadBody);
+      // locked 检测
+      if (result.content !== note.body) {
+        return failOutcome(action, "locked-skipped");
+      }
+      state.entries[action.key] = {
+        ref: action.ref,
+        localHash: note.contentHash,
+        remoteUpdatedAt: result.updated_at,
+      };
+      return okOutcome(action, restored ? { restored: 1 } : { uploaded: 1 });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      return failOutcome(action, detail);
+    }
+  };
+
+  const doDownload = async (
+    action: Extract<Action, { kind: "download" }> | Extract<Action, { kind: "download-new" }>,
+    isNew: boolean,
+  ): Promise<ActionOutcome> => {
+    try {
+      const remotePage = await io.remote.getPage(action.ref);
+      if (!remotePage) throw new Error(`远端页面不存在: ${action.ref}`);
+      await io.local.writeNote(action.key, remotePage.title, remotePage.content);
+      // key≠ref 时写入 sticky ref，使后续同步收敛到 frontmatter ref（仅 download-new）
+      if (isNew && action.key !== action.ref && io.local.setNoteRef) {
+        try { await io.local.setNoteRef(action.key, action.ref); } catch (e) { console.warn("setNoteRef failed", e); }
+      }
+      const h = await hashNote(remotePage.title, remotePage.content);
+      state.entries[action.key] = {
+        ref: action.ref,
+        localHash: h,
+        remoteUpdatedAt: remotePage.updated_at,
+      };
+      if (isNew) delete state.skipped[action.ref];
+      return okOutcome(action, { downloaded: 1 });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      return failOutcome(action, detail);
+    }
+  };
+
+  const doDeleteRemote = async (action: Extract<Action, { kind: "delete-remote" }>): Promise<ActionOutcome> => {
+    try {
+      await io.remote.deletePage(action.ref);
+      delete state.entries[action.key];
+      return okOutcome(action, { deletedRemote: 1 });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      return failOutcome(action, detail);
+    }
+  };
+
+  /** 将 outcome 汇总进 report（调用方按 plan 顺序调用，保证 items 顺序） */
+  const applyOutcome = (o: ActionOutcome): void => {
+    report.items.push(o.item);
+    report.uploaded += o.uploaded;
+    report.downloaded += o.downloaded;
+    report.conflicts += o.conflicts;
+    report.restored += o.restored;
+    report.deletedRemote += o.deletedRemote;
+    report.skipped += o.skipped;
+    report.errors += o.errors;
+  };
+
+  /** 简单并发池：worker 按下标取任务，最大并发度为 size */
+  const runPool = async (
+    indices: number[],
+    size: number,
+    run: (planIndex: number) => Promise<ActionOutcome>,
+    results: (ActionOutcome | undefined)[],
+  ): Promise<void> => {
+    let cursor = 0;
+    const workers: Promise<void>[] = [];
+    const workerCount = Math.min(Math.max(size, 1), indices.length);
+    for (let w = 0; w < workerCount; w++) {
+      workers.push(
+        (async () => {
+          for (;;) {
+            const pos = cursor++;
+            if (pos >= indices.length) return;
+            const planIndex = indices[pos];
+            results[planIndex] = await run(planIndex);
+          }
+        })(),
+      );
+    }
+    await Promise.all(workers);
+  };
+
+  // 第一遍：收集可并发的 action 下标，其余串行执行
+  const concurrentIndices: number[] = [];
+  const isConcurrent = (a: Action): boolean =>
+    a.kind === "upload" ||
+    a.kind === "restore-remote" ||
+    a.kind === "download" ||
+    a.kind === "download-new" ||
+    a.kind === "delete-remote";
+  for (let i = 0; i < plan.length; i++) {
+    if (isConcurrent(plan[i])) concurrentIndices.push(i);
+  }
+
+  const results: (ActionOutcome | undefined)[] = new Array(plan.length);
+  await runPool(
+    concurrentIndices,
+    SYNC_POOL_SIZE,
+    (planIndex) => {
+      const action = plan[planIndex];
+      switch (action.kind) {
+        case "upload":
+          return doUpload(action, false);
+        case "restore-remote":
+          return doUpload(action, true);
+        case "download":
+          return doDownload(action, false);
+        case "download-new":
+          return doDownload(action, true);
+        case "delete-remote":
+          return doDeleteRemote(action);
+        default:
+          return Promise.resolve(failOutcome(action, `未知 action: ${String(action)}`));
+      }
+    },
+    results,
+  );
+
+  // 第二遍：按 plan 顺序汇总——并发结果与串行 action 交错还原
+  for (let i = 0; i < plan.length; i++) {
+    const action = plan[i];
+    const pooled = results[i];
+    if (pooled) {
+      applyOutcome(pooled);
+      continue;
+    }
+    // 并发类必有 pooled 结果；防御性兜底（正常走不到），避免静默丢 action。
+    // 注意：此处用显式 kind 判断而非 isConcurrent()，以便 TS 收窄后续 switch 的 default 为 never
+    if (
+      action.kind === "upload" ||
+      action.kind === "restore-remote" ||
+      action.kind === "download" ||
+      action.kind === "download-new" ||
+      action.kind === "delete-remote"
+    ) {
+      applyOutcome(failOutcome(action, "内部错误：并发结果丢失"));
+      continue;
+    }
     try {
       switch (action.kind) {
         case "skip-incompatible":
         case "skip-empty":
         case "skip-conflict-copy": {
-          report.items.push({ action, ok: true });
-          report.skipped++;
-          break;
-        }
-        case "upload": {
-          const note = localByKey.get(action.key);
-          if (!note) throw new Error(`本地笔记不存在: ${action.key}`);
-          const title = truncTitle(note.title);
-          const uploadBody: { title: string; summary: string; content: string; origin_key?: string } = {
-            title,
-            summary: "",
-            content: note.body,
-          };
-          if (note.key !== action.ref) uploadBody.origin_key = note.key;
-          const result = await io.remote.putPage(action.ref, uploadBody);
-          // locked 检测
-          if (result.content !== note.body) {
-            report.items.push({ action, ok: false, detail: "locked-skipped" });
-            report.errors++;
-            break;
-          }
-          state.entries[action.key] = {
-            ref: action.ref,
-            localHash: note.contentHash,
-            remoteUpdatedAt: result.updated_at,
-          };
-          report.items.push({ action, ok: true });
-          report.uploaded++;
-          break;
-        }
-        case "restore-remote": {
-          const note = localByKey.get(action.key);
-          if (!note) throw new Error(`本地笔记不存在: ${action.key}`);
-          const title = truncTitle(note.title);
-          const restoreBody: { title: string; summary: string; content: string; origin_key?: string } = {
-            title,
-            summary: "",
-            content: note.body,
-          };
-          if (note.key !== action.ref) restoreBody.origin_key = note.key;
-          const result = await io.remote.putPage(action.ref, restoreBody);
-          if (result.content !== note.body) {
-            report.items.push({ action, ok: false, detail: "locked-skipped" });
-            report.errors++;
-            break;
-          }
-          state.entries[action.key] = {
-            ref: action.ref,
-            localHash: note.contentHash,
-            remoteUpdatedAt: result.updated_at,
-          };
-          report.items.push({ action, ok: true });
-          report.restored++;
-          break;
-        }
-        case "download": {
-          const remotePage = await io.remote.getPage(action.ref);
-          if (!remotePage) throw new Error(`远端页面不存在: ${action.ref}`);
-          await io.local.writeNote(action.key, remotePage.title, remotePage.content);
-          const h = await hashNote(remotePage.title, remotePage.content);
-          state.entries[action.key] = {
-            ref: action.ref,
-            localHash: h,
-            remoteUpdatedAt: remotePage.updated_at,
-          };
-          report.items.push({ action, ok: true });
-          report.downloaded++;
-          break;
-        }
-        case "delete-remote": {
-          await io.remote.deletePage(action.ref);
-          delete state.entries[action.key];
-          report.items.push({ action, ok: true });
-          report.deletedRemote++;
-          break;
-        }
-        case "download-new": {
-          const remotePage = await io.remote.getPage(action.ref);
-          if (!remotePage) throw new Error(`远端页面不存在: ${action.ref}`);
-          await io.local.writeNote(action.key, remotePage.title, remotePage.content);
-          // key≠ref 时写入 sticky ref，使后续同步收敛到 frontmatter ref
-          if (action.key !== action.ref && io.local.setNoteRef) {
-            try { await io.local.setNoteRef(action.key, action.ref); } catch (e) { console.warn("setNoteRef failed", e); }
-          }
-          const h = await hashNote(remotePage.title, remotePage.content);
-          state.entries[action.key] = {
-            ref: action.ref,
-            localHash: h,
-            remoteUpdatedAt: remotePage.updated_at,
-          };
-          delete state.skipped[action.ref];
-          report.items.push({ action, ok: true });
-          report.downloaded++;
+          applyOutcome(okOutcome(action, { skipped: 1 }));
           break;
         }
         case "drop-state": {
@@ -432,8 +568,7 @@ export async function runSync(
           const entry = state.entries[action.key];
           if (entry) state.skipped[entry.ref] = entry.remoteUpdatedAt;
           delete state.entries[action.key];
-          report.items.push({ action, ok: true });
-          report.skipped++;
+          applyOutcome(okOutcome(action, { skipped: 1 }));
           break;
         }
         case "conflict-local-wins": {
@@ -455,8 +590,7 @@ export async function runSync(
           if (note.key !== action.ref) conflictBody.origin_key = note.key;
           const result = await io.remote.putPage(action.ref, conflictBody);
           if (result.content !== note.body) {
-            report.items.push({ action, ok: false, detail: "locked-skipped" });
-            report.errors++;
+            applyOutcome(failOutcome(action, "locked-skipped"));
             break;
           }
           state.entries[action.key] = {
@@ -464,13 +598,11 @@ export async function runSync(
             localHash: note.contentHash,
             remoteUpdatedAt: result.updated_at,
           };
-          report.items.push({ action, ok: true });
-          report.conflicts++;
+          applyOutcome(okOutcome(action, { conflicts: 1 }));
           break;
         }
         case "conflict-pending": {
-          report.items.push({ action, ok: true });
-          report.conflicts++;
+          applyOutcome(okOutcome(action, { conflicts: 1 }));
           break;
         }
         case "conflict-remote-wins": {
@@ -489,8 +621,7 @@ export async function runSync(
             localHash: h,
             remoteUpdatedAt: remotePage.updated_at,
           };
-          report.items.push({ action, ok: true });
-          report.conflicts++;
+          applyOutcome(okOutcome(action, { conflicts: 1 }));
           break;
         }
         default: {
@@ -500,8 +631,7 @@ export async function runSync(
       }
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
-      report.items.push({ action, ok: false, detail });
-      report.errors++;
+      applyOutcome(failOutcome(action, detail));
     }
   }
 
