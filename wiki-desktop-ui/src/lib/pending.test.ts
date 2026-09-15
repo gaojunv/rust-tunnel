@@ -70,4 +70,28 @@ describe("computePendingCount", () => {
     ];
     expect(await computePendingCount(notes, state)).toBe(1);
   });
+
+  it("precomputed 命中时与无 precomputed 结果一致", async () => {
+    const state = emptySyncState("kid");
+    const h = await hashNote("t1", "b1");
+    state.entries["a/b"] = { ref: "a/b", localHash: h, remoteUpdatedAt: "2024-01-01 00:00:00" };
+    const notes = [
+      { key: "a/b", title: "t1", body: "b1" }, // synced → 0
+      { key: "c/d", title: "t2", body: "b2" }, // new → 1
+    ];
+    const precomputed = new Map([["a/b", h], ["c/d", await hashNote("t2", "b2")]]);
+    expect(await computePendingCount(notes, state, precomputed)).toBe(
+      await computePendingCount(notes, state),
+    );
+    expect(await computePendingCount(notes, state, precomputed)).toBe(1);
+  });
+
+  it("precomputed 过期（内容已变）时照常判 pending，不误判为已同步", async () => {
+    const state = emptySyncState("kid");
+    const h = await hashNote("t1", "b1");
+    state.entries["a/b"] = { ref: "a/b", localHash: h, remoteUpdatedAt: "2024-01-01 00:00:00" };
+    // doSync 快照是旧内容，precomputed 只覆盖未被改写的 key；被改写的 key 不在 map 中 → 走重算
+    const notes = [{ key: "a/b", title: "t1", body: "changed" }];
+    expect(await computePendingCount(notes, state, new Map())).toBe(1);
+  });
 });

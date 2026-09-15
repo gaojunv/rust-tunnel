@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TitleBar } from "@/components/TitleBar";
 import { WikiSidebar } from "@/components/WikiSidebar";
 import { NoteEditor, type NoteEditorHandle } from "@/components/NoteEditor";
 import { GraphPanel } from "@/components/GraphPanel";
 import { RightPanel } from "@/components/RightPanel";
-import { AgentPanel } from "@/components/agent/AgentPanel";
+// AgentPanel 重量级（含 streamdown/diff 链）：React.lazy 拆独立 chunk，
+// 首屏不加载；RightPanel 仅 agent tab 切入才挂载（keepMounted 语义不变）。
+const AgentPanel = lazy(() =>
+  import("@/components/agent/AgentPanel").then((m) => ({ default: m.AgentPanel })),
+);
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
 import { PanelResizer } from "@/components/PanelResizer";
@@ -14,7 +18,13 @@ import { useNoteHistory } from "@/lib/use-note-history";
 import { QuickSwitcher } from "@/components/QuickSwitcher";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { SyncReportDialog } from "@/components/SyncReportDialog";
-import { ConflictResolveDialog } from "@/components/ConflictResolveDialog";
+// ConflictResolveDialog 含 DiffView→diff 链：lazy 后 diff 首屏不再被主包引用，
+// 与 streamdown 同进 vendor-markdown 按需 chunk（冲突弹窗打开时才加载）。
+const ConflictResolveDialog = lazy(() =>
+  import("@/components/ConflictResolveDialog").then((m) => ({
+    default: m.ConflictResolveDialog,
+  })),
+);
 import { ToastHost } from "@/components/ToastHost";
 import { toast } from "@/lib/toast";
 import { useSync } from "@/lib/use-sync";
@@ -41,6 +51,50 @@ export function parseWikilinkTarget(target: string): [string, string | null] {
   return [notePart, heading ? heading : null];
 }
 
+/**
+ * 可变宽侧栏容器（memo）：拖拽中仅当 width/collapsed/drill-in props 变化时重渲染，
+ * App 整树其他 state（编辑器 body、agent 流等）变化时跳过。
+ * 拖拽中宽度经 dragWidth prop 传入（局部态），不经过 layout。
+ */
+const ResizableAside = memo(function ResizableAside({
+  side,
+  width,
+  collapsed,
+  dragging,
+  extraClassName,
+  contentClassName,
+  children,
+  resizer,
+  label,
+}: {
+  side: "left" | "right";
+  width: number;
+  collapsed: boolean;
+  dragging: boolean;
+  extraClassName: string;
+  contentClassName: string;
+  children: React.ReactNode;
+  resizer: React.ReactNode;
+  label: string;
+}) {
+  const w = collapsed ? 0 : width;
+  return (
+    <aside
+      className={`relative shrink-0 overflow-hidden bg-sidebar ${collapsed ? "" : side === "left" ? "border-r" : "border-l"} ${dragging ? "" : "transition-[width] duration-200"} ${extraClassName}`}
+      style={{ width: w }}
+      aria-hidden={collapsed}
+    >
+      <div className={contentClassName} style={{ width: w, minWidth: w }}>
+        {children}
+      </div>
+      {!collapsed && resizer}
+      <span className="sr-only" aria-hidden>
+        {label}
+      </span>
+    </aside>
+  );
+});
+
 export default function App() {
   const { current: selectedKey, canBack, canForward, navigate, back, forward, remove, replace, replacePrefix, removePrefix } =
     useNoteHistory();
@@ -65,7 +119,6 @@ export default function App() {
   } = useSync({
     flushSave: () => editorRef.current?.flushSave() ?? Promise.resolve(),
     onRefresh: bumpRefreshToken,
-    editorOpenKey: selectedKey,
     refreshToken,
     onNeedSettings: () => setSettingsOpen(true),
   });
@@ -74,6 +127,9 @@ export default function App() {
   const [conflictOpen, setConflictOpen] = useState(false);
 
   // 侧栏布局：宽度/折叠 + 拖拽态（拖拽中禁用 width 过渡）
+  // 拖拽中宽度下沉为 dragWidthRef + dragWidthTick 局部态：pointermove 只触发
+  // ResizableAside 重渲染（React.memo + 局部宽度 prop），整树不受影响；
+  // 拖拽中不写 layout（不触发 savePanelLayout effect），onDragEnd 一次提交。
   const [layout, setLayout] = useState<PanelLayout>(() => {
     const loaded = loadPanelLayout();
     try {
@@ -89,6 +145,8 @@ export default function App() {
     }
   });
   const [draggingSide, setDraggingSide] = useState<"left" | "right" | null>(null);
+  // 拖拽中的临时宽度（null = 非拖拽，用 layout 值）
+  const [dragWidth, setDragWidth] = useState<{ side: "left" | "right"; width: number } | null>(null);
 
   useEffect(() => {
     savePanelLayout(layout);
@@ -101,23 +159,38 @@ export default function App() {
     setLayout((prev) => ({ ...prev, rightCollapsed: !prev.rightCollapsed }));
   }, []);
 
-  const handleDragLeft = useCallback((rawWidth: number) => {
-    const r = resolveDragWidth("left", rawWidth);
-    if (r.collapsed) {
-      setLayout((prev) => ({ ...prev, leftCollapsed: true }));
-      return;
-    }
-    setLayout((prev) => ({ ...prev, leftCollapsed: false, leftWidth: r.width }));
+  // 拖拽中：仅更新 dragWidth 局部态（稳定的 useCallback，PanelResizer 的 ref 透传下也无妨）
+  const handleDragPreview = useCallback((side: "left" | "right", rawWidth: number) => {
+    setDragWidth({ side, width: rawWidth });
   }, []);
 
-  const handleDragRight = useCallback((rawWidth: number) => {
-    const r = resolveDragWidth("right", rawWidth);
-    if (r.collapsed) {
-      setLayout((prev) => ({ ...prev, rightCollapsed: true }));
-      return;
-    }
-    setLayout((prev) => ({ ...prev, rightCollapsed: false, rightWidth: r.width }));
+  // 拖拽结束：resolve + 一次性提交 layout（单次 setItem 在上面的 effect 里）
+  const handleDragEndLeft = useCallback(() => {
+    setDragWidth((dw) => {
+      if (dw && dw.side === "left") {
+        const r = resolveDragWidth("left", dw.width);
+        if (r.collapsed) setLayout((prev) => ({ ...prev, leftCollapsed: true }));
+        else setLayout((prev) => ({ ...prev, leftCollapsed: false, leftWidth: r.width }));
+      }
+      return null;
+    });
+    setDraggingSide(null);
   }, []);
+
+  const handleDragEndRight = useCallback(() => {
+    setDragWidth((dw) => {
+      if (dw && dw.side === "right") {
+        const r = resolveDragWidth("right", dw.width);
+        if (r.collapsed) setLayout((prev) => ({ ...prev, rightCollapsed: true }));
+        else setLayout((prev) => ({ ...prev, rightCollapsed: false, rightWidth: r.width }));
+      }
+      return null;
+    });
+    setDraggingSide(null);
+  }, []);
+
+  const handleDragStartLeft = useCallback(() => setDraggingSide("left"), []);
+  const handleDragStartRight = useCallback(() => setDraggingSide("right"), []);
 
   const handleResetLeft = useCallback(() => {
     setLayout((prev) => ({ ...prev, leftCollapsed: false, leftWidth: PANEL_LIMITS.left.defaultWidth }));
@@ -370,6 +443,116 @@ export default function App() {
     manualSyncPendingRef.current = true;
     void syncNow();
   }, [syncNow]);
+
+  // —— 以下回调专为 memo 子组件稳定身份：依赖仅为已稳定的 handle* ——
+  // （位置必须在 handleManualSync/getCurrentNoteForAi/handleScrollToLine/handleAiInsert
+  // 定义之后，避免 TDZ 引用）
+  const handleSelectNote = useCallback((k: string) => void handleNavigate(k), [handleNavigate]);
+  const handleCreateNoteFromSidebar = useCallback(
+    (k: string, t: string) => void handleCreateNote(k, t),
+    [handleCreateNote],
+  );
+  const handleBackVoid = useCallback(() => void handleBack(), [handleBack]);
+  const handleForwardVoid = useCallback(() => void handleForward(), [handleForward]);
+  const handleOpenSwitcher = useCallback(() => setSwitcherOpen(true), []);
+  const handleCloseSwitcher = useCallback(() => setSwitcherOpen(false), []);
+  const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
+  const handleCloseSettings = useCallback(() => setSettingsOpen(false), []);
+  const handleSyncNowVoid = useCallback(() => void handleManualSync(), [handleManualSync]);
+  const handleFlushSave = useCallback(
+    () => editorRef.current?.flushSave() ?? Promise.resolve(),
+    [],
+  );
+  const handleNavigateVoid = useCallback((k: string) => void handleNavigate(k), [handleNavigate]);
+  const handleDragPreviewLeft = useCallback((w: number) => handleDragPreview("left", w), [handleDragPreview]);
+  const handleDragPreviewRight = useCallback((w: number) => handleDragPreview("right", w), [handleDragPreview]);
+  const handleResolvedConflict = useCallback(
+    (k: string) => {
+      clearPendingConflict(k);
+      bumpRefreshToken();
+    },
+    [clearPendingConflict, bumpRefreshToken],
+  );
+  const handleCloseConflicts = useCallback(() => {
+    setConflictOpen(false);
+    bumpRefreshToken();
+  }, [bumpRefreshToken]);
+  const handleCloseReport = useCallback(() => {
+    setReportDialogOpen(false);
+    setReport(null);
+  }, [setReport]);
+
+  // 拖拽中生效宽度：dragWidth 命中对应 side 时覆盖 layout（仅拖拽帧）
+  const leftWidthLive = dragWidth?.side === "left" ? dragWidth.width : layout.leftWidth;
+  const rightWidthLive = dragWidth?.side === "right" ? dragWidth.width : layout.rightWidth;
+
+  // 面板元素 memo 化：依赖均为稳定回调 / 标量，还原 RightPanel 按需渲染。
+  // 四面板中 AgentPanel 为重量级但带内部线程状态，经确认其全部状态
+  // （view/items/queue/model 等）均为 React state（见 AgentPanel.tsx），
+  // 卸载后重挂仅回到"新会话"占位、无后台线程可丢；且 RightPanel 非 agent tab
+  // 时 agent 本就不在视图内。按任务要求仅 agent 面板 keepMounted，其余按 tab 按需渲染。
+  const graphPanelEl = useMemo(
+    () => (
+      <GraphPanel
+        selectedKey={selectedKey}
+        refreshToken={refreshToken}
+        onNavigate={handleNavigateVoid}
+        onCreate={handleCreated}
+      />
+    ),
+    [selectedKey, refreshToken, handleNavigateVoid, handleCreated],
+  );
+  const backlinksPanelEl = useMemo(
+    () => (
+      <BacklinksPanel
+        selectedKey={selectedKey}
+        refreshToken={refreshToken}
+        onNavigate={handleNavigateVoid}
+      />
+    ),
+    [selectedKey, refreshToken, handleNavigateVoid],
+  );
+  const tocPanelEl = useMemo(
+    () => (
+      <TocPanel
+        noteKey={selectedKey}
+        getCurrentNote={getCurrentNoteForAi}
+        refreshToken={refreshToken}
+        onScrollToLine={handleScrollToLine}
+      />
+    ),
+    [selectedKey, getCurrentNoteForAi, refreshToken, handleScrollToLine],
+  );
+  const agentPanelEl = useMemo(
+    () => (
+      <Suspense
+        fallback={
+          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+            Agent 面板加载中…
+          </p>
+        }
+      >
+        <AgentPanel
+          onInsertToNote={handleAiInsert}
+          vaultRoot={vault?.root ?? null}
+          onVaultChanged={handleAgentVaultChanged}
+          flushSave={handleFlushSave}
+          onOpenSettings={handleOpenSettings}
+          noteKey={selectedKey}
+          getCurrentNote={getCurrentNoteForAi}
+        />
+      </Suspense>
+    ),
+    [
+      handleAiInsert,
+      vault?.root,
+      handleAgentVaultChanged,
+      handleFlushSave,
+      handleOpenSettings,
+      selectedKey,
+      getCurrentNoteForAi,
+    ],
+  );
   useEffect(() => {
     if (!report) {
       setReportDialogOpen(false);
@@ -397,13 +580,13 @@ export default function App() {
         dirty={editorDirty}
         canBack={canBack}
         canForward={canForward}
-        onBack={() => void handleBack()}
-        onForward={() => void handleForward()}
-        onOpenSwitcher={() => setSwitcherOpen(true)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onBack={handleBackVoid}
+        onForward={handleForwardVoid}
+        onOpenSwitcher={handleOpenSwitcher}
+        onOpenSettings={handleOpenSettings}
         syncing={syncing}
         syncStatus={syncStatus}
-        onSyncNow={() => void handleManualSync()}
+        onSyncNow={handleSyncNowVoid}
         leftVisible={!layout.leftCollapsed}
         rightVisible={!layout.rightCollapsed}
         onToggleLeft={toggleLeft}
@@ -411,46 +594,37 @@ export default function App() {
       />
 
       <div className="flex min-h-0 flex-1">
-        <aside
-          className={`relative shrink-0 overflow-hidden bg-sidebar ${layout.leftCollapsed ? "" : "border-r"} ${draggingSide ? "" : "transition-[width] duration-200"}`}
-          style={{ width: layout.leftCollapsed ? 0 : layout.leftWidth }}
-          aria-hidden={layout.leftCollapsed}
-        >
-          <div
-            className="h-full w-full overflow-hidden"
-            style={{
-              width: layout.leftCollapsed ? 0 : layout.leftWidth,
-              minWidth: layout.leftCollapsed ? 0 : layout.leftWidth,
-            }}
-          >
-            <WikiSidebar
-              selectedKey={selectedKey}
-              onSelect={(k) => void handleNavigate(k)}
-              refreshToken={refreshToken}
-              vaultInfo={vault}
-              onCreateNote={(k, t) => void handleCreateNote(k, t)}
-              onFolderChanged={handleFolderChanged}
-              onHistoryReplacePrefix={handleHistoryReplacePrefix}
-              onHistoryRemovePrefix={handleHistoryRemovePrefix}
-            />
-          </div>
-          {!layout.leftCollapsed && (
+        <ResizableAside
+          side="left"
+          width={leftWidthLive}
+          collapsed={layout.leftCollapsed}
+          dragging={draggingSide === "left"}
+          extraClassName=""
+          contentClassName="h-full w-full overflow-hidden"
+          label="左侧栏"
+          resizer={
             <PanelResizer
               side="left"
-              currentWidth={layout.leftWidth}
+              currentWidth={leftWidthLive}
               dragging={draggingSide === "left"}
-              onDrag={(w) => {
-                if (draggingSide !== "left") setDraggingSide("left");
-                handleDragLeft(w);
-              }}
-              onDragEnd={() => setDraggingSide(null)}
+              onDrag={handleDragPreviewLeft}
+              onDragStart={handleDragStartLeft}
+              onDragEnd={handleDragEndLeft}
               onReset={handleResetLeft}
             />
-          )}
-          <span className="sr-only" aria-hidden>
-            左侧栏
-          </span>
-        </aside>
+          }
+        >
+          <WikiSidebar
+            selectedKey={selectedKey}
+            onSelect={handleSelectNote}
+            refreshToken={refreshToken}
+            vaultInfo={vault}
+            onCreateNote={handleCreateNoteFromSidebar}
+            onFolderChanged={handleFolderChanged}
+            onHistoryReplacePrefix={handleHistoryReplacePrefix}
+            onHistoryRemovePrefix={handleHistoryRemovePrefix}
+          />
+        </ResizableAside>
 
         <main className="min-w-0 flex-1 overflow-hidden bg-background">
           <NoteEditor
@@ -460,107 +634,71 @@ export default function App() {
             onSaved={handleSaved}
             onDeleted={handleDeleted}
             onDirtyChange={setEditorDirty}
-            onNavigate={(k) => void handleNavigate(k)}
+            onNavigate={handleNavigateVoid}
             onCreate={handleCreated}
             onRenamed={handleRenamed}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={handleOpenSettings}
             refreshToken={refreshToken}
             onNoteLoaded={handleNoteLoaded}
           />
         </main>
 
-        <aside
-          className={`relative hidden shrink-0 overflow-hidden bg-sidebar xl:flex xl:flex-col ${layout.rightCollapsed ? "" : "border-l"} ${draggingSide ? "" : "transition-[width] duration-200"}`}
-          style={{ width: layout.rightCollapsed ? 0 : layout.rightWidth }}
-          aria-hidden={layout.rightCollapsed}
-        >
-          <div
-            className="flex h-full w-full flex-col overflow-hidden"
-            style={{
-              width: layout.rightCollapsed ? 0 : layout.rightWidth,
-              minWidth: layout.rightCollapsed ? 0 : layout.rightWidth,
-            }}
-          >
-            <RightPanel
-              graphPanel={
-                <GraphPanel
-                  selectedKey={selectedKey}
-                  refreshToken={refreshToken}
-                  onNavigate={(k) => void handleNavigate(k)}
-                  onCreate={handleCreated}
-                />
-              }
-              backlinksPanel={
-                <BacklinksPanel
-                  selectedKey={selectedKey}
-                  refreshToken={refreshToken}
-                  onNavigate={(k) => void handleNavigate(k)}
-                />
-              }
-              tocPanel={
-                <TocPanel
-                  noteKey={selectedKey}
-                  getCurrentNote={getCurrentNoteForAi}
-                  refreshToken={refreshToken}
-                  onScrollToLine={handleScrollToLine}
-                />
-              }
-              agentPanel={
-                <AgentPanel
-                  onInsertToNote={handleAiInsert}
-                  vaultRoot={vault?.root ?? null}
-                  onVaultChanged={handleAgentVaultChanged}
-                  flushSave={() => editorRef.current?.flushSave() ?? Promise.resolve()}
-                  onOpenSettings={() => setSettingsOpen(true)}
-                  noteKey={selectedKey}
-                  getCurrentNote={getCurrentNoteForAi}
-                />
-              }
-            />
-          </div>
-          {!layout.rightCollapsed && (
+        <ResizableAside
+          side="right"
+          width={rightWidthLive}
+          collapsed={layout.rightCollapsed}
+          dragging={draggingSide === "right"}
+          extraClassName="hidden xl:flex xl:flex-col"
+          contentClassName="flex h-full w-full flex-col overflow-hidden"
+          label="右侧栏"
+          resizer={
             <PanelResizer
               side="right"
-              currentWidth={layout.rightWidth}
+              currentWidth={rightWidthLive}
               dragging={draggingSide === "right"}
-              onDrag={(w) => {
-                if (draggingSide !== "right") setDraggingSide("right");
-                handleDragRight(w);
-              }}
-              onDragEnd={() => setDraggingSide(null)}
+              onDrag={handleDragPreviewRight}
+              onDragStart={handleDragStartRight}
+              onDragEnd={handleDragEndRight}
               onReset={handleResetRight}
             />
-          )}
-        </aside>
+          }
+        >
+          <RightPanel
+            graphPanel={graphPanelEl}
+            backlinksPanel={backlinksPanelEl}
+            tocPanel={tocPanelEl}
+            agentPanel={agentPanelEl}
+          />
+        </ResizableAside>
       </div>
       <QuickSwitcher
         open={switcherOpen}
-        onClose={() => setSwitcherOpen(false)}
-        onSelect={(k) => void handleNavigate(k)}
+        onClose={handleCloseSwitcher}
+        onSelect={handleSelectNote}
+        onCreate={handleCreateNoteFromSidebar}
       />
-      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onSync={() => void handleManualSync()} />}
+      {settingsOpen && <SettingsDialog onClose={handleCloseSettings} onSync={handleSyncNowVoid} />}
       {conflictOpen && pendingConflicts.length > 0 && syncState && (
-        <ConflictResolveDialog
-          conflicts={pendingConflicts}
-          state={syncState}
-          onResolved={(k) => {
-            clearPendingConflict(k);
-            bumpRefreshToken();
-          }}
-          onClose={() => {
-            setConflictOpen(false);
-            bumpRefreshToken();
-          }}
-        />
+        <Suspense
+          fallback={
+            <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+              冲突解决面板加载中…
+            </p>
+          }
+        >
+          <ConflictResolveDialog
+            conflicts={pendingConflicts}
+            state={syncState}
+            onResolved={handleResolvedConflict}
+            onClose={handleCloseConflicts}
+          />
+        </Suspense>
       )}
       {reportDialogOpen && report && !(conflictOpen && pendingConflicts.length > 0) && (
         <SyncReportDialog
           report={report}
-          onClose={() => {
-            setReportDialogOpen(false);
-            setReport(null);
-          }}
-          onNavigate={(k) => void handleNavigate(k)}
+          onClose={handleCloseReport}
+          onNavigate={handleNavigateVoid}
         />
       )}
       <ToastHost />

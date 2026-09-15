@@ -46,6 +46,8 @@ import { livePreview, wikilinkNavFacet } from "@/lib/codemirror/live-preview/ind
 export type MarkdownEditorProps = {
   initialDoc: string;
   onDocChanged?: (doc: string) => void;
+  /** 选区/光标变化时触发（调用方自行从 view 读取行号，避免传参 stale） */
+  onCursorChanged?: () => void;
   onSave?: () => void;
   getCompletionNotes?: () => NoteSummaryLike[];
   onPasteImage?: (file: File) => Promise<string | null>;
@@ -85,6 +87,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
     {
       initialDoc,
       onDocChanged,
+      onCursorChanged,
       onSave,
       getCompletionNotes,
       onPasteImage,
@@ -100,6 +103,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
     const viewRef = useRef<EditorView | null>(null);
 
     const onDocChangedRef = useLatest(onDocChanged);
+    const onCursorChangedRef = useLatest(onCursorChanged);
     const onSaveRef = useLatest(onSave);
     const onPasteImageRef = useLatest(onPasteImage);
     const onImageErrorRef = useLatest(onImageError);
@@ -135,6 +139,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       const updateListener = EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           onDocChangedRef.current?.(update.state.doc.toString());
+        }
+        if (update.selectionSet && !update.docChanged) {
+          onCursorChangedRef.current?.();
         }
       });
 
@@ -246,10 +253,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
         // also enable explicit trigger for wikilinks: start completion on "[["
         EditorView.updateListener.of((update) => {
           if (!update.docChanged) return;
-          const doc = update.state.doc.toString();
           const pos = update.state.selection.main.head;
-          // if last two chars before cursor are "[[", trigger completion
-          if (pos >= 2 && doc.slice(pos - 2, pos) === "[[") {
+          // 只读光标前 2 字符，避免每次击键全文 toString
+          if (pos >= 2 && update.state.sliceDoc(Math.max(0, pos - 2), pos) === "[[") {
             startCompletion(update.view);
           }
         }),

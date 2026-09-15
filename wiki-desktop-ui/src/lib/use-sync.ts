@@ -3,7 +3,7 @@ import { createServerApi, loadSyncConfig, ServerError } from "@/api/server";
 import { AuthExpiredError, clearToken, getToken } from "@/lib/server-auth";
 import {
   emptySyncState,
-  hashNote,
+  hashNotesBatch,
   planSync,
   runSync,
   type LocalNote,
@@ -67,7 +67,6 @@ const BACKOFF_STEPS = [30_000, 120_000, 600_000];
 export function useSync(opts: {
   flushSave: () => Promise<void>;
   onRefresh: () => void;
-  editorOpenKey: string | null;
   refreshToken: number;
   onNeedSettings?: () => void;
 }): {
@@ -81,8 +80,6 @@ export function useSync(opts: {
   clearPendingConflict(key: string): void;
 } {
   const { flushSave, onRefresh, refreshToken, onNeedSettings } = opts;
-  // editorOpenKey kept for spec compatibility (unused but listed in opts)
-  void opts.editorOpenKey;
 
   const flushSaveRef = useRef(flushSave);
   useEffect(() => {
@@ -132,46 +129,62 @@ export function useSync(opts: {
     }
   }, []);
 
-  const recomputePending = useCallback(async () => {
-    const cfg = loadSyncConfig();
-    if (!cfg?.baseUrl || !cfg?.knowledgeId) {
-      setStatus((s) => ({ ...s, phase: "disabled", pendingCount: null }));
-      return;
-    }
-    const token = getToken(cfg.baseUrl);
-    if (!token) {
-      setStatus((s) => ({ ...s, phase: "disabled", pendingCount: null }));
-      return;
-    }
-    try {
-      const notes = await listNotesFull();
-      const raw = await readSyncState().catch(() => null);
-      let state: SyncState | null = null;
-      if (raw) {
-        try {
-          const parsed = JSON.parse(raw) as SyncState;
-          if (parsed && parsed.knowledgeId === cfg.knowledgeId && parsed.version === 1) state = parsed;
-        } catch {
-          // ignore
-        }
+  /**
+   * 重算 pending 数量
+   * @param reuse doSync 刚算好的本地列表 + 已更新 state + 未被改写的 contentHash，
+   *   传入即复用，跳过 listNotesFull 全文拉取；precomputed 未覆盖的 key 照常 hash；
+   *   不传则走 IPC 拉取（定时/外部触发/失败路径）
+   */
+  const recomputePending = useCallback(
+    async (reuse?: {
+      notes: { key: string; title: string; body: string; refId: string | null }[];
+      state: SyncState | null;
+      precomputed?: Map<string, string>;
+    }) => {
+      const cfg = loadSyncConfig();
+      if (!cfg?.baseUrl || !cfg?.knowledgeId) {
+        setStatus((s) => ({ ...s, phase: "disabled", pendingCount: null }));
+        return;
       }
-      const cnt = await computePendingCount(
-        notes.map((dto) => ({
-          key: dto.key,
-          title: dto.title,
-          body: dto.body,
-          refId: (dto.ref_id as string | null | undefined) ?? null,
-        })),
-        state,
-      );
-      setStatus((s) => {
-        if (s.phase === "syncing" || s.phase === "offline") return { ...s, pendingCount: cnt };
-        return { ...s, pendingCount: cnt };
-      });
-    } catch {
-      // ignore
-    }
-  }, []);
+      const token = getToken(cfg.baseUrl);
+      if (!token) {
+        setStatus((s) => ({ ...s, phase: "disabled", pendingCount: null }));
+        return;
+      }
+      try {
+        let inputs: { key: string; title: string; body: string; refId: string | null }[];
+        let state: SyncState | null;
+        if (reuse) {
+          // doSync 刚拉取全文并算好 hash，直接复用：零 IPC；precomputed 覆盖的 key 跳过 hash
+          inputs = reuse.notes;
+          state = reuse.state;
+        } else {
+          const notes = await listNotesFull();
+          const raw = await readSyncState().catch(() => null);
+          state = null;
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw) as SyncState;
+              if (parsed && parsed.knowledgeId === cfg.knowledgeId && parsed.version === 1) state = parsed;
+            } catch {
+              // ignore
+            }
+          }
+          inputs = notes.map((dto) => ({
+            key: dto.key,
+            title: dto.title,
+            body: dto.body,
+            refId: (dto.ref_id as string | null | undefined) ?? null,
+          }));
+        }
+        const cnt = await computePendingCount(inputs, state, reuse?.precomputed);
+        setStatus((s) => ({ ...s, pendingCount: cnt }));
+      } catch {
+        // ignore
+      }
+    },
+    [],
+  );
 
   const schedulePendingRecompute = useCallback(() => {
     if (pendingTimerRef.current !== null) window.clearTimeout(pendingTimerRef.current);
@@ -299,19 +312,22 @@ export function useSync(opts: {
         }, delay);
       };
 
+      let syncOk = false;
       try {
         const notes = await listNotesFull();
+        // hash 分批并行（crypto.subtle 异步真并行），替代逐篇 await 串行
+        const hashes = await hashNotesBatch(notes.map((dto) => ({ title: dto.title, body: dto.body })));
         const local: LocalNote[] = [];
         const localByKey = new Map<string, LocalNote>();
-        for (const dto of notes) {
-          const h = await hashNote(dto.title, dto.body);
+        for (let i = 0; i < notes.length; i++) {
+          const dto = notes[i];
           const ln: LocalNote = {
             key: dto.key,
             refId: (dto.ref_id as string | null | undefined) ?? null,
             title: dto.title,
             body: dto.body,
             modified: dto.modified,
-            contentHash: h,
+            contentHash: hashes[i],
           };
           local.push(ln);
           localByKey.set(dto.key, ln);
@@ -343,10 +359,13 @@ export function useSync(opts: {
         const remote = await serverApi.listAllPages();
 
         const plan = planSync({ local, remote, state, propagateDeletes: cfg.propagateDeletes, deferConflicts: true });
+        // runSync 期间被本地改写的 key：其快照 hash 已过期，复用时剔除（走重算）
+        const writtenKeys = new Set<string>();
         const io = {
           local: {
             writeNote: async (key: string, title: string, body: string) => {
               const dto = await saveNote(key, body, title);
+              writtenKeys.add(key);
               return { modified: dto.modified };
             },
             setNoteRef: (key: string, ref: string) => setNoteRef(key, ref),
@@ -376,17 +395,25 @@ export function useSync(opts: {
           offlineStepRef.current = 0;
         }
 
-        // Auto-sync silent unless errors/conflicts: only open dialog when needed
-        if (!silent || syncReport.errors > 0 || syncReport.conflicts > 0) {
-          setReport(syncReport);
-        } else {
-          // Still update report state silently but mark to suppress dialog
-          // We set report but App will check silent marker; simplest: still set but let App decide
-          setReport(syncReport);
-        }
+        // 同步成功时静默更新 report（App 按 silent 标记决定是否弹窗），错误/冲突时直接展示
+        setReport(syncReport);
 
         onRefreshRef.current();
-        void recomputePending();
+        // 成功路径零 IPC 复用：本次 local 快照 + 已更新 state；runSync 改写过的 key
+        // 剔除 precomputed（其内容已变，走 hash 重算）；同步期间用户的新编辑由
+        // onRefresh → refreshToken 的防抖重算随后覆盖，不阻塞本次返回
+        syncOk = true;
+        {
+          const precomputed = new Map<string, string>();
+          for (const ln of local) {
+            if (!writtenKeys.has(ln.key)) precomputed.set(ln.key, ln.contentHash);
+          }
+          void recomputePending({
+            notes: local.map((ln) => ({ key: ln.key, title: ln.title, body: ln.body, refId: ln.refId })),
+            state,
+            precomputed,
+          });
+        }
       } catch (e: unknown) {
         if (e instanceof AuthExpiredError) {
           const cfg2 = loadSyncConfig();
@@ -418,7 +445,8 @@ export function useSync(opts: {
       } finally {
         syncingRef.current = false;
         setStatus((s) => (s.phase === "syncing" ? { ...s, phase: "idle" } : s));
-        void recomputePending();
+        // 失败路径 state 不完整，走 IPC 全量重算；成功路径已零 IPC 复用，不再重复拉取
+        if (!syncOk) void recomputePending();
       }
     },
     [clearOfflineTimer, recomputePending],

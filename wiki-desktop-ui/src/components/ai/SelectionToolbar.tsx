@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SELECTION_ACTIONS, type SelectionAction } from "@/lib/ai-prompts";
@@ -7,9 +7,13 @@ import { chatStream } from "@/lib/ai-client";
 import { getAiConfig } from "@/lib/ai-config";
 import { loadSyncConfig } from "@/api/server";
 import { getToken } from "@/lib/server-auth";
-import { Streamdown } from "streamdown";
-import "streamdown/styles.css";
 import type { SelectionSource } from "@/lib/selection-source";
+
+// streamdown（含 styles.css）仅 AI 结果区需要：lazy 后首屏主包不再含
+// react-markdown/remark 系。结果区打开前不加载，打开时 Suspense 占位。
+const LazyStreamdown = lazy(() =>
+  import("streamdown").then((m) => ({ default: m.Streamdown })),
+);
 
 type Props = {
   source: SelectionSource;
@@ -74,41 +78,33 @@ export function SelectionToolbar({
     requestAnimationFrame(() => updateSelection());
   }, [updateSelection]);
 
-  // polling-based selection detection — CM does not emit textarea select/mouseup events reliably
-  // requestAnimationFrame polling is cheap and torn down when selection is stable
+  // 事件驱动的选区检测：无常驻 rAF 轮询。
+  // CM6 用 contenteditable，选区变化会触发 document selectionchange；
+  // mouseup/keyup 覆盖鼠标/键盘操作；1s interval 只做 key 比较兜底极端情况
+  // （变化时才 setState，无变化零开销）。
   useEffect(() => {
-    let raf: number | null = null;
     let lastKey = "";
-    const tick = () => {
+    const check = () => {
       const sel = source.getSelection();
       const key = sel ? `${sel.start}:${sel.end}` : "";
       if (key !== lastKey) {
         lastKey = key;
         handleSelect();
       }
-      raf = requestAnimationFrame(tick);
     };
-    // use mouseup/keyup as cheaper triggers plus a light interval fallback
     const onAny = () => handleSelect();
     window.addEventListener("mouseup", onAny);
     window.addEventListener("keyup", onAny);
-    // lightweight poll only while component mounted — rAF but throttled via key check so no visual jitter
-    raf = requestAnimationFrame(tick);
-    const interval = window.setInterval(() => {
-      const sel = source.getSelection();
-      const key = sel ? `${sel.start}:${sel.end}` : "";
-      if (key !== lastKey) {
-        lastKey = key;
-        updateSelection();
-      }
-    }, 300);
+    document.addEventListener("selectionchange", check);
+    check();
+    const interval = window.setInterval(check, 1000);
     return () => {
       window.removeEventListener("mouseup", onAny);
       window.removeEventListener("keyup", onAny);
-      if (raf !== null) cancelAnimationFrame(raf);
+      document.removeEventListener("selectionchange", check);
       clearInterval(interval);
     };
-  }, [source, handleSelect, updateSelection]);
+  }, [source, handleSelect]);
 
   // reset on note switch
   useEffect(() => {
@@ -244,7 +240,9 @@ export function SelectionToolbar({
           {error && <p className="mb-2 rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</p>}
           {result !== null && result !== "" ? (
             <div className="prose prose-sm max-w-none text-sm dark:prose-invert">
-              <Streamdown>{result}</Streamdown>
+              <Suspense fallback={<p className="text-xs text-muted-foreground">渲染中…</p>}>
+                <LazyStreamdown>{result}</LazyStreamdown>
+              </Suspense>
             </div>
           ) : streaming ? (
             <p className="text-xs text-muted-foreground">生成中…</p>

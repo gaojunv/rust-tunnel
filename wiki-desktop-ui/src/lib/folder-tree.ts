@@ -9,10 +9,13 @@ export type FolderNode = { kind: "folder"; name: string; path: string; children:
 export type TreeNode = FolderNode | NoteNode;
 
 /**
- * 排序比较器：中文友好，大小写不敏感由 localeCompare 处理
+ * 排序比较器：中文友好。Intl.Collator 实例复用（顶层单例），
+ * 避免每次比较重复解析 "zh" locale（旧实现每次 localeCompare 都走慢路径）。
  */
+const NAME_COLLATOR = new Intl.Collator("zh");
+
 function compareName(a: string, b: string): number {
-  return a.localeCompare(b, "zh");
+  return NAME_COLLATOR.compare(a, b);
 }
 
 /**

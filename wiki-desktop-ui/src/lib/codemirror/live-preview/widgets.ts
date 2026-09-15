@@ -1,8 +1,11 @@
 import { Facet } from "@codemirror/state";
 import { EditorView, WidgetType } from "@codemirror/view";
-import katex from "katex";
+// katex CSS 保留静态导入：CSS 拆分会打乱首屏样式顺序、收益小（~25KB gzip 前 24KB 是字体，
+// CSS 本体仅 ~24KB 未压缩）；JS 侧（katex.mjs ~592KB 未压缩）改首次遇到公式时动态 import。
 import "katex/dist/katex.min.css";
 import { attachWikilinkHover } from "./hover-preview";
+
+type KatexModule = typeof import("katex");
 
 /**
  * Live Preview 视图 widget 层。
@@ -21,14 +24,70 @@ const CHECK_EMPTY = "[ ]";
 const CHECK_FULL = "[x]";
 
 /**
+ * widget 当前文档区间：经 `view.posAtDOM` 由 DOM 反查。
+ * widget 闭包里存的 from 是"创建时"偏移，上方编辑后 CM 会映射 Decoration
+ * 但不会更新闭包——点击时必须反查，否则跳到陈旧偏移。反查失败（widget 已
+ * 卸载等）时回退构造时的偏移。
+ */
+export function widgetRangeOf(
+  view: EditorView,
+  dom: HTMLElement,
+  fallbackFrom: number,
+  fallbackTo: number,
+): { from: number; to: number } {
+  // 仅当 dom 实际挂在编辑器内才信任反查：游离 DOM 上 posAtDOM 会返回
+  // 最近可定位位置（如 0），是误导值，必须回退构造偏移。
+  try {
+    if (view.dom.contains(dom)) {
+      const pos = view.posAtDOM(dom);
+      if (pos >= 0) {
+        const len = Math.max(0, fallbackTo - fallbackFrom);
+        return { from: pos, to: pos + len };
+      }
+    }
+  } catch {
+    // 忽略，回退构造偏移
+  }
+  return { from: fallbackFrom, to: fallbackTo };
+}
+
+/**
+ * widget 点击还原：光标移入源码区间。优先用事件坐标反查（MdLink 参照实现），
+ * 坐标不可用时用 DOM 反查，最后回退构造偏移。
+ */
+export function revealAtClick(
+  view: EditorView,
+  e: MouseEvent,
+  dom: HTMLElement,
+  fallbackFrom: number,
+  fallbackTo: number,
+): void {
+  let anchor: number | null = null;
+  // 仅当 widget 已挂载才做坐标反查（游离 DOM/合成事件的坐标是误导值）
+  if (view.dom.contains(dom)) {
+    try {
+      anchor = view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
+    } catch {
+      anchor = null;
+    }
+  }
+  if (anchor == null) anchor = widgetRangeOf(view, dom, fallbackFrom, fallbackTo).from;
+  view.dispatch({ selection: { anchor } });
+  view.focus();
+}
+
+/**
  * 任务复选框。点击在 `[ ]` / `[x]` 之间翻转，直接在原文上改动（Decoration 是
  * 纯视图层，format-commands/搜索/补全都仍作用于原文）。
  */
 export class CheckboxWidget extends WidgetType {
   constructor(
     readonly checked: boolean,
-    private readonly from: number,
-    private readonly to: number,
+    // _from/_to 仅 click 时兜底用（posAtDOM 失败时），eq 不比较位置：
+    // Decoration 映射保证位置变化时 widget 重建；上方编辑导致偏移漂移时，
+    // 位置相同+内容相同即复用 DOM，避免其前任何编辑都销毁重建。
+    private readonly _from: number,
+    private readonly _to: number,
   ) {
     super();
   }
@@ -36,9 +95,7 @@ export class CheckboxWidget extends WidgetType {
   eq(other: WidgetType): boolean {
     return (
       other instanceof CheckboxWidget &&
-      other.checked === this.checked &&
-      other.from === this.from &&
-      other.to === this.to
+      other.checked === this.checked
     );
   }
 
@@ -56,7 +113,9 @@ export class CheckboxWidget extends WidgetType {
       e.preventDefault();
       e.stopPropagation();
       const insert = this.checked ? CHECK_EMPTY : CHECK_FULL;
-      view.dispatch({ changes: { from: this.from, to: this.to, insert } });
+      // 经 DOM 反查当前位置（闭包偏移在上方编辑后会陈旧），失败时回退构造偏移
+      const at = widgetRangeOf(view, box, this._from, this._to);
+      view.dispatch({ changes: { from: at.from, to: at.to, insert } });
       view.focus();
     });
     return box;
@@ -251,12 +310,12 @@ export class ImageWidget extends WidgetType {
       wrap.appendChild(img);
     }
 
-    // 点击 → 光标移入源码区间，自然还原
+    // 点击 → 光标移入源码区间，自然还原（经 DOM/坐标反查，闭包偏移会陈旧）
     wrap.style.cursor = "pointer";
+    const imgFrom = this.from;
     wrap.addEventListener("click", (e) => {
       e.preventDefault();
-      view.dispatch({ selection: { anchor: this.from } });
-      view.focus();
+      revealAtClick(view, e, wrap, imgFrom, imgFrom);
     });
 
     return wrap;
@@ -692,11 +751,11 @@ export class FrontmatterWidget extends WidgetType {
     el.className = "cm-lp-frontmatter";
     const label = this.propCount === 1 ? "1 property" : `${this.propCount} properties`;
     el.textContent = `··· ${label} ···`;
+    const fmFrom = this.from;
     el.addEventListener("click", (e) => {
       e.preventDefault();
-      // 光标移入 frontmatter 区间起点 → 还原为源码
-      view.dispatch({ selection: { anchor: this.from } });
-      view.focus();
+      // 光标移入 frontmatter 区间起点 → 还原为源码（经 DOM/坐标反查，闭包偏移会陈旧）
+      revealAtClick(view, e, el, fmFrom, fmFrom);
     });
     return el;
   }
@@ -769,6 +828,74 @@ export class CalloutWidget extends WidgetType {
 // ── 数学公式 widget ────────────────────────────────────────────────────────
 
 /**
+ * KaTeX 渲染结果缓存（模块级 LRU，上限 500）。
+ * `toDOM` 每次重建 DOM 都会同步调 `katex.renderToString`，相同公式反复渲染
+ * 是纯浪费；`eq` 只防同实例重复（不同实例同 tex 仍重渲）。缓存 key 含
+ * displayMode（同一 tex 在行内/块级下输出不同）。
+ */
+const KATEX_CACHE_LIMIT = 500;
+const katexCache = new Map<string, string>();
+
+export function katexCacheSizeForTest(): number {
+  return katexCache.size;
+}
+
+export function clearKatexCacheForTest(): void {
+  katexCache.clear();
+}
+
+// katex 模块单例：首次遇到公式时动态 import（首屏不进主包），后续复用。
+let katexModule: KatexModule | null = null;
+let katexLoadPromise: Promise<KatexModule> | null = null;
+
+function loadKatex(): Promise<KatexModule> {
+  if (katexModule) return Promise.resolve(katexModule);
+  katexLoadPromise ??= import("katex").then((m) => {
+    katexModule = (m as unknown as { default?: KatexModule }).default ?? (m as unknown as KatexModule);
+    return katexModule;
+  });
+  return katexLoadPromise;
+}
+
+/** 测试辅助：预置 katex 模块（jsdom 单测避免真实动态 import 开销） */
+export function __setKatexModuleForTest(mod: KatexModule | null): void {
+  katexModule = mod;
+  if (mod === null) katexLoadPromise = null;
+}
+
+function renderKatexCached(katex: KatexModule, tex: string, displayMode: boolean): string {
+  const key = `${displayMode ? "1" : "0"}:${tex}`;
+  const hit = katexCache.get(key);
+  if (hit !== undefined) {
+    // LRU refresh：删了重插，移到插入序末尾
+    katexCache.delete(key);
+    katexCache.set(key, hit);
+    return hit;
+  }
+  const html = katex.renderToString(tex, {
+    displayMode,
+    throwOnError: false,
+  });
+  katexCache.set(key, html);
+  if (katexCache.size > KATEX_CACHE_LIMIT) {
+    // 淘汰最久未用（Map 插入序首位）
+    const oldest = katexCache.keys().next();
+    if (!oldest.done) katexCache.delete(oldest.value);
+  }
+  return html;
+}
+
+/** 已加载 katex 时的同步渲染（缓存命中优先；模块未加载时返回 null 由调用方走异步路径） */
+function tryRenderKatexSync(tex: string, displayMode: boolean): string | null {
+  if (!katexModule) return null;
+  try {
+    return renderKatexCached(katexModule, tex, displayMode);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * KaTeX 数学公式渲染。`$$...$$` 块级公式（displayMode）与 `$...$` 行内公式共用。
  * 渲染失败时退化为等宽斜体原文显示（`cm-lp-math-error`）。
  *
@@ -778,6 +905,7 @@ export class MathWidget extends WidgetType {
   constructor(
     readonly tex: string,
     readonly displayMode: boolean,
+    // 仅 click 兜底用（posAtDOM/坐标反查失败时），eq 不比较位置
     private readonly from: number,
   ) {
     super();
@@ -794,20 +922,48 @@ export class MathWidget extends WidgetType {
   toDOM(view: EditorView): HTMLElement {
     const el = document.createElement("div");
     el.className = this.displayMode ? "cm-lp-math cm-lp-math-block" : "cm-lp-math";
-    try {
-      el.innerHTML = katex.renderToString(this.tex, {
-        displayMode: this.displayMode,
-        throwOnError: false,
-      });
-    } catch {
-      el.textContent = this.tex;
+    const tex = this.tex;
+    const displayMode = this.displayMode;
+    // 同步路径：katex 已加载（或缓存命中）→ 直接渲染，保持原有 eq/DOM 复用语义
+    const syncHtml = tryRenderKatexSync(tex, displayMode);
+    if (syncHtml !== null) {
+      el.innerHTML = syncHtml;
+    } else if (katexModule === null) {
+      // 异步路径：首次遇到公式 → 占位 + 动态 import 后回填。
+      // 回填条件：el 仍挂载（isConnected）才写 innerHTML，避免游离 DOM 误写；
+      // 回填内容经 LRU 缓存，后续同 tex 走同步路径。
+      el.classList.add("cm-lp-math-loading");
+      el.textContent = tex;
+      void loadKatex().then(
+        (katex) => {
+          if (!el.isConnected) return;
+          try {
+            el.innerHTML = renderKatexCached(katex, tex, displayMode);
+          } catch {
+            el.textContent = tex;
+            el.classList.add("cm-lp-math-error");
+          } finally {
+            el.classList.remove("cm-lp-math-loading");
+          }
+        },
+        () => {
+          if (!el.isConnected) return;
+          el.textContent = tex;
+          el.classList.add("cm-lp-math-error");
+          el.classList.remove("cm-lp-math-loading");
+        },
+      );
+    } else {
+      // katex 已加载但渲染抛错（非法 tex 等）→ 退化为原文
+      el.textContent = tex;
       el.classList.add("cm-lp-math-error");
     }
     el.style.cursor = "pointer";
+    const mathFrom = this.from;
     el.addEventListener("click", (e) => {
       e.preventDefault();
-      view.dispatch({ selection: { anchor: this.from } });
-      view.focus();
+      // 经 DOM/坐标反查当前位置（闭包偏移在上方编辑后会陈旧）
+      revealAtClick(view, e, el, mathFrom, mathFrom);
     });
     return el;
   }

@@ -1,9 +1,37 @@
 import type { DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult, SearchHitDto, VaultInfo } from "./types";
-import { mockVault } from "./mock";
+
+// mockVault 仅非 Tauri 环境（浏览器/mock）使用：动态导入，生产主包不含 mock.ts。
+// （Tauri 容器内 mock 分支永不执行，mock chunk 不会被加载。）
+type MockVault = typeof import("./mock").mockVault;
+let mockVaultPromise: Promise<MockVault> | null = null;
+function loadMockVault(): Promise<MockVault> {
+  mockVaultPromise ??= import("./mock").then((m) => m.mockVault);
+  return mockVaultPromise;
+}
 
 // 是否处于 Tauri 容器内
 export const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+// —— base64 编解码（附件 IPC 用字符串传输，避免 number[] JSON 膨胀 3~4 倍）——
+// btoa 入参是 UTF-16 码元串：按 32KB 分块 fromCharCode，避免大文件栈溢出。
+
+const B64_CHUNK = 0x8000;
+
+export function uint8ToBase64(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += B64_CHUNK) {
+    s += String.fromCharCode(...bytes.subarray(i, i + B64_CHUNK));
+  }
+  return btoa(s);
+}
+
+export function base64ToBytes(b64: string): Uint8Array {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
 
 // 通用 invoke 封装：Tauri 环境动态导入并 invoke，否则走 mock
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -12,62 +40,63 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     return invoke<T>(cmd, args);
   }
   // —— mock 分支 —— //
+  const mv = await loadMockVault();
   switch (cmd) {
     case "get_vault_info":
-      return mockVault.getVaultInfo() as unknown as T;
+      return mv.getVaultInfo() as unknown as T;
     case "list_notes":
-      return mockVault.listNotes() as unknown as T;
+      return mv.listNotes() as unknown as T;
     case "get_note":
-      return mockVault.getNote(args?.["key"] as string) as unknown as T;
+      return mv.getNote(args?.["key"] as string) as unknown as T;
     case "save_note":
-      return mockVault.saveNote(
+      return mv.saveNote(
         args?.["key"] as string,
         args?.["body"] as string,
         args?.["title"] as string | undefined,
       ) as unknown as T;
     case "delete_note":
-      return mockVault.deleteNote(args?.["key"] as string) as unknown as T;
+      return mv.deleteNote(args?.["key"] as string) as unknown as T;
     case "search_notes":
-      return mockVault.searchNotes(
+      return mv.searchNotes(
         args?.["query"] as string,
         args?.["limit"] as number,
       ) as unknown as T;
     case "get_graph":
-      return mockVault.getGraph() as unknown as T;
+      return mv.getGraph() as unknown as T;
     case "rename_note":
-      return mockVault.renameNote(
+      return mv.renameNote(
         args?.["key"] as string,
         args?.["newKey"] as string,
         args?.["rewriteLinks"] as boolean,
       ) as unknown as T;
     case "rename_folder":
-      return mockVault.renameFolder(
+      return mv.renameFolder(
         args?.["oldPrefix"] as string,
         args?.["newPrefix"] as string,
         args?.["rewriteLinks"] as boolean,
       ) as unknown as T;
     case "delete_folder":
-      return mockVault.deleteFolder(args?.["prefix"] as string) as unknown as T;
+      return mv.deleteFolder(args?.["prefix"] as string) as unknown as T;
     case "list_notes_full":
-      return mockVault.listNotesFull() as unknown as T;
+      return mv.listNotesFull() as unknown as T;
     case "read_sync_state":
-      return mockVault.readSyncState() as unknown as T;
+      return mv.readSyncState() as unknown as T;
     case "write_sync_state":
-      return mockVault.writeSyncState(args?.["json"] as string) as unknown as T;
+      return mv.writeSyncState(args?.["json"] as string) as unknown as T;
     case "set_note_ref":
-      return mockVault.setNoteRef(args?.["key"] as string, args?.["refId"] as string) as unknown as T;
+      return mv.setNoteRef(args?.["key"] as string, args?.["refId"] as string) as unknown as T;
     case "save_attachment": {
-      const data = args?.["data"] as number[] | undefined;
-      const bytes = data ? new Uint8Array(data) : new Uint8Array();
-      return mockVault.saveAttachment(
+      const data = args?.["data"] as string | undefined;
+      const bytes = data ? base64ToBytes(data) : new Uint8Array();
+      return mv.saveAttachment(
         args?.["noteKey"] as string,
         args?.["fileName"] as string,
         bytes,
       ) as unknown as T;
     }
     case "read_attachment": {
-      const raw = mockVault.readAttachment(args?.["relPath"] as string) as unknown as Uint8Array;
-      return Array.from(raw) as unknown as T;
+      const raw = mv.readAttachment(args?.["relPath"] as string) as unknown as Uint8Array;
+      return uint8ToBase64(raw) as unknown as T;
     }
     default:
       throw new Error(`未知命令: ${cmd}`);
@@ -151,10 +180,29 @@ export function saveAttachment(
   return call<{ rel_path: string }>("save_attachment", {
     noteKey,
     fileName,
-    data: Array.from(data),
+    data: uint8ToBase64(data),
   });
 }
 
 export function readAttachment(relPath: string): Promise<Uint8Array> {
-  return call<number[]>("read_attachment", { relPath }).then((arr) => new Uint8Array(arr));
+  return call<string>("read_attachment", { relPath }).then((b64) => base64ToBytes(b64));
+}
+
+// —— vault 外部文件变更订阅 ——
+//
+// Rust 侧 `spawn_vault_watcher`（crates/wiki-serve/src/tauri_app.rs）递归监听
+// vault 根目录，debounce ~300ms 后经 `vault:fs-changed` 事件广播变更 note key 数组。
+
+export const VAULT_FS_CHANGED_EVENT = "vault:fs-changed";
+
+export type UnlistenFn = () => void;
+
+/** 订阅 vault 外部文件变更；非 Tauri 环境（浏览器/mock）返回 no-op。 */
+export async function onVaultFsChanged(cb: (keys: string[]) => void): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<string[]>(VAULT_FS_CHANGED_EVENT, (event) => {
+    cb(Array.isArray(event.payload) ? event.payload : []);
+  });
+  return unlisten;
 }

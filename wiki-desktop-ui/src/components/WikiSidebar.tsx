@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Search, FolderPlus, Plus } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { deleteFolder, deleteNote, getNote, listNotes, renameFolder, renameNote, searchNotes } from "@/api/tauri";
+import { deleteFolder, deleteNote, getNote, listNotes, onVaultFsChanged, renameFolder, renameNote, searchNotes } from "@/api/tauri";
+import type { UnlistenFn } from "@/api/tauri";
 import type { NoteSummary, SearchHitDto, VaultInfo } from "@/api/types";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { FolderTree } from "@/components/FolderTree";
@@ -54,7 +55,7 @@ function isNotFoundError(msg: string): boolean {
   return lower.includes("notfound") || lower.includes("not found") || msg.includes("笔记不存在");
 }
 
-export function WikiSidebar({
+export const WikiSidebar = memo(function WikiSidebar({
   selectedKey,
   onSelect,
   refreshToken,
@@ -78,10 +79,35 @@ export function WikiSidebar({
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const trimmed = query.trim();
 
-  // 持久化展开状态
+  // 持久化展开状态：300ms 防抖，连续展开/折叠中不反复 JSON.stringify + 写盘
+  const expandedSaveTimer = useRef<number | null>(null);
   useEffect(() => {
-    saveExpanded(expanded);
+    if (expandedSaveTimer.current !== null) window.clearTimeout(expandedSaveTimer.current);
+    expandedSaveTimer.current = window.setTimeout(() => {
+      expandedSaveTimer.current = null;
+      saveExpanded(expanded);
+    }, 300);
+    return () => {
+      if (expandedSaveTimer.current !== null) {
+        window.clearTimeout(expandedSaveTimer.current);
+        expandedSaveTimer.current = null;
+      }
+    };
   }, [expanded]);
+  const expandedRef = useRef(expanded);
+  useEffect(() => {
+    expandedRef.current = expanded;
+  }, [expanded]);
+  useEffect(() => {
+    // 卸载时立即落盘，避免防抖窗口内关闭丢失最后一次展开态
+    return () => {
+      if (expandedSaveTimer.current !== null) {
+        window.clearTimeout(expandedSaveTimer.current);
+        expandedSaveTimer.current = null;
+        saveExpanded(expandedRef.current);
+      }
+    };
+  }, []);
 
   const toggle = useCallback((path: string) => {
     setExpanded((prev) => {
@@ -120,6 +146,22 @@ export function WikiSidebar({
     return hits.filter((h) => (tagMap.get(h.note_key) ?? []).includes(activeTag));
   }, [hits, notes, activeTag]);
 
+  // vault 外部文件变更：递增 fsTick，走下方同一加载通路刷新列表
+  const [fsTick, setFsTick] = useState(0);
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    onVaultFsChanged(() => {
+      if (!cancelled) setFsTick((t) => t + 1);
+    }).then((u) => {
+      if (!cancelled) unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   // 加载列表
   useEffect(() => {
     let cancelled = false;
@@ -133,7 +175,7 @@ export function WikiSidebar({
     return () => {
       cancelled = true;
     };
-  }, [refreshToken]);
+  }, [refreshToken, fsTick]);
 
   // 搜索（输入非空时展示 search_notes 结果）
   useEffect(() => {
@@ -159,36 +201,45 @@ export function WikiSidebar({
 
   const isSearching = trimmed.length > 0;
 
-  const handleCreate = async (raw: string) => {
-    const fullKey = createInFolder ? `${createInFolder}/${raw}` : raw;
-    const normalized = normalizeNoteKey(fullKey);
-    const err = validateNoteKey(fullKey);
-    if (err) throw new Error(err);
-    if (notes.some((n) => n.key === normalized)) {
-      throw new Error("已存在同名笔记");
-    }
-    await onCreateNote(normalized, normalized);
-    // 自动展开祖先
-    const ancestors = folderPathsOf(normalized);
-    if (ancestors.length > 0) {
-      setExpanded((prev) => {
-        const next = new Set(prev);
-        for (const a of ancestors) next.add(a);
-        return next;
-      });
-    }
-    setNewOpen(false);
-    setCreateInFolder(null);
-  };
+  // 新建/重命名判重用的 key 集合：notes 变化时重建，避免每渲染 some() 线性扫描
+  const noteKeySet = useMemo(() => new Set(notes.map((n) => n.key)), [notes]);
 
-  const createValidate = (raw: string): string | null => {
-    const fullKey = createInFolder ? `${createInFolder}/${raw}` : raw;
-    const err = validateNoteKey(fullKey);
-    if (err) return err;
-    const normalized = normalizeNoteKey(fullKey);
-    if (notes.some((n) => n.key === normalized)) return "已存在同名笔记";
-    return null;
-  };
+  const handleCreate = useCallback(
+    async (raw: string) => {
+      const fullKey = createInFolder ? `${createInFolder}/${raw}` : raw;
+      const normalized = normalizeNoteKey(fullKey);
+      const err = validateNoteKey(fullKey);
+      if (err) throw new Error(err);
+      if (noteKeySet.has(normalized)) {
+        throw new Error("已存在同名笔记");
+      }
+      await onCreateNote(normalized, normalized);
+      // 自动展开祖先
+      const ancestors = folderPathsOf(normalized);
+      if (ancestors.length > 0) {
+        setExpanded((prev) => {
+          const next = new Set(prev);
+          for (const a of ancestors) next.add(a);
+          return next;
+        });
+      }
+      setNewOpen(false);
+      setCreateInFolder(null);
+    },
+    [createInFolder, noteKeySet, onCreateNote],
+  );
+
+  const createValidate = useCallback(
+    (raw: string): string | null => {
+      const fullKey = createInFolder ? `${createInFolder}/${raw}` : raw;
+      const err = validateNoteKey(fullKey);
+      if (err) return err;
+      const normalized = normalizeNoteKey(fullKey);
+      if (noteKeySet.has(normalized)) return "已存在同名笔记";
+      return null;
+    },
+    [createInFolder, noteKeySet],
+  );
 
   const handleCreateInFolder = useCallback((folderPath: string) => {
     setCreateInFolder(folderPath);
@@ -291,11 +342,14 @@ export function WikiSidebar({
     [onFolderChanged, onHistoryRemovePrefix],
   );
 
-  const handleRenameSubmit = async (raw: string) => {
-    if (!renameTarget) return;
-    await handleRenameFolder(renameTarget, raw);
-    setRenameTarget(null);
-  };
+  const handleRenameSubmit = useCallback(
+    async (raw: string) => {
+      if (!renameTarget) return;
+      await handleRenameFolder(renameTarget, raw);
+      setRenameTarget(null);
+    },
+    [renameTarget, handleRenameFolder],
+  );
 
   // 笔记重命名：与 NoteEditor.handleRename 同模式（校验→判重→renameNote rewriteLinks=true）
   const handleRenameNote = useCallback(
@@ -330,16 +384,22 @@ export function WikiSidebar({
     [onFolderChanged, onHistoryReplace],
   );
 
-  const handleRenameNoteSubmit = async (raw: string) => {
-    if (!renameNoteTarget) return;
-    await handleRenameNote(renameNoteTarget, raw);
-    setRenameNoteTarget(null);
-  };
+  const handleRenameNoteSubmit = useCallback(
+    async (raw: string) => {
+      if (!renameNoteTarget) return;
+      await handleRenameNote(renameNoteTarget, raw);
+      setRenameNoteTarget(null);
+    },
+    [renameNoteTarget, handleRenameNote],
+  );
+
+  // key→title 映射：删除确认框用，避免每渲染 find 线性扫描
+  const noteTitleMap = useMemo(() => new Map(notes.map((n) => [n.key, n.title] as const)), [notes]);
 
   // 笔记删除：与 NoteEditor.handleDelete 同模式（window.confirm 确认）
   const handleDeleteNote = useCallback(
     async (key: string) => {
-      const title = notes.find((n) => n.key === key)?.title ?? key;
+      const title = noteTitleMap.get(key) ?? key;
       const ok = window.confirm(`确定删除「${title}」吗？此操作不可撤销。`);
       if (!ok) return;
       try {
@@ -352,10 +412,37 @@ export function WikiSidebar({
       onHistoryRemove?.(key);
       onFolderChanged?.();
     },
-    [notes, onFolderChanged, onHistoryRemove],
+    [noteTitleMap, onFolderChanged, onHistoryRemove],
   );
 
-  const renameValidate = (raw: string): string | null => validateNoteKey(raw);
+  const handleDeleteNoteVoid = useCallback((key: string) => void handleDeleteNote(key), [handleDeleteNote]);
+  const handleRenameFolderOpen = useCallback((path: string) => setRenameTarget(path), []);
+  const handleRenameNoteOpen = useCallback((key: string) => setRenameNoteTarget(key), []);
+  const handleCloseNewDialog = useCallback(() => {
+    setNewOpen(false);
+    setCreateInFolder(null);
+  }, []);
+  const handleCloseRenameFolder = useCallback(() => setRenameTarget(null), []);
+  const handleCloseRenameNote = useCallback(() => setRenameNoteTarget(null), []);
+  const handleCloseFolderHint = useCallback(() => {
+    setShowNewFolderHint(false);
+    setCreateInFolder(null);
+  }, []);
+  const handleSubfolderSubmit = useCallback(async (raw: string) => {
+    const normalized = normalizeNoteKey(raw);
+    // 新建文件夹本质是提示用户去新建笔记，这里直接打开新建对话框并预填文件夹
+    setShowNewFolderHint(false);
+    setCreateInFolder(normalized);
+    setNewOpen(true);
+  }, []);
+  const handleOpenNewNote = useCallback(() => {
+    setCreateInFolder(null);
+    setNewOpen(true);
+  }, []);
+  const handleOpenNewFolderHint = useCallback(() => setShowNewFolderHint(true), []);
+  const handleTagToggle = useCallback((tag: string) => setActiveTag((prev) => (prev === tag ? null : tag)), []);
+
+  const renameValidate = useCallback((raw: string): string | null => validateNoteKey(raw), []);
 
   const newDialogTitle = createInFolder ? `在 ${createInFolder} 新建笔记` : "新建笔记";
   const newDialogHint = createInFolder
@@ -391,10 +478,7 @@ export function WikiSidebar({
             variant="ghost"
             size="icon"
             className="size-9 shrink-0"
-            onClick={() => {
-              setCreateInFolder(null);
-              setNewOpen(true);
-            }}
+            onClick={handleOpenNewNote}
             title="新建笔记"
             aria-label="新建笔记"
           >
@@ -405,7 +489,7 @@ export function WikiSidebar({
             variant="ghost"
             size="icon"
             className="size-9 shrink-0"
-            onClick={() => setShowNewFolderHint(true)}
+            onClick={handleOpenNewFolderHint}
             title="新建文件夹"
             aria-label="新建文件夹"
           >
@@ -420,19 +504,7 @@ export function WikiSidebar({
               {tagChips.map(({ tag, count }) => {
                 const active = activeTag === tag;
                 return (
-                  <button
-                    key={tag}
-                    type="button"
-                    onClick={() => setActiveTag((prev) => (prev === tag ? null : tag))}
-                    className="shrink-0"
-                    aria-pressed={active}
-                    aria-label={`按标签 ${tag} 过滤`}
-                  >
-                    <Badge variant={active ? "default" : "secondary"} className="gap-1 px-2 py-0.5 text-xs">
-                      {tag}
-                      <span className="text-[10px] opacity-70">{count}</span>
-                    </Badge>
-                  </button>
+                  <TagChip key={tag} tag={tag} count={count} active={active} onToggle={handleTagToggle} />
                 );
               })}
             </div>
@@ -450,22 +522,14 @@ export function WikiSidebar({
           ) : (
             <ul className="space-y-1">
               {filteredHits.map((h) => (
-                <li key={h.note_key}>
-                  <button
-                    type="button"
-                    onClick={() => onSelect(h.note_key)}
-                    className={cn(
-                      "flex w-full flex-col gap-1 rounded-md border px-3 py-2.5 text-left transition-colors",
-                      selectedKey === h.note_key
-                        ? "border-primary/40 bg-accent"
-                        : "border-transparent hover:bg-accent/60",
-                    )}
-                  >
-                    <span className="line-clamp-1 text-sm font-medium">{h.title}</span>
-                    <span className="line-clamp-2 text-xs text-muted-foreground">{h.snippet}</span>
-                    <span className="text-xs text-muted-foreground">匹配分 {h.score.toFixed(1)}</span>
-                  </button>
-                </li>
+                <SearchHitRow
+                  key={h.note_key}
+                  noteKey={h.note_key}
+                  title={h.title}
+                  snippet={h.snippet}
+                  selected={selectedKey === h.note_key}
+                  onSelect={onSelect}
+                />
               ))}
             </ul>
           )
@@ -478,10 +542,10 @@ export function WikiSidebar({
             onSelectNote={onSelect}
             onCreateInFolder={handleCreateInFolder}
             onCreateSubfolder={handleCreateSubfolder}
-            onRenameFolder={(path) => setRenameTarget(path)}
+            onRenameFolder={handleRenameFolderOpen}
             onDeleteFolder={handleDeleteFolder}
-            onRenameNote={(key) => setRenameNoteTarget(key)}
-            onDeleteNote={(key) => void handleDeleteNote(key)}
+            onRenameNote={handleRenameNoteOpen}
+            onDeleteNote={handleDeleteNoteVoid}
           />
         )}
       </ScrollArea>
@@ -495,10 +559,7 @@ export function WikiSidebar({
           submitText="创建"
           validate={createValidate}
           onSubmit={handleCreate}
-          onClose={() => {
-            setNewOpen(false);
-            setCreateInFolder(null);
-          }}
+          onClose={handleCloseNewDialog}
         />
       )}
 
@@ -512,7 +573,7 @@ export function WikiSidebar({
           submitText="重命名"
           validate={renameValidate}
           onSubmit={handleRenameSubmit}
-          onClose={() => setRenameTarget(null)}
+          onClose={handleCloseRenameFolder}
         />
       )}
 
@@ -526,7 +587,7 @@ export function WikiSidebar({
           submitText="重命名"
           validate={renameValidate}
           onSubmit={handleRenameNoteSubmit}
-          onClose={() => setRenameNoteTarget(null)}
+          onClose={handleCloseRenameNote}
         />
       )}
 
@@ -539,19 +600,74 @@ export function WikiSidebar({
           hint="文件夹随首篇笔记创建；请输入 folder/note 形式的笔记路径来创建首篇笔记"
           submitText="去新建笔记"
           validate={renameValidate}
-          onSubmit={async (raw) => {
-            const normalized = normalizeNoteKey(raw);
-            // 新建文件夹本质是提示用户去新建笔记，这里直接打开新建对话框并预填文件夹
-            setShowNewFolderHint(false);
-            setCreateInFolder(normalized);
-            setNewOpen(true);
-          }}
-          onClose={() => {
-            setShowNewFolderHint(false);
-            setCreateInFolder(null);
-          }}
+          onSubmit={handleSubfolderSubmit}
+          onClose={handleCloseFolderHint}
         />
       )}
     </div>
   );
-}
+});
+
+/** 搜索结果行：memo，hits 列表滚动/输入时仅变化行重渲染 */
+const SearchHitRow = memo(function SearchHitRow({
+  noteKey,
+  title,
+  snippet,
+  selected,
+  onSelect,
+}: {
+  noteKey: string;
+  title: string;
+  snippet: string | null;
+  selected: boolean;
+  onSelect: (key: string) => void;
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => onSelect(noteKey)}
+        className={cn(
+          "flex w-full flex-col gap-1 rounded-md border px-3 py-2.5 text-left transition-colors",
+          selected ? "border-primary/40 bg-accent" : "border-transparent hover:bg-accent/60",
+        )}
+      >
+        <span className="line-clamp-1 text-sm font-medium">{title}</span>
+        <span className="truncate text-xs text-muted-foreground">{noteKey}</span>
+        {snippet && (
+          <span className="line-clamp-2 whitespace-pre-wrap break-words text-xs text-muted-foreground">
+            {snippet}
+          </span>
+        )}
+      </button>
+    </li>
+  );
+});
+
+/** 标签 chip：memo，按 active/tag/count 判等，行内 20 个 chip 不随输入框 query 重渲染 */
+const TagChip = memo(function TagChip({
+  tag,
+  count,
+  active,
+  onToggle,
+}: {
+  tag: string;
+  count: number;
+  active: boolean;
+  onToggle: (tag: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(tag)}
+      className="shrink-0"
+      aria-pressed={active}
+      aria-label={`按标签 ${tag} 过滤`}
+    >
+      <Badge variant={active ? "default" : "secondary"} className="gap-1 px-2 py-0.5 text-xs">
+        {tag}
+        <span className="text-[10px] opacity-70">{count}</span>
+      </Badge>
+    </button>
+  );
+});

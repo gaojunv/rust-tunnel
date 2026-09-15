@@ -58,42 +58,136 @@ pub fn render_html(content: &str) -> String {
     postprocess_wikilinks(&raw)
 }
 
-/// 提取所有标题的文本（跳过 frontmatter）。
+/// 单次 comrak 解析的产物：代码块字节区间与标题文本。
+///
+/// 由 [`analyze_markdown`] 一次 `parse_document` 产出，供调用方复用，
+/// 避免对同一正文做多次全量解析。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownAnalysis {
+    /// 代码块（围栏块与行内码）的字节区间（开区间 `end`）。
+    pub code_ranges: Vec<(usize, usize)>,
+    /// 标题层级文本（`#`/`##`/`###` …）。
+    pub headings: Vec<String>,
+}
+
+/// 单次 comrak 解析同时产出代码块区间与标题。
+///
+/// 只调一次 `parse_document`，在同一 AST 上做线性遍历收集两种信息；
+/// 等价于 `collect_code_ranges` + [`extract_headings`] 分两次解析的结果。
 #[must_use]
-pub fn extract_headings(content: &str) -> Vec<String> {
+pub fn analyze_markdown(content: &str) -> MarkdownAnalysis {
     use comrak::nodes::NodeValue;
-    use comrak::{parse_document, Arena};
+    use comrak::Arena;
 
     let options = comrak_options();
     let arena = Arena::new();
-    let root = parse_document(&arena, content, &options);
+    let root = comrak::parse_document(&arena, content, &options);
+    let line_starts = compute_line_starts(content);
+    let content_len = content.len();
+    let mut code_ranges = Vec::new();
     let mut headings = Vec::new();
     for node in root.descendants() {
         let ast = node.data();
-        if !matches!(ast.value, NodeValue::Heading(_)) {
-            continue;
-        }
-        let mut text = String::new();
-        for desc in node.descendants() {
-            if desc.same_node(node) {
-                continue;
+        match &ast.value {
+            NodeValue::CodeBlock(_) | NodeValue::Code(_) => {
+                let sp = ast.sourcepos;
+                if sp.start.line == 0 || sp.end.line == 0 {
+                    continue;
+                }
+                let Some(start) =
+                    byte_offset(&line_starts, content_len, sp.start.line, sp.start.column)
+                else {
+                    continue;
+                };
+                let Some(end_inclusive) =
+                    byte_offset(&line_starts, content_len, sp.end.line, sp.end.column)
+                else {
+                    continue;
+                };
+                let end_exclusive = end_inclusive.checked_add(1).unwrap_or(content_len);
+                let end_clamped = if end_exclusive > content_len {
+                    content_len
+                } else {
+                    end_exclusive
+                };
+                if start < end_clamped {
+                    code_ranges.push((start, end_clamped));
+                }
             }
-            let d = desc.data();
-            match &d.value {
-                NodeValue::Text(t) => text.push_str(t),
-                NodeValue::Code(c) => text.push_str(&c.literal),
-                _ => {}
+            NodeValue::Heading(_) => {
+                let mut text = String::new();
+                for desc in node.descendants() {
+                    if desc.same_node(node) {
+                        continue;
+                    }
+                    let d = desc.data();
+                    match &d.value {
+                        NodeValue::Text(t) => text.push_str(t),
+                        NodeValue::Code(c) => text.push_str(&c.literal),
+                        _ => {}
+                    }
+                }
+                let trimmed = text.trim().to_owned();
+                if trimmed.is_empty() {
+                    // 空标题仍记录为空串以保留结构，但通常不出现
+                    headings.push(String::new());
+                } else {
+                    headings.push(trimmed);
+                }
             }
-        }
-        let trimmed = text.trim().to_owned();
-        if trimmed.is_empty() {
-            // 空标题仍记录为空串以保留结构，但通常不出现
-            headings.push(String::new());
-        } else {
-            headings.push(trimmed);
+            _ => {}
         }
     }
-    headings
+    MarkdownAnalysis {
+        code_ranges,
+        headings,
+    }
+}
+
+/// 提取所有标题的文本（跳过 frontmatter）。
+///
+/// 经 [`analyze_markdown`] 单次解析产出，与旧实现（独立 `parse_document`）
+/// 结果一致。
+#[must_use]
+pub fn extract_headings(content: &str) -> Vec<String> {
+    analyze_markdown(content).headings
+}
+
+/// 收集正文中代码块的字节区间（单次解析）。
+///
+/// 经 [`analyze_markdown`] 产出，供 [`crate::link`] 复用，避免重复解析。
+#[must_use]
+pub(crate) fn code_ranges(content: &str) -> Vec<(usize, usize)> {
+    analyze_markdown(content).code_ranges
+}
+
+fn compute_line_starts(content: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(32);
+    starts.push(0);
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' && idx < content.len() {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
+fn byte_offset(
+    line_starts: &[usize],
+    content_len: usize,
+    line: usize,
+    column: usize,
+) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+    let line_idx = line.checked_sub(1)?;
+    let line_start = *line_starts.get(line_idx)?;
+    let offset = line_start.checked_add(column.checked_sub(1)?)?;
+    if offset > content_len {
+        return None;
+    }
+    Some(offset)
 }
 
 /// 去掉 frontmatter 后返回正文部分。
@@ -263,5 +357,29 @@ mod tests {
         assert_eq!(doc.headings, vec!["H"]);
         assert_eq!(doc.wikilinks.len(), 1);
         assert_eq!(doc.wikilinks[0].target, "a");
+    }
+
+    #[test]
+    fn analyze_markdown_matches_separate_paths() {
+        let content = "# H1\n\ntext `code [[a]]` more\n\n```\n[[b]]\n```\n\n## H2\n\n[[c]]";
+        let analysis = analyze_markdown(content);
+        // 标题与独立 `extract_headings` 一致
+        assert_eq!(analysis.headings, extract_headings(content));
+        assert_eq!(analysis.headings, vec!["H1", "H2"]);
+        // 代码块区间非空（行内码 + 围栏块），且 wikilink 提取跳过它们
+        assert!(!analysis.code_ranges.is_empty());
+        let links = crate::link::extract_wikilinks(content);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "c");
+    }
+
+    #[test]
+    fn analyze_markdown_empty_and_plain() {
+        let empty = analyze_markdown("");
+        assert!(empty.headings.is_empty());
+        assert!(empty.code_ranges.is_empty());
+        let plain = analyze_markdown("just text\n\n- list");
+        assert!(plain.headings.is_empty());
+        assert!(plain.code_ranges.is_empty());
     }
 }

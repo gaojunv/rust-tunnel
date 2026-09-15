@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef, useMemo } from "react";
+import { useCallback, useDeferredValue, useEffect, useImperativeHandle, useRef, useState, forwardRef, useMemo } from "react";
 import { Save, Trash2, FileText, FilePenLine, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { getNote, saveNote, deleteNote, renameNote, listNotes, saveAttachment } from "@/api/tauri";
+import { getNote, saveNote, deleteNote, renameNote, listNotes, saveAttachment, onVaultFsChanged } from "@/api/tauri";
+import type { UnlistenFn } from "@/api/tauri";
 import type { NoteDto, NoteSummary } from "@/api/types";
 import { NoteFormDialog } from "@/components/NoteFormDialog";
 import { normalizeNoteKey, validateNoteKey } from "@/lib/note-key";
@@ -16,6 +17,7 @@ import { readScrollPos, writeScrollPos } from "@/lib/scroll-memory";
 import { loadEditorPrefs, saveEditorPrefs } from "@/lib/editor-prefs";
 import { extractToc } from "@/lib/markdown-toc";
 import { toast } from "@/lib/toast";
+import { publishNoteLiveContent, clearNoteLiveSnapshot } from "@/lib/note-live-content";
 
 export interface NoteEditorHandle {
   insertAtCursor(text: string): void;
@@ -125,6 +127,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // vault 外部文件变更提示（watcher 事件驱动，非侵入 banner，见下方订阅 effect）
+  const [externalInfo, setExternalInfo] = useState<{ kind: "modified" | "deleted" } | null>(null);
   const [renameOpen, setRenameOpen] = useState(false);
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
   // Live Preview 开关：默认开启，切换时写 localStorage
@@ -218,6 +222,78 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     return doReloadNote(noteKey);
   }, [noteKey, onDirtyChange, doReloadNote]);
 
+  // 应用内保存回声抑制：保存成功后 1s 内忽略该 key 的 watcher 事件
+  // （watcher 会把应用内写入也广播回来，内容一致时本可由对比过滤，
+  // 但删除→重建等边界下显式时间窗更稳妥）
+  const suppressEchoUntilRef = useRef<Map<string, number>>(new Map());
+  const markSelfSaved = useCallback((key: string) => {
+    suppressEchoUntilRef.current.set(key, Date.now() + 1000);
+  }, []);
+  const isEchoSuppressed = useCallback((key: string) => {
+    const until = suppressEchoUntilRef.current.get(key);
+    return until != null && Date.now() < until;
+  }, []);
+
+  // vault watcher 订阅：当前笔记被外部修改/删除时的增量处理。
+  // 与上方的 refreshToken 轮询探测互补：watcher 事件带变更 key，
+  // 只处理命中当前 noteKey 的事件；无关 key 的事件直接忽略（列表侧由 Sidebar 处理）。
+  useEffect(() => {
+    if (!noteKey) return;
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    onVaultFsChanged((keys) => {
+      if (cancelled) return;
+      if (!keys.includes(noteKey)) return;
+      if (isEchoSuppressed(noteKey)) return;
+      const n = noteRef.current;
+      if (!n) return;
+      // 先拿当前编辑态判断 dirty
+      const v = cmRef.current?.view();
+      const curBody = v ? v.state.doc.toString() : bodyRef.current;
+      const curTitle = titleRef.current;
+      const isDirty = curTitle !== n.title || curBody !== n.body;
+      // 拉取磁盘最新做内容对比；一致则静默忽略（echo 兜底）
+      getNote(noteKey)
+        .then((remote) => {
+          if (cancelled) return;
+          const base = noteRef.current;
+          if (!base) return;
+          if (remote.body === base.body && remote.title === base.title) return;
+          if (!isDirty) {
+            // 无未保存改动：自动重载
+            setNote(remote);
+            setTitle(remote.title);
+            setBody(remote.body);
+            bodyAtMountRef.current = remote.body;
+            hasLoadedRef.current = true;
+            const view = cmRef.current?.view();
+            if (view) replaceDocPreserveSelection(view, remote.body);
+            setExternalInfo(null);
+          } else {
+            // 有未保存改动：非侵入 banner，等待用户点「重新加载」
+            setExternalInfo({ kind: "modified" });
+          }
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!isDirty && isNotFoundError(msg)) setExternalInfo({ kind: "deleted" });
+        });
+    }).then((u) => {
+      if (!cancelled) unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [noteKey, isEchoSuppressed]);
+
+  const handleExternalReload = useCallback(() => {
+    if (!noteKey) return;
+    setExternalInfo(null);
+    doReloadNote(noteKey);
+  }, [noteKey, doReloadNote]);
+
   // refreshToken 驱动的外部重载：带脏保护
   useEffect(() => {
     if (!noteKey) return;
@@ -288,7 +364,13 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     };
   }, [refreshToken, noteKey, doReloadNote]);
 
-  const dirty = note ? title !== note.title || body !== note.body : false;
+  // dirty 判定本身是 O(n) 全文比较（title/body vs note），memo 化避免每渲染重复比较。
+  // 注意：body 每键都变，dirty 仍每键重算一次——这是必要的（autosave/debounce 依赖它），
+  // 但其他无关 state 变化（saving/error/外部刷新等）触发的重渲染不再重复比较。
+  const dirty = useMemo(
+    () => (note ? title !== note.title || body !== note.body : false),
+    [note, title, body],
+  );
 
   useEffect(() => {
     onDirtyChange(dirty);
@@ -339,6 +421,51 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     onSavedRef.current = onSaved;
   }, [onSaved]);
 
+  // ---------- live-content publish（TOC 实时刷新 + 当前标题高亮） ----------
+  // 文档变化（body state）与纯光标移动（CM selectionSet）都走同一调度：
+  // debounce 200ms 后发布 CM 当前 { body, cursorLine }；body 与光标行都无变化则跳过。
+  // NoteEditor 按 noteKey remount，timer 用 ref 持有、noteKey 变化/unmount 时清理。
+  const livePublishTimerRef = useRef<number | null>(null);
+  const lastPublishedRef = useRef<{ body: string; cursorLine: number | null } | null>(null);
+  const scheduleLivePublish = useCallback(() => {
+    if (!noteKeyRef.current) return;
+    if (livePublishTimerRef.current !== null) {
+      window.clearTimeout(livePublishTimerRef.current);
+    }
+    livePublishTimerRef.current = window.setTimeout(() => {
+      livePublishTimerRef.current = null;
+      const key = noteKeyRef.current;
+      if (!key) return;
+      const view = cmRef.current?.view();
+      const liveBody = view ? view.state.doc.toString() : bodyRef.current;
+      const cursorLine = view ? view.state.doc.lineAt(view.state.selection.main.head).number - 1 : null;
+      const prev = lastPublishedRef.current;
+      if (prev && prev.body === liveBody && prev.cursorLine === cursorLine) return;
+      lastPublishedRef.current = { body: liveBody, cursorLine };
+      publishNoteLiveContent({ noteKey: key, body: liveBody, cursorLine });
+    }, 200);
+  }, []);
+
+  // 文档内容变化（CM onDocChanged -> setBody）时调度发布
+  useEffect(() => {
+    if (!noteKey) return;
+    if (!hasLoadedRef.current) return;
+    scheduleLivePublish();
+  }, [body, noteKey, scheduleLivePublish]);
+
+  // 笔记切换时重置发布状态、清理旧快照
+  useEffect(() => {
+    lastPublishedRef.current = null;
+    if (noteKey) clearNoteLiveSnapshot(noteKey);
+    return () => {
+      if (livePublishTimerRef.current !== null) {
+        window.clearTimeout(livePublishTimerRef.current);
+        livePublishTimerRef.current = null;
+      }
+      if (noteKey) clearNoteLiveSnapshot(noteKey);
+    };
+  }, [noteKey]);
+
   // clear timers on unmount
   useEffect(() => {
     return () => {
@@ -359,6 +486,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     retryCountRef.current = 0;
     pendingSaveRef.current = false;
     lastSaveErrorRef.current = null;
+    setExternalInfo(null);
   }, [noteKey, clearRetryTimer]);
 
   const computeDirtyNow = useCallback(() => {
@@ -390,6 +518,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     const p = (async () => {
       const updated = await saveNote(sentKey, sentBody, sentTitle.trim() || undefined);
       if (noteKeyRef.current !== sentKey) return;
+      markSelfSaved(sentKey);
       const nowView = cmRef.current?.view();
       const nowBody = nowView ? nowView.state.doc.toString() : bodyRef.current;
       const nowTitle = titleRef.current;
@@ -426,7 +555,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       setSaving(false);
       savingRef.current = false;
     }
-  }, []);
+  }, [markSelfSaved]);
 
   // 指向最新 runSaveAfterPending 的 ref：供 scheduleSaveRetry 经 ref 调用，
   // 避免 scheduleSaveRetry ↔ runSaveAfterPending 的 useCallback 循环依赖
@@ -489,9 +618,14 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
   // 失败态下仍用 debounce 跟踪用户的新编辑；后台重试由 scheduleSaveRetry 负责；
   // error 只有保存成功（executeSave 内）或用户撤销到干净（重试触发时）才清除，
   // 因此状态栏的失败提示保持可见直到成功。
+  //
+  // 依赖用值级 key [noteKey, title, body, loading] 而非 dirty 布尔：
+  // dirty 是派生布尔，首键后恒为 true，后续击键不再变化 → effect 不重跑 →
+  // timer 不重置 → 连续输入中途触发保存（旧 debounce 名存实亡的根因）。
+  // 值级依赖保证每次击键都重置 1500ms 计时器，停手后才保存。
+  // 体内仍以 computeDirtyNow() 做最终守卫（竞态下可能已干净）。
   useEffect(() => {
     if (!noteKey) return;
-    if (!dirty) return;
     if (loading) return;
     if (autosaveTimerRef.current !== null) {
       window.clearTimeout(autosaveTimerRef.current);
@@ -516,7 +650,8 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
         autosaveTimerRef.current = null;
       }
     };
-  }, [noteKey, dirty, loading, computeDirtyNow, runSaveAfterPending]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [noteKey, title, body, loading]);
 
   const flushSaveInner = useCallback(async () => {
     if (savingRef.current && inFlightPromiseRef.current) {
@@ -724,15 +859,21 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
     };
   }, []);
 
-  // 底栏统计：字符/词/行（由 body 派生）
+  // 底栏统计：字符/词/行（由 body 派生）。
+  // 每键 body 都变，全文扫描（spread + trim + split×2）若同步做会阻塞输入；
+  // 用 useDeferredValue 降优先级：紧急的输入/光标先渲染，统计随后跟上。
+  const deferredBodyForStats = useDeferredValue(body);
   const bodyStats = useMemo(() => {
-    const chars = [...body].length;
-    const trimmed = body.trim();
+    const chars = [...deferredBodyForStats].length;
+    const trimmed = deferredBodyForStats.trim();
     const words = trimmed === "" ? 0 : trimmed.split(/\s+/).length;
-    const lines = body === "" ? 0 : body.split("\n").length;
+    const lines = deferredBodyForStats === "" ? 0 : deferredBodyForStats.split("\n").length;
     return { chars, words, lines };
-  }, [body]);
+  }, [deferredBodyForStats]);
 
+  // body/title 的 ref 镜像，供命令句柄闭包读取最新值而不需要把 body/title
+  // 放进 useImperativeHandle 依赖（否则每键重建句柄；body 已有 bodyRef/titleRef 同步）。
+  // 注意 bodyRef/titleRef 在下方 effect 中与 state 同步，此处直接复用。
   // —— 命令句柄 ——
   useImperativeHandle(
     ref,
@@ -740,10 +881,10 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       getBody() {
         const view = cmRef.current?.view();
         if (view) return view.state.doc.toString();
-        return body;
+        return bodyRef.current;
       },
       getTitle() {
-        return title;
+        return titleRef.current;
       },
       getEditorView() {
         return cmRef.current?.view() ?? null;
@@ -803,7 +944,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       },
       flushSave,
     }),
-    [body, title, flushSave],
+    [flushSave],
   );
 
   if (!noteKey) {
@@ -914,6 +1055,27 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
 
       {error && <p className="mx-3 mt-3 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
 
+      {/* vault 外部变更提示条（watcher 事件驱动；参考保存失败 banner 的非侵入样式） */}
+      {externalInfo?.kind === "modified" && (
+        <div className="mx-3 mt-3 flex items-center gap-2 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-600">
+          <span className="flex-1">文件已在磁盘上被修改（外部程序）。未保存的改动仍保留。</span>
+          <Button type="button" variant="outline" size="sm" onClick={handleExternalReload}>
+            重新加载
+          </Button>
+          <Button type="button" variant="ghost" size="sm" onClick={() => setExternalInfo(null)}>
+            忽略
+          </Button>
+        </div>
+      )}
+      {externalInfo?.kind === "deleted" && (
+        <div className="mx-3 mt-3 flex items-center gap-2 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-600">
+          <span className="flex-1">文件已在磁盘上被删除（外部程序）。当前内容仍保留在编辑器中。</span>
+          <Button type="button" variant="ghost" size="sm" onClick={() => setExternalInfo(null)}>
+            忽略
+          </Button>
+        </div>
+      )}
+
       {/* 编辑区：恒为编辑态；空正文时编辑器照常渲染（CM placeholder 已有提示） */}
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="px-4 pt-3">
@@ -933,6 +1095,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
               ref={cmRef}
               initialDoc={bodyAtMountRef.current}
               onDocChanged={setBody}
+              onCursorChanged={scheduleLivePublish}
               onSave={() => void flushSave()}
               getCompletionNotes={getCompletionNotes}
               livePreviewEnabled={livePreview}
@@ -959,7 +1122,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
             source={selectionSource}
             containerRef={editorContentRef}
             noteTitle={note?.title ?? title ?? noteKey}
-            noteBody={body}
+            noteBody={deferredBodyForStats}
             noteKey={noteKey}
             onOpenSettings={() => onOpenSettings?.()}
           />
@@ -997,7 +1160,7 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
       {linkDialogOpen && (
         <LinkSuggestDialog
           noteTitle={note?.title ?? title ?? noteKey}
-          noteBody={body}
+          noteBody={deferredBodyForStats}
           onClose={() => setLinkDialogOpen(false)}
           onInsertRef={(text) => {
             const view = cmRef.current?.view();
@@ -1006,7 +1169,9 @@ export const NoteEditor = forwardRef<NoteEditorHandle, Props>(function NoteEdito
             view.focus();
           }}
           onAppendTag={(tagText) => {
-            const suffix = body.endsWith("\n") || body.length === 0 ? tagText : ` ${tagText}`;
+            // 以 CM 视图的最新文档为准（body state 可能落后一个 tick）
+            const cur = cmRef.current?.view()?.state.doc.toString() ?? bodyRef.current;
+            const suffix = cur.endsWith("\n") || cur.length === 0 ? tagText : ` ${tagText}`;
             const view = cmRef.current?.view();
             if (!view) {
               setBody((prev) => prev + suffix);

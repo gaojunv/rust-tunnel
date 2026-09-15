@@ -10,14 +10,27 @@ import { describe, it, expect, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { livePreview } from "./index";
+import katex from "katex";
 import {
   BulletWidget,
   CalloutWidget,
+  CheckboxWidget,
+  FrontmatterWidget,
+  ImageWidget,
   MathWidget,
+  __setKatexModuleForTest,
+  clearKatexCacheForTest,
+  katexCacheSizeForTest,
   renderTableCellInline,
+  revealAtClick,
   TableWidget,
+  widgetRangeOf,
   wikilinkNavFacet,
 } from "./widgets";
+
+// katex 改动态 import 后：单测预置模块，还原同步渲染断言语义
+__setKatexModuleForTest(katex);
 
 function makeView(): EditorView {
   return new EditorView({
@@ -214,6 +227,98 @@ describe("TableWidget with inline rendering", () => {
   });
 });
 
+// ── CheckboxWidget eq/点击（jsdom）────────────────────────────────────────────
+
+describe("CheckboxWidget", () => {
+  it("eq 不比较位置：checked 相同即相等", () => {
+    expect(new CheckboxWidget(true, 0, 3).eq(new CheckboxWidget(true, 10, 13))).toBe(true);
+    expect(new CheckboxWidget(false, 0, 3).eq(new CheckboxWidget(false, 0, 3))).toBe(true);
+    expect(new CheckboxWidget(true, 0, 3).eq(new CheckboxWidget(false, 0, 3))).toBe(false);
+  });
+
+  it("点击翻转走 widgetRangeOf 反查路径", () => {
+    const view = makeView();
+    try {
+      const dispatchSpy = vi.spyOn(view, "dispatch").mockImplementation(() => {});
+      const w = new CheckboxWidget(false, 0, 3);
+      const el = w.toDOM(view) as HTMLInputElement;
+      expect(el.checked).toBe(false);
+      el.click();
+      // 空文档反查失败 → 回退构造区间 [0,3)，insert [x]
+      expect(dispatchSpy).toHaveBeenCalledWith({
+        changes: { from: 0, to: 3, insert: "[x]" },
+      });
+      dispatchSpy.mockRestore();
+    } finally {
+      view.destroy();
+    }
+  });
+});
+
+describe("widgetRangeOf / revealAtClick", () => {
+  it("未挂载 DOM 时回退构造偏移", () => {
+    const view = makeView();
+    try {
+      const dom = document.createElement("span");
+      expect(widgetRangeOf(view, dom, 7, 12)).toEqual({ from: 7, to: 12 });
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("已挂载 DOM：反查返回当前位置而非陈旧闭包偏移", () => {
+    // 回归：上方编辑后闭包 from 陈旧，点击必须经 DOM 反查映射后位置。
+    // 用 EditorView 挂载含 checkbox 的文档，取真实 widget DOM 反查。
+    const doc = "- [ ] todo\n";
+    const view = new EditorView({
+      state: EditorState.create({
+        doc,
+        extensions: [markdown({ base: markdownLanguage }), livePreview()],
+      }),
+      parent: document.body,
+    });
+    try {
+      view.dispatch({ selection: { anchor: doc.length } });
+      const box = view.dom.querySelector(".cm-lp-checkbox-input") as HTMLElement | null;
+      expect(box).not.toBeNull();
+      // TaskMarker `[ ]` 在文档 [2,5)：反查返回其当前插入点 2，
+      // 而非回退值 999——证明走的是 DOM 反查路径而非闭包/回退
+      const at = widgetRangeOf(view, box!, 999, 999);
+      expect(at.from).toBe(2);
+      expect(at.to).toBe(2);
+    } finally {
+      view.destroy();
+      document.body.innerHTML = "";
+    }
+  });
+
+  it("revealAtClick 回退时 dispatch 反查/回退位置", () => {
+    const view = makeView();
+    try {
+      const dispatchSpy = vi.spyOn(view, "dispatch").mockImplementation(() => {});
+      const focusSpy = vi.spyOn(view, "focus").mockImplementation(() => {});
+      const dom = document.createElement("span");
+      revealAtClick(view, new MouseEvent("click"), dom, 4, 4);
+      expect(dispatchSpy).toHaveBeenCalledWith({ selection: { anchor: 4 } });
+      dispatchSpy.mockRestore();
+      focusSpy.mockRestore();
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("FrontmatterWidget eq 不比较 from", () => {
+    expect(new FrontmatterWidget(2, 0).eq(new FrontmatterWidget(2, 99))).toBe(true);
+    expect(new FrontmatterWidget(2, 0).eq(new FrontmatterWidget(3, 0))).toBe(false);
+  });
+
+  it("ImageWidget eq 不比较 from（本就如此，锁定）", () => {
+    const a = new ImageWidget("alt", "x.png", false, 0, false);
+    const b = new ImageWidget("alt", "x.png", false, 50, false);
+    expect(a.eq(b)).toBe(true);
+  });
+});
+
 // ── MathWidget 测试（jsdom）───────────────────────────────────────────────────
 
 describe("MathWidget", () => {
@@ -243,16 +348,49 @@ describe("MathWidget", () => {
     }
   });
 
-  it("点击 → dispatch selection at from", () => {
+  it("点击 → 经 DOM 反查 dispatch（不直接用闭包 from）", () => {
     const view = makeView();
     try {
-      // mockImplementation：from=5 超出空文档，穿透调用会抛 RangeError
       const dispatchSpy = vi.spyOn(view, "dispatch").mockImplementation(() => {});
       const w = new MathWidget("x", false, 5);
       const el = w.toDOM(view);
       el.click();
+      // 空文档 + 未挂载 DOM：posAtDOM/posAtCoords 反查失败 → 回退构造偏移 5
+      // （本用例主要锁定"点击走反查路径"；真实编辑器内反查优先）
       expect(dispatchSpy).toHaveBeenCalledWith({ selection: { anchor: 5 } });
       dispatchSpy.mockRestore();
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("katex 渲染结果缓存：同 tex+displayMode 只调一次 renderToString", () => {
+    clearKatexCacheForTest();
+    const view = makeView();
+    try {
+      const a = new MathWidget("x^2+y^2", true, 0);
+      const b = new MathWidget("x^2+y^2", true, 10);
+      const elA = a.toDOM(view) as HTMLElement;
+      const sizeAfterFirst = katexCacheSizeForTest();
+      const elB = b.toDOM(view) as HTMLElement;
+      expect(katexCacheSizeForTest()).toBe(sizeAfterFirst);
+      expect(elA.innerHTML).toBe(elB.innerHTML);
+      expect(elA.querySelector(".katex")).not.toBeNull();
+    } finally {
+      view.destroy();
+    }
+  });
+
+  it("katex 缓存区分 displayMode", () => {
+    clearKatexCacheForTest();
+    const view = makeView();
+    try {
+      const block = new MathWidget("x", true, 0);
+      const inline = new MathWidget("x", false, 0);
+      const elBlock = block.toDOM(view) as HTMLElement;
+      const elInline = inline.toDOM(view) as HTMLElement;
+      expect(katexCacheSizeForTest()).toBe(2);
+      expect(elBlock.innerHTML).not.toBe(elInline.innerHTML);
     } finally {
       view.destroy();
     }
@@ -280,6 +418,32 @@ describe("MathWidget", () => {
       expect(w.eq(new BulletWidget())).toBe(false);
     } finally {
       view.destroy();
+    }
+  });
+
+  it("模块未加载时渲染占位 + loading class（异步回填前）", async () => {
+    __setKatexModuleForTest(null);
+    clearKatexCacheForTest();
+    const view = makeView();
+    try {
+      const w = new MathWidget("x^2", true, 0);
+      const el = w.toDOM(view) as HTMLElement;
+      // 同步：占位原文 + loading 标记，无 .katex
+      expect(el.classList.contains("cm-lp-math-loading")).toBe(true);
+      expect(el.querySelector(".katex")).toBeNull();
+      // 回填要求 el 挂载（isConnected 守卫）：先挂载再等回填
+      document.body.appendChild(el);
+      try {
+        await vi.waitFor(() => {
+          expect(el.querySelector(".katex")).not.toBeNull();
+        });
+        expect(el.classList.contains("cm-lp-math-loading")).toBe(false);
+      } finally {
+        el.remove();
+      }
+    } finally {
+      view.destroy();
+      __setKatexModuleForTest(katex);
     }
   });
 });

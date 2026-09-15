@@ -35,6 +35,9 @@ pub mod state;
 pub mod tauri_app;
 /// Vault 纯逻辑操作（不依赖 `tauri`）。
 pub mod vault_ops;
+/// Vault 目录外部变更监听：debounce 聚合与过滤纯逻辑（不依赖 `tauri`；
+/// `RecommendedWatcher` 创建与事件广播见 `tauri_app::spawn_vault_watcher`）。
+pub mod watcher;
 /// Codex app-server agent transport 层（除 `bridge` 外不依赖 `tauri`）。
 pub mod agent;
 

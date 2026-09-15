@@ -29,7 +29,9 @@ import {
 } from "@/lib/agent/client";
 import type { AgentSettingsDto, AgentStatusDto, ParseErrorPayload } from "@/lib/agent/client";
 import {
+  applyBufferedDeltas,
   createInitialView,
+  isDeltaEvent,
   reduceAgentEvent,
   reduceServerRequest,
   resolveServerRequest,
@@ -227,6 +229,13 @@ export function AgentPanel({
   }, [allowlist]);
 
   const listRef = useRef<HTMLDivElement>(null);
+  // 滚动跟随：唯一跟随逻辑。用户是否贴底由 onScroll 维护（pinnedRef），
+  // 新 turn 开始时重置为贴底；流式中仅贴底才 auto 跟随；用户上翻后不再强制拉底。
+  const pinnedRef = useRef(true);
+  // delta 攒批缓冲：流式 delta 通知先入队，100ms flush 一次经 applyBufferedDeltas 应用。
+  // 非 delta 事件走快速路径立即应用（并先 flush 攒批，保证顺序）。
+  const deltaBufferRef = useRef<ServerNotification[]>([]);
+  const deltaFlushTimerRef = useRef<number | null>(null);
   const parseErrorDedupRef = useRef<{ key: string; at: number } | null>(null);
   const viewRef = useRef(view);
   useEffect(() => {
@@ -372,10 +381,43 @@ export function AgentPanel({
       unlistenStatus = fn;
     });
 
+    // 滚动跟随 helpers（effect 闭包内定义，供订阅回调与 flush 共用）
+    const isPinned = (): boolean => pinnedRef.current;
+    const scrollToBottom = (smooth: boolean) => {
+      const el = listRef.current;
+      if (!el || !pinnedRef.current) return;
+      // 流式中用 auto（instant）避免 smooth 被下一 token 打断；仅新 turn 用 smooth
+      el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+    };
+    const flushDeltaBuffer = () => {
+      if (deltaFlushTimerRef.current !== null) {
+        window.clearTimeout(deltaFlushTimerRef.current);
+        deltaFlushTimerRef.current = null;
+      }
+      const buffered = deltaBufferRef.current;
+      if (buffered.length === 0) return;
+      deltaBufferRef.current = [];
+      setView((prev) => applyBufferedDeltas(prev, buffered));
+      // flush 后若仍贴底，跟随到底（auto，不抢用户滚动）
+      requestAnimationFrame(() => scrollToBottom(false));
+    };
+    const scheduleDeltaFlush = () => {
+      if (deltaFlushTimerRef.current !== null) return;
+      deltaFlushTimerRef.current = window.setTimeout(flushDeltaBuffer, 100);
+    };
+
     void onAgentNotification((n: ServerNotification) => {
       if (cancelled) return;
       const method = (n as unknown as { method: string }).method;
-      setView((prev) => reduceAgentEvent(prev, n));
+      // delta 类事件：攒批 100ms 后一次应用（降 setView 频率 + 合并 O(n²) 拷贝）；
+      // 其他事件：先 flush 攒批（保序），再立即应用。
+      if (isDeltaEvent(method)) {
+        deltaBufferRef.current.push(n);
+        scheduleDeltaFlush();
+      } else {
+        flushDeltaBuffer();
+        setView((prev) => reduceAgentEvent(prev, n));
+      }
       const params = (n as unknown as { params: unknown }).params as Record<string, unknown> | null | undefined;
       // 2C：thread/name/updated → 同步头部显示名 + 本地 store 标题（含 codex 侧自动标题）
       if (method === "thread/name/updated") {
@@ -403,6 +445,9 @@ export function AgentPanel({
       }
       if (method === "turn/started") {
         fileChangeInTurnRef.current = false;
+        // 新 turn 开始：重置为贴底并 smooth 滚到底（全会话唯一 smooth 触发点）
+        pinnedRef.current = true;
+        requestAnimationFrame(() => scrollToBottom(true));
       }
       if (method === "turn/completed") {
         const hadFileChange = fileChangeInTurnRef.current;
@@ -414,9 +459,10 @@ export function AgentPanel({
         // 2E：回合完成（codec 置 idle 的同一点）→ 弹出队首自动走发送管线
         void sendQueuedTurnRef.current();
       }
-      requestAnimationFrame(() => {
-        if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
-      });
+      // 非 delta 事件（上已立即 setView）：若贴底则跟随；delta 事件的跟随在 flush 时处理
+      if (!isDeltaEvent(method) && method !== "turn/started" && isPinned()) {
+        requestAnimationFrame(() => scrollToBottom(false));
+      }
     }).then((fn) => {
       unlistenNotif = fn;
     });
@@ -481,12 +527,49 @@ export function AgentPanel({
 
     return () => {
       cancelled = true;
+      // 卸载时 flush 残余 delta，避免卸载恰在节流窗口内导致尾部文本丢失
+      const buffered = deltaBufferRef.current;
+      if (buffered.length > 0) {
+        deltaBufferRef.current = [];
+        setView((prev) => applyBufferedDeltas(prev, buffered));
+      }
+      if (deltaFlushTimerRef.current !== null) {
+        window.clearTimeout(deltaFlushTimerRef.current);
+        deltaFlushTimerRef.current = null;
+      }
       unlistenStatus?.();
       unlistenNotif?.();
       unlistenReq?.();
       unlistenParse?.();
     };
   }, [isDesktop, onVaultChanged]);
+
+  // 滚动容器 scroll 监听：维护贴底态（阈值 48px）。用户上翻后 pinned=false，
+  // 流式跟随即停；滚回底部自动恢复跟随。
+  // ScrollArea 不透传 onScroll（领地外组件，不改其 props），此处直接绑 viewport DOM。
+  useEffect(() => {
+    let cleanup: (() => void) | null = null;
+    let raf = 0;
+    let attempts = 0;
+    const attach = () => {
+      const el = listRef.current;
+      if (!el) {
+        if (++attempts < 30) raf = requestAnimationFrame(attach);
+        return;
+      }
+      const onScroll = () => {
+        const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+        pinnedRef.current = dist < 48;
+      };
+      el.addEventListener("scroll", onScroll, { passive: true });
+      cleanup = () => el.removeEventListener("scroll", onScroll);
+    };
+    attach();
+    return () => {
+      cancelAnimationFrame(raf);
+      cleanup?.();
+    };
+  }, [panelMode]);
 
   const handleApprovalRespond = useCallback(
     (id: unknown, result: unknown, errorVal?: unknown) => {
@@ -927,8 +1010,11 @@ export function AgentPanel({
       } finally {
         sendingRef.current = false;
         setSending(false);
+        // 发送的是用户主动操作：视为回到贴底并跟随
+        pinnedRef.current = true;
         requestAnimationFrame(() => {
-          if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+          const el = listRef.current;
+          if (el) el.scrollTop = el.scrollHeight;
         });
       }
     },

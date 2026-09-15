@@ -22,11 +22,13 @@ Tauri 的 `tauri::State<'_, T>` 只在 `tauri` feature 开启时存在，且
 无处可测；当前形态保留了这一层的可测性。
 */
 
+use base64::Engine as _;
+
 use crate::dto::{
     AttachmentDto, DeleteFolderResult, GraphDto, NoteDto, NoteSummary, RenameFolderResult,
     SearchHitDto, VaultInfo,
 };
-use crate::error::IpcResult;
+use crate::error::{IpcError, IpcResult};
 use crate::state::AppState;
 use crate::vault_ops;
 
@@ -206,31 +208,40 @@ pub fn set_note_ref(state: &AppState, key: String, ref_id: String) -> IpcResult<
     vault_ops::set_note_ref(&root, &key, &ref_id)
 }
 
-/// 保存附件（`data` 为字节数组，透传到 `vault_ops`）。
+/// 保存附件（`data` 为标准 base64 字符串，解码后透传到 `vault_ops`）。
+///
+/// base64 而非 `Vec<u8>`：Tauri IPC 的 JSON 序列化把 `Vec<u8>` 编成 `number[]`，
+/// 每个字节膨胀为 1~4 字符（约 3~4 倍）；base64 仅膨胀约 4/3。命令名与参数名不变，
+/// 前端同步改发 base64 字符串。
 ///
 /// # Errors
 ///
-/// 透传 [`vault_ops::save_attachment`] 的错误。
+/// - base64 非法时返回 [`IpcError::InvalidArgument`]
+/// - 透传 [`vault_ops::save_attachment`] 的错误。
 #[allow(clippy::needless_pass_by_value)]
 pub fn save_attachment(
     state: &AppState,
     note_key: String,
     file_name: String,
-    data: Vec<u8>,
+    data: String,
 ) -> IpcResult<AttachmentDto> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|e| IpcError::InvalidArgument(format!("附件 base64 非法：{e}")))?;
     let root = state.root();
-    vault_ops::save_attachment(&root, &note_key, &file_name, &data)
+    vault_ops::save_attachment(&root, &note_key, &file_name, &bytes)
 }
 
-/// 读取附件。
+/// 读取附件（返回标准 base64 字符串，由前端解码为字节）。
 ///
 /// # Errors
 ///
 /// 透传 [`vault_ops::read_attachment`] 的错误。
 #[allow(clippy::needless_pass_by_value)]
-pub fn read_attachment(state: &AppState, rel_path: String) -> IpcResult<Vec<u8>> {
+pub fn read_attachment(state: &AppState, rel_path: String) -> IpcResult<String> {
     let root = state.root();
-    vault_ops::read_attachment(&root, &rel_path)
+    let bytes = vault_ops::read_attachment(&root, &rel_path)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
 #[cfg(test)]
@@ -277,6 +288,44 @@ mod tests {
         assert!(!dir.path().join("hello.md").exists());
         let err = get_note(&state, "missing".to_owned()).expect_err("应不存在");
         assert!(matches!(err, crate::error::IpcError::NoteNotFound(_)));
+    }
+
+    #[test]
+    fn commands_attachment_base64_roundtrip() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(dir.path().to_path_buf());
+        let raw = b"fake image \x00\x01\x02 bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let dto = save_attachment(
+            &state,
+            "docs/a".to_owned(),
+            "photo.png".to_owned(),
+            b64,
+        )
+        .expect("save");
+        assert!(dto.rel_path.starts_with("assets/docs-a/"));
+        let back_b64 = read_attachment(&state, dto.rel_path.clone()).expect("read");
+        let back = base64::engine::general_purpose::STANDARD
+            .decode(&back_b64)
+            .expect("decode");
+        assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn commands_attachment_rejects_bad_base64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(dir.path().to_path_buf());
+        let res = save_attachment(
+            &state,
+            "note".to_owned(),
+            "a.png".to_owned(),
+            "!!!not-base64!!!".to_owned(),
+        );
+        assert!(
+            matches!(res, Err(crate::error::IpcError::InvalidArgument(_))),
+            "非法 base64 应拒绝：{res:?}"
+        );
     }
 
     #[test]
