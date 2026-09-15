@@ -1,10 +1,14 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TitleBar } from "@/components/TitleBar";
 import { WikiSidebar } from "@/components/WikiSidebar";
 import { NoteEditor, type NoteEditorHandle } from "@/components/NoteEditor";
 import { GraphPanel } from "@/components/GraphPanel";
 import { RightPanel } from "@/components/RightPanel";
-import { AgentPanel } from "@/components/agent/AgentPanel";
+// AgentPanel 重量级（含 streamdown/diff 链）：React.lazy 拆独立 chunk，
+// 首屏不加载；RightPanel 仅 agent tab 切入才挂载（keepMounted 语义不变）。
+const AgentPanel = lazy(() =>
+  import("@/components/agent/AgentPanel").then((m) => ({ default: m.AgentPanel })),
+);
 import { BacklinksPanel } from "@/components/BacklinksPanel";
 import { TocPanel } from "@/components/TocPanel";
 import { PanelResizer } from "@/components/PanelResizer";
@@ -14,7 +18,13 @@ import { useNoteHistory } from "@/lib/use-note-history";
 import { QuickSwitcher } from "@/components/QuickSwitcher";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { SyncReportDialog } from "@/components/SyncReportDialog";
-import { ConflictResolveDialog } from "@/components/ConflictResolveDialog";
+// ConflictResolveDialog 含 DiffView→diff 链：lazy 后 diff 首屏不再被主包引用，
+// 与 streamdown 同进 vendor-markdown 按需 chunk（冲突弹窗打开时才加载）。
+const ConflictResolveDialog = lazy(() =>
+  import("@/components/ConflictResolveDialog").then((m) => ({
+    default: m.ConflictResolveDialog,
+  })),
+);
 import { ToastHost } from "@/components/ToastHost";
 import { toast } from "@/lib/toast";
 import { useSync } from "@/lib/use-sync";
@@ -109,7 +119,6 @@ export default function App() {
   } = useSync({
     flushSave: () => editorRef.current?.flushSave() ?? Promise.resolve(),
     onRefresh: bumpRefreshToken,
-    editorOpenKey: selectedKey,
     refreshToken,
     onNeedSettings: () => setSettingsOpen(true),
   });
@@ -516,15 +525,23 @@ export default function App() {
   );
   const agentPanelEl = useMemo(
     () => (
-      <AgentPanel
-        onInsertToNote={handleAiInsert}
-        vaultRoot={vault?.root ?? null}
-        onVaultChanged={handleAgentVaultChanged}
-        flushSave={handleFlushSave}
-        onOpenSettings={handleOpenSettings}
-        noteKey={selectedKey}
-        getCurrentNote={getCurrentNoteForAi}
-      />
+      <Suspense
+        fallback={
+          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+            Agent 面板加载中…
+          </p>
+        }
+      >
+        <AgentPanel
+          onInsertToNote={handleAiInsert}
+          vaultRoot={vault?.root ?? null}
+          onVaultChanged={handleAgentVaultChanged}
+          flushSave={handleFlushSave}
+          onOpenSettings={handleOpenSettings}
+          noteKey={selectedKey}
+          getCurrentNote={getCurrentNoteForAi}
+        />
+      </Suspense>
     ),
     [
       handleAiInsert,
@@ -662,12 +679,20 @@ export default function App() {
       />
       {settingsOpen && <SettingsDialog onClose={handleCloseSettings} onSync={handleSyncNowVoid} />}
       {conflictOpen && pendingConflicts.length > 0 && syncState && (
-        <ConflictResolveDialog
-          conflicts={pendingConflicts}
-          state={syncState}
-          onResolved={handleResolvedConflict}
-          onClose={handleCloseConflicts}
-        />
+        <Suspense
+          fallback={
+            <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+              冲突解决面板加载中…
+            </p>
+          }
+        >
+          <ConflictResolveDialog
+            conflicts={pendingConflicts}
+            state={syncState}
+            onResolved={handleResolvedConflict}
+            onClose={handleCloseConflicts}
+          />
+        </Suspense>
       )}
       {reportDialogOpen && report && !(conflictOpen && pendingConflicts.length > 0) && (
         <SyncReportDialog

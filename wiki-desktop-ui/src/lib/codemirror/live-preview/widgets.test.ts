@@ -11,6 +11,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { livePreview } from "./index";
+import katex from "katex";
 import {
   BulletWidget,
   CalloutWidget,
@@ -18,6 +19,7 @@ import {
   FrontmatterWidget,
   ImageWidget,
   MathWidget,
+  __setKatexModuleForTest,
   clearKatexCacheForTest,
   katexCacheSizeForTest,
   renderTableCellInline,
@@ -26,6 +28,9 @@ import {
   widgetRangeOf,
   wikilinkNavFacet,
 } from "./widgets";
+
+// katex 改动态 import 后：单测预置模块，还原同步渲染断言语义
+__setKatexModuleForTest(katex);
 
 function makeView(): EditorView {
   return new EditorView({
@@ -413,6 +418,32 @@ describe("MathWidget", () => {
       expect(w.eq(new BulletWidget())).toBe(false);
     } finally {
       view.destroy();
+    }
+  });
+
+  it("模块未加载时渲染占位 + loading class（异步回填前）", async () => {
+    __setKatexModuleForTest(null);
+    clearKatexCacheForTest();
+    const view = makeView();
+    try {
+      const w = new MathWidget("x^2", true, 0);
+      const el = w.toDOM(view) as HTMLElement;
+      // 同步：占位原文 + loading 标记，无 .katex
+      expect(el.classList.contains("cm-lp-math-loading")).toBe(true);
+      expect(el.querySelector(".katex")).toBeNull();
+      // 回填要求 el 挂载（isConnected 守卫）：先挂载再等回填
+      document.body.appendChild(el);
+      try {
+        await vi.waitFor(() => {
+          expect(el.querySelector(".katex")).not.toBeNull();
+        });
+        expect(el.classList.contains("cm-lp-math-loading")).toBe(false);
+      } finally {
+        el.remove();
+      }
+    } finally {
+      view.destroy();
+      __setKatexModuleForTest(katex);
     }
   });
 });
