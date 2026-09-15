@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
+  applyBufferedDeltas,
   createInitialView,
   hydrateTurnsToItems,
+  isDeltaEvent,
   reduceAgentEvent,
   reduceServerRequest,
   resolveServerRequest,
@@ -588,5 +590,70 @@ describe("审批队列 reducer", () => {
     ];
     const q2 = resolveServerRequest(q1, 42 as unknown);
     expect(q2.length).toBe(0);
+  });
+});
+
+describe("delta 攒批（isDeltaEvent / applyBufferedDeltas）", () => {
+  it("识别全部增量类 method", () => {
+    for (const m of [
+      "item/agentMessage/delta",
+      "item/reasoning/summaryTextDelta",
+      "item/reasoning/textDelta",
+      "item/commandExecution/outputDelta",
+      "command/exec/outputDelta",
+      "item/fileChange/outputDelta",
+      "item/fileChange/patchUpdated",
+      "item/plan/delta",
+    ]) {
+      expect(isDeltaEvent(m)).toBe(true);
+    }
+  });
+
+  it("非增量事件返回 false", () => {
+    for (const m of ["item/started", "item/completed", "turn/started", "turn/completed", "warning"]) {
+      expect(isDeltaEvent(m)).toBe(false);
+    }
+  });
+
+  it("空缓冲返回原 state（引用不变）", () => {
+    const s = createInitialView("t1");
+    expect(applyBufferedDeltas(s, [])).toBe(s);
+  });
+
+  it("攒批应用与逐条等价", () => {
+    const seed = reduceAgentEvent(
+      createInitialView("t1"),
+      notif("item/started", { item: { type: "agentMessage", id: "a1", text: "" } }),
+    );
+    const deltas = ["hello ", "world", "!"].map((delta) =>
+      notif("item/agentMessage/delta", { itemId: "a1", delta }),
+    );
+    let sequential = seed;
+    for (const d of deltas) sequential = reduceAgentEvent(sequential, d);
+    const batched = applyBufferedDeltas(seed, deltas);
+    expect(batched).toEqual(sequential);
+    expect(batched.items.find((i) => i.id === "a1")).toMatchObject({
+      kind: "agentMessage",
+      text: "hello world!",
+    });
+  });
+
+  it("混合多 item 的攒批等价", () => {
+    let seed = reduceAgentEvent(
+      createInitialView("t1"),
+      notif("item/started", { item: { type: "agentMessage", id: "a1", text: "" } }),
+    );
+    seed = reduceAgentEvent(
+      seed,
+      notif("item/started", { item: { type: "reasoning", id: "r1", summary: [], content: [] } }),
+    );
+    const deltas = [
+      notif("item/agentMessage/delta", { itemId: "a1", delta: "x" }),
+      notif("item/reasoning/textDelta", { itemId: "r1", delta: "y" }),
+      notif("item/agentMessage/delta", { itemId: "a1", delta: "z" }),
+    ];
+    let sequential = seed;
+    for (const d of deltas) sequential = reduceAgentEvent(sequential, d);
+    expect(applyBufferedDeltas(seed, deltas)).toEqual(sequential);
   });
 });

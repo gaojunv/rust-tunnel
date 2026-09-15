@@ -48,16 +48,18 @@ function normalizeApprovalForWire(v: string): string {
 }
 
 export function SettingsDialog({ onClose, onSync }: Props) {
+  // loadSyncConfig 每渲染都 localStorage.getItem + JSON.parse（旧 69-70 行问题）：
+  // 改 useState 惰性初始化，只读一次；后续渲染复用 state。
+  const [savedConfig] = useState(() => loadSyncConfig());
   // 默认 baseUrl：非 Tauri 用 mock://local，Tauri 为空
   const defaultBaseUrl = isTauri ? "" : "mock://local";
-  const saved = loadSyncConfig();
 
-  const [baseUrl, setBaseUrl] = useState(saved?.baseUrl ?? defaultBaseUrl);
+  const [baseUrl, setBaseUrl] = useState(savedConfig?.baseUrl ?? defaultBaseUrl);
   const [password, setPassword] = useState("");
-  const [knowledgeId, setKnowledgeId] = useState(saved?.knowledgeId ?? "");
-  const [propagateDeletes, setPropagateDeletes] = useState(saved?.propagateDeletes ?? false);
-  const [autoSyncAfterSave, setAutoSyncAfterSave] = useState(saved?.autoSyncAfterSave ?? true);
-  const [syncIntervalMinutes, setSyncIntervalMinutes] = useState(String(saved?.syncIntervalMinutes ?? 0));
+  const [knowledgeId, setKnowledgeId] = useState(savedConfig?.knowledgeId ?? "");
+  const [propagateDeletes, setPropagateDeletes] = useState(savedConfig?.propagateDeletes ?? false);
+  const [autoSyncAfterSave, setAutoSyncAfterSave] = useState(savedConfig?.autoSyncAfterSave ?? true);
+  const [syncIntervalMinutes, setSyncIntervalMinutes] = useState(String(savedConfig?.syncIntervalMinutes ?? 0));
 
   const [sources, setSources] = useState<KnowledgeSourceInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -66,7 +68,7 @@ export function SettingsDialog({ onClose, onSync }: Props) {
   const [saving, setSaving] = useState(false);
 
   // —— Agent 侧状态 ——
-  const syncBaseUrlForPlaceholder = (loadSyncConfig()?.baseUrl ?? baseUrl ?? "").trim();
+  const syncBaseUrlForPlaceholder = (savedConfig?.baseUrl ?? baseUrl ?? "").trim();
   const gatewayPlaceholder = syncBaseUrlForPlaceholder || "https://example.com";
 
   const [agentSettings, setAgentSettings] = useState<AgentSettingsDto | null>(null);

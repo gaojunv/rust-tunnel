@@ -1,5 +1,5 @@
 // 文件夹树组件：递归渲染，交互全部经 props 回调
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -46,7 +46,7 @@ type Props = {
 /** 右键菜单锚点：viewport 坐标 */
 type MenuAnchor = { x: number; y: number };
 
-function FolderRow({
+const FolderRow = memo(function FolderRow({
   node,
   depth,
   isExpanded,
@@ -176,9 +176,9 @@ function FolderRow({
       {isExpanded && <ul className="space-y-0.5">{children}</ul>}
     </li>
   );
-}
+});
 
-function NoteRow({
+const NoteRow = memo(function NoteRow({
   node,
   depth,
   selectedKey,
@@ -261,9 +261,9 @@ function NoteRow({
       )}
     </li>
   );
-}
+});
 
-export function FolderTree({
+export const FolderTree = memo(function FolderTree({
   notes,
   selectedKey,
   expanded,
@@ -276,7 +276,9 @@ export function FolderTree({
   onRenameNote,
   onDeleteNote,
 }: Props) {
-  const tree = buildTree(notes);
+  // notes 引用不变时复用整棵树：WikiSidebar 的 listNotes setState 在内容一致时仍换引用，
+  // 此处 useMemo 至少保证父级其他 state 变化（query 输入等）不触发重建
+  const tree = useMemo(() => buildTree(notes), [notes]);
 
   if (tree.length === 0) {
     return (
@@ -323,4 +325,4 @@ export function FolderTree({
   };
 
   return <ul className="space-y-0.5 px-1">{renderNodes(tree, 0)}</ul>;
-}
+});

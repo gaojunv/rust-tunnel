@@ -340,6 +340,46 @@ function systemItemFromEvent(
   return null;
 }
 
+// —— 流式 delta 归类与缓冲聚合 ——
+//
+// 背景：流式输出时服务端每 token 下发一条 delta 通知；若每条都经
+// reduceAgentEvent → setView，会触发「全量字符串拷贝 + 全数组拷贝 +
+// 整树渲染」的三层 O(n²)。调用方（AgentPanel）对 delta 类事件做
+// 100ms 节流缓冲：攒批后经 applyBufferedDeltas 一次应用。
+// 非 delta 事件（started/completed/turn/* 等）保持立即应用；
+// flush 时若攒批为空返回原 state（引用不变，避免空渲染）。
+
+/** 增量追加类通知：可安全延迟 100ms 批量应用（幂等、无顺序依赖外溢） */
+export function isDeltaEvent(method: string): boolean {
+  return (
+    method === "item/agentMessage/delta" ||
+    method === "item/reasoning/summaryTextDelta" ||
+    method === "item/reasoning/textDelta" ||
+    method === "item/commandExecution/outputDelta" ||
+    method === "command/exec/outputDelta" ||
+    method === "item/fileChange/outputDelta" ||
+    method === "item/fileChange/patchUpdated" ||
+    method === "item/plan/delta"
+  );
+}
+
+/**
+ * 将一批已缓冲的 delta 事件一次性折叠进视图。
+ * 语义与逐条 reduceAgentEvent 等价（同为纯文本追加），但只产生一次
+ * items 数组拷贝与一次 setView；events 为空时返回原 state。
+ */
+export function applyBufferedDeltas(
+  state: AgentThreadView,
+  events: readonly ServerNotification[],
+): AgentThreadView {
+  if (events.length === 0) return state;
+  let next = state;
+  for (const e of events) {
+    next = reduceAgentEvent(next, e);
+  }
+  return next;
+}
+
 // —— 主 reducer ——
 
 export function reduceAgentEvent(

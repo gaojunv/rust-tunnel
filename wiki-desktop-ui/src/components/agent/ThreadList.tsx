@@ -4,7 +4,7 @@
  * 2C：handleResume 改为 threadTurnsList 历史回填（threadRead includeTurns 兜底）；
  *     删除按钮 + 已归档折叠区（恢复/删除）；删除的是当前会话时经 onDeleted 通知父级。
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -131,6 +131,15 @@ export function ThreadList({
 
   const localActive = useMemo(() => localThreads.filter((r) => !r.archived), [localThreads]);
   const localArchived = useMemo(() => localThreads.filter((r) => r.archived), [localThreads]);
+  // 本地标题索引：行渲染与 resume 标题回退时 O(1) 命中，避免每行 find 线性扫描 O(R·L)
+  const localActiveTitleMap = useMemo(
+    () => new Map(localActive.map((r) => [r.threadId, r.title] as const)),
+    [localActive],
+  );
+  const localArchivedTitleMap = useMemo(
+    () => new Map(localArchived.map((r) => [r.threadId, r.title] as const)),
+    [localArchived],
+  );
   const localIds = useMemo(() => new Set(localActive.map((r) => r.threadId)), [localActive]);
   const archivedLocalIds = useMemo(
     () => new Set(localArchived.map((r) => r.threadId)),
@@ -215,8 +224,14 @@ export function ThreadList({
     }
   }, []);
 
+  // resume 连点竞态守卫：同一 threadId 的并发 resume 只保留第一次，
+  // 后续点击直接返回（await 期间按钮侧由 AgentPanel 切换视图，用户可继续操作）。
+  const resumingRef = useRef<Set<string>>(new Set());
+
   const handleResume = useCallback(
     async (threadId: string) => {
+      if (resumingRef.current.has(threadId)) return;
+      resumingRef.current.add(threadId);
       try {
         let resumed: ThreadResumeResult | null = null;
         try {
@@ -241,7 +256,7 @@ export function ThreadList({
           const items = await fetchBackfill(threadId);
           // 会话显示名：远端 name（用户标题）优先，其次本地标题，最后预览；均无则回退 id 短码
           const localTitle = vaultRoot
-            ? localActive.find((r) => r.threadId === threadId)?.title ?? null
+            ? (localActiveTitleMap.get(threadId) ?? null)
             : null;
           const title = thread.name ?? localTitle ?? thread.preview ?? null;
           resumed = { items, title };
@@ -252,9 +267,11 @@ export function ThreadList({
         onSelectThread(threadId, resumed);
       } catch (e: unknown) {
         setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        resumingRef.current.delete(threadId);
       }
     },
-    [onSelectThread, vaultRoot, localActive, model, fetchBackfill],
+    [onSelectThread, vaultRoot, localActive, localActiveTitleMap, model, fetchBackfill],
   );
 
   const handleArchive = useCallback(
@@ -330,7 +347,7 @@ export function ThreadList({
   );
 
   const localEntryTitle = (r: AgentThreadRecord): string => r.title || r.threadId.slice(0, 8);
-  const remoteEntryTitle = (t: Thread, localTitle?: string): string =>
+  const remoteEntryTitle = (t: Thread, localTitle?: string | null): string =>
     localTitle || t.name || t.preview || t.id.slice(0, 8);
 
   return (
@@ -424,7 +441,7 @@ export function ThreadList({
           )}
           <ul className="space-y-1">
             {filteredRemote.map((t) => {
-              const localTitle = localActive.find((r) => r.threadId === t.id)?.title;
+              const localTitle = localActiveTitleMap.get(t.id);
               return (
                 <li
                   key={t.id}
@@ -471,7 +488,7 @@ export function ThreadList({
             ) : (
               <ul className="space-y-1">
                 {filteredArchivedRemote.map((t) => {
-                  const localTitle = localArchived.find((r) => r.threadId === t.id)?.title;
+                  const localTitle = localArchivedTitleMap.get(t.id);
                   return (
                     <li
                       key={t.id}
