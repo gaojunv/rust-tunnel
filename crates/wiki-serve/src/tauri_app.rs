@@ -273,12 +273,34 @@ fn spawn_agent_autostart(
         }
         let sink: std::sync::Arc<dyn crate::agent::AgentEventSink> =
             std::sync::Arc::new(crate::agent::bridge::TauriEventSink(app_handle));
-        let mut guard = agent_manager
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 三阶段启动（与 `agent_start` 对称）：持锁 begin_start（快）→ 放锁
+        // wait_handshake（最长 15s）→ 持锁 complete_start 回写。
         // 失败仅记日志：错误状态已随 `agent:status` 事件广播，前端面板会展示
-        if let Err(err) = guard.start(sink) {
-            eprintln!("agent 自动启动失败：{err}");
+        let pending = {
+            let mut guard = agent_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.begin_start(std::sync::Arc::clone(&sink)) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("agent 自动启动失败：{err}");
+                    return;
+                }
+            }
+        };
+        let Some(pending) = pending else {
+            // 幂等：已在运行/启动中，无事可做
+            return;
+        };
+        let epoch = pending.epoch;
+        let outcome = pending.wait_handshake();
+        {
+            let mut guard = agent_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(err) = guard.complete_start(outcome, epoch, &sink) {
+                eprintln!("agent 自动启动失败：{err}");
+            }
         }
     });
 }

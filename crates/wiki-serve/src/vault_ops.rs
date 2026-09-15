@@ -13,6 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "search")]
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rust_tunnel_wiki_core::graph::LinkGraph;
@@ -288,7 +290,8 @@ pub fn set_note_ref(root: &Path, key: &str, ref_id: &str) -> IpcResult<NoteDto> 
         let _ = fs::remove_file(&alt);
     }
 
-    get_note(root, key)
+    // 写后直构 DTO，不走 `get_note` 全 vault 回读
+    Ok(note_dto_from_written(key, &target, &merged))
 }
 
 /// 将 `SystemTime` 转为 unix 秒，失败回退 0（保留供未来复用）。
@@ -320,6 +323,9 @@ pub fn get_vault_info(root: &Path) -> IpcResult<VaultInfo> {
 
 /// 列出全部笔记摘要，按 `modified` 降序、同秒按 `key` 升序.
 ///
+/// 经 [`Vault::load_notes_meta`] 加载：摘要字段（key/title/tags/ref_id）
+/// 只需 frontmatter，跳过 wikilinks 与 markdown 全量解析。
+///
 /// # Errors
 ///
 /// `root` 不存在时返回 [`IpcError::VaultNotFound`]。
@@ -327,13 +333,53 @@ pub fn list_notes(root: &Path) -> IpcResult<Vec<NoteSummary>> {
     if !root.exists() {
         return Err(IpcError::VaultNotFound(root.display().to_string()));
     }
-    let notes = Vault::load(root);
+    let notes = Vault::load_notes_meta(root);
     let mut out: Vec<NoteSummary> = notes.iter().map(NoteSummary::from).collect();
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.key.cmp(&b.key)));
     Ok(out)
 }
 
-/// 读取单篇笔记。
+/// 从刚写入的文件内容直接构造 [`NoteDto`]（不走全量回读）。
+///
+/// `modified` 取写入目标文件的 mtime；解析管线与 `Vault::load_one` 一致。
+/// 调用方须保证 `target` 已写入且 `key` 与之对应。
+fn note_dto_from_written(key: &str, target: &Path, content: &str) -> NoteDto {
+    use rust_tunnel_wiki_core::frontmatter::{extract_frontmatter_delimiter, parse_frontmatter};
+
+    let normalized = key.replace('\\', "/");
+    let frontmatter = parse_frontmatter(content);
+    let body = if let Some((_, end)) = extract_frontmatter_delimiter(content) {
+        content[end..].trim_start_matches(['\n', '\r']).to_owned()
+    } else {
+        content.to_owned()
+    };
+    let title = frontmatter.title.clone().unwrap_or_else(|| {
+        target
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&normalized)
+            .to_owned()
+    });
+    let modified = target
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        .unwrap_or_default();
+    // `NoteDto` 无 wikilinks/backlinks 等聚合字段：DTO 所需字段全部来自
+    // 刚写入的单文件内容，无需任何全库扫描。
+    NoteDto {
+        key: normalized,
+        title,
+        aliases: frontmatter.aliases.clone(),
+        tags: frontmatter.tags.clone(),
+        body,
+        modified,
+        ref_id: frontmatter.ref_id.map(|r| r.as_str().to_owned()),
+    }
+}
+
+/// 读取单篇笔记（只读目标单文件，不扫描全 vault）。
 ///
 /// # Errors
 ///
@@ -344,11 +390,10 @@ pub fn get_note(root: &Path, key: &str) -> IpcResult<NoteDto> {
     if !root.exists() {
         return Err(IpcError::VaultNotFound(root.display().to_string()));
     }
-    let notes = Vault::load(root);
-    let Some(note) = notes.iter().find(|n| n.key.as_str() == key) else {
+    let Some(note) = Vault::load_one(root, key) else {
         return Err(IpcError::NoteNotFound(key.to_owned()));
     };
-    Ok(NoteDto::from(note))
+    Ok(NoteDto::from(&note))
 }
 
 /// 保存笔记（创建或覆盖），可选地注入 `title` 到 frontmatter。
@@ -376,7 +421,48 @@ pub fn save_note(root: &Path, key: &str, body: &str, title: Option<String>) -> I
         let _ = fs::remove_file(&alt);
     }
 
-    get_note(root, key)
+    // 常驻搜索索引增量更新（未建索引时跳过，下次搜索冷启动会含新数据）
+    #[cfg(feature = "search")]
+    {
+        use rust_tunnel_wiki_core::frontmatter::{
+            extract_frontmatter_delimiter, parse_frontmatter,
+        };
+        use rust_tunnel_wiki_core::link::extract_wikilinks;
+        use rust_tunnel_wiki_core::note::{Note, NoteKey};
+        let frontmatter = parse_frontmatter(&to_write);
+        let body = if let Some((_, end)) = extract_frontmatter_delimiter(&to_write) {
+            to_write[end..].trim_start_matches(['\n', '\r']).to_owned()
+        } else {
+            to_write.clone()
+        };
+        let modified = target
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::now());
+        let title = frontmatter.title.clone().unwrap_or_else(|| {
+            key.replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .unwrap_or(key)
+                .to_owned()
+        });
+        let note = Note {
+            key: NoteKey::new(key.replace('\\', "/")),
+            ref_id: frontmatter.ref_id.clone(),
+            title,
+            aliases: frontmatter.aliases.clone(),
+            tags: frontmatter.tags.clone(),
+            wikilinks: extract_wikilinks(&body),
+            body,
+            frontmatter,
+            modified,
+        };
+        search_index_upsert(root, &note);
+    }
+
+    // 写后直构 DTO，不走 `get_note` 全 vault 回读
+    Ok(note_dto_from_written(key, &target, &to_write))
 }
 
 /// 删除笔记。
@@ -398,10 +484,100 @@ pub fn delete_note(root: &Path, key: &str) -> IpcResult<()> {
     if exists_markdown {
         fs::remove_file(&alt).map_err(IpcError::Io)?;
     }
+    // 常驻搜索索引增量删除（未建索引时跳过）
+    #[cfg(feature = "search")]
+    search_index_remove(root, key);
     Ok(())
 }
 
-/// 搜索笔记（`search` feature 走 tantivy 临时索引，否则朴素子串匹配）。
+// ---------------------------------------------------------------------------
+// 常驻内存搜索索引（按 vault root 懒建一次，增量更新）
+// ---------------------------------------------------------------------------
+
+/// 常驻索引槽：索引句柄 + 建索引时的 vault key 指纹。
+///
+/// 指纹用于检测外部写入（非本进程写链路）：`search_notes` 命中缓存时
+/// 比对当前 key 集合，不一致则全量重建，避免返回过期结果。
+#[cfg(feature = "search")]
+struct CachedSearchIndex {
+    /// 常驻内存 tantivy 索引。
+    index: rust_tunnel_wiki_core::search::SearchIndex,
+    /// 建索引时的 vault key 指纹（排序后 `\n` 拼接）。
+    fingerprint: String,
+}
+
+/// 常驻内存搜索索引的缓存：按 vault root 只建一次，进程内复用。
+#[cfg(feature = "search")]
+fn search_cache() -> &'static Mutex<HashMap<PathBuf, CachedSearchIndex>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedSearchIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 对 `root` 做 key 指纹：全部笔记键排序后拼接。
+#[cfg(feature = "search")]
+fn vault_key_fingerprint(root: &Path) -> String {
+    let mut names: Vec<String> = VaultScanner::new(root)
+        .scan()
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .collect();
+    names.sort();
+    names.join("\n")
+}
+
+/// 使 `root` 的常驻搜索索引失效（下次 `search_notes` 重建）。
+///
+/// 供后续文件 watcher 调用：外部写入（非本进程写链路）后调此钩子；
+/// 本分支无 watcher，写链路均走增量更新，无需调用。
+#[cfg(feature = "search")]
+pub fn invalidate_search_index(root: &Path) {
+    let mut guard = search_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.remove(root);
+}
+
+/// `save/delete/rename` 后对常驻索引做增量更新（若已建索引）。
+///
+/// - `upsert`: 有则更新、无则忽略（`save_note` 覆盖写不需要 key 是否存在的前置判断，
+///   未建索引时直接跳过，下次搜索冷启动会含新数据）
+/// - `remove_key`: 删除旧 key 的文档（`rename_note` 的旧 key 用此函数）
+/// - `upsert` 失败（如索引损坏）时降级为失效，下次搜索重建
+#[cfg(feature = "search")]
+fn search_index_upsert(root: &Path, note: &rust_tunnel_wiki_core::note::Note) {
+    let mut guard = search_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(slot) = guard.get_mut(root) else {
+        return;
+    };
+    if slot.index.update_note(note).is_err() {
+        guard.remove(root);
+    }
+}
+
+/// `delete_note` / `rename_note`（旧 key）后从常驻索引删除文档（若已建索引）。
+#[cfg(feature = "search")]
+fn search_index_remove(root: &Path, key: &str) {
+    use rust_tunnel_wiki_core::note::NoteKey;
+    let mut guard = search_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(slot) = guard.get_mut(root) else {
+        return;
+    };
+    // 索引内 key 统一为 `/` 形态（`note_key_from_path` 归一），此处同样归一
+    let note_key = NoteKey::new(key.replace('\\', "/"));
+    if slot.index.remove_note(&note_key).is_err() {
+        guard.remove(root);
+    }
+}
+
+/// 搜索笔记（`search` feature 走常驻内存 tantivy 索引，否则朴素子串匹配）。
+///
+/// 常驻索引按 vault root 懒建一次（冷启动全量 `add_notes` 单次 commit），
+/// 后续 `save/delete/rename` 走增量更新；命中缓存时比对 key 指纹，
+/// 外部写入导致的漂移自动全量重建。
 ///
 /// # Errors
 ///
@@ -415,32 +591,38 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> IpcResult<Vec<Sea
     if !root.exists() {
         return Err(IpcError::VaultNotFound(root.display().to_string()));
     }
-    let notes = Vault::load(root);
-    if notes.is_empty() {
-        return Ok(Vec::new());
-    }
 
-    // 使用 `std::env::temp_dir()` + 唯一子目录，避免引入 `tempfile` 生产依赖
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let tmp_dir = std::env::temp_dir().join(format!("wiki-search-{pid}-{nanos}"));
-    fs::create_dir_all(&tmp_dir).map_err(IpcError::Io)?;
-
-    let res: IpcResult<Vec<SearchHitDto>> = (|| {
+    let mut guard = search_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let canon = root.to_owned();
+    let fingerprint = vault_key_fingerprint(&canon);
+    let stale_or_missing = guard
+        .get(&canon)
+        .is_none_or(|slot| slot.fingerprint != fingerprint);
+    if stale_or_missing {
+        let notes = Vault::load(&canon);
         let mut index =
-            rust_tunnel_wiki_core::search::SearchIndex::open(&tmp_dir).map_err(IpcError::Search)?;
-        for note in &notes {
-            index.add_note(note).map_err(IpcError::Search)?;
-        }
-        let hits = index.search(trimmed, limit).map_err(IpcError::Search)?;
-        Ok(hits.iter().map(SearchHitDto::from).collect())
-    })();
-
-    let _ = fs::remove_dir_all(&tmp_dir);
-    res
+            rust_tunnel_wiki_core::search::SearchIndex::open_in_memory()
+                .map_err(IpcError::Search)?;
+        index.add_notes(&notes).map_err(IpcError::Search)?;
+        guard.insert(
+            canon.clone(),
+            CachedSearchIndex {
+                index,
+                fingerprint,
+            },
+        );
+    }
+    let Some(slot) = guard.get(&canon) else {
+        return Err(IpcError::Search(
+            rust_tunnel_wiki_core::search::SearchError::Io(std::io::Error::other(
+                "搜索索引构建失败",
+            )),
+        ));
+    };
+    let hits = slot.index.search(trimmed, limit).map_err(IpcError::Search)?;
+    Ok(hits.iter().map(SearchHitDto::from).collect())
 }
 
 /// 搜索笔记（无 `search` feature 的朴素降级：大小写不敏感子串，标题权重高于正文）。
@@ -457,14 +639,18 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> IpcResult<Vec<Sea
     if !root.exists() {
         return Err(IpcError::VaultNotFound(root.display().to_string()));
     }
-    let notes = Vault::load(root);
+    // 降级路径同样走轻量加载：子串匹配不需要 wikilinks/markdown 解析。
+    let notes = Vault::load_notes_meta(root);
     let lower_q = trimmed.to_lowercase();
+    let q_chars = lower_q.chars().count();
     let mut hits: Vec<SearchHitDto> = Vec::new();
 
     for note in &notes {
+        // 标题/正文各只做一次 `to_lowercase`（原逻辑对同一正文多次
+        // 全克隆：`to_lowercase` + 命中时 `chars().collect`）。
         let lower_title = note.title.to_lowercase();
-        let lower_body = note.body.to_lowercase();
         let title_hit = lower_title.contains(&lower_q);
+        let lower_body = note.body.to_lowercase();
         let body_hit = lower_body.contains(&lower_q);
         if !title_hit && !body_hit {
             continue;
@@ -478,10 +664,11 @@ pub fn search_notes(root: &Path, query: &str, limit: usize) -> IpcResult<Vec<Sea
         }
         let snippet = if body_hit {
             if let Some(pos) = lower_body.find(&lower_q) {
-                // 40 字符前、160 字符后
-                let char_pos = lower_body[..pos].chars().count();
-                let q_chars = lower_q.chars().count();
+                // 40 字符前、160 字符后：正文字符只收集一次（原逻辑在命中
+                // 时重复 `chars().collect::<Vec<char>>()`）；定位换算与原
+                // 逻辑一致（`lower_body` 字节前缀的字符数）。
                 let body_chars: Vec<char> = note.body.chars().collect();
+                let char_pos = lower_body[..pos].chars().count();
                 let len = body_chars.len();
                 let start = char_pos.saturating_sub(40);
                 let end = (char_pos + q_chars + 160).min(len);
@@ -578,9 +765,14 @@ const SYNC_STATE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// 读取 `<root>/.wiki-sync.json`；不存在返回 `Ok(None)`。
 ///
+/// 先查文件大小：超过 [`SYNC_STATE_MAX_BYTES`]（与写侧同限 16 MiB）时
+/// 返回 [`IpcError::InvalidArgument`]，避免无界读入内存。`metadata` 与
+/// 读取之间存在 TOCTOU 窗口，读后复核字节数，双重兜底。
+///
 /// # Errors
 ///
-/// 仅在 IO 失败时返回 [`IpcError::Io`]；`root` 不存在时按约定返回 `Ok(None)`。
+/// - 文件超限时返回 [`IpcError::InvalidArgument`]
+/// - IO 失败时返回 [`IpcError::Io`]；`root` 不存在时按约定返回 `Ok(None)`
 pub fn read_sync_state(root: &Path) -> IpcResult<Option<String>> {
     if !root.exists() {
         return Ok(None);
@@ -589,7 +781,19 @@ pub fn read_sync_state(root: &Path) -> IpcResult<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
+    let size = path.metadata().map_err(IpcError::Io)?.len();
+    if size > SYNC_STATE_MAX_BYTES as u64 {
+        return Err(IpcError::InvalidArgument(format!(
+            "sync state 过大：{size} 字节，上限 {SYNC_STATE_MAX_BYTES} 字节"
+        )));
+    }
     let content = fs::read_to_string(&path).map_err(IpcError::Io)?;
+    if content.len() > SYNC_STATE_MAX_BYTES {
+        return Err(IpcError::InvalidArgument(format!(
+            "sync state 过大：{} 字节，上限 {SYNC_STATE_MAX_BYTES} 字节",
+            content.len()
+        )));
+    }
     Ok(Some(content))
 }
 
@@ -870,20 +1074,29 @@ fn target_exists(root: &Path, key: &str) -> bool {
 }
 
 /// 对全 vault 笔记执行 `rewrite_wikilinks`，只写回内容变化的文件。
+///
+/// `keys` 由调用方传入已扫描的 key 列表（复用第一次 scan，避免二次全量 walk）；
+/// `known_paths` 为已知 `key → 文件路径` 映射（rename 刚移动的文件），命中则
+/// 跳过 `find_existing_note_file` 的 stat。返回 `(被改写 key, 总次数)`。
 fn rewrite_vault_links(
     root: &Path,
     rename_map: &HashMap<String, String>,
+    keys: &[String],
+    known_paths: &HashMap<String, PathBuf>,
 ) -> (Vec<String>, usize) {
     if rename_map.is_empty() {
         return (Vec::new(), 0);
     }
-    let scanner = VaultScanner::new(root);
-    let keys = scanner.scan();
     let mut link_rewritten = Vec::new();
     let mut total = 0usize;
-    for key in keys {
-        let key_str = key.as_str().to_owned();
-        let Some(path) = find_existing_note_file(root, &key_str) else {
+    for key_str in keys {
+        // 刚被 rename 移动的目标文件路径已知，走内存映射判存在，免 stat
+        let path_opt = if let Some(p) = known_paths.get(key_str) {
+            if p.exists() { Some(p.clone()) } else { None }
+        } else {
+            find_existing_note_file(root, key_str)
+        };
+        let Some(path) = path_opt else {
             continue;
         };
         let Ok(content) = fs::read_to_string(&path) else {
@@ -895,7 +1108,7 @@ fn rewrite_vault_links(
             continue;
         }
         if fs::write(&path, new_content.as_bytes()).is_ok() {
-            link_rewritten.push(key_str);
+            link_rewritten.push(key_str.clone());
             total += count;
         }
     }
@@ -988,8 +1201,21 @@ pub fn rename_note(
     if rewrite_links {
         let mut rename_map = HashMap::new();
         rename_map.insert(old_norm.to_lowercase(), new_norm.clone());
-        let (_rewritten, _count) = rewrite_vault_links(root, &rename_map);
+        // 新目标文件路径已知：rewrite 循环内免 stat
+        let keys: Vec<String> = VaultScanner::new(root)
+            .scan()
+            .iter()
+            .map(|k| k.as_str().to_owned())
+            .collect();
+        let known_paths: HashMap<String, PathBuf> =
+            [(new_norm.clone(), new_candidate.clone())].into_iter().collect();
+        let (_rewritten, _count) = rewrite_vault_links(root, &rename_map, &keys, &known_paths);
+        // 索引无需增量更新：rename 改变 key 集合，下次搜索指纹失配自动重建。
     }
+
+    // 常驻搜索索引：rename 改变 key 集合，指纹下次搜索时必然失配并自动
+    // 全量重建（含新 key 与 rewrite 后的新内容），此处无需增量操作。
+    // （`search_index_remove` 仅用于 key 集合不变的 `delete_note` 场景。）
 
     get_note(root, &new_norm)
 }
@@ -1029,17 +1255,31 @@ pub fn rename_folder(
         return Err(IpcError::PathTraversal(format!("逃逸到 root 之外：{new_prefix}")));
     }
 
+    // 第一次全量 scan：复用于 matched 过滤与 rewrite（避免第二次 walk）
     let scanner = VaultScanner::new(root);
-    let all_keys = scanner.scan();
-    let mut matched: Vec<String> = all_keys
+    let all_keys: Vec<String> = scanner
+        .scan()
         .iter()
         .map(|k| k.as_str().to_owned())
-        .filter(|k| k == &old_norm || k.starts_with(&format!("{old_norm}/")))
+        .collect();
+    let mut matched: Vec<String> = all_keys
+        .iter()
+        .filter(|k| *k == &old_norm || k.starts_with(&format!("{old_norm}/")))
+        .cloned()
         .collect();
     if matched.is_empty() {
         return Err(IpcError::NoteNotFound(old_prefix.to_owned()));
     }
     matched.sort();
+
+    // 预建存在集合：一次 scan 的 key 集合进内存 `HashSet`，循环内
+    // `target_exists` 的每次 2 次 stat 改为内存查表。存原始大小写精确匹配
+    // （对齐 `target_exists` 的路径存在语义：任一扩展名存在即占用）；
+    // 批内目标冲突检测沿用原有的小写 `seen_targets`，语义不变。
+    let mut occupied: HashSet<String> = HashSet::with_capacity(all_keys.len());
+    for k in &all_keys {
+        occupied.insert(k.clone());
+    }
 
     // 预计算目标 key，检测批内冲突与已存在文件的冲突
     let mut seen_targets: HashSet<String> = HashSet::new();
@@ -1057,6 +1297,8 @@ pub fn rename_folder(
 
     let mut moved: Vec<MovedEntry> = Vec::new();
     let mut failed: Vec<FailedEntry> = Vec::new();
+    // 成功移动的目标路径：供 rewrite 免 stat + 待清理目录去重
+    let mut moved_dst_paths: HashMap<String, PathBuf> = HashMap::new();
 
     for (from_key, to_key) in planned {
         let to_lower = to_key.to_lowercase();
@@ -1067,9 +1309,10 @@ pub fn rename_folder(
             });
             continue;
         }
-        if target_exists(root, &to_key) {
-            // 若目标已在 matched 集合中（即同批内将被移走），允许覆盖检查延后；
-            // 但此处扫描基于移动前状态，无法区分，故一律视为占用
+        // 内存判存在（对齐原 `target_exists` 精确路径语义）：
+        // 移动前 vault 中已存在、或被本批早先移动占用（`seen_targets`
+        // 已拦截同名大小写变体，此处只查精确 key）均视为占用。
+        if occupied.contains(&to_key) {
             failed.push(FailedEntry {
                 key: from_key.clone(),
                 error: format!("目标已存在：{to_key}"),
@@ -1100,6 +1343,12 @@ pub fn rename_folder(
                 if old_alt != src_path && old_alt.exists() {
                     let _ = fs::remove_file(&old_alt);
                 }
+                // 同步内存占用集合与文件系统实时状态（对齐原循环内
+                // `target_exists` 实时检查语义）：源已移走则释放，
+                // 目标已占用则登记。同批"目标恰为另一源"的链式移动仍放行。
+                occupied.remove(&from_key);
+                occupied.insert(to_key.clone());
+                moved_dst_paths.insert(to_key.clone(), dst_path.clone());
                 moved.push(MovedEntry {
                     from_key: from_key.clone(),
                     to_key: to_key.clone(),
@@ -1114,9 +1363,21 @@ pub fn rename_folder(
         }
     }
 
-    // 清理空目录链（对每个成功移动的源路径）
-    for m in &moved {
-        cleanup_empty_parents(root, &m.from_key);
+    // 清理空目录链：按直接父目录去重后统一处理（同父目录只走一次
+    // `read_dir` 链；`cleanup_empty_parents` 向上遇非空即停，父目录相同
+    // 的源路径清理结果一致，去重不改变最终状态）
+    {
+        let mut seen_parents: HashSet<String> = HashSet::with_capacity(moved.len());
+        for m in &moved {
+            let normalized = m.from_key.replace('\\', "/");
+            let parent = Path::new(&normalized)
+                .parent()
+                .map(|p| p.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if seen_parents.insert(parent) {
+                cleanup_empty_parents(root, &m.from_key);
+            }
+        }
     }
 
     let (link_rewritten, rewritten_count) = if rewrite_links && !moved.is_empty() {
@@ -1124,7 +1385,21 @@ pub fn rename_folder(
         for m in &moved {
             rename_map.insert(m.from_key.to_lowercase(), m.to_key.clone());
         }
-        rewrite_vault_links(root, &rename_map)
+        // 移动后 key 集合 = 移动前集合 − 已移走源 + 新目标（含自引用目标文件，
+        // 如改名后的文件内容含指向自身的旧链接）。内存推导免第二次 walk；
+        // 已移动目标走路径映射免 stat。索引无需增量更新：key 集合已变，
+        // 下次搜索指纹失配自动重建。
+        let moved_from: HashSet<&str> =
+            moved.iter().map(|m| m.from_key.as_str()).collect();
+        let mut post_keys: Vec<String> = all_keys
+            .iter()
+            .filter(|k| !moved_from.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for m in &moved {
+            post_keys.push(m.to_key.clone());
+        }
+        rewrite_vault_links(root, &rename_map, &post_keys, &moved_dst_paths)
     } else {
         (Vec::new(), 0)
     };
@@ -1201,8 +1476,19 @@ pub fn delete_folder(root: &Path, prefix: &str) -> IpcResult<DeleteFolderResult>
         }
     }
 
-    for key in &deleted {
-        cleanup_empty_parents(root, key);
+    // 按直接父目录去重后统一清理（同父目录只走一次 `read_dir` 链）
+    {
+        let mut seen_parents: HashSet<String> = HashSet::with_capacity(deleted.len());
+        for key in &deleted {
+            let normalized = key.replace('\\', "/");
+            let parent = Path::new(&normalized)
+                .parent()
+                .map(|p| p.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if seen_parents.insert(parent) {
+                cleanup_empty_parents(root, key);
+            }
+        }
     }
     // 若前缀本身是目录（无笔记但有空目录），也尝试清理
     let dir = root.join(norm.replace('\\', "/"));
@@ -2198,38 +2484,23 @@ mod tests {
         // 未创建文件
         let assets_dir = dir.path().join("assets");
         if assets_dir.exists() {
-            let count = fs::read_dir(&assets_dir)
-                .map(|it| {
-                    it.filter_map(Result::ok)
-                        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                        .count()
-                })
-                .unwrap_or(0);
-            // 若 assets 已存在但超限写入未创建文件，则其下不应有文件（可能仅空目录）
-            // 更严格：递归检查
-            let has_any_file = fs::read_dir(&assets_dir).is_ok_and(|it| {
-                it.filter_map(Result::ok).any(|_| true)
-            });
-            // 若有文件则说明超限写入未被拒绝
-            if has_any_file {
-                // 递归统计文件数
-                let mut file_count = 0usize;
-                let mut stack = vec![assets_dir.clone()];
-                while let Some(d) = stack.pop() {
-                    if let Ok(rd) = fs::read_dir(&d) {
-                        for e in rd.filter_map(Result::ok) {
-                            let ft = e.file_type().ok();
-                            if ft.is_some_and(|f| f.is_dir()) {
-                                stack.push(e.path());
-                            } else if ft.is_some_and(|f| f.is_file()) {
-                                file_count += 1;
-                            }
+            // 递归统计文件数（超限写入不应创建任何文件）
+            let mut file_count = 0usize;
+            let mut stack = vec![assets_dir.clone()];
+            while let Some(d) = stack.pop() {
+                if let Ok(rd) = fs::read_dir(&d) {
+                    for e in rd.filter_map(Result::ok) {
+                        let ft = e.file_type().ok();
+                        if ft.is_some_and(|f| f.is_dir()) {
+                            stack.push(e.path());
+                        } else if ft.is_some_and(|f| f.is_file()) {
+                            // `file_type` 失败视为非文件：仅统计确认是文件的条目
+                            file_count += 1;
                         }
                     }
                 }
-                assert_eq!(file_count, 0, "超限不应创建文件");
             }
-            assert_eq!(count, 0, "超限不应创建文件（顶层）");
+            assert_eq!(file_count, 0, "超限不应创建文件");
         }
         // 刚好 10 MiB 应通过
         let exact = vec![0u8; 10 * 1024 * 1024];
@@ -2301,5 +2572,164 @@ mod tests {
         // 正常文件仍可读
         let read_back = read_attachment(dir.path(), &dto.rel_path).expect("normal read");
         assert_eq!(read_back, b"data");
+    }
+
+    // ---- 性能修复回归测试 ----
+
+    #[test]
+    fn get_note_single_file_matches_full_load() {
+        use rust_tunnel_wiki_core::vault::Vault;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            dir.path(),
+            "hello.md",
+            "---\ntitle: Hello\ntags:\n  - t1\n---\nBody [[world]]",
+        );
+        write_file(dir.path(), "world.md", "plain");
+        // 单文件读取与全量 load 结果一致
+        let dto = get_note(dir.path(), "hello").expect("get");
+        let full = Vault::load(dir.path());
+        let expected = full
+            .iter()
+            .find(|n| n.key.as_str() == "hello")
+            .expect("full");
+        assert_eq!(dto.key, expected.key.as_str());
+        assert_eq!(dto.title, expected.title);
+        assert_eq!(dto.body, expected.body);
+        assert_eq!(dto.tags, expected.tags);
+        // 大 vault 下单文件读取不受其它文件影响
+        for i in 0..20 {
+            write_file(dir.path(), &format!("filler-{i}.md"), "filler body");
+        }
+        let dto2 = get_note(dir.path(), "hello").expect("get2");
+        assert_eq!(dto2, dto);
+    }
+
+    #[test]
+    fn save_note_dto_matches_reread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 写后直构 DTO 应与重新 get_note 一致（形状不变）
+        let dto = save_note(dir.path(), "a", "hello body", Some("T".to_owned())).expect("save");
+        let reread = get_note(dir.path(), "a").expect("reread");
+        assert_eq!(dto.key, reread.key);
+        assert_eq!(dto.title, reread.title);
+        assert_eq!(dto.body, reread.body);
+        assert_eq!(dto.tags, reread.tags);
+        assert_eq!(dto.ref_id, reread.ref_id);
+        // 覆盖写同样一致
+        let dto2 = save_note(dir.path(), "a", "new body", None).expect("save2");
+        let reread2 = get_note(dir.path(), "a").expect("reread2");
+        assert_eq!(dto2.body, reread2.body);
+        assert!(dto2.body.contains("new body"));
+    }
+
+    #[test]
+    fn set_note_ref_dto_matches_reread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "hello", "plain body", None).expect("save");
+        let dto = set_note_ref(dir.path(), "hello", "n-abc123def456").expect("set ref");
+        let reread = get_note(dir.path(), "hello").expect("reread");
+        assert_eq!(dto, reread);
+    }
+
+    #[test]
+    fn list_notes_meta_matches_full_load_summary() {
+        use rust_tunnel_wiki_core::vault::Vault;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            dir.path(),
+            "a.md",
+            "---\ntitle: TA\ntags:\n  - t1\n---\nbody [[b]]",
+        );
+        write_file(dir.path(), "b.md", "plain body");
+        // 轻量摘要与全量 load 的摘要字段一致
+        let list = list_notes(dir.path()).expect("list");
+        assert_eq!(list.len(), 2);
+        let full = Vault::load(dir.path());
+        for sum in &list {
+            let n = full.iter().find(|x| x.key.as_str() == sum.key).expect("match");
+            assert_eq!(sum.title, n.title);
+            assert_eq!(sum.tags, n.tags);
+            assert_eq!(
+                sum.ref_id,
+                n.ref_id.as_ref().map(|r| r.as_str().to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn read_sync_state_oversize_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 超过 16 MiB 的文件读取应拒绝（与写侧同限）
+        let big = "b".repeat(16 * 1024 * 1024 + 1);
+        fs::write(dir.path().join(".wiki-sync.json"), big.as_bytes()).expect("write big");
+        let err = read_sync_state(dir.path()).expect_err("应超限");
+        assert!(matches!(err, IpcError::InvalidArgument(_)));
+        // 刚好上限内可读
+        let ok_json = r#"{"v":1}"#;
+        fs::write(dir.path().join(".wiki-sync.json"), ok_json).expect("write ok");
+        let back = read_sync_state(dir.path()).expect("read").expect("some");
+        assert_eq!(back, ok_json);
+    }
+
+    #[test]
+    fn rename_folder_occupied_target_still_rejected() {
+        // 占用语义保持：目标已存在（非同批源）则该条目失败，
+        // 不相关条目正常移动（内存 `occupied` 与原实时 `target_exists` 一致）
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "src/a", "body a", None).expect("a");
+        save_note(dir.path(), "src/b", "body b", None).expect("b");
+        save_note(dir.path(), "dst/a", "body dst", None).expect("dst");
+        let res = rename_folder(dir.path(), "src", "dst", false).expect("rename");
+        assert_eq!(res.moved.len(), 1);
+        assert_eq!(res.moved[0].from_key, "src/b");
+        assert_eq!(res.moved[0].to_key, "dst/b");
+        assert_eq!(res.failed.len(), 1);
+        assert_eq!(res.failed[0].key, "src/a");
+        // 原文件仍在，新文件已就位
+        assert!(dir.path().join("src/a.md").exists());
+        assert!(dir.path().join("dst/b.md").exists());
+        assert!(dir.path().join("dst/a.md").exists());
+    }
+
+    #[test]
+    fn rename_note_self_reference_rewritten() {
+        // 移动后目标文件的自引用链接应被改写（post_keys 含新目标）
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "a", "self [[a]]", None).expect("a");
+        rename_note(dir.path(), "a", "b", true).expect("rename");
+        let got = get_note(dir.path(), "b").expect("get b");
+        assert!(got.body.contains("[[b]]"), "自引用应改写：{}", got.body);
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn search_index_incremental_save_delete() {
+        // 常驻索引：冷启动建索引 → save 增量可见 → delete 后不可见
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "k1", "alpha unique word", None).expect("k1");
+        let hits = search_notes(dir.path(), "unique", 10).expect("search1");
+        assert!(hits.iter().any(|h| h.note_key == "k1"));
+        // 覆盖写新内容：新词可见
+        save_note(dir.path(), "k1", "alpha secondword body", None).expect("save2");
+        let hits2 = search_notes(dir.path(), "secondword", 10).expect("search2");
+        assert!(hits2.iter().any(|h| h.note_key == "k1"));
+        // 删除后不可见（delete 走 remove + 指纹重建双保险）
+        delete_note(dir.path(), "k1").expect("delete");
+        let hits3 = search_notes(dir.path(), "secondword", 10).expect("search3");
+        assert!(!hits3.iter().any(|h| h.note_key == "k1"));
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn search_index_invalidate_hook_rebuilds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_note(dir.path(), "k1", "hooktest body", None).expect("k1");
+        assert!(!search_notes(dir.path(), "hooktest", 10).expect("s1").is_empty());
+        // 外部直接写文件（绕过写链路）+ 显式失效 → 下次搜索重建可见
+        write_file(dir.path(), "external.md", "external hooktest word");
+        invalidate_search_index(dir.path());
+        let hits = search_notes(dir.path(), "external", 10).expect("s2");
+        assert!(hits.iter().any(|h| h.note_key == "external"));
     }
 }
