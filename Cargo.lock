@@ -8085,6 +8085,7 @@ name = "rust-tunnel-wiki-serve"
 version = "0.4.0"
 dependencies = [
  "axum 0.7.9",
+ "base64 0.22.1",
  "chrono",
  "notify",
  "open",

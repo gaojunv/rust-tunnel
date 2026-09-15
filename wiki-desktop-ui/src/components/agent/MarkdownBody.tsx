@@ -11,9 +11,15 @@
  *   rehype-harden，HTML 不会原样注入）；此处仅覆盖 `a` 强制
  *   target=_blank + rel=noreferrer（Tauri 内打开外链，避免劫持面板路由）
  */
-import { memo } from "react";
-import { Streamdown } from "streamdown";
+import { lazy, memo, Suspense } from "react";
 import type { Components } from "streamdown";
+
+// streamdown 首屏不加载：AgentPanel 本就经 React.lazy 挂载，此处再包一层 lazy，
+// streamdown（含 react-markdown/remark 系 + styles.css）进 AgentPanel 的 lazy chunk。
+// 加载前降级为纯文本 pre（与 MessageStream 流式中占位同风格），避免布局跳变。
+const LazyStreamdown = lazy(() =>
+  import("streamdown").then((m) => ({ default: m.Streamdown })),
+);
 
 const agentComponents: Components = {
   a: ({ node, className, ...props }) => {
@@ -38,9 +44,18 @@ type Props = {
 export const MarkdownBody = memo(function MarkdownBody({ text, streaming }: Props) {
   return (
     <div className="agent-md">
-      <Streamdown mode={streaming ? "streaming" : "static"} components={agentComponents}>
-        {text}
-      </Streamdown>
+      <Suspense
+        fallback={
+          <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed">{text}</pre>
+        }
+      >
+        <LazyStreamdown
+          mode={streaming ? "streaming" : "static"}
+          components={agentComponents}
+        >
+          {text}
+        </LazyStreamdown>
+      </Suspense>
     </div>
   );
 });

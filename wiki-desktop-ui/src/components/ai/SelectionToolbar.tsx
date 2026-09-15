@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SELECTION_ACTIONS, type SelectionAction } from "@/lib/ai-prompts";
@@ -7,9 +7,13 @@ import { chatStream } from "@/lib/ai-client";
 import { getAiConfig } from "@/lib/ai-config";
 import { loadSyncConfig } from "@/api/server";
 import { getToken } from "@/lib/server-auth";
-import { Streamdown } from "streamdown";
-import "streamdown/styles.css";
 import type { SelectionSource } from "@/lib/selection-source";
+
+// streamdown（含 styles.css）仅 AI 结果区需要：lazy 后首屏主包不再含
+// react-markdown/remark 系。结果区打开前不加载，打开时 Suspense 占位。
+const LazyStreamdown = lazy(() =>
+  import("streamdown").then((m) => ({ default: m.Streamdown })),
+);
 
 type Props = {
   source: SelectionSource;
@@ -236,7 +240,9 @@ export function SelectionToolbar({
           {error && <p className="mb-2 rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</p>}
           {result !== null && result !== "" ? (
             <div className="prose prose-sm max-w-none text-sm dark:prose-invert">
-              <Streamdown>{result}</Streamdown>
+              <Suspense fallback={<p className="text-xs text-muted-foreground">渲染中…</p>}>
+                <LazyStreamdown>{result}</LazyStreamdown>
+              </Suspense>
             </div>
           ) : streaming ? (
             <p className="text-xs text-muted-foreground">生成中…</p>

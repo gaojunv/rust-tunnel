@@ -8,6 +8,8 @@ import {
   parseRemoteTime,
   conflictCopyKey,
   hashNote,
+  hashNotesBatch,
+  SYNC_POOL_SIZE,
   type LocalNote,
   type SyncState,
 } from "./sync-engine";
@@ -972,5 +974,201 @@ describe("runSync origin_key 相关行为", () => {
       state,
     });
     expect(capturedBody.origin_key).toBeUndefined();
+  });
+});
+
+// —— 并行 hash：hashNotesBatch ——
+
+describe("hashNotesBatch", () => {
+  it("与逐个 hashNote 结果一致且顺序对应", async () => {
+    const notes = [
+      { title: "t1", body: "b1" },
+      { title: "t2", body: "b2" },
+      { title: "中文标题", body: "中文内容\n多行" },
+      { title: "", body: "" },
+    ];
+    const batched = await hashNotesBatch(notes);
+    const serial: string[] = [];
+    for (const n of notes) serial.push(await hashNote(n.title, n.body));
+    expect(batched).toEqual(serial);
+  });
+
+  it("空数组返回空数组", async () => {
+    await expect(hashNotesBatch([])).resolves.toEqual([]);
+  });
+
+  it("超过一批的数量仍顺序正确（覆盖分批边界）", async () => {
+    const notes = Array.from({ length: 30 }, (_, i) => ({ title: `t${i}`, body: `body-${i}` }));
+    const batched = await hashNotesBatch(notes);
+    expect(batched).toHaveLength(30);
+    // 抽查首/批界/尾与串行一致
+    for (const i of [0, 11, 12, 23, 24, 29]) {
+      await expect(hashNote(notes[i].title, notes[i].body)).resolves.toBe(batched[i]);
+    }
+  });
+});
+
+// —— runSync 并发池 ——
+
+describe("runSync 并发", () => {
+  it("多 upload 并发执行：计数/state 与串行一致，items 保持 plan 顺序", async () => {
+    const state = emptySyncState("kid");
+    const keys = ["a/1", "a/2", "a/3", "a/4", "a/5", "a/6", "a/7", "a/8"];
+    const localByKey = new Map(keys.map((k) => [k, note({ key: k, title: k, body: `body-${k}`, contentHash: `h-${k}` })]));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const io = makeFakeIO({
+      remote: {
+        listAllPages: vi.fn(async () => []),
+        getPage: vi.fn(async () => null),
+        putPage: vi.fn(async (ref: string, body: { title: string; summary: string; content: string }) => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((r) => setTimeout(r, 5));
+          inFlight--;
+          return {
+            ref,
+            title: body.title,
+            summary: body.summary,
+            content: body.content,
+            locked: false,
+            updated_at: "2024-01-03 00:00:00",
+          };
+        }),
+        deletePage: vi.fn(async () => true),
+      },
+    } as unknown as Partial<SyncIO>);
+    const plan = keys.map((k) => ({ kind: "upload" as const, key: k, ref: k }));
+    const report = await runSync(plan, { localByKey, io, state });
+    expect(report.errors).toBe(0);
+    expect(report.uploaded).toBe(keys.length);
+    // 确实发生了并发（串行时 maxInFlight 恒为 1）
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(SYNC_POOL_SIZE);
+    // items 顺序与 plan 一致
+    expect(report.items.map((it) => it.action.kind === "upload" ? it.action.key : null)).toEqual(keys);
+    for (const k of keys) {
+      expect(state.entries[k]).toEqual({ ref: k, localHash: `h-${k}`, remoteUpdatedAt: "2024-01-03 00:00:00" });
+    }
+  });
+
+  it("并发中单条失败不影响其它条，错误按 plan 顺序归位", async () => {
+    const state = emptySyncState("kid");
+    const keys = ["a/1", "a/2", "a/3", "a/4"];
+    const localByKey = new Map(keys.map((k) => [k, note({ key: k, title: k, body: `body-${k}`, contentHash: `h-${k}` })]));
+    const failingRemote = {
+      listAllPages: vi.fn(async () => []),
+      getPage: vi.fn(async () => null),
+      putPage: vi.fn(async (ref: string, body: { title: string; summary: string; content: string }) => {
+        await new Promise((r) => setTimeout(r, 5));
+        if (ref === "a/2" || ref === "a/4") throw new Error(`fail ${ref}`);
+        return {
+          ref,
+          title: body.title,
+          summary: body.summary,
+          content: body.content,
+          locked: false,
+          updated_at: "2024-01-03 00:00:00",
+        };
+      }),
+      deletePage: vi.fn(async () => true),
+    } as unknown as ServerApi;
+    const written = new Map<string, { title: string; body: string }>();
+    const io: SyncIO = {
+      local: {
+        writeNote: async (k: string, t: string, b: string) => {
+          written.set(k, { title: t, body: b });
+          return { modified: 0 };
+        },
+      },
+      remote: failingRemote,
+      now: () => 0,
+    };
+    const report = await runSync(
+      keys.map((k) => ({ kind: "upload" as const, key: k, ref: k })),
+      { localByKey, io, state },
+    );
+    expect(report.errors).toBe(2);
+    expect(report.uploaded).toBe(2);
+    expect(report.items.map((it) => it.ok)).toEqual([true, false, true, false]);
+    expect(report.items[1].detail).toBe("fail a/2");
+    expect(report.items[3].detail).toBe("fail a/4");
+    expect(state.entries["a/1"]).toBeDefined();
+    expect(state.entries["a/2"]).toBeUndefined();
+    expect(state.entries["a/3"]).toBeDefined();
+    expect(state.entries["a/4"]).toBeUndefined();
+  });
+
+  it("混合 plan：并发类与串行类交错时计数正确、顺序保持", async () => {
+    const state = emptySyncState("kid");
+    const n1 = note({ key: "u/1", title: "t", body: "b1", contentHash: "h1" });
+    const n2 = note({ key: "u/2", title: "t", body: "b2", contentHash: "h2" });
+    const io = makeFakeIO();
+    const report = await runSync(
+      [
+        { kind: "upload", key: "u/1", ref: "u/1" },
+        { kind: "skip-empty", key: "s/1" },
+        { kind: "conflict-pending", key: "c/1", ref: "c/1", localModified: 1, remoteUpdatedAt: "t" },
+        { kind: "upload", key: "u/2", ref: "u/2" },
+        { kind: "drop-state", key: "missing" },
+      ],
+      { localByKey: new Map([["u/1", n1], ["u/2", n2]]), io, state },
+    );
+    expect(report.errors).toBe(0);
+    expect(report.uploaded).toBe(2);
+    expect(report.conflicts).toBe(1);
+    expect(report.skipped).toBe(2);
+    expect(report.items.map((it) => it.action.kind)).toEqual([
+      "upload",
+      "skip-empty",
+      "conflict-pending",
+      "upload",
+      "drop-state",
+    ]);
+  });
+
+  it("冲突类保持串行语义：conflict-local-wins 先读远端副本再覆盖", async () => {
+    const nowEpoch = Math.floor(Date.parse("2024-01-04T12:00:00Z") / 1000);
+    const n = note({ key: "a/b", title: "local", body: "local body", contentHash: "h1" });
+    const state = emptySyncState("kid");
+    const calls: string[] = [];
+    const io = makeFakeIO({
+      remote: {
+        listAllPages: vi.fn(async () => []),
+        getPage: vi.fn(async (ref: string) => {
+          calls.push(`get:${ref}`);
+          return {
+            ref,
+            title: "remote",
+            summary: "",
+            content: "remote body",
+            locked: false,
+            updated_at: "2024-01-02 00:00:00",
+          };
+        }),
+        putPage: vi.fn(async (ref: string, body: { title: string; summary: string; content: string }) => {
+          calls.push(`put:${ref}`);
+          return {
+            ref,
+            title: body.title,
+            summary: body.summary,
+            content: body.content,
+            locked: false,
+            updated_at: "2024-01-03 00:00:00",
+          };
+        }),
+        deletePage: vi.fn(async () => true),
+      },
+    } as unknown as Partial<SyncIO>);
+    const report = await runSync([{ kind: "conflict-local-wins", key: "a/b", ref: "a/b" }], {
+      localByKey: new Map([["a/b", n]]),
+      io: { ...io, now: () => nowEpoch } as SyncIO,
+      state,
+    });
+    expect(report.conflicts).toBe(1);
+    expect(report.errors).toBe(0);
+    // 同一 key 内先 get 后 put（依赖顺序不被并发打乱）
+    expect(calls).toEqual(["get:a/b", "put:a/b"]);
+    expect((io.written.get(conflictCopyKey("a/b", nowEpoch)) as { body: string } | undefined)?.body).toBe("remote body");
   });
 });

@@ -1,8 +1,11 @@
 import { Facet } from "@codemirror/state";
 import { EditorView, WidgetType } from "@codemirror/view";
-import katex from "katex";
+// katex CSS 保留静态导入：CSS 拆分会打乱首屏样式顺序、收益小（~25KB gzip 前 24KB 是字体，
+// CSS 本体仅 ~24KB 未压缩）；JS 侧（katex.mjs ~592KB 未压缩）改首次遇到公式时动态 import。
 import "katex/dist/katex.min.css";
 import { attachWikilinkHover } from "./hover-preview";
+
+type KatexModule = typeof import("katex");
 
 /**
  * Live Preview 视图 widget 层。
@@ -841,7 +844,26 @@ export function clearKatexCacheForTest(): void {
   katexCache.clear();
 }
 
-function renderKatexCached(tex: string, displayMode: boolean): string {
+// katex 模块单例：首次遇到公式时动态 import（首屏不进主包），后续复用。
+let katexModule: KatexModule | null = null;
+let katexLoadPromise: Promise<KatexModule> | null = null;
+
+function loadKatex(): Promise<KatexModule> {
+  if (katexModule) return Promise.resolve(katexModule);
+  katexLoadPromise ??= import("katex").then((m) => {
+    katexModule = (m as unknown as { default?: KatexModule }).default ?? (m as unknown as KatexModule);
+    return katexModule;
+  });
+  return katexLoadPromise;
+}
+
+/** 测试辅助：预置 katex 模块（jsdom 单测避免真实动态 import 开销） */
+export function __setKatexModuleForTest(mod: KatexModule | null): void {
+  katexModule = mod;
+  if (mod === null) katexLoadPromise = null;
+}
+
+function renderKatexCached(katex: KatexModule, tex: string, displayMode: boolean): string {
   const key = `${displayMode ? "1" : "0"}:${tex}`;
   const hit = katexCache.get(key);
   if (hit !== undefined) {
@@ -861,6 +883,16 @@ function renderKatexCached(tex: string, displayMode: boolean): string {
     if (!oldest.done) katexCache.delete(oldest.value);
   }
   return html;
+}
+
+/** 已加载 katex 时的同步渲染（缓存命中优先；模块未加载时返回 null 由调用方走异步路径） */
+function tryRenderKatexSync(tex: string, displayMode: boolean): string | null {
+  if (!katexModule) return null;
+  try {
+    return renderKatexCached(katexModule, tex, displayMode);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -890,10 +922,40 @@ export class MathWidget extends WidgetType {
   toDOM(view: EditorView): HTMLElement {
     const el = document.createElement("div");
     el.className = this.displayMode ? "cm-lp-math cm-lp-math-block" : "cm-lp-math";
-    try {
-      el.innerHTML = renderKatexCached(this.tex, this.displayMode);
-    } catch {
-      el.textContent = this.tex;
+    const tex = this.tex;
+    const displayMode = this.displayMode;
+    // 同步路径：katex 已加载（或缓存命中）→ 直接渲染，保持原有 eq/DOM 复用语义
+    const syncHtml = tryRenderKatexSync(tex, displayMode);
+    if (syncHtml !== null) {
+      el.innerHTML = syncHtml;
+    } else if (katexModule === null) {
+      // 异步路径：首次遇到公式 → 占位 + 动态 import 后回填。
+      // 回填条件：el 仍挂载（isConnected）才写 innerHTML，避免游离 DOM 误写；
+      // 回填内容经 LRU 缓存，后续同 tex 走同步路径。
+      el.classList.add("cm-lp-math-loading");
+      el.textContent = tex;
+      void loadKatex().then(
+        (katex) => {
+          if (!el.isConnected) return;
+          try {
+            el.innerHTML = renderKatexCached(katex, tex, displayMode);
+          } catch {
+            el.textContent = tex;
+            el.classList.add("cm-lp-math-error");
+          } finally {
+            el.classList.remove("cm-lp-math-loading");
+          }
+        },
+        () => {
+          if (!el.isConnected) return;
+          el.textContent = tex;
+          el.classList.add("cm-lp-math-error");
+          el.classList.remove("cm-lp-math-loading");
+        },
+      );
+    } else {
+      // katex 已加载但渲染抛错（非法 tex 等）→ 退化为原文
+      el.textContent = tex;
       el.classList.add("cm-lp-math-error");
     }
     el.style.cursor = "pointer";

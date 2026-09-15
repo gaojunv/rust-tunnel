@@ -208,17 +208,37 @@ export function createServerApi(baseUrl: string, knowledgeId: string): ServerApi
 
   return {
     async listAllPages(): Promise<RemotePageSummary[]> {
-      const out: RemotePageSummary[] = [];
       const limit = 200;
-      // 用 for 循环替代 while(true) 以通过 no-constant-condition
-      for (let offset = 0; offset <= 100_000; offset += limit) {
-        const data = await fetchJson<{ pages?: unknown[]; total?: number }>(
+      const fetchPage = (offset: number) =>
+        fetchJson<{ pages?: unknown[]; total?: number }>(
           baseUrl,
           `/api/knowledge/${encodedId}/pages?limit=${limit}&offset=${offset}`,
         );
-        const pages = Array.isArray(data?.pages) ? data.pages : [];
-        for (const p of pages) out.push(parsePageSummary(p));
-        if (pages.length < limit) break;
+      // 首页先行：拿到第一页后即可判断是否只有一页（常见情况，零额外开销）
+      const first = await fetchPage(0);
+      const firstPages = Array.isArray(first?.pages) ? first.pages : [];
+      if (firstPages.length < limit) {
+        return firstPages.map((p) => parsePageSummary(p));
+      }
+      // 多页：offset>0 的页无数据依赖，并发拉取（页数少，上限 8 并发防突发）；
+      // 服务端 total 语义为"本页数量"不可靠，故按"某页不满即结束"逐批推进
+      const out: RemotePageSummary[] = firstPages.map((p) => parsePageSummary(p));
+      let offset = limit;
+      for (let batch = 0; batch < 12_500; batch++) {
+        const offsets: number[] = [];
+        for (let i = 0; i < 8; i++) offsets.push(offset + i * limit);
+        const results = await Promise.all(offsets.map((o) => fetchPage(o)));
+        let done = false;
+        for (const data of results) {
+          const pages = Array.isArray(data?.pages) ? data.pages : [];
+          for (const p of pages) out.push(parsePageSummary(p));
+          if (pages.length < limit) {
+            done = true;
+            break;
+          }
+        }
+        if (done) break;
+        offset += 8 * limit;
       }
       return out;
     },
