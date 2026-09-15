@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
@@ -154,13 +155,13 @@ export default function SkillDialog({ open, onClose, skill = null, onCreated }: 
           </div>
           <div className="space-y-2">
             <Label>{t('skill.content')}</Label>
-            <textarea
+            <Textarea
               value={content}
               onChange={(e) => setContent(e.target.value)}
               rows={6}
               placeholder={t('skill.contentPlaceholder')}
               aria-label={t('skill.content')}
-              className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+              className="font-mono"
             />
           </div>
           <div className="space-y-2">

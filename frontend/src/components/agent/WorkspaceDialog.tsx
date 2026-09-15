@@ -9,6 +9,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -623,12 +624,11 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
             </div>
             <div className="space-y-2">
               <Label>{t('agent.systemPrompt')}</Label>
-              <textarea
+              <Textarea
                 value={systemPrompt}
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 placeholder={t('agent.systemPromptPlaceholder')}
                 rows={3}
-                className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm"
               />
             </div>
           </TabsContent>

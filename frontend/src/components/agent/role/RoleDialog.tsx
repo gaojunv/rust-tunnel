@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
@@ -249,13 +250,13 @@ export default function RoleDialog({ open, onClose, role = null }: Props) {
           {/* 系统提示词 */}
           <div className="space-y-2">
             <Label>{t('role.systemPrompt')}</Label>
-            <textarea
+            <Textarea
               value={systemPrompt}
               onChange={(e) => setSystemPrompt(e.target.value)}
               rows={6}
               placeholder={t('role.systemPromptPlaceholder')}
               aria-label={t('role.systemPrompt')}
-              className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+              className="font-mono"
             />
           </div>
 

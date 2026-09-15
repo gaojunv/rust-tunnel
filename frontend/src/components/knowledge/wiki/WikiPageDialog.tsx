@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
@@ -139,13 +140,13 @@ export default function WikiPageDialog({ wikiId, open, onClose, page = null }: P
                 <Markdown content={content} />
               </div>
             ) : (
-              <textarea
+              <Textarea
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
                 rows={8}
                 placeholder={t('wiki.pageContentPlaceholder')}
                 aria-label={t('wiki.pageContent')}
-                className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+                className="font-mono"
               />
             )}
           </div>
