@@ -25,8 +25,24 @@ const DEFAULT_AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_min
 /// On reconnect the inner sender is hot-swapped via [`ClientLogLayer::set_sender`].
 static LOG_LAYER: std::sync::OnceLock<ClientLogLayer> = std::sync::OnceLock::new();
 
+/// 返回进程级共享的日志捕获 layer（首次调用时创建）。
+///
+/// 调用方（CLI bin / GUI）应尽早把它注册进全局 subscriber
+/// （[`init_logging_with_layer`]），`run_client_inner` 内部复用同一实例做
+/// sender 热替换。若各调各的 `ClientLogLayer::new()`，先初始化的那个才会被
+/// 注册，另一个永远收不到事件：日志不上报，且其 sender 挂在 static 上永不
+/// 释放会让每次重连泄漏一个日志转发任务。
+#[must_use]
+pub fn shared_log_layer() -> ClientLogLayer {
+    LOG_LAYER.get_or_init(ClientLogLayer::new).clone()
+}
+
 /// Type alias for the control message sender
 pub type ControlSender = mpsc::Sender<ControlMessage>;
+
+/// 等待本地拨号期间允许缓冲的最大字节数（超出即判定目标不可达并快速失败，
+/// 避免黑洞目标 + 服务端持续推 Data 时客户端内存无界增长）。
+const MAX_PENDING_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// State of a local connection being established
 enum LocalConnectionState {
@@ -39,6 +55,8 @@ enum LocalConnectionState {
 /// Information about a local connection (pending or active)
 struct ActiveLocalConnection {
     state: LocalConnectionState,
+    /// Pending 状态下已缓冲的字节数（配合 `MAX_PENDING_BUFFER_BYTES` 限流）。
+    pending_bytes: usize,
 }
 
 /// 多任务共享的客户端状态：连接表、取消句柄与 spawn 管理器等
@@ -49,6 +67,9 @@ pub struct ClientState {
     /// 控制通道消息发送端（发往服务端的 `ControlMessage`）。
     pub control_sender: ControlSender,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
+    /// 每条隧道连接的 reader 任务句柄：控制通道断开或收到 Close 时统一 abort，
+    /// 避免旧任务吊着本地 socket/sender 成为孤儿（长连接 + 频繁重连时持续累积）。
+    conn_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
     /// 进行中的 agent exec 取消句柄：request_id → cancel 信号发送端。
     exec_cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     /// 长生命周期 agent 进程的 spawn 管理器（AgentSpawn* 消息）。
@@ -79,6 +100,7 @@ impl ClientState {
             config,
             control_sender,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            conn_tasks: Arc::new(Mutex::new(HashMap::new())),
             exec_cancels: Arc::new(Mutex::new(HashMap::new())),
             spawn_manager: SpawnManager::new(),
             llm_proxy_pending: crate::llm_proxy::new_pending_map(),
@@ -153,8 +175,18 @@ impl ClientState {
     pub fn set_connected(&self, connected: bool) {
         if let Ok(mut guard) = self.status_inner.try_lock() {
             guard.connected = connected;
-            if connected && guard.connected_at.is_none() {
-                guard.connected_at = Some(std::time::SystemTime::now());
+            if connected {
+                if guard.connected_at.is_none() {
+                    guard.connected_at = Some(std::time::SystemTime::now());
+                }
+            } else {
+                // 断开即清空随连接而生的瞬态，避免离线时展示过期的
+                // 在线时长/RTT/映射摘要/隧道计数。
+                guard.connected_at = None;
+                guard.rtt_ms = None;
+                guard.mapping_summary = None;
+                guard.active_tunnels = 0;
+                guard.pending_tunnels = 0;
             }
             let snap = guard.clone();
             drop(guard);
@@ -164,15 +196,80 @@ impl ClientState {
         }
     }
 
+    /// 从连接表重算 active/pending 计数并广播（连接增删后调用）。
+    async fn refresh_tunnel_stats(&self) {
+        let (mut active, mut pending) = (0usize, 0usize);
+        {
+            let conns = self.active_connections.lock().await;
+            for conn in conns.values() {
+                match conn.state {
+                    LocalConnectionState::Active(_) => active += 1,
+                    LocalConnectionState::Pending(_) => pending += 1,
+                }
+            }
+        }
+        if let Ok(mut guard) = self.status_inner.try_lock() {
+            guard.active_tunnels = active;
+            guard.pending_tunnels = pending;
+            let snap = guard.clone();
+            drop(guard);
+            if let Some(tx) = &self.status_tx {
+                let _ = tx.send(snap);
+            }
+        }
+    }
+
+    /// 记录一条最近隧道（最新在前，cap 20），供 GUI 状态页展示。
+    fn note_recent_tunnel(&self, connection_id: u64, target_addr: &str) {
+        if let Ok(mut guard) = self.status_inner.try_lock() {
+            guard.recent_tunnels.insert(
+                0,
+                (
+                    connection_id,
+                    target_addr.to_string(),
+                    std::time::SystemTime::now(),
+                ),
+            );
+            guard.recent_tunnels.truncate(20);
+        }
+    }
+
+    /// 登记一条隧道连接的 reader 任务句柄（供断开清理/Close 中止）。
+    /// 任务若在登记前已结束（快速失败路径）则直接跳过，避免积累陈旧句柄。
+    pub async fn register_conn_task(&self, connection_id: u64, handle: tokio::task::JoinHandle<()>) {
+        if handle.is_finished() {
+            return;
+        }
+        self.conn_tasks
+            .lock()
+            .await
+            .insert(connection_id, handle.abort_handle());
+    }
+
+    /// 控制通道断开后的确定性清理：abort 全部隧道 reader 任务并清空连接表，
+    /// 不再依赖 channel drop 的间接时序回收旧任务。
+    pub async fn shutdown_connections(&self) {
+        let mut tasks = self.conn_tasks.lock().await;
+        for (_, handle) in tasks.drain() {
+            handle.abort();
+        }
+        drop(tasks);
+        self.active_connections.lock().await.clear();
+    }
+
     /// 注册一条待建立的本地连接（数据先缓冲，待拨号成功后刷出）。
     pub async fn add_pending_connection(&self, connection_id: u64) {
-        let mut conns = self.active_connections.lock().await;
-        conns.insert(
-            connection_id,
-            ActiveLocalConnection {
-                state: LocalConnectionState::Pending(Vec::new()),
-            },
-        );
+        {
+            let mut conns = self.active_connections.lock().await;
+            conns.insert(
+                connection_id,
+                ActiveLocalConnection {
+                    state: LocalConnectionState::Pending(Vec::new()),
+                    pending_bytes: 0,
+                },
+            );
+        }
+        self.refresh_tunnel_stats().await;
     }
 
     /// Transition a pending connection to active, flushing any buffered data.
@@ -182,70 +279,131 @@ impl ClientState {
         connection_id: u64,
         stream: Box<dyn AsyncWrite + Unpin + Send>,
     ) -> bool {
-        let mut conns = self.active_connections.lock().await;
-        if let Some(conn) = conns.get_mut(&connection_id) {
-            match std::mem::replace(
-                &mut conn.state,
-                LocalConnectionState::Active(Arc::new(Mutex::new(stream))),
-            ) {
-                LocalConnectionState::Pending(buffered) => {
-                    if !buffered.is_empty() {
-                        if let LocalConnectionState::Active(writer) = &conn.state {
-                            let mut writer = writer.lock().await;
-                            for data in buffered {
-                                let _ = writer.write_all(&data).await;
+        let activated = {
+            let mut conns = self.active_connections.lock().await;
+            if let Some(conn) = conns.get_mut(&connection_id) {
+                match std::mem::replace(
+                    &mut conn.state,
+                    LocalConnectionState::Active(Arc::new(Mutex::new(stream))),
+                ) {
+                    LocalConnectionState::Pending(buffered) => {
+                        if !buffered.is_empty() {
+                            if let LocalConnectionState::Active(writer) = &conn.state {
+                                let mut writer = writer.lock().await;
+                                for data in buffered {
+                                    let _ = writer.write_all(&data).await;
+                                }
+                                let _ = writer.flush().await;
                             }
-                            let _ = writer.flush().await;
                         }
+                        true
                     }
-                    true
+                    LocalConnectionState::Active(_) => {
+                        debug!(
+                            "Connection {} already active, ignoring duplicate activation",
+                            connection_id
+                        );
+                        false
+                    }
                 }
-                LocalConnectionState::Active(_) => {
-                    debug!(
-                        "Connection {} already active, ignoring duplicate activation",
-                        connection_id
-                    );
-                    false
-                }
+            } else {
+                debug!(
+                    "Connection {} not found during activation (may have been closed)",
+                    connection_id
+                );
+                false
             }
-        } else {
-            debug!(
-                "Connection {} not found during activation (may have been closed)",
-                connection_id
-            );
-            false
+        };
+        if activated {
+            self.refresh_tunnel_stats().await;
         }
+        activated
     }
 
-    /// 移除一条连接（无论 pending 还是 active）。
+    /// 移除一条连接（无论 pending 还是 active），并中止其 reader 任务：
+    /// 收到 Close 时立即停掉本地读循环，不再等本地 socket 自行关闭。
     pub async fn remove_connection(&self, connection_id: u64) {
-        let mut conns = self.active_connections.lock().await;
-        conns.remove(&connection_id);
+        {
+            let mut conns = self.active_connections.lock().await;
+            conns.remove(&connection_id);
+        }
+        // abort 对已完成/自身任务是安全的（下一个 yield 点才生效，调用方随即返回）。
+        if let Some(handle) = self.conn_tasks.lock().await.remove(&connection_id) {
+            handle.abort();
+        }
+        self.refresh_tunnel_stats().await;
     }
 
-    /// 向指定连接投递数据；pending 时缓冲，active 时写入本地服务。
+    /// 向指定连接投递数据；pending 时缓冲（受 `MAX_PENDING_BUFFER_BYTES` 限制），
+    /// active 时写入本地服务。
+    ///
+    /// 写入本地服务时不持有连接表锁（writer 为 Arc 克隆，锁内只取句柄），
+    /// 避免一个慢消费者阻塞所有连接的数据投递与 Close 处理（队头阻塞）。
     ///
     /// # Errors
     ///
     /// 当底层 `write_all`/`flush` 发生 `I/O` 错误时返回 `Err`。
     pub async fn deliver_data(&self, connection_id: u64, data: Vec<u8>) -> TunnelResult<()> {
-        let mut conns = self.active_connections.lock().await;
-        if let Some(conn) = conns.get_mut(&connection_id) {
-            match &mut conn.state {
-                LocalConnectionState::Pending(buffer) => {
-                    buffer.push(data);
-                    Ok(())
-                }
-                LocalConnectionState::Active(writer) => {
-                    let mut writer = writer.lock().await;
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
-                    Ok(())
-                }
+        enum Delivery {
+            Write(Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>, Vec<u8>),
+            Buffered,
+            PendingOverflow,
+            Missing,
+        }
+        let action = {
+            let mut conns = self.active_connections.lock().await;
+            match conns.get_mut(&connection_id) {
+                Some(conn) => match &mut conn.state {
+                    LocalConnectionState::Pending(buffer) => {
+                        conn.pending_bytes += data.len();
+                        if conn.pending_bytes > MAX_PENDING_BUFFER_BYTES {
+                            conns.remove(&connection_id);
+                            Delivery::PendingOverflow
+                        } else {
+                            buffer.push(data);
+                            Delivery::Buffered
+                        }
+                    }
+                    LocalConnectionState::Active(writer) => {
+                        Delivery::Write(writer.clone(), data)
+                    }
+                },
+                None => Delivery::Missing,
             }
-        } else {
-            debug!("No active local connection found for id {}", connection_id);
-            Ok(())
+        };
+        match action {
+            Delivery::Write(writer, data) => {
+                let mut writer = writer.lock().await;
+                writer.write_all(&data).await?;
+                writer.flush().await?;
+                Ok(())
+            }
+            Delivery::PendingOverflow => {
+                warn!(
+                    "Connection {} pending buffer exceeded {} bytes while connecting; failing open",
+                    connection_id, MAX_PENDING_BUFFER_BYTES
+                );
+                // 中止仍在进行的拨号任务，并快速失败服务端等待的 open 结果
+                // （若成功结果已抢先送达，服务端 open_result.take 语义会忽略本条）。
+                if let Some(handle) = self.conn_tasks.lock().await.remove(&connection_id) {
+                    handle.abort();
+                }
+                let _ = self
+                    .control_sender
+                    .send(ControlMessage::TunnelOpenResult {
+                        connection_id,
+                        success: false,
+                        error: Some("pending buffer overflow while connecting".into()),
+                    })
+                    .await;
+                self.refresh_tunnel_stats().await;
+                Ok(())
+            }
+            Delivery::Missing => {
+                debug!("No active local connection found for id {}", connection_id);
+                Ok(())
+            }
+            Delivery::Buffered => Ok(()),
         }
     }
 
@@ -362,8 +520,9 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         );
                         // Pre-register as pending so Data messages are buffered instead of dropped
                         state.add_pending_connection(connection_id).await;
+                        state.note_recent_tunnel(connection_id, &target_addr);
                         let state_clone = state.clone();
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             if let Err(e) =
                                 proxy::handle_open_tunnel(state_clone, connection_id, target_addr)
                                     .await
@@ -371,6 +530,9 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                                 warn!("Failed to handle OpenTunnel {}: {}", connection_id, e);
                             }
                         });
+                        // 登记 reader 任务句柄：Close/断开时由 remove_connection /
+                        // shutdown_connections 统一中止，不再残留孤儿任务。
+                        state.register_conn_task(connection_id, handle).await;
                     }
                     ControlMessage::Data {
                         connection_id,
@@ -760,7 +922,7 @@ async fn run_client_inner(
     let (sender, mut receiver) = mpsc::channel::<ControlMessage>(32);
 
     // Spawn writer task
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(msg) = receiver.recv().await {
             if let Err(e) = msg.write_to_stream(&mut writer).await {
                 debug!("Failed to write control message: {}", e);
@@ -773,23 +935,19 @@ async fn run_client_inner(
     let log_ctrl_sender = sender.clone();
     let (log_tx, log_rx) = mpsc::unbounded_channel::<ClientLogEntry>();
 
-    let layer = ClientLogLayer::new();
-    if LOG_LAYER.set(layer).is_ok() {
-        // First connection: the layer was stored; now initialise logging with it.
-        let Some(stored) = LOG_LAYER.get() else {
-            unreachable!("LOG_LAYER just set")
-        };
-        init_logging_with_layer(&config.log, stored.clone());
-    }
+    // 复用进程级共享 layer：无论全局 subscriber 由 CLI bin、GUI 还是首次
+    // run_client_inner 注册，拿到的都是同一个实例，sender 热替换才会作用到
+    // 真正注册的那个 layer 上；旧 sender 随替换释放，旧 forwarder 收到
+    // None 自行退出，重连不再累积泄漏任务。
+    let stored = shared_log_layer();
+    init_logging_with_layer(&config.log, stored.clone());
 
     // 本地环形缓冲（托盘/GUI 拉取），与远端上报双写
     let log_buffer = shared_log_buffer
         .unwrap_or_else(|| std::sync::Arc::new(crate::log_buffer::LogBuffer::default()));
-    if let Some(stored) = LOG_LAYER.get() {
-        stored.set_sender(log_tx);
-        stored.set_log_buffer(log_buffer.clone());
-        spawn_log_forwarder(log_rx, log_ctrl_sender);
-    }
+    stored.set_sender(log_tx);
+    stored.set_log_buffer(log_buffer.clone());
+    spawn_log_forwarder(log_rx, log_ctrl_sender);
     // --- End log capture setup ---
 
     let mut state = ClientState::new(config, sender.clone()).with_log_buffer(log_buffer);
@@ -800,9 +958,14 @@ async fn run_client_inner(
     state.set_last_error(None);
 
     // Start heartbeat task
-    tokio::spawn(start_heartbeat(sender));
+    let heartbeat_task = tokio::spawn(start_heartbeat(sender));
 
     let result = process_control_messages(&mut reader, state.clone()).await;
+    // 确定性清理：立即停掉心跳与写任务（不再等 channel drop 的间接时序），
+    // 并中止全部隧道 reader 任务、清空连接表，避免重连后旧任务/旧 socket 累积。
+    heartbeat_task.abort();
+    writer_task.abort();
+    state.shutdown_connections().await;
     state.set_connected(false);
     if let Err(ref e) = result {
         state.set_last_error(Some(e.to_string()));
@@ -1266,5 +1429,131 @@ mod tests {
             decoded,
             ControlMessage::AgentExecCancel { request_id } if request_id == "req-x"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_deliver_data_pending_overflow_fails_open() {
+        // pending 缓冲超过上限：移除连接、中止 reader 任务、回 TunnelOpenResult 失败
+        let (tx, mut rx) = mpsc::channel(32);
+        let state = ClientState {
+            control_sender: tx,
+            ..create_test_state()
+        };
+        state.add_pending_connection(7).await;
+        // 登记一个永不结束的任务充当 reader
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        state.register_conn_task(7, handle).await;
+
+        // 逐块写入直至超过 4MiB 上限
+        let chunk = vec![0u8; 1024 * 1024];
+        for _ in 0..4 {
+            state.deliver_data(7, chunk.clone()).await.unwrap();
+        }
+        assert!(state.active_connections.lock().await.contains_key(&7));
+        state.deliver_data(7, chunk).await.unwrap();
+
+        // 连接已移除，任务已中止，且服务端收到失败结果
+        assert!(!state.active_connections.lock().await.contains_key(&7));
+        assert!(state.conn_tasks.lock().await.is_empty());
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        match msg {
+            ControlMessage::TunnelOpenResult {
+                connection_id,
+                success,
+                error,
+            } => {
+                assert_eq!(connection_id, 7);
+                assert!(!success);
+                assert!(error.unwrap().contains("overflow"));
+            }
+            other => panic!("expected TunnelOpenResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_connection_aborts_reader_task() {
+        // Close/移除连接应中止其 reader 任务（不再等本地 socket 自行关闭）
+        let state = create_test_state();
+        state.add_pending_connection(9).await;
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = handle.abort_handle();
+        state.register_conn_task(9, handle).await;
+
+        state.remove_connection(9).await;
+        assert!(state.conn_tasks.lock().await.is_empty());
+        // abort 在下一个 yield 生效，让出一次调度后任务应已结束
+        tokio::task::yield_now().await;
+        assert!(abort_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_connections_clears_all() {
+        // 控制通道断开：全部 reader 任务中止 + 连接表清空
+        let state = create_test_state();
+        for id in 1..=3u64 {
+            state.add_pending_connection(id).await;
+            let handle = tokio::spawn(async move {
+                std::future::pending::<()>().await;
+            });
+            state.register_conn_task(id, handle).await;
+        }
+        state.shutdown_connections().await;
+        assert!(state.active_connections.lock().await.is_empty());
+        assert!(state.conn_tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_stats_refresh_and_recent() {
+        // 状态页计数：pending→active→removed 各阶段正确，最近隧道 cap 20 最新在前
+        let state = create_test_state();
+        state.add_pending_connection(1).await;
+        state.note_recent_tunnel(1, "127.0.0.1:80");
+        {
+            let snap = state.status_inner.lock().await;
+            assert_eq!(snap.pending_tunnels, 1);
+            assert_eq!(snap.active_tunnels, 0);
+            assert_eq!(snap.recent_tunnels[0].0, 1);
+            assert_eq!(snap.recent_tunnels[0].1, "127.0.0.1:80");
+        }
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        assert!(state.activate_connection(1, mock_writer).await);
+        {
+            let snap = state.status_inner.lock().await;
+            assert_eq!(snap.pending_tunnels, 0);
+            assert_eq!(snap.active_tunnels, 1);
+        }
+        state.remove_connection(1).await;
+        let snap = state.status_inner.lock().await;
+        assert_eq!(snap.pending_tunnels, 0);
+        assert_eq!(snap.active_tunnels, 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_connected_false_clears_transient() {
+        // 断开连接：清空 RTT/映射摘要/在线时间/隧道计数，避免离线展示过期数据
+        let state = create_test_state();
+        state.set_connected(true);
+        state.set_rtt(12.0);
+        state.set_mapping_summary(rust_tunnel_common::protocol::MappingSummary {
+            connected_at: None,
+            active_tunnels: 0,
+            rtt_ms: None,
+            rules: vec![],
+            truncated: false,
+        });
+        state.set_connected(false);
+        let snap = state.status_inner.lock().await;
+        assert!(!snap.connected);
+        assert!(snap.connected_at.is_none());
+        assert!(snap.rtt_ms.is_none());
+        assert!(snap.mapping_summary.is_none());
+        assert_eq!(snap.active_tunnels, 0);
     }
 }
