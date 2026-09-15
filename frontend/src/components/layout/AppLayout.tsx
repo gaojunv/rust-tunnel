@@ -6,6 +6,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { logout as apiLogout } from '@/api/client';
 import { AgentNotificationsProvider } from '@/notifications/NotificationProvider';
+import { RouteErrorBoundary } from '@/components/shared/RouteErrorBoundary';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 
 export default function AppLayout() {
@@ -43,10 +44,15 @@ export default function AppLayout() {
         </div>
       }
     >
-      {/* 全局工作台通知：订阅所有会话事件，标签闪动 + 系统通知（需开启开关） */}
-      <AgentNotificationsProvider>
-        <Outlet />
-      </AgentNotificationsProvider>
+      {/* 路由级错误边界：页面崩溃只替换内容区，Header/移动导航存活；
+          resetKey=pathname，导航即自动重置。布局级/lazy chunk 失败仍由
+          App.tsx 路由 errorElement 兜底。 */}
+      <RouteErrorBoundary resetKey={location.pathname} onGoHome={() => navigate('/dashboard')}>
+        {/* 全局工作台通知：订阅所有会话事件，标签闪动 + 系统通知（需开启开关） */}
+        <AgentNotificationsProvider>
+          <Outlet />
+        </AgentNotificationsProvider>
+      </RouteErrorBoundary>
     </Suspense>
   );
 
