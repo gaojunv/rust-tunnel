@@ -281,13 +281,31 @@ export function OverlayScrollbar({ containerRef, orientation = "vertical" }: Ove
   const [el, setEl] = React.useState<HTMLElement | null>(() => containerRef.current);
 
   React.useEffect(() => {
-    setEl(containerRef.current);
-    // 容器可能是异步创建（如 CM 的 scrollDOM），用短轮询兜底
-    const id = window.setInterval(() => {
-      if (containerRef.current !== el) setEl(containerRef.current);
-    }, 120);
-    return () => window.clearInterval(id);
-  }, [containerRef, el]);
+    // 容器可能是异步创建（如 CM 的 scrollDOM 在父 effect 中才就绪，
+    // 子 effect 先跑）：有限次 rAF 重试（约 0.5s 上限），代替 120ms 永生轮询。
+    // 注：ref.current 赋值不触发重渲染，调用方就绪时不会重跑本 effect，
+    // 因此首次挂载必须自带重试；成功或超限即停，无常驻开销。
+    let raf = 0;
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 30;
+    const poll = () => {
+      if (cancelled) return;
+      const cur = containerRef.current;
+      if (cur) {
+        setEl((prev) => (prev === cur ? prev : cur));
+        return;
+      }
+      if (++attempts < MAX_ATTEMPTS) {
+        raf = window.requestAnimationFrame(poll);
+      }
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, [containerRef]);
 
   if (!el) return null;
   return <ScrollbarTrack containerEl={el} orientation={orientation} />;

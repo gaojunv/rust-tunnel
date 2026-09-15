@@ -121,6 +121,26 @@ describe("livePreview view adapter", () => {
     expect(view.dom.textContent ?? "").toContain("# Hello");
   });
 
+  it("选区变化但可见 spec 不变 → StateField 值引用不变（脏检查）", () => {
+    const v = mount("# Hello\n\nbody text here\n");
+    v.dispatch({ selection: { anchor: v.state.doc.length } });
+    const before = v.state.field(livePreviewField);
+    // 在同一空行内移动光标：可见 spec 集不变
+    v.dispatch({ selection: { anchor: v.state.doc.length - 1 } });
+    const after = v.state.field(livePreviewField);
+    expect(after).toBe(before);
+  });
+
+  it("选区触碰构造 → 可见 spec 变化 → StateField 更新", () => {
+    const v = mount("# Hello\n\nbody text here\n");
+    v.dispatch({ selection: { anchor: v.state.doc.length } });
+    const before = v.state.field(livePreviewField);
+    // 光标移入标题行：标题还原，可见集变化
+    v.dispatch({ selection: { anchor: 0 } });
+    const after = v.state.field(livePreviewField);
+    expect(after).not.toBe(before);
+  });
+
   it("wikilink 点击触发导航回调", () => {
     const seen: string[] = [];
     view = new EditorView({

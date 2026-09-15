@@ -253,10 +253,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
         // also enable explicit trigger for wikilinks: start completion on "[["
         EditorView.updateListener.of((update) => {
           if (!update.docChanged) return;
-          const doc = update.state.doc.toString();
           const pos = update.state.selection.main.head;
-          // if last two chars before cursor are "[[", trigger completion
-          if (pos >= 2 && doc.slice(pos - 2, pos) === "[[") {
+          // 只读光标前 2 字符，避免每次击键全文 toString
+          if (pos >= 2 && update.state.sliceDoc(Math.max(0, pos - 2), pos) === "[[") {
             startCompletion(update.view);
           }
         }),

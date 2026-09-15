@@ -40,10 +40,16 @@ export function wikilinkCompletionSource(
   getNotes: () => NoteSummaryLike[],
 ): (ctx: CompletionContext) => CompletionResult | null {
   return (ctx: CompletionContext): CompletionResult | null => {
-    const doc = ctx.state.doc.toString();
+    // 只读 caret 所在行：findLinkQuery 仅用行内文本 + caret 行内偏移。
+    // caret 大于行尾时（极端竞态）回退为 0，避免 line 内容错位。
     const caret = ctx.pos;
-    const info = findLinkQuery(doc, caret);
-    if (!info) return null;
+    const line = ctx.state.doc.lineAt(caret);
+    const lineText = line.text;
+    const caretInLine = caret - line.from;
+    const lineInfo = findLinkQuery(lineText, caretInLine);
+    if (!lineInfo) return null;
+    // findLinkQuery 只见行内文本，其 start 为行内偏移 → 转回文档绝对偏移
+    const info = { start: line.from + lineInfo.start, query: lineInfo.query };
 
     const notes = getNotes();
     const candidates = rankNotes(notes, info.query);

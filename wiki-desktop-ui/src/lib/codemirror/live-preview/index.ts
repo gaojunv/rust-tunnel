@@ -70,12 +70,10 @@ export { wikilinkNavFacet } from "./widgets";
 function buildDecoSetFromSpecs(
   state: EditorState,
   specs: readonly DecoSpec[],
-): { decos: DecorationSet; specs: DecoSpec[] } {
+): DecorationSet {
   const lineDecos: { line: number; deco: Decoration }[] = [];
   const inlineDecos: { from: number; to: number; deco: Decoration }[] = [];
-  const allSpecs: DecoSpec[] = [];
 
-  allSpecs.push(...specs);
   for (const spec of specs) {
     switch (spec.kind) {
       case "line":
@@ -237,7 +235,7 @@ function buildDecoSetFromSpecs(
     const pos = doc.line(line).from;
     ranges.push({ from: pos, to: pos, value: deco });
   }
-  return { decos: Decoration.set(ranges, true), specs: allSpecs };
+  return Decoration.set(ranges, true);
 }
 
 interface LivePreviewState {
@@ -250,18 +248,114 @@ interface LivePreviewState {
   doc: EditorState["doc"];
 }
 
+/**
+ * 可见 spec 集的浅比较：kind/from/to + payload 标量逐项相等即视为一致。
+ * 一致时 `updateForSelection` 直接返回旧 StateField 值（引用不变），
+ * CM 的 `provide` 字段值不变即跳过装饰 diff，避免全量重建 DecorationSet。
+ */
+function specShallowEqual(a: DecoSpec, b: DecoSpec): boolean {
+  if (a.kind !== b.kind) return false;
+  switch (a.kind) {
+    case "line":
+      return b.kind === "line" && a.line === b.line && a.cls === b.cls;
+    case "mark":
+      return b.kind === "mark" && a.from === b.from && a.to === b.to && a.cls === b.cls;
+    case "hide":
+      return b.kind === "hide" && a.from === b.from && a.to === b.to;
+    case "checkbox":
+      return (
+        b.kind === "checkbox" &&
+        a.from === b.from && a.to === b.to && a.checked === b.checked
+      );
+    case "hr":
+      return b.kind === "hr" && a.from === b.from && a.to === b.to;
+    case "wikilink":
+      return (
+        b.kind === "wikilink" &&
+        a.from === b.from && a.to === b.to &&
+        a.target === b.target && a.label === b.label
+      );
+    case "image":
+      return (
+        b.kind === "image" &&
+        a.from === b.from && a.to === b.to &&
+        a.alt === b.alt && a.src === b.src && a.block === b.block &&
+        a.width === b.width && a.height === b.height
+      );
+    case "mdlink":
+      return (
+        b.kind === "mdlink" &&
+        a.from === b.from && a.to === b.to &&
+        a.text === b.text && a.url === b.url
+      );
+    case "table":
+      return (
+        b.kind === "table" &&
+        a.from === b.from && a.to === b.to && a.raw === b.raw
+      );
+    case "codeheader":
+      return (
+        b.kind === "codeheader" &&
+        a.from === b.from && a.to === b.to && a.lang === b.lang
+      );
+    case "codefooter":
+      return b.kind === "codefooter" && a.from === b.from && a.to === b.to;
+    case "frontmatter":
+      return (
+        b.kind === "frontmatter" &&
+        a.from === b.from && a.to === b.to && a.propCount === b.propCount
+      );
+    case "callout":
+      return (
+        b.kind === "callout" &&
+        a.from === b.from && a.to === b.to &&
+        a.calloutType === b.calloutType && a.title === b.title
+      );
+    case "highlight":
+      return (
+        b.kind === "highlight" &&
+        a.from === b.from && a.to === b.to &&
+        a.markFrom === b.markFrom && a.markTo === b.markTo
+      );
+    case "mathblock":
+      return (
+        b.kind === "mathblock" &&
+        a.from === b.from && a.to === b.to && a.tex === b.tex
+      );
+    case "mathinline":
+      return (
+        b.kind === "mathinline" &&
+        a.from === b.from && a.to === b.to && a.tex === b.tex
+      );
+    case "bullet":
+      return b.kind === "bullet" && a.from === b.from && a.to === b.to;
+  }
+}
+
+function specsShallowEqual(a: readonly DecoSpec[], b: readonly DecoSpec[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!specShallowEqual(a[i], b[i])) return false;
+  }
+  return true;
+}
+
 /** 全量构建（含语法树遍历 + 行扫描），只在文档变化时调用。 */
 function rebuildAll(state: EditorState): LivePreviewState {
   const zoned = computeZonedSpecs(state);
   const specs = filterZonedSpecs(zoned, state.selection.ranges);
-  const { decos } = buildDecoSetFromSpecs(state, specs);
+  const decos = buildDecoSetFromSpecs(state, specs);
   return { decos, specs, zoned, doc: state.doc };
 }
 
-/** 选区变化时增量更新：复用 zoned 全集，只重做过滤 + 装饰映射。 */
+/**
+ * 选区变化时增量更新：复用 zoned 全集，只重做过滤 + 装饰映射。
+ * 过滤结果与上次浅比较一致时保持旧引用返回（StateField 值不变，CM 跳过 diff）。
+ */
 function updateForSelection(value: LivePreviewState, state: EditorState): LivePreviewState {
   const specs = filterZonedSpecs(value.zoned, state.selection.ranges);
-  const { decos } = buildDecoSetFromSpecs(state, specs);
+  if (specsShallowEqual(specs, value.specs)) return value;
+  const decos = buildDecoSetFromSpecs(state, specs);
   return { decos, specs, zoned: value.zoned, doc: value.doc };
 }
 
