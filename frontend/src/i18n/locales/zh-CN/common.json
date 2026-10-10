@@ -35,6 +35,7 @@
     "loadMore": "加载更多",
     "loadedOf": "已加载 {{loaded}} / 共 {{total}}",
     "loadFailed": "加载失败",
+    "refresh": "刷新",
     "retry": "重试"
   },
   "timeRange": {
@@ -183,6 +184,12 @@
     "kickAndDelete": "踢出并删除",
     "kickDeleteConfirm": "踢出 {{name}} 并删除？",
     "deleteConfirm": "删除 {{name}}？",
+    "kickConfirmTitle": "踢出客户端",
+    "kickConfirmDesc": "踢出 {{name}}？连接将立即断开，客户端可凭令牌重新连接。",
+    "toast": {
+      "kicked": "已断开客户端连接",
+      "rotated": "令牌已轮换"
+    },
     "table": {
       "name": "名称",
       "status": "状态",

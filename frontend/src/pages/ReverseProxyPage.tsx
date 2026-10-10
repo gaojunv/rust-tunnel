@@ -11,7 +11,7 @@ import type { ProxyRule } from '@/types';
 
 export default function ReverseProxyPage() {
   const { t } = useTranslation();
-  const { data: rules, isLoading } = useProxyRules();
+  const { data: rules, isLoading, isError, refetch } = useProxyRules();
   const updateMutation = useUpdateProxyRule();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<ProxyRule | null>(null);
@@ -58,6 +58,8 @@ export default function ReverseProxyPage() {
       <ProxyRuleTable
         rules={(rules ?? []).filter(r => r.id !== '__llm_gateway__')}
         isLoading={isLoading}
+        isError={isError}
+        onRetry={() => void refetch()}
         onEdit={handleEdit}
         onToggleEnabled={handleToggleEnabled}
       />

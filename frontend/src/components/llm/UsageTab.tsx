@@ -19,6 +19,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { StatCard } from '@/components/shared/StatCard';
+import { ErrorBanner } from '@/components/shared/ErrorBanner';
 import { TimeRangeSelector } from '@/components/shared/TimeRangeSelector';
 import { useTimeRange } from '@/hooks/useTimeRange';
 import { useLlmUsageSummary, useLlmUsageAggregate, useLlmUsageLogs } from '@/api/hooks';
@@ -62,13 +63,15 @@ export default function UsageTab() {
     setPage(0);
   }, [apiRange.start, apiRange.end, groupBy]);
 
-  const { data: summary, isError: summaryError } = useLlmUsageSummary(apiRange);
-  const { data: rows, isLoading: rowsLoading, isError: rowsError } = useLlmUsageAggregate(groupBy, apiRange);
+  const { data: summary, isError: summaryError, error: summaryErr, refetch: refetchSummary } = useLlmUsageSummary(apiRange);
+  const { data: rows, isLoading: rowsLoading, isError: rowsError, error: rowsErr, refetch: refetchRows } = useLlmUsageAggregate(groupBy, apiRange);
   const {
     data: logsData,
     isLoading: logsLoading,
     isError: logsError,
+    error: logsErr,
     isFetching: logsFetching,
+    refetch: refetchLogs,
   } = useLlmUsageLogs(apiRange, PAGE_SIZE, page * PAGE_SIZE);
 
   const logs = logsData?.logs ?? [];
@@ -96,9 +99,7 @@ export default function UsageTab() {
 
       {/* Stat Cards：错误态用横幅提示，转移率读 summary 汇总而非分页数据 */}
       {summaryError && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {t('llm.usage.loadFailed')}
-        </div>
+        <ErrorBanner error={summaryErr} onRetry={() => void refetchSummary()} />
       )}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <StatCard
@@ -159,9 +160,7 @@ export default function UsageTab() {
         </CardHeader>
         <CardContent>
           {rowsError && (
-            <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-              {t('llm.usage.loadFailed')}
-            </div>
+            <ErrorBanner className="mb-3" error={rowsErr} onRetry={() => void refetchRows()} />
           )}
           <div className="overflow-x-auto">
             <Table>
@@ -230,9 +229,7 @@ export default function UsageTab() {
         </CardHeader>
         <CardContent>
           {logsError && (
-            <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-              {t('llm.usage.loadFailed')}
-            </div>
+            <ErrorBanner className="mb-3" error={logsErr} onRetry={() => void refetchLogs()} />
           )}
           <div className="overflow-x-auto">
             <Table>

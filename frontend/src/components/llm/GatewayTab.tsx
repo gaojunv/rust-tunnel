@@ -22,7 +22,6 @@ export default function GatewayTab() {
   const [listen, setListen] = useState(DEFAULT_LISTEN);
   const [tlsEnabled, setTlsEnabled] = useState(true);
   const [tlsAcme, setTlsAcme] = useState(false);
-  const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
   // initRef：仅在配置首次加载时回填表单。`config` 是 react-query 缓存对象，
@@ -51,7 +50,6 @@ export default function GatewayTab() {
       tlsAcme !== (config.tls_acme ?? false));
 
   const submit = () => {
-    setSaveMsg(null);
     setSaveError(null);
     updateMutation.mutate(
       {
@@ -64,10 +62,9 @@ export default function GatewayTab() {
       },
       {
         // 保存成功后放开 initRef，让失效后重来的服务端值重新成为基线，
-        // 使脏检查回到「无改动」状态。
+        // 使脏检查回到「无改动」状态。成功 toast 由 hook meta.successToast 全局发出。
         onSuccess: () => {
           initRef.current = false;
-          setSaveMsg(t('llm.gateway.saved'));
         },
         onError: (err) => {
           setSaveError(t('llm.gateway.saveError', { error: getApiErrorMessage(err) }));
@@ -134,9 +131,6 @@ export default function GatewayTab() {
             <Label>{t('llm.gateway.acmeAutoRenew')}</Label>
             <Switch checked={tlsAcme} onCheckedChange={setTlsAcme} disabled={!enabled} />
           </div>
-        )}
-        {saveMsg && (
-          <p className="text-sm text-emerald-600 dark:text-emerald-400">{saveMsg}</p>
         )}
         {saveError && (
           <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">

@@ -4,9 +4,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
-import { toast } from 'sonner';
 import {
   ArrowLeft,
   Loader2,
@@ -82,10 +82,8 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
       () => {
         setError(null);
         deleteMutation.mutate(memory.id, {
-          onSuccess: () => {
-            toast.success(t('common.toast.deleted'));
-            onDeleted();
-          },
+          // 成功 toast 由 hook meta.successToast 全局发出
+          onSuccess: onDeleted,
           onError: (err) => {
             setError(t('memory.saveError', { error: getApiErrorMessage(err) }));
           },
@@ -161,12 +159,11 @@ export default function MemoryDetail({ memory, onBack, onDeleted }: Props) {
         <CardContent className="space-y-4 p-4">
           <div className="space-y-2">
             <Label>{t('memory.content')}</Label>
-            <textarea
+            <Textarea
               value={content}
               onChange={(e) => setContent(e.target.value)}
               rows={4}
               aria-label={t('memory.content')}
-              className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm"
             />
           </div>
           <div className="space-y-2">

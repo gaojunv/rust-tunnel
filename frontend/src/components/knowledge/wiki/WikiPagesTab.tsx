@@ -11,7 +11,7 @@ import { useDeleteWikiPage, useWikiPage, useWikiSearch } from '@/api/hooks';
 import LoadMoreFooter from '@/components/knowledge/shared/LoadMoreFooter';
 import { usePagedList } from '@/components/knowledge/shared/usePagedList';
 import Markdown from '@/components/agent/Markdown';
-import { ConfirmDialog, useConfirm } from '@/components/llm/confirm';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import WikiPageDialog from './WikiPageDialog';
 import type { WikiPage, WikiPageSummary, WikiSearchHit } from '@/types';
 
@@ -315,6 +315,8 @@ export default function WikiPagesTab({ wikiId, defaultOpenRef = null }: Props) {
         onConfirm={confirmAndClose}
         onCancel={cancelConfirm}
         variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
       />
     </div>
   );

@@ -35,6 +35,7 @@
     "loadMore": "Load more",
     "loadedOf": "Loaded {{loaded}} of {{total}}",
     "loadFailed": "Failed to load data",
+    "refresh": "Refresh",
     "retry": "Retry"
   },
   "timeRange": {
@@ -183,6 +184,12 @@
     "kickAndDelete": "Kick and delete",
     "kickDeleteConfirm": "Kick {{name}} and delete it?",
     "deleteConfirm": "Delete {{name}}?",
+    "kickConfirmTitle": "Kick client",
+    "kickConfirmDesc": "Kick {{name}}? The connection drops immediately; the client can reconnect with the token.",
+    "toast": {
+      "kicked": "Client kicked",
+      "rotated": "Token rotated"
+    },
     "table": {
       "name": "Name",
       "status": "Status",

@@ -2,9 +2,11 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useQuery } from '@tanstack/react-query';
-import { clientsApi } from '@/api/client';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorState } from '@/components/shared/ErrorState';
+import { useClients } from '@/api/hooks';
 import { ArrowLeft, Signal, Clock, Activity, Shield } from 'lucide-react';
 
 export default function ClientDetailPage() {
@@ -12,11 +14,7 @@ export default function ClientDetailPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
 
-  const { data: clients = [], isLoading, isError, refetch } = useQuery({
-    queryKey: ['clients', 'detail'],
-    queryFn: () => clientsApi.list(),
-    refetchInterval: 5000,
-  });
+  const { data: clients = [], isLoading, isError, refetch } = useClients();
 
   const client = clients.find((c) => c.name === name);
 
@@ -24,7 +22,13 @@ export default function ClientDetailPage() {
     return (
       <div className="space-y-6">
         <PageHeader title={t('clientDetail.title')} description={t('common.loading')} />
-        <div className="py-12 text-center text-muted-foreground">{t('common.loading')}</div>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-24 w-full" />
+        </div>
+        <Skeleton className="h-48 w-full" />
       </div>
     );
   }
@@ -32,18 +36,13 @@ export default function ClientDetailPage() {
   if (isError) {
     return (
       <div className="space-y-6">
-        <PageHeader title={t('clientDetail.title')} description={t('common.loadFailed')}>
+        <PageHeader title={t('clientDetail.title')}>
           <Button variant="outline" onClick={() => navigate('/dashboard')}>
             <ArrowLeft className="mr-2 h-4 w-4" />
             {t('clientDetail.back')}
           </Button>
         </PageHeader>
-        <div className="flex flex-col items-center gap-3 py-12 text-center">
-          <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-          <Button variant="outline" size="sm" onClick={() => void refetch()}>
-            {t('common.retry')}
-          </Button>
-        </div>
+        <ErrorState onRetry={() => void refetch()} />
       </div>
     );
   }
@@ -51,12 +50,16 @@ export default function ClientDetailPage() {
   if (!client) {
     return (
       <div className="space-y-6">
-        <PageHeader title={t('clientDetail.notFoundTitle')} description={t('clientDetail.notFoundDesc', { name })}>
+        <PageHeader title={t('clientDetail.notFoundTitle')}>
           <Button variant="outline" onClick={() => navigate('/dashboard')}>
             <ArrowLeft className="mr-2 h-4 w-4" />
             {t('clientDetail.back')}
           </Button>
         </PageHeader>
+        <EmptyState
+          title={t('clientDetail.notFoundTitle')}
+          description={t('clientDetail.notFoundDesc', { name })}
+        />
       </div>
     );
   }

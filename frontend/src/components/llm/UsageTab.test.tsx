@@ -75,7 +75,9 @@ describe('UsageTab', () => {
     mockState.summaryError = true;
     render(<UsageTab />);
 
-    expect(screen.getByText('llm.usage.loadFailed')).toBeTruthy();
+    // ErrorBanner：error 未提供时回退到 common.loadFailed，role=alert 供断言
+    expect(screen.getByRole('alert')).toBeTruthy();
+    expect(screen.getByText('common.loadFailed')).toBeTruthy();
     expect(screen.getAllByText('—').length).toBeGreaterThan(0);
   });
 });

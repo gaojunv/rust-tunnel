@@ -1,7 +1,10 @@
 import { lazy } from 'react';
 import { createBrowserRouter, RouterProvider, Navigate, Outlet } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MutationCache, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { I18nProvider } from './i18n/I18nProvider';
+import i18n from './i18n';
+import { getApiErrorMessage } from './api/client';
 import { ThemeProvider } from './theme/ThemeProvider';
 import { PreferencesProvider } from './preferences/PreferencesProvider';
 import LoginPage from './pages/LoginPage';
@@ -28,7 +31,23 @@ const LLMPage = lazy(() => import('./pages/LLMPage'));
 const KnowledgePage = lazy(() => import('./pages/KnowledgePage'));
 const AgentPage = lazy(() => import('./pages/AgentPage'));
 
+// 全局 mutation 反馈：失败默认错误 toast（meta.muteErrorToast 豁免——错误已内联展示、
+// 乐观回滚自解释等场景），成功按 meta.successToast（i18n key）toast。
+// 本地 onError/onSuccess 仍照常触发（全局回调是追加而非替代）。
 const queryClient = new QueryClient({
+  mutationCache: new MutationCache({
+    onError: (error, _variables, _context, mutation) => {
+      if (mutation.options.meta?.muteErrorToast) return;
+      // 401 由 axios 拦截器清 token 并硬跳转登录页，错误 toast 只会闪现干扰
+      if ((error as { response?: { status?: number } } | null)?.response?.status === 401) return;
+      toast.error(i18n.t('common.toast.actionFailed', { error: getApiErrorMessage(error) }));
+    },
+    onSuccess: (_data, _variables, _context, mutation) => {
+      const key = mutation.options.meta?.successToast;
+      // meta 为运行时字符串 key，需宽签名 t（同 useApprovalMutation 的 needsUpgradeKey 处理）
+      if (key) toast.success((i18n.t as (k: string) => string)(key));
+    },
+  }),
   defaultOptions: {
     queries: {
       staleTime: 5000,

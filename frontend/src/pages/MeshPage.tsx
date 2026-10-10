@@ -10,10 +10,13 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useQuery } from '@tanstack/react-query';
-import { clientsApi } from '@/api/client';
+import { useClients } from '@/api/hooks';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorState } from '@/components/shared/ErrorState';
+import { RefreshCw } from 'lucide-react';
 
 type StatusTone = 'critical' | 'warning' | 'connected' | 'unknown';
 
@@ -40,18 +43,19 @@ const STATUS_LABEL_KEYS = {
 
 export default function MeshPage() {
   const { t } = useTranslation();
-  const { data: clients = [], isLoading, isError, refetch } = useQuery({
-    queryKey: ['clients', 'mesh'],
-    queryFn: () => clientsApi.list(),
-    refetchInterval: 5000,
-  });
+  const { data: clients = [], isLoading, isError, isFetching, refetch } = useClients();
 
   return (
     <div className="space-y-6">
       <PageHeader
         title={t('mesh.title')}
         description={t('mesh.description')}
-      />
+      >
+        <Button variant="outline" onClick={() => void refetch()} disabled={isFetching}>
+          <RefreshCw className={cn('mr-2 h-4 w-4', isFetching && 'animate-spin')} />
+          {t('common.refresh')}
+        </Button>
+      </PageHeader>
 
       <Card>
         <CardHeader>
@@ -59,20 +63,15 @@ export default function MeshPage() {
         </CardHeader>
         <CardContent>
           {isLoading ? (
-            <div className="text-center py-8 text-muted-foreground">
-              {t('common.loading')}
+            <div className="space-y-3 py-2">
+              <Skeleton className="h-6 w-full" />
+              <Skeleton className="h-6 w-full" />
+              <Skeleton className="h-6 w-3/4" />
             </div>
           ) : isError ? (
-            <div className="flex flex-col items-center gap-3 py-8 text-center">
-              <p className="text-sm text-destructive">{t('common.loadFailed')}</p>
-              <Button variant="outline" size="sm" onClick={() => void refetch()}>
-                {t('common.retry')}
-              </Button>
-            </div>
+            <ErrorState onRetry={() => void refetch()} />
           ) : clients.length === 0 ? (
-            <div className="text-center py-8 text-muted-foreground">
-              {t('mesh.empty')}
-            </div>
+            <EmptyState title={t('mesh.empty')} />
           ) : (
             <Table>
               <TableHeader>

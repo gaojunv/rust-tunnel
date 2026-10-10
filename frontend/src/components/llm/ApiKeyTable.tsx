@@ -22,7 +22,7 @@ import {
 } from '@/api/hooks';
 import { getApiErrorMessage } from '@/api/client';
 import { Skeleton } from '@/components/ui/skeleton';
-import { ConfirmDialog, useConfirm } from './confirm';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { Plus, Trash2, Copy, Check, AlertTriangle } from 'lucide-react';
 import type { LlmApiKey, CreateApiKeyResponse } from '@/types';
 
@@ -159,7 +159,7 @@ export default function ApiKeyTable() {
           )}
         </CardContent>
       </Card>
-      <ConfirmDialog open={confirmOpen} payload={confirmPayload} onConfirm={confirmAndClose} onCancel={cancelConfirm} variant="destructive" />
+      <ConfirmDialog open={confirmOpen} payload={confirmPayload} onConfirm={confirmAndClose} onCancel={cancelConfirm} variant="destructive" confirmLabel={t('common.confirm')} cancelLabel={t('common.cancel')} />
     </div>
   );
 }

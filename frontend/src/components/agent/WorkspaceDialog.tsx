@@ -9,12 +9,12 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Loader2 } from 'lucide-react';
 import {
-  clientsApi,
   createAgentWorkspace,
   getApiErrorMessage,
   listAllLlmModels,
@@ -22,9 +22,9 @@ import {
   listLlmProviders,
   updateAgentWorkspace,
 } from '@/api/client';
+import { useClients } from '@/api/hooks';
 import type {
   AgentWorkspace,
-  Client,
   LlmModel,
   LlmModelGroup,
   LlmProvider,
@@ -108,10 +108,7 @@ interface Props {
 export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { data: clients, isLoading } = useQuery<Client[]>({
-    queryKey: ['clients'],
-    queryFn: clientsApi.list,
-  });
+  const { data: clients, isLoading } = useClients({ refetchInterval: false });
   // LLM 模型下拉数据源：workspace llm_model_id 存「model:<id> / group:<id>」带类型
   // 前缀的引用，需用全量列表（而非 alias 名），并映射 provider_id → 供应商名。
   const { data: models } = useQuery<LlmModel[]>({
@@ -623,12 +620,11 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
             </div>
             <div className="space-y-2">
               <Label>{t('agent.systemPrompt')}</Label>
-              <textarea
+              <Textarea
                 value={systemPrompt}
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 placeholder={t('agent.systemPromptPlaceholder')}
                 rows={3}
-                className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm"
               />
             </div>
           </TabsContent>

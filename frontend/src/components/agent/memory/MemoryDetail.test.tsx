@@ -9,8 +9,8 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string, _o?: unknown) => k }),
 }));
 
-const toastSpy = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
-vi.mock('sonner', () => ({ toast: toastSpy }));
+// 成功 toast 已迁移到全局 MutationCache（App.tsx）按 hook meta 发出；
+// 此处 mock 了 @/api/hooks，组件不再本地调 toast，无需 mock sonner。
 
 const api = vi.hoisted(() => ({
   updateMemory: vi.fn(),
@@ -112,17 +112,18 @@ describe('MemoryDetail', () => {
     confirmSpy.mockRestore();
   });
 
-  it('删除成功触发 toast.success', async () => {
+  it('删除成功回调 onDeleted（成功 toast 由全局 MutationCache 发出）', async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     deleteMock.mockImplementation((_id: string, _opts?: { onSuccess?: () => void }) => _opts?.onSuccess?.());
+    const onDeleted = vi.fn();
     render(
       <QueryClientProvider client={qc}>
-        <MemoryDetail memory={memoryFixture} onBack={vi.fn()} onDeleted={vi.fn()} />
+        <MemoryDetail memory={memoryFixture} onBack={vi.fn()} onDeleted={onDeleted} />
       </QueryClientProvider>,
     );
     fireEvent.click(screen.getByText('common.delete'));
     fireEvent.click(await screen.findByText('common.confirm'));
-    await waitFor(() => expect(toastSpy.success).toHaveBeenCalledWith('common.toast.deleted'));
+    await waitFor(() => expect(onDeleted).toHaveBeenCalled());
   });
 
   it('pin 失败显示错误横幅', async () => {

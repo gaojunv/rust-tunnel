@@ -3,8 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Card, CardContent } from '@/components/ui/card';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/shared/EmptyState';
+import { ErrorState } from '@/components/shared/ErrorState';
 import GatewayTab from '@/components/llm/GatewayTab';
 import ProviderCard from '@/components/llm/ProviderCard';
 import ProviderDialog from '@/components/llm/ProviderDialog';
@@ -38,7 +39,7 @@ export default function LLMPage() {
   );
   const [providerDialogOpen, setProviderDialogOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
-  const { data: providers, isLoading } = useLlmProviders();
+  const { data: providers, isLoading, isError, refetch } = useLlmProviders();
 
   return (
     <div className="space-y-6">
@@ -66,13 +67,18 @@ export default function LLMPage() {
               <Skeleton className="h-24 w-full rounded-lg" />
               <Skeleton className="h-24 w-full rounded-lg" />
             </div>
+          ) : isError ? (
+            <ErrorState onRetry={() => void refetch()} />
           ) : !providers || providers.length === 0 ? (
-            <Card>
-              <CardContent className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
-                <Server className="h-8 w-8" />
-                <div>{t('llm.providersEmpty')}</div>
-              </CardContent>
-            </Card>
+            <EmptyState
+              icon={Server}
+              title={t('llm.providersEmpty')}
+              action={
+                <Button onClick={() => { setEditingProvider(null); setProviderDialogOpen(true); }}>
+                  <Plus className="w-4 h-4 mr-2" /> {t('llm.addProvider')}
+                </Button>
+              }
+            />
           ) : (
             providers.map((p) => (
               <ProviderCard key={p.id} provider={p} onEdit={() => { setEditingProvider(p.id); setProviderDialogOpen(true); }} />

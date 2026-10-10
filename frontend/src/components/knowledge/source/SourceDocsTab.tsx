@@ -19,7 +19,7 @@ import {
   useDeleteKnowledgeDoc,
   useReindexKnowledgeDoc,
 } from '@/api/hooks';
-import { ConfirmDialog, useConfirm } from '@/components/llm/confirm';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import type {
   KnowledgeSource,
   KnowledgeDoc,
@@ -353,6 +353,8 @@ export default function SourceDocsTab({ source }: { source: KnowledgeSource }) {
         onConfirm={confirmAndClose}
         onCancel={cancelConfirm}
         variant="destructive"
+        confirmLabel={t('common.confirm')}
+        cancelLabel={t('common.cancel')}
       />
     </div>
   );

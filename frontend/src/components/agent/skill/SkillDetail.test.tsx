@@ -9,8 +9,8 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string, _o?: unknown) => k }),
 }));
 
-const toastSpy = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
-vi.mock('sonner', () => ({ toast: toastSpy }));
+// 成功 toast 已迁移到全局 MutationCache（App.tsx）按 hook meta 发出；
+// 此处 mock 了 @/api/hooks，组件不再本地调 toast，无需 mock sonner。
 
 vi.mock('@/api/client', () => ({
   getApiErrorMessage: (err: unknown) => (err as Error)?.message ?? String(err),
@@ -59,13 +59,14 @@ const skillFixture: AgentSkill = {
   updated_at: '2026-08-02T00:00:00Z',
 };
 
-const renderDetail = (skill: AgentSkill = skillFixture) => {
+const renderDetail = (skill: AgentSkill = skillFixture, onDeleted = vi.fn()) => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  render(
     <QueryClientProvider client={qc}>
-      <SkillDetail skill={skill} onBack={vi.fn()} onDeleted={vi.fn()} />
+      <SkillDetail skill={skill} onBack={vi.fn()} onDeleted={onDeleted} />
     </QueryClientProvider>,
   );
+  return { onDeleted };
 };
 
 describe('SkillDetail', () => {
@@ -101,12 +102,12 @@ describe('SkillDetail', () => {
     confirmSpy.mockRestore();
   });
 
-  it('删除成功触发 toast.success', async () => {
+  it('删除成功回调 onDeleted（成功 toast 由全局 MutationCache 发出）', async () => {
     deleteMock.mockImplementation((_id: string, _opts?: { onSuccess?: () => void }) => _opts?.onSuccess?.());
-    renderDetail();
+    const { onDeleted } = renderDetail();
     fireEvent.click(screen.getByText('common.delete'));
     fireEvent.click(await screen.findByText('common.confirm'));
-    await waitFor(() => expect(toastSpy.success).toHaveBeenCalledWith('common.toast.deleted'));
+    await waitFor(() => expect(onDeleted).toHaveBeenCalled());
   });
 
   it('启停失败显示错误横幅', async () => {

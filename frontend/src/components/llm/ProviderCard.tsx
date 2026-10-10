@@ -12,7 +12,7 @@ import { CONTEXT_LIMIT_OPTIONS, parseContextLimit, mergeContextLimit } from './c
 import type { ContextLimitTier } from './contextLimit';
 import { parseUpstreamProtocol, mergeUpstreamProtocol } from './upstreamProtocol';
 import type { UpstreamProtocol } from './upstreamProtocol';
-import { ConfirmDialog, useConfirm } from './confirm';
+import { ConfirmDialog, useConfirm } from '@/components/ui/confirm-dialog';
 import { Trash2, Plus, Edit3, ChevronDown, ChevronRight, Check, X } from 'lucide-react';
 
 interface Props { provider: LlmProvider; onEdit: () => void; }
@@ -169,7 +169,7 @@ export default function ProviderCard({ provider, onEdit }: Props) {
           </div>
         </CardContent>
       )}
-      <ConfirmDialog open={confirmOpen} payload={confirmPayload} onConfirm={confirmAndClose} onCancel={cancelConfirm} variant="destructive" />
+      <ConfirmDialog open={confirmOpen} payload={confirmPayload} onConfirm={confirmAndClose} onCancel={cancelConfirm} variant="destructive" confirmLabel={t('common.confirm')} cancelLabel={t('common.cancel')} />
     </Card>
   );
 }

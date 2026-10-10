@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { toast } from 'sonner';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -75,7 +74,7 @@ export default function RoleList({
       },
       () =>
         deleteMutation.mutate(role.id, {
-          onSuccess: () => toast.success(t('common.toast.deleted')),
+          // 成功 toast 由 hook meta.successToast 全局发出
           onError: (err) => setError(t('role.actionFailed', { error: getApiErrorMessage(err) })),
         }),
     );
