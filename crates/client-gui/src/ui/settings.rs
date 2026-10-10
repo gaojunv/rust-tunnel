@@ -34,7 +34,8 @@ impl Default for SettingsState {
             tls_insecure: true,
             enable_agent: false,
             status_msg: None,
-            remember_password: true,
+            // 默认掩码显示密码（勾选"显示密码"才明文），防肩窥。
+            remember_password: false,
         }
     }
 }
@@ -51,7 +52,7 @@ impl SettingsState {
             tls_insecure: cfg.tls_insecure,
             enable_agent: cfg.enable_agent,
             status_msg: None,
-            remember_password: true,
+            remember_password: false,
         }
     }
 
@@ -118,37 +119,45 @@ pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
             ui.add_enabled_ui(can_save, |ui| {
                 if ui.button("保存并重连").clicked() {
                     let current = app_state.config_snapshot();
-                    let mut cfg = state.to_config(current.as_ref());
+                    let cfg = state.to_config(current.as_ref());
                     if cfg.server.trim().is_empty() || cfg.password.trim().is_empty() {
                         state.status_msg = Some("服务器与密码必填".to_string());
                     } else {
-                        match config_store::save_to_default_path(&cfg) {
-                            Ok(()) => {
-                                if state.save_to_keyring && !cfg.password.is_empty() {
-                                    let cname = cfg.name.as_deref().unwrap_or("");
-                                    if let Err(e) = config_store::write_password_to_keyring(
-                                        &cfg.server,
-                                        cname,
-                                        &cfg.password,
-                                    ) {
-                                        state.status_msg =
-                                            Some(format!("配置已保存，但钥匙串失败: {e}"));
-                                    } else {
-                                        state.status_msg =
-                                            Some("已保存并已写入钥匙串，正在重连…".to_string());
-                                    }
-                                } else if !state.save_to_keyring {
-                                    let cname = cfg.name.as_deref().unwrap_or("");
-                                    config_store::delete_password_from_keyring(&cfg.server, cname);
-                                    state.status_msg = Some("已保存，正在重连…".to_string());
-                                } else {
-                                    state.status_msg = Some(format!(
-                                        "已保存到 {}",
-                                        config_store::default_path().display()
-                                    ));
+                        // 先写钥匙串：成功则落盘 TOML 不含明文密码（加载时自动回填）；
+                        // 失败则明文落盘并显式告警。内存态始终保留真实密码供重连。
+                        let mut disk_cfg = cfg.clone();
+                        let mut keyring_stored = false;
+                        let mut warn_msg: Option<String> = None;
+                        let cname = cfg.name.as_deref().unwrap_or("").to_string();
+                        if state.save_to_keyring {
+                            match config_store::write_password_to_keyring(
+                                &cfg.server,
+                                &cname,
+                                &cfg.password,
+                            ) {
+                                Ok(()) => {
+                                    keyring_stored = true;
+                                    disk_cfg.password.clear();
                                 }
+                                Err(e) => {
+                                    warn_msg =
+                                        Some(format!("钥匙串写入失败（密码已明文落盘）: {e}"));
+                                }
+                            }
+                        } else {
+                            config_store::delete_password_from_keyring(&cfg.server, &cname);
+                        }
+                        match config_store::save_to_default_path(&disk_cfg) {
+                            Ok(()) => {
+                                let base = if let Some(w) = warn_msg {
+                                    format!("{w}，正在重连…")
+                                } else if keyring_stored {
+                                    "已保存（密码存于钥匙串），正在重连…".to_string()
+                                } else {
+                                    "已保存，正在重连…".to_string()
+                                };
+                                state.status_msg = Some(base);
                                 // 更新内存态并触发控制链路重载（无需重启）
-                                cfg.password.clone_from(&state.password);
                                 app_state.set_config(Some(cfg));
                                 app_state
                                     .reconnect_requested

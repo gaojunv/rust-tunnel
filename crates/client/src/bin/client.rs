@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rust_tunnel_client::control;
 use rust_tunnel_client::{ClientConfig, ReconnectPolicy};
-use rust_tunnel_common::{init_logging_with_level, TunnelResult};
+use rust_tunnel_common::{init_logging_with_layer, TunnelResult};
 
 fn wait_for_exit() {
     if std::io::stdout().is_terminal() {
@@ -26,7 +26,9 @@ async fn main() {
 
 async fn run() -> TunnelResult<()> {
     let config = ClientConfig::load().map_err(std::io::Error::other)?;
-    init_logging_with_level(&config.log);
+    // 注册进程级共享日志 layer：run_client 内部复用同一实例做 sender 热替换，
+    // 日志才能批量上报到服务端（用 init_logging_with_level 会让 layer 永远挂不上）。
+    init_logging_with_layer(&config.log, control::shared_log_layer());
     tracing::info!(
         "Starting rust-tunnel client, connecting to server {}",
         config.server

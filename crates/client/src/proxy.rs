@@ -5,6 +5,10 @@ use tracing::{debug, warn};
 pub use crate::control::ClientState;
 use rust_tunnel_common::{ControlMessage, TunnelError, TunnelResult};
 
+/// 本地目标拨号超时：内核默认 SYN 重传可达数分钟，期间 pending 缓冲持续累积；
+/// 10s 足够覆盖内网/回环场景，超时即快速失败并释放缓冲。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 处理服务端的 `OpenTunnel` 请求：拨号本地目标、回传 `TunnelOpenResult`，随后双向转发数据。
 ///
 /// # Errors
@@ -15,10 +19,19 @@ pub async fn handle_open_tunnel(
     connection_id: u64,
     target_addr: String,
 ) -> TunnelResult<()> {
-    // Connect to local target using async Tokio TcpStream
+    // Connect to local target using async Tokio TcpStream (bounded by CONNECT_TIMEOUT)
     debug!("Connecting to target {}", target_addr);
 
-    match TcpStream::connect(&target_addr).await {
+    let connect_result =
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&target_addr)).await {
+            Ok(res) => res,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect to {target_addr} timed out after {CONNECT_TIMEOUT:?}"),
+            )),
+        };
+
+    match connect_result {
         Ok(local_stream) => {
             debug!("Successfully connected to {}", target_addr);
 

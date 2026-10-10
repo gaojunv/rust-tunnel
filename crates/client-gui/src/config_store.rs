@@ -22,6 +22,9 @@ pub fn default_path() -> PathBuf {
 }
 
 /// 从默认路径加载配置；文件不存在时返回 `Ok(None)`。
+///
+/// 若文件内密码为空（钥匙串保存模式），先从钥匙串回填再交给 `from_cli`
+/// 校验——否则 `from_cli` 的"密码必填"校验会直接失败，配置形同丢失。
 #[must_use]
 pub fn load_from_default_path() -> Option<ClientConfig> {
     let path = default_path();
@@ -29,7 +32,7 @@ pub fn load_from_default_path() -> Option<ClientConfig> {
         return None;
     }
     // 通过 CLI 解析的 from_cli 复用 TOML 合并：构造一个仅带 config_file 的 ClientCli
-    let cli = rust_tunnel_client::config::ClientCli {
+    let mut cli = rust_tunnel_client::config::ClientCli {
         config_file: Some(path.to_string_lossy().to_string()),
         server: None,
         name: None,
@@ -44,6 +47,20 @@ pub fn load_from_default_path() -> Option<ClientConfig> {
         agent_pty_port: None,
         log: None,
     };
+    // 钥匙串回填：文件密码为空时，以文件里的 server/name 定位钥匙串条目
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(file_cfg) =
+            toml::from_str::<rust_tunnel_client::config::ClientConfigFile>(&content)
+        {
+            if file_cfg.password.as_deref().unwrap_or_default().is_empty() {
+                let server = file_cfg.server.unwrap_or_default();
+                let cname = file_cfg.name.unwrap_or_default();
+                if let Some(pw) = read_password_from_keyring(&server, &cname) {
+                    cli.password = Some(pw);
+                }
+            }
+        }
+    }
     ClientConfig::from_cli(cli).ok()
 }
 

@@ -267,10 +267,13 @@ fn spawn_runtime(
         }
         // GUI 全局日志初始化：立即可见（否则日志面板在首次连接前为空）
         {
-            use rust_tunnel_client::{log_buffer::LogBuffer as LB, logs::ClientLogLayer};
+            use rust_tunnel_client::log_buffer::LogBuffer as LB;
             use rust_tunnel_common::init_logging_with_layer;
             let lb: Arc<LB> = log_buffer.clone();
-            let layer = ClientLogLayer::new();
+            // 必须用进程级共享 layer 注册：run_client_inner 内部复用同一实例做
+            // sender 热替换（日志上报服务端）；另建实例会导致其收不到事件、
+            // 且每次重连泄漏一个日志转发任务。
+            let layer = rust_tunnel_client::control::shared_log_layer();
             layer.set_log_buffer(lb);
             // 用当前 log 级别（若有配置否则 info）初始化；重复 init 内部 try_init 会静默忽略
             let lvl = bootstrap.as_ref().map(|c| c.log.as_str()).unwrap_or("info");
