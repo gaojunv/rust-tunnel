@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use enigo::{Keyboard as _, Mouse as _};
 use rust_tunnel_remote::{
     DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
-    RemoteManager, RemoteResult, ScreenSource,
+    RemoteManager, RemoteResult, ScreenSource, TileUpdate,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -90,9 +90,51 @@ pub fn open_permission_settings(kind: PermissionKind) {
     platform::open_settings(kind);
 }
 
-/// 安装平台实现到引擎（截屏 + 输入注入）。
+/// 安装平台实现到引擎（截屏 + 输入注入 + 剪贴板）。
 pub fn install_platform(manager: &Arc<RemoteManager>) {
     manager.install_platform(platform::screen_source(), platform::input_sink());
+    manager.install_clipboard(Arc::new(SystemClipboard));
+}
+
+/// 控制器下载文件的落地目录（系统「下载」目录；取不到时回落到临时目录）。
+#[must_use]
+pub fn download_dir() -> std::path::PathBuf {
+    directories::UserDirs::new()
+        .and_then(|d| d.download_dir().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// 被控端对外共享的目录：`<下载目录>/rust-tunnel-share`。
+///
+/// 放在「下载」而不是用户主目录下，是为了让被控端用户一眼能看到别人能读到什么、也能随时
+/// 自己清空；反过来，主目录会让「共享」这件事变得难以察觉。
+///
+/// 本端始终提供共享目录，故直接返回路径；由调用方包成
+/// [`rust_tunnel_remote::RemoteManagerConfig::share_dir`] 需要的 `Some(..)`。
+#[must_use]
+pub fn share_dir() -> std::path::PathBuf {
+    download_dir().join("rust-tunnel-share")
+}
+
+/// 基于 `arboard` 的文本剪贴板（被控端用它读写本机剪贴板）。
+///
+/// `arboard` 的 `Clipboard` 不是 `Sync`，且每次读写都要新建（Linux 下它要独占 X11 selection），
+/// 因此这里**不缓存实例**，每次操作现开现关。
+#[derive(Debug, Default)]
+pub struct SystemClipboard;
+
+impl rust_tunnel_remote::Clipboard for SystemClipboard {
+    fn get(&self) -> RemoteResult<String> {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.get_text())
+            .map_err(|err| RemoteError::Platform(format!("读取剪贴板失败: {err}")))
+    }
+
+    fn set(&self, text: &str) -> RemoteResult<()> {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_owned()))
+            .map_err(|err| RemoteError::Platform(format!("写入剪贴板失败: {err}")))
+    }
 }
 
 // ── 跨平台键码约定 ───────────────────────────────────────────────────
@@ -452,12 +494,16 @@ fn query_origins() -> Vec<(u32, i32, i32)> {
 /// 引擎侧 [`FrameSink`] 与 UI 共享的画面槽。
 #[derive(Default)]
 pub struct FrameState {
-    /// 最新一帧（UI 未消费时被覆盖，只保留最新）。
+    /// 最新一帧**整帧**（首帧/关键帧）。UI 取走即清；未消费时被覆盖，只保留最新。
     pub latest: Option<DecodedFrame>,
+    /// 最新一次增量瓦片更新。UI 取走即清；被整帧（关键帧）作废（差分相对旧帧，不可再用）。
+    pub tiles: Option<TileUpdate>,
     /// 显示器列表（会话建立时下发一次）。
     pub displays: Vec<DisplayInfo>,
     /// 会话关闭原因（UI 取走即清）。
     pub closed: Option<String>,
+    /// 最近收到的对端剪贴板文本（UI 取走即清）。
+    pub clipboard_in: Option<String>,
 }
 
 /// [`FrameSink`] 的 egui 实现：把帧塞进共享槽并唤醒 UI 重绘。
@@ -485,6 +531,22 @@ impl FrameSink for GuiFrameSink {
         self.ctx.request_repaint();
     }
 
+    fn on_tiles(&self, update: TileUpdate) {
+        // 瓦片已是 RGBA，本线程（引擎运行时线程）只做搬运，解码/上传留给 UI 线程。
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.tiles = Some(update);
+        }
+        self.ctx.request_repaint();
+    }
+
+    fn on_clipboard(&self, text: String) {
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.clipboard_in = Some(text);
+        }
+        self.ctx.request_repaint();
+    }
+
+
     fn on_closed(&self, reason: String) {
         if let Ok(mut guard) = self.shared.lock() {
             guard.closed = Some(reason);
@@ -495,6 +557,22 @@ impl FrameSink for GuiFrameSink {
 
 // ── 会话视图状态 ────────────────────────────────────────────────────
 
+/// 会话窗口内需要跨帧留存的**本地输入态**（纯 UI 用，引擎不读取）。
+///
+/// egui 是即时模式：文本框内容必须自己存着，否则每帧都会被清空。放在这里而不是 egui
+/// 的临时存储里，是为了随 [`RemoteView`] 一起显式管理。
+#[derive(Debug, Default)]
+pub struct SessionInputs {
+    /// 待发送给被控端的剪贴板文本（可在文本框编辑；「读取本机」会填入）。
+    pub clipboard_out: String,
+    /// 最近收到的对端剪贴板文本（供展示与「复制到本机」）。
+    pub clipboard_in: Option<String>,
+    /// 待上传文件的**本机绝对路径**（无原生文件选择器，只能手填）。
+    pub upload_local: String,
+    /// 上传到被控端的目标文件名（相对当前虚拟目录）。
+    pub upload_name: String,
+}
+
 /// 远程会话窗口的 GUI 侧状态（纹理、输入边沿状态）。
 pub struct RemoteView {
     /// 与 [`GuiFrameSink`] 共享的画面槽。
@@ -503,12 +581,12 @@ pub struct RemoteView {
     texture: Option<egui::TextureHandle>,
     /// 当前纹理尺寸 `(宽, 高)`。
     tex_size: (u32, u32),
-    /// 已上传的帧序号（避免同帧重复上传）。
-    last_seq: Option<u64>,
     /// 是否已安装 [`FrameSink`]。
     sink_installed: bool,
     /// 当前观看的显示器编号。
     selected_display: Option<u32>,
+    /// 会话窗口内的本地输入态（剪贴板文本、上传路径等）。
+    inputs: SessionInputs,
     /// 上一次发出的鼠标位置（去重）。
     last_mouse: Option<(i32, i32)>,
     /// 上一次的三个鼠标按键状态 `[左, 右, 中]`。
@@ -525,9 +603,9 @@ impl RemoteView {
             shared: Arc::new(Mutex::new(FrameState::default())),
             texture: None,
             tex_size: (0, 0),
-            last_seq: None,
             sink_installed: false,
             selected_display: None,
+            inputs: SessionInputs::default(),
             last_mouse: None,
             buttons: [false; 3],
             modifiers: 0,
@@ -550,7 +628,6 @@ impl RemoteView {
     pub fn reset_session(&mut self) {
         self.texture = None;
         self.tex_size = (0, 0);
-        self.last_seq = None;
         self.last_mouse = None;
         self.buttons = [false; 3];
         self.modifiers = 0;
@@ -571,12 +648,25 @@ impl RemoteView {
         self.selected_display
     }
 
-    /// 切换观看的显示器。
-    pub fn set_selected_display(&mut self, id: u32) {
+    /// 会话窗口的本地输入态（可编辑）。
+    pub fn inputs_mut(&mut self) -> &mut SessionInputs {
+        &mut self.inputs
+    }
+
+    /// 取走最近收到的对端剪贴板文本（取走即清）。
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        let mut guard = self.shared.lock().ok()?;
+        guard.clipboard_in.take()
+    }
+
+    /// 切换观看的显示器：同步引擎，并作废本地纹理（新显示器尺寸不同，等下一个关键帧重建）。
+    pub fn set_selected_display(&mut self, id: u32, manager: &Arc<RemoteManager>) {
         if self.selected_display != Some(id) {
             self.selected_display = Some(id);
-            // 切显示器后强制重传首帧。
-            self.last_seq = None;
+            self.texture = None;
+            self.tex_size = (0, 0);
+            // 引擎会据此强制下一个关键帧（尺寸变了，差分基准失效）。
+            manager.select_display(id);
         }
     }
 
@@ -586,32 +676,70 @@ impl RemoteView {
         guard.closed.take()
     }
 
-    /// 把最新帧上传为纹理，返回 `(纹理 ID, 宽, 高)`；无新帧时返回既有纹理。
+    /// 把最新画面（整帧或增量瓦片）落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
+    ///
+    /// 整帧（首帧/关键帧）优先：它会让任何在途瓦片失效（瓦片是相对旧帧的差分）。瓦片只在
+    /// **已有纹理、尺寸一致、且属于当前显示器**时应用，否则整批丢弃——下一个关键帧会修正。
     pub fn upload(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, u32, u32)> {
-        let frame = {
-            let guard = self.shared.lock().ok()?;
-            guard.latest.clone()?
-        };
-        let (width, height) = (frame.width, frame.height);
-        let (pixel_w, pixel_h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
-        let expected = pixel_w.checked_mul(pixel_h)?.checked_mul(4)?;
-        if pixel_w == 0 || pixel_h == 0 || frame.rgba.len() != expected {
-            return None;
-        }
-        let unchanged = self.last_seq == Some(frame.seq) && self.tex_size == (width, height);
-        if !unchanged {
-            let image = egui::ColorImage::from_rgba_unmultiplied([pixel_w, pixel_h], &frame.rgba);
-            if self.texture.is_some() && self.tex_size == (width, height) {
-                if let Some(texture) = self.texture.as_mut() {
-                    texture.set(image, egui::TextureOptions::LINEAR);
+        // 1) 整帧（首帧/关键帧）：重建或整幅更新纹理。
+        let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
+        if let Some(frame) = frame {
+            if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
+                let (width, height) = (frame.width, frame.height);
+                let image = egui::ColorImage::from_rgba_unmultiplied([pixel_w, pixel_h], &frame.rgba);
+                if self.texture.is_some() && self.tex_size == (width, height) {
+                    if let Some(texture) = self.texture.as_mut() {
+                        texture.set(image, egui::TextureOptions::LINEAR);
+                    }
+                } else {
+                    self.texture = Some(ctx.load_texture("remote-frame", image, egui::TextureOptions::LINEAR));
                 }
-            } else {
-                self.texture = Some(ctx.load_texture("remote-frame", image, egui::TextureOptions::LINEAR));
+                self.tex_size = (width, height);
             }
-            self.tex_size = (width, height);
-            self.last_seq = Some(frame.seq);
+            // 关键帧已重建整幅画面，任何在途瓦片都相对旧帧，作废。
+            if let Ok(mut guard) = self.shared.lock() {
+                guard.tiles = None;
+            }
         }
-        self.texture.as_ref().map(|texture| (texture.id(), width, height))
+
+        // 2) 增量瓦片：应用在**同一帧**返回的纹理上，UI 本帧即可看到更新。
+        if let Some(update) = self.shared.lock().ok().and_then(|mut guard| guard.tiles.take()) {
+            self.apply_tiles(&update);
+        }
+
+        self.texture
+            .as_ref()
+            .map(|texture| (texture.id(), self.tex_size.0, self.tex_size.1))
+    }
+
+    /// 把一次增量瓦片更新应用到当前纹理（尚无纹理/尺寸或显示器不符时整批丢弃）。
+    fn apply_tiles(&mut self, update: &TileUpdate) {
+        // 尚无纹理（首帧未到）或尺寸不符（切显示器/切档位后的陈旧更新）→ 丢弃，等关键帧重建。
+        if (update.width, update.height) != self.tex_size {
+            return;
+        }
+        // 不属于当前观看的显示器 → 丢弃。
+        if self.selected_display.is_some_and(|display| display != update.display) {
+            return;
+        }
+        let Some(texture) = self.texture.as_mut() else {
+            return;
+        };
+        for tile in &update.tiles {
+            let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                usize::try_from(tile.x),
+                usize::try_from(tile.y),
+                usize::try_from(tile.width),
+                usize::try_from(tile.height),
+            ) else {
+                continue;
+            };
+            if w == 0 || h == 0 || tile.rgba.len() != w * h * 4 {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &tile.rgba);
+            texture.set_partial([x, y], image, egui::TextureOptions::LINEAR);
+        }
     }
 
     /// 捕获会话窗口内的鼠标/键盘并转成 [`InputEvent`] 投递给引擎。
@@ -726,6 +854,16 @@ impl Default for RemoteView {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 校验整帧像素数据是否自洽，返回 `(宽像素, 高像素)`；不合法时 `None`。
+fn valid_frame_dims(frame: &DecodedFrame) -> Option<(usize, usize)> {
+    let (pixel_w, pixel_h) = (
+        usize::try_from(frame.width).ok()?,
+        usize::try_from(frame.height).ok()?,
+    );
+    let expected = pixel_w.checked_mul(pixel_h)?.checked_mul(4)?;
+    (pixel_w != 0 && pixel_h != 0 && frame.rgba.len() == expected).then_some((pixel_w, pixel_h))
 }
 
 /// 把窗口内偏移按比例映射到远程像素坐标（有界，非负）。

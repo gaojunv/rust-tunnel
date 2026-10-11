@@ -8259,6 +8259,7 @@ name = "rust-tunnel-client-gui"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "async-trait",
  "auto-launch",
  "clap",

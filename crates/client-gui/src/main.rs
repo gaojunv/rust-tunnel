@@ -296,6 +296,10 @@ fn build_remote_manager(config: &ClientConfig, enabled: bool) -> Arc<RemoteManag
         enabled,
         establisher,
         encode: EncodeOptions::default(),
+        // 被控端共享目录固定为「下载」目录下的 rust-tunnel-share：可见、易找，且与用户的
+        // 个人目录隔离。用户要换目录只需在这里改一处（后续可在设置页做成可配）。
+        share_dir: Some(remote::share_dir()),
+        download_dir: remote::download_dir(),
     });
     remote::install_platform(&manager);
     manager

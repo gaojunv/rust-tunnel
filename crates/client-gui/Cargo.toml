@@ -41,6 +41,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # 故不需要本文件再按 target 门控（区别于下方的 keyring）。
 xcap = "0.9.8"
 enigo = "0.6.1"
+# 被控端剪贴板同步。arboard 各平台后端由 crate 内部 cfg 处理，无需再门控。
+arboard = "3"
 
 [build-dependencies]
 embed-resource = "3"

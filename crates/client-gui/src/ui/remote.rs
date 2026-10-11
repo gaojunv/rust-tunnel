@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use egui::{RichText, Ui};
 use rust_tunnel_common::protocol::RemoteMode;
-use rust_tunnel_remote::{RemoteManager, RemoteUiState, SessionRole, SessionState};
+use rust_tunnel_remote::{Clipboard as _, QualityPreset, RemoteManager, RemoteUiState, SessionRole, SessionState};
 
 use crate::app::AppState;
 use crate::remote::{self, PermissionKind, RemoteView};
@@ -101,6 +101,10 @@ pub fn controlled_banner(ui: &mut Ui, manager: Option<&Arc<RemoteManager>>) {
                     }
                 });
             });
+            // 被控时明确告知对外共享的目录，让用户一眼看到别人能读到什么。
+            if let Some(dir) = manager.share_dir() {
+                ui.label(RichText::new(format!("对外共享目录：{}", dir.display())).weak().small());
+            }
         });
     ui.add_space(8.0);
 }
@@ -192,30 +196,16 @@ fn show_session(
             // 被控端不接收画面，只提示状态（画面/输入捕获是控制端的事）。
             if active.role == SessionRole::Controlled {
                 ui.label(RichText::new("本机画面正发送给控制方；如需终止请点「中断会话」。").weak());
+                if let Some(dir) = manager.share_dir() {
+                    ui.label(RichText::new(format!("对外共享目录：{}", dir.display())).weak().small());
+                }
                 return;
             }
 
-            // 多显示器选择。
-            let displays = view.displays();
-            if displays.len() > 1 {
-                let current = view
-                    .selected_display()
-                    .or_else(|| displays.first().map(|d| d.id));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("显示器").weak().small());
-                    for display in &displays {
-                        if ui
-                            .selectable_label(current == Some(display.id), display.name.as_str())
-                            .clicked()
-                        {
-                            view.set_selected_display(display.id);
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-            } else if let Some(display) = displays.first() {
-                view.set_selected_display(display.id);
-            }
+            // 显示器选择 + 画质档位（都由被控端生效）。
+            show_display_selector(ui, view, manager);
+            show_quality_selector(ui, manager, state.quality);
+            ui.add_space(4.0);
 
             // 画面：等比缩放铺满可用宽度，高度上限 420。
             if let Some((texture, width, height)) = view.upload(ui.ctx()) {
@@ -246,8 +236,206 @@ fn show_session(
                 });
                 ui.add_space(24.0);
             }
+
+            // 剪贴板与文件面板（仅控制器侧有意义：被控端只应答）。
+            show_clipboard(ui, view, manager);
+            show_files(ui, view, manager, state);
         });
     ui.add_space(8.0);
+}
+
+/// 显示器选择：多显示器时逐台可点，单显示器时把当前显示器同步给引擎。
+fn show_display_selector(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>) {
+    let displays = view.displays();
+    if displays.len() > 1 {
+        let current = view
+            .selected_display()
+            .or_else(|| displays.first().map(|d| d.id));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("显示器").weak().small());
+            for display in &displays {
+                if ui
+                    .selectable_label(current == Some(display.id), display.name.as_str())
+                    .clicked()
+                {
+                    view.set_selected_display(display.id, manager);
+                }
+            }
+        });
+    } else if let Some(display) = displays.first() {
+        view.set_selected_display(display.id, manager);
+    }
+}
+
+/// 画质档位选择（流畅/均衡/高清）；切换经会话命令下发，由被控端生效。
+fn show_quality_selector(ui: &mut Ui, manager: &Arc<RemoteManager>, current: QualityPreset) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("画质").weak().small());
+        for preset in QualityPreset::all() {
+            if ui.selectable_label(current == preset, preset.label()).clicked() {
+                manager.set_quality(preset);
+            }
+        }
+    });
+}
+
+/// 剪贴板同步：发送本机剪贴板、索取对端剪贴板、展示收到的对端文本。
+///
+/// 读取本机剪贴板借 [`remote::SystemClipboard`]（arboard）——egui 0.31 只提供**写**系统剪贴板的
+/// `Context::copy_text`，没有读取 API，故这里用平台实现读；读不到时可退回文本框里手填的内容。
+fn show_clipboard(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>) {
+    // 对端发来的剪贴板：从共享槽取走并留在本地输入态，跨帧展示。
+    if let Some(text) = view.take_clipboard() {
+        view.inputs_mut().clipboard_in = Some(text);
+    }
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("剪贴板").strong());
+        if ui.button("读取本机").clicked() {
+            match remote::SystemClipboard.get() {
+                Ok(text) => view.inputs_mut().clipboard_out = text,
+                Err(err) => tracing::warn!("读取本机剪贴板失败：{err}"),
+            }
+        }
+        if ui.button("发送本机剪贴板").clicked() {
+            let text = view.inputs_mut().clipboard_out.clone();
+            manager.send_clipboard(text);
+        }
+        if ui.button("获取对端剪贴板").clicked() {
+            manager.request_clipboard();
+        }
+    });
+    ui.add(
+        egui::TextEdit::singleline(&mut view.inputs_mut().clipboard_out)
+            .desired_width(f32::INFINITY)
+            .hint_text("待发送给对端的文本（可点「读取本机」填入）"),
+    );
+    if let Some(text) = view.inputs_mut().clipboard_in.clone() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("对端剪贴板").weak().small());
+            if ui.button("复制到本机").clicked() {
+                ui.ctx().copy_text(text.clone());
+            }
+            if ui.button("清空").clicked() {
+                view.inputs_mut().clipboard_in = None;
+            }
+        });
+        // 只读展示：传一份临时副本并关掉交互，用户仍可选中复制。
+        let mut shown = text;
+        ui.add(
+            egui::TextEdit::multiline(&mut shown)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .interactive(false),
+        );
+    }
+}
+
+/// 文件面板：浏览被控端共享目录、下载、上传、查看传输进度。
+#[expect(clippy::cast_precision_loss, reason = "传输字节数有界，f32 进度条精度足够")]
+fn show_files(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>, state: &RemoteUiState) {
+    ui.separator();
+    egui::CollapsingHeader::new("文件传输")
+        .default_open(false)
+        .show(ui, |ui| {
+            let shown_dir = if state.remote_dir.is_empty() {
+                "/".to_owned()
+            } else {
+                state.remote_dir.clone()
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("当前目录：{shown_dir}")).weak().small());
+                if ui.button("上级").clicked() {
+                    manager.list_remote_dir(&parent_virtual(&state.remote_dir));
+                }
+                if ui.button("刷新").clicked() {
+                    manager.list_remote_dir(&state.remote_dir);
+                }
+            });
+
+            if state.remote_entries.is_empty() {
+                ui.label(RichText::new("（空目录或尚未加载，点「刷新」）").weak().small());
+            }
+            for entry in &state.remote_entries {
+                ui.horizontal(|ui| {
+                    let label = if entry.is_dir {
+                        format!("[目录] {}", entry.name)
+                    } else {
+                        entry.name.clone()
+                    };
+                    if ui.selectable_label(false, label).clicked() {
+                        if entry.is_dir {
+                            manager.list_remote_dir(&entry.path);
+                        } else {
+                            manager.download_remote_file(&entry.path);
+                        }
+                    }
+                    if !entry.is_dir {
+                        ui.label(RichText::new(format!("{} B", entry.size)).weak().small());
+                    }
+                });
+            }
+
+            ui.add_space(4.0);
+            // 上传：无原生文件选择器（不为此引入文件对话框依赖），只能手填本机绝对路径。
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("上传").weak().small());
+                ui.add(
+                    egui::TextEdit::singleline(&mut view.inputs_mut().upload_local)
+                        .desired_width(150.0)
+                        .hint_text("本机绝对路径"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut view.inputs_mut().upload_name)
+                        .desired_width(110.0)
+                        .hint_text("目标文件名"),
+                );
+                if ui.button("上传").clicked() {
+                    let local = view.inputs_mut().upload_local.clone();
+                    let name = view.inputs_mut().upload_name.clone();
+                    if !local.is_empty() && !name.is_empty() {
+                        let remote = join_virtual(&state.remote_dir, &name);
+                        manager.upload_local_file(std::path::PathBuf::from(local), &remote);
+                    }
+                }
+            });
+
+            if let Some(note) = &state.transfer_note {
+                ui.label(RichText::new(note.as_str()).weak().small());
+            }
+            for transfer in &state.transfers {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}（{}）", transfer.name, transfer.direction.label()));
+                    let fraction = transfer.done as f32 / transfer.total.max(1) as f32;
+                    ui.add(egui::ProgressBar::new(fraction).desired_width(120.0));
+                    if ui.button("取消").clicked() {
+                        manager.cancel_transfer(transfer.id);
+                    }
+                });
+            }
+
+            if let Some(dir) = manager.share_dir() {
+                ui.label(RichText::new(format!("本机对外共享：{}", dir.display())).weak().small());
+            }
+        });
+}
+
+/// 虚拟路径的上一级（已在根时返回根 `""`）。
+fn parent_virtual(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some((parent, _)) => parent.to_owned(),
+        None => String::new(),
+    }
+}
+
+/// 把当前虚拟目录与文件名拼成完整虚拟路径。
+fn join_virtual(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), name)
+    }
 }
 
 /// 可被远程控制的在线客户端列表 + 一键连接。
