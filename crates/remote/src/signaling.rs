@@ -105,8 +105,29 @@ fn encode_message(msg: &RendezvousMessage) -> RemoteResult<BytesMut> {
     frame(&msg.encode_to_vec()).map_err(|err| RemoteError::Signaling(format!("会合帧编码失败: {err}")))
 }
 
+/// 剥掉 `host` 里可能带的端口，只留主机部分。
+///
+/// GUI 传进来的 `server_host` 就是 `config.server`，即 `host:port`；而这里的端口由
+/// [`RemoteParams`] 单独给出。若不剥离，`getaddrinfo` 会把 `"hbbs.example:8080"`
+/// 整个当成主机名而解析失败，会话永远建不起来。
+///
+/// 同时处理 IPv6 字面量：`[::1]:8080` → `::1`；裸 `::1` 有多个冒号、右侧不是端口，
+/// 原样返回。
+fn strip_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rsplit_once(':') {
+        Some((head, tail)) if !head.contains(':') && tail.parse::<u16>().is_ok() => head,
+        _ => host,
+    }
+}
+
 /// 解析主机 + 端口为套接字地址。
+///
+/// `host` 允许带端口（见 [`strip_port`]），带的端口会被忽略，以 `port` 为准。
 async fn resolve(host: &str, port: u16) -> RemoteResult<SocketAddr> {
+    let host = strip_port(host);
     tokio::net::lookup_host((host, port))
         .await
         .map_err(|err| RemoteError::Signaling(format!("无法解析 {host}:{port}: {err}")))?
@@ -520,6 +541,32 @@ mod tests {
         assert_eq!(cfg.host, "hbbs.example");
         assert_eq!(cfg.relay_server, "relay.example");
         assert!(cfg.always_use_relay);
+    }
+
+    #[tokio::test]
+    async fn resolve_accepts_host_with_port() {
+        // GUI 传进来的 `server_host` 是 `config.server`，即 `host:port`。若 `resolve`
+        // 把整串当主机名交给 getaddrinfo，会解析失败，导致会话永远建不起来。
+        let addr = resolve("127.0.0.1:8080", 21116).await;
+        assert_eq!(
+            addr.ok(),
+            Some("127.0.0.1:21116".parse().unwrap()),
+            "带端口的 host 应被剥掉端口后解析"
+        );
+    }
+
+    #[test]
+    fn strip_port_handles_hosts_and_ipv6() {
+        assert_eq!(strip_port("hbbs.example:8080"), "hbbs.example");
+        assert_eq!(strip_port("127.0.0.1:3000"), "127.0.0.1");
+        assert_eq!(strip_port("hbbs.example"), "hbbs.example");
+        assert_eq!(strip_port("127.0.0.1"), "127.0.0.1");
+        // 裸 IPv6 的冒号不是端口分隔符，不能误剥。
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+        // 带方括号的 IPv6 字面量。
+        assert_eq!(strip_port("[::1]:8080"), "::1");
+        assert_eq!(strip_port("[::1]"), "::1");
     }
 
     #[test]
