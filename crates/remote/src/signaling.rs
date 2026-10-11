@@ -507,6 +507,78 @@ async fn accept_task(listener: TcpListener, tx: mpsc::UnboundedSender<TcpStream>
     debug!("直连接受任务结束");
 }
 
+/// 延迟构造的 [`RustDeskTransport`]。
+///
+/// [`RemoteManager`](crate::RemoteManager) 构造时就需要 `Arc<dyn TransportEstablisher>`，而
+/// [`RustDeskTransport::new`] 依赖 [`RemoteParams`]（会合/中继地址、`licence_key`）——它要等
+/// 控制通道下发 `RemoteCapability` 才有。本类型把构造推迟到参数到手，并在拿到参数时**立即**
+/// 构造（见 [`TransportEstablisher::prepare`] 的文档），让本端提前登记到会合服务器。
+///
+/// 按本端 `rd_id` 缓存：`rd_id` 变化（重新注册、换服务端）时重建。
+pub struct LazyTransport {
+    /// 本机服务端 `host:port`（`params.rendezvous_host` 留空时补齐）。
+    server_host: String,
+    /// 已构造的传输及其对应的本端 `rd_id`。
+    inner: Mutex<Option<(String, std::sync::Arc<RustDeskTransport>)>>,
+}
+
+impl LazyTransport {
+    /// 以本机服务端地址构造。
+    #[must_use]
+    pub fn new(server_host: String) -> Self {
+        Self {
+            server_host,
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// 取（必要时构造并缓存）`local_rd_id` 对应的传输。
+    ///
+    /// [`RustDeskTransport::new`] 构造时即向会合服务器登记，因此「构造」就等于「上线」。
+    ///
+    /// # Errors
+    /// 参数无法解析出地址、或套接字绑定失败时返回 [`RemoteError`]。
+    async fn transport_for(
+        &self,
+        params: &RemoteParams,
+        local_rd_id: &str,
+    ) -> RemoteResult<std::sync::Arc<RustDeskTransport>> {
+        let mut guard = self.inner.lock().await;
+        if let Some((cached_rd_id, transport)) = guard.as_ref() {
+            if cached_rd_id == local_rd_id {
+                return Ok(std::sync::Arc::clone(transport));
+            }
+        }
+        let config = SignalingConfig::from_params(params, local_rd_id.to_owned(), &self.server_host);
+        let transport = RustDeskTransport::new(config).await?;
+        *guard = Some((local_rd_id.to_owned(), std::sync::Arc::clone(&transport)));
+        Ok(transport)
+    }
+}
+
+#[async_trait]
+impl TransportEstablisher for LazyTransport {
+    /// 提前构造传输 = 提前向会合服务器登记。
+    ///
+    /// **必须做**：hbbs 对未登记的对端会静默丢弃中继请求，而控制器的中继请求往往在目标登记
+    /// 之前就发出（详见 [`TransportEstablisher::prepare`]）。管理器在收到 `RemoteCapability`
+    /// 与打开「允许被远程控制」开关时都会调用本方法。
+    async fn prepare(&self, params: &RemoteParams, local_rd_id: &str) -> RemoteResult<()> {
+        let transport = self.transport_for(params, local_rd_id).await?;
+        debug!(
+            rd_id = %local_rd_id,
+            direct = %transport.direct_addr(),
+            "远程数据面已预登记到会合服务器"
+        );
+        Ok(())
+    }
+
+    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<BoxDuplex> {
+        let transport = self.transport_for(&request.params, &request.local_rd_id).await?;
+        transport.establish(request, role).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

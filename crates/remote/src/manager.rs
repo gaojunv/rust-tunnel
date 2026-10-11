@@ -164,6 +164,11 @@ pub struct RemoteManager {
     input_tx: Mutex<Option<mpsc::Sender<InputEvent>>>,
     /// 自引用弱指针（供同步方法 `spawn` 使用）。
     self_weak: Weak<RemoteManager>,
+    /// 构造时所在的 Tokio 运行时句柄。
+    ///
+    /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
+    /// `tokio::spawn` 会 panic；预登记必须走这个句柄。构造发生在 `block_on` 内，故句柄可用。
+    rt: Option<tokio::runtime::Handle>,
 }
 
 impl std::fmt::Debug for RemoteManager {
@@ -197,6 +202,7 @@ impl RemoteManager {
             frame_sink: RwLock::new(None),
             input_tx: Mutex::new(None),
             self_weak: weak.clone(),
+            rt: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
@@ -236,7 +242,10 @@ impl RemoteManager {
     pub fn set_enabled(&self, on: bool) {
         self.update_ui(|s| s.enabled = on);
         self.announce();
-        if !on {
+        if on {
+            // 刚打开开关：补一次预登记，别等到第一个会话才登记（见 `TransportEstablisher::prepare`）。
+            self.prewarm();
+        } else {
             self.abort_active();
         }
     }
@@ -297,6 +306,41 @@ impl RemoteManager {
     /// 锁输入发送端（容忍中毒）。
     fn lock_input(&self) -> MutexGuard<'_, Option<mpsc::Sender<InputEvent>>> {
         self.input_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 让数据面提前完成会合服务器登记（见 [`TransportEstablisher::prepare`]）。
+    ///
+    /// 只在**本端允许被远程控制**时做：关闭时既不会出现在别人的「可远程」列表里，也没必要
+    /// 登记。关闭开关后**不主动撤销**登记——登记只代表「在线存在」，建立会话仍需服务端签发的
+    /// 一次性 token，而被控端关闭的客户端服务端根本不会签发。
+    fn prewarm(&self) {
+        if !self.ui_tx.borrow().enabled {
+            return;
+        }
+        let (params, rd_id) = {
+            let inner = self.lock_inner();
+            (inner.params.clone(), inner.rd_id.clone())
+        };
+        let Some(params) = params else {
+            debug!("会合参数尚未下发，跳过预登记");
+            return;
+        };
+        if rd_id.is_empty() {
+            debug!("本端 rd_id 尚未分配，跳过预登记");
+            return;
+        }
+        let Some(rt) = self.rt.clone() else {
+            // 无运行时上下文（如未在 Tokio 内构造管理器的单测）：跳过即可，首个会话仍会
+            // 在 `establish` 时构造传输。
+            debug!("无 Tokio 运行时句柄，跳过数据面预登记");
+            return;
+        };
+        let establisher = Arc::clone(&self.cfg.establisher);
+        rt.spawn(async move {
+            if let Err(err) = establisher.prepare(&params, &rd_id).await {
+                warn!(error = %err, "数据面预登记失败；会话发起时会重新构造传输");
+            }
+        });
     }
 
     /// 读平台实现（容忍中毒）。
@@ -437,6 +481,9 @@ impl RemoteManager {
         });
         if capability {
             self.announce();
+            // 提前登记到会合服务器。**这一步不能省**：控制器的中继请求若早于被控端登记到达
+            // hbbs，会被静默丢弃（见 `TransportEstablisher::prepare` 的说明）。
+            self.prewarm();
         }
     }
 
@@ -784,6 +831,120 @@ mod tests {
         async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
             Err(RemoteError::Signaling("测试用建立器".to_owned()))
         }
+    }
+
+    /// 记录 `prepare` 调用的建立器替身（验证预登记时序）。
+    #[derive(Default)]
+    struct SpyEstablisher {
+        /// 已收到的 `prepare` 调用：(本端 rd_id, 会合主机)。
+        prepared: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl SpyEstablisher {
+        /// 取已记录调用的快照。
+        fn calls(&self) -> Vec<(String, String)> {
+            self.prepared.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TransportEstablisher for SpyEstablisher {
+        async fn prepare(&self, params: &RemoteParams, local_rd_id: &str) -> RemoteResult<()> {
+            self.prepared
+                .lock()
+                .unwrap()
+                .push((local_rd_id.to_owned(), params.rendezvous_host.clone()));
+            Ok(())
+        }
+
+        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+            Err(RemoteError::Signaling("测试用建立器".to_owned()))
+        }
+    }
+
+    /// 以指定建立器构造管理器（`server_host` 固定为 `tunnel.example:8080`）。
+    fn manager_with(enabled: bool, establisher: Arc<dyn TransportEstablisher>) -> Arc<RemoteManager> {
+        RemoteManager::new(RemoteManagerConfig {
+            server_host: "tunnel.example:8080".to_owned(),
+            self_client_name: "home-nas".to_owned(),
+            platform: "linux".to_owned(),
+            displays: 1,
+            enabled,
+            establisher,
+            encode: EncodeOptions::default(),
+        })
+    }
+
+    /// 轮询等待条件成立（`prewarm` 在派生任务里跑，需要让出调度）。
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    /// `RemoteCapability` 到达且本端允许被控时，应**提前**登记数据面。
+    ///
+    /// 回归用例：hbbs 会静默丢弃「目标尚未登记」的中继请求，而控制器的请求往往在被控端登记
+    /// 之前就发出（控制器只需一个 RTT，被控端要等用户/桥接接受）。不预登记则会话必现超时。
+    #[tokio::test]
+    async fn capability_prewarms_data_plane_when_enabled() {
+        let spy = Arc::new(SpyEstablisher::default());
+        let mgr = manager_with(true, spy.clone());
+
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "123456789".to_owned(),
+        });
+
+        assert!(
+            wait_until(|| !spy.calls().is_empty()).await,
+            "允许被控时应预登记数据面"
+        );
+        assert_eq!(
+            spy.calls(),
+            vec![("123456789".to_owned(), "tunnel.example:8080".to_owned())],
+            "预登记应带上本端 rd_id 与补齐后的会合主机"
+        );
+    }
+
+    /// 未开启「允许被远程控制」时不应登记（默认关闭，不该对外宣告在线）。
+    #[tokio::test]
+    async fn capability_does_not_prewarm_when_disabled() {
+        let spy = Arc::new(SpyEstablisher::default());
+        let mgr = manager_with(false, spy.clone());
+
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "123456789".to_owned(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(spy.calls().is_empty(), "未开启被控时不应预登记");
+    }
+
+    /// 先收到能力、后打开开关：打开时应补登记（托盘/UI 切换路径）。
+    #[tokio::test]
+    async fn enabling_after_capability_prewarms() {
+        let spy = Arc::new(SpyEstablisher::default());
+        let mgr = manager_with(false, spy.clone());
+
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "123456789".to_owned(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(spy.calls().is_empty(), "关闭状态不应预登记");
+
+        mgr.set_enabled(true);
+        assert!(
+            wait_until(|| !spy.calls().is_empty()).await,
+            "打开开关应补一次预登记"
+        );
+        assert_eq!(spy.calls().len(), 1, "只应登记一次");
     }
 
     /// 记录调用的假 FrameSink。

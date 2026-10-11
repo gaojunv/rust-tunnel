@@ -53,6 +53,35 @@ pub struct EstablishRequest {
 /// 数据面建立器。
 #[async_trait]
 pub trait TransportEstablisher: Send + Sync + 'static {
+    /// 预登记（可选钩子）：拿到服务端下发的 [`RemoteParams`] 后、**首个会话之前**调用。
+    ///
+    /// # 为什么需要这个钩子（别省掉）
+    ///
+    /// 会合服务器 hbbs 对**未登记**的对端是「静默丢弃」的：
+    /// - `RequestRelay` 在目标不在登记表里时只打一条 `debug!` 就丢掉——**不回复、不排队、
+    ///   不重试**（`crates/rustdesk/src/rendezvous.rs` 的 `forward_relay_request`）；
+    /// - `PunchHoleRequest` 对不存在的 ID 立刻回 `IdNotExist`，于是控制器的
+    ///   [`crate::signaling::RustDeskTransport`] 会在**一个 RTT 内**就判定「无直连」并转去
+    ///   `notify_relay`。
+    ///
+    /// 而被控端若等到接受 `RemoteSessionIncoming` 之后才构造传输（要解析 DNS、绑套接字、
+    /// 探测本机 IP，还要先等用户/桥接点「接受」），它登记进 hbbs 时控制器的中继请求早已发完
+    /// 并被丢弃——被控端随后白等一整个等待窗口才超时。**这不是理论上的竞争，是必现的**：
+    /// 控制器只需一个 RTT，被控端要等一次人工/桥接确认。
+    ///
+    /// 因此实现应当在**本端已具备被控能力时提前完成登记**，让两端在会话发起前就都在线。
+    /// 这正是真实 RustDesk 客户端「常驻登记」的做法。
+    ///
+    /// 默认实现为空操作：测试替身、以及不需要预登记的实现无需关心。
+    ///
+    /// # Errors
+    /// 解析、绑定、登记失败时返回 [`crate::error::RemoteError`]。调用方只记日志、不中断流程
+    /// （真正的会话发起会再走一次 [`Self::establish`]）。
+    async fn prepare(&self, params: &RemoteParams, local_rd_id: &str) -> RemoteResult<()> {
+        let _ = (params, local_rd_id);
+        Ok(())
+    }
+
     /// 建立一条双向字节流。
     ///
     /// 实现必须遵守模块级「建立契约」：中继路径只发一帧 `RequestRelay` 后转裸字节、不等应答，
