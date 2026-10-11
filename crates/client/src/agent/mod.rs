@@ -1717,7 +1717,7 @@ mod tests {
             LIST_DIR_MAX_ENTRIES + 1
         )));
         assert_eq!(content.lines().count(), LIST_DIR_MAX_ENTRIES + 1);
-        let mut listed: Vec<&str> = content
+        let listed: Vec<&str> = content
             .lines()
             .take(LIST_DIR_MAX_ENTRIES)
             .collect();
