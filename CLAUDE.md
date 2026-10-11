@@ -126,7 +126,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `session.rs` — 会话帧（4 字节大端长度前缀 + bincode，上限 16 MiB——屏幕帧远大于 `common::protocol` 的 1 MiB）+ `Lane{Control,Screen,File}` 多路复用车道（`File` 预留给文件传输）
 - `crypto.rs` — X25519 临时密钥交换 + ChaCha20-Poly1305，双向独立密钥与 nonce 计数器。**一次性 token 进 KDF（别去掉）**：裸 ECDH 挡不住中继方——`Hello`/`HelloAck` 都是明文，它可替换两端临时公钥做完整 MITM；token 经加密控制通道下发且从不上数据面，攻击者不知道它就算不出密钥 → 两端密钥必然不一致 → 首帧 AEAD 认证失败。另拒绝低阶点（`was_contributory`）
 - `auth.rs` — 握手 HMAC-SHA256，字段用 **8 字节长度前缀**（`nonce`/公钥是二进制，固定分隔符会有拼接歧义）；`Hello` 的 MAC 覆盖控制器临时公钥，`HelloAck` 的 `hmac_ack` 绑定被控端临时公钥，控制器**真正校验**它；挂起会话 TTL 60s、鉴权成功即消费（重放被拒）、MAC 失败保留以允许重试
-- `signaling.rs` — RustDesk 会合/中继客户端（注册/心跳/打洞/中继请求）；`impl TransportEstablisher for RustDeskTransport` 是数据面建立的唯一实现
+- `signaling.rs` — RustDesk 会合/中继客户端（注册/心跳/打洞/中继请求）；`RustDeskTransport` 是真实数据面建立的唯一实现，`LazyTransport` 把它的构造推迟到 `RemoteParams` 到手（GUI 与 e2e 共用）
 - `transport.rs` — 数据面传输抽象（`BoxDuplex`/`EstablishRequest`/`TransportEstablisher`），把「建立一条双向字节流」与「会话跑在这条流上」解耦；**建立契约**写在模块文档里（中继路径只发一帧 `RequestRelay` 后转裸字节、不等应答，并把 `early` 与之合并写出）
 - `controller.rs`/`controlled.rs` — 两侧会话循环（握手 → 画面/输入/心跳）；控制器把 `Hello` 帧流水线进建立阶段，因此**会话循环不再发 `Hello`，只等 `HelloAck`**
 - `screen.rs` — `ScreenSource`/`InputSink`/`FrameSink` 平台 trait + JPEG 编解码 + 帧哈希去重（静止画面零输出）
@@ -144,6 +144,8 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 **会话鉴权不依赖 hbbs**（hbbs 按设计不做身份认证，ID 可被抢占）：服务端签发 `session_id` + 一次性 `token`（TTL 60s），经加密控制通道同时下发给控制器与被控端；被控端在 P2P 握手时校验。**没有 token 的第三方即使抢注了 ID 也建不起会话。**
 
 **数据面分两层**：主路径是 hbbr 中继（所有 NAT 场景可用）；同内网直连（`FetchLocalAddr`/`LocalAddr`）是优化。**跨 NAT TCP 同时打开打洞在当前 hbbs 语义下不成立**——`forward_punch_result` 回给请求方的是目标端信令连接的**源地址**（临时端口），目标端并未在该端口监听，所以「拿到地址就直连」在跨 NAT 场景走不通。打洞是阶段 3 的可选项，只能真机验证。
+
+**数据面必须预登记**：hbbs 对**未登记**的对端是静默丢弃的（`RequestRelay` 只打 debug 就丢、不排队不重试；`PunchHoleRequest` 立刻回 `IdNotExist`，于是控制器一个 RTT 内就转去中继信令）。所以 `TransportEstablisher::prepare` 在收到 `RemoteCapability`、以及打开「允许被远程控制」开关时被调用，两端在会话发起前就已在线。**别把它当成可选优化**——被控端若等到接受 `RemoteSessionIncoming` 才登记，控制器早已发完请求，会话**必现**超时（`tests/remote_session.rs` 的 C 部分用例锁定这一点）。注意 `set_enabled` 由 GUI 的 UI 线程调用，**不在 Tokio 运行时内**，所以预登记走构造时捕获的 `Handle` 而不是 `tokio::spawn`。
 
 **中继约束**：hbbr 按 uuid 配对，先发**恰好一个**带帧的 `RequestRelay` 然后转裸字节、**没有 ack**；`pair_window` 与 `idle_timeout` 都是 30s（任何字节都会重置 idle，每 3s 检查一次）。因此会话必须靠应用层心跳保活（`HEARTBEAT_INTERVAL` 低于 30s），**静止画面也不例外**。配对超时不会有任何错误通知，控制器必须自己按窗口超时提示，否则用户看到的是「卡在连接中」。
 
