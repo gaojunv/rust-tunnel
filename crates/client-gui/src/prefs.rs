@@ -65,15 +65,18 @@ pub struct GuiPrefs {
     /// 主题偏好。
     #[serde(default)]
     pub theme: ThemePref,
+    /// 是否允许被其他客户端远程控制。**默认关闭**：开启等于把本机屏幕与输入
+    /// 交给持有效 token 的对端，必须是用户的显式选择，且随进程重启保留。
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 /// GUI 偏好文件路径（与 client 配置同目录的 gui.toml）。
 #[must_use]
 pub fn path() -> PathBuf {
-    config_store::default_path().parent().map_or_else(
-        || PathBuf::from("gui.toml"),
-        |dir| dir.join("gui.toml"),
-    )
+    config_store::default_path()
+        .parent()
+        .map_or_else(|| PathBuf::from("gui.toml"), |dir| dir.join("gui.toml"))
 }
 
 /// 加载 GUI 偏好；文件缺失/读取/解析失败时返回默认值。

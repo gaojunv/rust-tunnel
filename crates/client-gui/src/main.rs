@@ -26,7 +26,11 @@ fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
         tracing::warn!("窗口图标解码失败，回退为系统默认图标");
         return None;
     };
-    Some(std::sync::Arc::new(egui::IconData { rgba, width: w, height: h }))
+    Some(std::sync::Arc::new(egui::IconData {
+        rgba,
+        width: w,
+        height: h,
+    }))
 }
 
 struct GuiApp {
@@ -42,7 +46,11 @@ struct GuiApp {
 }
 
 impl GuiApp {
-    fn new(app_state: Arc<app::AppState>, tray: Option<tray::TrayHandle>, prefs: prefs::GuiPrefs) -> Self {
+    fn new(
+        app_state: Arc<app::AppState>,
+        tray: Option<tray::TrayHandle>,
+        prefs: prefs::GuiPrefs,
+    ) -> Self {
         let settings = app_state
             .config_snapshot()
             .as_ref()
@@ -107,6 +115,18 @@ impl GuiApp {
                     self.app_state
                         .reconnect_requested
                         .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tray::TrayAction::ToggleAllowRemote => {
+                    // 从 muda 读翻转后的新状态（不维护镜像，见 TrayHandle 文档）。
+                    let enabled = self
+                        .tray
+                        .as_ref()
+                        .is_some_and(|h| h.allow_remote_item.is_checked());
+                    self.prefs.allow_remote = enabled;
+                    if let Err(e) = prefs::save(&self.prefs) {
+                        tracing::warn!("被控开关保存失败：{e}");
+                    }
+                    tracing::info!("允许被远程控制：{}", if enabled { "开" } else { "关" });
                 }
                 tray::TrayAction::Quit => {
                     self.app_state
@@ -178,7 +198,8 @@ impl GuiApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate() {
+                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate()
+                    {
                         let sel = self.selected_tab == idx;
                         if ui.selectable_label(sel, *label).clicked() {
                             self.selected_tab = idx;
@@ -415,9 +436,13 @@ fn main() -> anyhow::Result<()> {
     // 后台 tokio 运行时（控制通道/隧道）
     spawn_runtime(app_state.clone(), status_tx, log_buffer, reconnect_flag);
 
+    // 偏好须在构建托盘之前加载：托盘的「允许被远程控制」勾选项要以持久化值为初态，
+    // 否则重启后菜单显示未勾选、而实际仍在被控状态（或反之）。
+    let prefs = prefs::load();
+
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，
     // 此处先构建托盘（句柄随 GuiApp 持有生命周期），再起 eframe。
-    let tray: Option<tray::TrayHandle> = match tray::build_tray() {
+    let tray: Option<tray::TrayHandle> = match tray::build_tray(prefs.allow_remote) {
         Ok(t) => Some(t),
         Err(e) => {
             tracing::warn!("托盘初始化失败（无桌面环境时可忽略）：{e}");
@@ -450,7 +475,6 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             fonts::setup_fonts(&cc.egui_ctx);
-            let prefs = prefs::load();
             apply_theme(&cc.egui_ctx, prefs.theme);
             Ok(Box::new(GuiApp::new(app_state, tray, prefs)))
         }),

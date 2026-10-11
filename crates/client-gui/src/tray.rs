@@ -1,6 +1,6 @@
 //! 托盘图标与菜单（tray-icon + muda）。
 
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 /// 托盘连接态（决定图标与菜单文案）。
@@ -45,6 +45,8 @@ pub mod ids {
     pub const SETTINGS: &str = "settings";
     /// 立即重连。
     pub const RECONNECT: &str = "reconnect";
+    /// 允许被远程控制（勾选项）。
+    pub const ALLOW_REMOTE: &str = "allow-remote";
     /// 退出应用。
     pub const QUIT: &str = "quit";
 }
@@ -71,17 +73,31 @@ pub struct TrayHandle {
     pub status_item: MenuItem,
     /// 菜单第二行的只读服务器项。
     pub server_item: MenuItem,
+    /// 「允许被远程控制」勾选项。
+    ///
+    /// 勾选态由 muda 自己翻转，调用方在收到 [`TrayAction::ToggleAllowRemote`] 后
+    /// 用 [`CheckMenuItem::is_checked`] 读**新**状态，不要另存一份镜像——镜像会与
+    /// 用户从系统菜单触发的点击脱节。
+    pub allow_remote_item: CheckMenuItem,
 }
 
 /// 构造托盘图标与菜单，返回可持久持有的句柄（调用方需持有其生命周期）。
 ///
 /// 图标三态可通过 `handle.icon.set_icon(...)` 切换；此处先以离线态创建。
-pub fn build_tray() -> anyhow::Result<TrayHandle> {
+/// `allow_remote` 为「允许被远程控制」的初始勾选态（取自持久化偏好）。
+pub fn build_tray(allow_remote: bool) -> anyhow::Result<TrayHandle> {
     let status_item = MenuItem::with_id("status", "● 离线", false, None);
     let server_item = MenuItem::with_id("server", "服务器：未配置", false, None);
     let show_item = MenuItem::with_id(ids::SHOW, "打开面板…", true, None);
     let settings_item = MenuItem::with_id(ids::SETTINGS, "设置…", true, None);
     let reconnect_item = MenuItem::with_id(ids::RECONNECT, "重连", true, None);
+    let allow_remote_item = CheckMenuItem::with_id(
+        ids::ALLOW_REMOTE,
+        "允许被远程控制",
+        true,
+        allow_remote,
+        None,
+    );
     let quit_item = MenuItem::with_id(ids::QUIT, "退出", true, None);
 
     let menu = Menu::with_items(&[
@@ -90,6 +106,8 @@ pub fn build_tray() -> anyhow::Result<TrayHandle> {
         &PredefinedMenuItem::separator(),
         &show_item,
         &settings_item,
+        &PredefinedMenuItem::separator(),
+        &allow_remote_item,
         &PredefinedMenuItem::separator(),
         &reconnect_item,
         &PredefinedMenuItem::separator(),
@@ -118,6 +136,7 @@ pub fn build_tray() -> anyhow::Result<TrayHandle> {
         icon: tray,
         status_item,
         server_item,
+        allow_remote_item,
     })
 }
 
@@ -218,6 +237,9 @@ pub enum TrayAction {
     Settings,
     /// 请求重连。
     Reconnect,
+    /// 切换「允许被远程控制」。不带勾选态——调用方从
+    /// [`TrayHandle::allow_remote_item`] 读 muda 翻转后的新状态。
+    ToggleAllowRemote,
     /// 退出进程。
     Quit,
 }
@@ -228,6 +250,7 @@ impl TrayAction {
             ids::SHOW => Some(Self::Show),
             ids::SETTINGS => Some(Self::Settings),
             ids::RECONNECT => Some(Self::Reconnect),
+            ids::ALLOW_REMOTE => Some(Self::ToggleAllowRemote),
             ids::QUIT => Some(Self::Quit),
             _ => None,
         }
