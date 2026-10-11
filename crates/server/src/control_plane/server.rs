@@ -332,6 +332,10 @@ async fn handle_client_connection(
     cleanup_registry
         .disconnect(&name_for_cleanup, "connection closed")
         .await;
+    // 该客户端可能正出现在别人的「可远程」列表里：离开后要广播最新集合，否则列表会
+    // 一直挂着一个已离线的条目，用户点下去只会得到「目标客户端不在线」。
+    // 必须在 `disconnect` **之后**广播——广播是按当前在线集合构建的。
+    broadcast_remote_peer_list(&state).await;
     result
 }
 

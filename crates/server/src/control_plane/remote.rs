@@ -183,6 +183,20 @@ pub async fn remote_params(state: &ServerState) -> Option<RemoteParams> {
     })
 }
 
+/// 服务端 RustDesk 是否启用（不看密钥能否解析，只做「要不要广播」的廉价判断）。
+///
+/// 刻意不调 [`remote_params`]：那条路径在密钥损坏时会 `warn!`，而本函数会被
+/// 「每次客户端断开」触发，用它会让日志被同一条告警刷屏。
+async fn rustdesk_enabled(state: &ServerState) -> bool {
+    state
+        .dynamic_config
+        .read()
+        .await
+        .rustdesk
+        .as_ref()
+        .is_some_and(|rd| rd.enabled)
+}
+
 /// 构建可远程客户端列表：只含已开启被控、在线、版本支持且已分配 RustDesk ID 的客户端。
 ///
 /// `exclude` 为收件人自身的客户端名——必须排除，否则「自己也开了被控」的客户端会在
@@ -229,6 +243,10 @@ pub async fn broadcast_remote_peer_list(state: &ServerState) {
     let Some(registry) = state.client_registry.as_ref() else {
         return;
     };
+    // RustDesk 未启用时谁都不可能成为可远程对端，广播空列表只是噪音。
+    if !rustdesk_enabled(state).await {
+        return;
+    }
     for entry in registry.list_online().await {
         if !client_supports_remote(entry.client_version.as_deref()) {
             continue;
@@ -780,6 +798,51 @@ mod tests {
         }
         let got = tokio::time::timeout(Duration::from_millis(150), rx_old.recv()).await;
         assert!(got.is_err(), "老客户端不应收到 RemotePeerList");
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_removes_peer_from_broadcast() {
+        // 客户端离线后别人的「可远程」列表必须跟着更新，否则列表里会一直挂着一个
+        // 点不动的条目（点下去只有「目标客户端不在线」）。
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let mut rx_new = register(&state, "new", "0.10.0").await;
+        let _rx_peer = register(&state, "peer", "0.10.0").await;
+
+        for (name, platform, rd_id) in [
+            ("new", "windows", "111222333"),
+            ("peer", "macos", "444555666"),
+        ] {
+            let e = registry.get(name).await.unwrap();
+            e.set_remote_caps(true, platform.to_string(), 1);
+            e.set_rd_id(rd_id.to_string());
+        }
+
+        broadcast_remote_peer_list(&state).await;
+        match rx_new.recv().await.expect("应收到列表") {
+            ControlMessage::RemotePeerList { peers } => assert_eq!(peers.len(), 1),
+            other => panic!("expected RemotePeerList, got {other:?}"),
+        }
+
+        // peer 离线 → 广播出的列表应不再含它。
+        registry.disconnect("peer", "test").await;
+        broadcast_remote_peer_list(&state).await;
+        match rx_new.recv().await.expect("应收到更新后的列表") {
+            ControlMessage::RemotePeerList { peers } => {
+                assert!(peers.is_empty(), "离线客户端不应还在列表里，实得 {peers:?}");
+            }
+            other => panic!("expected RemotePeerList, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_skipped_when_rustdesk_disabled() {
+        // 未启用 RustDesk 时谁都不可能成为可远程对端，广播空列表只是噪音。
+        let state = state_with_rustdesk(false).await;
+        let mut rx = register(&state, "new", "0.10.0").await;
+        broadcast_remote_peer_list(&state).await;
+        let got = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        assert!(got.is_err(), "未启用 RustDesk 时不应广播 RemotePeerList");
     }
 
     #[tokio::test]
