@@ -484,7 +484,10 @@ fn manager(
         encode: EncodeOptions {
             quality: 60,
             scale: 1.0,
+            max_fps: 10,
         },
+        share_dir: None,
+        download_dir: std::env::temp_dir(),
     });
     // 双方先拿到能力通告（设置 params / rd_id），与真实控制通道下发等价。
     mgr.handle_control_message(ControlMessage::RemoteCapability {
@@ -515,7 +518,10 @@ fn manager_lazy(
         encode: EncodeOptions {
             quality: 60,
             scale: 1.0,
+            max_fps: 10,
         },
+        share_dir: None,
+        download_dir: std::env::temp_dir(),
     });
     mgr.handle_control_message(ControlMessage::RemoteCapability {
         params: Some(params.clone()),

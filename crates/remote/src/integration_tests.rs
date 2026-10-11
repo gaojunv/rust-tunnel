@@ -6,17 +6,19 @@
 use crate::auth::PendingSessions;
 use crate::controller::{run_controller, ControllerConfig};
 use crate::controlled::{run_controlled, ControlledConfig};
+use crate::transfer::{TransferEvent, TransferHub};
 use crate::error::{RemoteError, RemoteResult};
 use crate::manager::{RemoteManager, RemoteManagerConfig};
 use crate::screen::{
-    DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame,
-    ScreenSource,
+    Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton,
+    RawFrame, ScreenSource, TileUpdate,
 };
 use crate::session::plan_controller_handshake;
 use crate::transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
 use async_trait::async_trait;
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
 use rust_tunnel_common::remote_bridge::RemoteBridge as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,6 +41,39 @@ fn solid(display: u32, w: u32, h: u32, color: [u8; 4]) -> RawFrame {
         height: h,
         rgba,
     }
+}
+
+/// 把帧内子矩形填成指定颜色（必须落在帧内）。用于制造「局部变化」。
+fn fill_rect(frame: &mut RawFrame, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+    let stride = frame.width as usize * 4;
+    for yy in y..y + h {
+        for xx in x..x + w {
+            let off = yy as usize * stride + xx as usize * 4;
+            frame.rgba[off..off + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+/// 造一段确定性的伪随机字节（LCG；不引额外依赖，便于逐字节比对）。
+fn pseudo_bytes(len: usize) -> Vec<u8> {
+    let mut x: u32 = 0x1234_5678;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        out.push(u8::try_from(x >> 24).unwrap_or(0));
+    }
+    out
+}
+
+/// 轮询等待条件成立（有界；超时后返回条件的最终值）。
+async fn poll_until(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..250 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
 }
 
 /// 固定内容的采集源。
@@ -120,6 +155,12 @@ struct RecordingSink {
     frames: AtomicUsize,
     displays: Mutex<Vec<DisplayInfo>>,
     closed: Mutex<Option<String>>,
+    /// 收到的瓦片更新批次数。
+    tiles: AtomicUsize,
+    /// 收到的瓦片更新（供断言矩形与尺寸）。
+    tile_updates: Mutex<Vec<TileUpdate>>,
+    /// 最近一次收到的剪贴板文本。
+    clipboard: Mutex<Option<String>>,
     notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
@@ -148,6 +189,17 @@ impl FrameSink for RecordingSink {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(());
             }
+        }
+    }
+    fn on_tiles(&self, update: TileUpdate) {
+        self.tiles.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = self.tile_updates.lock() {
+            guard.push(update);
+        }
+    }
+    fn on_clipboard(&self, text: String) {
+        if let Ok(mut guard) = self.clipboard.lock() {
+            *guard = Some(text);
         }
     }
     fn on_closed(&self, reason: String) {
@@ -215,6 +267,17 @@ fn params() -> RemoteParams {
 }
 
 fn manager(establisher: Arc<dyn TransportEstablisher>, enabled: bool, name: &str) -> Arc<RemoteManager> {
+    manager_with_dirs(establisher, enabled, name, None, std::env::temp_dir())
+}
+
+/// 与 [`manager`] 同源，但可指定共享目录与下载目录（文件传输用例用）。
+fn manager_with_dirs(
+    establisher: Arc<dyn TransportEstablisher>,
+    enabled: bool,
+    name: &str,
+    share_dir: Option<PathBuf>,
+    download_dir: PathBuf,
+) -> Arc<RemoteManager> {
     RemoteManager::new(RemoteManagerConfig {
         server_host: "tunnel.example:8080".to_owned(),
         self_client_name: name.to_owned(),
@@ -225,8 +288,161 @@ fn manager(establisher: Arc<dyn TransportEstablisher>, enabled: bool, name: &str
         encode: EncodeOptions {
             quality: 60,
             scale: 1.0,
+            max_fps: 10,
         },
+        share_dir,
+        download_dir,
     })
+}
+
+/// 采集源：`capture` 返回共享缓冲里的当前帧，测试可中途改它（制造局部变化）。
+struct MutableScreen {
+    frame: Mutex<RawFrame>,
+}
+
+impl MutableScreen {
+    fn new(frame: RawFrame) -> Self {
+        Self {
+            frame: Mutex::new(frame),
+        }
+    }
+}
+
+impl ScreenSource for MutableScreen {
+    fn displays(&self) -> Vec<DisplayInfo> {
+        vec![DisplayInfo {
+            id: 0,
+            width: 192,
+            height: 128,
+            name: "fake".into(),
+            primary: true,
+        }]
+    }
+
+    fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
+        let guard = self.frame.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut frame = guard.clone();
+        frame.display = display;
+        Ok(frame)
+    }
+}
+
+/// 双显示器采集源：记录每次 `capture` 收到的显示器编号，供切换断言。
+#[derive(Default)]
+struct TwoDisplayScreen {
+    captured: Mutex<Vec<u32>>,
+}
+
+impl ScreenSource for TwoDisplayScreen {
+    fn displays(&self) -> Vec<DisplayInfo> {
+        vec![
+            DisplayInfo {
+                id: 0,
+                width: 64,
+                height: 64,
+                name: "left".into(),
+                primary: true,
+            },
+            DisplayInfo {
+                id: 1,
+                width: 96,
+                height: 48,
+                name: "right".into(),
+                primary: false,
+            },
+        ]
+    }
+
+    fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
+        if let Ok(mut guard) = self.captured.lock() {
+            guard.push(display);
+        }
+        let (w, h) = if display == 1 { (96, 48) } else { (64, 64) };
+        Ok(solid(display, w, h, [50, 60, 70, 255]))
+    }
+}
+
+/// 内存剪贴板替身（被控端侧）。
+struct FakeClipboard {
+    value: Mutex<String>,
+}
+
+impl FakeClipboard {
+    fn new(initial: &str) -> Self {
+        Self {
+            value: Mutex::new(initial.to_owned()),
+        }
+    }
+
+    fn current(&self) -> String {
+        self.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
+impl Clipboard for FakeClipboard {
+    fn get(&self) -> RemoteResult<String> {
+        Ok(self.current())
+    }
+
+    fn set(&self, text: &str) -> RemoteResult<()> {
+        *self.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text.to_owned();
+        Ok(())
+    }
+}
+
+/// 走完整控制面把两个管理器接成一条会话（与 `full_session_between_two_managers` 同序）。
+///
+/// 两端需已装好平台实现 / 画面上报目标；被控端需 `enabled: true`。
+async fn establish_session(ctrl: &Arc<RemoteManager>, ctld: &Arc<RemoteManager>) {
+    // 双方先拿到能力通告（设置 params / rd_id）。
+    ctrl.handle_control_message(ControlMessage::RemoteCapability {
+        params: Some(params()),
+        rd_id: "111111111".to_owned(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteCapability {
+        params: Some(params()),
+        rd_id: "222222222".to_owned(),
+    });
+
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel(64);
+    let (ctld_tx, mut ctld_rx) = mpsc::channel(64);
+    ctrl.attach(ctrl_tx);
+    ctld.attach(ctld_tx);
+    let _ = ctrl_rx.try_recv();
+    let _ = ctld_rx.try_recv();
+
+    // 服务端：给控制器授权 + 给被控端转达请求（同一 session_id 与 token）。
+    ctrl.handle_control_message(ControlMessage::RemoteConnectGrant {
+        session_id: "sess-1".to_owned(),
+        token: "tok-1".to_owned(),
+        target_rd_id: "222222222".to_owned(),
+        target_platform: "linux".to_owned(),
+        params: params(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteSessionIncoming {
+        session_id: "sess-1".to_owned(),
+        token: "tok-1".to_owned(),
+        from_name: "home-nas".to_owned(),
+        mode: RemoteMode::Control,
+    });
+
+    // 被控端应回 accepted:true（此后两端各自异步建立数据面）。
+    let response = tokio::time::timeout(WAIT, ctld_rx.recv())
+        .await
+        .expect("等被控端应答超时")
+        .expect("通道关闭");
+    match response {
+        ControlMessage::RemoteSessionResponse { accepted, .. } => assert!(accepted, "应接受会话"),
+        other => panic!("应为 RemoteSessionResponse，实得 {other:?}"),
+    }
+}
+
+/// 造一个空闲的传输状态机（这些用例不测文件传输）。
+///
+/// 返回事件接收端：调用方持有时可断言传输事件，丢弃时 hub 只是记一条 debug 日志。
+fn transfer_hub() -> (TransferHub, mpsc::UnboundedReceiver<TransferEvent>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (TransferHub::new(None, std::env::temp_dir(), tx), rx)
 }
 
 #[tokio::test]
@@ -369,6 +585,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         ctld_cfg,
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),
+        None,
+        transfer_hub().0,
         CancellationToken::new(),
     ));
     let ctrl_task = tokio::spawn(run_controller(
@@ -376,6 +594,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         ctrl_cfg,
         plan,
         input_rx,
+        transfer_hub().0,
         sink,
         CancellationToken::new(),
     ));
@@ -423,6 +642,8 @@ async fn correct_token_completes_handshake_and_streams() {
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),
+        None,
+        transfer_hub().0,
         cancel.clone(),
     ));
     let (_input_tx, input_rx) = mpsc::channel(4);
@@ -436,6 +657,7 @@ async fn correct_token_completes_handshake_and_streams() {
         },
         plan,
         input_rx,
+        transfer_hub().0,
         sink.clone(),
         cancel.clone(),
     ));
@@ -542,6 +764,7 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
         },
         plan,
         input_rx,
+        transfer_hub().0,
         sink,
         CancellationToken::new(),
     )
@@ -555,3 +778,215 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
         other => panic!("被替换公钥的 HelloAck 必须被拒，实得 {other:?}"),
     }
 }
+
+/// 瓦片差分：静止画面零瓦片输出，局部变化才产生瓦片。
+#[tokio::test]
+async fn static_screen_emits_no_tiles_and_change_emits_tiles() {
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let ctrl = manager(Arc::new(OneShotEstablisher::new(Box::new(a), true)), false, "home-nas");
+    let ctld = manager(Arc::new(OneShotEstablisher::new(Box::new(b), false)), true, "office-pc");
+
+    let (ctrl_sink, _frame_rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    // 192x128 → 3x2 = 6 块瓦片；先给一张纯色静止帧。
+    let screen = Arc::new(MutableScreen::new(solid(0, 192, 128, [10, 20, 30, 255])));
+    ctld.install_platform(screen.clone(), Arc::new(RecordingInput::default()));
+
+    establish_session(&ctrl, &ctld).await;
+
+    // 首帧是关键帧（整帧 Video），不是瓦片。
+    assert!(
+        poll_until(|| ctrl_sink.frames.load(Ordering::Relaxed) >= 1).await,
+        "应收到首帧关键帧"
+    );
+
+    // 静止画面：再等一段，瓦片输出必须为零。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ctrl_sink.tiles.load(Ordering::Relaxed), 0, "静止画面不应有瓦片输出");
+
+    // 只改左上角瓦片 (0,0) 内的一小块区域。
+    {
+        let mut frame = screen.frame.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        fill_rect(&mut frame, 10, 10, 20, 20, [250, 10, 10, 255]);
+    }
+
+    // 变化应产生至少一次瓦片更新。
+    assert!(
+        poll_until(|| ctrl_sink.tiles.load(Ordering::Relaxed) >= 1).await,
+        "画面变化应产生瓦片"
+    );
+    let updates = ctrl_sink.tile_updates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let update = updates.last().expect("应有瓦片更新");
+    assert_eq!((update.display, update.width, update.height), (0, 192, 128), "瓦片应带整帧尺寸");
+    assert!(
+        update
+            .tiles
+            .iter()
+            .any(|t| (t.x, t.y, t.width, t.height) == (0, 0, 64, 64)),
+        "应含左上角 64x64 瓦片，实得 {:?}",
+        update.tiles.iter().map(|t| (t.x, t.y, t.width, t.height)).collect::<Vec<_>>()
+    );
+}
+
+/// 多显示器切换：控制器 `select_display` 后，被控端应改采目标显示器。
+#[tokio::test]
+async fn select_display_switches_controlled_capture_target() {
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let ctrl = manager(Arc::new(OneShotEstablisher::new(Box::new(a), true)), false, "home-nas");
+    let ctld = manager(Arc::new(OneShotEstablisher::new(Box::new(b), false)), true, "office-pc");
+
+    let (ctrl_sink, _rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    let screen = Arc::new(TwoDisplayScreen::default());
+    ctld.install_platform(screen.clone(), Arc::new(RecordingInput::default()));
+
+    establish_session(&ctrl, &ctld).await;
+
+    // 初始应采集主显示器（id 0）。
+    assert!(
+        poll_until(|| screen
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&0))
+        .await,
+        "初始应采集显示器 0"
+    );
+
+    // 切到显示器 1，被控端采集目标应随之改变。
+    ctrl.select_display(1);
+    assert!(
+        poll_until(|| screen
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&1))
+        .await,
+        "切换后应采集显示器 1"
+    );
+}
+
+/// 文件传输：完整 manager 通路上的下载与上传（含多块）。
+#[tokio::test]
+async fn file_transfer_download_and_upload() {
+    let pid = std::process::id();
+    let share = std::env::temp_dir().join(format!("rt-xfer-share-{pid}"));
+    let dl = std::env::temp_dir().join(format!("rt-xfer-dl-{pid}"));
+    let _ = std::fs::remove_dir_all(&share);
+    let _ = std::fs::remove_dir_all(&dl);
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&dl).unwrap();
+
+    // 源文件大于单块（CHUNK_SIZE = 64 KiB），保证多块流动。
+    let payload = pseudo_bytes(200 * 1024);
+    std::fs::write(share.join("source.bin"), &payload).unwrap();
+
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let ctrl = manager_with_dirs(
+        Arc::new(OneShotEstablisher::new(Box::new(a), true)),
+        false,
+        "home-nas",
+        None,
+        dl.clone(),
+    );
+    let ctld = manager_with_dirs(
+        Arc::new(OneShotEstablisher::new(Box::new(b), false)),
+        true,
+        "office-pc",
+        Some(share.clone()),
+        dl.clone(),
+    );
+
+    let (ctrl_sink, _rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+
+    establish_session(&ctrl, &ctld).await;
+
+    // 下载：先列远端目录。
+    ctrl.list_remote_dir("/");
+    assert!(
+        poll_until(|| ctrl
+            .snapshot()
+            .remote_entries
+            .iter()
+            .any(|e| e.name == "source.bin"))
+        .await,
+        "应列出 source.bin"
+    );
+    let entry = ctrl
+        .snapshot()
+        .remote_entries
+        .into_iter()
+        .find(|e| e.name == "source.bin")
+        .expect("应含 source.bin");
+    assert!(!entry.is_dir, "应为普通文件");
+    assert_eq!(entry.size, payload.len() as u64, "应回报正确大小");
+
+    ctrl.download_remote_file("/source.bin");
+    let downloaded = dl.join("source.bin");
+    assert!(
+        poll_until(|| std::fs::read(&downloaded).is_ok_and(|b| b == payload)).await,
+        "下载文件内容应与源一致"
+    );
+    // 传输结束后不应有在途项，且留下结果提示。
+    assert!(
+        poll_until(|| {
+            let snap = ctrl.snapshot();
+            snap.transfers.is_empty() && snap.transfer_note.is_some()
+        })
+        .await,
+        "传输应结束并留下提示"
+    );
+
+    // 上传：本地文件 → 被控端共享目录。
+    let up_payload = pseudo_bytes(150 * 1024);
+    let local = dl.join("upload-src.bin");
+    std::fs::write(&local, &up_payload).unwrap();
+    ctrl.upload_local_file(local, "/up.bin");
+    let uploaded = share.join("up.bin");
+    assert!(
+        poll_until(|| std::fs::read(&uploaded).is_ok_and(|b| b == up_payload)).await,
+        "上传文件内容应与本地一致"
+    );
+
+    let _ = std::fs::remove_dir_all(&share);
+    let _ = std::fs::remove_dir_all(&dl);
+}
+
+/// 剪贴板：控制器请求 → 收被控端文本；控制器下发 → 被控端剪贴板被写入。
+#[tokio::test]
+async fn clipboard_request_and_send_roundtrip() {
+    let (a, b) = tokio::io::duplex(128 * 1024);
+    let ctrl = manager(Arc::new(OneShotEstablisher::new(Box::new(a), true)), false, "home-nas");
+    let ctld = manager(Arc::new(OneShotEstablisher::new(Box::new(b), false)), true, "office-pc");
+
+    let (ctrl_sink, _rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    let clipboard = Arc::new(FakeClipboard::new("from-controlled"));
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+    ctld.install_clipboard(clipboard.clone());
+
+    establish_session(&ctrl, &ctld).await;
+
+    // 控制器请求剪贴板 → 应收到被控端的文本。
+    ctrl.request_clipboard();
+    assert!(
+        poll_until(|| ctrl_sink
+            .clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            == Some("from-controlled"))
+        .await,
+        "应收到被控端剪贴板文本"
+    );
+
+    // 控制器下发文本 → 被控端剪贴板应被写入。
+    ctrl.send_clipboard("from-controller".into());
+    assert!(
+        poll_until(|| clipboard.current() == "from-controller").await,
+        "被控端剪贴板应被写入"
+    );
+}
+
