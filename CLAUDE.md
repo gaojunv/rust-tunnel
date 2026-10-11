@@ -62,7 +62,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `crates/client-gui`（`rust-tunnel-client-gui`）— 桌面托盘客户端（eframe/egui + winit + tray-icon），「状态/映射/设置/日志/远程」五个 Tab
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
 - `crates/rustdesk`（`rust-tunnel-rustdesk`）— 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**（`frame`/`proto`/`addr`/`key`/`peer`/`relay`/`rendezvous`）
-- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环），**不含任何平台或 UI 依赖**
+- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环/瓦片差分/文件传输），**不含任何平台或 UI 依赖**
 - 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）
 - **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
@@ -128,10 +128,13 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `auth.rs` — 握手 HMAC-SHA256，字段用 **8 字节长度前缀**（`nonce`/公钥是二进制，固定分隔符会有拼接歧义）；`Hello` 的 MAC 覆盖控制器临时公钥，`HelloAck` 的 `hmac_ack` 绑定被控端临时公钥，控制器**真正校验**它；挂起会话 TTL 60s、鉴权成功即消费（重放被拒）、MAC 失败保留以允许重试
 - `signaling.rs` — RustDesk 会合/中继客户端（注册/心跳/打洞/中继请求）；`RustDeskTransport` 是真实数据面建立的唯一实现，`LazyTransport` 把它的构造推迟到 `RemoteParams` 到手（GUI 与 e2e 共用）
 - `transport.rs` — 数据面传输抽象（`BoxDuplex`/`EstablishRequest`/`TransportEstablisher`），把「建立一条双向字节流」与「会话跑在这条流上」解耦；**建立契约**写在模块文档里（中继路径只发一帧 `RequestRelay` 后转裸字节、不等应答，并把 `early` 与之合并写出）
-- `controller.rs`/`controlled.rs` — 两侧会话循环（握手 → 画面/输入/心跳）；控制器把 `Hello` 帧流水线进建立阶段，因此**会话循环不再发 `Hello`，只等 `HelloAck`**
-- `screen.rs` — `ScreenSource`/`InputSink`/`FrameSink` 平台 trait + JPEG 编解码 + 帧哈希去重（静止画面零输出）
-- `manager.rs` — `RemoteManager` 门面（`RemoteUiState` watch、连接请求、启停、平台注入、`RemoteBridge` 实现）
-- 平台实现（xcap 抓屏 / enigo 注入）**放在 `crates/client-gui`**，本 crate 保持编译面干净
+- `controller.rs`/`controlled.rs` — 两侧会话循环（握手 → 画面/输入/心跳/文件）；控制器把 `Hello` 帧流水线进建立阶段，因此**会话循环不再发 `Hello`，只等 `HelloAck`**。UI 命令统一走 `ControllerCommand`（输入/切显示器/切画质/剪贴板/文件），单通道保证顺序与用户操作一致
+- `screen.rs` — `ScreenSource`/`InputSink`/`FrameSink`/`Clipboard` 平台 trait + JPEG 编解码 + 帧哈希去重（静止画面零输出）；`FrameSink` 的 `on_tiles`/`on_clipboard` 默认空实现，控制器侧不必实现 `Clipboard`（它读写的是**本机**剪贴板，由 UI 直接处理）。剪贴板是**单向按需**的：只有控制器会发 `ClipboardRequest`（被控端只应答），控制器侧收到它是异常，只记日志
+- `tiles.rs` — 瓦片差分（64×64 网格）：只编码变化的瓦片，静止桌面流量趋近于零。**关键不变量：瓦片永远是原生分辨率，缩放帧只能整帧发**——所以 `scale != 1.0` 一律强制关键帧，否则缩放关键帧与原生瓦片混在一起会错位。`KEYFRAME_INTERVAL_FRAMES=120` / `KEYFRAME_CHANGE_RATIO=0.6` 是重发整帧的两个阈值
+- `file.rs` — 被控端共享目录的沙箱文件服务（虚拟 `/` 路径）。**两层校验缺一不可**：`validate_virtual_path` 管语法（拒 `..`/`.`/`\`/盘符/控制字符/空段），`FileService::resolve` 管语义（对**最深的已存在祖先**做 canonicalize 后 `Path::starts_with(canonical_root)`，故符号链接逃逸会被拒）。`list` 里指向根外的符号链接项直接跳过
+- `transfer.rs` — 会话内文件传输状态机（两端共用）。只有**控制器**能发起（浏览/下载/上传），被控端只应答。同一时刻只允许一次传输；`CHUNK_SIZE=64 KiB` 且每块之间 `CHUNK_PAUSE=4ms` **主动让出调度**，会话循环的 `select!` 才有机会插入画面帧（中继只给一条字节流，画面与文件天然共享带宽）
+- `manager.rs` — `RemoteManager` 门面（`RemoteUiState` watch、连接请求、启停、平台注入、剪贴板/共享目录注入、`RemoteBridge` 实现）
+- 平台实现（xcap 抓屏 / enigo 注入 / arboard 剪贴板）**放在 `crates/client-gui`**，本 crate 保持编译面干净
 
 #### 远程控制的控制面与数据面
 
@@ -144,6 +147,8 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 **会话鉴权不依赖 hbbs**（hbbs 按设计不做身份认证，ID 可被抢占）：服务端签发 `session_id` + 一次性 `token`（TTL 60s），经加密控制通道同时下发给控制器与被控端；被控端在 P2P 握手时校验。**没有 token 的第三方即使抢注了 ID 也建不起会话。**
 
 **数据面分两层**：主路径是 hbbr 中继（所有 NAT 场景可用）；同内网直连（`FetchLocalAddr`/`LocalAddr`）是优化。**跨 NAT TCP 同时打开打洞在当前 hbbs 语义下不成立**——`forward_punch_result` 回给请求方的是目标端信令连接的**源地址**（临时端口），目标端并未在该端口监听，所以「拿到地址就直连」在跨 NAT 场景走不通。打洞是阶段 3 的可选项，只能真机验证。
+
+**直连探测必须用短超时**（`signaling.rs` 的 `DIRECT_SIGNAL_TIMEOUT = 2s`，**不是** `RELAY_WAIT`）：hbbs 只对 `same_intranet` 的 `PunchHoleRequest` 回包，跨 NAT 时它只推一个 `PunchHole` 数据报、**永不回响应**。若沿用 25s，控制器会空等 25s 才去发中继信令，而被控端的 `wait_relay_push(RELAY_WAIT)` 几乎同时超时 → 会话必现「卡在连接中」。`signaling::tests::try_direct_gives_up_quickly_when_hbbs_never_answers` 用假静默 hbbs 锁定这一点。
 
 **数据面必须预登记**：hbbs 对**未登记**的对端是静默丢弃的（`RequestRelay` 只打 debug 就丢、不排队不重试；`PunchHoleRequest` 立刻回 `IdNotExist`，于是控制器一个 RTT 内就转去中继信令）。所以 `TransportEstablisher::prepare` 在收到 `RemoteCapability`、以及打开「允许被远程控制」开关时被调用，两端在会话发起前就已在线。**别把它当成可选优化**——被控端若等到接受 `RemoteSessionIncoming` 才登记，控制器早已发完请求，会话**必现**超时（`tests/remote_session.rs` 的 C 部分用例锁定这一点）。注意 `set_enabled` 由 GUI 的 UI 线程调用，**不在 Tokio 运行时内**，所以预登记走构造时捕获的 `Handle` 而不是 `tokio::spawn`。
 
