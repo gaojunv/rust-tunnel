@@ -699,8 +699,9 @@ async fn data_plane_relay_session_between_two_managers() {
     assert!(ctrl.snapshot().active.is_none(), "控制器 active 应清空");
     assert!(ctld.snapshot().active.is_none(), "被控端 active 应清空");
 
-    ctrl_transport.shutdown();
-    ctld_transport.shutdown();
+    // 传输现在靠 `Drop` 取消后台登记/直连任务（见 `signaling.rs` 的 `impl Drop`）；本用例断言
+    // 已完成，两个 `Arc<RustDeskTransport>` 随函数结束一起释放即可，无需显式关闭。
+    drop((ctrl_transport, ctld_transport));
 }
 
 /// C 部分：**预登记**不变量的回归用例——被控端必须在会话发起前就登记到 hbbs。
@@ -780,4 +781,100 @@ async fn relay_session_survives_controller_requesting_before_target_session_star
         .expect("等画面超时——中继请求很可能在目标登记前被丢弃")
         .expect("画面通道关闭");
     assert!(ctrl_sink.frames.load(Ordering::Relaxed) >= 1, "应收到画面");
+}
+
+// ── D 部分：真实控制通道上的「被控端拒绝」路径 ────────────────────────
+
+/// 轮询等待条件成立（有界；事件驱动，不用固定 sleep 蒙）。超时后返回条件的最终值。
+async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..500 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+/// 起一个直接挂在**真实控制通道**上的 [`RemoteManager`]（桥接就是 manager 本身）。
+fn control_channel_manager(server_host: &str, name: &str, enabled: bool) -> Arc<RemoteManager> {
+    RemoteManager::new(RemoteManagerConfig {
+        server_host: server_host.to_owned(),
+        self_client_name: name.to_owned(),
+        platform: "linux".to_owned(),
+        displays: 1,
+        enabled,
+        // 本用例不建立数据面（被拒），用延迟建立器即可——只有真的走到 `establish` 才会构造传输。
+        establisher: Arc::new(LazyTransport::new(server_host.to_owned())),
+        encode: EncodeOptions {
+            quality: 60,
+            scale: 1.0,
+            max_fps: 10,
+        },
+        share_dir: None,
+        download_dir: std::env::temp_dir(),
+        // 被控端用默认的 `Confirm`（本用例要测拒绝路径）；控制器侧策略无关紧要。
+        approval_policy: if enabled { ApprovalPolicy::Confirm } else { ApprovalPolicy::Auto },
+    })
+}
+
+/// P0-2：真实控制通道 + 两个真实客户端，被控端 `Confirm` 且用户**拒绝**——控制器必须收敛到
+/// 「无会话 + 有错误」，且不建立任何数据面会话。
+///
+/// 锁的不变量：接入确认门控在**真实控制通道**上端到端成立——拒绝经服务端转达后，控制器
+/// 停在会话之前而不是「卡在连接中」。现有 A/B/C 三部只走 `Auto` 策略，拒绝路径完全没跑过。
+/// 破坏它会怎样：用户点「拒绝」而控制器仍在后台建数据面，或 UI 永远停在「连接中」。
+#[tokio::test]
+async fn control_channel_reject_leaves_controller_without_session() {
+    let mut harness = TestHarness::spawn(HarnessOpts::default()).await;
+    let ports = alloc_rustdesk_ports();
+    // 开 RustDesk 才有远程能力；本用例不建立数据面（被拒），故 relay 参数无关紧要。
+    let _ = enable(&harness.api_client(), &ports, false).await;
+
+    let server_host = harness.control_addr.to_string();
+
+    let ctrl = control_channel_manager(&server_host, "ctrl", false);
+    let target = control_channel_manager(&server_host, "target", true);
+    // 被控端需装平台实现，否则 `handle_incoming` 会直接以「缺屏幕/输入」拒绝、走不到弹窗。
+    target.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+    let (ctrl_sink, _frame_rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+
+    // 两个真实客户端，桥接即各自的 RemoteManager——控制通道消息直达引擎。
+    let _ctrl_client = harness.spawn_remote_client(Some("ctrl"), ctrl.bridge());
+    let _target_client = harness.spawn_remote_client(Some("target"), target.bridge());
+
+    // 服务端下发 RemoteCapability 后 manager 才有 capability / rd_id。
+    assert!(wait_for(|| ctrl.snapshot().capability).await, "控制器应收到能力通告");
+    assert!(wait_for(|| target.snapshot().capability).await, "被控端应收到能力通告");
+
+    // 被控端 enabled=true 会随能力自动上报 → 控制器的可远程列表应出现 target。
+    assert!(
+        wait_for(|| ctrl.snapshot().peers.iter().any(|p| p.client_name == "target")).await,
+        "控制器应看到目标对端，实得 {:?}",
+        ctrl.snapshot().peers
+    );
+
+    // 控制器发起连接 → 服务端签发会话 → 被控端进入待确认（Confirm + 未信任）。
+    ctrl.request_connect("target", RemoteMode::Control);
+    assert!(
+        wait_for(|| target.snapshot().pending_approval.is_some()).await,
+        "被控端应弹出待确认请求"
+    );
+
+    // 用户拒绝。
+    target.reject_pending(None);
+
+    // 控制器最终应进入「无会话 + 有错误信息」，且错误来自**拒绝**而非数据面失败
+    // （若它错误地去建立数据面，这里会是信令/超时错误，而不是「用户拒绝」）。
+    assert!(
+        wait_for(|| ctrl.snapshot().active.is_none() && ctrl.snapshot().last_error.is_some()).await,
+        "控制器应收敛到无会话 + 有错误，实得 {:?}",
+        ctrl.snapshot()
+    );
+    let err = ctrl.snapshot().last_error.expect("应有错误信息");
+    assert!(err.contains("拒绝"), "错误应来自被控端拒绝，实得 {err:?}");
+    // 没有建立数据面会话：控制器从未收到任何画面帧。
+    assert_eq!(ctrl_sink.frames.load(Ordering::Relaxed), 0, "拒绝后不应有任何画面帧");
+    assert!(target.snapshot().active.is_none(), "被控端不应有活动会话");
 }

@@ -13,10 +13,13 @@
 //!   控制通道下发 `RemoteCapability` 才拿到，而 [`rust_tunnel_remote::RemoteManager`] 在构造时
 //!   就要 `Arc<dyn TransportEstablisher>`。
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 // enigo 的 `move_mouse` / `button` / `scroll` / `key` 由这两个 trait 提供，必须引入。
 use enigo::{Keyboard as _, Mouse as _};
+// `Clipboard::get` 供后台线程读取本机剪贴板（见 `RemoteView::request_local_clipboard`）。
+use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
     DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
     RemoteManager, RemoteResult, ScreenSource, TileUpdate,
@@ -300,6 +303,224 @@ pub fn code_to_enigo(code: u32) -> Option<enigo::Key> {
     })
 }
 
+// ── 输入门控 ─────────────────────────────────────────────────────────
+//
+// 控制器侧的鼠标/键盘事件来自**整窗**（`ui.input(..)` 不区分是哪个控件收到的），若不门控
+// 就会把用户在工具条、剪贴板输入框、文件列表上的操作一并注入远端；而远端输入是**有状态**的
+// （按下与抬起必须配对），所以又不能「只看指针在不在画面上」一刀切——那样移出画面后的抬起
+// 会丢，远端会卡键。下面这个状态机把「是否转达」的判定独立出来，与 egui 运行时解耦，便于单测。
+
+/// 修饰键位掩码 → 跨平台键码（顺序固定，便于边沿检测）。
+const MODIFIER_CODES: [(u8, u32); 4] = [
+    (modifier::ALT, keycode::ALT),
+    (modifier::CTRL, keycode::CTRL),
+    (modifier::SHIFT, keycode::SHIFT),
+    (modifier::META, keycode::META),
+];
+
+/// 鼠标键顺序（下标与 `mouse_seen` / `mouse_forwarded` 对应）。
+const MOUSE_BUTTONS: [MouseButton; 3] = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+
+/// 组一个键盘 [`InputEvent`]（减少重复字面量）。
+fn key_event(code: u32, pressed: bool, text: Option<String>, modifiers: u8) -> InputEvent {
+    InputEvent::Key(KeyEvent { code, pressed, text, modifiers })
+}
+
+/// `MouseButton` → 数组下标（与 [`MOUSE_BUTTONS`] 对应）。
+fn mouse_index(button: MouseButton) -> usize {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
+    }
+}
+
+/// 输入门控状态机（**只做「是否转达」的判定，不依赖 egui 运行时**，便于单测）。
+///
+/// # 为什么不能只用 `hovered()` 一把梭
+///
+/// 远端（被控端）的输入是**有状态**的：按下与抬起必须配对，否则会卡住一个按住不放的键或
+/// 鼠标键。而 egui 的鼠标/键盘事件是**整窗**的（`ui.input(..)` 不分控件），所以两个方向
+/// 要分开处理：
+///
+/// - **按下必须门控**：只有指针位于画面内（`pointer_in_image`）时才转达。否则点「中断会话」
+///   按钮、在剪贴板/上传路径的输入框里打字、滚动文件列表，都会在最后悬停的远端坐标上凭空
+///   注入一次操作；
+/// - **抬起必须无条件转达**：只要这次按下**曾经**转达过，其抬起就必须发出去——哪怕指针已
+///   移出画面、甚至移出窗口。否则远端会残留一个按下的键或鼠标键。
+///
+/// 为此这里分别跟踪「观察到的物理状态」（`*_seen`，做边沿检测）与「已转达按下、等待抬起」
+/// 的集合（`*_forwarded`）。键盘与修饰键同一门控：只有「本窗口有焦点」且「没有 egui 控件在
+/// 吃键盘输入」时才转发按下，避免把用户在本地输入框里敲的字、Ctrl+C 之类同时注入远端。
+#[derive(Debug, Default)]
+pub struct InputGate {
+    /// 上一帧观察到的鼠标键是否按下（下标见 [`MOUSE_BUTTONS`]）。
+    mouse_seen: [bool; 3],
+    /// 已转达按下、尚未转达抬起的鼠标键。
+    mouse_forwarded: [bool; 3],
+    /// 已转达按下、尚未转达抬起的特殊键（跨平台键码；文本键无配对抬起，不进此集合）。
+    keys_forwarded: BTreeSet<u32>,
+    /// 上一帧观察到的修饰键位掩码（边沿检测基线）。
+    modifiers_seen: u8,
+    /// 已转达按下的修饰键位掩码。
+    modifiers_forwarded: u8,
+}
+
+impl InputGate {
+    /// 鼠标按键门控。`down` 为**本帧该键是否处于按下态**（不是「刚按下」——边沿由本结构自行
+    /// 判断）；`pointer_in_image` 为指针是否位于画面内。返回要转达的按下/抬起事件，不转达时
+    /// 为 `None`。语义见类型文档。
+    #[must_use]
+    pub fn mouse_button(&mut self, button: MouseButton, down: bool, pointer_in_image: bool) -> Option<InputEvent> {
+        let idx = mouse_index(button);
+        if down == self.mouse_seen[idx] {
+            return None; // 无状态变化
+        }
+        self.mouse_seen[idx] = down;
+        if down {
+            // 按下：只有指针在画面上才转达。
+            if !pointer_in_image {
+                return None;
+            }
+            self.mouse_forwarded[idx] = true;
+            Some(InputEvent::MouseButton { button, pressed: true })
+        } else if self.mouse_forwarded[idx] {
+            // 抬起：这次按下曾转达过 → 无条件转达（哪怕指针已移出画面）。
+            self.mouse_forwarded[idx] = false;
+            Some(InputEvent::MouseButton { button, pressed: false })
+        } else {
+            // 这次按下从未转达（当时指针在画面外）→ 不能凭空给远端发抬起。
+            None
+        }
+    }
+
+    /// 滚轮门控：只有指针位于画面内时才转达（避免在文件列表 / 输入框上滚动时误滚远端）。
+    #[must_use]
+    pub fn wheel(pointer_in_image: bool, dx: i32, dy: i32) -> Option<InputEvent> {
+        if !pointer_in_image || (dx == 0 && dy == 0) {
+            return None;
+        }
+        Some(InputEvent::Wheel { dx, dy })
+    }
+
+    /// 特殊键门控。`code` 为跨平台键码（非 [`keycode::TEXT`]），`pressed` 由 egui 事件直接给出
+    /// （自带边沿）；`keyboard_enabled` = 本窗口有焦点且无控件在吃键盘输入。
+    ///
+    /// 与 [`Self::modifiers`] 的补偿路径对称：`keyboard_enabled == false` 时不再转发任何按下，
+    /// 而是返回 [`Self::release_keys`] 的结果（回收所有「已转达按下」的键并清空状态）。这条路径
+    /// 必不可少——窗口失焦时 egui **不会**合成 key-up（egui 0.31 的 `keys_down` 只由真实的
+    /// `Event::Key` 清除，物理抬起交给了获得焦点的另一个应用），若不在此回收，被控端会一直保持
+    /// 该键按下，直到用户再按一次并释放。
+    #[must_use]
+    pub fn key(&mut self, code: u32, pressed: bool, keyboard_enabled: bool, modifiers: u8) -> Vec<InputEvent> {
+        if !keyboard_enabled {
+            return self.release_keys();
+        }
+        if pressed {
+            self.keys_forwarded.insert(code);
+            return vec![key_event(code, true, None, modifiers)];
+        }
+        if self.keys_forwarded.remove(&code) {
+            // 抬起：曾转达过就无条件转达（与鼠标键同一条不变量）。
+            return vec![key_event(code, false, None, modifiers)];
+        }
+        Vec::new()
+    }
+
+    /// 文本输入门控（可打印字符走此路径）。与键盘同一门控；egui 的文本事件没有配对抬起
+    /// （注入侧按「点按」处理），故只做单向转发。纯控制字符不转发。
+    #[must_use]
+    pub fn text(text: &str, keyboard_enabled: bool, modifiers: u8) -> Option<InputEvent> {
+        if !keyboard_enabled || !text.chars().any(|c| !c.is_control()) {
+            return None;
+        }
+        Some(key_event(keycode::TEXT, true, Some(text.to_owned()), modifiers))
+    }
+
+    /// 修饰键门控。`bits` 为当前位掩码（[`egui_modifiers`] 的结果），`keyboard_enabled` 同键盘。
+    /// 返回本帧需要转达的修饰键按下/抬起事件。
+    #[must_use]
+    pub fn modifiers(&mut self, bits: u8, keyboard_enabled: bool) -> Vec<InputEvent> {
+        if !keyboard_enabled {
+            // 门控关闭：把已转达按下的修饰键补发抬起，并把观察基线同步到当前物理状态——
+            // 否则重新放行时会凭空产生一次「按下」边沿（远端会多按一个修饰键）。
+            let out = self.release_modifiers();
+            self.modifiers_seen = bits;
+            return out;
+        }
+        let changed = bits ^ self.modifiers_seen;
+        self.modifiers_seen = bits;
+        let mut out = Vec::new();
+        for (mask, code) in MODIFIER_CODES {
+            if changed & mask != 0 {
+                let pressed = bits & mask != 0;
+                if pressed {
+                    self.modifiers_forwarded |= mask;
+                } else {
+                    self.modifiers_forwarded &= !mask;
+                }
+                out.push(key_event(code, pressed, None, bits));
+            }
+        }
+        out
+    }
+
+    /// 释放所有「已转达按下」的鼠标键 / 修饰键 / 特殊键（补发抬起），并清空状态。
+    ///
+    /// 退出捕获（会话结束、切 Tab、切到非「完全控制」模式）时调用；返回的事件应投递给引擎——
+    /// 会话已结束时 `send_input` 会静默丢弃，无副作用。
+    #[must_use]
+    pub fn release_all(&mut self) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        for (idx, button) in MOUSE_BUTTONS.iter().enumerate() {
+            if self.mouse_forwarded[idx] {
+                self.mouse_forwarded[idx] = false;
+                out.push(InputEvent::MouseButton { button: *button, pressed: false });
+            }
+        }
+        out.extend(self.release_modifiers());
+        out.extend(self.release_keys());
+        // 观察基线一并清零：重新进入捕获时不因残留基线凭空产生边沿。
+        self.mouse_seen = [false; 3];
+        self.modifiers_seen = 0;
+        out
+    }
+
+    /// 回收所有「已转达按下」的特殊键（补发抬起）并清空集合，返回事件列表。
+    ///
+    /// 与 [`Self::release_all`] 的区别：只动键盘、不动鼠标——键盘门控关闭（失焦 / 有控件在吃
+    /// 键盘输入）但鼠标仍可能在使用时只回收键盘。**幂等**：状态清空后再调用返回空，故可每帧安全
+    /// 调用而不重发抬起。修饰键不在此处处理，由 [`Self::modifiers`] 的补偿路径负责释放并同步基线。
+    #[must_use]
+    pub fn release_keys(&mut self) -> Vec<InputEvent> {
+        std::mem::take(&mut self.keys_forwarded)
+            .into_iter()
+            .map(|code| key_event(code, false, None, 0))
+            .collect()
+    }
+
+    /// 清空所有状态、**不**补发事件（会话已确定不可达、或纯 UI 复位时用）。
+    pub fn reset(&mut self) {
+        self.mouse_seen = [false; 3];
+        self.mouse_forwarded = [false; 3];
+        self.keys_forwarded.clear();
+        self.modifiers_seen = 0;
+        self.modifiers_forwarded = 0;
+    }
+
+    /// 把已转达按下的修饰键补发抬起并清零，返回事件列表。
+    fn release_modifiers(&mut self) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        for (mask, code) in MODIFIER_CODES {
+            if self.modifiers_forwarded & mask != 0 {
+                out.push(key_event(code, false, None, 0));
+            }
+        }
+        self.modifiers_forwarded = 0;
+        out
+    }
+}
+
 // ── 屏幕采集（xcap，三平台通用）─────────────────────────────────────
 
 /// 基于 `xcap` 的屏幕采集源。
@@ -573,6 +794,10 @@ pub struct SessionInputs {
     pub upload_name: String,
 }
 
+/// 本机剪贴板异步读取的结果槽：`(请求代, 结果)`。`Arc<Mutex<..>>` 供短命后台线程写入、
+/// UI 线程读取（非阻塞）；「代」用于丢弃跨会话 / 被后续请求取代的陈旧结果。
+type ClipboardReadSlot = Arc<Mutex<Option<(u64, Result<String, String>)>>>;
+
 /// 远程会话窗口的 GUI 侧状态（纹理、输入边沿状态）。
 pub struct RemoteView {
     /// 与 [`GuiFrameSink`] 共享的画面槽。
@@ -589,10 +814,17 @@ pub struct RemoteView {
     inputs: SessionInputs,
     /// 上一次发出的鼠标位置（去重）。
     last_mouse: Option<(i32, i32)>,
-    /// 上一次的三个鼠标按键状态 `[左, 右, 中]`。
-    buttons: [bool; 3],
-    /// 上一次的修饰键位掩码。
-    modifiers: u8,
+    /// 输入门控状态机（按下需门控、抬起按「是否转达过」处理）。
+    gate: InputGate,
+    /// 本帧 [`Self::capture_input`] 是否运行过的戳记（egui 输入时间）；见
+    /// [`Self::reconcile_input_capture`]。
+    capture_stamp: Option<f64>,
+    /// 后台读取本机剪贴板的结果槽（非阻塞）；携带发起请求时的「代」编号（见
+    /// [`Self::request_local_clipboard`] 与 [`Self::take_clipboard_read`]）。
+    clipboard_read: ClipboardReadSlot,
+    /// 剪贴板读取的「代」：每次发起请求 +1；[`Self::reset_session`] 也 +1 以作废在途读取。
+    /// 取回时只认当前代的结果，从而丢弃跨会话 / 被后续请求取代的陈旧结果。
+    clipboard_read_gen: u64,
     /// 接入确认弹窗的「本次运行内不再询问该对端」勾选态（请求消失时由弹窗清零）。
     approval_remember: bool,
 }
@@ -609,8 +841,10 @@ impl RemoteView {
             selected_display: None,
             inputs: SessionInputs::default(),
             last_mouse: None,
-            buttons: [false; 3],
-            modifiers: 0,
+            gate: InputGate::default(),
+            capture_stamp: None,
+            clipboard_read: Arc::new(Mutex::new(None)),
+            clipboard_read_gen: 0,
             approval_remember: false,
         }
     }
@@ -627,14 +861,24 @@ impl RemoteView {
         self.sink_installed = true;
     }
 
-    /// 会话结束后清空纹理与输入边沿状态。
+    /// 会话结束后清空纹理与输入门控状态。
+    ///
+    /// 这里**不**补发抬起：会话已经结束，引擎会丢弃输入事件。会话仍在、只是退出「完全控制」
+    /// 捕获的场景由 [`Self::reconcile_input_capture`] 负责补发抬起。
     pub fn reset_session(&mut self) {
         self.texture = None;
         self.tex_size = (0, 0);
         self.last_mouse = None;
-        self.buttons = [false; 3];
-        self.modifiers = 0;
+        self.gate.reset();
+        self.capture_stamp = None;
         self.selected_display = None;
+        // 本机剪贴板读取结果属于上一会话：清空槽位，并推进「代」以作废在途读取——后台线程若在
+        // 复位之后才写回旧结果，其代号与当前不符，会被 `take_clipboard_read` 丢弃，不会流入下一
+        // 个会话的输入框。
+        if let Ok(mut guard) = self.clipboard_read.lock() {
+            *guard = None;
+        }
+        self.clipboard_read_gen = self.clipboard_read_gen.wrapping_add(1);
     }
 
     /// 当前显示器列表（引擎下发）。
@@ -754,6 +998,11 @@ impl RemoteView {
     ///
     /// `rect` 为画面显示区域，`remote_w`/`remote_h` 为远程帧像素尺寸；鼠标坐标从窗口内
     /// 显示区域**反变换**到远程屏幕坐标（画面可能被等比缩放）。
+    ///
+    /// 事件来源是**整窗**的，故按键/滚轮/键盘都要经 [`InputGate`] 门控（详见其文档）：鼠标
+    /// 按下只在指针位于画面上时转达、抬起只要曾转达过就无条件转达；滚轮只在指针位于画面上
+    /// 时转达；键盘只在窗口有焦点且无控件吃键盘输入时转达。鼠标移动仍只在指针位于画面上时
+    /// 更新（`hover_pos` 本身即以 `hovered()` 为准）。
     pub fn capture_input(
         &mut self,
         ui: &egui::Ui,
@@ -763,9 +1012,16 @@ impl RemoteView {
         remote_w: u32,
         remote_h: u32,
     ) {
+        // 记录「本帧已捕获」的戳记：`reconcile_input_capture` 靠它判断捕获是否仍在进行。
+        self.capture_stamp = Some(ui.ctx().input(|i| i.time));
+
         let display = self.selected_display.unwrap_or(0);
 
-        // 1) 鼠标移动（去重后发送）。
+        // 指针是否在画面内：拖动本控件（画面）期间 `hovered()` 会变 false，故把
+        // `is_pointer_button_down_on()` 也算进来，让「在画面上按下后拖出画面」的拖动继续生效。
+        let pointer_in_image = response.hovered() || response.is_pointer_button_down_on();
+
+        // 1) 鼠标移动（去重后发送；仅在指针位于画面上时更新）。
         if let Some(pos) = response.hover_pos() {
             let x = scale_axis(pos.x - rect.min.x, rect.width(), remote_w);
             let y = scale_axis(pos.y - rect.min.y, rect.height(), remote_h);
@@ -775,7 +1031,12 @@ impl RemoteView {
             }
         }
 
-        // 2) 鼠标按键 / 滚轮 / 修饰键（按边沿变化发送）。
+        // 键盘门控：本窗口有焦点，且当前没有 egui 控件在吃键盘输入。否则用户在本地输入框
+        // （剪贴板 / 上传路径）里敲的字、Ctrl+C 之类会被同时注入远端——egui 不会把这些事件
+        // 从 `i.events` 里摘掉，必须由我们判断。
+        let keyboard_enabled = ui.ctx().input(|i| i.focused) && !ui.ctx().wants_keyboard_input();
+
+        // 2) 鼠标按键 / 滚轮 / 修饰键（经门控，按边沿发送）。
         let (buttons, scroll, mods) = ui.input(|i| {
             (
                 [
@@ -787,73 +1048,110 @@ impl RemoteView {
                 egui_modifiers(i.modifiers),
             )
         });
-        for (idx, down) in buttons.iter().enumerate() {
-            if *down != self.buttons[idx] {
-                self.buttons[idx] = *down;
-                let button = match idx {
-                    0 => MouseButton::Left,
-                    1 => MouseButton::Right,
-                    _ => MouseButton::Middle,
-                };
-                manager.send_input(InputEvent::MouseButton {
-                    button,
-                    pressed: *down,
-                });
+        for (button, down) in [
+            (MouseButton::Left, buttons[0]),
+            (MouseButton::Right, buttons[1]),
+            (MouseButton::Middle, buttons[2]),
+        ] {
+            if let Some(event) = self.gate.mouse_button(button, down, pointer_in_image) {
+                manager.send_input(event);
             }
         }
-        if scroll.x != 0.0 || scroll.y != 0.0 {
-            // egui 的滚动量为正表示内容上移，enigo 正值为向下滚动 → 取反。
-            manager.send_input(InputEvent::Wheel {
-                dx: -round_i32(scroll.x),
-                dy: -round_i32(scroll.y),
-            });
+        // egui 的滚动量为正表示内容上移，enigo 正值为向下滚动 → 取反。
+        if let Some(event) = InputGate::wheel(pointer_in_image, -round_i32(scroll.x), -round_i32(scroll.y)) {
+            manager.send_input(event);
         }
-        if mods != self.modifiers {
-            let changed = mods ^ self.modifiers;
-            for (bit, code) in [
-                (modifier::ALT, keycode::ALT),
-                (modifier::CTRL, keycode::CTRL),
-                (modifier::SHIFT, keycode::SHIFT),
-                (modifier::META, keycode::META),
-            ] {
-                if changed & bit != 0 {
-                    let pressed = mods & bit != 0;
-                    manager.send_input(InputEvent::Key(KeyEvent {
-                        code,
-                        pressed,
-                        text: None,
-                        modifiers: mods,
-                    }));
-                }
+        for event in self.gate.modifiers(mods, keyboard_enabled) {
+            manager.send_input(event);
+        }
+        // 键盘门控关闭（失焦 / 有控件在吃键盘输入）时每帧收敛：把「已转达按下」的特殊键补发抬起。
+        // 这里不能只依赖下面的事件循环——egui 在窗口失焦时不会合成 key-up，若不在门控关闭的这一帧
+        // 回收，被控端会残留一个按住不放的键。与 `modifiers()` 的补偿路径对称；`release_keys` 幂等，
+        // 状态清空后重复调用返回空，故不会每帧重发抬起。
+        if !keyboard_enabled {
+            for event in self.gate.release_keys() {
+                manager.send_input(event);
             }
-            self.modifiers = mods;
         }
 
-        // 3) 键盘事件（特殊键走 code；文本走 TEXT）。
+        // 3) 键盘事件（特殊键走 code；文本走 TEXT）。控制字符（Enter/Tab 等）已由 Key 事件
+        //    处理，`InputGate::text` 会把纯控制文本滤掉，避免重复。
         let events = ui.input(|i| i.events.clone());
         for event in events {
             match event {
                 egui::Event::Key { key, pressed, .. } => {
                     if let Some(code) = egui_key_to_code(key) {
-                        manager.send_input(InputEvent::Key(KeyEvent {
-                            code,
-                            pressed,
-                            text: None,
-                            modifiers: mods,
-                        }));
+                        for out in self.gate.key(code, pressed, keyboard_enabled, mods) {
+                            manager.send_input(out);
+                        }
                     }
                 }
-                // 控制字符（Enter/Tab 等）已由 Key 事件处理，避免重复。
-                egui::Event::Text(text) if text.chars().any(|c| !c.is_control()) => {
-                    manager.send_input(InputEvent::Key(KeyEvent {
-                        code: keycode::TEXT,
-                        pressed: true,
-                        text: Some(text),
-                        modifiers: mods,
-                    }));
+                egui::Event::Text(text) => {
+                    if let Some(out) = InputGate::text(&text, keyboard_enabled, mods) {
+                        manager.send_input(out);
+                    }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// 每帧收敛输入捕获状态：若本帧 [`Self::capture_input`] 没有运行（用户切到别的 Tab、模式
+    /// 不再是「完全控制」、会话已结束、或画面还没到），就把上一轮「已转达按下」的鼠标键 / 键 /
+    /// 修饰键补发抬起并清空门控，避免远端残留按下的键。
+    ///
+    /// 「本帧是否捕获过」用 egui 的输入时间戳判断（同一帧的多次 pass 该值不变，跨帧递增）。
+    ///
+    /// 调用点：由 [`crate::ui::remote::approval_modal`] 每帧调用——它是 `GuiApp::update` 里
+    /// **每帧**都会执行、且同时拿到 `&mut RemoteView` 与 [`egui::Context`] 的唯一入口
+    /// （`ui::remote::show` 只在远程 Tab 被选中时才渲染）。
+    pub fn reconcile_input_capture(&mut self, ctx: &egui::Context, manager: Option<&Arc<RemoteManager>>) {
+        let now = ctx.input(|i| i.time);
+        if self.capture_stamp == Some(now) {
+            return; // 本帧已捕获输入，无需收敛
+        }
+        self.capture_stamp = None;
+        let releases = self.gate.release_all();
+        if let Some(manager) = manager {
+            for event in releases {
+                manager.send_input(event);
+            }
+        }
+    }
+
+    /// 请求异步读取本机剪贴板：立刻返回，结果在下一次 [`Self::take_clipboard_read`] 取回。
+    ///
+    /// **不能**在 `update` 里同步调用 `SystemClipboard::get`：`arboard::Clipboard::new()` 每次
+    /// 都要新建平台连接，X11 下若别的进程正持有 selection 可能长时间阻塞，会直接卡死 UI 线程。
+    /// 故丢到短命线程里读，结果经共享槽交回 UI 线程。每次请求推进「代」，后发起的读取胜出；被
+    /// [`Self::reset_session`] 作废的旧请求即使晚到也不会被取回。
+    pub fn request_local_clipboard(&mut self) {
+        self.clipboard_read_gen = self.clipboard_read_gen.wrapping_add(1);
+        let gen = self.clipboard_read_gen;
+        let slot = Arc::clone(&self.clipboard_read);
+        std::thread::spawn(move || {
+            // 后台线程 panic 会静默丢掉结果并让槽位空转；用 catch_unwind 兜底成错误信息。
+            let result = std::panic::catch_unwind(|| SystemClipboard.get().map_err(|err| err.to_string()))
+                .unwrap_or_else(|_| Err("读取本机剪贴板时发生内部错误".to_owned()));
+            if let Ok(mut guard) = slot.lock() {
+                // 只写入不比槽内更旧的结果：连点两次时后发起的（代更大）胜出，先发起者若晚到也不
+                // 覆盖它；复位后旧代的结果同样在此被丢弃。
+                let stale = matches!(&*guard, Some((older, _)) if gen < *older);
+                if !stale {
+                    *guard = Some((gen, result));
+                }
+            }
+        });
+    }
+
+    /// 取回后台读取的本机剪贴板结果（取走即清）；仍在读取、无请求、或结果属于旧的一代（上一会话 /
+    /// 已被更新的请求取代）时 `None`。
+    #[must_use]
+    pub fn take_clipboard_read(&mut self) -> Option<Result<String, String>> {
+        let mut guard = self.clipboard_read.lock().ok()?;
+        match guard.take() {
+            Some((gen, result)) if gen == self.clipboard_read_gen => Some(result),
+            _ => None,
         }
     }
 }
@@ -900,3 +1198,325 @@ fn round_i32(value: f32) -> i32 {
 // 推迟到 `RemoteParams` 到手，并在拿到参数时**立即**构造（= 立即向会合服务器登记），
 // 避免「控制器先发中继请求、被控端还没登记」导致的推送丢失。这里只做转出，便于本模块引用。
 pub use rust_tunnel_remote::signaling::LazyTransport;
+
+#[cfg(test)]
+mod tests {
+    //! 只覆盖**纯逻辑**：门控状态机与坐标/尺寸换算。真实鼠标/键盘行为（egui 的 `hovered()`、
+    //! `wants_keyboard_input()`、平台注入）无法在无头环境验证，只能由这些单测锁住判定规则。
+
+    use super::*;
+
+    /// 构造一条鼠标按键事件（测试用）。
+    fn mouse_btn(button: MouseButton, pressed: bool) -> InputEvent {
+        InputEvent::MouseButton { button, pressed }
+    }
+
+    /// 构造一条键盘事件（测试用）。
+    fn key_ev(code: u32, pressed: bool) -> InputEvent {
+        InputEvent::Key(KeyEvent { code, pressed, text: None, modifiers: 0 })
+    }
+
+    // ── InputGate：鼠标按键门控矩阵 ──────────────────────────────────
+
+    #[test]
+    fn mouse_press_outside_image_is_not_forwarded() {
+        let mut gate = InputGate::default();
+        // 指针不在画面上（点工具条 / 在输入框里点）→ 按下绝不转达。
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, false), None);
+        // 这次按下从未转达，抬起也不能凭空发出。
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, false), None);
+    }
+
+    #[test]
+    fn mouse_press_inside_image_is_forwarded_once() {
+        let mut gate = InputGate::default();
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        // 仍按住（无新边沿）→ 不重复发。
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), None);
+    }
+
+    #[test]
+    fn mouse_release_is_forwarded_even_after_pointer_left_image() {
+        let mut gate = InputGate::default();
+        assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
+        // 按下已转达过 → 即便指针已移出画面（甚至窗口），抬起仍必须转达。
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, false), Some(mouse_btn(MouseButton::Left, false)));
+        // 再抬起（本就没按下）→ 不转达。
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, false), None);
+    }
+
+    #[test]
+    fn mouse_button_gating_is_per_button() {
+        let mut gate = InputGate::default();
+        // 右键在画面外按下不转达；左键在画面内按下转达——两者互不影响。
+        assert_eq!(gate.mouse_button(MouseButton::Right, true, false), None);
+        assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
+        assert_eq!(gate.mouse_button(MouseButton::Right, false, true), None);
+        assert!(gate.mouse_button(MouseButton::Left, false, true).is_some());
+    }
+
+    /// 在画面上拖出画面：按下时在画面内、抬起时指针已在画面外 —— 抬起仍要转达。
+    #[test]
+    fn mouse_drag_starting_in_image_releases_when_outside() {
+        let mut gate = InputGate::default();
+        assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
+        // 拖动期间指针离开画面：`pointer_in_image` 由 hovered||is_pointer_button_down_on 决定，
+        // 这里直接验证「指针在画面外」时按下状态不变则不重复发、抬起照发。
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, false), None);
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, false), Some(mouse_btn(MouseButton::Left, false)));
+    }
+
+    // ── InputGate：滚轮门控 ──────────────────────────────────────────
+
+    #[test]
+    fn wheel_only_forwards_when_pointer_in_image() {
+        assert_eq!(InputGate::wheel(false, 3, -4), None);
+        assert_eq!(InputGate::wheel(true, 0, 0), None);
+        assert_eq!(InputGate::wheel(true, 3, -4), Some(InputEvent::Wheel { dx: 3, dy: -4 }));
+    }
+
+    // ── InputGate：键盘 / 文本 / 修饰键门控 ──────────────────────────
+
+    #[test]
+    fn key_press_requires_keyboard_gate() {
+        let mut gate = InputGate::default();
+        // 有控件在吃键盘（或窗口失焦）→ 按下不转达。
+        assert!(gate.key(keycode::ENTER, true, false, 0).is_empty());
+        // 未转达过按下的抬起也不转达。
+        assert!(gate.key(keycode::ENTER, false, false, 0).is_empty());
+    }
+
+    #[test]
+    fn key_release_is_forwarded_after_gated_press_even_if_gate_closed() {
+        let mut gate = InputGate::default();
+        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+        // 随后门控关闭（失焦 / 输入框获得焦点）→ key() 的补偿路径把该键补发抬起，远端不会卡住 Enter。
+        assert_eq!(gate.key(keycode::ENTER, false, false, 0), vec![key_ev(keycode::ENTER, false)]);
+    }
+
+    /// 门控关闭时 `key()` 走与 `modifiers()` 对称的补偿路径：回收已转达按下的键。
+    #[test]
+    fn key_recovers_forwarded_keys_when_gate_closes() {
+        let mut gate = InputGate::default();
+        // 门控开启时按下方向键 → 转达按下。
+        assert_eq!(gate.key(keycode::ARROW_UP, true, true, 0), vec![key_ev(keycode::ARROW_UP, true)]);
+        // 失焦（门控关闭）：不再转发任何按下，而是把该键补发抬起。
+        assert_eq!(gate.key(keycode::ARROW_UP, true, false, 0), vec![key_ev(keycode::ARROW_UP, false)]);
+        // 幂等：状态已清干净，重复调用（无论 pressed 真假）都不再重发抬起。
+        assert!(gate.key(keycode::ARROW_UP, true, false, 0).is_empty());
+        assert!(gate.key(keycode::ARROW_UP, false, false, 0).is_empty());
+        // 退出捕获用的 `release_all` 也已是空。
+        assert!(gate.release_all().is_empty());
+    }
+
+    /// 门控关闭后重新开启，同一个键必须能再次产生「按下」边沿（不因状态残留被吞掉）。
+    #[test]
+    fn key_can_press_again_after_gate_reopens() {
+        let mut gate = InputGate::default();
+        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+        // 门控关闭 → 补发抬起、清空 keys_forwarded。
+        assert_eq!(gate.key(keycode::ENTER, true, false, 0), vec![key_ev(keycode::ENTER, false)]);
+        // 重新放行：同一键再次按下必须能产生新的「按下」边沿。
+        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+    }
+
+    /// `release_keys` 只回收键盘（不动鼠标），且幂等。
+    #[test]
+    fn release_keys_leaves_mouse_untouched_and_is_idempotent() {
+        let mut gate = InputGate::default();
+        assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
+        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+        assert_eq!(gate.key(keycode::F1, true, true, 0), vec![key_ev(keycode::F1, true)]);
+        let released = gate.release_keys();
+        assert!(released.contains(&key_ev(keycode::ENTER, false)));
+        assert!(released.contains(&key_ev(keycode::F1, false)));
+        // 鼠标键未被键盘回收触碰，仍处于「已转达按下」。
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, true), Some(mouse_btn(MouseButton::Left, false)));
+        // 幂等：再次回收键盘返回空。
+        assert!(gate.release_keys().is_empty());
+    }
+
+    #[test]
+    fn text_is_gated_and_ignores_control_only_text() {
+        assert_eq!(InputGate::text("a", false, 0), None);
+        assert_eq!(
+            InputGate::text("a", true, 0),
+            Some(InputEvent::Key(KeyEvent { code: keycode::TEXT, pressed: true, text: Some("a".to_owned()), modifiers: 0 }))
+        );
+        // 纯控制字符（Enter/Tab 等）已由 Key 事件处理，不重复注入。
+        assert_eq!(InputGate::text("\n", true, 0), None);
+    }
+
+    #[test]
+    fn modifiers_forward_edge_then_release_when_gate_closes() {
+        let mut gate = InputGate::default();
+        // Ctrl 按下边沿 → 转达按下。
+        assert_eq!(
+            gate.modifiers(modifier::CTRL, true),
+            vec![InputEvent::Key(KeyEvent { code: keycode::CTRL, pressed: true, text: None, modifiers: modifier::CTRL })]
+        );
+        // 门控关闭 → 补发 Ctrl 抬起（否则远端残留一个按下的 Ctrl）。
+        assert_eq!(gate.modifiers(modifier::CTRL, false), vec![key_ev(keycode::CTRL, false)]);
+        // 重新放行：基线已同步为 CTRL，不应凭空再产生一次「按下」边沿。
+        assert!(gate.modifiers(modifier::CTRL, true).is_empty());
+        // 真正的抬起边沿照常转达。
+        assert_eq!(gate.modifiers(0, true), vec![key_ev(keycode::CTRL, false)]);
+    }
+
+    #[test]
+    fn modifiers_single_disabled_frame_without_forwarded_modifier_emits_nothing() {
+        let mut gate = InputGate::default();
+        // 从没转达过修饰键按下时，门控关闭不应凭空发抬起。
+        assert!(gate.modifiers(modifier::SHIFT, false).is_empty());
+    }
+
+    // ── InputGate：退出捕获时的清理 ─────────────────────────────────
+
+    #[test]
+    fn reset_clears_state_without_releasing() {
+        let mut gate = InputGate::default();
+        assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
+        assert!(!gate.key(keycode::ENTER, true, true, 0).is_empty());
+        assert!(!gate.modifiers(modifier::CTRL, true).is_empty());
+        // 会话结束 / 切模式：状态清干净，且不补发（会话已不可达）。
+        gate.reset();
+        assert!(gate.release_all().is_empty());
+        // 复位后，未转达过按下的抬起不会被转发（避免凭空发松开）。
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, true), None);
+        assert!(gate.key(keycode::ENTER, false, true, 0).is_empty());
+        assert!(gate.modifiers(0, true).is_empty());
+    }
+
+    #[test]
+    fn release_all_emits_release_for_everything_forwarded_then_empties() {
+        let mut gate = InputGate::default();
+        assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
+        assert!(gate.mouse_button(MouseButton::Middle, true, true).is_some());
+        assert!(!gate.key(keycode::ENTER, true, true, 0).is_empty());
+        assert!(!gate.modifiers(modifier::CTRL, true).is_empty());
+
+        let released = gate.release_all();
+        assert!(released.contains(&mouse_btn(MouseButton::Left, false)));
+        assert!(released.contains(&mouse_btn(MouseButton::Middle, false)));
+        assert!(released.contains(&key_ev(keycode::ENTER, false)));
+        assert!(released.contains(&key_ev(keycode::CTRL, false)));
+        // 第二次调用已无内容可释放。
+        assert!(gate.release_all().is_empty());
+    }
+
+    // ── 键码 / 修饰键映射 ───────────────────────────────────────────
+
+    #[test]
+    fn egui_key_to_code_maps_specials_and_rejects_unknown() {
+        assert_eq!(egui_key_to_code(egui::Key::Enter), Some(keycode::ENTER));
+        assert_eq!(egui_key_to_code(egui::Key::Escape), Some(keycode::ESCAPE));
+        assert_eq!(egui_key_to_code(egui::Key::ArrowUp), Some(keycode::ARROW_UP));
+        assert_eq!(egui_key_to_code(egui::Key::ArrowLeft), Some(keycode::ARROW_LEFT));
+        assert_eq!(egui_key_to_code(egui::Key::F1), Some(keycode::F1));
+        assert_eq!(egui_key_to_code(egui::Key::F12), Some(keycode::F1 + 11));
+        // 普通字符键走 TEXT 路径；未知键返回 None 而不是 panic。
+        assert_eq!(egui_key_to_code(egui::Key::A), None);
+        assert_eq!(egui_key_to_code(egui::Key::Num0), None);
+    }
+
+    #[test]
+    fn code_to_enigo_round_trips_specials_and_f_keys() {
+        assert_eq!(code_to_enigo(keycode::ENTER), Some(enigo::Key::Return));
+        assert_eq!(code_to_enigo(keycode::ESCAPE), Some(enigo::Key::Escape));
+        assert_eq!(code_to_enigo(keycode::CTRL), Some(enigo::Key::Control));
+        assert_eq!(code_to_enigo(keycode::F1), Some(enigo::Key::F1));
+        assert_eq!(code_to_enigo(keycode::F1 + 11), Some(enigo::Key::F12));
+        // 未知码静默忽略（不 panic）。
+        assert_eq!(code_to_enigo(keycode::TEXT), None);
+        assert_eq!(code_to_enigo(keycode::F1 + 12), None);
+        assert_eq!(code_to_enigo(u32::MAX), None);
+    }
+
+    #[test]
+    fn egui_modifiers_sets_each_bit() {
+        assert_eq!(egui_modifiers(egui::Modifiers::NONE), 0);
+        assert_eq!(egui_modifiers(egui::Modifiers::ALT), modifier::ALT);
+        assert_eq!(egui_modifiers(egui::Modifiers::CTRL), modifier::CTRL);
+        assert_eq!(egui_modifiers(egui::Modifiers::SHIFT), modifier::SHIFT);
+        assert_eq!(egui_modifiers(egui::Modifiers::COMMAND), modifier::META);
+        assert_eq!(
+            egui_modifiers(egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::SHIFT),
+            modifier::CTRL | modifier::ALT | modifier::SHIFT
+        );
+    }
+
+    // ── 坐标 / 尺寸换算的边界 ───────────────────────────────────────
+
+    #[test]
+    fn scale_axis_is_bounded_and_never_panics() {
+        // 显示区域宽度为 0（画面还没布局好）→ 0，不做除零。
+        assert_eq!(scale_axis(10.0, 0.0, 1920), 0);
+        assert_eq!(scale_axis(0.0, -5.0, 1920), 0);
+        // 左 / 上溢出被夹到 0；右 / 下溢出被夹到 max。
+        assert_eq!(scale_axis(-100.0, 100.0, 100), 0);
+        assert_eq!(scale_axis(50.0, 100.0, 100), 50);
+        assert_eq!(scale_axis(200.0, 100.0, 100), 100);
+        // 极大 / 极小偏移不 panic、不产生负数或溢出。
+        assert!(scale_axis(f32::MAX, 1.0, u32::MAX) > 0);
+        assert_eq!(scale_axis(f32::MIN, 1.0, u32::MAX), 0);
+    }
+
+    #[test]
+    fn round_i32_handles_extremes() {
+        assert_eq!(round_i32(0.0), 0);
+        assert_eq!(round_i32(1.4), 1);
+        assert_eq!(round_i32(-1.6), -2);
+        // f32 越界 → 饱和到 i32 边界，不 panic、不 wrap。
+        assert_eq!(round_i32(f32::MAX), i32::MAX);
+        assert_eq!(round_i32(f32::MIN), i32::MIN);
+    }
+
+    #[test]
+    fn valid_frame_dims_checks_length_and_nonzero_size() {
+        let frame = DecodedFrame { display: 0, width: 2, height: 2, seq: 0, rgba: vec![0; 16] };
+        assert_eq!(valid_frame_dims(&frame), Some((2, 2)));
+        // 像素数据长度与尺寸不符 → 拒。
+        let short = DecodedFrame { rgba: vec![0; 15], ..frame.clone() };
+        assert_eq!(valid_frame_dims(&short), None);
+        let long = DecodedFrame { rgba: vec![0; 17], ..frame.clone() };
+        assert_eq!(valid_frame_dims(&long), None);
+        // 任一维为 0 → 拒。
+        let zero_w = DecodedFrame { width: 0, height: 2, rgba: Vec::new(), ..frame.clone() };
+        assert_eq!(valid_frame_dims(&zero_w), None);
+        let zero_h = DecodedFrame { width: 2, height: 0, rgba: Vec::new(), ..frame.clone() };
+        assert_eq!(valid_frame_dims(&zero_h), None);
+        // 尺寸乘积溢出 usize → 拒（不 panic）。用 u32::MAX×u32::MAX×4 会溢出。
+        let huge = DecodedFrame { width: u32::MAX, height: u32::MAX, rgba: Vec::new(), ..frame };
+        assert_eq!(valid_frame_dims(&huge), None);
+    }
+
+    // ── RemoteView：会话复位时的剪贴板读取槽清理 ─────────────────────
+
+    /// 会话复位必须清空本机剪贴板读取槽，并作废上一会话在途读取的结果（防跨会话残留）。
+    #[test]
+    fn reset_session_clears_clipboard_read_slot_and_invalidates_in_flight() {
+        let mut view = RemoteView::new();
+        // 上一会话遗留的读取结果：复位后应被清空。
+        let stale_gen = view.clipboard_read_gen;
+        if let Ok(mut guard) = view.clipboard_read.lock() {
+            *guard = Some((stale_gen, Ok("上一会话".to_owned())));
+        }
+        view.reset_session();
+        assert_eq!(view.take_clipboard_read(), None);
+
+        // 在途线程在复位之后才写回旧一代的结果：必须被丢弃，不能流入下一次取回。
+        if let Ok(mut guard) = view.clipboard_read.lock() {
+            *guard = Some((stale_gen, Ok("迟到的上一会话".to_owned())));
+        }
+        assert_eq!(view.take_clipboard_read(), None);
+
+        // 当前一代的结果正常返回。
+        let fresh_gen = view.clipboard_read_gen;
+        if let Ok(mut guard) = view.clipboard_read.lock() {
+            *guard = Some((fresh_gen, Ok("当前会话".to_owned())));
+        }
+        assert_eq!(view.take_clipboard_read(), Some(Ok("当前会话".to_owned())));
+        // 取走即清，第二次取回为空。
+        assert_eq!(view.take_clipboard_read(), None);
+    }
+}

@@ -273,6 +273,69 @@ mod tests {
         assert!(matches!(a.diffie_hellman(&[0u8; 31]), Err(RemoteError::Auth(_))));
     }
 
+    /// 已知的低阶 X25519 公钥（u 坐标）全集。
+    ///
+    /// 取自 libsodium `crypto_scalarmult_curve25519` 的黑名单，与 RFC 7748 §6.1 提到的
+    /// small-order 点一致——`x25519-dalek` 本身**不带**这些测试向量，故在此内置。
+    /// 这些点乘以任何「clamp 后」（8 的倍数）的标量都得到单位元，于是共享秘密恒为全零。
+    fn low_order_public_keys() -> [[u8; 32]; 7] {
+        // p = 2^255 - 19；下面三个是 p-1 / p / p+1 的小端编码（分别对应 -1 / 0 / 1 的非规范编码）。
+        let mut p_minus_1 = [0xFFu8; 32];
+        p_minus_1[0] = 0xEC;
+        p_minus_1[31] = 0x7F;
+        let mut p = [0xFFu8; 32];
+        p[0] = 0xED;
+        p[31] = 0x7F;
+        let mut p_plus_1 = [0xFFu8; 32];
+        p_plus_1[0] = 0xEE;
+        p_plus_1[31] = 0x7F;
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        [
+            // 0（阶 4）
+            [0u8; 32],
+            // 1（阶 1）
+            one,
+            // 325606250916557431795983626356110631294008115727848805560023387167927233504（阶 8）
+            [
+                0xE0, 0xEB, 0x7A, 0x7C, 0x3B, 0x41, 0xB8, 0xAE, 0x16, 0x56, 0xE3, 0xFA, 0xF1, 0x9F, 0xC4, 0x6A,
+                0xDA, 0x09, 0x8D, 0xEB, 0x9C, 0x32, 0xB1, 0xFD, 0x86, 0x62, 0x05, 0x16, 0x5F, 0x49, 0xB8, 0x00,
+            ],
+            // 39382357235489614581723060781553021112529911719440698176882885853963445705823（阶 8）
+            [
+                0x5F, 0x9C, 0x95, 0xBC, 0xA3, 0x50, 0x8C, 0x24, 0xB1, 0xD0, 0xB1, 0x55, 0x9C, 0x83, 0xEF, 0x5B,
+                0x04, 0x44, 0x5C, 0xC4, 0x58, 0x1C, 0x8E, 0x86, 0xD8, 0x22, 0x4E, 0xDD, 0xD0, 0x9F, 0x11, 0x57,
+            ],
+            // p-1（阶 2）
+            p_minus_1,
+            // p（= 0，阶 4）
+            p,
+            // p+1（= 1，阶 1）
+            p_plus_1,
+        ]
+    }
+
+    #[test]
+    fn low_order_public_key_is_rejected() {
+        // 锁的不变量：`diffie_hellman` 必须拒绝**低阶点**（`was_contributory() == false`），
+        // 而不只是长度不对的入参。
+        //
+        // 为什么它此前从未被锁住：`bad_peer_key_is_rejected` 传的是 31 字节，命中的是**长度
+        // 分支**，`was_contributory()` 那条路一次都没被执行过。低阶点会把共享秘密压成全零这个
+        // **已知值**——攻击者无需知道私钥即可预测派生密钥的一部分，是标准卫生必须挡住的一类输入。
+        let a = EphemeralKeyPair::generate();
+        for (idx, pk) in low_order_public_keys().iter().enumerate() {
+            assert_eq!(pk.len(), X25519_PUBLIC_LEN, "候选点必须是 32 字节");
+            assert!(
+                matches!(a.diffie_hellman(pk), Err(RemoteError::Auth(_))),
+                "第 {idx} 个低阶点必须被拒绝：{pk:?}"
+            );
+        }
+        // 对照组：正常随机公钥应被接受——否则上面的「拒绝」可能只是「一律拒绝」的假象。
+        let b = EphemeralKeyPair::generate();
+        assert!(a.diffie_hellman(&b.public_bytes()).is_ok(), "正常随机公钥应被接受");
+    }
+
     #[test]
     fn derived_keys_are_directional() {
         let shared = [7u8; 32];

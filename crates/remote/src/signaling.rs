@@ -203,6 +203,21 @@ impl std::fmt::Debug for RustDeskTransport {
     }
 }
 
+impl Drop for RustDeskTransport {
+    fn drop(&mut self) {
+        // 析构即取消后台登记任务与直连接受任务。
+        //
+        // 为什么必须有：`RustDeskTransport::new` 会 spawn 一个登记任务（UDP 心跳 + 推送处理）和
+        // 一个直连 accept 任务（监听 0.0.0.0:0）。若无人取消它们，`LazyTransport::transport_for`
+        // 在 `rd_id` 变化时重建、或建立阶段被取消而丢弃传输时，旧任务与那个 `TcpListener` 就会
+        // **永久泄漏**——绑定的端口不释放、心跳也一直往外发。
+        //
+        // 这里的 `JoinHandle` 不 join（join 会要求 `Drop` 里阻塞等待，语义也过度），随结构体一起
+        // detach 即可：`cancel` 一 fire，两个任务都在各自的 `select!` 里看到 `cancelled()` 后退出。
+        self.cancel.cancel();
+    }
+}
+
 impl RustDeskTransport {
     /// 构造并启动后台登记/直连监听任务。
     ///
@@ -261,11 +276,6 @@ impl RustDeskTransport {
     #[must_use]
     pub fn direct_addr(&self) -> SocketAddr {
         self.direct_addr
-    }
-
-    /// 关闭后台任务。
-    pub fn shutdown(&self) {
-        self.cancel.cancel();
     }
 
     /// 向 hbbs 发一帧 `RequestRelay`（`id` = 目标端），让服务端把请求推给目标端。

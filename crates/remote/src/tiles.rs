@@ -264,12 +264,36 @@ impl TileDiffer {
     }
 }
 
+/// 整帧声明尺寸的合理性上限（像素，对宽、高各自生效）。
+///
+/// 这不是「能显示多大」的限制，而是给**对端单方声明**的尺寸兜底：`width*height` 常被想当然地
+/// 当成分配依据，放任 `10000x10000` 之类的声明，任何一处「按声明分配整帧缓冲」的代码都会被
+/// 打爆。真实单台显示器最大为 8K（7680x4320），且本工具**一帧只对应一台物理显示器**（多显示器
+/// 各自成帧），因此 16384（≈2 倍 8K 宽、≈4 倍 8K 高）已远超任何真实画面，同时把
+/// `width*height*4` 的最坏情形压在 1 GiB 量级（真正的内存炸弹由 [`TILE_SIZE`] 上限在解码前挡下）。
+pub const MAX_FRAME_DIM: u32 = 16384;
+
 /// 把一组瓦片补丁解码成 [`TileUpdate`]（控制器侧调用）。
 ///
 /// 允许空 `tiles`（无害但无意义，等价于一次空更新）。
 ///
+/// # 为什么校验不能只跟「同一条消息里的声明」比
+///
+/// `width`/`height` 与每个 [`TilePatch`] 的矩形都是**对端（被控端）单方给出**的，同一条消息
+/// 内部一致并不构成任何约束：攻击者可以声明一个 `10000x10000` 的整帧，再附上几块几十 KB 的
+/// 纯色 JPEG（JPEG 对平坦色块压缩率极高，几十 KB 就能编码出上亿像素），让解码后的 RGBA 把
+/// 控制器内存吃爆。所以这里必须用**与声明无关**的规则（[`TILE_SIZE`] 上限、[`TILE_SIZE`] 网格
+/// 对齐、[`MAX_FRAME_DIM`]）在**解码之前**拒掉非法布局，绝不允许「先解出大图再比对尺寸」。
+///
+/// # 定位：纵深防御
+///
+/// 数据面本身已由一次性 token + AEAD 认证（见 `crate::crypto`），真正的对端是已授权的被控端，
+/// 正常路径不会产出这里的任何非法布局。本层不是鉴权边界，而是**纵深防御**：令牌泄漏、被控端
+/// 被攻陷或实现跑飞（bug 产出畸形帧）时，也不该让一条 ≤16 MiB 的消息把控制器打爆。
+///
 /// # Errors
-/// 任一瓦片 JPEG 非法、瓦片尺寸为零、声明尺寸与解码结果不符、或瓦片越出整帧边界时返回
+/// 整帧声明尺寸为零或超过 [`MAX_FRAME_DIM`]、瓦片尺寸为零或超过 [`TILE_SIZE`]、坐标未按
+/// [`TILE_SIZE`] 网格对齐、声明矩形越出整帧边界、JPEG 非法、或声明尺寸与解码结果不符时返回
 /// [`crate::error::RemoteError::Encode`]。
 pub fn decode_tiles(
     display: u32,
@@ -278,15 +302,43 @@ pub fn decode_tiles(
     height: u32,
     tiles: &[TilePatch],
 ) -> RemoteResult<TileUpdate> {
+    // 先校验整帧声明尺寸：它是所有瓦片坐标的参照系，也可能被别处当作分配依据。
+    if width == 0 || height == 0 {
+        return Err(RemoteError::Encode(format!(
+            "整帧尺寸为零：{width}x{height}"
+        )));
+    }
+    if width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+        return Err(RemoteError::Encode(format!(
+            "整帧声明尺寸超出上限：{width}x{height}（上限 {MAX_FRAME_DIM}）"
+        )));
+    }
+
     let mut decoded = Vec::with_capacity(tiles.len());
     for patch in tiles {
-        // 先校验声明矩形（零尺寸、越界），再解码：越界补丁无需浪费一次 JPEG 解码。
+        // 尺寸规则（**解码前**）：瓦片边长不得超过 TILE_SIZE，且坐标必须网格对齐。
+        // 这两条是被控端编码侧的硬不变量（见 `tile_rect`/`TileDiffer::diff`：瓦片从左上角按
+        // TILE_SIZE 步伐铺开，末列/末行的**部分**瓦片只收窄宽高、起点不变），同时把「声明超大
+        // 尺寸」的内存炸弹挡在解码之前——攻击者无需真的构造一张巨图，几个字节的声明就会被拒。
         if patch.width == 0 || patch.height == 0 {
             return Err(RemoteError::Encode(format!(
                 "瓦片尺寸为零：{}x{}",
                 patch.width, patch.height
             )));
         }
+        if patch.width > TILE_SIZE || patch.height > TILE_SIZE {
+            return Err(RemoteError::Encode(format!(
+                "瓦片尺寸超过 TILE_SIZE：{}x{}（上限 {}）",
+                patch.width, patch.height, TILE_SIZE
+            )));
+        }
+        if patch.x % TILE_SIZE != 0 || patch.y % TILE_SIZE != 0 {
+            return Err(RemoteError::Encode(format!(
+                "瓦片坐标未网格对齐：({}, {})（须为 {} 的整数倍）",
+                patch.x, patch.y, TILE_SIZE
+            )));
+        }
+        // 越界校验（声明矩形相对整帧；整帧尺寸本身已在上方校验）。
         let in_bounds = patch
             .x
             .checked_add(patch.width)
@@ -551,17 +603,84 @@ mod tests {
 
     #[test]
     fn decode_tiles_rejects_out_of_bounds_patch() {
+        // x = 128 为网格对齐（128 % 64 == 0），故能越过新的「尺寸/对齐」校验而落在越界分支：
+        // 若沿用旧坐标 x = 100（未对齐）会先被对齐规则拒绝，无法再验证越界语义。
         let patch = TilePatch {
-            x: 100,
+            x: 128,
             y: 0,
             width: 64,
             height: 64,
             jpeg: jpeg_of(64, 64),
         };
-        assert!(
-            matches!(decode_tiles(0, 0, 128, 128, &[patch]), Err(RemoteError::Encode(_))),
-            "越界瓦片应被拒绝"
+        let err = decode_tiles(0, 0, 128, 128, &[patch]).expect_err("越界瓦片应被拒绝");
+        assert!(err.to_string().contains("越界"), "错误应指向越界：{err}");
+    }
+
+    #[test]
+    fn decode_tiles_rejects_oversized_tile_before_decoding() {
+        // 声明 10000x10000 的超大瓦片、坐标网格对齐（0,0）、JPEG 字段给**垃圾字节**。
+        // 若实现是「先解码再比对尺寸」，这里会先因垃圾字节报「JPEG 解码失败」；本用例要求错误
+        // 指向**尺寸规则**，即证明校验发生在解码之前——攻击者无需真的构造一张巨图（几字节的
+        // 声明即可被拒），这正是挡下内存炸弹的关键。
+        let patch = TilePatch {
+            x: 0,
+            y: 0,
+            width: 10_000,
+            height: 10_000,
+            jpeg: b"not a jpeg at all".to_vec(),
+        };
+        let err = decode_tiles(0, 0, 128, 128, &[patch]).expect_err("超大瓦片应被拒绝");
+        let msg = err.to_string();
+        assert!(msg.contains("TILE_SIZE"), "错误应指向瓦片尺寸上限：{msg}");
+        assert!(!msg.contains("JPEG"), "不应走到 JPEG 解码：{msg}");
+    }
+
+    #[test]
+    fn decode_tiles_rejects_unaligned_coordinates() {
+        // 网格对齐是硬不变量：瓦片恒为原生分辨率、与整帧的关键帧网格逐格对应（见模块文档），
+        // 非对齐坐标既无法与控制器已持有的整帧像素对应，也说明对端在伪造布局。
+        let patch = TilePatch {
+            x: 1,
+            y: 0,
+            width: 64,
+            height: 64,
+            jpeg: jpeg_of(64, 64),
+        };
+        let err = decode_tiles(0, 0, 128, 128, &[patch]).expect_err("未对齐坐标应被拒绝");
+        assert!(err.to_string().contains("对齐"), "错误应指向网格对齐：{err}");
+    }
+
+    #[test]
+    fn decode_tiles_accepts_aligned_and_partial_edge_tiles() {
+        // 整帧 100 宽 → 网格 2 列：col0 起点 0、宽 64；col1 起点 64、宽 36（末列部分瓦片）。
+        // 两条都必须通过——这正是编码侧 `tile_rect` 的产出（起点对齐、末列只收窄宽高）。
+        let full = TilePatch {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            jpeg: jpeg_of(64, 64),
+        };
+        let edge = TilePatch {
+            x: 64,
+            y: 0,
+            width: 36,
+            height: 64,
+            jpeg: jpeg_of(36, 64),
+        };
+        let update = decode_tiles(0, 0, 100, 100, &[full, edge]).expect("对齐瓦片与部分边缘瓦片应可解码");
+        assert_eq!(update.tiles.len(), 2);
+        assert_eq!(
+            (update.tiles[0].x, update.tiles[0].width, update.tiles[0].height),
+            (0, 64, 64),
+            "整瓦片尺寸应与声明一致"
         );
+        assert_eq!(
+            (update.tiles[1].x, update.tiles[1].width, update.tiles[1].height),
+            (64, 36, 64),
+            "末列部分瓦片尺寸应与声明一致"
+        );
+        assert_eq!(update.tiles[1].rgba.len(), 36 * 64 * BYTES_PER_PIXEL, "部分瓦片 RGBA 长度应正确");
     }
 
     #[test]

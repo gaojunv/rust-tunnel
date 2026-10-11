@@ -466,7 +466,7 @@ pub fn plan_controller_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen::{MouseButton, KeyEvent};
+    use crate::screen::{FileEntry, KeyEvent, MouseButton, QualityPreset, TilePatch};
 
     fn codec_roundtrip(message: SessionMessage, lane: Lane) -> SessionFrame {
         let mut enc = SessionCodec::new();
@@ -546,6 +546,236 @@ mod tests {
             let got = codec_roundtrip(message.clone(), lane);
             assert_eq!(got.lane, lane, "lane 应保持");
             assert_eq!(got.message, message, "消息应往返一致");
+        }
+    }
+
+    /// 造一个显示器的元信息。
+    fn display(id: u32) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            width: 1280,
+            height: 720,
+            name: format!("d{id}"),
+            primary: id == 0,
+        }
+    }
+
+    /// 造一个目录项。
+    fn entry(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_owned(),
+            path: format!("/{name}"),
+            is_dir: false,
+            size: 4096,
+            modified_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "枚举全部变体平铺成一张表，拆开反而看不出覆盖面"
+    )]
+    fn all_session_variants_roundtrip() {
+        // 锁的不变量：**每一个** `SessionMessage` 变体都能 bincode 编解码往返，且 lane 保持。
+        //
+        // 这是数据面的线上契约：`messages_roundtrip` 只覆盖了约 6 个变体，全部 `File*`、
+        // `VideoTiles`、`SetQuality`、`SelectDisplay`、`Clipboard`、`ClipboardRequest`、
+        // `DisplayList`、`HeartbeatAck` 从未被序列化过。某个变体的字段一旦漂移（改类型、
+        // 调字段序），只有真机联调才会炸——这条用例把契约钉死在单测里。
+        // 每个变体都带上非空与边界内容（空 tiles、空 entries、空 data、空字符串路径）。
+        let cases: Vec<(SessionMessage, Lane)> = vec![
+            (
+                SessionMessage::Hello {
+                    session_id: "s1".into(),
+                    proto_version: SESSION_PROTO_VERSION,
+                    controller_rd_id: "123456789".into(),
+                    nonce: vec![1, 2, 3],
+                    hmac: vec![9; 32],
+                    x25519_pub: vec![7; 32],
+                },
+                Lane::Control,
+            ),
+            (
+                SessionMessage::HelloAck {
+                    accepted: false,
+                    reason: Some("拒绝".into()),
+                    displays: vec![],
+                    x25519_pub: vec![],
+                    hmac_ack: vec![],
+                },
+                Lane::Control,
+            ),
+            (
+                SessionMessage::Video {
+                    display: 0,
+                    width: 640,
+                    height: 480,
+                    seq: 42,
+                    jpeg: vec![0xFF, 0xD8, 0xFF],
+                },
+                Lane::Screen,
+            ),
+            (
+                SessionMessage::VideoTiles {
+                    display: 1,
+                    width: 192,
+                    height: 128,
+                    seq: 7,
+                    tiles: vec![
+                        TilePatch {
+                            x: 0,
+                            y: 0,
+                            width: 64,
+                            height: 64,
+                            jpeg: vec![0xAB; 8],
+                        },
+                        TilePatch {
+                            x: 128,
+                            y: 64,
+                            width: 64,
+                            height: 64,
+                            jpeg: vec![],
+                        },
+                    ],
+                },
+                Lane::Screen,
+            ),
+            // 边界：空瓦片批次（静止画面之外的空更新）。
+            (
+                SessionMessage::VideoTiles {
+                    display: 0,
+                    width: 64,
+                    height: 64,
+                    seq: 0,
+                    tiles: vec![],
+                },
+                Lane::Screen,
+            ),
+            (
+                SessionMessage::Input(InputEvent::MouseMove {
+                    x: -5,
+                    y: 100,
+                    display: 2,
+                }),
+                Lane::Control,
+            ),
+            (
+                SessionMessage::Input(InputEvent::MouseButton {
+                    button: MouseButton::Middle,
+                    pressed: false,
+                }),
+                Lane::Control,
+            ),
+            (
+                SessionMessage::Input(InputEvent::Wheel { dx: -3, dy: 9 }),
+                Lane::Control,
+            ),
+            (
+                SessionMessage::Input(InputEvent::Key(KeyEvent {
+                    code: 27,
+                    pressed: true,
+                    text: None,
+                    modifiers: 0b1010,
+                })),
+                Lane::Control,
+            ),
+            (SessionMessage::SelectDisplay { display: 1 }, Lane::Control),
+            (SessionMessage::SetQuality { preset: QualityPreset::Hd }, Lane::Control),
+            (SessionMessage::Clipboard { text: "剪贴板文本".into() }, Lane::Control),
+            // 边界：空剪贴板文本。
+            (SessionMessage::Clipboard { text: String::new() }, Lane::Control),
+            (SessionMessage::ClipboardRequest, Lane::Control),
+            (SessionMessage::DisplayList(vec![display(0), display(1)]), Lane::Control),
+            // 边界：显示器列表为空（无显示器）。
+            (SessionMessage::DisplayList(vec![]), Lane::Control),
+            (SessionMessage::Heartbeat, Lane::Control),
+            (SessionMessage::HeartbeatAck, Lane::Control),
+            // 边界：空结束原因。
+            (SessionMessage::Bye { reason: String::new() }, Lane::Control),
+            // 边界：根路径（`""` = 共享根）。
+            (SessionMessage::FileListRequest { id: 1, path: String::new() }, Lane::File),
+            (
+                SessionMessage::FileList {
+                    id: 1,
+                    path: "/docs".into(),
+                    entries: vec![entry("a.txt"), entry("b.bin")],
+                },
+                Lane::File,
+            ),
+            // 边界：空目录。
+            (SessionMessage::FileList { id: 2, path: "/empty".into(), entries: vec![] }, Lane::File),
+            (SessionMessage::FileDownloadRequest { id: 3, path: "/a.bin".into() }, Lane::File),
+            // 边界：声明字节数为 u64 上限。
+            (
+                SessionMessage::FileUploadRequest {
+                    id: 4,
+                    path: "/big.bin".into(),
+                    size: u64::MAX,
+                },
+                Lane::File,
+            ),
+            (
+                SessionMessage::FileAccept {
+                    id: 5,
+                    accepted: true,
+                    reason: None,
+                    size: 200 * 1024,
+                },
+                Lane::File,
+            ),
+            (
+                SessionMessage::FileAccept {
+                    id: 6,
+                    accepted: false,
+                    reason: Some("被控端未开启文件共享".into()),
+                    size: 0,
+                },
+                Lane::File,
+            ),
+            (SessionMessage::FileChunk { id: 7, data: vec![0xCD; 4096] }, Lane::File),
+            // 边界：空数据块。
+            (SessionMessage::FileChunk { id: 8, data: vec![] }, Lane::File),
+            (SessionMessage::FileDone { id: 9 }, Lane::File),
+            (SessionMessage::FileError { id: 10, reason: "用户取消".into() }, Lane::File),
+        ];
+        for (message, lane) in cases {
+            let got = codec_roundtrip(message.clone(), lane);
+            assert_eq!(got.lane, lane, "lane 应保持：{message:?}");
+            assert_eq!(got.message, message, "消息应往返一致");
+        }
+    }
+
+    #[test]
+    fn unknown_session_variant_is_rejected() {
+        // 锁的不变量：数据面收到**未知的 `SessionMessage` 判别式**（lane 合法、长度合法、
+        // 但枚举序号越界）必须报错，既不能静默接受也不能 panic。
+        //
+        // 这是数据面的「版本门控等价物」：控制通道有 `client_supports_remote` 挡住老客户端，
+        // 数据面没有——版本漂移最可能的表现就是发来一个本端不认识的新变体，必须干净地拒绝。
+        // bincode 1.3 默认 fixint 编码：枚举判别式是 u32 小端（见 `bincode::serialize` 的
+        // `DefaultOptions::new().with_fixint_encoding()`），故越界值用 u32 构造。
+        let mut dec = SessionCodec::new();
+        let mut buf = BytesMut::new();
+        let payload = u32::MAX.to_le_bytes();
+        // 长度 = 1 字节 lane + 载荷长度。
+        buf.put_u32(u32::try_from(1 + payload.len()).unwrap());
+        buf.put_u8(Lane::Control.as_u8());
+        buf.put_slice(&payload);
+        assert!(dec.decode(&mut buf).is_err(), "越界的枚举判别式必须被拒绝");
+    }
+
+    #[test]
+    fn short_length_prefix_awaits_more_data() {
+        // 锁的不变量：长度前缀不足 4 字节时必须返回 `Ok(None)`（半包，等待更多数据），
+        // 而不是报错或 panic——读循环据此保留缓冲、下次读齐了再解。
+        for n in 0..LENGTH_PREFIX {
+            let mut dec = SessionCodec::new();
+            let mut buf = BytesMut::from(&vec![0u8; n][..]);
+            assert!(
+                dec.decode(&mut buf).unwrap().is_none(),
+                "长度前缀只有 {n} 字节时应为半包（Ok(None)）"
+            );
         }
     }
 

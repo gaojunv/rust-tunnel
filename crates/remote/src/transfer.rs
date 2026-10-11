@@ -167,6 +167,24 @@ struct Incoming {
     local_path: PathBuf,
 }
 
+/// 本端已发出 `FileUploadRequest`、正在等 `FileAccept` 的一次上传。
+struct PendingUpload {
+    /// 请求 ID（`FileAccept` 必须回同一个才认）。
+    id: u64,
+    /// 本地源文件（受理之后才打开句柄）。
+    local: PathBuf,
+    /// 远端虚拟目标路径（含文件名）。
+    remote: String,
+}
+
+/// 本端已发出 `FileDownloadRequest`、正在等 `FileAccept` 的一次下载。
+struct PendingDownload {
+    /// 请求 ID（`FileAccept` 必须回同一个才认）。
+    id: u64,
+    /// 远端文件名（落地时的默认名）。
+    name: String,
+}
+
 /// 文件传输状态机。
 pub struct TransferHub {
     /// 本端作为被控端时的共享目录服务；`None` 表示本端不提供文件服务。
@@ -179,10 +197,13 @@ pub struct TransferHub {
     outgoing: Option<Outgoing>,
     /// 在途入站传输。
     incoming: Option<Incoming>,
-    /// 已发出 `FileUploadRequest`、正在等 `FileAccept` 的本地源（路径, 远端路径）。
-    pending_upload: Option<(PathBuf, String)>,
-    /// 已发出 `FileDownloadRequest`、正在等 `FileAccept` 的远端文件名。
-    pending_download: Option<String>,
+    /// 已发出 `FileUploadRequest`、正在等 `FileAccept` 的上传。
+    ///
+    /// 槽位里**带着请求 id**：`FileAccept` 只有与它匹配时才允许开本地文件，否则被当成
+    /// 未经请求/陈旧/重复的受理拒掉（见 [`TransferHub::on_accept`]）。
+    pending_upload: Option<PendingUpload>,
+    /// 已发出 `FileDownloadRequest`、正在等 `FileAccept` 的下载（同样带着请求 id）。
+    pending_download: Option<PendingDownload>,
     /// 下一个传输/请求 ID。
     next_id: u64,
 }
@@ -270,8 +291,11 @@ impl TransferHub {
                     .filter(|n| !n.is_empty())
                     .unwrap_or("download")
                     .to_owned();
-                self.pending_download = Some(name);
+                // 请求与待决槽位共用同一个 id：**发起时就分配并记进槽位**，`FileAccept` 回来
+                // 时才有东西可对（旧槽位只存文件名/路径、不存 id，于是无从判断受理是不是自己发的，
+                // 任何受理都被当成这一次的）。
                 let id = self.alloc_id();
+                self.pending_download = Some(PendingDownload { id, name });
                 Ok(Some(SessionMessage::FileDownloadRequest { id, path }))
             }
             TransferCommand::Upload { local, remote } => {
@@ -283,9 +307,13 @@ impl TransferHub {
                 if size > MAX_TRANSFER_BYTES {
                     return Err(RemoteError::Platform(format!("文件过大（{size} 字节）")));
                 }
-                // 记住本地源，等 `FileAccept` 到了再开句柄（被拒就不必开）。
-                self.pending_upload = Some((local, remote.clone()));
+                // 记住本地源与请求 id，等 `FileAccept` 回来且 id 匹配了再开句柄（被拒就不必开）。
                 let id = self.alloc_id();
+                self.pending_upload = Some(PendingUpload {
+                    id,
+                    local,
+                    remote: remote.clone(),
+                });
                 Ok(Some(SessionMessage::FileUploadRequest { id, path: remote, size }))
             }
             TransferCommand::Cancel { id } => {
@@ -330,13 +358,13 @@ impl TransferHub {
                 accepted,
                 reason,
                 size,
-            } => self.on_accept(id, accepted, reason, size).await?,
+            } => self.on_accept(id, accepted, reason, size, &mut out).await?,
             SessionMessage::FileChunk { id, data } => self.on_chunk(id, data, &mut out).await?,
             SessionMessage::FileDone { id } => self.on_done(id).await?,
             SessionMessage::FileError { id, reason } => {
+                // `abort_transfer` 现在会连 id 匹配的待决槽位一起撤掉，所以这里不再无差别地
+                // 清空两个待决槽位——否则一个无关 id 的错误会把正当等待中的请求也抹掉。
                 self.abort_transfer(id);
-                self.pending_upload = None;
-                self.pending_download = None;
                 self.emit(TransferEvent::Failed { id, reason });
             }
             _ => {}
@@ -425,26 +453,42 @@ impl TransferHub {
     }
 
     /// `FileAccept`：受理则按方向开本地源（上传）或落地文件（下载），拒绝则报失败。
+    ///
+    /// **受理只有在 id 与某个待决槽位匹配时才生效**：无待决请求、陈旧 id 或重复受理一律
+    /// **不开本地文件**，只回一条 `FileError` 告知对端「这次受理没有对应请求」。否则已授权的
+    /// 对端只要主动发一个 `accepted:true` + 一串 `FileChunk`，就能在本机凭空创建文件并写到
+    /// [`MAX_TRANSFER_BYTES`]，用户全程无从取消。
     async fn on_accept(
         &mut self,
         id: u64,
         accepted: bool,
         reason: Option<String>,
         size: u64,
+        out: &mut Vec<SessionMessage>,
     ) -> RemoteResult<()> {
         if !accepted {
-            self.pending_upload = None;
-            self.pending_download = None;
+            // 拒绝：只撤掉 id 匹配的那一个待决槽位，另一个（若有）必须原样留着。
+            if self.pending_upload.as_ref().is_some_and(|p| p.id == id) {
+                self.pending_upload = None;
+            }
+            if self.pending_download.as_ref().is_some_and(|p| p.id == id) {
+                self.pending_download = None;
+            }
             self.emit(TransferEvent::Failed {
                 id,
                 reason: reason.unwrap_or_else(|| "对端拒绝".to_owned()),
             });
             return Ok(());
         }
-        if let Some((local, remote)) = self.pending_upload.take() {
+        if let Some(pending) = self.pending_upload.take_if(|p| p.id == id) {
             // 我们在上传：开本地源，开始推块。
-            let file = tokio::fs::File::open(&local).await?;
-            let name = remote.rsplit('/').next().unwrap_or(remote.as_str()).to_owned();
+            let file = tokio::fs::File::open(&pending.local).await?;
+            let name = pending
+                .remote
+                .rsplit('/')
+                .next()
+                .unwrap_or(pending.remote.as_str())
+                .to_owned();
             self.emit(TransferEvent::Started(TransferProgress {
                 id,
                 name: name.clone(),
@@ -459,14 +503,13 @@ impl TransferHub {
                 done: 0,
                 total: size,
             });
-        } else {
+        } else if let Some(pending) = self.pending_download.take_if(|p| p.id == id) {
             // 我们在下载：落地到本端目录，开始收块。
-            let name = self.pending_download.take().unwrap_or_else(|| format!("file-{id}"));
-            let dest = unique_path(&self.local_root, &name).await;
+            let dest = unique_path(&self.local_root, &pending.name).await;
             let file = tokio::fs::File::create(&dest).await?;
             self.emit(TransferEvent::Started(TransferProgress {
                 id,
-                name: name.clone(),
+                name: pending.name.clone(),
                 direction: TransferDirection::Download,
                 done: 0,
                 total: size,
@@ -477,6 +520,12 @@ impl TransferHub {
                 done: 0,
                 total: size,
                 local_path: dest,
+            });
+        } else {
+            // 没有任何待决槽位匹配这个 id：未经请求的受理、陈旧 id 或重复受理。
+            out.push(SessionMessage::FileError {
+                id,
+                reason: "未经请求的受理或受理 id 不匹配".to_owned(),
             });
         }
         Ok(())
@@ -563,6 +612,11 @@ impl TransferHub {
     }
 
     /// 中断一次传输（只清本地状态；调用方决定要不要发 `FileError`）。
+    ///
+    /// **必须连 id 匹配的待决请求一起撤销**：用户在 `FileAccept` 回来之前取消时，若不把槽位
+    /// 清掉，晚到的 `FileAccept{accepted:true}` 会命中同一个 id，把已经取消的传输重新拉起来
+    /// （用户取消被无视）；而若 accept 永远不回来，陈旧的槽位又会让后续所有传输一直报
+    /// 「已有进行中的传输」。
     pub fn abort_transfer(&mut self, id: u64) {
         if self.outgoing.as_ref().is_some_and(|o| o.id == id) {
             self.outgoing = None;
@@ -570,12 +624,24 @@ impl TransferHub {
         if self.incoming.as_ref().is_some_and(|i| i.id == id) {
             self.incoming = None;
         }
+        if self.pending_upload.as_ref().is_some_and(|p| p.id == id) {
+            self.pending_upload = None;
+        }
+        if self.pending_download.as_ref().is_some_and(|p| p.id == id) {
+            self.pending_download = None;
+        }
     }
 
-    /// 会话结束时清空所有在途传输。
-    pub fn abort_all(&mut self, reason: &str) {
+    /// 会话内所有在途传输作废；返回需要回发给对端的 `FileError`（每个被中断的传输一条），
+    /// 调用方负责写出。**必须回发**：发送方读文件失败时若不通知对端，对端会一直挂在半途。
+    pub fn abort_all(&mut self, reason: &str) -> Vec<SessionMessage> {
+        let mut out = Vec::new();
         if let Some(outgoing) = self.outgoing.take() {
             self.emit(TransferEvent::Failed {
+                id: outgoing.id,
+                reason: reason.to_owned(),
+            });
+            out.push(SessionMessage::FileError {
                 id: outgoing.id,
                 reason: reason.to_owned(),
             });
@@ -585,9 +651,15 @@ impl TransferHub {
                 id: incoming.id,
                 reason: reason.to_owned(),
             });
+            out.push(SessionMessage::FileError {
+                id: incoming.id,
+                reason: reason.to_owned(),
+            });
         }
+        // 待决请求还没进入在途，对端没有数据面需要收尾，只清本地槽位（与旧行为一致）。
         self.pending_upload = None;
         self.pending_download = None;
+        out
     }
 }
 
@@ -629,4 +701,460 @@ async fn unique_path(dir: &Path, name: &str) -> PathBuf {
     }
     // 兜底：加一个几乎不可能冲突的后缀。
     dir.join(format!("{stem}-{}{ext}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 带自清理的临时根目录（不引入 `tempfile` 依赖）；名字带进程 id + 原子序号，并发测试互不踩。
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("rt-remote-xfer-{}-{tag}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn service(&self) -> Arc<FileService> {
+            Arc::new(FileService::new(self.0.clone()))
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn hub(
+        service: Option<Arc<FileService>>,
+        local_root: PathBuf,
+    ) -> (TransferHub, mpsc::UnboundedReceiver<TransferEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (TransferHub::new(service, local_root, tx), rx)
+    }
+
+    /// 排空事件通道。
+    fn drain(rx: &mut mpsc::UnboundedReceiver<TransferEvent>) -> Vec<TransferEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    /// 从回发消息里挑出 `accepted:true` 的 `FileAccept`，返回它声明的字节数。
+    fn expect_accept(replies: &[SessionMessage]) -> u64 {
+        replies
+            .iter()
+            .find_map(|m| match m {
+                SessionMessage::FileAccept {
+                    accepted: true, size, ..
+                } => Some(*size),
+                _ => None,
+            })
+            .expect("回发消息里应有 accepted:true 的 FileAccept")
+    }
+
+    /// 回发消息里是否有指向 `id` 的 `FileError`。
+    fn has_file_error(msgs: &[SessionMessage], id: u64) -> bool {
+        msgs.iter()
+            .any(|m| matches!(m, SessionMessage::FileError { id: mid, .. } if *mid == id))
+    }
+
+    /// 造一段可复现的伪随机字节（仅用于内容比对）。
+    fn pseudo_bytes(len: usize) -> Vec<u8> {
+        let mut x: u32 = 0x1234_5678;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push(u8::try_from(x >> 24).unwrap_or(0));
+        }
+        out
+    }
+
+    /// 起一次下载请求，取出它分配的 id。
+    async fn start_download(hub: &mut TransferHub, path: &str) -> u64 {
+        let req = hub
+            .on_command(TransferCommand::Download { path: path.to_owned() })
+            .await
+            .unwrap()
+            .expect("下载应发出请求");
+        match req {
+            SessionMessage::FileDownloadRequest { id, .. } => id,
+            other => panic!("应为 FileDownloadRequest，实得 {other:?}"),
+        }
+    }
+
+    /// 用户取消必须连待决请求一起撤销：晚到的 `FileAccept{accepted:true}` 不得把已取消的传输拉起来。
+    #[tokio::test]
+    async fn cancel_during_pending_voids_late_accept() {
+        let local = TempRoot::new("cancel-pending");
+        let (mut ctrl, _rx) = hub(None, local.0.clone());
+        let id = start_download(&mut ctrl, "/a.txt").await;
+        assert!(ctrl.pending_download.is_some(), "发起后应有待决槽位");
+
+        let cancel = ctrl
+            .on_command(TransferCommand::Cancel { id })
+            .await
+            .unwrap()
+            .expect("取消应回一条 FileError");
+        assert!(matches!(cancel, SessionMessage::FileError { id: cid, .. } if cid == id));
+        assert!(ctrl.pending_download.is_none(), "取消应清掉待决槽位");
+
+        // 晚到的受理：id 还在，但待决槽位已撤销 → 不得开传输、不得落盘。
+        let out = ctrl
+            .on_message(SessionMessage::FileAccept {
+                id,
+                accepted: true,
+                reason: None,
+                size: 10,
+            })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, id), "对晚到的受理应回 FileError");
+        assert!(ctrl.incoming.is_none(), "不得进入收块状态");
+        assert!(ctrl.is_idle(), "取消后应完全空闲");
+        assert!(!local.0.join("a.txt").exists(), "取消后不得创建目标文件");
+    }
+
+    /// 未被请求的受理（含重复受理）不得落盘，且要回 `FileError`。
+    #[tokio::test]
+    async fn unrequested_and_duplicate_accept_are_rejected() {
+        let local = TempRoot::new("unrequested-accept");
+        let (mut ctrl, _rx) = hub(None, local.0.clone());
+
+        // 无任何待决请求时的受理。
+        let out = ctrl
+            .on_message(SessionMessage::FileAccept {
+                id: 999,
+                accepted: true,
+                reason: None,
+                size: 5,
+            })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, 999), "未经请求的受理应回 FileError");
+        assert!(ctrl.incoming.is_none(), "不得进入收块状态");
+
+        // 正常发起并受理一次。
+        let id = start_download(&mut ctrl, "/x.bin").await;
+        let out = ctrl
+            .on_message(SessionMessage::FileAccept {
+                id,
+                accepted: true,
+                reason: None,
+                size: 5,
+            })
+            .await
+            .unwrap();
+        assert!(out.is_empty(), "正常受理无需回包");
+        assert!(ctrl.incoming.is_some(), "受理后应进入收块状态");
+        assert!(local.0.join("x.bin").exists(), "受理后应落地文件");
+
+        // 同一 id 再来一次（重复受理）：回 FileError，且不产生第二个文件。
+        let out = ctrl
+            .on_message(SessionMessage::FileAccept {
+                id,
+                accepted: true,
+                reason: None,
+                size: 5,
+            })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, id), "重复受理应回 FileError");
+        let files: Vec<_> = std::fs::read_dir(&local.0).unwrap().collect();
+        assert_eq!(files.len(), 1, "重复受理不得创建第二个文件");
+    }
+
+    /// `accepted:false` 只清 id 匹配的那一个待决槽位。
+    #[tokio::test]
+    async fn rejection_only_clears_matching_pending() {
+        let local = TempRoot::new("reject-match");
+        let (mut ctrl, mut rx) = hub(None, local.0.clone());
+        ctrl.pending_upload = Some(PendingUpload {
+            id: 7,
+            local: local.0.join("src"),
+            remote: "/r".to_owned(),
+        });
+        ctrl.pending_download = Some(PendingDownload {
+            id: 8,
+            name: "n".to_owned(),
+        });
+
+        let _ = ctrl
+            .on_message(SessionMessage::FileAccept {
+                id: 7,
+                accepted: false,
+                reason: Some("拒绝".to_owned()),
+                size: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(ctrl.pending_upload.is_none(), "id 匹配的待决槽位应被清掉");
+        assert!(ctrl.pending_download.is_some(), "另一个待决槽位必须原样保留");
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, TransferEvent::Failed { id: 7, .. })));
+    }
+
+    /// 无对应 `incoming` 的数据块被拒。
+    #[tokio::test]
+    async fn chunk_without_incoming_is_rejected() {
+        let local = TempRoot::new("chunk-orphan");
+        let (mut ctrl, _rx) = hub(None, local.0.clone());
+        let out = ctrl
+            .on_message(SessionMessage::FileChunk { id: 1, data: vec![0; 4] })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, 1));
+    }
+
+    /// id 不匹配的数据块被拒，且不影响在途的 `incoming`。
+    #[tokio::test]
+    async fn chunk_id_mismatch_is_rejected() {
+        let local = TempRoot::new("chunk-mismatch");
+        let (mut ctrl, _rx) = hub(None, local.0.clone());
+        let path = local.0.join("in.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        ctrl.incoming = Some(Incoming {
+            id: 5,
+            file,
+            done: 0,
+            total: 100,
+            local_path: path,
+        });
+
+        let out = ctrl
+            .on_message(SessionMessage::FileChunk { id: 6, data: vec![0; 4] })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, 6));
+        assert!(ctrl.incoming.is_some(), "不匹配的块不得殃及在途传输");
+    }
+
+    /// 长度溢出与超过 `MAX_TRANSFER_BYTES` 都回 `FileError` 并中断该次传输。
+    #[tokio::test]
+    async fn chunk_overflow_and_over_cap_abort() {
+        let local = TempRoot::new("chunk-limit");
+        let (mut ctrl, _rx) = hub(None, local.0.clone());
+
+        let overflow = local.0.join("overflow.bin");
+        let file = tokio::fs::File::create(&overflow).await.unwrap();
+        ctrl.incoming = Some(Incoming {
+            id: 1,
+            file,
+            done: u64::MAX - 1,
+            total: 0,
+            local_path: overflow,
+        });
+        let out = ctrl
+            .on_message(SessionMessage::FileChunk { id: 1, data: vec![0; 4] })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, 1), "溢出应回 FileError");
+        assert!(ctrl.incoming.is_none(), "溢出应中断该次传输");
+
+        let capped = local.0.join("capped.bin");
+        let file = tokio::fs::File::create(&capped).await.unwrap();
+        ctrl.incoming = Some(Incoming {
+            id: 2,
+            file,
+            done: MAX_TRANSFER_BYTES,
+            total: 0,
+            local_path: capped,
+        });
+        let out = ctrl
+            .on_message(SessionMessage::FileChunk { id: 2, data: vec![0; 1] })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, 2), "超上限应回 FileError");
+        assert!(ctrl.incoming.is_none(), "超上限应中断该次传输");
+    }
+
+    /// `abort_all` 对 outgoing / incoming 各回一条 `FileError` 并清空状态，本地 `Failed` 照发。
+    #[tokio::test]
+    async fn abort_all_reports_and_clears() {
+        let local = TempRoot::new("abort-all");
+        let (mut ctrl, mut rx) = hub(None, local.0.clone());
+        let src = tokio::fs::File::create(local.0.join("out.bin")).await.unwrap();
+        ctrl.outgoing = Some(Outgoing {
+            id: 11,
+            name: "out.bin".to_owned(),
+            file: src,
+            done: 0,
+            total: 0,
+        });
+        let dst = tokio::fs::File::create(local.0.join("in.bin")).await.unwrap();
+        ctrl.incoming = Some(Incoming {
+            id: 12,
+            file: dst,
+            done: 0,
+            total: 0,
+            local_path: local.0.join("in.bin"),
+        });
+
+        let msgs = ctrl.abort_all("坏了");
+        assert_eq!(msgs.len(), 2, "每个被中断的传输一条 FileError");
+        assert!(has_file_error(&msgs, 11));
+        assert!(has_file_error(&msgs, 12));
+        assert!(ctrl.outgoing.is_none() && ctrl.incoming.is_none(), "状态应清空");
+
+        let events = drain(&mut rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, TransferEvent::Failed { id: 11, .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, TransferEvent::Failed { id: 12, .. })));
+    }
+
+    /// 已有在途/待决传输时，新的上传/下载被拒（报事件、不发请求）。
+    #[tokio::test]
+    async fn busy_rejects_second_transfer() {
+        let local = TempRoot::new("busy");
+        let (mut ctrl, mut rx) = hub(None, local.0.clone());
+        let _ = start_download(&mut ctrl, "/first.bin").await;
+
+        let second = ctrl
+            .on_command(TransferCommand::Download {
+                path: "/second.bin".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(second.is_none(), "第二个下载不得发出请求");
+        let src = local.0.join("local.bin");
+        std::fs::write(&src, b"x").unwrap();
+        let up = ctrl
+            .on_command(TransferCommand::Upload {
+                local: src.clone(),
+                remote: "/u.bin".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(up.is_none(), "待决期间的上传不得发出请求");
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, TransferEvent::Failed { id: 0, .. })));
+    }
+
+    /// 上传源超过上限被拒（发起阶段就挡下）。
+    #[tokio::test]
+    async fn upload_over_cap_is_rejected() {
+        let local = TempRoot::new("upload-cap");
+        let (mut ctrl, _rx) = hub(None, local.0.clone());
+        let big = local.0.join("big.bin");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_TRANSFER_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = ctrl
+            .on_command(TransferCommand::Upload {
+                local: big,
+                remote: "/big.bin".to_owned(),
+            })
+            .await;
+        assert!(matches!(err, Err(RemoteError::Platform(_))), "超上限应报错");
+    }
+
+    /// `unique_path`：同名时依次 `name (1)`、`name (2)`，无扩展名也成立。
+    #[tokio::test]
+    async fn unique_path_avoids_conflicts() {
+        let local = TempRoot::new("unique-path");
+        std::fs::write(local.0.join("a.txt"), b"x").unwrap();
+        assert_eq!(unique_path(&local.0, "a.txt").await, local.0.join("a (1).txt"));
+        std::fs::write(local.0.join("a (1).txt"), b"x").unwrap();
+        assert_eq!(unique_path(&local.0, "a.txt").await, local.0.join("a (2).txt"));
+        assert_eq!(unique_path(&local.0, "b.txt").await, local.0.join("b.txt"));
+        std::fs::write(local.0.join("noext"), b"x").unwrap();
+        assert_eq!(unique_path(&local.0, "noext").await, local.0.join("noext (1)"));
+    }
+
+    /// 下载 happy path：请求 → 受理 → 推块 → 完成，两端状态机经消息来回即可跑通。
+    #[tokio::test]
+    async fn download_happy_path() {
+        let share = TempRoot::new("dl-share");
+        let dest = TempRoot::new("dl-dest");
+        let payload = pseudo_bytes(150 * 1024);
+        std::fs::write(share.0.join("source.bin"), &payload).unwrap();
+
+        let (mut ctld, _ctld_rx) = hub(Some(share.service()), share.0.clone());
+        let (mut ctrl, _ctrl_rx) = hub(None, dest.0.clone());
+
+        let id = start_download(&mut ctrl, "/source.bin").await;
+        let req = SessionMessage::FileDownloadRequest {
+            id,
+            path: "/source.bin".to_owned(),
+        };
+
+        let replies = ctld.on_message(req).await.unwrap();
+        let size = expect_accept(&replies);
+        assert_eq!(size, payload.len() as u64, "被控端应回报真实大小");
+        ctrl.on_message(accept(id, size)).await.unwrap();
+        assert!(ctrl.incoming.is_some(), "受理后控制器应进入收块状态");
+
+        loop {
+            let msg = ctld.next_outbound().await.unwrap().expect("应有出站消息");
+            let done = matches!(msg, SessionMessage::FileDone { .. });
+            ctrl.on_message(msg).await.unwrap();
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(std::fs::read(dest.0.join("source.bin")).unwrap(), payload);
+        assert!(ctrl.incoming.is_none(), "完成后应清空入站状态");
+    }
+
+    /// 上传 happy path：请求 → 受理 → 推块 → 完成，内容与源一致。
+    #[tokio::test]
+    async fn upload_happy_path() {
+        let dest = TempRoot::new("ul-dest");
+        let share = TempRoot::new("ul-share");
+        let payload = pseudo_bytes(150 * 1024);
+        let local = dest.0.join("upload-src.bin");
+        std::fs::write(&local, &payload).unwrap();
+
+        let (mut ctld, _ctld_rx) = hub(Some(share.service()), share.0.clone());
+        let (mut ctrl, _ctrl_rx) = hub(None, dest.0.clone());
+
+        let req = ctrl
+            .on_command(TransferCommand::Upload {
+                local,
+                remote: "/up.bin".to_owned(),
+            })
+            .await
+            .unwrap()
+            .expect("上传应发出请求");
+        let id = match req {
+            SessionMessage::FileUploadRequest { id, .. } => id,
+            other => panic!("应为 FileUploadRequest，实得 {other:?}"),
+        };
+
+        let replies = ctld.on_message(req).await.unwrap();
+        let size = expect_accept(&replies);
+        assert_eq!(size, payload.len() as u64);
+        ctrl.on_message(accept(id, size)).await.unwrap();
+        assert!(ctrl.outgoing.is_some(), "受理后控制器应开始推块");
+
+        loop {
+            let msg = ctrl.next_outbound().await.unwrap().expect("应有出站消息");
+            let done = matches!(msg, SessionMessage::FileDone { .. });
+            ctld.on_message(msg).await.unwrap();
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(std::fs::read(share.0.join("up.bin")).unwrap(), payload);
+        assert!(ctrl.outgoing.is_none(), "完成后应清空出站状态");
+    }
 }

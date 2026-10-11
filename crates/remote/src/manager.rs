@@ -30,7 +30,7 @@
 use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
 use crate::auth::{PendingSession, PendingSessions};
 use crate::controller::{run_controller, ControllerCommand, ControllerConfig};
-use crate::controlled::{run_controlled, ControlledConfig};
+use crate::controlled::{run_controlled, ControlledConfig, CAPTURE_WATCHDOG};
 use crate::error::{RemoteError, RemoteResult};
 use crate::file::FileService;
 use crate::screen::{
@@ -38,18 +38,32 @@ use crate::screen::{
 };
 use crate::session::plan_controller_handshake;
 use crate::transfer::{TransferCommand, TransferEvent, TransferHub, TransferProgress};
-use crate::transport::{EstablishRequest, Role, TransportEstablisher};
+use crate::transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams, RemotePeerInfo};
 use rust_tunnel_common::remote_bridge::RemoteBridge;
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 /// 会话命令队列容量。
 const COMMAND_CAPACITY: usize = 256;
+
+/// 建立数据面的整体超时兜底。
+///
+/// 覆盖最慢的合法路径：被控端要等中继推送 `RELAY_WAIT`（25s，见 [`crate::signaling`]），
+/// 控制器要先试 `DIRECT_SIGNAL_TIMEOUT`（2s）再走中继，hbbr 的配对窗口是 30s。取 45s 留足余量。
+///
+/// # 为什么必须有兜底
+///
+/// DNS 慢 / 连接挂住 / 信令卡住时 `establish` 可能长时间不返回；没有兜底，UI 会永久停在
+/// 「连接中」，会话任务与 `pending_grant`/`active` 一起泄漏。**取消才是主要退出路径**（用户点
+/// 「中断」必须立刻生效），本超时只是最后一道保险。
+const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// 本端在会话中的角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,8 +177,15 @@ pub struct RemoteManagerConfig {
 struct ActiveHandle {
     /// 会话 ID。
     session_id: String,
+    /// 本端角色（关闭被控开关时据此判断是否该中断）。
+    role: SessionRole,
     /// 中断信号。
     cancel: CancellationToken,
+    /// 数据面是否**已建立**（`establish` 返回后才置位，见 [`RemoteManager::mark_active`]）。
+    ///
+    /// 用来区分「已跑起来的会话」与「刚受理、还在协商的占位会话」：针对**未签发**会话的空
+    /// `session_id` 拒绝只该清掉后者，不该顺手掐断前者（见 `deny_unissued_request`）。
+    established: bool,
 }
 
 /// 被控端当前待用户确认的接入请求（内部）。
@@ -224,6 +245,8 @@ struct Inner {
     approval_timeout: Duration,
     /// 控制器等待确认的时限（默认 [`APPROVAL_WAIT_TIMEOUT`]，测试可注入）。
     approval_wait_timeout: Duration,
+    /// 建立数据面的整体超时（默认 [`ESTABLISH_TIMEOUT`]，测试可注入）。
+    establish_timeout: Duration,
 }
 
 /// 已安装的平台实现。
@@ -248,6 +271,14 @@ pub struct RemoteManager {
     cfg: RemoteManagerConfig,
     /// 控制通道上行发送端。
     upstream: Mutex<Option<mpsc::Sender<ControlMessage>>>,
+    /// 出站泵的唤醒句柄。`Some` = 已启动常驻泵（构造时有 Tokio 运行时）；`None` = 无运行时
+    /// （仅少数同步单测），此时退回 [`Self::send_direct`] 的直接投递。
+    out_pump: Option<Arc<Notify>>,
+    /// 出站积压队列：**仅当**控制通道瞬时打满时才有内容（无上限）。由 [`Self::send`] 入队、
+    /// [`pump_outbound`] 清空；乱序防御见 [`Self::send`] 的说明。
+    out_backlog: Mutex<VecDeque<ControlMessage>>,
+    /// 是否有一条积压消息正在被转发。为 `true` 时 [`Self::send`] 不再走同步快路径，保证 FIFO。
+    out_inflight: AtomicBool,
     /// UI 状态广播端。
     ui_tx: watch::Sender<RemoteUiState>,
     /// 内部状态。
@@ -297,14 +328,22 @@ impl RemoteManager {
             service: Arc::new(FileService::new(path.clone())),
             path,
         });
-        Arc::new_cyclic(|weak| Self {
+        // 出站泵：构造时常驻（见 `pump_outbound`）。无运行时上下文时不启用，退回直接投递。
+        let rt = tokio::runtime::Handle::try_current().ok();
+        let out_pump = rt.as_ref().map(|_| Arc::new(Notify::new()));
+        let rt_field = rt.clone();
+        let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
+            out_pump,
+            out_backlog: Mutex::new(VecDeque::new()),
+            out_inflight: AtomicBool::new(false),
             ui_tx,
             inner: Mutex::new(Inner {
                 pending: Arc::new(PendingSessions::new()),
                 approval_timeout: APPROVAL_TIMEOUT,
                 approval_wait_timeout: APPROVAL_WAIT_TIMEOUT,
+                establish_timeout: ESTABLISH_TIMEOUT,
                 ..Inner::default()
             }),
             platform: RwLock::new(None),
@@ -313,8 +352,13 @@ impl RemoteManager {
             clipboard: RwLock::new(None),
             share,
             self_weak: weak.clone(),
-            rt: tokio::runtime::Handle::try_current().ok(),
-        })
+            rt: rt_field,
+        });
+        // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
+        if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
+            rt.spawn(pump_outbound(Arc::downgrade(&mgr), notify));
+        }
+        mgr
     }
 
     /// 本端共享目录路径（未配置时 `None`）。
@@ -355,7 +399,10 @@ impl RemoteManager {
         });
     }
 
-    /// 设置是否允许被远程控制；变化时上报 `RemoteAnnounce`。关闭时中断在途会话。
+    /// 设置是否允许被远程控制；变化时上报 `RemoteAnnounce`。
+    ///
+    /// 关闭时只中断**本机作为被控端**的会话与待确认请求（见 [`Self::abort_controlled_session`]）；
+    /// 本机正在控制别人的出站会话不受影响——开关语义是「**允许被**远程控制」，不是「允许发起」。
     pub fn set_enabled(&self, on: bool) {
         self.update_ui(|s| s.enabled = on);
         self.announce();
@@ -363,28 +410,57 @@ impl RemoteManager {
             // 刚打开开关：补一次预登记，别等到第一个会话才登记（见 `TransportEstablisher::prepare`）。
             self.prewarm();
         } else {
-            self.abort_active();
+            self.abort_controlled_session();
         }
     }
 
-    /// 一键中断当前会话（UI 中断按钮）。若正有接入请求待确认，也一并拒绝。
+    /// 一键中断当前会话（UI 中断按钮，**不分角色**）。若正有接入请求待确认，也一并拒绝。
     pub fn abort_active(&self) {
         // 待确认的接入请求随之中止：不该在用户已关闭/中断后还留着弹窗等点击。
-        // 理由是给**控制器**看的，而本方法是「中断会话」「关闭被控开关」「新请求取代旧会话」
-        // 三个入口的公共路径，故用中性措辞，不写死成其中某一个的原因。
         self.reject_pending_request("被控端中止了接入");
-        self.lock_inner().pending_grant = None;
-        if let Some(active) = self.take_active() {
-            active.cancel.cancel();
-            self.lock_cmd().take();
+        // 注意：先取 id 到块外，别在 `if let` 的 scrutinee 里持锁（临时 MutexGuard 会活到
+        // 块尾，之后再次 `lock_inner()` 会死锁——std::sync::Mutex 不可重入）。
+        let sid = {
+            let inner = self.lock_inner();
+            inner.active.as_ref().map(|a| a.session_id.clone())
+        };
+        if let Some(sid) = sid {
             // 被控端：控制器还没拨进来时挂起记录仍在表里，一并撤掉，不必等下一个 TTL 窗口。
-            self.lock_inner().pending.remove(&active.session_id);
+            self.lock_inner().pending.remove(&sid);
             self.send(ControlMessage::RemoteSessionEnd {
-                session_id: active.session_id,
+                session_id: sid,
                 reason: "用户中断".to_owned(),
             });
-            self.update_ui(|s| s.active = None);
         }
+        // 清 active / pending_grant / early_accept / cmd_tx：统一走收尾路径（见 `conclude_session`）。
+        self.conclude_session(None, None);
+    }
+
+    /// 关闭「允许被远程控制」时的清理：拒绝待确认请求，并中断**本机作为被控端**的会话。
+    ///
+    /// 与 [`Self::abort_active`] 的关键区别是**分角色**：开关语义是「**允许被**远程控制」，
+    /// 关掉它不该掐断一条「本机正在控制别人」（[`SessionRole::Controller`]）的出站会话，也不该
+    /// 动它的 `pending_grant`（那会让一条正在协商的控制器会话莫名失败）。
+    fn abort_controlled_session(&self) {
+        // 待确认的接入请求一律拒绝（既有行为）：用户已关开关，不该再留着弹窗等点击。
+        self.reject_pending_request("被控端中止了接入");
+        let sid = {
+            let inner = self.lock_inner();
+            inner
+                .active
+                .as_ref()
+                .filter(|a| a.role == SessionRole::Controlled)
+                .map(|a| a.session_id.clone())
+        };
+        let Some(sid) = sid else {
+            return;
+        };
+        self.lock_inner().pending.remove(&sid);
+        self.send(ControlMessage::RemoteSessionEnd {
+            session_id: sid.clone(),
+            reason: "用户关闭被控开关".to_owned(),
+        });
+        self.conclude_session(Some(&sid), None);
     }
 
     /// 安装平台实现（截屏 + 输入注入）。安装后若已具备能力则重新上报显示器数。
@@ -533,6 +609,21 @@ impl RemoteManager {
         inner.approval_wait_timeout = wait;
     }
 
+    /// 注入建立阶段超时（仅测试用，避免真等 [`ESTABLISH_TIMEOUT`]）。
+    #[cfg(test)]
+    pub(crate) fn set_establish_timeout(&self, timeout: Duration) {
+        self.lock_inner().establish_timeout = timeout;
+    }
+
+    /// 被控端挂起会话表（**仅测试**）。
+    ///
+    /// 让端到端用例对**管理器真实的那张表**下断言，而不是自己再造一张空表——后者只能证明
+    /// 「空表里没有 token」，证明不了「拒绝/超时路径没有往表里登记」。
+    #[cfg(test)]
+    pub(crate) fn pending_sessions(&self) -> Arc<PendingSessions> {
+        Arc::clone(&self.lock_inner().pending)
+    }
+
     // ── 内部辅助 ───────────────────────────────────────────────────────
 
     /// 锁内部状态（容忍中毒）。
@@ -543,6 +634,11 @@ impl RemoteManager {
     /// 锁上行发送端（容忍中毒）。
     fn lock_upstream(&self) -> MutexGuard<'_, Option<mpsc::Sender<ControlMessage>>> {
         self.upstream.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 锁出站积压队列（容忍中毒）。
+    fn lock_backlog(&self) -> MutexGuard<'_, VecDeque<ControlMessage>> {
+        self.out_backlog.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 锁会话命令发送端（容忍中毒）。
@@ -632,8 +728,89 @@ impl RemoteManager {
         }
     }
 
-    /// 上行发送一条控制消息（非阻塞；通道满或未连接时丢弃并记日志）。
+    /// 建立数据面：对取消敏感 + 整体超时兜底（见 [`ESTABLISH_TIMEOUT`]）。
+    ///
+    /// **取消是主要退出路径**：用户点「中断」时 `cancel` 立即生效，不必等超时。超时只是最后
+    /// 一道保险，避免 DNS 慢 / 连接挂住 / 信令卡住时 UI 永久停在「连接中」、会话任务与
+    /// `pending_grant`/`active` 一起泄漏。无论走哪条退出路径，错误都由调用方的
+    /// `finish_session` 收尾（清 `active`、清 `cmd_tx`），不留悬挂状态。
+    async fn establish_guarded(
+        &self,
+        request: EstablishRequest,
+        role: Role,
+        cancel: &CancellationToken,
+    ) -> RemoteResult<BoxDuplex> {
+        let deadline = self.lock_inner().establish_timeout;
+        let attempt = self.cfg.establisher.establish(request, role);
+        tokio::select! {
+            // 取消分支放前面：用户中断必须立刻生效，不能被超时拖住。
+            () = cancel.cancelled() => Err(RemoteError::Cancelled),
+            result = tokio::time::timeout(deadline, attempt) => match result {
+                Ok(r) => r,
+                Err(_) => Err(RemoteError::Signaling("建立数据面超时".to_owned())),
+            },
+        }
+    }
+
+    /// 上行发送一条控制消息（**非阻塞**入口）。
+    ///
+    /// # 为什么不能直接 `try_send`
+    ///
+    /// 控制通道容量只有 32，且与隧道/心跳/agent 流量共享。用 `try_send` 时瞬时打满会**静默丢掉
+    /// 关键生命周期消息**（`RemoteSessionResponse{accepted:true}`、`RemoteSessionEnd`、拒绝响应…），
+    /// 控制器于是只能白等到 `APPROVAL_WAIT_TIMEOUT`，用户看到的是「卡住」。
+    ///
+    /// # 设计（快路径 + 常驻泵）
+    ///
+    /// - **快路径**（通道尚有余量、且无积压/无在途转发）：直接 `try_send`，保持与旧实现一致的
+    ///   **同步投递**语义——控制通道读循环与 UI 立即能看到消息。
+    /// - **拥塞路径**：一旦 `try_send` 打满，消息转入 [`Self::out_backlog`]，并唤醒常驻泵
+    ///   [`pump_outbound`] 用 `Sender::send().await` 转发（通道满时挂起等待，**绝不丢**）。
+    ///
+    /// # 保序（关键）
+    ///
+    /// 快路径的判断（`积压为空 && 无在途`）与 `try_send` 都在**积压锁内**完成；一旦进入拥塞路径，
+    /// 泵在排空前一直保持 `out_inflight=true`，使后续 `send` 一律入队而非插队——所以**
+    /// 任何两条消息都不会乱序**。无运行时（无泵）时退回 [`Self::send_direct`]，语义同旧的 `try_send`。
+    ///
+    /// 尚未 `attach` 或控制通道已断开时与旧行为一致：丢弃并记日志（此时确实无处可发）。
+    ///
+    /// 注意：数据面命令走 [`Self::send_command`]，那是**另一条**队列，且允许在拥塞时丢弃——
+    /// 丢一条鼠标/键盘输入事件是可接受的，与「会话级生命周期消息」不同。
     fn send(&self, msg: ControlMessage) {
+        // 无运行时/无泵：退回直接投递（与旧语义一致）。
+        if self.out_pump.is_none() {
+            self.send_direct(msg);
+            return;
+        }
+        let Some(tx) = self.lock_upstream().clone() else {
+            debug!("控制通道尚未就绪或已断开，丢弃远程消息");
+            return;
+        };
+        // 积压锁内含「判断 + 投递/入队」，与泵的取件互斥，保证 FIFO（见方法文档）。
+        {
+            let mut backlog = self.lock_backlog();
+            if backlog.is_empty() && !self.out_inflight.load(Ordering::Acquire) {
+                match tx.try_send(msg) {
+                    Ok(()) => return,
+                    // 通道打满：转入积压，交给泵用 `send().await` 转发，绝不丢。
+                    Err(mpsc::error::TrySendError::Full(msg)) => backlog.push_back(msg),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!("控制通道已关闭，丢弃远程消息");
+                        return;
+                    }
+                }
+            } else {
+                backlog.push_back(msg);
+            }
+        }
+        if let Some(notify) = self.out_pump.as_ref() {
+            notify.notify_one();
+        }
+    }
+
+    /// 直接向控制通道投递（**仅**在无运行时、没有出站泵可依赖时兜底；语义同旧的 `try_send`）。
+    fn send_direct(&self, msg: ControlMessage) {
         let guard = self.lock_upstream();
         if let Some(tx) = guard.as_ref() {
             if tx.try_send(msg).is_err() {
@@ -676,7 +853,18 @@ impl RemoteManager {
     }
 
     /// 把某会话标为 `Active`（若仍是当前会话）。
+    ///
+    /// 这是「数据面已建立」的唯一判定点：内部句柄的 `established` 与 UI 快照的
+    /// [`SessionState::Active`] 一并置位。
     fn mark_active(&self, session_id: &str) {
+        {
+            let mut inner = self.lock_inner();
+            if let Some(active) = inner.active.as_mut() {
+                if active.session_id == session_id {
+                    active.established = true;
+                }
+            }
+        }
         self.update_ui(|s| {
             if let Some(active) = s.active.as_mut() {
                 if active.session_id == session_id {
@@ -712,6 +900,85 @@ impl RemoteManager {
                 s.last_error = Some(reason);
             }
         });
+    }
+
+    /// 会话收尾的**唯一**清理路径：中断匹配的会话、清掉与之绑定的 `pending_grant` /
+    /// `early_accept` / `cmd_tx`，把 `active` 置空，并按需记录错误。返回是否清掉了 `active`。
+    ///
+    /// `session_id`：`Some(sid)` 只作用于该会话；`None` 作用于**当前任意**会话（开关关闭、空
+    /// `session_id` 拒绝等不针对具体 id 的场景）。
+    ///
+    /// # 为什么要收敛到一处
+    ///
+    /// `active` 一旦残留而没有定时器兜底（例如某条早退分支清了 `pending_grant` 却直接 `return`），
+    /// UI 就会永久停在 `Negotiating`/`Connecting`——用户看到的是「卡住」。让所有结束分支都走这里，
+    /// 就不可能出现「清了授权却漏了 active」的组合。
+    fn conclude_session(&self, session_id: Option<&str>, error: Option<String>) -> bool {
+        let matched = {
+            let mut inner = self.lock_inner();
+            // 只清与目标会话绑定的授权/乱序暂存；`None` 表示清掉任意当前会话的授权。
+            let grant_matches = match session_id {
+                Some(sid) => inner.pending_grant.as_ref().is_some_and(|g| g.session_id == sid),
+                None => inner.pending_grant.is_some(),
+            };
+            if grant_matches {
+                inner.pending_grant = None;
+            }
+            let early_matches = match session_id {
+                Some(sid) => inner.early_accept.as_deref() == Some(sid),
+                None => inner.early_accept.is_some(),
+            };
+            if early_matches {
+                inner.early_accept = None;
+            }
+            match session_id {
+                Some(sid) => inner.active.as_ref().is_some_and(|a| a.session_id == sid),
+                None => inner.active.is_some(),
+            }
+        };
+        if !matched {
+            return false;
+        }
+        if let Some(active) = self.take_active() {
+            active.cancel.cancel();
+        }
+        self.lock_cmd().take();
+        self.update_ui(move |s| {
+            s.active = None;
+            if let Some(err) = error {
+                s.last_error = Some(err);
+            }
+        });
+        true
+    }
+
+    /// 处理**未签发会话**的拒绝（`RemoteSessionResponse{accepted:false}` 且 `session_id` 为空）。
+    ///
+    /// 服务端在会话签发之前就会拒绝（目标离线 / 未开启被控 / 无 rd_id，见
+    /// `crates/server/src/control_plane/remote.rs::deny_connect`），此时响应里没有 id 可对号。
+    ///
+    /// 为什么不能直接用 [`Self::conclude_session(None, _)`]：它的 `None` 语义是「当前任意会话」，
+    /// 会连**已建立**的会话一起中断。而本机完全可能在同一时刻已经跑着一条会话（例如用户正被
+    /// 远程控制着，又去点了一个离线对端），那条空 `session_id` 的拒绝与它毫无关系，却会把它掐断、
+    /// 并把「对端离线」写成它的失败原因——用户看到的是「好好的会话被人点没了」。
+    ///
+    /// 因此这里只清**在途协商的占位**：`pending_grant` / `early_accept` 存在，或 `active` 尚未建立
+    /// （`Negotiating`/`Connecting` 占位）。已建立（`Active`）的会话原样保留，只记错误。
+    ///
+    /// 返回是否清掉了当前会话。
+    fn deny_unissued_request(&self, error: String) -> bool {
+        let placeholder = {
+            let inner = self.lock_inner();
+            inner.pending_grant.is_some()
+                || inner.early_accept.is_some()
+                || inner.active.as_ref().is_some_and(|a| !a.established)
+        };
+        if !placeholder {
+            // 没有待决协商可清（本机若已有会话，那是**已建立**的一条）：只报错，不动会话。
+            self.update_ui(move |s| s.last_error = Some(error));
+            return false;
+        }
+        self.conclude_session(None, Some(error))
     }
 
     /// 处理 `RemoteCapability`。
@@ -753,8 +1020,23 @@ impl RemoteManager {
         target_platform: &str,
         params: RemoteParams,
     ) {
+        // 本请求的乱序暂存要先摘出来再放回：`abort_active` 走的 `conclude_session(None, _)` 语义是
+        // 「清掉任意当前会话的暂存」，会连**本次**的 `early_accept` 一起抹掉——而被控端确认先于
+        // 授权到达时，那条标记正是这次会话要用的，抹掉后 `already_accepted` 判定失败，会话退化成
+        // 空等 `approval_wait_timeout`。放回前按 id 校验，不把上一条会话的残留带进来。
+        let early_for_me = {
+            let inner = self.lock_inner();
+            inner
+                .early_accept
+                .as_ref()
+                .filter(|sid| sid.as_str() == session_id)
+                .cloned()
+        };
         // 新请求取代旧会话（沿用既有语义）。
         self.abort_active();
+        if let Some(sid) = early_for_me {
+            self.lock_inner().early_accept = Some(sid);
+        }
 
         let mut filled = params;
         if filled.rendezvous_host.is_empty() {
@@ -766,7 +1048,9 @@ impl RemoteManager {
         let cancel = CancellationToken::new();
         self.set_active(ActiveHandle {
             session_id: session_id.to_owned(),
+            role: SessionRole::Controller,
             cancel: cancel.clone(),
+            established: false,
         });
         // `RemoteConnectGrant` 只带 `target_rd_id`，不带展示名：回查可远程列表把名字补上，
         // 否则会话窗口会显示一串 9 位数字。列表里查不到（对端刚离线等）就回落到 rd_id。
@@ -868,7 +1152,7 @@ impl RemoteManager {
             prefer_direct: true,
             early: handshake.hello_frame.clone(),
         };
-        let duplex = self.cfg.establisher.establish(request, Role::Controller).await?;
+        let duplex = self.establish_guarded(request, Role::Controller, &cancel).await?;
         self.mark_active(&session_id);
         // 落地目录可能还不存在（首次使用）；建不出来就让下载直接失败，别让它到 99% 才炸。
         if let Err(err) = tokio::fs::create_dir_all(&self.cfg.download_dir).await {
@@ -990,7 +1274,9 @@ impl RemoteManager {
         let cancel = CancellationToken::new();
         self.set_active(ActiveHandle {
             session_id: req.session_id.clone(),
+            role: SessionRole::Controlled,
             cancel: cancel.clone(),
+            established: false,
         });
         let info = ActiveSessionInfo {
             session_id: req.session_id.clone(),
@@ -1034,7 +1320,7 @@ impl RemoteManager {
             prefer_direct: true,
             early: Vec::new(),
         };
-        let duplex = self.cfg.establisher.establish(request, Role::Controlled).await?;
+        let duplex = self.establish_guarded(request, Role::Controlled, &cancel).await?;
         self.mark_active(&session_id);
         let config = ControlledConfig {
             session_id,
@@ -1042,6 +1328,7 @@ impl RemoteManager {
             mode,
             pending,
             encode: self.cfg.encode,
+            capture_watchdog: CAPTURE_WATCHDOG,
         };
         let clipboard = self
             .clipboard
@@ -1070,10 +1357,14 @@ impl RemoteManager {
     ///
     /// - `accepted:true` 命中待确认授权 → 启动数据面；若授权尚未到达（乱序）则先记下，
     ///   等 [`Self::start_controller`] 到达时立即建立。
-    /// - 拒绝：清掉待确认授权并结束会话。
+    /// - 拒绝：`session_id` 非空时按 id 收尾；**为空**时只能按「当前待决请求被拒」处理，
+    ///   且只清占位会话（见 [`Self::deny_unissued_request`]）。
     ///
     /// **拒绝路径的 `session_id` 可能是空串**（服务端在会话签发之前就拒绝了：目标离线/未开启
-    /// 被控/无 rd_id），因此不能拿它去对号——按「当前待决请求失败」处理即可。
+    /// 被控/无 rd_id，见 `crates/server/src/control_plane/remote.rs::deny_connect`），因此不能拿它
+    /// 去对号。注意**不能**假设「当前 active 就是被拒的那一个」：`start_controller` 只在**授权**
+    /// （`RemoteConnectGrant`）到达时才中断旧会话，所以在「发出请求」到「收到授权」之间，`active`
+    /// 仍可能是上一条**已建立**的会话——此时这条空 id 拒绝与它无关，必须原样保留。
     fn on_session_response(&self, session_id: &str, accepted: bool, reason: Option<String>) {
         if accepted {
             let matches_grant = self
@@ -1091,76 +1382,25 @@ impl RemoteManager {
         }
 
         let reason = reason.unwrap_or_else(|| "对端拒绝".to_owned());
-        {
-            let mut inner = self.lock_inner();
-            let matches_grant = inner
-                .pending_grant
-                .as_ref()
-                .is_some_and(|g| g.session_id == session_id);
-            if session_id.is_empty() || matches_grant {
-                inner.pending_grant = None;
-            }
-            if inner.early_accept.as_deref() == Some(session_id) {
-                inner.early_accept = None;
-            }
-        }
         if session_id.is_empty() {
-            // 尚未签发会话，没有可中断的 active；只记错误。
-            self.update_ui(move |s| s.last_error = Some(reason));
+            // 未签发会话即可拒绝：响应里没有 id 可对号，只能按「当前待决请求被拒」处理。
+            //
+            // **关键**：必须连同 `active` 里的**占位会话**一起清——早退分支若只清授权就直接
+            // return，兜底的 `on_wait_timeout` 会因 `pending_grant` 已空而失效，`active` 就永久
+            // 停在 `Negotiating`。但**已建立**的会话不能清（它与这条拒绝无关），故走
+            // [`Self::deny_unissued_request`] 而不是 `conclude_session(None, _)`。
+            self.deny_unissued_request(reason);
             return;
         }
-        let is_current = self
-            .lock_inner()
-            .active
-            .as_ref()
-            .is_some_and(|a| a.session_id == session_id);
-        if !is_current {
-            return;
-        }
-        if let Some(active) = self.take_active() {
-            active.cancel.cancel();
-        }
-        self.lock_cmd().take();
-        self.update_ui(move |s| {
-            s.active = None;
-            s.last_error = Some(reason);
-        });
+        // 非空 sid：按 id 对号清理；不属于当前会话（迟到的拒绝）则原样忽略。
+        self.conclude_session(Some(session_id), Some(reason));
     }
 
     /// 处理 `RemoteSessionEnd`：中断匹配的会话且**不再回发**结束（避免回声）。
     fn on_remote_session_end(&self, session_id: &str, reason: &str) {
-        {
-            let mut inner = self.lock_inner();
-            if inner
-                .pending_grant
-                .as_ref()
-                .is_some_and(|g| g.session_id == session_id)
-            {
-                inner.pending_grant = None;
-            }
-            if inner.early_accept.as_deref() == Some(session_id) {
-                inner.early_accept = None;
-            }
-        }
-        let is_current = self
-            .lock_inner()
-            .active
-            .as_ref()
-            .is_some_and(|a| a.session_id == session_id);
-        if !is_current {
-            return;
-        }
-        if let Some(active) = self.take_active() {
-            active.cancel.cancel();
-        }
-        self.lock_cmd().take();
         // 会话已被服务端判死：挂起记录留着也不会再被消费。
         self.lock_inner().pending.remove(session_id);
-        let reason = reason.to_owned();
-        self.update_ui(move |s| {
-            s.active = None;
-            s.last_error = Some(reason);
-        });
+        self.conclude_session(Some(session_id), Some(reason.to_owned()));
     }
 
     /// 取平台实现（若已安装）。
@@ -1252,28 +1492,17 @@ impl RemoteManager {
 
     /// 控制器等待确认超时：清掉授权与 active，记错误。
     fn on_wait_timeout(&self, session_id: &str) {
-        let mut inner = self.lock_inner();
-        let is_pending = inner
+        let is_pending = self
+            .lock_inner()
             .pending_grant
             .as_ref()
             .is_some_and(|g| g.session_id == session_id);
         if !is_pending {
             return;
         }
-        inner.pending_grant = None;
-        if inner.early_accept.as_deref() == Some(session_id) {
-            inner.early_accept = None;
-        }
-        drop(inner);
-        // 取出会话句柄（其 `cancel` 与授权共用同一个 token），一并中断，别把 active 留在内部状态里。
-        if let Some(active) = self.take_active() {
-            active.cancel.cancel();
-        }
-        self.lock_cmd().take();
-        self.update_ui(|s| {
-            s.active = None;
-            s.last_error = Some("等待对端确认超时".to_owned());
-        });
+        // 授权与 active 的 `session_id` 恒等（`start_controller` 一起写入），故按「当前会话」
+        // 清理（`None`）即可，避免只清掉授权却把 active 落在 `Negotiating`。
+        self.conclude_session(None, Some("等待对端确认超时".to_owned()));
     }
 }
 
@@ -1366,6 +1595,57 @@ impl RemoteBridge for RemoteManager {
             s.active = None;
             s.pending_approval = None;
         });
+    }
+}
+
+/// 常驻出站泵：把 [`RemoteManager::out_backlog`] 里的积压消息**保序**转发到**当前**控制通道发送端。
+///
+/// # 性质
+///
+/// - **不丢（拥塞时）**：通道满时在 `Sender::send().await` 上等待，直到下游（客户端的控制通道
+///   写循环）腾出位置。只有「未 attach / 已断开」（取不到发送端）或「发送端已关闭」才丢弃，
+///   与旧 `try_send` 语义一致。这就是关键生命周期消息（`accepted:true`、`RemoteSessionEnd`…）
+///   不再因瞬时拥塞消失的原因。
+/// - **保序**：入队与「取件 + 置 `out_inflight`」在同一把积压锁内完成，泵单任务串行转发；
+///   排空期间 `out_inflight` 恒为 `true`，[`RemoteManager::send`] 因而不会插入同步快路径。
+/// - **不空转**：无积压时挂在 `notify.notified()` 上；被唤醒才排空。控制通道断开时同理（不忙等），
+///   等下一次 `attach` 换上新的发送端后继续转发。这里选择「断开不退出」，好处是不必在
+///   attach/disconnect 之间反复重建任务；代价是断开期间的消息会被丢弃（那时也确实发不出去）。
+/// - **不拖住管理器**：每轮只在锁内取件，转发时 `drop(mgr)` 后才 `await`，不跨 await 持有 `Arc`。
+async fn pump_outbound(mgr: Weak<RemoteManager>, notify: Arc<Notify>) {
+    loop {
+        // 无积压时在此挂起（不空转）；管理器释放后弱指针升级失败即退出。
+        notify.notified().await;
+        loop {
+            let Some(mgr) = mgr.upgrade() else {
+                return;
+            };
+            // 锁内「取件 + 标记在途」：与 `send` 的快路径判断互斥，保证任何两条消息不乱序。
+            let next = {
+                let mut backlog = mgr.lock_backlog();
+                let item = backlog.pop_front();
+                if item.is_some() {
+                    mgr.out_inflight.store(true, Ordering::Release);
+                }
+                item
+            };
+            let Some(msg) = next else {
+                // 排空：清除在途标记后再退出内层循环。因取件与本判断同锁，不会有消息被漏掉。
+                mgr.out_inflight.store(false, Ordering::Release);
+                break;
+            };
+            // 取当前发送端的克隆后释放 `Arc`，别跨 await 持有它（否则会拖住管理器的释放）。
+            let tx = mgr.lock_upstream().clone();
+            drop(mgr);
+            if let Some(tx) = tx {
+                // 阻塞点：通道满时在此等待；绝不因拥塞丢。
+                if tx.send(msg).await.is_err() {
+                    debug!("控制通道已关闭，丢弃远程消息");
+                }
+            } else {
+                debug!("控制通道尚未就绪或已断开，丢弃远程消息");
+            }
+        }
     }
 }
 
@@ -1840,5 +2120,344 @@ mod tests {
         // 未安装 sink 时不应 panic（走 NullFrameSink）。
         let _ = mgr.frame_sink_arc();
         mgr.install_frame_sink(Arc::new(RecordingSink));
+    }
+
+    // ── 加固用例 ───────────────────────────────────────────────────────
+
+    /// `establish` 永久挂起的建立器，模拟 DNS 慢 / 连接挂住 / 信令卡死。
+    #[derive(Clone)]
+    struct HangingEstablisher {
+        /// 是否已进入 `establish`（测试据此确认建立阶段已开始，再触发取消/超时）。
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HangingEstablisher {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TransportEstablisher for HangingEstablisher {
+        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+            self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            // 永不返回：只有取消或超时才能让这个 future 结束。
+            std::future::pending::<RemoteResult<BoxDuplex>>().await
+        }
+    }
+
+    /// 把控制器会话推进到「正在建立数据面」（capability → grant → accepted）。
+    fn drive_controller_to_establish(mgr: &Arc<RemoteManager>) {
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".to_owned(),
+        });
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s1".to_owned(),
+            token: "t1".to_owned(),
+            target_rd_id: "987654321".to_owned(),
+            target_platform: "linux".to_owned(),
+            params: params(),
+        });
+        mgr.handle_control_message(ControlMessage::RemoteSessionResponse {
+            session_id: "s1".to_owned(),
+            accepted: true,
+            reason: None,
+        });
+    }
+
+    /// 建立阶段必须**可取消**：`establish` 挂起时点「中断」应立即结束任务并清空 active，
+    /// 而不是永久停在「连接中」（旧实现把取消令牌漏给了建立阶段）。
+    #[tokio::test]
+    async fn establish_is_cancellable() {
+        let est = Arc::new(HangingEstablisher::new());
+        let mgr = manager_with(true, est.clone());
+        drive_controller_to_establish(&mgr);
+        assert!(
+            wait_until(|| est.entered.load(std::sync::atomic::Ordering::SeqCst)).await,
+            "应进入建立阶段（establish 已被调用）"
+        );
+
+        // 只取消令牌（不调 abort_active），以验证会话任务自身对取消敏感并完成收尾。
+        let cancel = mgr
+            .lock_inner()
+            .active
+            .as_ref()
+            .expect("应处于控制器会话")
+            .cancel
+            .clone();
+        cancel.cancel();
+
+        assert!(
+            wait_until(|| mgr.snapshot().active.is_none()).await,
+            "取消后应清空 active，UI 回到无会话"
+        );
+        assert!(mgr.snapshot().last_error.is_some(), "取消应记为一次会话失败");
+    }
+
+    /// 建立阶段必须有**超时兜底**：即使无人取消，挂起的 `establish` 也应在超时后收尾。
+    #[tokio::test]
+    async fn establish_times_out_and_cleans_up() {
+        let est = Arc::new(HangingEstablisher::new());
+        let mgr = manager_with(true, est.clone());
+        mgr.set_establish_timeout(Duration::from_millis(80));
+        drive_controller_to_establish(&mgr);
+        assert!(
+            wait_until(|| est.entered.load(std::sync::atomic::Ordering::SeqCst)).await,
+            "应进入建立阶段"
+        );
+
+        assert!(
+            wait_until(|| mgr.snapshot().active.is_none()).await,
+            "超时后应清空 active，不留悬挂会话"
+        );
+        assert!(mgr.snapshot().last_error.is_some(), "超时应记为一次会话失败");
+    }
+
+    /// 关键生命周期消息**不因控制通道拥塞而丢**：容量 1 的通道先塞满，随后触发的
+    /// `accepted:true` 仍会在通道腾出后按序到达。旧实现用 `try_send` 会在此静默丢弃，
+    /// 控制器只能白等到 `APPROVAL_WAIT_TIMEOUT`。
+    #[tokio::test]
+    async fn lifecycle_message_survives_upstream_congestion() {
+        let mgr = manager(true);
+        let (tx, mut rx) = mpsc::channel(1);
+        // 占满容量为 1 的控制通道（模拟隧道/心跳/agent 流量抢占带宽）。
+        tx.send(ControlMessage::RemotePeerListRequest).await.unwrap();
+        mgr.attach(tx);
+
+        // 触发一条关键生命周期消息（控制器侧的 accepted 响应）。
+        mgr.send(ControlMessage::RemoteSessionResponse {
+            session_id: "s1".to_owned(),
+            accepted: true,
+            reason: None,
+        });
+
+        // 开始 drain：占位消息先出来，随后那条 accepted 必须到达（保序、未丢）。
+        match rx.recv().await.unwrap() {
+            ControlMessage::RemotePeerListRequest => {}
+            other => panic!("首条应为占位消息，实得 {other:?}"),
+        }
+        let arrived = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("关键生命周期消息不能因拥塞被丢弃")
+            .unwrap();
+        match arrived {
+            ControlMessage::RemoteSessionResponse {
+                accepted, session_id, ..
+            } => {
+                assert!(accepted, "应收到 accepted:true");
+                assert_eq!(session_id, "s1");
+            }
+            other => panic!("应为 accepted 响应，实得 {other:?}"),
+        }
+    }
+
+    /// 关闭「允许被远程控制」**不得**中断本机作为**控制方**的会话，也不得动它的待确认授权。
+    #[tokio::test]
+    async fn disabling_does_not_abort_controller_session() {
+        let mgr = manager(true);
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".to_owned(),
+        });
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s-control".to_owned(),
+            token: "t".to_owned(),
+            target_rd_id: "987654321".to_owned(),
+            target_platform: "linux".to_owned(),
+            params: params(),
+        });
+        assert_eq!(
+            mgr.snapshot().active.as_ref().map(|a| a.role),
+            Some(SessionRole::Controller)
+        );
+
+        mgr.set_enabled(false);
+
+        assert!(!mgr.snapshot().enabled, "开关应已关闭");
+        assert_eq!(
+            mgr.snapshot().active.as_ref().map(|a| a.role),
+            Some(SessionRole::Controller),
+            "关闭被控开关不得中断本机作为控制方的会话"
+        );
+        assert!(
+            mgr.lock_inner().pending_grant.is_some(),
+            "也不得清掉控制器会话的待确认授权"
+        );
+    }
+
+    /// 关闭开关应中断本机作为**被控端**的会话（与上一条形成对照）。
+    #[tokio::test]
+    async fn disabling_aborts_controlled_session() {
+        let mgr = manager(true);
+        // 安装空平台实现，让被控端路径可用。
+        mgr.install_platform(
+            Arc::new(crate::controlled::EmptyScreenSource),
+            Arc::new(crate::controlled::NullInputSink),
+        );
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".to_owned(),
+        });
+        // 策略为 Auto + 已装平台：直接接受，进入被控 active（未 attach，不会真发消息）。
+        mgr.handle_control_message(ControlMessage::RemoteSessionIncoming {
+            session_id: "s-ctl".to_owned(),
+            token: "t".to_owned(),
+            from_name: "peer".to_owned(),
+            mode: RemoteMode::Control,
+        });
+        assert_eq!(
+            mgr.snapshot().active.as_ref().map(|a| a.role),
+            Some(SessionRole::Controlled),
+            "应进入被控会话"
+        );
+
+        mgr.set_enabled(false);
+
+        assert!(mgr.snapshot().active.is_none(), "关闭开关应中断被控会话");
+    }
+
+    /// 空 `session_id` 的拒绝也必须清掉 active：它会把 `pending_grant` 清空，使兜底的
+    /// `on_wait_timeout` 失效；若在这里直接 `return`，UI 将永久停在 `Negotiating`。
+    #[tokio::test]
+    async fn empty_sid_rejection_clears_active() {
+        let mgr = manager(true);
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".to_owned(),
+        });
+        // 请求 A 先拿到授权。
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s-a".to_owned(),
+            token: "t".to_owned(),
+            target_rd_id: "987654321".to_owned(),
+            target_platform: "linux".to_owned(),
+            params: params(),
+        });
+        // 请求 B 到来，取代 A 并重新武装等待（复现触发路径）。
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s-b".to_owned(),
+            token: "t".to_owned(),
+            target_rd_id: "987654321".to_owned(),
+            target_platform: "linux".to_owned(),
+            params: params(),
+        });
+        assert_eq!(
+            mgr.snapshot().active.as_ref().map(|a| a.session_id.as_str()),
+            Some("s-b")
+        );
+
+        // 服务端在会话签发前拒绝（空 sid，如目标离线/未开启被控）。
+        mgr.handle_control_message(ControlMessage::RemoteSessionResponse {
+            session_id: String::new(),
+            accepted: false,
+            reason: Some("目标不在线".to_owned()),
+        });
+
+        assert!(
+            mgr.snapshot().active.is_none(),
+            "空 sid 拒绝后不得把 active 留在 Negotiating"
+        );
+        assert_eq!(
+            mgr.snapshot().last_error.as_deref(),
+            Some("目标不在线"),
+            "应记录拒绝原因"
+        );
+    }
+
+    /// 空 `session_id` 的拒绝只该清「尚未建立」的占位协商，**不得**掐断已建立的会话。
+    ///
+    /// 回归用例：控制器在一条会话正跑着时又去点另一个离线对端，服务端在签发会话之前就拒绝
+    /// （`session_id` 为空）。`conclude_session(None, _)` 的 `None` 语义是「当前任意会话」，于是
+    /// 会把那条**已建立**的会话一并中断，还把「对端离线」写成它的失败原因——用户看到的是
+    /// 「好好的会话被人点没了」。
+    #[tokio::test]
+    async fn empty_sid_denial_keeps_established_session() {
+        for role in [SessionRole::Controller, SessionRole::Controlled] {
+            let mgr = manager(true);
+            let cancel = CancellationToken::new();
+            // 直接摆出「已建立」状态：`mark_active` 是唯一的置位点，这里不必跑真实会话。
+            mgr.set_active(ActiveHandle {
+                session_id: "s1".to_owned(),
+                role,
+                cancel: cancel.clone(),
+                established: true,
+            });
+            mgr.update_ui(|s| {
+                s.active = Some(ActiveSessionInfo {
+                    session_id: "s1".to_owned(),
+                    role,
+                    peer_name: "office-pc".to_owned(),
+                    mode: RemoteMode::Control,
+                    state: SessionState::Active,
+                    started_at_ms: 0,
+                });
+            });
+
+            mgr.handle_control_message(ControlMessage::RemoteSessionResponse {
+                session_id: String::new(),
+                accepted: false,
+                reason: Some("对端离线".to_owned()),
+            });
+
+            let snap = mgr.snapshot();
+            assert!(snap.active.is_some(), "{role:?} 已建立的会话不得被空 sid 拒绝掐断");
+            assert_eq!(
+                snap.active.expect("应保留会话").session_id,
+                "s1",
+                "{role:?} 应保留原会话"
+            );
+            assert_eq!(
+                snap.last_error.as_deref(),
+                Some("对端离线"),
+                "用户仍应看到拒绝原因"
+            );
+            assert!(!cancel.is_cancelled(), "{role:?} 的中断信号不得被触发");
+        }
+    }
+
+    /// 乱序防御（被控端确认先于授权到达）不得被 `start_controller` 自己的「中断旧会话」步骤抹掉。
+    ///
+    /// `abort_active` 走的 `conclude_session(None, _)` 会连 `early_accept` 一起清；若不清点出本次
+    /// 请求的那条标记，`already_accepted` 判定必然失败，会话退化成空等 `approval_wait_timeout`
+    /// （60s）后才失败。
+    #[tokio::test]
+    async fn early_accept_survives_grant_start() {
+        let mgr = manager(true);
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".into(),
+        });
+        // 确认先到（授权还没来）→ 暂存。
+        mgr.handle_control_message(ControlMessage::RemoteSessionResponse {
+            session_id: "s3".into(),
+            accepted: true,
+            reason: None,
+        });
+        assert_eq!(
+            mgr.lock_inner().early_accept.as_deref(),
+            Some("s3"),
+            "确认应先被暂存"
+        );
+
+        // 授权后到 → 必须立即建立（授权当场被消费），而不是重新武装等待。
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s3".into(),
+            token: "t3".into(),
+            target_rd_id: "987654321".into(),
+            target_platform: "linux".into(),
+            params: params(),
+        });
+
+        assert!(
+            mgr.lock_inner().pending_grant.is_none(),
+            "确认已到，授权应被立即消费（修复前会退化成 arm_wait_timeout 空等 60s）"
+        );
+        assert!(
+            mgr.lock_inner().early_accept.is_none(),
+            "暂存应被消费掉，不留残留"
+        );
     }
 }

@@ -6,7 +6,7 @@
 use crate::approval::ApprovalPolicy;
 use crate::auth::PendingSessions;
 use crate::controller::{run_controller, ControllerConfig};
-use crate::controlled::{run_controlled, ControlledConfig};
+use crate::controlled::{run_controlled, ControlledConfig, CAPTURE_WATCHDOG};
 use crate::transfer::{TransferEvent, TransferHub};
 use crate::error::{RemoteError, RemoteResult};
 use crate::manager::{RemoteManager, RemoteManagerConfig, SessionState};
@@ -14,7 +14,7 @@ use crate::screen::{
     Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton,
     RawFrame, ScreenSource, TileUpdate,
 };
-use crate::session::plan_controller_handshake;
+use crate::session::{plan_controller_handshake, SessionCodec, SessionMessage};
 use crate::transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
 use async_trait::async_trait;
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
@@ -397,6 +397,19 @@ impl Clipboard for FakeClipboard {
 ///
 /// 两端需已装好平台实现 / 画面上报目标；被控端需 `enabled: true`。
 async fn establish_session(ctrl: &Arc<RemoteManager>, ctld: &Arc<RemoteManager>) {
+    establish_session_with_mode(ctrl, ctld, RemoteMode::Control, RemoteMode::Control).await;
+}
+
+/// 与 [`establish_session`] 同源，但可指定**两端各自的会话模式**。
+///
+/// 模式决定被控端的权限边界（采集 / 注入 / 文件服务，见 `manager.rs::controlled_task`），
+/// 因此 P0-3 的 `ViewOnly` / `FileTransfer` 用例要能把它灌进来。
+async fn establish_session_with_mode(
+    ctrl: &Arc<RemoteManager>,
+    ctld: &Arc<RemoteManager>,
+    ctrl_mode: RemoteMode,
+    ctld_mode: RemoteMode,
+) {
     // 双方先拿到能力通告（设置 params / rd_id）。
     ctrl.handle_control_message(ControlMessage::RemoteCapability {
         params: Some(params()),
@@ -406,11 +419,15 @@ async fn establish_session(ctrl: &Arc<RemoteManager>, ctld: &Arc<RemoteManager>)
         params: Some(params()),
         rd_id: "222222222".to_owned(),
     });
+    // 控制器记录本次请求模式：`RemoteConnectGrant` 只带 `target_rd_id`、不带模式，
+    // 控制器侧的模式是从这里回查的（见 `start_controller`）。
+    ctrl.request_connect("office-pc", ctrl_mode);
 
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel(64);
     let (ctld_tx, mut ctld_rx) = mpsc::channel(64);
     ctrl.attach(ctrl_tx);
     ctld.attach(ctld_tx);
+    // `attach` 会补上报一次 `RemoteAnnounce`；先排空这类旁路消息。
     let _ = ctrl_rx.try_recv();
     let _ = ctld_rx.try_recv();
 
@@ -426,14 +443,12 @@ async fn establish_session(ctrl: &Arc<RemoteManager>, ctld: &Arc<RemoteManager>)
         session_id: "sess-1".to_owned(),
         token: "tok-1".to_owned(),
         from_name: "home-nas".to_owned(),
-        mode: RemoteMode::Control,
+        mode: ctld_mode,
     });
 
     // 被控端应回 accepted:true（此后两端各自异步建立数据面）。
-    let response = tokio::time::timeout(WAIT, ctld_rx.recv())
-        .await
-        .expect("等被控端应答超时")
-        .expect("通道关闭");
+    // 用 `next_response` 跳过任何旁路消息（如额外的 `RemoteAnnounce`），只取真正的应答。
+    let response = next_response(&mut ctld_rx).await;
     match &response {
         ControlMessage::RemoteSessionResponse { accepted, .. } => assert!(accepted, "应接受会话"),
         other => panic!("应为 RemoteSessionResponse，实得 {other:?}"),
@@ -576,6 +591,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         mode: RemoteMode::Control,
         pending,
         encode: EncodeOptions::default(),
+        capture_watchdog: CAPTURE_WATCHDOG,
     };
     let ctrl_cfg = ControllerConfig {
         session_id: "sess-1".to_owned(),
@@ -646,6 +662,7 @@ async fn correct_token_completes_handshake_and_streams() {
             mode: RemoteMode::ViewOnly,
             pending,
             encode: EncodeOptions::default(),
+            capture_watchdog: CAPTURE_WATCHDOG,
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),
@@ -1247,5 +1264,309 @@ async fn controller_waits_for_acceptance_before_establishing() {
         SessionState::Active,
         "数据面就绪后应升为 Active"
     );
+}
+
+// ── 「拒绝是引擎强制的」 ───────────────────────────────────────────────
+
+/// 记录 `establish` 调用次数的建立器。
+///
+/// 用于断言**拒绝路径根本不建立数据面**——`FailingEstablisher` 只能让建立失败，无法区分
+/// 「没被调用」与「被调用后失败」，而这里要锁的正是「根本没调用」。
+struct CountingEstablisher {
+    calls: AtomicUsize,
+}
+
+impl CountingEstablisher {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl TransportEstablisher for CountingEstablisher {
+    async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        // 被控端只**接受**会话才会走到这里；拒绝/超时路径调用它即为回归。
+        Err(RemoteError::Signaling("本用例不应建立数据面".to_owned()))
+    }
+}
+
+/// 驱动一次**真实数据面握手**：控制器发 `Hello`，被控端用一张**空的**挂起会话表跑
+/// [`run_controlled`]。
+///
+/// 空表正是「用户拒绝 / 超时自动拒绝」之后 manager 留下的状态：
+/// `reject_pending_request` 与 `on_approval_timeout`（`manager.rs`）**只回响应、从不
+/// `insert`**，因此被控端从未登记该 token。这条 helper 把「硬闯数据面」这个动作真的跑到
+/// 协议层，而不是只断言 UI 状态。
+///
+/// 返回 `(被控端会话结果, 控制器按明文读到的 HelloAck)`。
+async fn handshake_against_unregistered_token(
+    pending: Arc<PendingSessions>,
+    session_id: &str,
+    token: &str,
+) -> (RemoteResult<()>, SessionMessage) {
+    use futures_util::StreamExt as _;
+    use tokio_util::codec::FramedRead;
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let plan = plan_controller_handshake(session_id, token, "111111111").unwrap();
+
+    // 控制器把 Hello 写进数据面（模拟「无视拒绝、直接硬闯」）。
+    let mut ctrl_stream: BoxDuplex = Box::new(a);
+    ctrl_stream.write_all(&plan.hello_frame).await.unwrap();
+    ctrl_stream.flush().await.unwrap();
+
+    let result = run_controlled(
+        Box::new(b),
+        ControlledConfig {
+            session_id: session_id.to_owned(),
+            local_rd_id: "222222222".to_owned(),
+            mode: RemoteMode::Control,
+            // 传**管理器真实的那张表**：断言的是「拒绝/超时路径没有往表里登记」，
+            // 而不是「一张新造的空表里查不到」。
+            pending,
+            encode: EncodeOptions::default(),
+            capture_watchdog: CAPTURE_WATCHDOG,
+        },
+        Arc::new(FakeScreen),
+        Arc::new(RecordingInput::default()),
+        None,
+        transfer_hub().0,
+        CancellationToken::new(),
+    )
+    .await;
+
+    // 被控端拒绝时会明文回一条 `HelloAck{accepted:false}`；读回来做协议层断言。
+    let mut reader = FramedRead::new(ctrl_stream, SessionCodec::new());
+    let ack = tokio::time::timeout(WAIT, reader.next())
+        .await
+        .expect("等 HelloAck 超时")
+        .expect("流在拒绝应答前关闭")
+        .expect("HelloAck 解码失败")
+        .message;
+    (result, ack)
+}
+
+/// P0-1a：用户**拒绝**后，即使控制器无视拒绝硬闯数据面，也必须因鉴权失败而终止。
+///
+/// 锁的不变量：`Confirm` 下的「拒绝」是**引擎强制**的、不只是 UI 语义——被控端从不登记该
+/// token，所以硬闯者过不了握手鉴权。破坏它会怎样：用户点了「拒绝」，攻击者（或竞态中的
+/// 控制器）照样能接管屏幕，弹窗沦为装饰。
+#[tokio::test]
+async fn reject_pending_makes_data_plane_handshake_fail() {
+    let est = Arc::new(CountingEstablisher::new());
+    let ctld = manager(est.clone(), true, "office-pc");
+    ctld.set_approval_policy(ApprovalPolicy::Confirm);
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-rej", "home-nas");
+    ctld.reject_pending(None);
+    let (accepted, sid, reason) = expect_response(rx.try_recv().expect("拒绝后应回响应"));
+    assert!(!accepted, "应拒绝");
+    assert_eq!(sid, "sess-rej");
+    assert_eq!(reason.as_deref(), Some("用户拒绝"));
+    assert!(ctld.snapshot().pending_approval.is_none(), "拒绝后应清空待确认");
+    assert!(ctld.snapshot().active.is_none(), "拒绝后不应有活动会话");
+
+    // (a) 拒绝路径根本不建立数据面（让出调度后再断言，排除竞态）。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(est.calls(), 0, "拒绝后不应建立数据面");
+
+    // (b) 硬闯：控制器拿着那个 token 径自握手 → 必须鉴权失败。
+    //     用**管理器真实那张挂起表**：拒绝路径必须一个 token 都没登记。
+    let pending = ctld.pending_sessions();
+    assert!(
+        pending.is_empty(),
+        "拒绝后挂起表必须一个 token 都不留（len={}）",
+        pending.len()
+    );
+    let (result, ack) = handshake_against_unregistered_token(pending, "sess-rej", "tok").await;
+    assert!(
+        matches!(result, Err(RemoteError::Auth(_))),
+        "被控端必须因 token 未登记而鉴权失败，实得 {result:?}"
+    );
+    match ack {
+        SessionMessage::HelloAck { accepted, .. } => assert!(!accepted, "被控端必须回 accepted:false"),
+        other => panic!("应回 HelloAck，实得 {other:?}"),
+    }
+}
+
+/// P0-1b：`APPROVAL_TIMEOUT` 到点**自动拒绝**同样从不登记 token，硬闯数据面必失败。
+///
+/// 锁的不变量与 [`reject_pending_makes_data_plane_handshake_fail`] 同一条，只是触发路径换成
+/// 超时。既有的 `approval_timeout_rejects` 只断言了响应/UI 层，这里补上「引擎强制」层：
+/// 超时与显式拒绝留下的**协议后果完全一致**——挂起表里没有这条会话。
+#[tokio::test]
+async fn approval_timeout_makes_data_plane_handshake_fail() {
+    let est = Arc::new(CountingEstablisher::new());
+    let ctld = manager(est.clone(), true, "office-pc");
+    ctld.set_approval_policy(ApprovalPolicy::Confirm);
+    ctld.set_timeouts(Duration::from_millis(50), Duration::from_secs(5));
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-to", "home-nas");
+    let (accepted, sid, reason) = expect_response(next_response(&mut rx).await);
+    assert!(!accepted, "超时应拒绝");
+    assert_eq!(sid, "sess-to");
+    assert_eq!(reason.as_deref(), Some("等待确认超时"));
+    assert!(ctld.snapshot().active.is_none(), "超时后不应有活动会话");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(est.calls(), 0, "超时拒绝后不应建立数据面");
+
+    let pending = ctld.pending_sessions();
+    assert!(
+        pending.is_empty(),
+        "超时拒绝后挂起表必须一个 token 都不留（len={}）",
+        pending.len()
+    );
+    let (result, ack) = handshake_against_unregistered_token(pending, "sess-to", "tok").await;
+    assert!(
+        matches!(result, Err(RemoteError::Auth(_))),
+        "硬闯必须鉴权失败，实得 {result:?}"
+    );
+    assert!(
+        matches!(ack, SessionMessage::HelloAck { accepted: false, .. }),
+        "被控端必须回 accepted:false，实得 {ack:?}"
+    );
+}
+
+// ── 会话模式的权限边界 ────────────────────────────────────────────────
+
+/// 造一对临时目录（共享目录 / 下载目录），返回 `(share, download)`。
+fn temp_dirs(tag: &str) -> (PathBuf, PathBuf) {
+    let pid = std::process::id();
+    let share = std::env::temp_dir().join(format!("rt-{tag}-share-{pid}"));
+    let dl = std::env::temp_dir().join(format!("rt-{tag}-dl-{pid}"));
+    let _ = std::fs::remove_dir_all(&share);
+    let _ = std::fs::remove_dir_all(&dl);
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::create_dir_all(&dl).unwrap();
+    (share, dl)
+}
+
+/// P0-3a：`ViewOnly` 模式被控端**不给文件服务**——权限边界，不只是 UI 偏好。
+///
+/// 锁的不变量：只读会话里控制器既不能下载也不能写入被控端文件（`manager.rs::controlled_task`
+/// 按 `mode != ViewOnly` 过滤掉 `service`，被控端据此拒绝一切文件请求）。破坏它会怎样：任何人
+/// 只拿到「仅观看」授权，就能顺着文件面板把被控端磁盘拖走。
+#[tokio::test]
+async fn view_only_mode_rejects_file_service() {
+    let (share, dl) = temp_dirs("vo");
+    std::fs::write(share.join("secret.bin"), b"top-secret").unwrap();
+
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let ctrl = manager_with_dirs(
+        Arc::new(OneShotEstablisher::new(Box::new(a), true)),
+        false,
+        "home-nas",
+        None,
+        dl.clone(),
+    );
+    let ctld = manager_with_dirs(
+        Arc::new(OneShotEstablisher::new(Box::new(b), false)),
+        true,
+        "office-pc",
+        Some(share.clone()),
+        dl.clone(),
+    );
+
+    let (ctrl_sink, mut frame_rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+
+    establish_session_with_mode(&ctrl, &ctld, RemoteMode::ViewOnly, RemoteMode::ViewOnly).await;
+
+    // 仅观看仍会推画面：先等一帧，确认会话真的跑起来了，后面的「空表 / 拒绝」才有意义。
+    tokio::time::timeout(WAIT, frame_rx.recv())
+        .await
+        .expect("等首帧超时")
+        .expect("画面通道关闭");
+
+    // 控制器列目录 + 下载被控端的 secret.bin：两者都必须被拒。
+    ctrl.list_remote_dir("/");
+    ctrl.download_remote_file("/secret.bin");
+    assert!(
+        poll_until(|| ctrl.snapshot().transfer_note.is_some()).await,
+        "下载应得到结果提示"
+    );
+    let note = ctrl.snapshot().transfer_note.expect("应有传输提示");
+    assert!(note.starts_with("失败："), "ViewOnly 下下载必须被拒，实得 {note}");
+    // 列表：被控端不提供文件服务 → 空表（而不是把 secret.bin 列出来）。
+    // 与下载共用同一条有序 TCP 流，下载的拒绝到了即证明列表应答也到了。
+    assert!(
+        ctrl.snapshot().remote_entries.is_empty(),
+        "ViewOnly 下列表必须为空，实得 {:?}",
+        ctrl.snapshot().remote_entries
+    );
+    // 没有任何文件落到下载目录。
+    assert!(!dl.join("secret.bin").exists(), "ViewOnly 下不应有任何文件落地");
+
+    let _ = std::fs::remove_dir_all(&share);
+    let _ = std::fs::remove_dir_all(&dl);
+}
+
+/// P0-3b：`FileTransfer` 模式**一个画面帧都不发**，但文件服务照常可用。
+///
+/// 锁的不变量：`FileTransfer` 下被控端 `capture == false`（`controlled.rs`），屏幕内容根本
+/// 不会被采集——「只传文件」是真不采集，而不是采了就扔。破坏它会怎样：以为在传文件，实际把
+/// 屏幕内容也编码推了出去。
+#[tokio::test]
+async fn file_transfer_mode_sends_no_video_but_allows_files() {
+    let (share, dl) = temp_dirs("ft");
+    let payload = pseudo_bytes(200 * 1024);
+    std::fs::write(share.join("source.bin"), &payload).unwrap();
+
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let ctrl = manager_with_dirs(
+        Arc::new(OneShotEstablisher::new(Box::new(a), true)),
+        false,
+        "home-nas",
+        None,
+        dl.clone(),
+    );
+    let ctld = manager_with_dirs(
+        Arc::new(OneShotEstablisher::new(Box::new(b), false)),
+        true,
+        "office-pc",
+        Some(share.clone()),
+        dl.clone(),
+    );
+
+    let (ctrl_sink, _frame_rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+
+    establish_session_with_mode(&ctrl, &ctld, RemoteMode::FileTransfer, RemoteMode::FileTransfer).await;
+
+    // 文件服务仍可用：列出并能下载（`service` 只在 `ViewOnly` 下被过滤掉）。
+    ctrl.list_remote_dir("/");
+    assert!(
+        poll_until(|| ctrl.snapshot().remote_entries.iter().any(|e| e.name == "source.bin")).await,
+        "FileTransfer 下应能列目录"
+    );
+    ctrl.download_remote_file("/source.bin");
+    let downloaded = dl.join("source.bin");
+    assert!(
+        poll_until(|| std::fs::read(&downloaded).is_ok_and(|b| b == payload)).await,
+        "FileTransfer 下应能下载文件"
+    );
+
+    // 全程零画面帧 / 零瓦片：被控端根本不采集。
+    assert_eq!(ctrl_sink.frames.load(Ordering::Relaxed), 0, "FileTransfer 不应有任何画面帧");
+    assert_eq!(ctrl_sink.tiles.load(Ordering::Relaxed), 0, "FileTransfer 不应有任何瓦片");
+
+    let _ = std::fs::remove_dir_all(&share);
+    let _ = std::fs::remove_dir_all(&dl);
 }
 

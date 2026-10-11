@@ -3,6 +3,12 @@
 //! 数据面（P2P 屏幕/输入流）跑在仓库内置的 hbbs 会合 + hbbr 中继上；本模块只负责
 //! 控制面——谁可以被远程、谁能连谁、会话授权与生命周期。
 //!
+//! 会话条目分两段生命周期：**待应答**（已签发、等被控端拍板）与**已接受**。
+//! [`REMOTE_SESSION_TTL`] 只治理前一段——被控端迟迟不应答才该过期。会话一旦被接受，
+//! 条目就必须活到任一端断开或显式 `End` 为止：若长会话（> TTL）在接受后仍被按 TTL
+//! 回收，后续 `End`/断开就查不到条目、对端永远收不到 `RemoteSessionEnd`，端侧表现成
+//! 「卡住」而非「对端结束了」。已接受条目只受 [`ACCEPTED_SESSION_MAX_LIFETIME`] 兜底。
+//!
 //! 硬约束：**所有 S→C 的远程变体推送前都必须过 [`client_supports_remote`]**。老客户端
 //! 收到未知 bincode 变体会反序列化失败并断开控制连接（与既有 `AgentExecCancel` 同因）。
 
@@ -20,10 +26,27 @@ use rust_tunnel_rustdesk::key::ServerKey;
 use super::client_registry::ClientEntry;
 use super::state::ServerState;
 
-/// 会话授权默认 TTL：被控端须在此期间内应答，否则视为过期（由 `issue`/`reap_expired` 回收）。
+/// 会话授权默认 TTL：被控端须在此期间内**应答**，否则视为过期（由 `issue`/`reap_expired` 回收）。
+///
+/// **只治理「待应答」阶段**（[`PendingSession::accepted_at`] 为 `None`）——用户拍板前的窗口。
+/// 会话被接受后不再受它约束，改由 [`ACCEPTED_SESSION_MAX_LIFETIME`] 兜底；否则长会话在接受后
+/// 被回收，`End`/断开会查不到条目、对端收不到 `RemoteSessionEnd`（见模块文档）。
 pub const REMOTE_SESSION_TTL: Duration = Duration::from_secs(60);
 
-/// 一条已签发、等待被控端应答的远程会话（内存态）。
+/// 已接受会话的兜底存活上限（12 小时）。
+///
+/// 正常路径根本用不到：会话在任一端断开时由 [`RemoteSessionTable::remove_for_client`] 摘除，
+/// 显式结束由 [`RemoteSessionTable::end`] 摘除，所以条目不会活这么久。它只是**防遗漏的最后
+/// 一道闸**——万一某条清理路径没走到（断连回调丢失、任务被 kill 等），也绝不能让已接受条目
+/// 把表顶到无界增长。取值取「明显长于任何真实远程会话」的量级：真机一次遥控很少超过数小时，
+/// 而与 [`REMOTE_SESSION_TTL`]（60s）拉开三个数量级，避免误伤长会话。
+pub const ACCEPTED_SESSION_MAX_LIFETIME: Duration = Duration::from_hours(12);
+
+/// 一条已签发的远程会话（内存态）。
+///
+/// 生命周期分两段：`accepted_at == None` 为**待应答**（等被控端拍板，受 [`REMOTE_SESSION_TTL`]
+/// 约束）；`Some(t)` 为**已接受**（`t` 为接受时刻，脱离 TTL，只受 [`ACCEPTED_SESSION_MAX_LIFETIME`]
+/// 兜底）。
 #[derive(Debug, Clone)]
 pub struct PendingSession {
     /// 一次性鉴权 token（被控端在数据面握手时校验）。
@@ -34,8 +57,10 @@ pub struct PendingSession {
     pub controller_client: String,
     /// 会话模式。
     pub mode: RemoteMode,
-    /// 签发时刻（单调时钟，仅用于 TTL 判定）。
+    /// 签发时刻（单调时钟，用于待应答阶段的 TTL 判定）。
     pub created_at: Instant,
+    /// 被控端接受时刻；`None` = 仍待应答。一旦填充，条目脱离 TTL 治理。
+    pub accepted_at: Option<Instant>,
 }
 
 /// 内存会话授权表：`session_id -> PendingSession`。
@@ -78,6 +103,7 @@ impl RemoteSessionTable {
                 controller_client: controller.to_string(),
                 mode,
                 created_at: Instant::now(),
+                accepted_at: None,
             },
         );
         (session_id, token)
@@ -98,8 +124,20 @@ impl RemoteSessionTable {
         self.inner.lock().await.remove(session_id);
     }
 
-    /// 移除 `client` 参与的全部会话，返回 `(session_id, 对端客户端名)` 列表，
-    /// 供控制连接断开时通知对端。`client` 为被控端时对端取控制端，反之亦然。
+    /// 把会话标记为「已接受」，使其脱离 [`REMOTE_SESSION_TTL`] 治理（改由
+    /// [`ACCEPTED_SESSION_MAX_LIFETIME`] 兜底）。未知 `session_id` 静默忽略。
+    ///
+    /// 记录接受时刻而非只翻一个 bool：既表达阶段，也保留「这条会话活了多久」的信息，
+    /// 且将来若要改成「按接受时刻起算兜底」无需再动结构。
+    pub async fn mark_accepted(&self, session_id: &str) {
+        let mut table = self.inner.lock().await;
+        if let Some(session) = table.get_mut(session_id) {
+            session.accepted_at = Some(Instant::now());
+        }
+    }
+
+    /// 移除 `client` 参与的全部会话（**含待应答与已接受**），返回 `(session_id, 对端客户端名)`
+    /// 列表，供控制连接断开时通知对端。`client` 为被控端时对端取控制端，反之亦然。
     pub async fn remove_for_client(&self, client: &str) -> Vec<(String, String)> {
         let mut table = self.inner.lock().await;
         let ids: Vec<String> = table
@@ -121,7 +159,10 @@ impl RemoteSessionTable {
         out
     }
 
-    /// 回收创建时刻早于 `now - ttl` 的会话，返回回收条数。
+    /// 回收过期会话，返回回收条数。
+    ///
+    /// 待应答条目按 `ttl` 回收；已接受条目**不受 `ttl` 影响**，只受
+    /// [`ACCEPTED_SESSION_MAX_LIFETIME`] 兜底（见 [`reap_locked`]）。
     pub async fn reap_expired(&self, ttl: Duration) -> usize {
         let mut table = self.inner.lock().await;
         reap_locked(&mut table, ttl)
@@ -133,10 +174,17 @@ impl RemoteSessionTable {
     }
 }
 
-/// 从表中剔除已过 TTL 的会话，返回剔除条数。
+/// 从表中剔除过期会话，返回剔除条数。
+///
+/// 阶段决定用哪个时限：**待应答**条目按 `ttl` 判定；**已接受**条目不看 `ttl`，只用
+/// [`ACCEPTED_SESSION_MAX_LIFETIME`] 兜底——否则 60s 的 TTL 会把长会话一并回收，`End`/
+/// 断开就找不到条目（见模块文档）。
 fn reap_locked(table: &mut HashMap<String, PendingSession>, ttl: Duration) -> usize {
     let before = table.len();
-    table.retain(|_, s| s.created_at.elapsed() < ttl);
+    table.retain(|_, s| match s.accepted_at {
+        None => s.created_at.elapsed() < ttl,
+        Some(accepted) => accepted.elapsed() < ACCEPTED_SESSION_MAX_LIFETIME,
+    });
     before - table.len()
 }
 
@@ -389,16 +437,22 @@ pub async fn handle_remote_connect_request(
     }
 
     let grant = ControlMessage::RemoteConnectGrant {
-        session_id,
+        session_id: session_id.clone(),
         token,
         target_rd_id: caps.rd_id,
         target_platform: caps.platform,
         params,
     };
-    let _ = controller.control_sender.send(grant).await;
+    if controller.control_sender.send(grant).await.is_err() {
+        // 控制器控制通道已断：会话条目与被控端手里的 token 都会白留到回收，且被控端会
+        // 挂着一个「永远不会有人拨进来」的会话。清掉条目，并尽力告知被控端原因，让它
+        // 立刻收摊而不是干等 TTL/兜底。
+        state.remote_sessions.end(&session_id).await;
+        notify_end(state, target_client, &session_id, "控制器已离线").await;
+    }
 }
 
-/// 处理被控端应答：转发给控制器；拒绝则同时清理会话。
+/// 处理被控端应答：转发给控制器；拒绝则清理会话，接受则把条目升为「已接受」阶段。
 ///
 /// 只有该会话的被控端有权应答（其余来源记 `warn!` 丢弃）。
 pub async fn handle_session_response(
@@ -427,7 +481,10 @@ pub async fn handle_session_response(
         reason,
     )
     .await;
-    if !accepted {
+    if accepted {
+        // 脱离 TTL 治理：之后只剩「任一端断开 / 显式 End」和兜底上限能清它。
+        state.remote_sessions.mark_accepted(session_id).await;
+    } else {
         state.remote_sessions.end(session_id).await;
     }
 }
@@ -459,7 +516,8 @@ async fn notify_controller_response(
         .await;
 }
 
-/// 处理任一端发起的会话结束：一次性消费会话并通知对端。
+/// 处理任一端发起的会话结束：一次性消费会话并通知对端。待应答与已接受阶段都适用——
+/// 正因为已接受条目不再被 TTL 回收（见模块文档），这里才能对长会话正常转发 `End`。
 ///
 /// 只有会话的两端之一有权结束它；非参与方的结束请求被丢弃（`session_id` 是
 /// uuid v4 本不可猜，此处是纵深防御：不校验的话任何客户端只要拿到 session_id
@@ -1092,5 +1150,278 @@ mod tests {
             other => panic!("expected RemoteSessionEnd, got {other:?}"),
         }
         assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    // ── 会话两段生命周期：TTL 只治理「待应答」 ──
+
+    #[tokio::test]
+    async fn test_pending_session_reaped_by_ttl() {
+        // 回归：阶段划分后 TTL 仍必须治理「待应答」——别把 TTL 一并修失效。
+        let table = RemoteSessionTable::new();
+        let (sid, _) = table.issue("t", "c", RemoteMode::Control).await;
+        // 不响应；把签发时刻倒退到超过 TTL（不用 sleep，避免测试拖墙钟）。
+        {
+            let mut inner = table.inner.lock().await;
+            inner.get_mut(&sid).unwrap().created_at = Instant::now()
+                .checked_sub(REMOTE_SESSION_TTL + Duration::from_secs(1))
+                .expect("backdating within representable range");
+        }
+        assert_eq!(table.reap_expired(REMOTE_SESSION_TTL).await, 1);
+        assert!(table.get(&sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_accepted_session_survives_ttl_then_reaped_at_backstop() {
+        // 已接受条目：60s TTL 不得回收它，但必须有很长的兜底上限防止表无界增长。
+        let table = RemoteSessionTable::new();
+        let (sid, _) = table.issue("t", "c", RemoteMode::Control).await;
+        table.mark_accepted(&sid).await;
+
+        // 普通 TTL 不动已接受条目。
+        assert_eq!(table.reap_expired(REMOTE_SESSION_TTL).await, 0);
+        assert!(table.get(&sid).await.is_some());
+
+        // 把接受时刻倒退到超过兜底上限（用 pub const 构造时间差，不用 sleep），此时才回收。
+        {
+            let mut inner = table.inner.lock().await;
+            inner.get_mut(&sid).unwrap().accepted_at = Some(
+                Instant::now()
+                    .checked_sub(ACCEPTED_SESSION_MAX_LIFETIME + Duration::from_secs(1))
+                    .expect("backdating within representable range"),
+            );
+        }
+        assert_eq!(
+            table
+                .reap_expired(ACCEPTED_SESSION_MAX_LIFETIME + Duration::from_secs(1))
+                .await,
+            1
+        );
+        assert!(table.get(&sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_accepted_session_end_still_forwards_after_ttl_elapsed() {
+        // 端到端复现原症状：接受后即使过了 TTL，端侧发起 End 仍要能转发给对端
+        // （旧行为是条目已被回收 → 对端收不到 End → 端侧「卡住」）。
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let mut rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let mut rx_target = register(&state, "target", "0.10.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1);
+        target.set_rd_id("123123123".to_string());
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+        let sid = match rx_ctrl.recv().await.unwrap() {
+            ControlMessage::RemoteConnectGrant { session_id, .. } => session_id,
+            other => panic!("expected grant, got {other:?}"),
+        };
+        let _incoming = rx_target.recv().await.unwrap();
+
+        handle_session_response(&state, "target", &sid, true, None).await;
+        let _accepted = rx_ctrl.recv().await.unwrap();
+
+        // 一次普通 TTL 回收之后条目仍在。
+        assert_eq!(state.remote_sessions.reap_expired(REMOTE_SESSION_TTL).await, 0);
+        assert!(state.remote_sessions.get(&sid).await.is_some());
+
+        // End 仍能转发给控制器。
+        handle_session_end(&state, "target", &sid, "done").await;
+        match rx_ctrl.recv().await.unwrap() {
+            ControlMessage::RemoteSessionEnd { session_id, reason } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(reason, "done");
+            }
+            other => panic!("expected RemoteSessionEnd, got {other:?}"),
+        }
+        assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    // ── 授权守卫（纵深防御）──
+
+    #[tokio::test]
+    async fn test_session_response_from_non_target_is_dropped() {
+        // 只有该会话的被控端有权应答：第三方应答既不转发给控制器、也不清会话。
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let mut rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let _rx_target = register(&state, "target", "0.10.0").await;
+        let _rx_intruder = register(&state, "intruder", "0.10.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1);
+        target.set_rd_id("321321321".to_string());
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+        let sid = match rx_ctrl.recv().await.unwrap() {
+            ControlMessage::RemoteConnectGrant { session_id, .. } => session_id,
+            other => panic!("expected grant, got {other:?}"),
+        };
+
+        handle_session_response(&state, "intruder", &sid, false, Some("spoof".into())).await;
+
+        let got = tokio::time::timeout(Duration::from_millis(150), rx_ctrl.recv()).await;
+        assert!(got.is_err(), "非被控端应答不应转发给控制器，却收到 {got:?}");
+        assert!(state.remote_sessions.get(&sid).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_end_from_non_participant_is_dropped() {
+        // 非参与方的 End 被丢弃（会话仍在、无人被通知）；参与方（控制器）的正常结束仍转发。
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let _rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let mut rx_target = register(&state, "target", "0.10.0").await;
+        let _rx_intruder = register(&state, "intruder", "0.10.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1);
+        target.set_rd_id("456456456".to_string());
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+        // session_id 从被控端的 Incoming 取（控制器侧通道留着不读也无妨）。
+        let sid = match rx_target.recv().await.unwrap() {
+            ControlMessage::RemoteSessionIncoming { session_id, .. } => session_id,
+            other => panic!("expected incoming, got {other:?}"),
+        };
+
+        handle_session_end(&state, "intruder", &sid, "shutdown").await;
+        assert!(
+            state.remote_sessions.get(&sid).await.is_some(),
+            "非参与方不应能拆掉会话"
+        );
+        let got = tokio::time::timeout(Duration::from_millis(150), rx_target.recv()).await;
+        assert!(got.is_err(), "非参与方结束不应通知任何一方，却收到 {got:?}");
+
+        handle_session_end(&state, "ctrl", &sid, "bye").await;
+        match rx_target.recv().await.unwrap() {
+            ControlMessage::RemoteSessionEnd { session_id, reason } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(reason, "bye");
+            }
+            other => panic!("expected RemoteSessionEnd, got {other:?}"),
+        }
+        assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    // ── 拒绝分支：控制器必收到 accepted:false 且带可读原因 ──
+
+    #[tokio::test]
+    async fn test_connect_request_denied_when_target_version_unsupported() {
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let mut rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let _rx_target = register(&state, "target", "0.9.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1);
+        target.set_rd_id("111000111".to_string());
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+        match rx_ctrl.recv().await.unwrap() {
+            ControlMessage::RemoteSessionResponse {
+                accepted, reason, ..
+            } => {
+                assert!(!accepted);
+                assert!(reason.unwrap_or_default().contains("版本"));
+            }
+            other => panic!("expected RemoteSessionResponse, got {other:?}"),
+        }
+        assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect_request_denied_when_target_lacks_rd_id() {
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let mut rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let _rx_target = register(&state, "target", "0.10.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1); // 刻意不给 rd_id
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+        match rx_ctrl.recv().await.unwrap() {
+            ControlMessage::RemoteSessionResponse {
+                accepted, reason, ..
+            } => {
+                assert!(!accepted);
+                assert!(reason.unwrap_or_default().contains("ID"));
+            }
+            other => panic!("expected RemoteSessionResponse, got {other:?}"),
+        }
+        assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect_request_denied_when_rustdesk_disabled() {
+        let state = state_with_rustdesk(false).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let mut rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let _rx_target = register(&state, "target", "0.10.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1);
+        target.set_rd_id("222222222".to_string());
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+        match rx_ctrl.recv().await.unwrap() {
+            ControlMessage::RemoteSessionResponse {
+                accepted, reason, ..
+            } => {
+                assert!(!accepted);
+                assert!(reason.unwrap_or_default().contains("未启用"));
+            }
+            other => panic!("expected RemoteSessionResponse, got {other:?}"),
+        }
+        assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    // ── 部分失败时的记账清理 ──
+
+    #[tokio::test]
+    async fn test_grant_failure_cleans_up_session_and_notifies_target() {
+        // 控制器下发 Grant 失败时不能把会话条目与被控端手里的 token 白留到回收：
+        // 条目必须清掉，且尽力告知被控端「控制器已离线」，别让它干等一个不会来的拨入。
+        let state = state_with_rustdesk(true).await;
+        let registry = state.client_registry.as_ref().unwrap();
+        let rx_ctrl = register(&state, "ctrl", "0.10.0").await;
+        let mut rx_target = register(&state, "target", "0.10.0").await;
+        let target = registry.get("target").await.unwrap();
+        target.set_remote_caps(true, "linux".to_string(), 1);
+        target.set_rd_id("999888777".to_string());
+        let ctrl = registry.get("ctrl").await.unwrap();
+
+        // drop 控制器接收端 → 后续 send 返回 Err（模拟控制通道已断）。
+        drop(rx_ctrl);
+
+        handle_remote_connect_request(&state, &ctrl, "target", RemoteMode::Control).await;
+
+        // 被控端：先收到 Incoming，紧接着收到希望它收摊的 End。
+        let _incoming = rx_target.recv().await.unwrap();
+        match rx_target.recv().await.unwrap() {
+            ControlMessage::RemoteSessionEnd { reason, .. } => {
+                assert_eq!(reason, "控制器已离线");
+            }
+            other => panic!("expected RemoteSessionEnd, got {other:?}"),
+        }
+        assert_eq!(state.remote_sessions.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_push_remote_config_false_for_unknown_or_offline() {
+        let state = state_with_rustdesk(true).await;
+        // 从未注册。
+        assert!(!push_remote_config(&state, "ghost").await);
+        // 注册后离线。
+        let _rx = register(&state, "nas", "0.10.0").await;
+        state
+            .client_registry
+            .as_ref()
+            .unwrap()
+            .disconnect("nas", "test")
+            .await;
+        assert!(!push_remote_config(&state, "nas").await);
     }
 }

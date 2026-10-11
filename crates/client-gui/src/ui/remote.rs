@@ -5,7 +5,7 @@ use std::sync::Arc;
 use egui::{RichText, Ui};
 use rust_tunnel_common::protocol::RemoteMode;
 use rust_tunnel_remote::{
-    ApprovalPolicy, Clipboard as _, QualityPreset, RemoteManager, RemoteUiState, SessionRole, SessionState,
+    ApprovalPolicy, QualityPreset, RemoteManager, RemoteUiState, SessionRole, SessionState,
 };
 
 use crate::app::AppState;
@@ -146,6 +146,12 @@ fn remaining_secs(deadline_ms: u64) -> u64 {
 /// 只展示 [`rust_tunnel_remote::PendingApproval`] 携带的字段——其中**不含**握手 token。
 /// 倒计时随 `GuiApp::update` 的 `request_repaint_after` 自然刷新，无需额外唤醒。
 pub fn approval_modal(ctx: &egui::Context, view: &mut RemoteView, manager: Option<&Arc<RemoteManager>>) {
+    // 每帧收敛输入捕获：本函数是 `GuiApp::update` 里**每帧**都会执行、且同时拿到
+    // `&mut RemoteView` 与 `egui::Context` 的唯一入口（`show` 只在远程 Tab 被选中时渲染）。
+    // 用户切到别的 Tab / 退出「完全控制」模式 / 会话结束时，`capture_input` 会停止运行，
+    // 由这里把「已转达按下」的键补发抬起，避免远端残留按下的键。
+    view.reconcile_input_capture(ctx, manager);
+
     let Some(manager) = manager else {
         return;
     };
@@ -439,20 +445,28 @@ fn show_quality_selector(ui: &mut Ui, manager: &Arc<RemoteManager>, current: Qua
 ///
 /// 读取本机剪贴板借 [`remote::SystemClipboard`]（arboard）——egui 0.31 只提供**写**系统剪贴板的
 /// `Context::copy_text`，没有读取 API，故这里用平台实现读；读不到时可退回文本框里手填的内容。
+/// 「读取本机」不阻塞 UI 线程：点击只发起后台线程读取（见 [`RemoteView::request_local_clipboard`]），
+/// 结果在下一帧取回。
 fn show_clipboard(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>) {
     // 对端发来的剪贴板：从共享槽取走并留在本地输入态，跨帧展示。
     if let Some(text) = view.take_clipboard() {
         view.inputs_mut().clipboard_in = Some(text);
     }
 
+    // 后台读取结果（若有）在本帧取回并填入输入框；读取在短命线程里做，绝不阻塞 UI 线程。
+    if let Some(result) = view.take_clipboard_read() {
+        match result {
+            Ok(text) => view.inputs_mut().clipboard_out = text,
+            Err(err) => tracing::warn!("读取本机剪贴板失败：{err}"),
+        }
+    }
+
     ui.separator();
     ui.horizontal(|ui| {
         ui.label(RichText::new("剪贴板").strong());
         if ui.button("读取本机").clicked() {
-            match remote::SystemClipboard.get() {
-                Ok(text) => view.inputs_mut().clipboard_out = text,
-                Err(err) => tracing::warn!("读取本机剪贴板失败：{err}"),
-            }
+            // 只发起异步读取；结果下一帧经 `take_clipboard_read` 取回（见 `request_local_clipboard`）。
+            view.request_local_clipboard();
         }
         if ui.button("发送本机剪贴板").clicked() {
             let text = view.inputs_mut().clipboard_out.clone();
