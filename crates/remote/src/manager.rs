@@ -515,11 +515,20 @@ impl RemoteManager {
             session_id: session_id.clone(),
             cancel: cancel.clone(),
         });
-        debug!(target_platform = %target_platform, "启动控制器会话");
+        // `RemoteConnectGrant` 只带 `target_rd_id`，不带展示名：回查可远程列表把名字补上，
+        // 否则会话窗口会显示一串 9 位数字。列表里查不到（对端刚离线等）就回落到 rd_id。
+        let peer_name = {
+            let ui = self.ui_tx.borrow();
+            ui.peers
+                .iter()
+                .find(|p| p.rd_id == target_rd_id)
+                .map_or_else(|| target_rd_id.clone(), |p| p.display_name.clone())
+        };
+        debug!(target_platform = %target_platform, peer = %peer_name, "启动控制器会话");
         let info = ActiveSessionInfo {
             session_id: session_id.clone(),
             role: SessionRole::Controller,
-            peer_name: target_rd_id.clone(),
+            peer_name,
             mode,
             state: SessionState::Connecting,
             started_at_ms: now_ms(),
@@ -1092,6 +1101,55 @@ mod tests {
             ControlMessage::RemoteAnnounce { enabled, .. } => assert!(enabled),
             other => panic!("应为 RemoteAnnounce，实得 {other:?}"),
         }
+    }
+
+    /// 控制器会话的 `peer_name` 应是**展示名**，不是服务端下发的 9 位 `rd_id`。
+    #[tokio::test]
+    async fn grant_resolves_peer_display_name_from_list() {
+        let mgr = manager(true);
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".into(),
+        });
+        mgr.handle_control_message(ControlMessage::RemotePeerList {
+            peers: vec![RemotePeerInfo {
+                client_name: "office-pc".into(),
+                display_name: "Office PC".into(),
+                platform: "windows".into(),
+                displays: 2,
+                rd_id: "987654321".into(),
+            }],
+        });
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s1".into(),
+            token: "t1".into(),
+            target_rd_id: "987654321".into(),
+            target_platform: "windows".into(),
+            params: params(),
+        });
+
+        let active = mgr.snapshot().active.expect("应进入控制器会话");
+        assert_eq!(active.peer_name, "Office PC", "应显示对端展示名");
+    }
+
+    /// 列表里查不到（对端刚离线）时回落到 `rd_id`，而不是留空。
+    #[tokio::test]
+    async fn grant_falls_back_to_rd_id_when_peer_unknown() {
+        let mgr = manager(true);
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".into(),
+        });
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s1".into(),
+            token: "t1".into(),
+            target_rd_id: "987654321".into(),
+            target_platform: "windows".into(),
+            params: params(),
+        });
+
+        let active = mgr.snapshot().active.expect("应进入控制器会话");
+        assert_eq!(active.peer_name, "987654321");
     }
 
     #[test]
