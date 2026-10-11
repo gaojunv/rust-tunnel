@@ -20,7 +20,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
-use rust_tunnel_remote::{EncodeOptions, RemoteManager, RemoteManagerConfig};
+use rust_tunnel_remote::{ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig};
 
 fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
     let bytes: &[u8] = include_bytes!("../icons/icon.png");
@@ -47,6 +47,9 @@ struct GuiApp {
     prefs: prefs::GuiPrefs,
     /// 远程会话窗口的 GUI 侧状态（纹理 + 输入捕获边沿状态）。
     remote_view: remote::RemoteView,
+    /// 上一帧待确认请求的会话 ID。用于检测 `None → Some` 跳变，仅在**首次出现**时
+    /// 强制显示并聚焦窗口（见 `update`），避免每帧与用户抢焦点。
+    last_pending_approval: Option<String>,
 }
 
 impl GuiApp {
@@ -68,6 +71,7 @@ impl GuiApp {
             last_tray_texts: None,
             prefs,
             remote_view: remote::RemoteView::new(),
+            last_pending_approval: None,
         }
     }
 
@@ -86,6 +90,24 @@ impl GuiApp {
             tracing::warn!("被控开关保存失败：{e}");
         }
         tracing::info!("允许被远程控制：{}", if on { "开" } else { "关" });
+    }
+
+    /// 应用接入确认策略的新状态：同步到引擎并落盘 gui.toml。
+    fn apply_approval_policy(&mut self, policy: ApprovalPolicy) {
+        self.prefs.remote_approval = policy;
+        if let Some(manager) = self.app_state.remote() {
+            manager.set_approval_policy(policy);
+        }
+        if let Err(e) = prefs::save(&self.prefs) {
+            tracing::warn!("接入确认策略保存失败：{e}");
+        }
+        tracing::info!(
+            "接入确认策略：{}",
+            match policy {
+                ApprovalPolicy::Auto => "自动接受",
+                ApprovalPolicy::Confirm => "需要确认",
+            }
+        );
     }
 }
 
@@ -159,11 +181,19 @@ impl GuiApp {
     }
 
     /// 托盘状态菜单/Tooltip 随连接态刷新（逐字段比较，仅写入变化字段）。
-    fn refresh_tray(&mut self, status: &ClientStatus) {
+    ///
+    /// `pending_approval` 为真时覆盖 tooltip：此时窗口可能已隐藏到托盘，tooltip 是用户
+    /// 唯一能看到的线索，提示有接入请求待确认。
+    fn refresh_tray(&mut self, status: &ClientStatus, pending_approval: bool) {
+        let tooltip = if pending_approval {
+            "rust-tunnel — 有远程接入请求待确认".to_owned()
+        } else {
+            tray::tooltip_text(status)
+        };
         let sig = (
             tray::status_menu_text(status),
             tray::server_menu_text(status),
-            tray::tooltip_text(status),
+            tooltip,
         );
         if self.last_tray_texts.as_ref() == Some(&sig) {
             return;
@@ -240,16 +270,29 @@ impl eframe::App for GuiApp {
         self.drain_tray_actions(ctx);
 
         let status = self.app_state.status_rx.borrow().clone();
-        self.refresh_tray(&status);
-        self.show_tabs(ctx);
 
         // 远程引擎就绪后安装帧通道（幂等）；引擎由后台运行时线程注入 AppState。
         let remote_manager = self.app_state.remote();
+        // 一帧只取一次远程状态快照：托盘 tooltip 与「待确认请求首次出现」都基于它。
+        let pending_id = remote_manager
+            .as_ref()
+            .and_then(|m| m.snapshot().pending_approval.map(|p| p.session_id));
+        self.refresh_tray(&status, pending_id.is_some());
+        self.show_tabs(ctx);
+
+        // 待确认请求首次出现：窗口可能已隐藏到托盘（见 `intercept_close`），安全提示绝不能
+        // 静默超时，故强制显示并聚焦。仅在 None→Some 跳变时做，避免每帧与用户抢焦点。
+        if pending_id.is_some() && self.last_pending_approval != pending_id {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        self.last_pending_approval = pending_id;
+
         if let Some(manager) = remote_manager.as_ref() {
             self.remote_view.ensure_sink(ctx, manager);
         }
 
-        let mut remote_toggle: Option<bool> = None;
+        let mut remote_actions = ui::remote::RemoteTabActions::default();
         let settings = &mut self.settings;
         let remote_view = &mut self.remote_view;
         let app_state = &self.app_state;
@@ -261,7 +304,7 @@ impl eframe::App for GuiApp {
                 0 => ui::status::show(ui, &status),
                 1 => ui::mappings::show(ui, &status),
                 2 => {
-                    remote_toggle =
+                    remote_actions =
                         ui::remote::show(ui, remote_view, remote_manager.as_ref(), app_state);
                 }
                 3 => ui::settings::show(ui, settings, app_state),
@@ -269,9 +312,14 @@ impl eframe::App for GuiApp {
                 _ => {}
             }
         });
-        if let Some(on) = remote_toggle {
+        if let Some(on) = remote_actions.allow_remote {
             self.apply_allow_remote(on);
         }
+        if let Some(policy) = remote_actions.approval_policy {
+            self.apply_approval_policy(policy);
+        }
+        // 接入确认弹窗常驻所有 Tab 之上（与 `controlled_banner` 同理）。
+        ui::remote::approval_modal(ctx, &mut self.remote_view, remote_manager.as_ref());
 
         let needs_repaint = !status.connected || status.last_error.is_some();
         if needs_repaint {
@@ -285,8 +333,9 @@ impl eframe::App for GuiApp {
 /// 构造远程控制引擎（配置就绪后调用一次）。
 ///
 /// `displays` 传 1 只是安装平台实现前的占位——[`remote::install_platform`] 之后
-/// 引擎以 `ScreenSource::displays()` 为准。
-fn build_remote_manager(config: &ClientConfig, enabled: bool) -> Arc<RemoteManager> {
+/// 引擎以 `ScreenSource::displays()` 为准。`approval_policy` 取自持久化偏好，决定被控端
+/// 是直接接受还是每次弹窗确认。
+fn build_remote_manager(config: &ClientConfig, enabled: bool, approval_policy: ApprovalPolicy) -> Arc<RemoteManager> {
     let establisher = Arc::new(remote::LazyTransport::new(config.server.clone()));
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),
@@ -294,6 +343,7 @@ fn build_remote_manager(config: &ClientConfig, enabled: bool) -> Arc<RemoteManag
         platform: remote::platform_name().to_owned(),
         displays: 1,
         enabled,
+        approval_policy,
         establisher,
         encode: EncodeOptions::default(),
         // 被控端共享目录固定为「下载」目录下的 rust-tunnel-share：可见、易找，且与用户的
@@ -317,6 +367,7 @@ fn spawn_runtime(
     log_buffer: Arc<LogBuffer>,
     reconnect_flag: Arc<AtomicBool>,
     initial_allow_remote: bool,
+    initial_approval: ApprovalPolicy,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -402,7 +453,7 @@ fn spawn_runtime(
             // 远程控制引擎：配置就绪后构造一次，安装平台实现（截屏/注入），注入 AppState
             // 供 GUI 读取，桥接交给控制通道。构造在此（而非 main）是因为 server_host /
             // 客户端名要等磁盘配置加载完；无配置时上面的循环会先等到配置。
-            let remote_manager = build_remote_manager(&config, initial_allow_remote);
+            let remote_manager = build_remote_manager(&config, initial_allow_remote, initial_approval);
             app_state.set_remote(Arc::clone(&remote_manager));
 
             let mut policy = ReconnectPolicy::new();
@@ -514,6 +565,7 @@ fn main() -> anyhow::Result<()> {
         log_buffer,
         reconnect_flag,
         prefs.allow_remote,
+        prefs.remote_approval,
     );
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，

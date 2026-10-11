@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use rust_tunnel_remote::ApprovalPolicy;
+
 use crate::config_store;
 
 /// 主题偏好（持久化值；egui 的 `ThemePreference` 未启用 serde，自行映射）。
@@ -69,6 +71,10 @@ pub struct GuiPrefs {
     /// 交给持有效 token 的对端，必须是用户的显式选择，且随进程重启保留。
     #[serde(default)]
     pub allow_remote: bool,
+    /// 被控端的接入确认策略。默认 `Confirm`——旧配置文件缺此字段时也落到「每次询问」，
+    /// 这是安全侧默认，不要改成 `Auto`。
+    #[serde(default)]
+    pub remote_approval: ApprovalPolicy,
 }
 
 /// GUI 偏好文件路径（与 client 配置同目录的 gui.toml）。

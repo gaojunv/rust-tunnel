@@ -3,12 +3,13 @@
 //! 这些测试放在 crate 内部（而非 `tests/`）以便复用 lib.rs 头部的 `cfg_attr(test, allow(...))`
 //! 豁免，并直接访问私有辅助。
 
+use crate::approval::ApprovalPolicy;
 use crate::auth::PendingSessions;
 use crate::controller::{run_controller, ControllerConfig};
 use crate::controlled::{run_controlled, ControlledConfig};
 use crate::transfer::{TransferEvent, TransferHub};
 use crate::error::{RemoteError, RemoteResult};
-use crate::manager::{RemoteManager, RemoteManagerConfig};
+use crate::manager::{RemoteManager, RemoteManagerConfig, SessionState};
 use crate::screen::{
     Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton,
     RawFrame, ScreenSource, TileUpdate,
@@ -292,6 +293,8 @@ fn manager_with_dirs(
         },
         share_dir,
         download_dir,
+        // 既有用例都按「直接接受」跑；确认门控的新用例各自 `set_approval_policy(Confirm)`。
+        approval_policy: ApprovalPolicy::Auto,
     })
 }
 
@@ -431,10 +434,12 @@ async fn establish_session(ctrl: &Arc<RemoteManager>, ctld: &Arc<RemoteManager>)
         .await
         .expect("等被控端应答超时")
         .expect("通道关闭");
-    match response {
+    match &response {
         ControlMessage::RemoteSessionResponse { accepted, .. } => assert!(accepted, "应接受会话"),
         other => panic!("应为 RemoteSessionResponse，实得 {other:?}"),
     }
+    // 服务端会把该响应无条件转达给控制器（新门控下控制器要等它才建立数据面）。
+    ctrl.handle_control_message(response);
 }
 
 /// 造一个空闲的传输状态机（这些用例不测文件传输）。
@@ -497,10 +502,12 @@ async fn full_session_between_two_managers() {
         .await
         .expect("等被控端应答超时")
         .expect("通道关闭");
-    match response {
+    match &response {
         ControlMessage::RemoteSessionResponse { accepted, .. } => assert!(accepted, "应接受会话"),
         other => panic!("应为 RemoteSessionResponse，实得 {other:?}"),
     }
+    // 服务端转达响应 → 控制器才建立数据面。
+    ctrl.handle_control_message(response);
 
     // 控制器应收到显示器列表与至少一帧画面。
     tokio::time::timeout(WAIT, frame_rx.recv())
@@ -694,6 +701,12 @@ async fn establish_failure_surfaces_as_session_error() {
         target_rd_id: "222222222".to_owned(),
         target_platform: "linux".to_owned(),
         params: params(),
+    });
+    // 新门控：控制器要先收到被控端确认才会去建立数据面；服务端会转达它。
+    mgr.handle_control_message(ControlMessage::RemoteSessionResponse {
+        session_id: "sess-x".to_owned(),
+        accepted: true,
+        reason: None,
     });
 
     // 建立失败 → 会话结束，last_error 有值。
@@ -987,6 +1000,252 @@ async fn clipboard_request_and_send_roundtrip() {
     assert!(
         poll_until(|| clipboard.current() == "from-controller").await,
         "被控端剪贴板应被写入"
+    );
+}
+
+// ── 接入确认门控 ───────────────────────────────────────────────────────
+
+/// 从通道取出下一条 `RemoteSessionResponse`（跳过 `RemoteSessionEnd` 等旁路消息）。
+async fn next_response(rx: &mut mpsc::Receiver<ControlMessage>) -> ControlMessage {
+    loop {
+        let msg = tokio::time::timeout(WAIT, rx.recv())
+            .await
+            .expect("等响应超时")
+            .expect("通道关闭");
+        if matches!(msg, ControlMessage::RemoteSessionResponse { .. }) {
+            return msg;
+        }
+    }
+}
+
+/// 造一个装了平台实现、确认策略为 `Confirm` 的被控端。
+fn confirm_controlled() -> Arc<RemoteManager> {
+    let mgr = manager(Arc::new(FailingEstablisher), true, "office-pc");
+    mgr.set_approval_policy(ApprovalPolicy::Confirm);
+    mgr.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+    mgr
+}
+
+/// 发一条接入请求。
+fn incoming(mgr: &Arc<RemoteManager>, session_id: &str, from_name: &str) {
+    mgr.handle_control_message(ControlMessage::RemoteSessionIncoming {
+        session_id: session_id.to_owned(),
+        token: "tok".to_owned(),
+        from_name: from_name.to_owned(),
+        mode: RemoteMode::Control,
+    });
+}
+
+/// 断言一条响应并返回 `(accepted, session_id, reason)`。
+fn expect_response(msg: ControlMessage) -> (bool, String, Option<String>) {
+    match msg {
+        ControlMessage::RemoteSessionResponse {
+            session_id,
+            accepted,
+            reason,
+        } => (accepted, session_id, reason),
+        other => panic!("应为 RemoteSessionResponse，实得 {other:?}"),
+    }
+}
+
+/// 1. `Confirm`：请求到达后**不回响应**，直到 `approve_pending` 才回 `accepted:true`。
+#[tokio::test]
+async fn confirm_policy_defers_until_approved() {
+    let ctld = confirm_controlled();
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-1", "home-nas");
+
+    assert!(rx.try_recv().is_err(), "确认前不应回任何响应");
+    let pending = ctld.snapshot().pending_approval.expect("应有待确认请求");
+    assert_eq!(pending.session_id, "sess-1");
+    assert_eq!(pending.from_name, "home-nas");
+    assert_eq!(pending.mode, RemoteMode::Control);
+    assert!(pending.deadline_ms > 0, "应带截止时刻");
+
+    ctld.approve_pending(false);
+    let (accepted, session_id, _) = expect_response(rx.try_recv().expect("批准后应回响应"));
+    assert!(accepted, "应接受");
+    assert_eq!(session_id, "sess-1");
+    assert!(ctld.snapshot().pending_approval.is_none(), "批准后应清空待确认");
+}
+
+/// 2. `reject_pending` 回 `accepted:false` 并带上理由（缺省为「用户拒绝」）。
+#[tokio::test]
+async fn reject_pending_sends_reason() {
+    let ctld = confirm_controlled();
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-1", "home-nas");
+    ctld.reject_pending(Some("不认识这台机器".into()));
+    let (accepted, session_id, reason) = expect_response(rx.try_recv().expect("应回拒绝"));
+    assert!(!accepted, "应拒绝");
+    assert_eq!(session_id, "sess-1");
+    assert_eq!(reason.as_deref(), Some("不认识这台机器"));
+    assert!(ctld.snapshot().pending_approval.is_none());
+
+    // 缺省理由。
+    incoming(&ctld, "sess-2", "home-nas");
+    ctld.reject_pending(None);
+    let (accepted, _, reason) = expect_response(rx.try_recv().expect("应回拒绝"));
+    assert!(!accepted);
+    assert_eq!(reason.as_deref(), Some("用户拒绝"));
+}
+
+/// 3. 超时自动拒绝，理由为「等待确认超时」。
+#[tokio::test]
+async fn approval_timeout_rejects() {
+    let ctld = confirm_controlled();
+    ctld.set_timeouts(Duration::from_millis(50), Duration::from_secs(5));
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-1", "home-nas");
+    let (accepted, session_id, reason) = expect_response(next_response(&mut rx).await);
+    assert!(!accepted, "超时应拒绝");
+    assert_eq!(session_id, "sess-1");
+    assert_eq!(reason.as_deref(), Some("等待确认超时"));
+    assert!(ctld.snapshot().pending_approval.is_none(), "超时后应清空待确认");
+}
+
+/// 4. 已信任对端再次请求时直接接受，不再弹窗。
+#[tokio::test]
+async fn trusted_peer_auto_accepts_without_prompt() {
+    let ctld = confirm_controlled();
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    // 第一次：确认并记住。
+    incoming(&ctld, "sess-1", "home-nas");
+    ctld.approve_pending(true);
+    let (accepted, _, _) = expect_response(next_response(&mut rx).await);
+    assert!(accepted, "首次应接受");
+    assert!(poll_until(|| ctld.snapshot().active.is_none()).await, "首会话应结束");
+    assert_eq!(ctld.snapshot().trusted_peers, vec!["home-nas".to_owned()]);
+
+    // 第二次：已信任 → 无弹窗直接接受。
+    incoming(&ctld, "sess-2", "home-nas");
+    assert!(
+        ctld.snapshot().pending_approval.is_none(),
+        "已信任对端不应再弹窗"
+    );
+    let (accepted, session_id, _) = expect_response(next_response(&mut rx).await);
+    assert!(accepted, "已信任应直接接受");
+    assert_eq!(session_id, "sess-2");
+}
+
+/// 5. 已有待确认请求时，第二条请求被拒。
+#[tokio::test]
+async fn second_incoming_while_pending_is_rejected() {
+    let ctld = confirm_controlled();
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-1", "home-nas");
+    incoming(&ctld, "sess-2", "other-pc");
+
+    let (accepted, session_id, reason) = expect_response(rx.try_recv().expect("应回拒绝"));
+    assert!(!accepted);
+    assert_eq!(session_id, "sess-2");
+    assert_eq!(reason.as_deref(), Some("被控端有待确认的接入请求"));
+    // 第一条仍在挂起。
+    assert_eq!(
+        ctld.snapshot().pending_approval.expect("首条应仍在").session_id,
+        "sess-1"
+    );
+}
+
+/// 6. `Auto` 策略仍立即接受（回归护栏）。
+#[tokio::test]
+async fn auto_policy_accepts_immediately() {
+    let ctld = manager(Arc::new(FailingEstablisher), true, "office-pc");
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+    let (tx, mut rx) = mpsc::channel(16);
+    ctld.attach(tx);
+
+    incoming(&ctld, "sess-1", "home-nas");
+    let (accepted, session_id, _) = expect_response(rx.try_recv().expect("应回响应"));
+    assert!(accepted, "Auto 应立即接受");
+    assert_eq!(session_id, "sess-1");
+    assert!(ctld.snapshot().pending_approval.is_none());
+}
+
+/// 7. 控制器在获被控端确认前**不建立数据面**；确认后才真正跑起来。
+#[tokio::test]
+async fn controller_waits_for_acceptance_before_establishing() {
+    let (a, b) = tokio::io::duplex(128 * 1024);
+    let ctrl_est = Arc::new(OneShotEstablisher::new(Box::new(a), true));
+    let ctld_est = Arc::new(OneShotEstablisher::new(Box::new(b), false));
+    let ctrl = manager(ctrl_est.clone(), false, "home-nas");
+    let ctld = manager(ctld_est, true, "office-pc");
+    ctld.set_approval_policy(ApprovalPolicy::Confirm);
+
+    let (ctrl_sink, mut frame_rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+
+    // 双方先拿到能力通告。
+    ctrl.handle_control_message(ControlMessage::RemoteCapability {
+        params: Some(params()),
+        rd_id: "111111111".to_owned(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteCapability {
+        params: Some(params()),
+        rd_id: "222222222".to_owned(),
+    });
+
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel(64);
+    let (ctld_tx, mut ctld_rx) = mpsc::channel(64);
+    ctrl.attach(ctrl_tx);
+    ctld.attach(ctld_tx);
+    let _ = ctrl_rx.try_recv();
+    let _ = ctld_rx.try_recv();
+
+    // 服务端：授权 + 转达请求。
+    ctrl.handle_control_message(ControlMessage::RemoteConnectGrant {
+        session_id: "sess-1".to_owned(),
+        token: "tok-1".to_owned(),
+        target_rd_id: "222222222".to_owned(),
+        target_platform: "linux".to_owned(),
+        params: params(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteSessionIncoming {
+        session_id: "sess-1".to_owned(),
+        token: "tok-1".to_owned(),
+        from_name: "home-nas".to_owned(),
+        mode: RemoteMode::Control,
+    });
+
+    // 控制器已受理，但停在「正在协商」，尚未建立数据面。
+    let active = ctrl.snapshot().active.expect("控制器应受理");
+    assert_eq!(active.state, SessionState::Negotiating, "应处于协商态");
+    assert!(
+        poll_until(|| ctld.snapshot().pending_approval.is_some()).await,
+        "被控端应待确认"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        ctrl_est.calls.load(Ordering::Relaxed),
+        0,
+        "确认前不得建立数据面"
+    );
+
+    // 用户确认 → 被控端回 accepted → 服务端转达 → 控制器建立数据面。
+    ctld.approve_pending(false);
+    let response = next_response(&mut ctld_rx).await;
+    ctrl.handle_control_message(response);
+
+    tokio::time::timeout(WAIT, frame_rx.recv())
+        .await
+        .expect("等画面超时")
+        .expect("画面通道关闭");
+    assert!(ctrl_est.calls.load(Ordering::Relaxed) >= 1, "确认后应建立数据面");
+    assert_eq!(
+        ctrl.snapshot().active.expect("会话应进行中").state,
+        SessionState::Active,
+        "数据面就绪后应升为 Active"
     );
 }
 

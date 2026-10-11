@@ -17,6 +17,10 @@
 //!   [`rust_tunnel_common::remote_bridge::RemoteBridge`]，由 `crates/client` 的读循环驱动。
 //! - 数据面：会话帧协议跑在一条**双向字节流**上，由 [`transport::TransportEstablisher`]
 //!   建立。以 **hbbr 中继为主路径**，同内网直连为优化；跨 NAT 打洞不做。
+//! - 接入确认：被控端默认 [`approval::ApprovalPolicy::Confirm`]——收到 `RemoteSessionIncoming`
+//!   后先弹窗等本机用户拍板，**批准了才登记 token 并回 `accepted:true`**（未批准前不登记、
+//!   不回包、不派生采集任务）。因此控制器把数据面建立**推迟到看见 `accepted:true` 之后**，
+//!   这是「连接中」会停留若干秒的原因。时限见 [`approval`]。
 //! - 平台抽象：[`screen::ScreenSource`] / [`screen::InputSink`] / [`screen::FrameSink`] /
 //!   [`screen::Clipboard`] 四个 trait 定义在 [`screen`]，实现在上层。
 //! - 会话内功能：瓦片差分（[`tiles`]）、文件传输（[`file`] 沙箱 + [`transfer`] 状态机）、
@@ -38,6 +42,7 @@
 //! `rust-tunnel-rustdesk`（[`transport`] 与 [`signaling`] 直接调用其 `frame`/`proto`/`addr`）。
 //! 本 crate 只实现**客户端侧**的会合与中继编排。
 
+pub mod approval;
 pub mod auth;
 pub mod controller;
 pub mod controlled;
@@ -55,6 +60,7 @@ pub mod transport;
 #[cfg(test)]
 mod integration_tests;
 
+pub use approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
 pub use error::{RemoteError, RemoteResult};
 pub use file::{FileService, TransferMeta};
 pub use controller::ControllerCommand;

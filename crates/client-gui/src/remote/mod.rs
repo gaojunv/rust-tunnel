@@ -593,6 +593,8 @@ pub struct RemoteView {
     buttons: [bool; 3],
     /// 上一次的修饰键位掩码。
     modifiers: u8,
+    /// 接入确认弹窗的「本次运行内不再询问该对端」勾选态（请求消失时由弹窗清零）。
+    approval_remember: bool,
 }
 
 impl RemoteView {
@@ -609,6 +611,7 @@ impl RemoteView {
             last_mouse: None,
             buttons: [false; 3],
             modifiers: 0,
+            approval_remember: false,
         }
     }
 
@@ -674,6 +677,11 @@ impl RemoteView {
     pub fn take_closed(&mut self) -> Option<String> {
         let mut guard = self.shared.lock().ok()?;
         guard.closed.take()
+    }
+
+    /// 接入确认弹窗的「本次运行内不再询问该对端」勾选态（可编辑；无请求时由弹窗清零）。
+    pub fn approval_remember_mut(&mut self) -> &mut bool {
+        &mut self.approval_remember
     }
 
     /// 把最新画面（整帧或增量瓦片）落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。

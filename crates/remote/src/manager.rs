@@ -13,13 +13,21 @@
 //!
 //! # 会话编排
 //!
-//! - 控制器：收到 `RemoteConnectGrant` → 预计算握手 → [`TransportEstablisher::establish`]
+//! - 控制器：收到 `RemoteConnectGrant` → 记录授权并置 `Negotiating`，**等被控端确认**
+//!   （`RemoteSessionResponse{accepted:true}`）→ 预计算握手 → [`TransportEstablisher::establish`]
 //!   （中继/直连）→ [`crate::controller::run_controller`]。
-//! - 被控端：收到 `RemoteSessionIncoming` 且 `enabled` → 登记一次性 token、回 `accepted`
-//!   → `establish` → [`crate::controlled::run_controlled`]。
+//! - 被控端：收到 `RemoteSessionIncoming` 且 `enabled` → 按 [`ApprovalPolicy`] 决定：`Auto`
+//!   或已信任对端则直接接受；`Confirm` 且未信任则挂起等用户
+//!   [`RemoteManager::approve_pending`] / [`RemoteManager::reject_pending`]（[`APPROVAL_TIMEOUT`]
+//!   到点自动拒绝）→ 登记一次性 token、回 `accepted` → `establish`
+//!   → [`crate::controlled::run_controlled`]。
+//!
+//! 确认门控复用既有 `RemoteSessionResponse` 通道，不新增任何控制消息变体；服务端本来就无条件
+//! 把被控端的响应转达给控制器，所以两端只需各自「延迟应答 / 等待应答」。
 //!
 //! 两者都接受 [`CancellationToken`]，由 [`RemoteManager::abort_active`] 一键中断。
 
+use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
 use crate::auth::{PendingSession, PendingSessions};
 use crate::controller::{run_controller, ControllerCommand, ControllerConfig};
 use crate::controlled::{run_controlled, ControlledConfig};
@@ -35,6 +43,7 @@ use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams, Rem
 use rust_tunnel_common::remote_bridge::RemoteBridge;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -114,6 +123,16 @@ pub struct RemoteUiState {
     pub transfers: Vec<TransferProgress>,
     /// 最近一次传输结果提示（成功落盘路径或失败原因）。
     pub transfer_note: Option<String>,
+    /// 被控端接入确认策略。
+    pub approval_policy: ApprovalPolicy,
+    /// 待本机确认的接入请求（UI 弹窗数据；无则为 `None`）。
+    pub pending_approval: Option<PendingApproval>,
+    /// 已信任的对端客户端名：命中后不再弹窗、直接接受。
+    ///
+    /// **以客户端名为键**：`RemoteSessionIncoming` 只带 `from_name`、不带 `from_rd_id`，
+    /// 没有别的标识可用。后果有二——服务端管理员把客户端改名后该条目即失效（新名字不在表里，
+    /// 会重新弹窗）；且信任**只存内存**，进程退出即清空。这两点都是刻意的，不做持久化。
+    pub trusted_peers: Vec<String>,
 }
 
 /// [`RemoteManager`] 的构造参数。
@@ -136,6 +155,8 @@ pub struct RemoteManagerConfig {
     pub share_dir: Option<PathBuf>,
     /// 控制器下载文件的落地目录。
     pub download_dir: PathBuf,
+    /// 被控端接入确认策略（默认 [`ApprovalPolicy::Confirm`]）。
+    pub approval_policy: ApprovalPolicy,
 }
 
 /// 正在进行的会话句柄。
@@ -144,6 +165,40 @@ struct ActiveHandle {
     session_id: String,
     /// 中断信号。
     cancel: CancellationToken,
+}
+
+/// 被控端当前待用户确认的接入请求（内部）。
+///
+/// `token` 是握手凭证，**绝不进 UI 状态**——[`PendingApproval`] 只带展示字段。
+struct PendingRequest {
+    /// 会话 ID。
+    session_id: String,
+    /// 服务端下发的一次性 token。
+    token: String,
+    /// 发起方客户端名。
+    from_name: String,
+    /// 会话模式。
+    mode: RemoteMode,
+}
+
+/// 控制器已受理、等待被控端确认的授权（内部）。
+struct PendingGrant {
+    /// 会话 ID。
+    session_id: String,
+    /// 服务端下发的一次性 token。
+    token: String,
+    /// 被控端 RustDesk ID。
+    target_rd_id: String,
+    /// 被控端平台标识（仅日志）。
+    target_platform: String,
+    /// 会合/中继参数（已补齐 host）。
+    params: RemoteParams,
+    /// 会话模式。
+    mode: RemoteMode,
+    /// 中断信号（等待期间与建立后共用同一个）。
+    cancel: CancellationToken,
+    /// 会话命令接收端，建立后交给 `controller_task`。
+    cmd_rx: mpsc::Receiver<ControllerCommand>,
 }
 
 /// 管理器内部可变状态。
@@ -159,6 +214,16 @@ struct Inner {
     pending: Arc<PendingSessions>,
     /// 最近一次请求的会话模式（`RemoteConnectGrant` 不携带模式）。
     last_requested_mode: Option<RemoteMode>,
+    /// 被控端待用户确认的接入请求。
+    pending_request: Option<PendingRequest>,
+    /// 控制器已受理、等待被控端确认的授权。
+    pending_grant: Option<PendingGrant>,
+    /// 乱序防御：被控端 `accepted` 先于授权到达时暂存的 `session_id`。
+    early_accept: Option<String>,
+    /// 被控端等待确认的时限（默认 [`APPROVAL_TIMEOUT`]，测试可注入）。
+    approval_timeout: Duration,
+    /// 控制器等待确认的时限（默认 [`APPROVAL_WAIT_TIMEOUT`]，测试可注入）。
+    approval_wait_timeout: Duration,
 }
 
 /// 已安装的平台实现。
@@ -223,6 +288,7 @@ impl RemoteManager {
             enabled: cfg.enabled,
             self_platform: cfg.platform.clone(),
             quality: QualityPreset::default(),
+            approval_policy: cfg.approval_policy,
             ..RemoteUiState::default()
         };
         let (ui_tx, _rx) = watch::channel(ui);
@@ -237,6 +303,8 @@ impl RemoteManager {
             ui_tx,
             inner: Mutex::new(Inner {
                 pending: Arc::new(PendingSessions::new()),
+                approval_timeout: APPROVAL_TIMEOUT,
+                approval_wait_timeout: APPROVAL_WAIT_TIMEOUT,
                 ..Inner::default()
             }),
             platform: RwLock::new(None),
@@ -299,8 +367,13 @@ impl RemoteManager {
         }
     }
 
-    /// 一键中断当前会话（UI 中断按钮）。
+    /// 一键中断当前会话（UI 中断按钮）。若正有接入请求待确认，也一并拒绝。
     pub fn abort_active(&self) {
+        // 待确认的接入请求随之中止：不该在用户已关闭/中断后还留着弹窗等点击。
+        // 理由是给**控制器**看的，而本方法是「中断会话」「关闭被控开关」「新请求取代旧会话」
+        // 三个入口的公共路径，故用中性措辞，不写死成其中某一个的原因。
+        self.reject_pending_request("被控端中止了接入");
+        self.lock_inner().pending_grant = None;
         if let Some(active) = self.take_active() {
             active.cancel.cancel();
             self.lock_cmd().take();
@@ -394,6 +467,70 @@ impl RemoteManager {
     /// 取消一次在途传输。
     pub fn cancel_transfer(&self, id: u64) {
         self.send_command(ControllerCommand::File(TransferCommand::Cancel { id }));
+    }
+
+    /// 设置被控端接入确认策略。
+    pub fn set_approval_policy(&self, policy: ApprovalPolicy) {
+        self.update_ui(|s| s.approval_policy = policy);
+    }
+
+    /// 当前被控端接入确认策略。
+    #[must_use]
+    pub fn approval_policy(&self) -> ApprovalPolicy {
+        self.ui_tx.borrow().approval_policy
+    }
+
+    /// 批准当前待确认的接入请求；`remember` 为真时把该对端加入信任列表（此后免弹窗）。
+    ///
+    /// 由 UI 线程调用，**不在 Tokio 运行时内**，故派生会话任务走构造时捕获的运行时句柄。
+    pub fn approve_pending(&self, remember: bool) {
+        let Some(req) = self.lock_inner().pending_request.take() else {
+            return;
+        };
+        if remember {
+            let name = req.from_name.clone();
+            self.update_ui(move |s| {
+                if !s.trusted_peers.iter().any(|n| n == &name) {
+                    s.trusted_peers.push(name);
+                }
+            });
+        }
+        self.update_ui(|s| s.pending_approval = None);
+        // 理论上平台实现在 `handle_incoming` 里已校验过；若中途被卸下，只能拒绝。
+        let Some((screen, input)) = self.platform_arc() else {
+            self.send(ControlMessage::RemoteSessionResponse {
+                session_id: req.session_id,
+                accepted: false,
+                reason: Some("被控端缺少屏幕/输入实现".to_owned()),
+            });
+            return;
+        };
+        self.accept_incoming(req, screen, input);
+    }
+
+    /// 拒绝当前待确认的接入请求；`reason` 为空时用「用户拒绝」。
+    pub fn reject_pending(&self, reason: Option<String>) {
+        let reason = reason.unwrap_or_else(|| "用户拒绝".to_owned());
+        self.reject_pending_request(&reason);
+    }
+
+    /// 清空信任列表。
+    pub fn clear_trusted(&self) {
+        self.update_ui(|s| s.trusted_peers.clear());
+    }
+
+    /// 从信任列表移除某个对端名。
+    pub fn untrust(&self, name: &str) {
+        let name = name.to_owned();
+        self.update_ui(move |s| s.trusted_peers.retain(|n| n != &name));
+    }
+
+    /// 注入确认时限（仅测试用，避免真等 45s）。
+    #[cfg(test)]
+    pub(crate) fn set_timeouts(&self, approval: Duration, wait: Duration) {
+        let mut inner = self.lock_inner();
+        inner.approval_timeout = approval;
+        inner.approval_wait_timeout = wait;
     }
 
     // ── 内部辅助 ───────────────────────────────────────────────────────
@@ -603,20 +740,20 @@ impl RemoteManager {
         }
     }
 
-    /// 启动一次控制器会话。
+    /// 受理一次控制器会话（`RemoteConnectGrant`）。
+    ///
+    /// 这里**不建立数据面**：先记录授权、置 `Negotiating`，等被控端回 `accepted:true`
+    /// （见 [`Self::begin_controller_session`]）后才 `establish`。若被控端确认先于授权到达
+    /// （乱序），立刻建立。
     fn start_controller(
         &self,
-        session_id: String,
+        session_id: &str,
         token: String,
         target_rd_id: String,
         target_platform: &str,
         params: RemoteParams,
     ) {
-        let Some(me) = self.self_weak.upgrade() else {
-            warn!("管理器已释放，忽略连接授权");
-            return;
-        };
-        // 已有会话先中断。
+        // 新请求取代旧会话（沿用既有语义）。
         self.abort_active();
 
         let mut filled = params;
@@ -628,7 +765,7 @@ impl RemoteManager {
         *self.lock_cmd() = Some(cmd_tx);
         let cancel = CancellationToken::new();
         self.set_active(ActiveHandle {
-            session_id: session_id.clone(),
+            session_id: session_id.to_owned(),
             cancel: cancel.clone(),
         });
         // `RemoteConnectGrant` 只带 `target_rd_id`，不带展示名：回查可远程列表把名字补上，
@@ -640,13 +777,13 @@ impl RemoteManager {
                 .find(|p| p.rd_id == target_rd_id)
                 .map_or_else(|| target_rd_id.clone(), |p| p.display_name.clone())
         };
-        debug!(target_platform = %target_platform, peer = %peer_name, "启动控制器会话");
+        debug!(target_platform = %target_platform, peer = %peer_name, "受理控制器会话，等待对端确认");
         let info = ActiveSessionInfo {
-            session_id: session_id.clone(),
+            session_id: session_id.to_owned(),
             role: SessionRole::Controller,
             peer_name,
             mode,
-            state: SessionState::Connecting,
+            state: SessionState::Negotiating,
             started_at_ms: now_ms(),
         };
         self.update_ui(move |s| {
@@ -654,14 +791,56 @@ impl RemoteManager {
             s.last_error = None;
         });
 
-        let me = me.clone();
-        let sid = session_id;
-        tokio::spawn(async move {
+        let grant = PendingGrant {
+            session_id: session_id.to_owned(),
+            token,
+            target_rd_id,
+            target_platform: target_platform.to_owned(),
+            params: filled,
+            mode,
+            cancel,
+            cmd_rx,
+        };
+        let already_accepted = {
+            let mut inner = self.lock_inner();
+            inner.pending_grant = Some(grant);
+            let early = inner.early_accept.take();
+            early.as_deref() == Some(session_id)
+        };
+        if already_accepted {
+            self.begin_controller_session();
+        } else {
+            self.arm_wait_timeout(session_id);
+        }
+    }
+
+    /// 被控端确认后真正启动控制器会话：`Negotiating` → `Connecting`，派生 `controller_task`。
+    fn begin_controller_session(&self) {
+        let Some(grant) = self.lock_inner().pending_grant.take() else {
+            return;
+        };
+        let Some(me) = self.self_weak.upgrade() else {
+            warn!("管理器已释放，忽略连接确认");
+            return;
+        };
+        debug!(target_platform = %grant.target_platform, "对端已确认，开始建立数据面");
+        // 状态推进：`Negotiating` → `Connecting`；`mark_active` 会在 `establish` 返回后升到 `Active`。
+        self.update_ui(|s| {
+            if let Some(active) = s.active.as_mut() {
+                if active.session_id == grant.session_id {
+                    active.state = SessionState::Connecting;
+                }
+            }
+        });
+        let sid = grant.session_id.clone();
+        let cancel = grant.cancel.clone();
+        let task = async move {
             let result = me
-                .controller_task(sid.clone(), token, target_rd_id, filled, mode, cmd_rx, cancel)
+                .controller_task(sid.clone(), grant.token, grant.target_rd_id, grant.params, grant.mode, grant.cmd_rx, cancel)
                 .await;
             me.finish_session(&sid, result);
-        });
+        };
+        self.spawn_detached(task);
     }
 
     /// 控制器会话任务体。
@@ -734,57 +913,90 @@ impl RemoteManager {
     }
 
     /// 处理 `RemoteSessionIncoming`（被控端）。
+    ///
+    /// 确认门控：`Auto` 或已信任对端直接接受；`Confirm` 且未信任则**不回响应、不登记 token、
+    /// 不派生任务**，只挂起等用户（见 [`Self::approve_pending`] / [`Self::reject_pending`]），
+    /// 并在 [`APPROVAL_TIMEOUT`] 后自动拒绝。
     fn handle_incoming(&self, session_id: String, token: String, from_name: String, mode: RemoteMode) {
         if !self.ui_tx.borrow().enabled {
-            self.send(ControlMessage::RemoteSessionResponse {
-                session_id,
-                accepted: false,
-                reason: Some("被控端未开启远程控制".to_owned()),
-            });
-            return;
-        }
-        if self.has_active() {
-            self.send(ControlMessage::RemoteSessionResponse {
-                session_id,
-                accepted: false,
-                reason: Some("被控端已有进行中的会话".to_owned()),
-            });
+            self.send(rejection(session_id, "被控端未开启远程控制"));
             return;
         }
         let Some((screen, input)) = self.platform_arc() else {
-            self.send(ControlMessage::RemoteSessionResponse {
-                session_id,
-                accepted: false,
-                reason: Some("被控端缺少屏幕/输入实现".to_owned()),
-            });
+            self.send(rejection(session_id, "被控端缺少屏幕/输入实现"));
             return;
         };
-        let Some(me) = self.self_weak.upgrade() else {
+        // 同一时刻只允许一个待确认请求，避免弹窗叠罗汉与「批准了哪一条」的歧义。
+        if self.lock_inner().pending_request.is_some() {
+            self.send(rejection(session_id, "被控端有待确认的接入请求"));
             return;
-        };
+        }
+        if self.has_active() {
+            self.send(rejection(session_id, "被控端已有进行中的会话"));
+            return;
+        }
 
+        let (policy, trusted) = {
+            let ui = self.ui_tx.borrow();
+            (
+                ui.approval_policy,
+                ui.trusted_peers.iter().any(|n| n == &from_name),
+            )
+        };
+        let req = PendingRequest {
+            session_id: session_id.clone(),
+            token,
+            from_name,
+            mode,
+        };
+        if policy == ApprovalPolicy::Auto || trusted {
+            self.accept_incoming(req, screen, input);
+            return;
+        }
+
+        // `Confirm` + 未信任：挂起等用户拍板。
+        let timeout = self.lock_inner().approval_timeout;
+        let deadline_ms = now_ms().saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+        let pending_ui = PendingApproval {
+            session_id: session_id.clone(),
+            from_name: req.from_name.clone(),
+            mode,
+            deadline_ms,
+        };
+        self.lock_inner().pending_request = Some(req);
+        self.update_ui(move |s| s.pending_approval = Some(pending_ui));
+        self.arm_approval_timeout(&session_id);
+    }
+
+    /// 真正接受一次接入请求：登记一次性 token → 回 `accepted:true` → 置 active → 派生被控任务。
+    fn accept_incoming(
+        &self,
+        req: PendingRequest,
+        screen: Arc<dyn ScreenSource>,
+        input: Arc<dyn InputSink>,
+    ) {
         // 登记一次性 token（握手时消费），再回 accepted。
         self.lock_inner().pending.insert(PendingSession::new(
-            session_id.clone(),
-            token,
-            from_name.clone(),
-            mode,
+            req.session_id.clone(),
+            req.token,
+            req.from_name.clone(),
+            req.mode,
         ));
         self.send(ControlMessage::RemoteSessionResponse {
-            session_id: session_id.clone(),
+            session_id: req.session_id.clone(),
             accepted: true,
             reason: None,
         });
         let cancel = CancellationToken::new();
         self.set_active(ActiveHandle {
-            session_id: session_id.clone(),
+            session_id: req.session_id.clone(),
             cancel: cancel.clone(),
         });
         let info = ActiveSessionInfo {
-            session_id: session_id.clone(),
+            session_id: req.session_id.clone(),
             role: SessionRole::Controlled,
-            peer_name: from_name,
-            mode,
+            peer_name: req.from_name,
+            mode: req.mode,
             state: SessionState::Connecting,
             started_at_ms: now_ms(),
         };
@@ -792,13 +1004,16 @@ impl RemoteManager {
             s.active = Some(info);
         });
 
-        let sid = session_id;
-        tokio::spawn(async move {
-            let result = me
-                .controlled_task(sid.clone(), mode, screen, input, cancel)
-                .await;
+        let Some(me) = self.self_weak.upgrade() else {
+            return;
+        };
+        let sid = req.session_id;
+        let mode = req.mode;
+        let task = async move {
+            let result = me.controlled_task(sid.clone(), mode, screen, input, cancel).await;
             me.finish_session(&sid, result);
-        });
+        };
+        self.spawn_detached(task);
     }
 
     /// 被控端会话任务体。
@@ -851,15 +1066,44 @@ impl RemoteManager {
         run_controlled(duplex, config, screen, input, clipboard, transfer, cancel).await
     }
 
-    /// 处理 `RemoteSessionResponse`（控制器侧收到拒绝时清理）。
+    /// 处理 `RemoteSessionResponse`（控制器侧）。
     ///
-    /// **拒绝路径的 `session_id` 是空串**（服务端在会话签发之前就拒绝了：目标离线/未开启
+    /// - `accepted:true` 命中待确认授权 → 启动数据面；若授权尚未到达（乱序）则先记下，
+    ///   等 [`Self::start_controller`] 到达时立即建立。
+    /// - 拒绝：清掉待确认授权并结束会话。
+    ///
+    /// **拒绝路径的 `session_id` 可能是空串**（服务端在会话签发之前就拒绝了：目标离线/未开启
     /// 被控/无 rd_id），因此不能拿它去对号——按「当前待决请求失败」处理即可。
     fn on_session_response(&self, session_id: &str, accepted: bool, reason: Option<String>) {
         if accepted {
+            let matches_grant = self
+                .lock_inner()
+                .pending_grant
+                .as_ref()
+                .is_some_and(|g| g.session_id == session_id);
+            if matches_grant {
+                self.begin_controller_session();
+            } else if !session_id.is_empty() {
+                // 乱序防御：确认先于授权到达，暂存，等授权到达时立即建立。
+                self.lock_inner().early_accept = Some(session_id.to_owned());
+            }
             return;
         }
+
         let reason = reason.unwrap_or_else(|| "对端拒绝".to_owned());
+        {
+            let mut inner = self.lock_inner();
+            let matches_grant = inner
+                .pending_grant
+                .as_ref()
+                .is_some_and(|g| g.session_id == session_id);
+            if session_id.is_empty() || matches_grant {
+                inner.pending_grant = None;
+            }
+            if inner.early_accept.as_deref() == Some(session_id) {
+                inner.early_accept = None;
+            }
+        }
         if session_id.is_empty() {
             // 尚未签发会话，没有可中断的 active；只记错误。
             self.update_ui(move |s| s.last_error = Some(reason));
@@ -885,6 +1129,19 @@ impl RemoteManager {
 
     /// 处理 `RemoteSessionEnd`：中断匹配的会话且**不再回发**结束（避免回声）。
     fn on_remote_session_end(&self, session_id: &str, reason: &str) {
+        {
+            let mut inner = self.lock_inner();
+            if inner
+                .pending_grant
+                .as_ref()
+                .is_some_and(|g| g.session_id == session_id)
+            {
+                inner.pending_grant = None;
+            }
+            if inner.early_accept.as_deref() == Some(session_id) {
+                inner.early_accept = None;
+            }
+        }
         let is_current = self
             .lock_inner()
             .active
@@ -911,6 +1168,121 @@ impl RemoteManager {
         self.read_platform()
             .as_ref()
             .map(|p| (Arc::clone(&p.screen), Arc::clone(&p.input)))
+    }
+
+    /// 派生一个后台任务；优先用构造时捕获的运行时句柄（同步方法可能不在运行时内调用）。
+    fn spawn_detached<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Some(rt) = self.rt.clone() {
+            rt.spawn(fut);
+        } else {
+            warn!("无 Tokio 运行时句柄，无法派生远程会话任务");
+        }
+    }
+
+    /// 取出并拒绝当前待确认的接入请求（无则返回 `false`）。**不登记 token**。
+    fn reject_pending_request(&self, reason: &str) -> bool {
+        let Some(req) = self.lock_inner().pending_request.take() else {
+            return false;
+        };
+        self.update_ui(|s| s.pending_approval = None);
+        self.send(ControlMessage::RemoteSessionResponse {
+            session_id: req.session_id,
+            accepted: false,
+            reason: Some(reason.to_owned()),
+        });
+        true
+    }
+
+    /// 武装被控端确认超时：到点若**仍是同一条**请求，自动拒绝。
+    fn arm_approval_timeout(&self, session_id: &str) {
+        let Some(rt) = self.rt.clone() else {
+            debug!("无 Tokio 运行时句柄，跳过确认超时计时");
+            return;
+        };
+        let timeout = self.lock_inner().approval_timeout;
+        let Some(me) = self.self_weak.upgrade() else {
+            return;
+        };
+        let sid = session_id.to_owned();
+        rt.spawn(async move {
+            tokio::time::sleep(timeout).await;
+            me.on_approval_timeout(&sid);
+        });
+    }
+
+    /// 确认超时到点：仅当同一条请求仍在挂起时拒绝。
+    fn on_approval_timeout(&self, session_id: &str) {
+        let mut inner = self.lock_inner();
+        let is_pending = inner
+            .pending_request
+            .as_ref()
+            .is_some_and(|r| r.session_id == session_id);
+        if !is_pending {
+            return;
+        }
+        inner.pending_request = None;
+        drop(inner);
+        self.update_ui(|s| s.pending_approval = None);
+        self.send(ControlMessage::RemoteSessionResponse {
+            session_id: session_id.to_owned(),
+            accepted: false,
+            reason: Some("等待确认超时".to_owned()),
+        });
+    }
+
+    /// 武装控制器等待确认超时：到点若授权仍未获确认，清理并报错。
+    fn arm_wait_timeout(&self, session_id: &str) {
+        let Some(rt) = self.rt.clone() else {
+            debug!("无 Tokio 运行时句柄，跳过确认等待计时");
+            return;
+        };
+        let timeout = self.lock_inner().approval_wait_timeout;
+        let Some(me) = self.self_weak.upgrade() else {
+            return;
+        };
+        let sid = session_id.to_owned();
+        rt.spawn(async move {
+            tokio::time::sleep(timeout).await;
+            me.on_wait_timeout(&sid);
+        });
+    }
+
+    /// 控制器等待确认超时：清掉授权与 active，记错误。
+    fn on_wait_timeout(&self, session_id: &str) {
+        let mut inner = self.lock_inner();
+        let is_pending = inner
+            .pending_grant
+            .as_ref()
+            .is_some_and(|g| g.session_id == session_id);
+        if !is_pending {
+            return;
+        }
+        inner.pending_grant = None;
+        if inner.early_accept.as_deref() == Some(session_id) {
+            inner.early_accept = None;
+        }
+        drop(inner);
+        // 取出会话句柄（其 `cancel` 与授权共用同一个 token），一并中断，别把 active 留在内部状态里。
+        if let Some(active) = self.take_active() {
+            active.cancel.cancel();
+        }
+        self.lock_cmd().take();
+        self.update_ui(|s| {
+            s.active = None;
+            s.last_error = Some("等待对端确认超时".to_owned());
+        });
+    }
+}
+
+/// 造一条拒绝响应。
+fn rejection(session_id: String, reason: &str) -> ControlMessage {
+    ControlMessage::RemoteSessionResponse {
+        session_id,
+        accepted: false,
+        reason: Some(reason.to_owned()),
     }
 }
 
@@ -945,7 +1317,7 @@ impl RemoteBridge for RemoteManager {
                 target_platform,
                 params,
             } => {
-                self.start_controller(session_id, token, target_rd_id, &target_platform, params);
+                self.start_controller(&session_id, token, target_rd_id, &target_platform, params);
                 true
             }
             ControlMessage::RemoteSessionIncoming {
@@ -979,9 +1351,20 @@ impl RemoteBridge for RemoteManager {
             active.cancel.cancel();
         }
         self.lock_cmd().take();
+        // 控制通道已断，服务端会把这侧的会话判死：任何挂起请求/授权都不可能再走通。
+        // 待确认的接入请求**只本地清掉、不发拒绝**（没有通道可发；即便发出去，服务端也已
+        // 回收该会话，只会记一条「未知 session」），否则用户点「接受」会给一个永远起不来的
+        // 会话登记 token 并回 accepted:true。
+        {
+            let mut inner = self.lock_inner();
+            inner.pending_request = None;
+            inner.pending_grant = None;
+            inner.early_accept = None;
+        }
         self.update_ui(|s| {
             s.connected = false;
             s.active = None;
+            s.pending_approval = None;
         });
     }
 }
@@ -1099,6 +1482,7 @@ mod tests {
             encode: EncodeOptions::default(),
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
+            approval_policy: ApprovalPolicy::Auto,
         })
     }
 
@@ -1195,6 +1579,7 @@ mod tests {
             encode: EncodeOptions::default(),
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
+            approval_policy: ApprovalPolicy::Auto,
         })
     }
 

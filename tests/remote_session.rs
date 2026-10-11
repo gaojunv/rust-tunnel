@@ -27,8 +27,8 @@ use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
 use rust_tunnel_common::remote_bridge::RemoteBridge;
 use rust_tunnel_remote::signaling::{LazyTransport, RustDeskTransport, SignalingConfig};
 use rust_tunnel_remote::{
-    DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton,
-    RawFrame, RemoteManager, RemoteManagerConfig, RemoteResult, ScreenSource,
+    ApprovalPolicy, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent,
+    MouseButton, RawFrame, RemoteManager, RemoteManagerConfig, RemoteResult, ScreenSource,
 };
 use std::collections::HashSet;
 use std::net::{TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
@@ -196,6 +196,37 @@ async fn recv_match<T>(
     })
     .await
     .unwrap_or_else(|_| panic!("等待 {desc} 超时"))
+}
+
+/// 与 [`recv_match`] 同源，但用于**有界**上行通道（[`RemoteBridge::attach`] 注入的那条）。
+async fn recv_match_bounded<T>(
+    rx: &mut mpsc::Receiver<ControlMessage>,
+    desc: &str,
+    mut f: impl FnMut(ControlMessage) -> Option<T>,
+) -> T {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let msg = rx.recv().await.expect("上行通道关闭");
+            if let Some(v) = f(msg) {
+                return v;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("等待 {desc} 超时"))
+}
+
+/// 模拟服务端把被控端的**接受**应答转达给控制器。
+///
+/// 控制器现在必须等到 `accepted:true` 才建立数据面（接入确认门控），而这两个 e2e 用例没有
+/// 真实控制通道、控制消息全靠手工注入，所以「服务端转发应答」这一步也得手工补上；否则控制器
+/// 会一直停在 `Negotiating`，画面永远不会到——表现为等画面超时。
+async fn relay_acceptance(ctld_upstream: &mut mpsc::Receiver<ControlMessage>, ctrl: &Arc<RemoteManager>) {
+    let msg = recv_match_bounded(ctld_upstream, "被控端接受应答", |m| {
+        matches!(m, ControlMessage::RemoteSessionResponse { accepted: true, .. }).then_some(m)
+    })
+    .await;
+    assert!(ctrl.handle_control_message(msg), "控制器应消费被控端应答");
 }
 
 /// 断言 `rd_id` 是 9 位数字（服务端分配的稳定 RustDesk ID）。
@@ -488,6 +519,10 @@ fn manager(
         },
         share_dir: None,
         download_dir: std::env::temp_dir(),
+        // 这两个用例测的是**真实 hbbr 中继的数据面**，不是接入确认门控（后者由
+        // `crates/remote` 的集成测试覆盖）。用 `Auto` 免去弹窗，但控制器仍会等应答，
+        // 故下面仍要手工转达 `accepted`——见 `relay_acceptance`。
+        approval_policy: ApprovalPolicy::Auto,
     });
     // 双方先拿到能力通告（设置 params / rd_id），与真实控制通道下发等价。
     mgr.handle_control_message(ControlMessage::RemoteCapability {
@@ -522,6 +557,10 @@ fn manager_lazy(
         },
         share_dir: None,
         download_dir: std::env::temp_dir(),
+        // 这两个用例测的是**真实 hbbr 中继的数据面**，不是接入确认门控（后者由
+        // `crates/remote` 的集成测试覆盖）。用 `Auto` 免去弹窗，但控制器仍会等应答，
+        // 故下面仍要手工转达 `accepted`——见 `relay_acceptance`。
+        approval_policy: ApprovalPolicy::Auto,
     });
     mgr.handle_control_message(ControlMessage::RemoteCapability {
         params: Some(params.clone()),
@@ -592,7 +631,8 @@ async fn data_plane_relay_session_between_two_managers() {
     ctld.install_platform(Arc::new(FakeScreen), ctld_input.clone());
 
     let (ctrl_tx, _ctrl_upstream) = mpsc::channel(64);
-    let (ctld_tx, _ctld_upstream) = mpsc::channel(64);
+    // 被控端的上行要留着读：控制器现在要等它的 `accepted` 才建立数据面。
+    let (ctld_tx, mut ctld_upstream) = mpsc::channel(64);
     ctrl.attach(ctrl_tx);
     ctld.attach(ctld_tx);
 
@@ -615,6 +655,7 @@ async fn data_plane_relay_session_between_two_managers() {
         from_name: "home-nas".to_owned(),
         mode: RemoteMode::Control,
     });
+    relay_acceptance(&mut ctld_upstream, &ctrl).await;
 
     // 控制器应收到显示器列表与至少一帧画面（全部经真实 hbbr 中继转发）。
     tokio::time::timeout(WAIT, frame_rx.recv())
@@ -662,13 +703,17 @@ async fn data_plane_relay_session_between_two_managers() {
     ctld_transport.shutdown();
 }
 
-/// C 部分：复现**真实时序**的回归用例——控制器发出中继请求时，被控端尚未进入会话。
+/// C 部分：**预登记**不变量的回归用例——被控端必须在会话发起前就登记到 hbbs。
 ///
 /// 两侧都用 [`LazyTransport`]（GUI 客户端的真实行为）：传输只在预登记或首个 `establish`
-/// 时才构造。控制器被授权后**立刻**发 `RequestRelay`（`always_use_relay` 下不试直连，
-/// 一个 RTT 就到 hbbs），而被控端要等 `RemoteSessionIncoming` 才进会话。若不在
-/// `RemoteCapability` 时预登记，hbbs 会因目标不在登记表里**静默丢弃**该请求，被控端随后
-/// 白等满 `RELAY_WAIT`（25s）才失败。本用例刻意在两者之间留出空档来锁定这个不变量。
+/// 时才构造。控制器的 `RequestRelay` 是发给 hbbs、由 hbbs 转发到**目标已登记的**信令连接的；
+/// 若不在 `RemoteCapability`（及打开被控开关）时预登记，hbbs 会因目标不在登记表里**静默丢弃**
+/// 该请求（不回复、不排队、不重试），被控端随后白等满 `RELAY_WAIT`（25s）才失败。
+///
+/// 接入确认门控加入后，控制器不再于被授权时立刻发 `RequestRelay`——它要等被控端的 `accepted`
+/// 才建立数据面，故本用例原先刻意制造的那段「控制器抢跑」时序已不可达。这里保留授权与
+/// `RemoteSessionIncoming` 之间的空档，改为覆盖「授权已下发、被控端尚未进会话」这一中间态
+/// 不会让任一端提前失败；预登记仍是本用例成立的前提。
 #[tokio::test]
 async fn relay_session_survives_controller_requesting_before_target_session_starts() {
     let harness = TestHarness::spawn(HarnessOpts::default()).await;
@@ -700,7 +745,8 @@ async fn relay_session_survives_controller_requesting_before_target_session_star
     ctld.install_platform(Arc::new(FakeScreen), ctld_input);
 
     let (ctrl_tx, _ctrl_upstream) = mpsc::channel(64);
-    let (ctld_tx, _ctld_upstream) = mpsc::channel(64);
+    // 被控端的上行要留着读：控制器现在要等它的 `accepted` 才建立数据面。
+    let (ctld_tx, mut ctld_upstream) = mpsc::channel(64);
     ctrl.attach(ctrl_tx);
     ctld.attach(ctld_tx);
 
@@ -726,6 +772,7 @@ async fn relay_session_survives_controller_requesting_before_target_session_star
         from_name: "home-nas".to_owned(),
         mode: RemoteMode::Control,
     });
+    relay_acceptance(&mut ctld_upstream, &ctrl).await;
 
     // 画面仍应经真实 hbbr 中继到达（说明早先的推送被 hbbs 收下并缓存，未被丢弃）。
     tokio::time::timeout(WAIT, frame_rx.recv())

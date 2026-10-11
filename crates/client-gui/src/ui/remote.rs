@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use egui::{RichText, Ui};
 use rust_tunnel_common::protocol::RemoteMode;
-use rust_tunnel_remote::{Clipboard as _, QualityPreset, RemoteManager, RemoteUiState, SessionRole, SessionState};
+use rust_tunnel_remote::{
+    ApprovalPolicy, Clipboard as _, QualityPreset, RemoteManager, RemoteUiState, SessionRole, SessionState,
+};
 
 use crate::app::AppState;
 use crate::remote::{self, PermissionKind, RemoteView};
@@ -19,26 +21,35 @@ fn state_label(state: SessionState) -> &'static str {
     }
 }
 
-/// 渲染「远程」Tab。返回 `Some(新状态)` 表示用户切换了「允许被远程控制」开关，
-/// 由调用方（`GuiApp`）同步到引擎、托盘与偏好文件。
+/// 「远程」Tab 的用户操作结果，由 `GuiApp` 同步到引擎与偏好文件。
+#[derive(Default)]
+pub struct RemoteTabActions {
+    /// 用户切换了「允许被远程控制」开关（`Some` 表示有变化）。
+    pub allow_remote: Option<bool>,
+    /// 用户切换了接入确认策略（`Some` 表示有变化）。
+    pub approval_policy: Option<ApprovalPolicy>,
+}
+
+/// 渲染「远程」Tab。返回本帧的用户操作，由调用方（`GuiApp`）同步到引擎、托盘与偏好文件。
 pub fn show(
     ui: &mut Ui,
     view: &mut RemoteView,
     manager: Option<&Arc<RemoteManager>>,
     _app_state: &Arc<AppState>,
-) -> Option<bool> {
+) -> RemoteTabActions {
     let Some(manager) = manager else {
         ui.add_space(10.0);
         ui.label("远程控制引擎尚未就绪（等待客户端配置 / 连接）…");
-        return None;
+        return RemoteTabActions::default();
     };
     let state = manager.snapshot();
 
     show_permissions(ui);
-    let toggle = show_switch(ui, &state);
+    let actions = show_switch(ui, &state);
     show_session(ui, view, manager, &state);
+    show_trusted_peers(ui, &state, manager);
     show_peers(ui, &state, manager);
-    toggle
+    actions
 }
 
 /// 平台权限提示（缺失时给出「去授权」按钮，避免被控时静默黑屏）。
@@ -109,20 +120,131 @@ pub fn controlled_banner(ui: &mut Ui, manager: Option<&Arc<RemoteManager>>) {
     ui.add_space(8.0);
 }
 
-/// 「允许被远程控制」开关与本机状态。
-fn show_switch(ui: &mut Ui, state: &RemoteUiState) -> Option<bool> {
-    let mut toggle = None;
+/// 会话模式的中文说明。用户被要求交出的是键鼠控制权，故把「要什么权限」写清楚，
+/// 「仅观看」与「完全控制」是性质不同的请求，不能只显示一个英文枚举名。
+fn mode_label(mode: RemoteMode) -> &'static str {
+    match mode {
+        RemoteMode::Control => "完全控制（画面 + 鼠标键盘）",
+        RemoteMode::ViewOnly => "仅观看",
+        RemoteMode::FileTransfer => "仅文件传输",
+    }
+}
+
+/// 距自动拒绝还剩多少秒（`deadline_ms` 为 epoch 毫秒；已过点时为 0）。
+fn remaining_secs(deadline_ms: u64) -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    deadline_ms.saturating_sub(now_ms) / 1000
+}
+
+/// 待确认的远程接入弹窗（安全提示，**必须在所有 Tab 之上**）。
+///
+/// 由 `GuiApp` 每帧调用（与 [`controlled_banner`] 同理）：请求到达时用户可能正在任何页面、
+/// 窗口甚至已隐藏到托盘，安全提示绝不能只在「远程」Tab 可见。
+///
+/// 只展示 [`rust_tunnel_remote::PendingApproval`] 携带的字段——其中**不含**握手 token。
+/// 倒计时随 `GuiApp::update` 的 `request_repaint_after` 自然刷新，无需额外唤醒。
+pub fn approval_modal(ctx: &egui::Context, view: &mut RemoteView, manager: Option<&Arc<RemoteManager>>) {
+    let Some(manager) = manager else {
+        return;
+    };
+    let state = manager.snapshot();
+    let Some(pending) = state.pending_approval.as_ref() else {
+        // 请求已消失（批准/拒绝/超时/断线）：清掉勾选态，别让它带到下一条请求。
+        *view.approval_remember_mut() = false;
+        return;
+    };
+
+    let remember = view.approval_remember_mut();
+    egui::Modal::new(egui::Id::new("remote_approval")).show(ctx, |ui| {
+        ui.set_width(340.0);
+        ui.heading("远程接入请求");
+        ui.add_space(6.0);
+        ui.label(RichText::new(format!("「{}」请求接入本机", pending.from_name)).strong());
+        ui.add_space(4.0);
+        egui::Grid::new("remote_approval_grid")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("请求内容").weak().small());
+                ui.label(mode_label(pending.mode));
+                ui.end_row();
+                ui.label(RichText::new("剩余时间").weak().small());
+                ui.label(format!("{} 秒后自动拒绝", remaining_secs(pending.deadline_ms)));
+                ui.end_row();
+            });
+        // 三种模式的风险各不相同，都要写明白——「仅文件传输」听起来无害，实际是读共享目录
+        // 全文并写入其中；「仅观看」也不等于没风险（对方能看到你的屏幕）。批准是知情同意，
+        // 不能只显示一个英文枚举名让用户猜。
+        let risk = match pending.mode {
+            RemoteMode::Control => "批准后对方可看到你的屏幕，并操作你的鼠标键盘。",
+            RemoteMode::ViewOnly => "批准后对方可看到你的屏幕（但不能操作鼠标键盘）。",
+            RemoteMode::FileTransfer => "批准后对方可读取共享目录中的文件，并可向其中写入文件。",
+        };
+        ui.add_space(4.0);
+        ui.colored_label(ui.visuals().warn_fg_color, RichText::new(risk).small());
+        ui.add_space(6.0);
+        ui.checkbox(remember, "本次运行内不再询问该对端");
+        ui.label(RichText::new("信任仅在本次运行内有效，退出应用即清除。").weak().small());
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("允许").clicked() {
+                manager.approve_pending(*remember);
+            }
+            if ui.button("拒绝").clicked() {
+                manager.reject_pending(None);
+            }
+        });
+    });
+}
+
+/// 「允许被远程控制」开关、接入确认策略与本机状态。
+fn show_switch(ui: &mut Ui, state: &RemoteUiState) -> RemoteTabActions {
+    let mut actions = RemoteTabActions::default();
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             let mut enabled = state.enabled;
             ui.horizontal(|ui| {
                 if ui.checkbox(&mut enabled, "允许被远程控制").changed() {
-                    toggle = Some(enabled);
+                    actions.allow_remote = Some(enabled);
                 }
                 ui.label(RichText::new("开启后本机屏幕与输入可被持有效 token 的对端接管").weak().small());
             });
             ui.add_space(4.0);
+
+            // 接入确认策略：默认「需要确认」；「自动接受」是风险更高的无人值守选择，故用警示色。
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("接入确认").weak().small());
+                let mut policy = state.approval_policy;
+                if ui
+                    .selectable_label(policy == ApprovalPolicy::Confirm, "需要确认")
+                    .clicked()
+                {
+                    policy = ApprovalPolicy::Confirm;
+                }
+                if ui
+                    .selectable_label(policy == ApprovalPolicy::Auto, "自动接受")
+                    .clicked()
+                {
+                    policy = ApprovalPolicy::Auto;
+                }
+                if policy != state.approval_policy {
+                    actions.approval_policy = Some(policy);
+                }
+            });
+            if state.approval_policy == ApprovalPolicy::Auto {
+                ui.label(
+                    RichText::new("自动接受：任何在线客户端都能直接接管本机，不再向你询问（无人值守场景，风险最高）。")
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                );
+            } else {
+                ui.label(RichText::new("需要确认：每次接入都会弹窗，由你决定是否放行。").weak().small());
+            }
+            ui.add_space(4.0);
+
             egui::Grid::new("remote_meta")
                 .num_columns(2)
                 .spacing([12.0, 6.0])
@@ -152,7 +274,41 @@ fn show_switch(ui: &mut Ui, state: &RemoteUiState) -> Option<bool> {
             }
         });
     ui.add_space(8.0);
-    toggle
+    actions
+}
+
+/// 已信任对端列表：逐条可移除、可一键全清。列表为空时整段隐藏。
+///
+/// 信任**只存内存**（见 [`RemoteUiState::trusted_peers`]），故明确告知用户退出即失效。
+fn show_trusted_peers(ui: &mut Ui, state: &RemoteUiState, manager: &Arc<RemoteManager>) {
+    if state.trusted_peers.is_empty() {
+        return;
+    }
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("已信任的对端").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("全部清除").clicked() {
+                        manager.clear_trusted();
+                    }
+                });
+            });
+            ui.label(RichText::new("信任仅本次运行有效，退出应用即清除。").weak().small());
+            ui.add_space(4.0);
+            for name in &state.trusted_peers {
+                ui.horizontal(|ui| {
+                    ui.label(name.as_str());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("移除").clicked() {
+                            manager.untrust(name);
+                        }
+                    });
+                });
+            }
+        });
+    ui.add_space(8.0);
 }
 
 /// 会话窗口（画面 + 输入捕获 + 工具条）。

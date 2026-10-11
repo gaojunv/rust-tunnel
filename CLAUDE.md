@@ -133,7 +133,8 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `tiles.rs` — 瓦片差分（64×64 网格）：只编码变化的瓦片，静止桌面流量趋近于零。**关键不变量：瓦片永远是原生分辨率，缩放帧只能整帧发**——所以 `scale != 1.0` 一律强制关键帧，否则缩放关键帧与原生瓦片混在一起会错位。`KEYFRAME_INTERVAL_FRAMES=120` / `KEYFRAME_CHANGE_RATIO=0.6` 是重发整帧的两个阈值
 - `file.rs` — 被控端共享目录的沙箱文件服务（虚拟 `/` 路径）。**两层校验缺一不可**：`validate_virtual_path` 管语法（拒 `..`/`.`/`\`/盘符/控制字符/空段），`FileService::resolve` 管语义（对**最深的已存在祖先**做 canonicalize 后 `Path::starts_with(canonical_root)`，故符号链接逃逸会被拒）。`list` 里指向根外的符号链接项直接跳过
 - `transfer.rs` — 会话内文件传输状态机（两端共用）。只有**控制器**能发起（浏览/下载/上传），被控端只应答。同一时刻只允许一次传输；`CHUNK_SIZE=64 KiB` 且每块之间 `CHUNK_PAUSE=4ms` **主动让出调度**，会话循环的 `select!` 才有机会插入画面帧（中继只给一条字节流，画面与文件天然共享带宽）
-- `manager.rs` — `RemoteManager` 门面（`RemoteUiState` watch、连接请求、启停、平台注入、剪贴板/共享目录注入、`RemoteBridge` 实现）
+- `approval.rs` — 被控端**接入确认**策略与待确认请求（`ApprovalPolicy{Auto,Confirm}`、`PendingApproval`、`APPROVAL_TIMEOUT=45s` / `APPROVAL_WAIT_TIMEOUT=60s`）。`Confirm` 是默认：被控端收到 `RemoteSessionIncoming` 后**不回响应、不登记 token、不派生任务**，只挂起等用户 `approve_pending`/`reject_pending`，到点自动拒绝。**token 绝不进 `PendingApproval`**——那是 UI 状态，凭证只在管理器内部持有。`APPROVAL_TIMEOUT` 必须明显小于服务端 `REMOTE_SESSION_TTL`（60s，见 `crates/server/src/control_plane/remote.rs`）：用户拍板的**整个过程**都要落在那个窗口内，否则响应会被服务端当未知会话丢弃，用户看到的是「卡住」而不是「被拒」
+- `manager.rs` — `RemoteManager` 门面（`RemoteUiState` watch、连接请求、启停、平台注入、剪贴板/共享目录注入、接入确认门控、`RemoteBridge` 实现）
 - 平台实现（xcap 抓屏 / enigo 注入 / arboard 剪贴板）**放在 `crates/client-gui`**，本 crate 保持编译面干净
 
 #### 远程控制的控制面与数据面
@@ -145,6 +146,10 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 **`rd_id` 由服务端分配并持久化**到 `clients.remote_id`（9 位数字，满足 `MIN_PEER_ID_LEN=6`）。同一 NAT 下多个客户端共用一个公网 IP，所以不能由客户端自选；用户全程看不到也不需要配置 ID。
 
 **会话鉴权不依赖 hbbs**（hbbs 按设计不做身份认证，ID 可被抢占）：服务端签发 `session_id` + 一次性 `token`（TTL 60s），经加密控制通道同时下发给控制器与被控端；被控端在 P2P 握手时校验。**没有 token 的第三方即使抢注了 ID 也建不起会话。**
+
+**接入确认复用既有 `RemoteSessionResponse` 通道，不新增控制消息变体**：服务端本来就无条件把被控端的响应转达给控制器（`handle_session_response` → `notify_controller_response`），所以两端只需各自「延迟应答 / 等待应答」。控制器**必须**等到 `accepted:true` 才 `establish`——若照旧在被授权时立刻建立，用户还在看弹窗时它的中继请求就已经发出去，会撞上 hbbr 的 30s 配对窗口，表现就是「卡在连接中」。`Confirm` 下被控端**不登记 token**，所以即使控制器硬闯也过不了握手鉴权：**拒绝是引擎强制的，弹窗只是表面**。开关语义因此是「允许被请求」而非「永久放行」。
+
+被控端 UI 面（`crates/client-gui`）：确认弹窗由 `ui/remote.rs::approval_modal` 在 `GuiApp::update` 里每帧渲染、**常驻所有 Tab 之上**（与 `controlled_banner` 同理，安全提示不能只在「远程」Tab 可见），并按模式给出不同的风险说明（「完全控制 / 仅观看 / 仅文件传输」三者的后果不同）；策略选择器与「已信任的对端」列表在「远程」Tab。策略经 `GuiPrefs.remote_approval` 持久化（`#[serde(default)]`，缺省 `Confirm`，旧配置文件也落到「每次询问」）；**信任列表只存内存**，退出应用即清空（`RemoteUiState.trusted_peers`，按客户端名索引——`RemoteSessionIncoming` 不带 `from_rd_id`，改名即失效）。请求首次出现时会强制显示并聚焦窗口（用户可能已把窗口隐藏到托盘），托盘 tooltip 同步改为「有远程接入请求待确认」。
 
 **数据面分两层**：主路径是 hbbr 中继（所有 NAT 场景可用）；同内网直连（`FetchLocalAddr`/`LocalAddr`）是优化。**跨 NAT TCP 同时打开打洞在当前 hbbs 语义下不成立**——`forward_punch_result` 回给请求方的是目标端信令连接的**源地址**（临时端口），目标端并未在该端口监听，所以「拿到地址就直连」在跨 NAT 场景走不通。打洞是阶段 3 的可选项，只能真机验证。
 
