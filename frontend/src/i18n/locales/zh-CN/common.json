@@ -113,6 +113,7 @@
     "reverseProxy": "反向代理",
     "shadowsocks": "Shadowsocks",
     "trojan": "Trojan",
+    "rustdesk": "RustDesk",
     "acmeCerts": "ACME 证书",
     "ai": "AI",
     "llmGateway": "LLM 网关",
@@ -145,6 +146,7 @@
       "reverseProxy": "反向代理",
       "shadowsocks": "Shadowsocks",
       "trojan": "Trojan",
+      "rustdesk": "RustDesk",
       "connections": "{{count}} 个连接 · {{entities}} 个实体"
     },
     "connectedClients": "已连接客户端",
@@ -156,7 +158,8 @@
       "client": "客户端",
       "proxy": "代理",
       "shadowsocks": "Shadowsocks",
-      "trojan": "Trojan"
+      "trojan": "Trojan",
+      "rustdesk": "RustDesk"
     },
     "noTraffic": "无 {{type}} 流量",
     "clientList": {
@@ -401,6 +404,69 @@
         "acme_wildcard": "ACME 通配符证书",
         "self_signed": "自签名证书（回退）"
       }
+    }
+  },
+  "rustdesk": {
+    "title": "RustDesk 服务器",
+    "description": "监控内置的 RustDesk 会合与中继服务器",
+    "stats": {
+      "status": "服务状态",
+      "onlinePeers": "在线对端",
+      "knownPeers": "已知对端",
+      "relayPairs": "中继对",
+      "throughput": "吞吐量"
+    },
+    "throughput": "吞吐量",
+    "chart": {
+      "bytesIn": "入站流量",
+      "bytesOut": "出站流量",
+      "empty": "暂无吞吐量数据"
+    },
+    "config": {
+      "title": "RustDesk 服务器",
+      "enable": "启用",
+      "rendezvousPort": "会合端口",
+      "natTestPortHint": "NAT 测试端口：{{port}}（会合端口 − 1）",
+      "relayPort": "中继端口",
+      "relayServer": "中继服务器",
+      "relayServerHint": "host:port。留空则由客户端自行决定中继服务器。",
+      "localIp": "本地 IP",
+      "localIpHint": "向同一局域网内对端通告的本地 IP；留空则自动探测。",
+      "mask": "网络掩码",
+      "maskHint": "视为本地网络的 CIDR 范围，例如 192.168.0.0/16。",
+      "alwaysUseRelay": "始终使用中继",
+      "alwaysUseRelayHint": "强制所有会话走中继，而不使用直连 P2P。",
+      "key": "服务端密钥",
+      "keyPlaceholder": "服务端密钥",
+      "keyHint": {
+        "enabled": "留空则保持当前密钥不变",
+        "disabled": "尚未设置密钥——请生成一个供客户端连接使用"
+      },
+      "generateKey": "生成密钥",
+      "generatedKey": {
+        "title": "新的服务端密钥（仅显示一次）",
+        "hint": "请立即复制——客户端必须配置完全相同的密钥才能连接。"
+      },
+      "lastError": {
+        "message": "上次应用配置失败：{{error}}——请修正后重新保存。"
+      },
+      "errors": {
+        "rendezvousPort": "会合端口必须是 2 到 65535 之间的整数。",
+        "relayPort": "中继端口必须是 1 到 65535 之间的整数。",
+        "relayPortConflict": "中继端口不能与会合端口或 NAT 测试端口（会合端口 − 1）相同。",
+        "relayServer": "需形如 host:port，host 不能为空且端口须大于 0（留空则由客户端自行决定）。",
+        "mask": "需形如 192.168.0.0/16 的 IPv4 CIDR（四段取 0–255 且不允许前导零，前缀取 0–32）。"
+      },
+      "status": {
+        "running": "运行中",
+        "stopped": "已停止",
+        "onlinePeers": "{{count}} 个在线",
+        "relayPairs": "{{count}} 对中继",
+        "knownPeers": "{{count}} 个已知",
+        "relayTotalPairs": "累计 {{count}} 对中继",
+        "rejectedTotal": "累计拒绝 {{count}} 次"
+      },
+      "save": "保存 RustDesk 配置"
     }
   },
   "acme": {

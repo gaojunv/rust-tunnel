@@ -30,6 +30,7 @@ import {
   RefreshCw,
   Shield,
   Globe,
+  MonitorSmartphone,
 } from 'lucide-react';
 
 function StatsOverview() {
@@ -58,12 +59,18 @@ function StatsOverview() {
       icon: <Globe className="h-4 w-4" />,
       entity: summary?.trojan,
     },
+    {
+      title: t('dashboard.statsOverview.rustdesk'),
+      icon: <MonitorSmartphone className="h-4 w-4" />,
+      entity: summary?.rustdesk,
+    },
   ];
 
   return (
     <div className="space-y-4">
       {isError && <ErrorBanner onRetry={() => void refetch()} />}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
+      {/* 概览卡共 5 张（客户端/反代/SS/Trojan/RustDesk），宽屏取 5 列以免末位掉行 */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-5">
         {cards.map((card) => (
           <StatCard
             key={card.title}
@@ -106,7 +113,7 @@ export default function DashboardPage() {
 
   const connectedClients = clients.filter((c) => c.online).length;
   const entities = summary
-    ? [summary.clients, summary.proxy, summary.shadowsocks, summary.trojan]
+    ? [summary.clients, summary.proxy, summary.shadowsocks, summary.trojan, summary.rustdesk]
     : [];
   const activeConnections = entities.reduce((sum, e) => sum + e.total_conns, 0);
   const totalBytesIn = entities.reduce((sum, e) => sum + e.total_bytes_in, 0);

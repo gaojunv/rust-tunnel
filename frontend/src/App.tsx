@@ -20,6 +20,7 @@ const MeshPage = lazy(() => import('./pages/MeshPage'));
 const DnsPage = lazy(() => import('./pages/DnsPage'));
 const ShadowsocksPage = lazy(() => import('./pages/ShadowsocksPage'));
 const TrojanPage = lazy(() => import('./pages/TrojanPage'));
+const RustdeskPage = lazy(() => import('./pages/RustdeskPage'));
 const ReverseProxyPage = lazy(() => import('./pages/ReverseProxyPage'));
 const AcmePage = lazy(() => import('./pages/AcmePage'));
 const LogsPage = lazy(() => import('./pages/LogsPage'));
@@ -84,6 +85,7 @@ const router = createBrowserRouter([
           { path: '/dns', element: <DnsPage /> },
           { path: '/shadowsocks', element: <ShadowsocksPage /> },
           { path: '/trojan', element: <TrojanPage /> },
+          { path: '/rustdesk', element: <RustdeskPage /> },
           { path: '/proxy', element: <ReverseProxyPage /> },
           { path: '/clients', element: <ClientsPage /> },
           { path: '/acme', element: <AcmePage /> },

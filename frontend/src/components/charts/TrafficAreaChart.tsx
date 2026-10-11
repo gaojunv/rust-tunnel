@@ -7,7 +7,7 @@ import type { StatsSnapshot } from '@/types';
 import { EntityTypePanel } from './EntityTypePanel';
 import type { EntityType } from '@/hooks/useEntityLabel';
 
-const ENTITY_TYPES: readonly EntityType[] = ['client', 'proxy', 'shadowsocks', 'trojan'];
+const ENTITY_TYPES: readonly EntityType[] = ['client', 'proxy', 'shadowsocks', 'trojan', 'rustdesk'];
 
 export const TrafficAreaChart = () => {
   const { t } = useTranslation();
@@ -29,6 +29,7 @@ export const TrafficAreaChart = () => {
       proxy: [],
       shadowsocks: [],
       trojan: [],
+      rustdesk: [],
     };
     for (const snap of snapshots) {
       map[snap.entity_type]?.push(snap);

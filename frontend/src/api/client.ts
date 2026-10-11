@@ -4,6 +4,8 @@ import type {
   LoginResponse,
   ShadowsocksConfig,
   TrojanConfig,
+  RustdeskConfig,
+  RustdeskUpdateResponse,
   LogEntry,
   MeshNetworkResponse,
   MeshServiceResponse,
@@ -154,6 +156,20 @@ export const getTrojanConfig = async (): Promise<TrojanConfig> => {
 
 export const updateTrojanConfig = async (config: Partial<TrojanConfig>): Promise<TrojanConfig> => {
   const response = await api.post<TrojanConfig>('/trojan', config);
+  return response.data;
+};
+
+// RustDesk API
+export const getRustdeskConfig = async (): Promise<RustdeskConfig> => {
+  const response = await api.get<RustdeskConfig>('/rustdesk');
+  return response.data;
+};
+
+/** `key` 留空=保持现有密钥；`generate_key: true` 时响应一次性回传新 `key`。 */
+export const updateRustdeskConfig = async (
+  config: Partial<RustdeskConfig> & { generate_key?: boolean },
+): Promise<RustdeskUpdateResponse> => {
+  const response = await api.post<RustdeskUpdateResponse>('/rustdesk', config);
   return response.data;
 };
 

@@ -6,6 +6,8 @@ import {
   updateShadowsocksConfig,
   getTrojanConfig,
   updateTrojanConfig,
+  getRustdeskConfig,
+  updateRustdeskConfig,
   getLogs,
   setLogsLevel,
   getLlmLogging,
@@ -127,6 +129,7 @@ import type {
   CreateRoleRequest,
   UpdateRoleRequest,
   RoleListParams,
+  RustdeskConfig,
 } from '../types';
 
 // Shadowsocks hooks
@@ -171,6 +174,27 @@ export function useUpdateTrojanConfig() {
     meta: { successToast: 'common.toast.saved' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['trojan-config'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
+    },
+  });
+}
+
+// RustDesk hooks
+export function useRustdeskConfig() {
+  return useQuery({
+    queryKey: ['rustdesk-config'],
+    queryFn: () => getRustdeskConfig(),
+  });
+}
+
+export function useUpdateRustdeskConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (config: Partial<RustdeskConfig> & { generate_key?: boolean }) =>
+      updateRustdeskConfig(config),
+    meta: { successToast: 'common.toast.saved' },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['rustdesk-config'] });
       queryClient.invalidateQueries({ queryKey: ['stats'] });
     },
   });

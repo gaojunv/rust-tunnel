@@ -113,6 +113,7 @@
     "reverseProxy": "Reverse Proxy",
     "shadowsocks": "Shadowsocks",
     "trojan": "Trojan",
+    "rustdesk": "RustDesk",
     "acmeCerts": "ACME Certs",
     "ai": "AI",
     "llmGateway": "LLM Gateway",
@@ -145,6 +146,7 @@
       "reverseProxy": "Reverse Proxy",
       "shadowsocks": "Shadowsocks",
       "trojan": "Trojan",
+      "rustdesk": "RustDesk",
       "connections": "{{count}} connections · {{entities}} entities"
     },
     "connectedClients": "Connected Clients",
@@ -156,7 +158,8 @@
       "client": "Client",
       "proxy": "Proxy",
       "shadowsocks": "Shadowsocks",
-      "trojan": "Trojan"
+      "trojan": "Trojan",
+      "rustdesk": "RustDesk"
     },
     "noTraffic": "No {{type}} traffic",
     "clientList": {
@@ -401,6 +404,69 @@
         "acme_wildcard": "ACME wildcard certificate",
         "self_signed": "Self-signed certificate (fallback)"
       }
+    }
+  },
+  "rustdesk": {
+    "title": "RustDesk Server",
+    "description": "Monitor the built-in RustDesk rendezvous and relay server",
+    "stats": {
+      "status": "Service Status",
+      "onlinePeers": "Online Peers",
+      "knownPeers": "Known Peers",
+      "relayPairs": "Relay Pairs",
+      "throughput": "Throughput"
+    },
+    "throughput": "Throughput",
+    "chart": {
+      "bytesIn": "Bytes In",
+      "bytesOut": "Bytes Out",
+      "empty": "No throughput data available"
+    },
+    "config": {
+      "title": "RustDesk Server",
+      "enable": "Enable",
+      "rendezvousPort": "Rendezvous Port",
+      "natTestPortHint": "NAT test port: {{port}} (rendezvous port − 1)",
+      "relayPort": "Relay Port",
+      "relayServer": "Relay Server",
+      "relayServerHint": "host:port. Leave blank to let clients choose the relay server.",
+      "localIp": "Local IP",
+      "localIpHint": "Advertised local IP for peers on the same LAN; leave blank to auto-detect.",
+      "mask": "Network Mask",
+      "maskHint": "CIDR range treated as the local network, e.g. 192.168.0.0/16.",
+      "alwaysUseRelay": "Always Use Relay",
+      "alwaysUseRelayHint": "Force sessions through the relay instead of direct P2P connections.",
+      "key": "Server Key",
+      "keyPlaceholder": "Server key",
+      "keyHint": {
+        "enabled": "Leave blank to keep the current key",
+        "disabled": "No key set yet — generate one so clients can connect"
+      },
+      "generateKey": "Generate Key",
+      "generatedKey": {
+        "title": "New server key (shown once)",
+        "hint": "Copy it now — clients must be configured with this exact key to connect."
+      },
+      "lastError": {
+        "message": "Last configuration apply failed: {{error}} — fix the issue and save again."
+      },
+      "errors": {
+        "rendezvousPort": "Rendezvous port must be an integer between 2 and 65535.",
+        "relayPort": "Relay port must be an integer between 1 and 65535.",
+        "relayPortConflict": "Relay port must differ from the rendezvous port and the NAT test port (rendezvous port − 1).",
+        "relayServer": "Expected host:port with a non-empty host and a port greater than 0 (leave blank to let clients choose).",
+        "mask": "Expected an IPv4 CIDR such as 192.168.0.0/16 (four 0–255 octets with no leading zeros, prefix 0–32)."
+      },
+      "status": {
+        "running": "Running",
+        "stopped": "Stopped",
+        "onlinePeers": "{{count}} online",
+        "relayPairs": "{{count}} relay pairs",
+        "knownPeers": "{{count}} known",
+        "relayTotalPairs": "{{count}} relay pairs since start",
+        "rejectedTotal": "{{count}} rejected since start"
+      },
+      "save": "Save RustDesk Config"
     }
   },
   "acme": {

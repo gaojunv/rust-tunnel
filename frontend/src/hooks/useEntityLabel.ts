@@ -13,6 +13,7 @@ export type EntityType = StatsSnapshot['entity_type'];
  *                 未命中则显示截断的 id
  *  - shadowsocks: "shadowsocks:<port>" → "Shadowsocks (port <port>)"，无法解析端口则原样
  *  - trojan:      "trojan:<port>" → "Trojan (port <port>)"，无法解析端口则原样
+ *  - rustdesk:    "rustdesk:<port>" → "RustDesk (port <port>)"，无法解析端口则原样
  */
 export function useEntityLabel(): (type: EntityType, id: string) => string {
   const { data: rules } = useProxyRules();
@@ -56,6 +57,8 @@ export function useEntityLabel(): (type: EntityType, id: string) => string {
           return formatPortLabel(id, 'shadowsocks:', 'Shadowsocks');
         case 'trojan':
           return formatPortLabel(id, 'trojan:', 'Trojan');
+        case 'rustdesk':
+          return formatPortLabel(id, 'rustdesk:', 'RustDesk');
         case 'proxy': {
           const mapped = proxyLabels.get(id);
           if (mapped) return mapped;

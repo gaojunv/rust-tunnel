@@ -58,6 +58,7 @@ const statsSummaryResponse = {
     proxy: entitySummary,
     shadowsocks: entitySummary,
     trojan: entitySummary,
+    rustdesk: entitySummary,
   },
   status: 200,
   statusText: 'OK',

@@ -39,12 +39,13 @@ import {
   BookOpen,
   Sparkles,
   Download,
+  MonitorSmartphone,
 } from 'lucide-react';
 // three.js 体积大（约 600KB），装饰性背景懒加载，不阻塞首屏
 const DataFlowBackground = lazy(() => import('@/components/dataflow/DataFlowBackground'));
 
 interface NavItem {
-  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.knowledge' | 'nav.agentWorkbench' | 'nav.logs' | 'nav.clientDownloads' | 'nav.settings';
+  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.rustdesk' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.knowledge' | 'nav.agentWorkbench' | 'nav.logs' | 'nav.clientDownloads' | 'nav.settings';
   icon: React.ReactNode;
   href: string;
 }
@@ -75,6 +76,7 @@ const navGroups: NavGroup[] = [
       { labelKey: 'nav.reverseProxy', icon: <ArrowLeftRight className="h-4 w-4" />, href: '/proxy' },
       { labelKey: 'nav.shadowsocks', icon: <Shield className="h-4 w-4" />, href: '/shadowsocks' },
       { labelKey: 'nav.trojan', icon: <ShieldCheck className="h-4 w-4" />, href: '/trojan' },
+      { labelKey: 'nav.rustdesk', icon: <MonitorSmartphone className="h-4 w-4" />, href: '/rustdesk' },
       { labelKey: 'nav.acmeCerts', icon: <FileBadge className="h-4 w-4" />, href: '/acme' },
     ],
   },

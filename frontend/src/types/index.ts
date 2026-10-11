@@ -26,6 +26,42 @@ export interface TrojanConfig {
   shared?: boolean;
 }
 
+// 内置 RustDesk 会合/中继服务器配置
+export interface RustdeskConfig {
+  enabled: boolean;
+  rendezvous_port?: number;
+  relay_port?: number;
+  /** `host:port`；空串表示由客户端自行决定中继服务器。 */
+  relay_server?: string;
+  always_use_relay?: boolean;
+  local_ip?: string;
+  mask?: string;
+  /** 是否已设置服务端密钥（密钥明文永不回传，同 SS/Trojan 的密码约定）。 */
+  key_set?: boolean;
+  running?: boolean;
+  /** NAT 测试端口，服务端按 `rendezvous_port - 1` 计算。 */
+  nat_test_port?: number;
+  online_peers?: number;
+  known_peers?: number;
+  relay_pairs?: number;
+  /** 最近一次 apply（绑定监听/启动）失败的原因；`running=true` 时恒为 null。 */
+  last_error?: string | null;
+  /** 累计已建立的中继对数（累计值，非当前值；勿与 `relay_pairs` 混淆）。 */
+  relay_total_pairs?: number;
+  /** 累计拒绝数（会合 + 中继）。 */
+  rejected_total?: number;
+}
+
+/** `POST /api/rustdesk` 成功响应。`generate_key: true` 时一次性回传新密钥。 */
+export interface RustdeskUpdateResponse {
+  status?: string;
+  enabled?: boolean;
+  rendezvous_port?: number;
+  relay_port?: number;
+  /** 仅在请求携带 `generate_key: true` 时出现（用于与客户端配置对齐）。 */
+  key?: string;
+}
+
 // Log entry
 export interface LogEntry {
   id: number;
@@ -281,7 +317,7 @@ export interface DnsSettings {
 // === Unified Stats ===
 
 export interface StatsSnapshot {
-  entity_type: 'client' | 'proxy' | 'shadowsocks' | 'trojan';
+  entity_type: 'client' | 'proxy' | 'shadowsocks' | 'trojan' | 'rustdesk';
   entity_id: string;
   timestamp: string;
   bytes_in: number;
@@ -305,6 +341,7 @@ export interface StatsSummary {
   proxy: EntitySummary;
   shadowsocks: EntitySummary;
   trojan: EntitySummary;
+  rustdesk: EntitySummary;
 }
 
 // === LLM Gateway ===
