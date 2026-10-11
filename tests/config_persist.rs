@@ -71,6 +71,8 @@ fn test_config(db_path: &str, api_port: u16) -> ServerConfig {
         acme_renewal_days_before_expiry: 30,
         acme_email: None,
         acme_tos_agreed: false,
+        // 本测试不关心 RustDesk，其余字段（含 rustdesk_*）沿用 ServerConfig 默认值。
+        ..Default::default()
     }
 }
 

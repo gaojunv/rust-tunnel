@@ -99,6 +99,18 @@ impl TestHarness {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: "127.0.0.1:80".to_string(),
+            // RustDesk 默认关闭：e2e 通过 POST /api/rustdesk 显式开启（端口由
+            // 测试自行分配，见 tests/rustdesk_server.rs），故这里只给关闭态默认值。
+            rustdesk_enabled: false,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: false,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            // 不指定绑定地址：运行时按 "0.0.0.0" 处理（见 effective_bind_addr）。
+            rustdesk_bind_addr: None,
             dns_enabled: false,
             dns_bind: "127.0.0.1:0".to_string(),
             dns_tunnel_domain: "tunnel.local".to_string(),
