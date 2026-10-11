@@ -246,6 +246,8 @@ impl RemoteManager {
         if let Some(active) = self.take_active() {
             active.cancel.cancel();
             self.lock_input().take();
+            // 被控端：控制器还没拨进来时挂起记录仍在表里，一并撤掉，不必等下一个 TTL 窗口。
+            self.lock_inner().pending.remove(&active.session_id);
             self.send(ControlMessage::RemoteSessionEnd {
                 session_id: active.session_id,
                 reason: "用户中断".to_owned(),
@@ -671,6 +673,8 @@ impl RemoteManager {
             active.cancel.cancel();
         }
         self.lock_input().take();
+        // 会话已被服务端判死：挂起记录留着也不会再被消费。
+        self.lock_inner().pending.remove(session_id);
         let reason = reason.to_owned();
         self.update_ui(move |s| {
             s.active = None;

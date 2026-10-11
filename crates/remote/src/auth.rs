@@ -211,8 +211,14 @@ impl PendingSessions {
     }
 
     /// 登记一条挂起会话（同 ID 覆盖旧记录）。
+    ///
+    /// 登记时**顺带清扫过期记录**：没有这一步，一条「服务端签发了会话但控制器始终没拨进来」
+    /// 的记录会永远留在表里——[`Self::authorize`] 只在被查到且已过期时才顺手移除，没人查就
+    /// 没人清。在插入时清扫即可把表大小限制在「最近一个 TTL 窗口内签发的会话」，与服务端
+    /// `RemoteSessionTable::issue` 的做法一致。
     pub fn insert(&self, pending: PendingSession) {
         if let Ok(mut guard) = self.inner.lock() {
+            guard.retain(|_, existing| !existing.is_expired());
             guard.insert(pending.session_id.clone(), pending);
         }
     }
@@ -397,6 +403,29 @@ mod tests {
             AuthError::Expired
         );
         assert!(store.is_empty(), "过期记录应被清理");
+    }
+
+    #[test]
+    fn insert_sweeps_expired_entries() {
+        // 会话签发后控制器始终没拨进来 → 记录不能被无限期留着。
+        let store = PendingSessions::new();
+        let mut stale = PendingSession::new(
+            "sess-old".to_owned(),
+            "tok".to_owned(),
+            "peer-a".to_owned(),
+            RemoteMode::Control,
+        );
+        stale.created = Instant::now()
+            .checked_sub(HANDSHAKE_TOKEN_TTL + Duration::from_secs(1))
+            .expect("测试机运行时间应足够长");
+        store.insert(stale);
+        assert_eq!(store.len(), 1);
+
+        // 新会话登记时，过期的那条被清扫掉。
+        insert(&store, "sess-new", "tok2");
+        assert_eq!(store.len(), 1, "过期记录应被 insert 清扫");
+        assert!(store.remove("sess-old").is_none(), "过期记录不应还在");
+        assert!(store.remove("sess-new").is_some(), "新记录应在");
     }
 
     #[test]
