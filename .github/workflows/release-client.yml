@@ -122,7 +122,12 @@ jobs:
           cache-on-failure: true
       - name: Install Linux GUI deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mold libgtk-3-dev librsvg2-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev pkg-config libdbus-1-dev libxdo-dev
+        # 远程控制新增的构建依赖（xcap 0.9 / enigo 0.6，二者在 Linux 上无条件编译）：
+        #   libpipewire-0.3-dev —— pipewire-sys 的 build script 走 system-deps 找 pkg-config
+        #   libclang-dev        —— 同一个 build script 用 bindgen 生成绑定
+        #   libxcb1-dev / libxcb-randr0-dev —— xcap 的 xcb(randr) 与 enigo 的 x11rb 后端
+        # libxkbcommon-dev 是 enigo 的既有依赖，原本已在列表里。
+        run: sudo apt-get update && sudo apt-get install -y mold libgtk-3-dev librsvg2-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libpipewire-0.3-dev libclang-dev libxcb1-dev libxcb-randr0-dev pkg-config libdbus-1-dev libxdo-dev
       - name: Build GUI
         run: cargo build --release -p rust-tunnel-client-gui --target ${{ matrix.target }}
       - name: Upload GUI to remote
