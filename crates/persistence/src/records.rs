@@ -58,6 +58,33 @@ pub struct TrojanConfigRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// RustDesk 会合/中继配置记录（单行表，id 恒为 1）。
+#[derive(FromRow, Debug)]
+pub struct RustdeskConfigRecord {
+    /// 主键 id，恒为 1（单行表）。
+    pub id: i32,
+    /// 是否启用（1 启用，0 禁用）。
+    pub enabled: i32,
+    /// hbbs 会合端口；NAT 探测端口 = 此值 - 1。
+    pub rendezvous_port: i32,
+    /// hbbr 中继端口。
+    pub relay_port: i32,
+    /// 服务端公钥（licence_key）；空串 = 不校验、不签名。
+    pub key: String,
+    /// 下发给客户端的中继地址；空串 = 由客户端自定。
+    pub relay_server: String,
+    /// 是否强制走中继（1 是，0 否）。
+    pub always_use_relay: i32,
+    /// 内网直连场景下作为中继地址下发的本机 IP；空串 = 不指定。
+    pub local_ip: String,
+    /// 内网判定掩码（如 192.168.0.0/16）；空串 = 不做内网判定。
+    pub mask: String,
+    /// 创建时间。
+    pub created_at: DateTime<Utc>,
+    /// 更新时间。
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Mesh network record from database
 #[derive(FromRow, Debug)]
 pub struct MeshNetworkRecord {

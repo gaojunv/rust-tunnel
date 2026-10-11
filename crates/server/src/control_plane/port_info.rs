@@ -79,3 +79,27 @@ pub struct TrojanRuntimeStatus {
     /// true = 与反代共享端口（SNI 分流）；false = 独立监听
     pub shared: bool,
 }
+
+/// RustDesk 运行时状态：会合/中继监听情况。
+/// 由 `rustdesk_runtime` 的启动/停止路径写入，`GET /api/rustdesk` 读取。
+#[derive(Debug, Clone, Default)]
+pub struct RustdeskRuntimeStatus {
+    /// 会合(hbbs)与中继(hbbr)监听是否都已就绪。
+    pub listening: bool,
+    /// 实际生效的会合端口；未运行时为 None。
+    pub rendezvous_port: Option<u16>,
+    /// 实际生效的中继端口；未运行时为 None。
+    pub relay_port: Option<u16>,
+    /// 最近一次启动/绑定失败的原因；管理 API 用它向用户暴露 bind 失败。
+    pub last_error: Option<String>,
+    /// 在线对端数（`REG_TIMEOUT` 内有心跳的 ID 数），由统计轮询任务刷新。
+    pub online_peers: usize,
+    /// 登记表里的 ID 总数（含已离线），由统计轮询任务刷新。
+    pub known_peers: usize,
+    /// 当前活跃中继配对数（`RelayStats::active_pairs`），由统计轮询任务刷新。
+    pub relay_pairs: usize,
+    /// 累计已建立的中继对数（`RelayStats` 单调递增计数），由统计轮询任务刷新。
+    pub relay_total_pairs: u64,
+    /// 累计拒绝数（会合 + 中继），由统计轮询任务刷新。
+    pub rejected_total: u64,
+}

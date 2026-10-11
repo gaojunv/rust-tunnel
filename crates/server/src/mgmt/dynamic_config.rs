@@ -33,6 +33,27 @@ pub struct TrojanDynamicConfig {
     pub domain: String,
 }
 
+/// RustDesk 动态配置（hbbs 会合 + hbbr 中继，同一个逻辑服务）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RustdeskDynamicConfig {
+    /// 是否启用 RustDesk 服务。
+    pub enabled: bool,
+    /// hbbs 会合端口；默认 21116，NAT 探测端口 = 此值 - 1。
+    pub rendezvous_port: u16,
+    /// hbbr 中继端口；默认 21117。
+    pub relay_port: u16,
+    /// 服务端公钥 licence_key；空 = 不校验 licence_key、不签名。
+    pub key: String,
+    /// 下发给客户端的中继地址；空 = 不下发中继地址，由客户端自定。
+    pub relay_server: String,
+    /// 是否强制客户端走中继。
+    pub always_use_relay: bool,
+    /// 内网直连场景下作为中继地址下发的本机 IP。
+    pub local_ip: String,
+    /// 内网判定掩码，形如 192.168.0.0/16；空 = 不做内网判定。
+    pub mask: String,
+}
+
 /// 反向代理动态配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseProxySettings {
@@ -64,6 +85,8 @@ pub struct DynamicConfig {
     pub ss: Option<ShadowsocksDynamicConfig>,
     /// Trojan 配置（None 表示未启用）。
     pub trojan: Option<TrojanDynamicConfig>,
+    /// RustDesk 配置（None 表示未启用）。
+    pub rustdesk: Option<RustdeskDynamicConfig>,
     /// 反向代理配置。
     pub reverse_proxy: ReverseProxySettings,
     /// DNS 配置。
@@ -80,6 +103,7 @@ impl DynamicConfig {
             llm_request_logging: true,
             ss: None,
             trojan: None,
+            rustdesk: None,
             reverse_proxy: ReverseProxySettings {
                 max_connections: 10000,
                 connection_timeout_secs: 30,
@@ -98,7 +122,7 @@ impl DynamicConfig {
     /// 那是用户最近一次通过 API 保存的配置。
     #[allow(
         clippy::too_many_lines,
-        reason = "顺序加载 6 类动态配置并在缺失时回写种子，共享同一 DB/ServerConfig 上下文，拆分会散开编排逻辑"
+        reason = "顺序加载 7 类动态配置并在缺失时回写种子，共享同一 DB/ServerConfig 上下文，拆分会散开编排逻辑"
     )]
     #[allow(
         clippy::single_match_else,
@@ -217,6 +241,61 @@ impl DynamicConfig {
             }
         };
 
+        // RustDesk（hbbs 会合 + hbbr 中继）
+        let rustdesk = match db.load_rustdesk_config().await {
+            Ok(Some(c)) => Some(RustdeskDynamicConfig {
+                enabled: c.enabled != 0,
+                rendezvous_port: u16::try_from(c.rendezvous_port).unwrap_or(u16::MAX),
+                relay_port: u16::try_from(c.relay_port).unwrap_or(u16::MAX),
+                key: c.key.clone(),
+                relay_server: c.relay_server.clone(),
+                always_use_relay: c.always_use_relay != 0,
+                local_ip: c.local_ip.clone(),
+                mask: c.mask.clone(),
+            }),
+            _ => {
+                if server_config.rustdesk_enabled {
+                    if let (Some(rendezvous_port), Some(relay_port)) = (
+                        server_config.rustdesk_rendezvous_port,
+                        server_config.rustdesk_relay_port,
+                    ) {
+                        // 缺省字段落库为默认空串，与动态配置的空值语义一致
+                        let key = server_config.rustdesk_key.clone().unwrap_or_default();
+                        let relay_server =
+                            server_config.rustdesk_relay_server.clone().unwrap_or_default();
+                        let local_ip = server_config.rustdesk_local_ip.clone().unwrap_or_default();
+                        let mask = server_config.rustdesk_mask.clone().unwrap_or_default();
+                        let _ = db
+                            .save_rustdesk_config(
+                                true,
+                                rendezvous_port,
+                                relay_port,
+                                &key,
+                                &relay_server,
+                                server_config.rustdesk_always_use_relay,
+                                &local_ip,
+                                &mask,
+                            )
+                            .await;
+                        Some(RustdeskDynamicConfig {
+                            enabled: true,
+                            rendezvous_port,
+                            relay_port,
+                            key,
+                            relay_server,
+                            always_use_relay: server_config.rustdesk_always_use_relay,
+                            local_ip,
+                            mask,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
         // Reverse proxy
         let reverse_proxy = if let Ok(Some(cfg)) = db.load_reverse_proxy_config().await {
             ReverseProxySettings {
@@ -263,6 +342,7 @@ impl DynamicConfig {
             llm_request_logging,
             ss,
             trojan,
+            rustdesk,
             reverse_proxy,
             dns,
         }
@@ -282,6 +362,7 @@ mod tests {
             llm_request_logging: true,
             ss: None,
             trojan: None,
+            rustdesk: None,
             reverse_proxy: ReverseProxySettings {
                 max_connections: 10000,
                 connection_timeout_secs: 30,

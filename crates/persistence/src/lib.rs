@@ -41,6 +41,8 @@ pub mod records;
 pub mod reverse_proxy;
 /// Agent 角色定义的持久化操作。
 pub mod roles;
+/// RustDesk 会合/中继配置的持久化操作（单行表）。
+pub mod rustdesk;
 /// 数据库表结构初始化与迁移。
 pub mod schema;
 /// 服务端鉴权 token 的持久化操作。

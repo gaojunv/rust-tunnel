@@ -36,6 +36,8 @@ pub use protocols::trojan;
 pub use rust_tunnel_protocols as protocols;
 // trojan_runtime 已移回 server 侧（不属于 protocols 关注点）
 pub mod trojan_runtime;
+/// 内置 RustDesk 会合(hbbs)/中继(hbbr)监听的启动与统计轮询入口。
+pub mod rustdesk_runtime;
 
 // 受控 re-export（替代 config::* 扁平化）：仅装配层与外部调用方需要的根符号
 pub use config::ServerConfig;

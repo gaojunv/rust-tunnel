@@ -94,6 +94,30 @@ impl Database {
             }
         }
 
+        // RustDesk 会合/中继配置表
+        // hbbs 会合 + hbbr 中继是同一个逻辑服务（同一开关、同一主机），故用单行表：
+        // CHECK (id = 1) 从库层面保证永远只有一份配置，避免按端口 upsert 残留旧行。
+        // key 用双引号：SQLite 中 KEY 是关键字，加引号可无歧义地当作列名。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rustdesk_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                rendezvous_port INTEGER NOT NULL DEFAULT 21116,
+                relay_port INTEGER NOT NULL DEFAULT 21117,
+                "key" TEXT NOT NULL DEFAULT '',
+                relay_server TEXT NOT NULL DEFAULT '',
+                always_use_relay INTEGER NOT NULL DEFAULT 0,
+                local_ip TEXT NOT NULL DEFAULT '',
+                mask TEXT NOT NULL DEFAULT '',
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         // Server logs table
         sqlx::query(
             r"

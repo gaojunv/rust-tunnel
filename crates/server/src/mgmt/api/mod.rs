@@ -46,6 +46,8 @@ pub mod mesh;
 pub mod preferences;
 /// 反向代理规则与配置路由。
 pub mod reverse_proxy;
+/// RustDesk 会合/中继配置路由。
+pub mod rustdesk;
 /// 服务端接入 Token 管理路由。
 pub mod server_auth;
 /// 通用设置路由。
@@ -313,6 +315,11 @@ pub async fn run_api_server(
         .route(
             "/api/trojan",
             get(trojan::get_trojan_config).post(trojan::update_trojan_config),
+        )
+        // RustDesk rendezvous/relay management endpoints
+        .route(
+            "/api/rustdesk",
+            get(rustdesk::get_rustdesk_config).post(rustdesk::update_rustdesk_config),
         )
         // Mesh network endpoints
         .route("/api/mesh", get(mesh::list_meshes))

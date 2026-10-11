@@ -27,6 +27,7 @@ rust-tunnel-common = { path = "../common" }
 rust-tunnel-persistence = { path = "../persistence" }
 rust-tunnel-protocols = { path = "../protocols" }
 rust-tunnel-rag = { path = "../rag", optional = true }
+rust-tunnel-rustdesk = { path = "../rustdesk" }
 rust-tunnel-llm = { path = "../llm" }
 rust-tunnel-agent = { path = "../agent" }
 rust-tunnel-pki = { path = "../pki" }

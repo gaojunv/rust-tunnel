@@ -14,7 +14,7 @@ use crate::reverse_proxy::ReverseProxyState;
 use rust_tunnel_common::ControlMessage;
 
 use super::acme_config::{AcmeConfigInfo, AcmeFullConfig};
-use super::port_info::{ClientInfo, PortInfo as ServerPortInfo, TrojanRuntimeStatus};
+use super::port_info::{ClientInfo, PortInfo as ServerPortInfo, RustdeskRuntimeStatus, TrojanRuntimeStatus};
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
@@ -76,6 +76,15 @@ pub struct ProxyPortsState {
     pub trojan_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
     /// Trojan 运行时状态（证书来源、共享模式）
     pub trojan_runtime: Arc<RwLock<TrojanRuntimeStatus>>,
+    /// RustDesk 会合/中继监听器 abort handle（hbbs + hbbr 共用同一开关）
+    pub rustdesk_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// RustDesk 运行时状态（监听端口、最近错误）
+    pub rustdesk_runtime: Arc<RwLock<RustdeskRuntimeStatus>>,
+    /// RustDesk 四个运行时任务的句柄（会合 TCP/UDP、NAT 探测、中继、统计轮询）。
+    /// 停旧时逐个有界 await，确保旧监听真正释放、旧 poller 的收尾（幻影连接数释放）已完成。
+    pub rustdesk_tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
+    /// RustDesk 监听绑定地址（静态配置，启动时由 bin/server.rs 写入一次；空串按 "0.0.0.0" 处理）。
+    pub rustdesk_bind_addr: Arc<RwLock<String>>,
 }
 
 impl ProxyPortsState {
@@ -283,6 +292,7 @@ impl ServerState {
                 llm_request_logging: true,
                 ss: None,
                 trojan: None,
+                rustdesk: None,
                 reverse_proxy: crate::dynamic_config::ReverseProxySettings {
                     max_connections: 10000,
                     connection_timeout_secs: 30,
@@ -328,6 +338,7 @@ impl ServerState {
                 llm_request_logging: true,
                 ss: None,
                 trojan: None,
+                rustdesk: None,
                 reverse_proxy: crate::dynamic_config::ReverseProxySettings {
                     max_connections: 10000,
                     connection_timeout_secs: 30,

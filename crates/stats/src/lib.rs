@@ -24,7 +24,7 @@ const RATE_WINDOW: std::time::Duration = std::time::Duration::from_mins(1);
 
 // ── Entity type ──────────────────────────────────────────────────
 
-/// 统计实体类型：区分客户端、反代、Shadowsocks、Trojan 四类桶。
+/// 统计实体类型：区分客户端、反代、Shadowsocks、Trojan、RustDesk 五类桶。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
@@ -36,6 +36,8 @@ pub enum EntityType {
     Shadowsocks,
     /// Trojan 代理端口。
     Trojan,
+    /// RustDesk 会合/中继端口（hbbs + hbbr）。
+    Rustdesk,
 }
 
 impl EntityType {
@@ -47,6 +49,7 @@ impl EntityType {
             EntityType::Proxy => "proxy",
             EntityType::Shadowsocks => "shadowsocks",
             EntityType::Trojan => "trojan",
+            EntityType::Rustdesk => "rustdesk",
         }
     }
 }
@@ -361,6 +364,7 @@ impl StatsCollector {
                 EntityType::Proxy => &mut summary.proxy,
                 EntityType::Shadowsocks => &mut summary.shadowsocks,
                 EntityType::Trojan => &mut summary.trojan,
+                EntityType::Rustdesk => &mut summary.rustdesk,
             };
             bucket.total_bytes_in += stats.bytes_in;
             bucket.total_bytes_out += stats.bytes_out;
@@ -385,6 +389,8 @@ pub struct StatsSummary {
     pub shadowsocks: EntitySummary,
     /// Trojan 聚合。
     pub trojan: EntitySummary,
+    /// RustDesk 会合/中继聚合。
+    pub rustdesk: EntitySummary,
 }
 
 /// 单类实体的聚合统计。

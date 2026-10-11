@@ -2,6 +2,7 @@
 
 use super::cli::ServerCli;
 use super::file::ServerConfigFile;
+use super::rustdesk_validation::{validate_rustdesk_config, RustdeskValidationInput};
 use super::ServerConfig;
 use clap::Parser;
 use figment::{
@@ -100,6 +101,33 @@ impl ServerConfig {
                 }
                 if let Some(v) = file_config.trojan_fallback {
                     config.trojan_fallback = v;
+                }
+                if let Some(v) = file_config.rustdesk_enabled {
+                    config.rustdesk_enabled = v;
+                }
+                if let Some(v) = file_config.rustdesk_rendezvous_port {
+                    config.rustdesk_rendezvous_port = Some(v);
+                }
+                if let Some(v) = file_config.rustdesk_relay_port {
+                    config.rustdesk_relay_port = Some(v);
+                }
+                if let Some(v) = file_config.rustdesk_key {
+                    config.rustdesk_key = Some(v);
+                }
+                if let Some(v) = file_config.rustdesk_relay_server {
+                    config.rustdesk_relay_server = Some(v);
+                }
+                if let Some(v) = file_config.rustdesk_always_use_relay {
+                    config.rustdesk_always_use_relay = v;
+                }
+                if let Some(v) = file_config.rustdesk_local_ip {
+                    config.rustdesk_local_ip = Some(v);
+                }
+                if let Some(v) = file_config.rustdesk_mask {
+                    config.rustdesk_mask = Some(v);
+                }
+                if let Some(v) = file_config.rustdesk_bind_addr {
+                    config.rustdesk_bind_addr = Some(v);
                 }
                 if let Some(v) = file_config.dns_enabled {
                     config.dns_enabled = v;
@@ -231,6 +259,39 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("TROJAN_FALLBACK") {
             config.trojan_fallback = v;
+        }
+
+        // Environment variables for RustDesk
+        if let Ok(v) = std::env::var("RUSTDESK_ENABLED") {
+            config.rustdesk_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_RENDEZVOUS_PORT") {
+            if let Ok(port) = v.parse::<u16>() {
+                config.rustdesk_rendezvous_port = Some(port);
+            }
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_RELAY_PORT") {
+            if let Ok(port) = v.parse::<u16>() {
+                config.rustdesk_relay_port = Some(port);
+            }
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_KEY") {
+            config.rustdesk_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_RELAY_SERVER") {
+            config.rustdesk_relay_server = Some(v);
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_ALWAYS_USE_RELAY") {
+            config.rustdesk_always_use_relay = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_LOCAL_IP") {
+            config.rustdesk_local_ip = Some(v);
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_MASK") {
+            config.rustdesk_mask = Some(v);
+        }
+        if let Ok(v) = std::env::var("RUSTDESK_BIND_ADDR") {
+            config.rustdesk_bind_addr = Some(v);
         }
 
         // Environment variables for DNS
@@ -367,6 +428,35 @@ impl ServerConfig {
             config.trojan_fallback = v;
         }
 
+        // RustDesk command line arguments
+        if let Some(v) = cli.rustdesk_enabled {
+            config.rustdesk_enabled = v;
+        }
+        if let Some(v) = cli.rustdesk_rendezvous_port {
+            config.rustdesk_rendezvous_port = Some(v);
+        }
+        if let Some(v) = cli.rustdesk_relay_port {
+            config.rustdesk_relay_port = Some(v);
+        }
+        if let Some(v) = cli.rustdesk_key {
+            config.rustdesk_key = Some(v);
+        }
+        if let Some(v) = cli.rustdesk_relay_server {
+            config.rustdesk_relay_server = Some(v);
+        }
+        if let Some(v) = cli.rustdesk_always_use_relay {
+            config.rustdesk_always_use_relay = v;
+        }
+        if let Some(v) = cli.rustdesk_local_ip {
+            config.rustdesk_local_ip = Some(v);
+        }
+        if let Some(v) = cli.rustdesk_mask {
+            config.rustdesk_mask = Some(v);
+        }
+        if let Some(v) = cli.rustdesk_bind_addr {
+            config.rustdesk_bind_addr = Some(v);
+        }
+
         // DNS command line arguments
         if let Some(v) = cli.dns_enabled {
             config.dns_enabled = v;
@@ -466,6 +556,31 @@ impl ServerConfig {
                         .to_string(),
                 );
             }
+        }
+
+        // Validate RustDesk configuration。触发条件放宽为「已启用 或 任一端口字段有值」：
+        // 默认配置与 e2e harness 全为 None，仍静默跳过；但只要有人写了端口，即便 enabled=false
+        // 也要拦住越界/冲突值，避免坏值落库留到下次启动才炸。
+        if config.rustdesk_enabled
+            || config.rustdesk_rendezvous_port.is_some()
+            || config.rustdesk_relay_port.is_some()
+        {
+            let other_ports: Vec<(u16, &str)> = [
+                (config.ss_port, "ss_port"),
+                (config.trojan_port, "trojan_port"),
+            ]
+            .into_iter()
+            .filter_map(|(port, label)| port.map(|port| (port, label)))
+            .collect();
+            validate_rustdesk_config(&RustdeskValidationInput {
+                enabled: config.rustdesk_enabled,
+                rendezvous_port: config.rustdesk_rendezvous_port,
+                relay_port: config.rustdesk_relay_port,
+                relay_server: config.rustdesk_relay_server.as_deref().unwrap_or(""),
+                mask: config.rustdesk_mask.as_deref().unwrap_or(""),
+                other_ports: &other_ports,
+            })
+            .map_err(|e| e.to_string())?;
         }
 
         // Validate DNS configuration

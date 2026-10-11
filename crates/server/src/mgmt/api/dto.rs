@@ -108,6 +108,47 @@ pub struct TrojanConfig {
     pub shared: bool,
 }
 
+/// RustDesk 会合/中继配置响应（`GET /api/rustdesk`）。
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "GET 契约冻结为四个独立布尔（启用/强制中继/已设密钥/运行中），改枚举会动到前端类型"
+)]
+#[derive(Debug, Serialize)]
+pub struct RustdeskConfig {
+    /// 是否启用 RustDesk 会合/中继服务。
+    pub enabled: bool,
+    /// hbbs 会合端口。
+    pub rendezvous_port: u16,
+    /// hbbr 中继端口。
+    pub relay_port: u16,
+    /// 下发给客户端的中继地址（`host:port`）；空串 = 由客户端自定。
+    pub relay_server: String,
+    /// 是否强制客户端走中继。
+    pub always_use_relay: bool,
+    /// 内网直连场景下作为中继地址下发的本机 IP。
+    pub local_ip: String,
+    /// 内网判定掩码（如 `192.168.0.0/16`）；空串 = 不做内网判定。
+    pub mask: String,
+    /// 是否已设置服务端密钥（明文永不回传，同 SS/Trojan 的密码约定）。
+    pub key_set: bool,
+    /// 会合/中继监听是否都已就绪。
+    pub running: bool,
+    /// NAT 探测端口，按 `rendezvous_port - 1` 计算。
+    pub nat_test_port: u16,
+    /// 在线对端数（透传运行状态）。
+    pub online_peers: usize,
+    /// 登记表 ID 总数（透传运行状态）。
+    pub known_peers: usize,
+    /// 当前活跃中继配对数（透传运行状态）。
+    pub relay_pairs: usize,
+    /// 最近一次 apply 失败的原因；`running=true` 时恒为 null。
+    pub last_error: Option<String>,
+    /// 累计已建立的中继对数（运行状态计数器）。
+    pub relay_total_pairs: u64,
+    /// 累计拒绝数（会合 + 中继）。
+    pub rejected_total: u64,
+}
+
 /// Mesh 网络信息响应。
 #[derive(Debug, Serialize)]
 pub struct MeshNetworkResponse {

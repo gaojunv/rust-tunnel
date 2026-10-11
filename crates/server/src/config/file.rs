@@ -43,6 +43,24 @@ pub struct ServerConfigFile {
     pub trojan_password: Option<String>,
     /// Trojan 认证失败回退地址。
     pub trojan_fallback: Option<String>,
+    /// 是否启用 RustDesk 会合/中继服务。
+    pub rustdesk_enabled: Option<bool>,
+    /// RustDesk 会合(hbbs)端口。
+    pub rustdesk_rendezvous_port: Option<u16>,
+    /// RustDesk 中继(hbbr)端口。
+    pub rustdesk_relay_port: Option<u16>,
+    /// RustDesk 服务端公钥（licence_key）。
+    pub rustdesk_key: Option<String>,
+    /// 下发给客户端的中继地址。
+    pub rustdesk_relay_server: Option<String>,
+    /// 是否强制客户端走中继。
+    pub rustdesk_always_use_relay: Option<bool>,
+    /// 内网直连场景下作为中继地址下发的本机 IP。
+    pub rustdesk_local_ip: Option<String>,
+    /// 内网判定掩码（IPv4 CIDR）。
+    pub rustdesk_mask: Option<String>,
+    /// RustDesk 四个监听的绑定 IP；未设置时运行时用默认 `0.0.0.0`。
+    pub rustdesk_bind_addr: Option<String>,
     /// 是否启用内置 DNS 服务。
     pub dns_enabled: Option<bool>,
     /// DNS 监听地址。

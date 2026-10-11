@@ -93,6 +93,42 @@ pub struct ServerCli {
     #[clap(long = "trojan-fallback")]
     pub trojan_fallback: Option<String>,
 
+    /// Enable the built-in RustDesk-compatible rendezvous (hbbs) / relay (hbbr) service
+    #[clap(long = "rustdesk-enabled")]
+    pub rustdesk_enabled: Option<bool>,
+
+    /// RustDesk rendezvous (hbbs) port (the NAT-test port is this value minus one)
+    #[clap(long = "rustdesk-rendezvous-port")]
+    pub rustdesk_rendezvous_port: Option<u16>,
+
+    /// RustDesk relay (hbbr) port
+    #[clap(long = "rustdesk-relay-port")]
+    pub rustdesk_relay_port: Option<u16>,
+
+    /// RustDesk server public key (licence_key); empty disables key verification
+    #[clap(long = "rustdesk-key")]
+    pub rustdesk_key: Option<String>,
+
+    /// Relay address handed to clients; empty lets clients choose
+    #[clap(long = "rustdesk-relay-server")]
+    pub rustdesk_relay_server: Option<String>,
+
+    /// Force clients to use the relay
+    #[clap(long = "rustdesk-always-use-relay")]
+    pub rustdesk_always_use_relay: Option<bool>,
+
+    /// LAN IP handed to clients as the relay address (direct-connect scenarios)
+    #[clap(long = "rustdesk-local-ip")]
+    pub rustdesk_local_ip: Option<String>,
+
+    /// LAN CIDR mask for direct-connect detection (e.g. 192.168.0.0/16)
+    #[clap(long = "rustdesk-mask")]
+    pub rustdesk_mask: Option<String>,
+
+    /// IP the four RustDesk listeners bind to (defaults to 0.0.0.0 when unset)
+    #[clap(long = "rustdesk-bind-addr")]
+    pub rustdesk_bind_addr: Option<String>,
+
     /// Enable embedded DNS server
     #[clap(long = "dns-enabled")]
     pub dns_enabled: Option<bool>,

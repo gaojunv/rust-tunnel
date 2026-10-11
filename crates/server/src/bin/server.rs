@@ -679,6 +679,30 @@ async fn main() -> TunnelResult<()> {
         }
     }
 
+    // 绑定地址是基础设施级设置（换网卡/内网隔离），只走静态配置，不进 DB/API；
+    // 每次启动覆盖一次，Web UI 保存路径与启动路径因此共用同一地址。
+    // 无条件写入：即使 RustDesk 当前 disabled，后续 API 保存也依赖它。
+    if let Some(addr) = &config.rustdesk_bind_addr {
+        *state.proxy_ports.rustdesk_bind_addr.write().await = addr.clone();
+    }
+
+    // Start RustDesk (hbbs rendezvous + hbbr relay) if enabled in dynamic config
+    {
+        let rd = {
+            let dc = state.dynamic_config.read().await;
+            dc.rustdesk.clone()
+        };
+        if let Some(ref rd) = rd {
+            if rd.enabled {
+                if let Err(e) =
+                    rust_tunnel_server::rustdesk_runtime::apply_rustdesk_config(&state, rd).await
+                {
+                    tracing::error!("RustDesk 启动失败: {}", e);
+                }
+            }
+        }
+    }
+
     // Spawn API server
     let api_tls_config = if config.api_tls {
         if let Some(ref cert_manager) = state.acme.cert_manager {

@@ -6,6 +6,8 @@ pub mod cli;
 pub mod file;
 /// 三级配置合并与校验逻辑。
 pub mod merge;
+/// RustDesk 配置校验：配置合并与管理 API 两条路径共用的唯一校验器。
+pub mod rustdesk_validation;
 
 pub use cli::ServerCli;
 pub use file::ServerConfigFile;
@@ -57,6 +59,24 @@ pub struct ServerConfig {
     pub trojan_password: Option<String>,
     /// Trojan 认证失败回退地址。
     pub trojan_fallback: String,
+    /// 是否启用 RustDesk 会合(hbbs)/中继(hbbr)服务。
+    pub rustdesk_enabled: bool,
+    /// RustDesk 会合(hbbs)端口；启用时必填，NAT 探测端口 = 此值 - 1。
+    pub rustdesk_rendezvous_port: Option<u16>,
+    /// RustDesk 中继(hbbr)端口；启用时必填。
+    pub rustdesk_relay_port: Option<u16>,
+    /// RustDesk 服务端公钥（licence_key）；空 = 不校验、不签名。
+    pub rustdesk_key: Option<String>,
+    /// 下发给客户端的中继地址；空 = 由客户端自定。
+    pub rustdesk_relay_server: Option<String>,
+    /// 是否强制客户端走中继。
+    pub rustdesk_always_use_relay: bool,
+    /// 内网直连场景下作为中继地址下发的本机 IP。
+    pub rustdesk_local_ip: Option<String>,
+    /// 内网判定掩码（IPv4 CIDR，如 192.168.0.0/16）；空 = 不做内网判定。
+    pub rustdesk_mask: Option<String>,
+    /// RustDesk 四个监听绑定的 IP；`None` = 运行时取默认 `0.0.0.0`。
+    pub rustdesk_bind_addr: Option<String>,
     /// 是否启用内置 DNS。
     pub dns_enabled: bool,
     /// DNS 监听地址。
@@ -118,6 +138,15 @@ impl Default for ServerConfig {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: "127.0.0.1:80".to_string(),
+            rustdesk_enabled: false,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: false,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: false,
             dns_bind: "0.0.0.0:53".to_string(),
             dns_tunnel_domain: "tunnel.local".to_string(),
@@ -169,6 +198,12 @@ mod tests {
         assert!(config.trojan_port.is_none());
         assert!(config.trojan_password.is_none());
         assert_eq!(config.trojan_fallback, "127.0.0.1:80");
+        assert!(!config.rustdesk_enabled);
+        assert!(config.rustdesk_rendezvous_port.is_none());
+        assert!(config.rustdesk_relay_port.is_none());
+        assert!(config.rustdesk_key.is_none());
+        assert!(!config.rustdesk_always_use_relay);
+        assert!(config.rustdesk_bind_addr.is_none());
         assert!(!config.dns_enabled);
         assert_eq!(config.dns_bind, "0.0.0.0:53");
         assert_eq!(config.dns_tunnel_domain, "tunnel.local");
@@ -199,6 +234,15 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: None,
             dns_bind: None,
             dns_tunnel_domain: None,
@@ -261,6 +305,15 @@ mod tests {
             trojan_port: Some(443),
             trojan_password: Some("trojan-pass".to_string()),
             trojan_fallback: "127.0.0.1:8080".to_string(),
+            rustdesk_enabled: true,
+            rustdesk_rendezvous_port: Some(21116),
+            rustdesk_relay_port: Some(21117),
+            rustdesk_key: Some("rd-key".to_string()),
+            rustdesk_relay_server: Some("relay.example.com:21117".to_string()),
+            rustdesk_always_use_relay: false,
+            rustdesk_local_ip: Some("192.168.1.10".to_string()),
+            rustdesk_mask: Some("192.168.0.0/16".to_string()),
+            rustdesk_bind_addr: None,
             dns_enabled: true,
             dns_bind: "0.0.0.0:53".to_string(),
             dns_tunnel_domain: "tunnel.local".to_string(),
@@ -302,6 +355,15 @@ mod tests {
         assert_eq!(config.trojan_port, cloned.trojan_port);
         assert_eq!(config.trojan_password, cloned.trojan_password);
         assert_eq!(config.trojan_fallback, cloned.trojan_fallback);
+        assert_eq!(config.rustdesk_enabled, cloned.rustdesk_enabled);
+        assert_eq!(
+            config.rustdesk_rendezvous_port,
+            cloned.rustdesk_rendezvous_port
+        );
+        assert_eq!(config.rustdesk_relay_port, cloned.rustdesk_relay_port);
+        assert_eq!(config.rustdesk_key, cloned.rustdesk_key);
+        assert_eq!(config.rustdesk_relay_server, cloned.rustdesk_relay_server);
+        assert_eq!(config.rustdesk_bind_addr, cloned.rustdesk_bind_addr);
         assert_eq!(config.dns_enabled, cloned.dns_enabled);
         assert_eq!(config.dns_bind, cloned.dns_bind);
         assert_eq!(config.dns_tunnel_domain, cloned.dns_tunnel_domain);
@@ -332,6 +394,15 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: None,
             dns_bind: None,
             dns_tunnel_domain: None,
@@ -381,6 +452,15 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: None,
             dns_bind: None,
             dns_tunnel_domain: None,
@@ -430,6 +510,15 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: None,
             dns_bind: None,
             dns_tunnel_domain: None,
@@ -479,6 +568,15 @@ mod tests {
             trojan_port: None,
             trojan_password: Some("password".to_string()),
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: None,
             dns_bind: None,
             dns_tunnel_domain: None,
@@ -528,6 +626,15 @@ mod tests {
             trojan_port: Some(443),
             trojan_password: None,
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: None,
             dns_bind: None,
             dns_tunnel_domain: None,
@@ -577,6 +684,15 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
             dns_enabled: Some(true),
             dns_bind: Some("not-an-address".to_string()),
             dns_tunnel_domain: None,
@@ -600,5 +716,189 @@ mod tests {
         let result = ServerConfig::from_cli(cli);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid dns_bind"));
+    }
+
+    /// 全部字段为 None 的 CLI 快照，供校验用例用 `..all_none_cli()` 覆盖 rustdesk 字段。
+    fn all_none_cli() -> ServerCli {
+        ServerCli {
+            config_file: None,
+            control_addr: None,
+            api_addr: None,
+            admin_password: None,
+            jwt_secret: None,
+            client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+            db_path: None,
+            client_dist_dir: None,
+            wiki_dist_dir: None,
+            ss_enabled: None,
+            ss_port: None,
+            ss_cipher: None,
+            ss_password: None,
+            trojan_enabled: None,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: None,
+            rustdesk_enabled: None,
+            rustdesk_rendezvous_port: None,
+            rustdesk_relay_port: None,
+            rustdesk_key: None,
+            rustdesk_relay_server: None,
+            rustdesk_always_use_relay: None,
+            rustdesk_local_ip: None,
+            rustdesk_mask: None,
+            rustdesk_bind_addr: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            api_tls: None,
+            api_domain: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
+        }
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_requires_ports() {
+        let cli = ServerCli {
+            rustdesk_enabled: Some(true),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("rustdesk_rendezvous_port and rustdesk_relay_port are required"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_ports_must_differ() {
+        let cli = ServerCli {
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(21116),
+            rustdesk_relay_port: Some(21116),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must differ"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_rendezvous_port_min() {
+        // 会合端口为 1 时 NAT 探测端口为 0，无法绑定，应报错
+        let cli = ServerCli {
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(1),
+            rustdesk_relay_port: Some(21117),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be >= 2"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_port_collision_with_ss() {
+        let cli = ServerCli {
+            ss_enabled: Some(true),
+            ss_port: Some(8388),
+            ss_cipher: Some("aes-256-gcm".to_string()),
+            ss_password: Some("password".to_string()),
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(8388),
+            rustdesk_relay_port: Some(21117),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("collide with ss_port"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_nat_test_port_collision() {
+        // NAT 探测端口 = rendezvous_port - 1 = 8388，与 ss_port 冲突
+        let cli = ServerCli {
+            ss_enabled: Some(true),
+            ss_port: Some(8388),
+            ss_cipher: Some("aes-256-gcm".to_string()),
+            ss_password: Some("password".to_string()),
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(8389),
+            rustdesk_relay_port: Some(8390),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("collide with ss_port"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_invalid_mask() {
+        let cli = ServerCli {
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(21116),
+            rustdesk_relay_port: Some(21117),
+            rustdesk_mask: Some("192.168.0.0/40".to_string()),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid rustdesk_mask"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_validation_invalid_relay_server() {
+        let cli = ServerCli {
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(21116),
+            rustdesk_relay_port: Some(21117),
+            rustdesk_relay_server: Some("no-port-here".to_string()),
+            ..all_none_cli()
+        };
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid rustdesk_relay_server"));
+    }
+
+    #[test]
+    fn test_rustdesk_config_valid_merges_fields() {
+        let cli = ServerCli {
+            rustdesk_enabled: Some(true),
+            rustdesk_rendezvous_port: Some(21116),
+            rustdesk_relay_port: Some(21117),
+            rustdesk_key: Some("pk".to_string()),
+            rustdesk_relay_server: Some("relay.example.com:21117".to_string()),
+            rustdesk_always_use_relay: Some(true),
+            rustdesk_local_ip: Some("192.168.1.10".to_string()),
+            rustdesk_mask: Some("192.168.0.0/16".to_string()),
+            ..all_none_cli()
+        };
+        let config = ServerConfig::from_cli(cli).unwrap();
+        assert!(config.rustdesk_enabled);
+        assert_eq!(config.rustdesk_rendezvous_port, Some(21116));
+        assert_eq!(config.rustdesk_relay_port, Some(21117));
+        assert_eq!(config.rustdesk_key.as_deref(), Some("pk"));
+        assert_eq!(
+            config.rustdesk_relay_server.as_deref(),
+            Some("relay.example.com:21117")
+        );
+        assert!(config.rustdesk_always_use_relay);
+        assert_eq!(config.rustdesk_local_ip.as_deref(), Some("192.168.1.10"));
+        assert_eq!(config.rustdesk_mask.as_deref(), Some("192.168.0.0/16"));
     }
 }

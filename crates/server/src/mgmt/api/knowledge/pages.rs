@@ -168,7 +168,7 @@ pub async fn put_page(
     let origin_key: Option<&str> = body
         .origin_key
         .as_deref()
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty());
     if origin_key.is_some_and(|k| k.chars().count() > 512) {
         return (
