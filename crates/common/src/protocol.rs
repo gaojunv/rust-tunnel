@@ -452,6 +452,128 @@ pub enum ControlMessage {
         /// 映射摘要。
         summary: MappingSummary,
     },
+    // ── 远程控制（GUI 客户端互控；新增变体一律追加在末尾以保持 bincode 序数稳定）──
+    /// 服务端下发的远程控制能力通告（server -> client，注册后按版本门控下发一次）。
+    ///
+    /// `params` 为 `None` 表示服务端未启用 RustDesk，客户端应隐藏远程功能并提示；
+    /// 此时 `rd_id` 为空串。
+    RemoteCapability {
+        /// RustDesk 会合/中继运行参数。
+        params: Option<RemoteParams>,
+        /// 服务端为本客户端分配的稳定 RustDesk ID（9 位数字）。
+        rd_id: String,
+    },
+    /// 客户端上报被控能力与开关状态（client -> server）。
+    ///
+    /// 开关变化或首次收到 `RemoteCapability` 时上报；服务端据此维护可远程列表。
+    RemoteAnnounce {
+        /// 是否允许被远程控制。
+        enabled: bool,
+        /// 平台标识：`macos` / `windows` / `linux`。
+        platform: String,
+        /// 显示器数量。
+        displays: u32,
+    },
+    /// 控制器拉取可远程列表（client -> server，打开远程页时的兜底；主路径是服务端广播）。
+    RemotePeerListRequest,
+    /// 可远程的在线客户端列表（server -> client）。
+    RemotePeerList {
+        /// 列表内容，只含已开启被控且在线、且具备远程能力的客户端。
+        peers: Vec<RemotePeerInfo>,
+    },
+    /// 控制器请求连接某个客户端（client -> server）。
+    RemoteConnectRequest {
+        /// 目标客户端名（rust-tunnel 内部名，非 RustDesk ID）。
+        target_client: String,
+        /// 会话模式。
+        mode: RemoteMode,
+    },
+    /// 服务端向控制器下发授权与会合参数（server -> controller）。
+    RemoteConnectGrant {
+        /// 服务端签发的会话 ID。
+        session_id: String,
+        /// 一次性鉴权 token（被控端在数据面握手时校验）。
+        token: String,
+        /// 目标端的 RustDesk ID。
+        target_rd_id: String,
+        /// 目标平台标识。
+        target_platform: String,
+        /// 会合/中继参数。
+        params: RemoteParams,
+    },
+    /// 服务端向被控端转达会话请求（server -> controlled）。
+    RemoteSessionIncoming {
+        /// 会话 ID。
+        session_id: String,
+        /// 一次性鉴权 token，被控端在数据面握手时校验。
+        token: String,
+        /// 发起方客户端名。
+        from_name: String,
+        /// 会话模式。
+        mode: RemoteMode,
+    },
+    /// 被控端对被控请求的应答（controlled -> server -> controller）。
+    RemoteSessionResponse {
+        /// 会话 ID。
+        session_id: String,
+        /// 是否接受。
+        accepted: bool,
+        /// 拒绝原因；接受时为 `None`。
+        reason: Option<String>,
+    },
+    /// 会话结束通知（任一端 -> server -> 对端）。
+    RemoteSessionEnd {
+        /// 会话 ID。
+        session_id: String,
+        /// 结束原因（用户主动断开/网络中断/被控端关闭开关）。
+        reason: String,
+    },
+}
+
+/// RustDesk 会合/中继运行参数（服务端生效配置，经控制通道下发给客户端）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteParams {
+    /// 会合服务器主机名。
+    ///
+    /// 服务端不知道自己的公网域名，故此处**留空**，由客户端用自身 `config.server`
+    /// 的 host 段补齐（两端连的是同一个服务端，填出来必然一致）。
+    pub rendezvous_host: String,
+    /// 会合端口（hbbs 主端口；NAT 探测端口 = 此值 - 1）。
+    pub rendezvous_port: u16,
+    /// 中继端口（hbbr）。
+    pub relay_port: u16,
+    /// 中继地址覆盖；空串 = 用 `rendezvous_host`。
+    pub relay_server: String,
+    /// 服务端公钥（licence_key）；空串 = 不校验（仅调试可用，客户端应告警）。
+    pub public_key: String,
+    /// 是否强制走中继（跳过打洞尝试）。
+    pub always_use_relay: bool,
+}
+
+/// 可远程的在线客户端。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemotePeerInfo {
+    /// 客户端名（rust-tunnel 内部标识，发起连接时回填 `RemoteConnectRequest`）。
+    pub client_name: String,
+    /// 展示名（优先 hostname，缺失时回落客户端名）。
+    pub display_name: String,
+    /// 平台标识：`macos` / `windows` / `linux`。
+    pub platform: String,
+    /// 显示器数量。
+    pub displays: u32,
+    /// 服务端分配的 RustDesk ID。
+    pub rd_id: String,
+}
+
+/// 远程会话模式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RemoteMode {
+    /// 完全控制：画面 + 鼠标键盘。
+    Control,
+    /// 仅观看：只收画面，不注入输入。
+    ViewOnly,
+    /// 仅文件传输：不传画面。
+    FileTransfer,
 }
 
 /// 客户端映射摘要。
@@ -1546,5 +1668,130 @@ mod tests {
             write_file2.len() > read_symbol.len() || write_file2 != read_symbol,
             "WriteFile2 should differ from ReadSymbol"
         );
+    }
+
+    // ── 远程控制变体 ──────────────────────────────────────────────────────
+
+    /// 远程控制全部新变体的 bincode roundtrip。
+    #[test]
+    fn test_remote_variants_roundtrip() {
+        let params = RemoteParams {
+            rendezvous_host: String::new(),
+            rendezvous_port: 21116,
+            relay_port: 21117,
+            relay_server: String::new(),
+            public_key: "abc".into(),
+            always_use_relay: false,
+        };
+        let variants = vec![
+            ControlMessage::RemoteCapability {
+                params: Some(params.clone()),
+                rd_id: "123456789".into(),
+            },
+            ControlMessage::RemoteCapability {
+                params: None,
+                rd_id: String::new(),
+            },
+            ControlMessage::RemoteAnnounce {
+                enabled: true,
+                platform: "macos".into(),
+                displays: 2,
+            },
+            ControlMessage::RemotePeerListRequest,
+            ControlMessage::RemotePeerList {
+                peers: vec![RemotePeerInfo {
+                    client_name: "home-nas".into(),
+                    display_name: "nas.local".into(),
+                    platform: "linux".into(),
+                    displays: 1,
+                    rd_id: "123456789".into(),
+                }],
+            },
+            ControlMessage::RemoteConnectRequest {
+                target_client: "home-nas".into(),
+                mode: RemoteMode::Control,
+            },
+            ControlMessage::RemoteConnectGrant {
+                session_id: "sid".into(),
+                token: "tok".into(),
+                target_rd_id: "123456789".into(),
+                target_platform: "linux".into(),
+                params,
+            },
+            ControlMessage::RemoteSessionIncoming {
+                session_id: "sid".into(),
+                token: "tok".into(),
+                from_name: "office-pc".into(),
+                mode: RemoteMode::ViewOnly,
+            },
+            ControlMessage::RemoteSessionResponse {
+                session_id: "sid".into(),
+                accepted: false,
+                reason: Some("用户拒绝".into()),
+            },
+            ControlMessage::RemoteSessionEnd {
+                session_id: "sid".into(),
+                reason: "对端断开".into(),
+            },
+        ];
+        for msg in &variants {
+            let bytes = bincode::serialize(msg).unwrap();
+            let back: ControlMessage = bincode::deserialize(&bytes).unwrap();
+            assert!(
+                format!("{back:?}") == format!("{msg:?}"),
+                "roundtrip mismatch: {msg:?}"
+            );
+        }
+    }
+
+    /// 远程控制变体必须**追加**在 `ClientMappingSummary` 之后：老客户端收到
+    /// 未知变体会反序列化失败并断连，故序数只能增大、不能重排。
+    ///
+    /// 判别方法：bincode 的 enum discriminant 排在最前。无论 varint（单字节）
+    /// 还是 fixint（u32 LE）编码，序数 29..38 与 28 的首字节都保持大小关系，
+    /// 因此「首字节严格更大」等价于「序号更靠后」。若有人把新变体插到中间，
+    /// `ClientMappingSummary` 的序号会后移，本断言即失败。
+    #[test]
+    fn test_remote_variants_append_after_mapping_summary() {
+        let summary = bincode::serialize(&ControlMessage::ClientMappingSummary {
+            summary: MappingSummary {
+                connected_at: None,
+                active_tunnels: 0,
+                rtt_ms: None,
+                rules: vec![],
+                truncated: false,
+            },
+        })
+        .unwrap();
+        let appended: Vec<ControlMessage> = vec![
+            ControlMessage::RemoteCapability {
+                params: None,
+                rd_id: String::new(),
+            },
+            ControlMessage::RemoteAnnounce {
+                enabled: false,
+                platform: String::new(),
+                displays: 0,
+            },
+            ControlMessage::RemotePeerListRequest,
+            ControlMessage::RemotePeerList { peers: vec![] },
+            ControlMessage::RemoteConnectRequest {
+                target_client: String::new(),
+                mode: RemoteMode::Control,
+            },
+            ControlMessage::RemoteSessionEnd {
+                session_id: String::new(),
+                reason: String::new(),
+            },
+        ];
+        for msg in &appended {
+            let bytes = bincode::serialize(msg).unwrap();
+            assert!(
+                bytes[0] > summary[0],
+                "变体 {msg:?} 的序数（首字节 {}）必须大于 ClientMappingSummary（{}）",
+                bytes[0],
+                summary[0]
+            );
+        }
     }
 }

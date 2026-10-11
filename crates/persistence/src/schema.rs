@@ -373,7 +373,8 @@ impl Database {
                 hostname      TEXT,
                 first_seen_at DATETIME NOT NULL,
                 last_seen_at  DATETIME NOT NULL,
-                note          TEXT
+                note          TEXT,
+                remote_id     TEXT
             )
             ",
         )
@@ -926,6 +927,7 @@ impl Database {
         Self::migrate_agent_sessions_add_spawn_error(pool).await?;
         Self::migrate_agent_pending_prompts(pool).await?;
         Self::migrate_knowledge_pages_add_origin_key(pool).await?;
+        Self::migrate_clients_add_remote_id(pool).await?;
         Self::seed_builtin_roles(pool).await?;
 
         // 必须在最后：依赖 knowledge_* 新表已建，且 rag_documents 旧表若存在时先让
@@ -953,6 +955,33 @@ impl Database {
                 tracing::debug!("knowledge_pages migration: origin_key column already exists");
             }
         }
+        Ok(())
+    }
+
+    /// `clients` 补 `remote_id` 列（服务端分配的稳定 RustDesk ID，9 位数字）与
+    /// 唯一索引。ID 必须持久化复用：hbbs 按 IP 限制 24h 内出现的不同 ID 数
+    /// （同一 NAT 下多客户端共用一个公网 IP），频繁换 ID 会被限流拒注册。
+    ///
+    /// 幂等：列已存在时 ALTER 报错即跳过。唯一索引允许 NULL（未分配）——SQLite
+    /// 视多个 NULL 互不相等，故未分配的客户端不会互相冲突。
+    async fn migrate_clients_add_remote_id(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE clients ADD COLUMN remote_id TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("clients migration: remote_id column already exists");
+            }
+        }
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_remote_id ON clients(remote_id)",
+        )
+        .execute(pool)
+        .await?;
         Ok(())
     }
 

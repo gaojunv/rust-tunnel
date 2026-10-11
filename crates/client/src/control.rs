@@ -13,7 +13,7 @@ use crate::status::ClientStatus;
 use crate::{proxy, spawn::SpawnManager, ClientConfig};
 use rust_tunnel_common::{
     connect_tls_insecure, init_logging_with_layer, protocol::MappingSummary, ClientLogEntry,
-    ControlMessage, MeshServiceDef, TunnelError, TunnelResult,
+    ControlMessage, MeshServiceDef, RemoteBridge, TunnelError, TunnelResult,
 };
 
 /// 控制通道心跳间隔：30s，兼顾 NAT 保活与服务端超时检测。
@@ -480,6 +480,7 @@ async fn start_heartbeat(sender: ControlSender) {
 async fn process_control_messages<R: AsyncRead + Unpin>(
     reader: &mut R,
     state: ClientState,
+    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
 ) -> TunnelResult<()> {
     loop {
         match ControlMessage::read_from_stream(reader).await {
@@ -737,8 +738,15 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         debug!("received mapping summary: {} rules", summary.rules.len());
                         state.set_mapping_summary(summary);
                     }
-                    _ => {
-                        warn!("Unexpected message from server: {:?}", msg);
+                    other => {
+                        // 远程控制变体只在装配了桥接的 GUI 客户端上才有归属；
+                        // 桥接未装配（CLI）或认领失败时仍走原有兜底日志。
+                        let handled = remote_bridge
+                            .as_ref()
+                            .is_some_and(|bridge| bridge.handle_control_message(other.clone()));
+                        if !handled {
+                            warn!("Unexpected message from server: {:?}", other);
+                        }
                     }
                 }
             }
@@ -774,8 +782,9 @@ pub async fn run_client_with_status(
     config: ClientConfig,
     status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
     shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
+    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
 ) -> TunnelResult<()> {
-    run_client_inner(config, status_tx, shared_log_buffer).await
+    run_client_inner(config, status_tx, shared_log_buffer, remote_bridge).await
 }
 
 /// 客户端主入口（无注入，默认行为）。
@@ -785,7 +794,7 @@ pub async fn run_client_with_status(
 /// # Errors
 /// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
 pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
-    run_client_inner(config, None, None).await
+    run_client_inner(config, None, None, None).await
 }
 
 #[allow(
@@ -796,6 +805,7 @@ async fn run_client_inner(
     config: ClientConfig,
     status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
     shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
+    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
 ) -> TunnelResult<()> {
     // Connect to server with or without TLS
     let (mut reader, mut writer): (
@@ -957,16 +967,26 @@ async fn run_client_inner(
     state.set_connected(true);
     state.set_last_error(None);
 
+    // 远程控制桥接：注入上行发送端（重连时热替换）。必须在读循环之前完成，
+    // 否则服务端注册后立刻下发的 RemoteCapability 会落进无人认领的兜底分支。
+    if let Some(bridge) = &remote_bridge {
+        bridge.attach(sender.clone());
+    }
+
     // Start heartbeat task
     let heartbeat_task = tokio::spawn(start_heartbeat(sender));
 
-    let result = process_control_messages(&mut reader, state.clone()).await;
+    let result = process_control_messages(&mut reader, state.clone(), remote_bridge.clone()).await;
     // 确定性清理：立即停掉心跳与写任务（不再等 channel drop 的间接时序），
     // 并中止全部隧道 reader 任务、清空连接表，避免重连后旧任务/旧 socket 累积。
     heartbeat_task.abort();
     writer_task.abort();
     state.shutdown_connections().await;
     state.set_connected(false);
+    // 控制通道已断：远程会话的 P2P 数据面此刻已无对端可续，就地清理。
+    if let Some(bridge) = &remote_bridge {
+        bridge.on_disconnected();
+    }
     if let Err(ref e) = result {
         state.set_last_error(Some(e.to_string()));
     }
@@ -1136,7 +1156,7 @@ mod tests {
         assert!(state.activate_connection(42, mock_writer).await);
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state.clone()).await;
+        let result = process_control_messages(&mut reader, state.clone(), None).await;
         assert!(result.is_ok());
     }
 
@@ -1153,7 +1173,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             TunnelError::Protocol(msg) => assert!(msg.contains("disconnect")),
@@ -1165,7 +1185,7 @@ mod tests {
     async fn test_process_control_messages_eof() {
         let state = create_test_state();
         let mut reader = &[] as &[u8];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_ok());
     }
 
@@ -1184,7 +1204,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_ok());
     }
 
@@ -1214,7 +1234,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -1263,7 +1283,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -1308,7 +1328,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -1343,7 +1363,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state).await;
+        let result = process_control_messages(&mut reader, state, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -1384,7 +1404,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state.clone()).await;
+        let result = process_control_messages(&mut reader, state.clone(), None).await;
         assert!(result.is_ok());
 
         // 先拿 Ready 里的端口，确认代理确实启动了

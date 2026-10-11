@@ -322,9 +322,14 @@ fn spawn_runtime(
                 let cfg = config.clone();
                 let tx = status_tx.clone();
                 let lb = log_buffer.clone();
-                let res =
-                    rust_tunnel_client::control::run_client_with_status(cfg, Some(tx), Some(lb))
-                        .await;
+                // 远程控制桥接尚未接入（阶段 0 只冻结接口），故传 None。
+                let res = rust_tunnel_client::control::run_client_with_status(
+                    cfg,
+                    Some(tx),
+                    Some(lb),
+                    None,
+                )
+                .await;
 
                 match res {
                     Ok(()) => {

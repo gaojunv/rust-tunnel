@@ -17,6 +17,8 @@ pub mod mesh_types;
 pub mod protocol;
 /// PTY 常量。
 pub mod pty;
+/// 远程控制引擎与控制通道的桥接接口。
+pub mod remote_bridge;
 /// STUN 协议解析与构造。
 pub mod stun;
 /// TLS 证书与连接工具。
@@ -27,5 +29,6 @@ pub use logging::*;
 pub use mesh_types::*;
 pub use protocol::*;
 pub use pty::DEFAULT_PTY_PORT;
+pub use remote_bridge::*;
 pub use stun::*;
 pub use tls::*;

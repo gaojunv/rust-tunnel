@@ -1,6 +1,6 @@
 [package]
 name = "rust-tunnel-client"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"

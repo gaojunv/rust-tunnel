@@ -1,6 +1,6 @@
 [package]
 name = "rust-tunnel-client-gui"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -32,7 +32,11 @@ egui = "0.31"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 tray-icon = { version = "0.19" }
 muda = "0.15"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 远程控制：截屏与输入注入。两者的平台差异都在各自 crate 内部 cfg 处理，
+# 故不需要本文件再按 target 门控（区别于下方的 keyring）。
+xcap = "0.9.8"
+enigo = "0.6.1"
 
 [build-dependencies]
 embed-resource = "3"

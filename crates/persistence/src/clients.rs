@@ -151,6 +151,74 @@ impl Database {
         Ok(())
     }
 
+    // ============================================================
+    // 远程控制：RustDesk ID 分配
+    // ============================================================
+
+    /// 读取客户端已分配的 RustDesk ID；未分配或客户端不存在时返回 `None`。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
+    pub async fn get_remote_id(&self, name: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT remote_id FROM clients WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(id,)| id))
+    }
+
+    /// 分配（或复用）客户端的稳定 RustDesk ID：9 位数字。
+    ///
+    /// 位数下限来自 hbbs 的 `MIN_PEER_ID_LEN = 6`，故 9 位数字必然合法。ID 由
+    /// 服务端分配而非客户端自选：同一 NAT 下多客户端共用一个公网 IP，而 hbbs 按
+    /// IP 限制 24h 内出现的不同 ID 数，自选 ID 极易撞限流。
+    ///
+    /// 幂等：已分配则原样返回。随机 ID 撞唯一索引时重试，最多 8 次。
+    ///
+    /// # Errors
+    /// 数据库读写失败时返回 `sqlx::Error`；客户端记录不存在时返回
+    /// [`sqlx::Error::RowNotFound`]（调用方须先 [`Database::upsert_client`]）；
+    /// 重试耗尽时返回 [`sqlx::Error::Protocol`]。
+    pub async fn allocate_remote_id(&self, name: &str) -> Result<String, sqlx::Error> {
+        for _ in 0..8 {
+            if let Some(existing) = self.get_remote_id(name).await? {
+                return Ok(existing);
+            }
+            // 先取模再取绝对值：random() 可能返回 i64::MIN，SQLite 的 abs(i64::MIN)
+            // 是 NULL，会让 remote_id 被写成 NULL（唯一索引拦不住）。
+            let outcome = sqlx::query(
+                r"UPDATE clients
+                  SET remote_id = printf('%09d', abs(random() % 1000000000))
+                  WHERE name = ? AND remote_id IS NULL",
+            )
+            .bind(name)
+            .execute(&self.pool)
+            .await;
+            match outcome {
+                Ok(res) if res.rows_affected() == 1 => {
+                    // 回读拿实际落库值，避免与 SQL 侧的格式化逻辑各写一份。
+                    if let Some(id) = self.get_remote_id(name).await? {
+                        return Ok(id);
+                    }
+                }
+                Ok(_) => {
+                    // 影响 0 行：行不存在，或并发下刚被别处分配（下一轮直接命中）。
+                    if self.get_remote_id(name).await?.is_some() {
+                        continue;
+                    }
+                    return Err(sqlx::Error::RowNotFound);
+                }
+                // 撞上唯一索引：不 return，落回循环顶部换一个随机值重试。
+                Err(e) if is_unique_violation(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(sqlx::Error::Protocol(
+            "allocate_remote_id: 随机 ID 重试耗尽".into(),
+        ))
+    }
+
     /// 删除指定名称的客户端注册记录。
     ///
     /// # Errors
@@ -210,6 +278,14 @@ impl Database {
         }
         Ok(out)
     }
+}
+
+/// 判断一个 `sqlx` 错误是否为唯一索引冲突（SQLite `SQLITE_CONSTRAINT_UNIQUE`）。
+///
+/// 走错误文案而非错误码：`sqlx` 的 `DatabaseError::code()` 在 SQLite 后端返回的
+/// 是扩展码字符串，不同版本表述不一，而文案在 SQLite 侧长期稳定。
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.message().contains("UNIQUE constraint failed"))
 }
 
 #[cfg(test)]
@@ -287,6 +363,49 @@ mod tests {
         db.delete_client("home-nas").await.unwrap();
         let list = db.list_clients().await.unwrap();
         assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_allocate_remote_id_is_stable_and_nine_digits() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", None).await.unwrap();
+
+        let first = db.allocate_remote_id("home-nas").await.unwrap();
+        assert_eq!(first.len(), 9, "ID 应为 9 位数字：{first}");
+        assert!(first.chars().all(|c| c.is_ascii_digit()), "ID 应全为数字");
+
+        // 幂等：重复调用必须返回同一个 ID（换 ID 会撞 hbbs 的单 IP ID 数限制）。
+        let second = db.allocate_remote_id("home-nas").await.unwrap();
+        assert_eq!(first, second);
+
+        // 落库可见。
+        assert_eq!(db.get_remote_id("home-nas").await.unwrap().as_deref(), Some(&*first));
+    }
+
+    #[tokio::test]
+    async fn test_allocate_remote_id_distinct_per_client() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("a-client", None).await.unwrap();
+        db.upsert_client("b-client", None).await.unwrap();
+        let a = db.allocate_remote_id("a-client").await.unwrap();
+        let b = db.allocate_remote_id("b-client").await.unwrap();
+        assert_ne!(a, b, "不同客户端应拿到不同 ID");
+    }
+
+    #[tokio::test]
+    async fn test_allocate_remote_id_unknown_client_is_row_not_found() {
+        let db = Database::new(":memory:").await.unwrap();
+        // 未 upsert 的客户端：分配应报 RowNotFound，而不是写入幽灵行。
+        let err = db.allocate_remote_id("ghost").await.unwrap_err();
+        assert!(matches!(err, sqlx::Error::RowNotFound), "got {err:?}");
+        assert!(db.get_remote_id("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_id_unallocated_is_none() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", None).await.unwrap();
+        assert!(db.get_remote_id("home-nas").await.unwrap().is_none());
     }
 
     #[tokio::test]

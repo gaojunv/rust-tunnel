@@ -106,6 +106,22 @@ pub fn client_supports_mapping_summary(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_MAPPING_SUMMARY_CLIENT_VERSION)
 }
 
+/// 首个支持远程控制（`RemoteCapability` / `RemotePeerList` 等控制通道变体）的
+/// 客户端版本。
+pub const MIN_REMOTE_CLIENT_VERSION: (u64, u64, u64) = (0, 10, 0);
+
+/// 客户端版本是否支持远程控制；缺失/非法视为不支持（保守，避免老客户端收到
+/// 未知 bincode 变体后反序列化失败断开控制连接）。
+///
+/// 本门控是**双向**的：服务端只在支持时才下发远程控制变体，客户端也只在收到
+/// `RemoteCapability` 后才开始上行新的变体——因此新客户端配老服务端同样安全。
+#[must_use]
+pub fn client_supports_remote(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_REMOTE_CLIENT_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +209,21 @@ mod tests {
         assert!(client_supports_edit(Some("1.0.0")));
         assert!(!client_supports_edit(None));
         assert!(!client_supports_edit(Some("abc")));
+    }
+
+    #[test]
+    fn test_client_supports_remote() {
+        assert!(client_supports_remote(Some("0.10.0")));
+        assert!(client_supports_remote(Some("v0.10.1")));
+        assert!(client_supports_remote(Some("1.0.0")));
+        // 上一条门控（0.9.0）的客户端不支持远程控制。
+        assert!(!client_supports_remote(Some("0.9.0")));
+        assert!(!client_supports_remote(Some("0.9.9")));
+        assert!(!client_supports_remote(None));
+        assert!(!client_supports_remote(Some("garbage")));
+        // 回归：agent 模式版本后缀 +agent 不得破坏版本门控。
+        assert!(client_supports_remote(Some("0.10.0+agent")));
+        assert!(!client_supports_remote(Some("0.9.0+agent")));
     }
 
     // ── agent_result_to_text WriteOutcome ───────────────────
