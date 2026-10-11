@@ -9,6 +9,10 @@ use tracing::{debug, info, warn};
 use crate::agent::runner::client_supports_mapping_summary;
 use crate::config::ServerConfig;
 use crate::control_plane::client_registry::TunnelOpenOutcome;
+use crate::control_plane::remote::{
+    broadcast_remote_peer_list, build_remote_peer_list, handle_client_disconnected,
+    handle_remote_connect_request, handle_session_end, handle_session_response, push_remote_config,
+};
 use rust_tunnel_common::{
     create_server_config, load_or_generate_cert, BackendSummary, ControlMessage, MappingSummary,
     RouteSummary, RuleSummary, TunnelError, TunnelResult,
@@ -124,6 +128,10 @@ async fn handle_client_connection(
                 .await;
         }
     }
+
+    // 首包远程能力通告（内部按 `client_supports_remote` 门控，老客户端收不到任何远程变体）。
+    // `rd_id` 分配失败已在 `push_remote_config` 内回落成未启用，不影响注册。
+    let _ = push_remote_config(&state, &entry.name).await;
 
     // 2. Reader loop: dispatch to registry active_connections / heartbeat / etc.
     let name_for_cleanup = entry.name.clone();
@@ -246,6 +254,48 @@ async fn handle_client_connection(
                         }
                     }
                 }
+                // ── 远程控制（GUI 客户端互控）──
+                // 客户端上报被控能力：更新注册项后广播最新可远程列表。
+                ControlMessage::RemoteAnnounce {
+                    enabled,
+                    platform,
+                    displays,
+                } => {
+                    entry.set_remote_caps(enabled, platform, displays);
+                    broadcast_remote_peer_list(&state).await;
+                }
+                // 控制器拉取可远程列表（兜底；主路径是服务端广播）。
+                ControlMessage::RemotePeerListRequest => {
+                    if crate::agent::runner::client_supports_remote(entry.client_version.as_deref())
+                    {
+                        // 排除请求者自身：列表里出现自己就会诱导用户连自己。
+                        let peers = build_remote_peer_list(&state, Some(&entry.name)).await;
+                        let _ = entry
+                            .control_sender
+                            .send(ControlMessage::RemotePeerList { peers })
+                            .await;
+                    }
+                }
+                // 控制器请求连接目标客户端：校验 → 签发会话 → 双向下发。
+                ControlMessage::RemoteConnectRequest {
+                    target_client,
+                    mode,
+                } => {
+                    handle_remote_connect_request(&state, &entry, &target_client, mode).await;
+                }
+                // 被控端应答：转发给控制器（拒绝时顺带清理会话）。
+                ControlMessage::RemoteSessionResponse {
+                    session_id,
+                    accepted,
+                    reason,
+                } => {
+                    handle_session_response(&state, &entry.name, &session_id, accepted, reason)
+                        .await;
+                }
+                // 任一端发起会话结束：消费会话并通知对端。
+                ControlMessage::RemoteSessionEnd { session_id, reason } => {
+                    handle_session_end(&state, &entry.name, &session_id, &reason).await;
+                }
                 // Mesh variants: forward to mesh_manager
                 m @ (ControlMessage::MeshJoin { .. }
                 | ControlMessage::MeshLeave { .. }
@@ -268,6 +318,8 @@ async fn handle_client_connection(
     .await;
 
     // 3. Cleanup: remove from registry
+    // 远程会话清理：该客户端参与的会话全部结束，并通知对端（best-effort）。
+    handle_client_disconnected(&state, &name_for_cleanup).await;
     // 客户端控制连接断开：先清理该客户端的 ACP 会话（flush 回合缓冲 + 移除条目）。
     // 客户端 agent 进程随连接断开而终止，残留条目只会被 idle reaper 晚回收
     // （30 分钟）；disconnect 只发断线通知、不 await 任何 agent 工作，此处即时

@@ -6,6 +6,8 @@ pub mod acme_config;
 pub mod client_registry;
 /// 端口信息与 Trojan 运行时状态。
 pub mod port_info;
+/// 远程控制控制面：会话授权表、可远程列表与能力下发。
+pub mod remote;
 /// 控制通道 TCP/TLS 服务端。
 pub mod server;
 /// 全局 ServerState 聚合。

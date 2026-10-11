@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, warn};
 
-use crate::agent::runner::client_supports_cancel;
+use crate::agent::runner::{client_supports_cancel, client_supports_remote};
 use crate::db::Database;
 use rust_tunnel_common::ControlMessage;
 
@@ -62,6 +62,19 @@ impl std::fmt::Display for RegisterError {
 
 impl std::error::Error for RegisterError {}
 
+/// 单个客户端的远程控制能力快照（由 `RemoteAnnounce` / 注册时能力下发维护）。
+#[derive(Debug, Clone, Default)]
+pub struct RemoteCaps {
+    /// 是否允许被远程控制（客户端开关）。
+    pub enabled: bool,
+    /// 平台标识：`macos` / `windows` / `linux`。
+    pub platform: String,
+    /// 显示器数量。
+    pub displays: u32,
+    /// 服务端分配的稳定 RustDesk ID；空串 = 未分配。
+    pub rd_id: String,
+}
+
 /// 单个在线客户端的注册项。
 #[derive(Debug)]
 pub struct ClientEntry {
@@ -84,12 +97,41 @@ pub struct ClientEntry {
     /// Pending agent exec requests, keyed by request_id; resolved by
     /// `deliver_agent_response` when the client's AgentExecResponse arrives.
     pub agent_pending: Mutex<HashMap<String, oneshot::Sender<rust_tunnel_common::AgentResult>>>,
+    /// 远程控制能力（被控开关/平台/显示器数/RustDesk ID）。临界区极短且无 await，
+    /// 用 `std::sync::Mutex` 避免把读快照也染成 async。
+    remote_caps: std::sync::Mutex<RemoteCaps>,
 }
 
 impl ClientEntry {
     /// 返回活跃隧道数快照（只读，供映射摘要等展示用途）。
     pub async fn active_tunnel_count(&self) -> usize {
         self.active_connections.lock().await.len()
+    }
+
+    /// 覆盖被控开关/平台/显示器数（保留已分配的 `rd_id`）。由 `RemoteAnnounce` 调用。
+    pub fn set_remote_caps(&self, enabled: bool, platform: String, displays: u32) {
+        let mut caps = self.lock_caps();
+        caps.enabled = enabled;
+        caps.platform = platform;
+        caps.displays = displays;
+    }
+
+    /// 写入服务端分配的 RustDesk ID。
+    pub fn set_rd_id(&self, rd_id: String) {
+        self.lock_caps().rd_id = rd_id;
+    }
+
+    /// 返回远程控制能力快照（只读克隆）。
+    #[must_use]
+    pub fn remote_caps(&self) -> RemoteCaps {
+        self.lock_caps().clone()
+    }
+
+    /// 取远程能力锁，忽略中毒（数据是纯值类型，中毒不破坏不变量）。
+    fn lock_caps(&self) -> std::sync::MutexGuard<'_, RemoteCaps> {
+        self.remote_caps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -179,6 +221,7 @@ impl ClientRegistry {
             last_ping_micros: AtomicU64::new(0),
             active_connections: Mutex::new(HashMap::new()),
             agent_pending: Mutex::new(HashMap::new()),
+            remote_caps: std::sync::Mutex::new(RemoteCaps::default()),
         });
         self.entries
             .write()
@@ -198,6 +241,28 @@ impl ClientRegistry {
     #[must_use]
     pub async fn list_online(&self) -> Vec<Arc<ClientEntry>> {
         self.entries.read().await.values().cloned().collect()
+    }
+
+    /// 列出「可被远程控制」的在线客户端：已开启被控且版本支持远程控制。
+    /// `rd_id` 是否已分配由调用方（`build_remote_peer_list`）进一步过滤。
+    #[must_use]
+    pub async fn list_remote_peers(&self) -> Vec<Arc<ClientEntry>> {
+        self.entries
+            .read()
+            .await
+            .values()
+            .filter(|entry| {
+                client_supports_remote(entry.client_version.as_deref())
+                    && entry.remote_caps().enabled
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 返回指定客户端的远程控制能力快照；客户端离线返回 `None`。
+    #[must_use]
+    pub async fn remote_caps_of(&self, name: &str) -> Option<RemoteCaps> {
+        self.get(name).await.map(|entry| entry.remote_caps())
     }
 
     /// Drop a client entry from the registry and send `Disconnect { reason }`

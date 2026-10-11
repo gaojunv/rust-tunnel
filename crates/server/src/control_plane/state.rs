@@ -14,7 +14,10 @@ use crate::reverse_proxy::ReverseProxyState;
 use rust_tunnel_common::ControlMessage;
 
 use super::acme_config::{AcmeConfigInfo, AcmeFullConfig};
-use super::port_info::{ClientInfo, PortInfo as ServerPortInfo, RustdeskRuntimeStatus, TrojanRuntimeStatus};
+use super::port_info::{
+    ClientInfo, PortInfo as ServerPortInfo, RustdeskRuntimeStatus, TrojanRuntimeStatus,
+};
+use super::remote::RemoteSessionTable;
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
@@ -247,6 +250,8 @@ pub struct ServerState {
         std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<crate::llm::LlmState>>>>,
     /// Client registry (spec §2.6)
     pub client_registry: Option<ClientRegistry>,
+    /// 远程控制会话授权表（内存态，`session_id -> PendingSession`）。
+    pub remote_sessions: Arc<RemoteSessionTable>,
     /// AI agent workbench state (workspace execution locks, DB access)
     pub agent_state: Option<crate::agent::AgentState>,
     /// ACME 证书生命周期（领域切片）
@@ -285,6 +290,7 @@ impl ServerState {
             proxy_state: ReverseProxyState::new(),
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: None,
+            remote_sessions: Arc::new(RemoteSessionTable::new()),
             agent_state: None,
             acme: AcmeState::default(),
             dynamic_config: Arc::new(RwLock::new(DynamicConfig {
@@ -328,6 +334,7 @@ impl ServerState {
             proxy_state: ReverseProxyState::with_db(db.clone()),
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: Some(registry.clone()),
+            remote_sessions: Arc::new(RemoteSessionTable::new()),
             agent_state: Some(crate::agent::AgentState::new(
                 std::sync::Arc::new(registry),
                 db,
