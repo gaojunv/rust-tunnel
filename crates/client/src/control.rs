@@ -738,15 +738,25 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         debug!("received mapping summary: {} rules", summary.rules.len());
                         state.set_mapping_summary(summary);
                     }
-                    other => {
-                        // 远程控制变体只在装配了桥接的 GUI 客户端上才有归属；
-                        // 桥接未装配（CLI）或认领失败时仍走原有兜底日志。
+                    // 远程控制变体只在装配了桥接的 GUI 客户端上才有归属。CLI 客户端
+                    // （无桥接）照样会收到服务端主动下发的 `RemoteCapability`——服务端
+                    // 无法区分两种客户端，这是**设计内的正常情形**，不能按「意外消息」
+                    // 告警刷屏（否则每个升级到 0.10.0 的 CLI 用户每次连接都会看到 WARN）。
+                    remote @ (ControlMessage::RemoteCapability { .. }
+                    | ControlMessage::RemotePeerList { .. }
+                    | ControlMessage::RemoteConnectGrant { .. }
+                    | ControlMessage::RemoteSessionIncoming { .. }
+                    | ControlMessage::RemoteSessionResponse { .. }
+                    | ControlMessage::RemoteSessionEnd { .. }) => {
                         let handled = remote_bridge
                             .as_ref()
-                            .is_some_and(|bridge| bridge.handle_control_message(other.clone()));
+                            .is_some_and(|bridge| bridge.handle_control_message(remote.clone()));
                         if !handled {
-                            warn!("Unexpected message from server: {:?}", other);
+                            debug!("收到远程控制消息但本客户端未装配远程桥接（CLI），已忽略: {remote:?}");
                         }
+                    }
+                    other => {
+                        warn!("Unexpected message from server: {:?}", other);
                     }
                 }
             }
