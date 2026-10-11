@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 rust-tunnel-client = { path = "../client" }
 rust-tunnel-common = { path = "../common" }
+# 远程控制引擎（协议 + 编排，零平台依赖）；平台实现（截屏/注入）在本 crate。
+rust-tunnel-remote = { path = "../remote" }
+# 实现 `rust_tunnel_remote::transport::TransportEstablisher`（async trait）需要该宏。
+async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

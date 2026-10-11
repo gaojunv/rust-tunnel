@@ -10,6 +10,7 @@ mod config_store;
 mod fonts;
 mod notify;
 mod prefs;
+mod remote;
 mod tray;
 mod ui;
 
@@ -19,6 +20,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
+use rust_tunnel_remote::{EncodeOptions, RemoteManager, RemoteManagerConfig};
 
 fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
     let bytes: &[u8] = include_bytes!("../icons/icon.png");
@@ -43,6 +45,8 @@ struct GuiApp {
     last_tray_texts: Option<(String, String, String)>,
     /// GUI 偏好（主题等），切换时落盘 gui.toml。
     prefs: prefs::GuiPrefs,
+    /// 远程会话窗口的 GUI 侧状态（纹理 + 输入捕获边沿状态）。
+    remote_view: remote::RemoteView,
 }
 
 impl GuiApp {
@@ -63,7 +67,25 @@ impl GuiApp {
             tray,
             last_tray_texts: None,
             prefs,
+            remote_view: remote::RemoteView::new(),
         }
+    }
+
+    /// 应用「允许被远程控制」的新状态：同步到引擎、托盘勾选与偏好文件。
+    ///
+    /// 托盘与 UI 两处入口都收敛到这里，避免两处各写一份导致引擎/托盘脱节。
+    fn apply_allow_remote(&mut self, on: bool) {
+        self.prefs.allow_remote = on;
+        if let Some(manager) = self.app_state.remote() {
+            manager.set_enabled(on);
+        }
+        if let Some(handle) = self.tray.as_ref() {
+            handle.allow_remote_item.set_checked(on);
+        }
+        if let Err(e) = prefs::save(&self.prefs) {
+            tracing::warn!("被控开关保存失败：{e}");
+        }
+        tracing::info!("允许被远程控制：{}", if on { "开" } else { "关" });
     }
 }
 
@@ -109,7 +131,8 @@ impl GuiApp {
                 tray::TrayAction::Settings => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.selected_tab = 2;
+                    // 「设置」Tab 下标（见 show_tabs 的标签数组：状态/映射/远程/设置/日志）。
+                    self.selected_tab = 3;
                 }
                 tray::TrayAction::Reconnect => {
                     self.app_state
@@ -122,11 +145,8 @@ impl GuiApp {
                         .tray
                         .as_ref()
                         .is_some_and(|h| h.allow_remote_item.is_checked());
-                    self.prefs.allow_remote = enabled;
-                    if let Err(e) = prefs::save(&self.prefs) {
-                        tracing::warn!("被控开关保存失败：{e}");
-                    }
-                    tracing::info!("允许被远程控制：{}", if enabled { "开" } else { "关" });
+                    // 收敛入口：同步引擎（set_enabled）+ 偏好文件。
+                    self.apply_allow_remote(enabled);
                 }
                 tray::TrayAction::Quit => {
                     self.app_state
@@ -198,7 +218,7 @@ impl GuiApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    for (idx, label) in ["状态", "映射", "设置", "日志"].iter().enumerate()
+                    for (idx, label) in ["状态", "映射", "远程", "设置", "日志"].iter().enumerate()
                     {
                         let sel = self.selected_tab == idx;
                         if ui.selectable_label(sel, *label).clicked() {
@@ -223,16 +243,35 @@ impl eframe::App for GuiApp {
         self.refresh_tray(&status);
         self.show_tabs(ctx);
 
+        // 远程引擎就绪后安装帧通道（幂等）；引擎由后台运行时线程注入 AppState。
+        let remote_manager = self.app_state.remote();
+        if let Some(manager) = remote_manager.as_ref() {
+            self.remote_view.ensure_sink(ctx, manager);
+        }
+
+        let mut remote_toggle: Option<bool> = None;
+        let settings = &mut self.settings;
+        let remote_view = &mut self.remote_view;
+        let app_state = &self.app_state;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
+            // 被控横幅常驻所有 Tab 顶部：无论用户切到哪个页都能看到并随时中断。
+            ui::remote::controlled_banner(ui, remote_manager.as_ref());
             match self.selected_tab {
                 0 => ui::status::show(ui, &status),
                 1 => ui::mappings::show(ui, &status),
-                2 => ui::settings::show(ui, &mut self.settings, &self.app_state),
-                3 => ui::logs::show(ui, &self.app_state.log_buffer),
+                2 => {
+                    remote_toggle =
+                        ui::remote::show(ui, remote_view, remote_manager.as_ref(), app_state);
+                }
+                3 => ui::settings::show(ui, settings, app_state),
+                4 => ui::logs::show(ui, &app_state.log_buffer),
                 _ => {}
             }
         });
+        if let Some(on) = remote_toggle {
+            self.apply_allow_remote(on);
+        }
 
         let needs_repaint = !status.connected || status.last_error.is_some();
         if needs_repaint {
@@ -241,6 +280,25 @@ impl eframe::App for GuiApp {
             ctx.request_repaint_after(Duration::from_millis(600));
         }
     }
+}
+
+/// 构造远程控制引擎（配置就绪后调用一次）。
+///
+/// `displays` 传 1 只是安装平台实现前的占位——[`remote::install_platform`] 之后
+/// 引擎以 `ScreenSource::displays()` 为准。
+fn build_remote_manager(config: &ClientConfig, enabled: bool) -> Arc<RemoteManager> {
+    let establisher = Arc::new(remote::LazyTransport::new(config.server.clone()));
+    let manager = RemoteManager::new(RemoteManagerConfig {
+        server_host: config.server.clone(),
+        self_client_name: config.name.clone().unwrap_or_default(),
+        platform: remote::platform_name().to_owned(),
+        displays: 1,
+        enabled,
+        establisher,
+        encode: EncodeOptions::default(),
+    });
+    remote::install_platform(&manager);
+    manager
 }
 
 #[allow(
@@ -254,6 +312,7 @@ fn spawn_runtime(
     status_tx: Arc<tokio::sync::watch::Sender<ClientStatus>>,
     log_buffer: Arc<LogBuffer>,
     reconnect_flag: Arc<AtomicBool>,
+    initial_allow_remote: bool,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -336,6 +395,12 @@ fn spawn_runtime(
                 }
             }
 
+            // 远程控制引擎：配置就绪后构造一次，安装平台实现（截屏/注入），注入 AppState
+            // 供 GUI 读取，桥接交给控制通道。构造在此（而非 main）是因为 server_host /
+            // 客户端名要等磁盘配置加载完；无配置时上面的循环会先等到配置。
+            let remote_manager = build_remote_manager(&config, initial_allow_remote);
+            app_state.set_remote(Arc::clone(&remote_manager));
+
             let mut policy = ReconnectPolicy::new();
             let mut first_success = true;
 
@@ -343,12 +408,13 @@ fn spawn_runtime(
                 let cfg = config.clone();
                 let tx = status_tx.clone();
                 let lb = log_buffer.clone();
-                // 远程控制桥接尚未接入（阶段 0 只冻结接口），故传 None。
+                // 控制通道读循环把远程变体交给引擎，上行经桥接回写同一条通道。
+                let bridge = Some(remote_manager.bridge());
                 let res = rust_tunnel_client::control::run_client_with_status(
                     cfg,
                     Some(tx),
                     Some(lb),
-                    None,
+                    bridge,
                 )
                 .await;
 
@@ -433,12 +499,18 @@ fn main() -> anyhow::Result<()> {
     let log_buffer = app_state.log_buffer.clone();
     let reconnect_flag = app_state.reconnect_requested.clone();
 
-    // 后台 tokio 运行时（控制通道/隧道）
-    spawn_runtime(app_state.clone(), status_tx, log_buffer, reconnect_flag);
-
-    // 偏好须在构建托盘之前加载：托盘的「允许被远程控制」勾选项要以持久化值为初态，
-    // 否则重启后菜单显示未勾选、而实际仍在被控状态（或反之）。
+    // 偏好须在构建托盘与运行时之前加载：托盘的「允许被远程控制」勾选项要以持久化值为初态，
+    // 且远程引擎的初始开关态取自该偏好（否则重启后菜单显示未勾选、而实际仍在被控状态）。
     let prefs = prefs::load();
+
+    // 后台 tokio 运行时（控制通道/隧道 + 远程控制引擎）
+    spawn_runtime(
+        app_state.clone(),
+        status_tx,
+        log_buffer,
+        reconnect_flag,
+        prefs.allow_remote,
+    );
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，
     // 此处先构建托盘（句柄随 GuiApp 持有生命周期），再起 eframe。
