@@ -17,6 +17,7 @@ cargo test -p rust-tunnel-common --lib
 cargo test -p rust-tunnel-client --lib
 cargo test -p rust-tunnel-server --lib        # 服务器单测（无 RAG，快速）
 cargo test -p rust-tunnel-server --lib --features rag   # 含 RAG 单测
+cargo test -p rust-tunnel-remote --lib        # 远程控制引擎单测（纯协议，秒级）
 cargo test                       # 根目录：e2e 集成测试（dev-dep 带 rag feature）
 cargo test -j 2                  # 内存限制：-j 是 cargo 构建并行度（e2e 编译含 qdrant-edge 时尤其需要）
 cargo clippy -p rust-tunnel-server
@@ -54,13 +55,15 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 ## 架构
 
-### Cargo workspace：四库 crate + 根元包
+### Cargo workspace：crate + 根元包
 - 根元包 `rust-tunnel` 仅托管 e2e 测试（`tests/`），无实现代码
 - `crates/common`（`rust-tunnel-common`）— 协议/TLS/错误/日志/mesh + `DEFAULT_PTY_PORT`
 - `crates/client`（`rust-tunnel-client`）— 客户端 lib + bin
+- `crates/client-gui`（`rust-tunnel-client-gui`）— 桌面托盘客户端（eframe/egui + winit + tray-icon），「状态/映射/设置/日志/远程」五个 Tab
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
 - `crates/rustdesk`（`rust-tunnel-rustdesk`）— 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**（`frame`/`proto`/`addr`/`key`/`peer`/`relay`/`rendezvous`）
-- 依赖单向：`common ← client`、`common ← server`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）
+- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环），**不含任何平台或 UI 依赖**
+- 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）
 - **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
 ### 核心数据流
@@ -118,6 +121,31 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 - 有意未实现：WebSocket 端口 21118/21119（Web 客户端不可用，原生桌面端不受影响）、WebRTC 通道、`KeyExchange`/`kx_version` 前向安全升级
 - 部署/防火墙/密钥/真机验证清单见根目录 `RUSTDESK.md`（`docs/` 被 gitignore，不放交付文档）
+
+**`crates/remote/src/`** — GUI 客户端互相远程控制的协议 + 引擎（**零平台/UI 依赖**）
+- `session.rs` — 会话帧（4 字节大端长度前缀 + bincode，上限 16 MiB——屏幕帧远大于 `common::protocol` 的 1 MiB）+ `Lane{Control,Screen,File}` 多路复用车道（`File` 预留给文件传输）
+- `crypto.rs` — X25519 临时密钥交换 + ChaCha20-Poly1305，双向独立密钥与 nonce 计数器。**一次性 token 进 KDF（别去掉）**：裸 ECDH 挡不住中继方——`Hello`/`HelloAck` 都是明文，它可替换两端临时公钥做完整 MITM；token 经加密控制通道下发且从不上数据面，攻击者不知道它就算不出密钥 → 两端密钥必然不一致 → 首帧 AEAD 认证失败。另拒绝低阶点（`was_contributory`）
+- `auth.rs` — 握手 HMAC-SHA256，字段用 **8 字节长度前缀**（`nonce`/公钥是二进制，固定分隔符会有拼接歧义）；`Hello` 的 MAC 覆盖控制器临时公钥，`HelloAck` 的 `hmac_ack` 绑定被控端临时公钥，控制器**真正校验**它；挂起会话 TTL 60s、鉴权成功即消费（重放被拒）、MAC 失败保留以允许重试
+- `signaling.rs` — RustDesk 会合/中继客户端（注册/心跳/打洞/中继请求）；`impl TransportEstablisher for RustDeskTransport` 是数据面建立的唯一实现
+- `transport.rs` — 数据面传输抽象（`BoxDuplex`/`EstablishRequest`/`TransportEstablisher`），把「建立一条双向字节流」与「会话跑在这条流上」解耦；**建立契约**写在模块文档里（中继路径只发一帧 `RequestRelay` 后转裸字节、不等应答，并把 `early` 与之合并写出）
+- `controller.rs`/`controlled.rs` — 两侧会话循环（握手 → 画面/输入/心跳）；控制器把 `Hello` 帧流水线进建立阶段，因此**会话循环不再发 `Hello`，只等 `HelloAck`**
+- `screen.rs` — `ScreenSource`/`InputSink`/`FrameSink` 平台 trait + JPEG 编解码 + 帧哈希去重（静止画面零输出）
+- `manager.rs` — `RemoteManager` 门面（`RemoteUiState` watch、连接请求、启停、平台注入、`RemoteBridge` 实现）
+- 平台实现（xcap 抓屏 / enigo 注入）**放在 `crates/client-gui`**，本 crate 保持编译面干净
+
+#### 远程控制的控制面与数据面
+
+**控制面走既有控制通道**（复用 `ControlMessage` + `ClientEntry.control_sender`），不新开 HTTP 鉴权面——GUI 客户端只有客户端 token，没有管理员 JWT。
+
+**向后兼容靠版本门控，不动 `protocol_version`**：服务端只在客户端版本 ≥ `MIN_REMOTE_CLIENT_VERSION`（`crates/agent/src/runner/version_gate.rs`，当前 `(0,10,0)`）时才下发 `RemoteCapability`；客户端只在收到它之后才发新的上行变体。新客户端 + 老服务端 → 老服务端不下发 → 新客户端全程不发新变体；老客户端 + 新服务端 → 门控拦住。两边都不会因 bincode 未知变体而断连。**新增 S→C 推送时必须过 `client_supports_remote`**，否则老客户端反序列化失败会直接断连。
+
+**`rd_id` 由服务端分配并持久化**到 `clients.remote_id`（9 位数字，满足 `MIN_PEER_ID_LEN=6`）。同一 NAT 下多个客户端共用一个公网 IP，所以不能由客户端自选；用户全程看不到也不需要配置 ID。
+
+**会话鉴权不依赖 hbbs**（hbbs 按设计不做身份认证，ID 可被抢占）：服务端签发 `session_id` + 一次性 `token`（TTL 60s），经加密控制通道同时下发给控制器与被控端；被控端在 P2P 握手时校验。**没有 token 的第三方即使抢注了 ID 也建不起会话。**
+
+**数据面分两层**：主路径是 hbbr 中继（所有 NAT 场景可用）；同内网直连（`FetchLocalAddr`/`LocalAddr`）是优化。**跨 NAT TCP 同时打开打洞在当前 hbbs 语义下不成立**——`forward_punch_result` 回给请求方的是目标端信令连接的**源地址**（临时端口），目标端并未在该端口监听，所以「拿到地址就直连」在跨 NAT 场景走不通。打洞是阶段 3 的可选项，只能真机验证。
+
+**中继约束**：hbbr 按 uuid 配对，先发**恰好一个**带帧的 `RequestRelay` 然后转裸字节、**没有 ack**；`pair_window` 与 `idle_timeout` 都是 30s（任何字节都会重置 idle，每 3s 检查一次）。因此会话必须靠应用层心跳保活（`HEARTBEAT_INTERVAL` 低于 30s），**静止画面也不例外**。配对超时不会有任何错误通知，控制器必须自己按窗口超时提示，否则用户看到的是「卡在连接中」。
 
 ### 前端架构
 - 位于 `frontend/`，构建产物输出到 `frontend-dist/`（gitignored，由 `rust-embed` 嵌入）
