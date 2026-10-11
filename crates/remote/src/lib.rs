@@ -16,9 +16,11 @@
 //!   的 9 个远程变体。本 crate 的 [`manager::RemoteManager`] 实现
 //!   [`rust_tunnel_common::remote_bridge::RemoteBridge`]，由 `crates/client` 的读循环驱动。
 //! - 数据面：会话帧协议跑在一条**双向字节流**上，由 [`transport::TransportEstablisher`]
-//!   建立。阶段 1 以 **hbbr 中继为主路径**，同内网直连为优化；跨 NAT 打洞不做。
-//! - 平台抽象：[`screen::ScreenSource`] / [`screen::InputSink`] / [`screen::FrameSink`]
-//!   三个 trait 定义在 [`screen`]，实现在上层。
+//!   建立。以 **hbbr 中继为主路径**，同内网直连为优化；跨 NAT 打洞不做。
+//! - 平台抽象：[`screen::ScreenSource`] / [`screen::InputSink`] / [`screen::FrameSink`] /
+//!   [`screen::Clipboard`] 四个 trait 定义在 [`screen`]，实现在上层。
+//! - 会话内功能：瓦片差分（[`tiles`]）、文件传输（[`file`] 沙箱 + [`transfer`] 状态机）、
+//!   多显示器切换、画质档位、剪贴板，全部由 [`controller`]/[`controlled`] 的会话循环编排。
 //!
 //! # 数据面协议（自研，跑在中继/直连建立的裸字节流上）
 //!
@@ -41,23 +43,32 @@ pub mod controller;
 pub mod controlled;
 pub mod crypto;
 pub mod error;
+pub mod file;
 pub mod manager;
 pub mod screen;
 pub mod session;
 pub mod signaling;
+pub mod tiles;
+pub mod transfer;
 pub mod transport;
 
 #[cfg(test)]
 mod integration_tests;
 
 pub use error::{RemoteError, RemoteResult};
+pub use file::{FileService, TransferMeta};
+pub use controller::ControllerCommand;
 pub use manager::{ActiveSessionInfo, RemoteManager, RemoteManagerConfig, RemoteUiState, SessionRole, SessionState};
 pub use screen::{
-    DecodedFrame, DisplayInfo, EncodeOptions, EncodedFrame, FrameSink, InputEvent, InputSink, KeyEvent,
-    MouseButton, RawFrame, ScreenSource,
+    Clipboard, DecodedFrame, DecodedTile, DisplayInfo, EncodeOptions, EncodedFrame, FileEntry, FrameSink, InputEvent,
+    InputSink, KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource, TILE_SIZE, TilePatch, TileUpdate,
 };
 pub use session::{
     ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionFrame,
     SessionMessage, plan_controller_handshake,
+};
+pub use tiles::{TileDiffer, TileEncodeResult};
+pub use transfer::{
+    TransferCommand, TransferDirection, TransferEvent, TransferHub, TransferProgress, CHUNK_PAUSE, CHUNK_SIZE,
 };
 pub use transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};

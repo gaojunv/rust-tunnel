@@ -1,21 +1,27 @@
 //! 屏幕/输入平台抽象与屏幕编码。
 //!
-//! # 三个 trait
+//! # 平台 trait
 //!
 //! - [`ScreenSource`]：被控端采集屏幕（`xcap` 实现）。
 //! - [`InputSink`]：被控端注入鼠标键盘（`enigo` 实现）。
 //! - [`FrameSink`]：控制器侧消费已解码画面（egui 实现）。
+//! - [`Clipboard`]：被控端读写文本剪贴板（`arboard` 实现）。
 //!
-//! 本 crate 只定义接口，平台实现放在 `crates/client-gui`。
+//! 本 crate 只定义接口，平台实现放在 `crates/client-gui`。文件传输**不是**平台相关的
+//! （三平台都有文件系统），故不走 trait，由 [`crate::file`] 直接实现。
 //!
-//! # 编码（阶段 1：整帧 JPEG + 帧哈希去重）
+//! # 编码
 //!
-//! [`encode_frame`] 是**纯函数**：输入「上一帧哈希」与当前 RGBA 帧，输出可选编码结果。
-//! 若当前帧哈希与上一帧相同则返回 `None`（静止桌面近零流量，只留心跳）。JPEG 编码在
-//! 引擎的运行时线程里完成；[`FrameSink::on_frame`] 拿到的是**已解码的 RGBA**，UI 线程
-//! 只负责上传纹理，避免在 egui 线程里解码掉帧。
+//! 两条路径，都在引擎的运行时线程里完成，[`FrameSink`] 拿到的永远是**已解码的 RGBA**
+//! （UI 线程只负责上传纹理，避免在 egui 线程里解码掉帧）：
 //!
-//! 瓦片差分是阶段 2，本轮不做，但 [`EncodeOptions`] / [`EncodedFrame`] 已为多路复用留位。
+//! - **整帧**：[`encode_frame`] 是纯函数，输入「上一帧哈希」与当前 RGBA 帧，相同则返回
+//!   `None`（静止桌面零输出）。用作首帧与关键帧。
+//! - **瓦片差分**：[`crate::tiles`] 把整帧切成 [`TILE_SIZE`] 见方的瓦片，只编码变化的那些，
+//!   经 [`FrameSink::on_tiles`] 交给 UI 做局部纹理更新。这是带宽的关键——整帧 JPEG 在
+//!   1080p@10fps 约 15–25 Mbps，经中继不可接受；静止桌面下瓦片路径趋近零流量。
+//!
+//! 画质档位见 [`QualityPreset`]，帧率上限见 [`EncodeOptions::max_fps`]。
 
 use crate::error::{RemoteError, RemoteResult};
 use image::codecs::jpeg::JpegEncoder;
@@ -26,6 +32,9 @@ use sha2::{Digest, Sha256};
 
 /// 每像素字节数（RGBA）。
 pub const BYTES_PER_PIXEL: usize = 4;
+
+/// 瓦片边长（像素）。见 [`crate::tiles`] 的差分说明。
+pub const TILE_SIZE: u32 = 64;
 
 /// 一台显示器的元信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +126,66 @@ pub struct KeyEvent {
     pub modifiers: u8,
 }
 
+/// 一块瓦片补丁（只含变化区域，JPEG 编码）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TilePatch {
+    /// 瓦片左上角 X（整帧像素坐标）。
+    pub x: u32,
+    /// 瓦片左上角 Y（整帧像素坐标）。
+    pub y: u32,
+    /// 瓦片宽（像素，边缘瓦片可小于 [`TILE_SIZE`]）。
+    pub width: u32,
+    /// 瓦片高（像素，边缘瓦片可小于 [`TILE_SIZE`]）。
+    pub height: u32,
+    /// JPEG 字节。
+    pub jpeg: Vec<u8>,
+}
+
+/// 已解码的一块瓦片（交给 UI 做局部纹理更新）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedTile {
+    /// 瓦片左上角 X（整帧像素坐标）。
+    pub x: u32,
+    /// 瓦片左上角 Y（整帧像素坐标）。
+    pub y: u32,
+    /// 瓦片宽（像素）。
+    pub width: u32,
+    /// 瓦片高（像素）。
+    pub height: u32,
+    /// RGBA8 像素数据，长度 = `width * height * 4`。
+    pub rgba: Vec<u8>,
+}
+
+/// 一次增量画面更新（整帧坐标系 + 若干已解码瓦片）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileUpdate {
+    /// 来源显示器编号。
+    pub display: u32,
+    /// 整帧宽（像素）。
+    pub width: u32,
+    /// 整帧高（像素）。
+    pub height: u32,
+    /// 帧序号（对端递增）。
+    pub seq: u64,
+    /// 本次更新的瓦片。
+    pub tiles: Vec<DecodedTile>,
+}
+
+/// 目录项（文件传输用；`crate::file` 与 UI 共用）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// 文件名（不含路径）。
+    pub name: String,
+    /// 相对共享根的虚拟路径（`/` 分隔，根为 `""`）。
+    pub path: String,
+    /// 是否目录。
+    pub is_dir: bool,
+    /// 字节数（目录为 0）。
+    pub size: u64,
+    /// 修改时间（毫秒，自 epoch）；取不到为 0。
+    pub modified_ms: u64,
+}
+
 /// 一条输入事件（控制器 → 被控端）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputEvent {
@@ -201,16 +270,49 @@ pub trait InputSink: Send + Sync + 'static {
 
 /// 控制器侧的画面上报目标（UI 实现）。
 ///
-/// **调用发生在引擎的运行时线程**：`on_frame` 收到的已是解码后的 RGBA，UI 线程只需上传纹理。
+/// **调用发生在引擎的运行时线程**：`on_frame` / `on_tiles` 收到的已是解码后的 RGBA，
+/// UI 线程只需上传纹理。
 pub trait FrameSink: Send + Sync + 'static {
     /// 显示器列表（会话建立时下发一次，变更时再次下发）。
     fn on_displays(&self, displays: Vec<DisplayInfo>);
 
-    /// 一帧已解码画面。
+    /// 一帧已解码**整帧**画面（首帧与关键帧走这里）。
     fn on_frame(&self, frame: DecodedFrame);
+
+    /// 一次增量瓦片更新（只含变化区域）。
+    ///
+    /// 默认实现为空操作：忽略它的 sink 会在下一个整帧（关键帧）自行恢复——被控端保证
+    /// 周期性发关键帧，所以这不是正确性缺口，只是「静止画面之外的更新被推迟到关键帧」。
+    /// egui 实现应覆写它并用 `TextureHandle::set_partial` 做局部更新。
+    fn on_tiles(&self, update: TileUpdate) {
+        let _ = update;
+    }
+
+    /// 对端（被控端）发来的剪贴板文本。
+    ///
+    /// 控制器侧不实现 [`Clipboard`]：它读写的本来就是**本机**剪贴板，UI 直接用自己的实现即可。
+    /// 默认实现为空操作——忽略它只意味着不做剪贴板同步，不影响会话。
+    fn on_clipboard(&self, text: String) {
+        let _ = text;
+    }
 
     /// 会话关闭。
     fn on_closed(&self, reason: String);
+}
+
+/// 文本剪贴板读写（被控端实现；控制器侧直接用 egui 自带的剪贴板）。
+pub trait Clipboard: Send + Sync + 'static {
+    /// 读取当前文本剪贴板。
+    ///
+    /// # Errors
+    /// 剪贴板不可用（无显示、被占用、内容非文本）时返回 [`RemoteError::Platform`]。
+    fn get(&self) -> RemoteResult<String>;
+
+    /// 写入文本剪贴板。
+    ///
+    /// # Errors
+    /// 剪贴板不可用时返回 [`RemoteError::Platform`]。
+    fn set(&self, text: &str) -> RemoteResult<()>;
 }
 
 /// 屏幕编码参数。
@@ -220,14 +322,76 @@ pub struct EncodeOptions {
     pub quality: u8,
     /// 缩放比例（1.0 = 原始尺寸；仅缩放发送，不影响哈希比对）。
     pub scale: f32,
+    /// 目标帧率上限（被控端据此定采集间隔）。
+    pub max_fps: u8,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
-        Self {
-            quality: 75,
-            scale: 1.0,
+        QualityPreset::default().options()
+    }
+}
+
+impl EncodeOptions {
+    /// 取该档位的目标采集间隔（`max_fps` 为 0 时按 1 fps 兜底，避免除零）。
+    #[must_use]
+    pub fn capture_interval(&self) -> std::time::Duration {
+        let fps = self.max_fps.max(1);
+        std::time::Duration::from_millis(1000 / u64::from(fps))
+    }
+}
+
+/// 画质档位：UI 只暴露这三档，映射到具体的 [`EncodeOptions`]。
+///
+/// 档位经 `SessionMessage::SetQuality` 下发给被控端，**由被控端生效**（编码在它那边）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QualityPreset {
+    /// 流畅：半分辨率 + 低质量 + 8 fps。窄带/跨地域中继场景。
+    Smooth,
+    /// 均衡：原始分辨率 + 中质量 + 12 fps。默认档。
+    #[default]
+    Balanced,
+    /// 高清：原始分辨率 + 高质量 + 20 fps。同内网直连场景。
+    Hd,
+}
+
+impl QualityPreset {
+    /// 映射到编码参数。
+    #[must_use]
+    pub fn options(self) -> EncodeOptions {
+        match self {
+            Self::Smooth => EncodeOptions {
+                quality: 45,
+                scale: 0.5,
+                max_fps: 8,
+            },
+            Self::Balanced => EncodeOptions {
+                quality: 70,
+                scale: 1.0,
+                max_fps: 12,
+            },
+            Self::Hd => EncodeOptions {
+                quality: 85,
+                scale: 1.0,
+                max_fps: 20,
+            },
         }
+    }
+
+    /// UI 中文名。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Smooth => "流畅",
+            Self::Balanced => "均衡",
+            Self::Hd => "高清",
+        }
+    }
+
+    /// 全部档位（UI 选择器用）。
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::Smooth, Self::Balanced, Self::Hd]
     }
 }
 
@@ -393,6 +557,7 @@ mod tests {
         let opts = EncodeOptions {
             quality: 80,
             scale: 0.5,
+            ..EncodeOptions::default()
         };
         let frame = solid(1, 40, 20, [1, 2, 3, 255]);
         let encoded = encode_frame(None, &frame, &opts).unwrap().unwrap();
@@ -430,5 +595,34 @@ mod tests {
     #[test]
     fn garbage_jpeg_is_rejected() {
         assert!(matches!(decode_frame(0, 0, b"not a jpeg"), Err(RemoteError::Encode(_))));
+    }
+
+    #[test]
+    fn presets_are_ordered_by_fidelity_and_cost() {
+        let smooth = QualityPreset::Smooth.options();
+        let balanced = QualityPreset::Balanced.options();
+        let hd = QualityPreset::Hd.options();
+        // 画质、帧率单调递增；流畅档降分辨率。
+        assert!(smooth.quality < balanced.quality && balanced.quality < hd.quality);
+        assert!(smooth.max_fps < balanced.max_fps && balanced.max_fps < hd.max_fps);
+        assert!(smooth.scale < 1.0, "流畅档应降分辨率以省带宽");
+        assert!((balanced.scale - 1.0).abs() < f32::EPSILON);
+        assert!((hd.scale - 1.0).abs() < f32::EPSILON);
+        // 默认档即均衡档（避免两处默认值漂移）。
+        assert_eq!(EncodeOptions::default(), balanced);
+        assert_eq!(QualityPreset::all().len(), 3);
+    }
+
+    #[test]
+    fn capture_interval_never_divides_by_zero() {
+        let opts = EncodeOptions {
+            max_fps: 0,
+            ..EncodeOptions::default()
+        };
+        assert_eq!(opts.capture_interval(), std::time::Duration::from_millis(1000));
+        assert_eq!(
+            QualityPreset::Hd.options().capture_interval(),
+            std::time::Duration::from_millis(50)
+        );
     }
 }

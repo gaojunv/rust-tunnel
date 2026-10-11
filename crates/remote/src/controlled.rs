@@ -7,23 +7,22 @@
 use crate::auth::{ack_mac, PendingSessions};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{encode_frame, EncodeOptions, InputSink, RawFrame, ScreenSource};
+use crate::screen::{Clipboard, EncodeOptions, InputSink, RawFrame, ScreenSource};
 use crate::session::{SessionCodec, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL, SESSION_PROTO_VERSION};
+use crate::tiles::TileDiffer;
+use crate::transfer::{TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
+use tokio::time::{interval_at, sleep, timeout, Instant, MissedTickBehavior};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 /// 等待 `Hello` 的超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 采集间隔（约 10 fps）。
-const CAPTURE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 被控端会话配置。
 #[derive(Debug, Clone)]
@@ -36,7 +35,7 @@ pub struct ControlledConfig {
     pub mode: RemoteMode,
     /// 挂起会话表（握手鉴权用）。
     pub pending: Arc<PendingSessions>,
-    /// 屏幕编码参数。
+    /// 屏幕编码参数（会话中可被控制器的 `SetQuality` 覆盖）。
     pub encode: EncodeOptions,
 }
 
@@ -53,6 +52,8 @@ pub async fn run_controlled(
     config: ControlledConfig,
     screen: Arc<dyn ScreenSource>,
     input: Arc<dyn InputSink>,
+    clipboard: Option<Arc<dyn Clipboard>>,
+    mut transfer: TransferHub,
     cancel: CancellationToken,
 ) -> RemoteResult<()> {
     let (read_half, write_half) = tokio::io::split(duplex);
@@ -135,7 +136,8 @@ pub async fn run_controlled(
 
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
-    let display_id = displays
+    let mut encode = config.encode;
+    let mut display_id = displays
         .iter()
         .find(|d| d.primary)
         .or_else(|| displays.first())
@@ -144,10 +146,16 @@ pub async fn run_controlled(
     // 3) 主循环。
     let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut capture_tick = interval_at(Instant::now() + CAPTURE_INTERVAL, CAPTURE_INTERVAL);
-    capture_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 出站文件块：只在有在途传输时启用。
+    let mut file_tick = interval_at(Instant::now(), CHUNK_PAUSE);
+    file_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let mut last_hash: Option<[u8; 32]> = None;
+    // 采集节拍用「可重置的 sleep」而不是固定 interval：画质档位会改 `max_fps`，档位一变
+    // 节拍要立刻跟着变（`interval_at` 的周期改不了，只能重建）。
+    let mut capture_tick = Box::pin(sleep(encode.capture_interval()));
+    let mut differ = TileDiffer::new();
+    // 首帧（或切显示器/切档位之后）必须先发整帧：差分器没有基准就没有变化可言。
+    let mut force_keyframe = true;
     let mut seq: u64 = 0;
     let mut reason = String::from("会话结束");
     let result = loop {
@@ -161,18 +169,30 @@ pub async fn run_controlled(
                     break Err(RemoteError::Io(err));
                 }
             }
-            _ = capture_tick.tick(), if capture => {
+            () = &mut capture_tick, if capture => {
+                capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
                 match screen.capture(display_id) {
-                    Ok(frame) => match encode_frame(last_hash.as_ref(), &frame, &config.encode) {
-                        Ok(Some(encoded)) => {
-                            last_hash = Some(encoded.hash);
+                    Ok(frame) => match differ.diff(&frame, &encode, force_keyframe) {
+                        Ok(Some(result)) => {
+                            force_keyframe = false;
                             seq = seq.wrapping_add(1);
-                            let msg = SessionMessage::Video {
-                                display: encoded.display,
-                                width: encoded.width,
-                                height: encoded.height,
-                                seq,
-                                jpeg: encoded.jpeg,
+                            // 关键帧与瓦片批次都走 Screen lane：控制器侧只有「整帧替换」和
+                            // 「局部更新」两种消费方式，不需要靠 lane 区分。
+                            let msg = match result.full {
+                                Some(full) => SessionMessage::Video {
+                                    display: full.display,
+                                    width: full.width,
+                                    height: full.height,
+                                    seq,
+                                    jpeg: full.jpeg,
+                                },
+                                None => SessionMessage::VideoTiles {
+                                    display: frame.display,
+                                    width: frame.width,
+                                    height: frame.height,
+                                    seq,
+                                    tiles: result.tiles,
+                                },
                             };
                             if let Err(err) = writer.send(SessionFrame::screen(msg)).await {
                                 break Err(RemoteError::Io(err));
@@ -182,6 +202,20 @@ pub async fn run_controlled(
                         Err(err) => warn!(error = %err, "画面编码失败"),
                     },
                     Err(err) => warn!(error = %err, "屏幕采集失败"),
+                }
+            }
+            _ = file_tick.tick(), if transfer.has_outgoing() => {
+                match transfer.next_outbound().await {
+                    Ok(Some(msg)) => {
+                        if let Err(err) = writer.send(SessionFrame::file(msg)).await {
+                            break Err(RemoteError::Io(err));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, "文件读取失败，中断该次传输");
+                        transfer.abort_all(&err.to_string());
+                    }
                 }
             }
             incoming = reader.next() => {
@@ -194,6 +228,47 @@ pub async fn run_controlled(
                                 }
                             }
                         }
+                        SessionMessage::SelectDisplay { display: target } => {
+                            // 切换采集目标后差分基准作废：分辨率/内容都变了，必须重发整帧。
+                            if displays.iter().any(|d| d.id == target) {
+                                display_id = target;
+                                differ.reset();
+                                force_keyframe = true;
+                            } else {
+                                // `display` 会与 `tracing::display` 撞名，故用 target 命名。
+                                warn!(target, "控制器请求了不存在的显示器");
+                            }
+                        }
+                        SessionMessage::SetQuality { preset } => {
+                            encode = preset.options();
+                            capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
+                            differ.reset();
+                            force_keyframe = true;
+                        }
+                        SessionMessage::Clipboard { text } => {
+                            if let Some(cb) = clipboard.as_ref() {
+                                if let Err(err) = cb.set(&text) {
+                                    warn!(error = %err, "写入剪贴板失败");
+                                }
+                            } else {
+                                debug!("本端未安装剪贴板实现，忽略写入");
+                            }
+                        }
+                        SessionMessage::ClipboardRequest => {
+                            let reply = match clipboard.as_ref() {
+                                Some(cb) => match cb.get() {
+                                    Ok(text) => SessionMessage::Clipboard { text },
+                                    Err(err) => {
+                                        warn!(error = %err, "读取剪贴板失败");
+                                        SessionMessage::Clipboard { text: String::new() }
+                                    }
+                                },
+                                None => SessionMessage::Clipboard { text: String::new() },
+                            };
+                            if let Err(err) = writer.send(SessionFrame::control(reply)).await {
+                                break Err(RemoteError::Io(err));
+                            }
+                        }
                         SessionMessage::Heartbeat => {
                             if let Err(err) = writer.send(SessionFrame::control(SessionMessage::HeartbeatAck)).await {
                                 break Err(RemoteError::Io(err));
@@ -204,6 +279,33 @@ pub async fn run_controlled(
                             reason = r;
                             break Ok(());
                         }
+                        file @ (SessionMessage::FileList { .. }
+                        | SessionMessage::FileListRequest { .. }
+                        | SessionMessage::FileDownloadRequest { .. }
+                        | SessionMessage::FileUploadRequest { .. }
+                        | SessionMessage::FileAccept { .. }
+                        | SessionMessage::FileChunk { .. }
+                        | SessionMessage::FileDone { .. }
+                        | SessionMessage::FileError { .. }) => {
+                            match transfer.on_message(file).await {
+                                Ok(replies) => {
+                                    let mut write_err = None;
+                                    for reply in replies {
+                                        if let Err(err) = writer.send(SessionFrame::file(reply)).await {
+                                            write_err = Some(err);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(err) = write_err {
+                                        break Err(RemoteError::Io(err));
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(error = %err, "文件落盘失败，中断该次传输");
+                                    transfer.abort_all(&err.to_string());
+                                }
+                            }
+                        }
                         other => debug!(?other, "被控端收到未处理的消息"),
                     },
                     Some(Err(err)) => break Err(RemoteError::Codec(err.to_string())),
@@ -213,6 +315,7 @@ pub async fn run_controlled(
         }
     };
 
+    transfer.abort_all(&reason);
     let _ = writer
         .send(SessionFrame::control(SessionMessage::Bye { reason: reason.clone() }))
         .await;

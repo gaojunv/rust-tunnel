@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 rust-tunnel-common = { path = "../common" }
 rust-tunnel-rustdesk = { path = "../rustdesk" }
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 # `FramedRead::next` / `FramedWrite::send` 需要 StreamExt / SinkExt，故为生产依赖。
 futures-util = "0.3"

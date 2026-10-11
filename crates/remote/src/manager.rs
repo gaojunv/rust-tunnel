@@ -21,21 +21,26 @@
 //! 两者都接受 [`CancellationToken`]，由 [`RemoteManager::abort_active`] 一键中断。
 
 use crate::auth::{PendingSession, PendingSessions};
-use crate::controller::{run_controller, ControllerConfig};
+use crate::controller::{run_controller, ControllerCommand, ControllerConfig};
 use crate::controlled::{run_controlled, ControlledConfig};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{EncodeOptions, FrameSink, InputEvent, InputSink, NullFrameSink, ScreenSource};
+use crate::file::FileService;
+use crate::screen::{
+    Clipboard, EncodeOptions, FileEntry, FrameSink, InputEvent, InputSink, NullFrameSink, QualityPreset, ScreenSource,
+};
 use crate::session::plan_controller_handshake;
+use crate::transfer::{TransferCommand, TransferEvent, TransferHub, TransferProgress};
 use crate::transport::{EstablishRequest, Role, TransportEstablisher};
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams, RemotePeerInfo};
 use rust_tunnel_common::remote_bridge::RemoteBridge;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-/// 输入事件队列容量。
-const INPUT_CAPACITY: usize = 256;
+/// 会话命令队列容量。
+const COMMAND_CAPACITY: usize = 256;
 
 /// 本端在会话中的角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +100,20 @@ pub struct RemoteUiState {
     pub active: Option<ActiveSessionInfo>,
     /// 最近一次错误（UI 提示用）。
     pub last_error: Option<String>,
+    /// 控制器当前选中的画质档位（下发后由被控端生效）。
+    pub quality: QualityPreset,
+    /// 控制器当前观看的显示器编号。
+    pub selected_display: u32,
+    /// 最近一次收到的对端剪贴板文本（UI 提供「粘贴到本机」按钮）。
+    pub clipboard_in: Option<String>,
+    /// 文件浏览器当前虚拟路径。
+    pub remote_dir: String,
+    /// 文件浏览器当前目录项。
+    pub remote_entries: Vec<FileEntry>,
+    /// 在途/刚结束的传输（UI 进度条）。
+    pub transfers: Vec<TransferProgress>,
+    /// 最近一次传输结果提示（成功落盘路径或失败原因）。
+    pub transfer_note: Option<String>,
 }
 
 /// [`RemoteManager`] 的构造参数。
@@ -113,6 +132,10 @@ pub struct RemoteManagerConfig {
     pub establisher: Arc<dyn TransportEstablisher>,
     /// 屏幕编码参数。
     pub encode: EncodeOptions,
+    /// 被控端对外共享的目录；`None` = 本端不接受任何文件请求。
+    pub share_dir: Option<PathBuf>,
+    /// 控制器下载文件的落地目录。
+    pub download_dir: PathBuf,
 }
 
 /// 正在进行的会话句柄。
@@ -146,6 +169,14 @@ struct PlatformHandles {
     input: Arc<dyn InputSink>,
 }
 
+/// 被控端共享目录（构造一次，会话间复用）。
+struct ShareDir {
+    /// 受限文件服务。
+    service: Arc<FileService>,
+    /// 原始路径（仅用于日志/UI 展示）。
+    path: PathBuf,
+}
+
 /// 远程控制引擎门面。
 pub struct RemoteManager {
     /// 构造参数。
@@ -160,8 +191,12 @@ pub struct RemoteManager {
     platform: RwLock<Option<PlatformHandles>>,
     /// 控制器侧画面上报目标。
     frame_sink: RwLock<Option<Arc<dyn FrameSink>>>,
-    /// 当前控制器会话的输入投递端。
-    input_tx: Mutex<Option<mpsc::Sender<InputEvent>>>,
+    /// 当前控制器会话的命令投递端（输入 / 切档位 / 剪贴板 / 文件）。
+    cmd_tx: Mutex<Option<mpsc::Sender<ControllerCommand>>>,
+    /// 被控端剪贴板实现。
+    clipboard: RwLock<Option<Arc<dyn Clipboard>>>,
+    /// 被控端共享目录（`share_dir` 为 `None` 时此处也是 `None`）。
+    share: Option<ShareDir>,
     /// 自引用弱指针（供同步方法 `spawn` 使用）。
     self_weak: Weak<RemoteManager>,
     /// 构造时所在的 Tokio 运行时句柄。
@@ -187,9 +222,15 @@ impl RemoteManager {
         let ui = RemoteUiState {
             enabled: cfg.enabled,
             self_platform: cfg.platform.clone(),
+            quality: QualityPreset::default(),
             ..RemoteUiState::default()
         };
         let (ui_tx, _rx) = watch::channel(ui);
+        // 共享目录在构造时就定下来：会话期间改目录会让正在传的文件落到别处。
+        let share = cfg.share_dir.clone().map(|path| ShareDir {
+            service: Arc::new(FileService::new(path.clone())),
+            path,
+        });
         Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -200,10 +241,18 @@ impl RemoteManager {
             }),
             platform: RwLock::new(None),
             frame_sink: RwLock::new(None),
-            input_tx: Mutex::new(None),
+            cmd_tx: Mutex::new(None),
+            clipboard: RwLock::new(None),
+            share,
             self_weak: weak.clone(),
             rt: tokio::runtime::Handle::try_current().ok(),
         })
+    }
+
+    /// 本端共享目录路径（未配置时 `None`）。
+    #[must_use]
+    pub fn share_dir(&self) -> Option<&std::path::Path> {
+        self.share.as_ref().map(|s| s.path.as_path())
     }
 
     /// 取桥接句柄，交给 `crates/client` 的控制通道。
@@ -254,7 +303,7 @@ impl RemoteManager {
     pub fn abort_active(&self) {
         if let Some(active) = self.take_active() {
             active.cancel.cancel();
-            self.lock_input().take();
+            self.lock_cmd().take();
             // 被控端：控制器还没拨进来时挂起记录仍在表里，一并撤掉，不必等下一个 TTL 窗口。
             self.lock_inner().pending.remove(&active.session_id);
             self.send(ControlMessage::RemoteSessionEnd {
@@ -282,13 +331,69 @@ impl RemoteManager {
         }
     }
 
+    /// 安装被控端剪贴板实现（`arboard` 等）。
+    pub fn install_clipboard(&self, clipboard: Arc<dyn Clipboard>) {
+        if let Ok(mut guard) = self.clipboard.write() {
+            *guard = Some(clipboard);
+        }
+    }
+
     /// 投递一条输入事件到当前控制器会话（无会话或队列满时静默丢弃）。
     pub fn send_input(&self, event: InputEvent) {
-        if let Some(tx) = self.lock_input().as_ref() {
-            if tx.try_send(event).is_err() {
-                debug!("输入队列满或会话已结束，丢弃输入事件");
-            }
-        }
+        self.send_command(ControllerCommand::Input(event));
+    }
+
+    /// 请求被控端切换到某台显示器。
+    pub fn select_display(&self, display: u32) {
+        self.update_ui(|s| s.selected_display = display);
+        self.send_command(ControllerCommand::SelectDisplay(display));
+    }
+
+    /// 下发画质档位（由被控端生效）。
+    pub fn set_quality(&self, preset: QualityPreset) {
+        self.update_ui(|s| s.quality = preset);
+        self.send_command(ControllerCommand::SetQuality(preset));
+    }
+
+    /// 把本机剪贴板文本发给被控端。
+    pub fn send_clipboard(&self, text: String) {
+        self.send_command(ControllerCommand::Clipboard(text));
+    }
+
+    /// 请求被控端把它的剪贴板发过来（结果经 [`FrameSink::on_clipboard`] 回给 UI）。
+    pub fn request_clipboard(&self) {
+        self.send_command(ControllerCommand::ClipboardRequest);
+    }
+
+    /// 列出被控端共享目录下的内容（结果进 [`RemoteUiState::remote_entries`]）。
+    pub fn list_remote_dir(&self, path: &str) {
+        self.update_ui(|s| {
+            path.clone_into(&mut s.remote_dir);
+            s.remote_entries.clear();
+        });
+        self.send_command(ControllerCommand::File(TransferCommand::List {
+            path: path.to_owned(),
+        }));
+    }
+
+    /// 下载被控端的某个文件到本机 `download_dir`。
+    pub fn download_remote_file(&self, path: &str) {
+        self.send_command(ControllerCommand::File(TransferCommand::Download {
+            path: path.to_owned(),
+        }));
+    }
+
+    /// 上传本机文件到被控端的共享目录。
+    pub fn upload_local_file(&self, local: PathBuf, remote: &str) {
+        self.send_command(ControllerCommand::File(TransferCommand::Upload {
+            local,
+            remote: remote.to_owned(),
+        }));
+    }
+
+    /// 取消一次在途传输。
+    pub fn cancel_transfer(&self, id: u64) {
+        self.send_command(ControllerCommand::File(TransferCommand::Cancel { id }));
     }
 
     // ── 内部辅助 ───────────────────────────────────────────────────────
@@ -303,9 +408,20 @@ impl RemoteManager {
         self.upstream.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// 锁输入发送端（容忍中毒）。
-    fn lock_input(&self) -> MutexGuard<'_, Option<mpsc::Sender<InputEvent>>> {
-        self.input_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// 锁会话命令发送端（容忍中毒）。
+    fn lock_cmd(&self) -> MutexGuard<'_, Option<mpsc::Sender<ControllerCommand>>> {
+        self.cmd_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 投递一条会话命令（无会话或队列满时静默丢弃）。
+    fn send_command(&self, cmd: ControllerCommand) {
+        if let Some(tx) = self.lock_cmd().as_ref() {
+            if tx.try_send(cmd).is_err() {
+                debug!("会话命令队列满或会话已结束，丢弃命令");
+            }
+        } else {
+            debug!("当前无控制器会话，丢弃命令");
+        }
     }
 
     /// 让数据面提前完成会合服务器登记（见 [`TransportEstablisher::prepare`]）。
@@ -444,7 +560,7 @@ impl RemoteManager {
             return;
         }
         self.take_active();
-        self.lock_input().take();
+        self.lock_cmd().take();
         let (reason, failed) = match result {
             Ok(()) => ("会话结束".to_owned(), false),
             Err(err) => (err.to_string(), true),
@@ -508,8 +624,8 @@ impl RemoteManager {
             filled.rendezvous_host.clone_from(&self.cfg.server_host);
         }
         let mode = self.lock_inner().last_requested_mode.unwrap_or(RemoteMode::Control);
-        let (input_tx, input_rx) = mpsc::channel(INPUT_CAPACITY);
-        *self.lock_input() = Some(input_tx);
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
+        *self.lock_cmd() = Some(cmd_tx);
         let cancel = CancellationToken::new();
         self.set_active(ActiveHandle {
             session_id: session_id.clone(),
@@ -542,7 +658,7 @@ impl RemoteManager {
         let sid = session_id;
         tokio::spawn(async move {
             let result = me
-                .controller_task(sid.clone(), token, target_rd_id, filled, mode, input_rx, cancel)
+                .controller_task(sid.clone(), token, target_rd_id, filled, mode, cmd_rx, cancel)
                 .await;
             me.finish_session(&sid, result);
         });
@@ -560,7 +676,7 @@ impl RemoteManager {
         target_rd_id: String,
         params: RemoteParams,
         mode: RemoteMode,
-        input_rx: mpsc::Receiver<InputEvent>,
+        cmd_rx: mpsc::Receiver<ControllerCommand>,
         cancel: CancellationToken,
     ) -> RemoteResult<()> {
         let local_rd_id = self.local_rd_id();
@@ -575,6 +691,10 @@ impl RemoteManager {
         };
         let duplex = self.cfg.establisher.establish(request, Role::Controller).await?;
         self.mark_active(&session_id);
+        // 落地目录可能还不存在（首次使用）；建不出来就让下载直接失败，别让它到 99% 才炸。
+        if let Err(err) = tokio::fs::create_dir_all(&self.cfg.download_dir).await {
+            warn!(error = %err, dir = %self.cfg.download_dir.display(), "创建下载目录失败");
+        }
         let config = ControllerConfig {
             session_id,
             // token 同时用于 KDF 认证，必须与被控端 `RemoteSessionIncoming` 收到的那个一致。
@@ -582,7 +702,35 @@ impl RemoteManager {
             local_rd_id,
             mode,
         };
-        run_controller(duplex, config, handshake, input_rx, self.frame_sink_arc(), cancel).await
+        // 控制器不提供文件服务（`service: None`），只负责发起与落地。
+        let transfer = self.build_transfer_hub(None, self.cfg.download_dir.clone(), cancel.clone());
+        run_controller(
+            duplex,
+            config,
+            handshake,
+            cmd_rx,
+            transfer,
+            self.frame_sink_arc(),
+            cancel,
+        )
+        .await
+    }
+
+    /// 造一个传输状态机并把事件泵到 UI 状态。
+    fn build_transfer_hub(
+        self: &Arc<Self>,
+        service: Option<Arc<FileService>>,
+        local_root: PathBuf,
+        cancel: CancellationToken,
+    ) -> TransferHub {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let hub = TransferHub::new(service, local_root, event_tx);
+        if let Some(me) = self.self_weak.upgrade() {
+            tokio::spawn(async move {
+                pump_transfer_events(me, event_rx, cancel).await;
+            });
+        }
+        hub
     }
 
     /// 处理 `RemoteSessionIncoming`（被控端）。
@@ -680,7 +828,27 @@ impl RemoteManager {
             pending,
             encode: self.cfg.encode,
         };
-        run_controlled(duplex, config, screen, input, cancel).await
+        let clipboard = self
+            .clipboard
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // 被控端只**应答**文件请求：共享目录未配置时传 `None`，一切请求都会被拒。
+        //
+        // 「仅观看」模式同样不给文件服务——这是权限边界，不只是 UI 偏好：否则控制器能在只读
+        // 会话里下载被控端的文件（或写入）。真正的强制点在这里（被控端拒绝），控制器的 UI
+        // 隐藏只是顺带的。
+        let service = self
+            .share
+            .as_ref()
+            .filter(|_| mode != RemoteMode::ViewOnly)
+            .map(|s| Arc::clone(&s.service));
+        let local_root = self
+            .share
+            .as_ref()
+            .map_or_else(|| self.cfg.download_dir.clone(), |s| s.path.clone());
+        let transfer = self.build_transfer_hub(service, local_root, cancel.clone());
+        run_controlled(duplex, config, screen, input, clipboard, transfer, cancel).await
     }
 
     /// 处理 `RemoteSessionResponse`（控制器侧收到拒绝时清理）。
@@ -708,7 +876,7 @@ impl RemoteManager {
         if let Some(active) = self.take_active() {
             active.cancel.cancel();
         }
-        self.lock_input().take();
+        self.lock_cmd().take();
         self.update_ui(move |s| {
             s.active = None;
             s.last_error = Some(reason);
@@ -728,7 +896,7 @@ impl RemoteManager {
         if let Some(active) = self.take_active() {
             active.cancel.cancel();
         }
-        self.lock_input().take();
+        self.lock_cmd().take();
         // 会话已被服务端判死：挂起记录留着也不会再被消费。
         self.lock_inner().pending.remove(session_id);
         let reason = reason.to_owned();
@@ -810,12 +978,60 @@ impl RemoteBridge for RemoteManager {
         if let Some(active) = self.take_active() {
             active.cancel.cancel();
         }
-        self.lock_input().take();
+        self.lock_cmd().take();
         self.update_ui(|s| {
             s.connected = false;
             s.active = None;
         });
     }
+}
+
+/// 把传输事件泵进 UI 状态，直到会话结束（hub 被 drop，通道关闭）或管理器释放。
+async fn pump_transfer_events(
+    mgr: Arc<RemoteManager>,
+    mut rx: mpsc::UnboundedReceiver<TransferEvent>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let event = tokio::select! {
+            () = cancel.cancelled() => break,
+            event = rx.recv() => match event {
+                Some(event) => event,
+                // hub 已随会话结束被 drop。
+                None => break,
+            },
+        };
+        apply_transfer_event(&mgr, event);
+    }
+}
+
+/// 把一条传输事件写进 [`RemoteUiState`]。
+fn apply_transfer_event(mgr: &RemoteManager, event: TransferEvent) {
+    mgr.update_ui(|s| match event {
+        TransferEvent::Listed { path, entries } => {
+            s.remote_dir = path;
+            s.remote_entries = entries;
+        }
+        TransferEvent::Started(progress) => {
+            s.transfers.retain(|t| t.id != progress.id);
+            s.transfers.push(progress);
+            s.transfer_note = None;
+        }
+        TransferEvent::Progress { id, done, total } => {
+            if let Some(t) = s.transfers.iter_mut().find(|t| t.id == id) {
+                t.done = done;
+                t.total = total;
+            }
+        }
+        TransferEvent::Finished { id, path } => {
+            s.transfers.retain(|t| t.id != id);
+            s.transfer_note = Some(format!("已完成：{path}"));
+        }
+        TransferEvent::Failed { id, reason } => {
+            s.transfers.retain(|t| t.id != id);
+            s.transfer_note = Some(format!("失败：{reason}"));
+        }
+    });
 }
 
 /// 当前时间（毫秒，自 epoch）。
@@ -881,6 +1097,8 @@ mod tests {
             enabled,
             establisher,
             encode: EncodeOptions::default(),
+            share_dir: None,
+            download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
         })
     }
 
@@ -975,6 +1193,8 @@ mod tests {
             enabled,
             establisher: Arc::new(NeverEstablisher),
             encode: EncodeOptions::default(),
+            share_dir: None,
+            download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
         })
     }
 

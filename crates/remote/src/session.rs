@@ -23,7 +23,7 @@
 use crate::auth::handshake_mac;
 use crate::crypto::{random_nonce, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{DisplayInfo, InputEvent};
+use crate::screen::{DisplayInfo, FileEntry, InputEvent, QualityPreset, TilePatch};
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -105,7 +105,9 @@ pub enum SessionMessage {
         /// 并绑定自己的临时公钥（防中继方替换 `x25519_pub`）。
         hmac_ack: Vec<u8>,
     },
-    /// 一帧画面（JPEG）。
+    /// 一帧画面（JPEG，整帧）。
+    ///
+    /// 首帧与关键帧走这里；两次关键帧之间只发 [`SessionMessage::VideoTiles`]。
     Video {
         /// 来源显示器编号。
         display: u32,
@@ -118,8 +120,41 @@ pub enum SessionMessage {
         /// JPEG 字节。
         jpeg: Vec<u8>,
     },
+    /// 增量瓦片更新（只含变化区域）。
+    ///
+    /// 收到它的控制器**应当**做局部更新而不是整帧替换；忽略它也能工作，只是要等下一个关键帧
+    /// （[`crate::tiles::KEYFRAME_INTERVAL_FRAMES`] 帧之内）才看到变化。
+    VideoTiles {
+        /// 来源显示器编号。
+        display: u32,
+        /// 整帧宽（瓦片坐标以此为参照）。
+        width: u32,
+        /// 整帧高。
+        height: u32,
+        /// 帧序号（被控端递增，与 `Video` 共用同一计数器）。
+        seq: u64,
+        /// 变化的瓦片。
+        tiles: Vec<TilePatch>,
+    },
     /// 一条输入事件。
     Input(InputEvent),
+    /// 控制器切换观看的显示器（被控端据此换采集目标）。
+    SelectDisplay {
+        /// 目标显示器编号（取自 `HelloAck.displays`）。
+        display: u32,
+    },
+    /// 控制器下发画质档位（被控端据此换编码参数并强制重发关键帧）。
+    SetQuality {
+        /// 目标档位。
+        preset: QualityPreset,
+    },
+    /// 剪贴板文本（双向）。
+    Clipboard {
+        /// 文本内容。
+        text: String,
+    },
+    /// 请求对端把剪贴板内容发过来（双向）。
+    ClipboardRequest,
     /// 显示器列表（会话中变更时下发）。
     DisplayList(Vec<DisplayInfo>),
     /// 心跳。
@@ -129,6 +164,69 @@ pub enum SessionMessage {
     /// 会话结束。
     Bye {
         /// 结束原因。
+        reason: String,
+    },
+    // ── 文件传输（走 `File` lane；`id` 由发起方分配，两端各自独立编号空间）──
+    /// 请求列目录（`path` 为共享根下的虚拟路径，`""` = 根）。
+    FileListRequest {
+        /// 请求 ID。
+        id: u64,
+        /// 虚拟路径。
+        path: String,
+    },
+    /// 列目录结果。
+    FileList {
+        /// 请求 ID。
+        id: u64,
+        /// 回显虚拟路径。
+        path: String,
+        /// 目录项。
+        entries: Vec<FileEntry>,
+    },
+    /// 请求下载（被控端 → 控制器方向的文件）。
+    FileDownloadRequest {
+        /// 传输 ID。
+        id: u64,
+        /// 虚拟路径。
+        path: String,
+    },
+    /// 请求上传（控制器 → 被控端方向的文件）。
+    FileUploadRequest {
+        /// 传输 ID。
+        id: u64,
+        /// 虚拟路径（含目标文件名）。
+        path: String,
+        /// 声明字节数（被控端据此预检限额）。
+        size: u64,
+    },
+    /// 传输受理/拒绝。
+    FileAccept {
+        /// 传输 ID。
+        id: u64,
+        /// 是否受理。
+        accepted: bool,
+        /// 拒绝原因；受理时为 `None`。
+        reason: Option<String>,
+        /// 受理方回填的实际字节数（下载时由被控端给出；上传时为 0）。
+        size: u64,
+    },
+    /// 数据块（按序追加；单条 TCP 流不会乱序，故无需 offset）。
+    FileChunk {
+        /// 传输 ID。
+        id: u64,
+        /// 数据。
+        data: Vec<u8>,
+    },
+    /// 传输完成。
+    FileDone {
+        /// 传输 ID。
+        id: u64,
+    },
+    /// 传输失败/取消（任一端均可发）。
+    FileError {
+        /// 传输 ID。
+        id: u64,
+        /// 原因。
         reason: String,
     },
 }
@@ -157,6 +255,15 @@ impl SessionFrame {
     pub fn screen(message: SessionMessage) -> Self {
         Self {
             lane: Lane::Screen,
+            message,
+        }
+    }
+
+    /// 构造一个 `File` 通道帧。
+    #[must_use]
+    pub fn file(message: SessionMessage) -> Self {
+        Self {
+            lane: Lane::File,
             message,
         }
     }

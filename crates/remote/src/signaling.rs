@@ -60,6 +60,22 @@ const RELAY_WAIT: Duration = Duration::from_secs(25);
 /// 直连尝试的连接超时。
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 等待 `PunchHoleResponse` 的超时（**不是** [`RELAY_WAIT`]，见下）。
+///
+/// # 为什么必须远小于 `RELAY_WAIT`
+///
+/// hbbs 的 `handle_punch_hole_request` 只在**同内网**（`peer_is_lan && remote_is_lan` 或
+/// 两端公网 IP 相同）时才回 `PunchHoleResponse`——它走 `FetchLocalAddr`，目标端立刻回
+/// `LocalAddr`，请求方很快拿到应答。**跨 NAT 时它改推一条 `PunchHole` 给目标端然后就不管了**
+/// （`handle_punch_hole_request` 返回 `None`），而本实现不处理 `PunchHole`（跨 NAT 打洞在
+/// 当前 hbbs 语义下不成立，见 `transport` 模块文档），因此**永远等不到应答**。
+///
+/// 若这里沿用 `RELAY_WAIT`(25s)，跨 NAT 场景（两端各在自家 NAT 后，即最常见的部署形态）会是：
+/// 控制器空等 25s 才去发中继信令 → 被控端的 `wait_relay_push(RELAY_WAIT)` 几乎同时超时 →
+/// **会话直接失败**，而且用户看到的是「卡在连接中」25 秒。所以直连只是一个**同内网的快速
+/// 优化**，给它一个短窗口：拿不到就立刻回退中继。
+const DIRECT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 会合/中继客户端配置。
 #[derive(Debug, Clone)]
 pub struct SignalingConfig {
@@ -327,14 +343,15 @@ impl RustDeskTransport {
         stream.write_all(&encode_message(&msg)?).await?;
         stream.flush().await?;
 
-        let response = match timeout(RELAY_WAIT, read_message(&mut stream)).await {
+        // 短窗口等待：同内网会立刻回 `PunchHoleResponse`，跨 NAT 永远不会回（见常量文档）。
+        let response = match timeout(DIRECT_SIGNAL_TIMEOUT, read_message(&mut stream)).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => {
                 debug!(error = %err, "读打洞应答失败");
                 return Ok(None);
             }
             Err(_) => {
-                debug!("等待打洞应答超时");
+                debug!("等待打洞应答超时（跨 NAT 或对端未登记），回退中继");
                 return Ok(None);
             }
         };
@@ -642,8 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_message_produces_framed_protobuf() {
-        let msg = RendezvousMessage::with(Union::RegisterPeer(RegisterPeer {
+    fn encode_message_produces_framed_protobuf() {        let msg = RendezvousMessage::with(Union::RegisterPeer(RegisterPeer {
             id: "123456789".into(),
             serial: 1,
         }));
@@ -656,6 +672,54 @@ mod tests {
             RendezvousMessage::decode(&payload[..]).unwrap(),
             msg,
             "帧应能解回原消息"
+        );
+    }
+
+    /// 跨 NAT 时 hbbs **不会**回 `PunchHoleResponse`：`handle_punch_hole_request` 只给目标端推
+    /// 一条 `PunchHole` 就返回 `None`，而本实现不处理 `PunchHole`（跨 NAT 打洞在当前 hbbs 语义
+    /// 下不成立），因此请求方永远等不到应答。
+    ///
+    /// 回归用例：`try_direct` 必须在**短窗口**内放弃并回退中继。若沿用 `RELAY_WAIT`(25s)，
+    /// 控制器要空等 25s 才去发中继信令，而被控端的 `wait_relay_push(RELAY_WAIT)` 几乎同时超时
+    /// ——跨 NAT（最常见的部署形态）下会话**必现失败**，用户看到的是「卡在连接中」25 秒。
+    #[tokio::test]
+    async fn try_direct_gives_up_quickly_when_hbbs_never_answers() {
+        // 假 hbbs：接受 TCP 连接后保持沉默，正是跨 NAT 时的真实行为。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hbbs_port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                // 拿着不放、也不回任何字节。
+                keep.push(stream);
+            }
+        });
+
+        let transport = RustDeskTransport::new(SignalingConfig {
+            rd_id: "111111111".into(),
+            licence_key: String::new(),
+            host: "127.0.0.1".into(),
+            rendezvous_port: hbbs_port,
+            relay_port: hbbs_port,
+            relay_server: String::new(),
+            always_use_relay: false,
+        })
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        let result = transport.try_direct("222222222").await;
+        let elapsed = started.elapsed();
+        held.abort();
+
+        assert!(matches!(result, Ok(None)), "无应答时应放弃直连、回退中继");
+        assert!(
+            elapsed >= DIRECT_SIGNAL_TIMEOUT,
+            "不该在应答窗口结束前就放弃（实测 {elapsed:?}）"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "必须在远小于 RELAY_WAIT({RELAY_WAIT:?}) 的时间内放弃，实测 {elapsed:?}"
         );
     }
 }
