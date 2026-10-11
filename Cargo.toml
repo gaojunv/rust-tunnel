@@ -6,7 +6,7 @@ description = "A simple intranet penetration tool with server and client"
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = ["crates/agent", "crates/client", "crates/client-gui", "crates/common", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/server", "crates/stats", "crates/wiki-core", "crates/wiki-serve"]
+members = ["crates/agent", "crates/client", "crates/client-gui", "crates/common", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/rustdesk", "crates/server", "crates/stats", "crates/wiki-core", "crates/wiki-serve"]
 
 [workspace.lints.clippy]
 # 企业级 lint 基线：pedantic 组已在批次 9/10 全仓清零，转 deny 硬门禁。
@@ -104,6 +104,15 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
 open = "5"
 
+# ── 内置 RustDesk 兼容服务（crates/rustdesk）────────────────────────
+# prost 手写 derive 声明消息体，不经 protoc：仓库无需 protoc 构建依赖，
+# 且消息定义与上游 rendezvous.proto 的字段号逐一对齐（互操作只依赖字段号）。
+prost = { version = "0.14", features = ["derive"] }
+# NaCl Ed25519（上游用 sodiumoxide 的 sign）是标准 Ed25519，签名 64 字节、
+# 私钥 64 字节 = seed(32) ‖ pubkey(32)，ed25519-dalek 可直接互操作。
+# 纯 Rust，不引入 libsodium C 依赖，musl 静态构建不受影响。
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+
 # ── 桌面笔记骨架（wiki-core / wiki-serve）──────────────────────────
 # 仅这两个 crate 使用；未挂到根 package 的 dependencies，故不影响既有
 # `cargo build` / `cargo test` 的编译面。
@@ -128,7 +137,10 @@ rust-tunnel-common = { path = "crates/common" }
 rust-tunnel-client = { path = "crates/client" }
 rust-tunnel-server = { path = "crates/server", features = ["rag"] }
 rust-tunnel-protocols = { path = "crates/protocols" }
+# e2e 直接用协议库的 frame/proto/addr 驱动真实监听端口（不重复实现线上格式）
+rust-tunnel-rustdesk = { path = "crates/rustdesk" }
 tokio.workspace = true
+bytes.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 rustls.workspace = true
