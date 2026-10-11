@@ -54,12 +54,13 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 ## 架构
 
-### Cargo workspace：三库 crate + 根元包
+### Cargo workspace：四库 crate + 根元包
 - 根元包 `rust-tunnel` 仅托管 e2e 测试（`tests/`），无实现代码
 - `crates/common`（`rust-tunnel-common`）— 协议/TLS/错误/日志/mesh + `DEFAULT_PTY_PORT`
 - `crates/client`（`rust-tunnel-client`）— 客户端 lib + bin
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
-- 依赖单向：`common ← client`、`common ← server`
+- `crates/rustdesk`（`rust-tunnel-rustdesk`）— 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**（`frame`/`proto`/`addr`/`key`/`peer`/`relay`/`rendezvous`）
+- 依赖单向：`common ← client`、`common ← server`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）
 - **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
 ### 核心数据流
@@ -95,12 +96,28 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `net/` — 网络基建（listener/dns/mesh）
 - `agent/` — AI agent 工作台：`runner`（自研 agent 循环/回合，作为未配置 agent_type 的 workspace 的回退运行时路径；ACP 为主路径）、`tools`（工具 schema：shell/read_file/read_file_range/write_file/patch_file/list_dir/search/git_*/code_outline/read_symbol，工具经隧道在内网客户端执行）、`executor`（命令执行）、`approval`（审批矩阵：危险工具挂起等待用户批准，支持"本会话记住"）、`session`/`title`/`compact`（会话管理、自动标题、上下文压缩）、`sse`（WebSocket 事件流）、`spawner`（ACP 路径：经控制通道 negotiate AgentSpawnRequest/AgentLlmProxyStart，在客户端 spawn agent 进程）、`acp_bridge`（ACP 路径：管理 ACP session 生命周期、stdio pump、idle reaper、断线恢复）、`acp_events`（ACP `SessionUpdate` → 现有 WS 帧映射）、`llm_bridge`（AgentLlmProxyRequest → 服务端 LLM 网关转发，服务端注入认证）、`roles`（多角色子代理：`agent_roles` 表定义角色 persona——系统提示词/工具白名单黑名单/模型覆盖/mode=subagent|primary|all/scope 仿 agent_skills；task 工具 `agent` 参数调度子代理角色，主会话可经 session.role_id 或 `@role-name` 前缀切换 primary 角色；工具过滤叠加顺序 = 角色过滤 ∩ plan 模式裁剪，子 agent 强制剔除 task/todo_write；内置角色 general/explore 启动时 seed）。`AgentState` 挂在 `ServerState` 上，含 per-workspace 执行锁（git 状态安全）和 per-session 回合锁（多标签页/重连防并发写库）
 - `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
+- `rustdesk_runtime.rs` — RustDesk 会合/中继运行时：`apply_rustdesk_config`（停旧→绑 4 个监听→起 4 个任务）、`nat_test_port()`；端口由本模块绑定（协议库只做协议处理）
 
 **`crates/client/src/`** — 客户端实现（零配置范式的端侧）
 - `control.rs` — 建立控制连接、TLS、密码认证、`Register{protocol_version:2, name, password, version}`、`ClientState`（pending→active 连接管理）、分发 `OpenTunnel`/`Data`/`Close`/`Disconnect`
 - `proxy.rs` — `handle_open_tunnel`：收到 OpenTunnel 后 `TcpStream::connect(target_addr)`，TunnelOpenResult 反馈，双向 shuttle 转发
 - `config.rs` — 同上三级配置优先级，但只保留 `server/password/name/tls*` 和 `mesh*`，删除 `forwards`
 - `logs.rs` — 客户端日志收集
+
+**`crates/rustdesk/src/`** — 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**
+- 独立实现线上协议（上游 `rustdesk-server` 是 AGPL，本项目 MIT/Apache；只对齐字段号/端口/帧格式，代码自有）；不引 libsodium C 依赖，Ed25519 走 `ed25519-dalek`（与 NaCl 私钥布局逐字节兼容）
+- `frame.rs` — 长度前缀帧编解码（可变长头部；配对成功后切裸字节模式）；`proto.rs` — 手写 `prost` derive 的消息定义（无需 protoc）；`addr.rs` — 地址 `AddrMangle` 编解码；`key.rs` — `ServerKey`（Ed25519 签 `IdPk` 绑定 + `licence_key` 明文比对）；`peer.rs` — 在线对端登记表（含 per-ID / per-IP 限流）；`relay.rs` — hbbr 中继；`rendezvous.rs` — hbbs 会合（注册/心跳/打洞协调/中继调度）
+- **不依赖 `stats`、不参与 `PortRegistry`/SNI 路由**：端口是固定的 21115/21116/21117，既不随反代规则分配、也不进 SS/Trojan 的端口表，故不登记端口；运行时胶水（绑定监听、统计轮询）在 `crates/server/src/rustdesk_runtime.rs`，管理面在 `crates/server/src/mgmt/api/rustdesk.rs`
+- 端口表（改主端口即整体平移；NAT 探测 = 会合端口 - 1）：
+
+| 端口 | 组件 | 传输 | 用途 |
+|---|---|---|---|
+| 21115 | hbbs | TCP | NAT 类型探测（= `rendezvous_port - 1`） |
+| 21116 | hbbs | **TCP + UDP** | 注册/心跳/打洞协调（UDP 半边是打洞成功的关键） |
+| 21117 | hbbr | TCP | 中继数据面（裸字节转发） |
+
+- 有意未实现：WebSocket 端口 21118/21119（Web 客户端不可用，原生桌面端不受影响）、WebRTC 通道、`KeyExchange`/`kx_version` 前向安全升级
+- 部署/防火墙/密钥/真机验证清单见根目录 `RUSTDESK.md`（`docs/` 被 gitignore，不放交付文档）
 
 ### 前端架构
 - 位于 `frontend/`，构建产物输出到 `frontend-dist/`（gitignored，由 `rust-embed` 嵌入）
@@ -115,11 +132,12 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 ### 数据库 (SQLite)
 - 位置：`--db-path` 配置（默认 `./data/rust-tunnel.db`），WAL 模式
-- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`knowledge_sources`（统一知识容器，`index_vector`/`index_pages` 双索引开关，取代旧 `rag_knowledge_bases`/`agent_wikis`）/ `knowledge_docs`（文档）/ `knowledge_doc_index`（按 `(doc_id, kind)` 记录每侧索引进度）/ `knowledge_chunks`（向量分块）/ `knowledge_pages`（页面）/ `knowledge_page_edges`（页面链接图谱；向量本体存于 `<db_parent>/rag/<source_id>/`，文档原文存于 `<db_parent>/knowledge_docs/<source_id>/`；**向量索引仅随 `rag` feature 编译**）、`agent_workspaces` / `agent_sessions`（含 `role_id`） / `agent_messages` / `agent_roles`（多角色子代理定义）；模型 `extra_config` JSON 支持 `upstream_protocol: "responses"` 声明上游使用 Responses API（与 `agent_context_limit` 并列，缺省 `chat_completions`）
+- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`rustdesk_config`（单行：enabled/端口/key/relay_server/always_use_relay/local_ip/mask）、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`knowledge_sources`（统一知识容器，`index_vector`/`index_pages` 双索引开关，取代旧 `rag_knowledge_bases`/`agent_wikis`）/ `knowledge_docs`（文档）/ `knowledge_doc_index`（按 `(doc_id, kind)` 记录每侧索引进度）/ `knowledge_chunks`（向量分块）/ `knowledge_pages`（页面）/ `knowledge_page_edges`（页面链接图谱；向量本体存于 `<db_parent>/rag/<source_id>/`，文档原文存于 `<db_parent>/knowledge_docs/<source_id>/`；**向量索引仅随 `rag` feature 编译**）、`agent_workspaces` / `agent_sessions`（含 `role_id`） / `agent_messages` / `agent_roles`（多角色子代理定义）；模型 `extra_config` JSON 支持 `upstream_protocol: "responses"` 声明上游使用 Responses API（与 `agent_context_limit` 并列，缺省 `chat_completions`）
 
 ### API 端点
 - 公开：`POST /api/login`、`GET /api/health`、`GET /api/knowledge/events`（SSE，`?token=` 认证）
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
+- RustDesk（新）：`GET /api/rustdesk`（配置 + 运行状态；密钥只回 `key_set` 布尔，明文永不回传）、`POST /api/rustdesk`（更新并应用；`generate_key: true` 时一次性回传新公钥）
 - 产物归档下载：`GET /api/client-downloads`、`GET /api/wiki-downloads`（列表，需 JWT）；`GET /api/client-downloads/:version/:file`、`GET /api/wiki-downloads/:version/:file`（下载，公开路由自带 `?token=` 校验，因 `<a download>` 不能带 Header）。分别只读 `client_dist_dir` / `wiki_dist_dir`，由 `release-client.yml` / `release-wiki-client.yml` 落盘
 - LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`、`POST /v1/responses`（Responses API 入口，与 `/v1/chat/completions` 同域）
 - 统一知识容器（新）：`/api/knowledge`（CRUD）、`/api/knowledge/:id`、`/api/knowledge/:id/docs`、`/api/knowledge/:id/docs/:doc_id`（含 `/reindex`）、`/api/knowledge/test-embedding`、`/api/knowledge/:id/query`（向量检索预览）、`/api/knowledge/:id/pages`、`/api/knowledge/:id/graph`、`/api/knowledge/:id/search`、`/api/knowledge/search`
@@ -152,10 +170,20 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `--name <name>` — 客户端名称（默认系统 hostname）
 - `--tls` / `--tls-insecure` — TLS 连接控制
 
+服务端 RustDesk 配置项（默认关闭；TOML `rustdesk_*` / 环境变量 `RUSTDESK_*` / CLI `--rustdesk-*`，同一条三级优先级）：
+- `rustdesk_enabled` — 总开关（hbbs 会合 + hbbr 中继共用一个开关）
+- `rustdesk_rendezvous_port` / `rustdesk_relay_port` — 会合端口（NAT 探测端口 = 此值 - 1）/ 中继端口
+- `rustdesk_key` — 服务端密钥；这是**密钥对**，推荐由 Web UI 的「生成」按钮产生（服务端持久化私钥、一次性展示公钥）
+- `rustdesk_relay_server` — 下发给客户端的中继地址（空 = 由客户端自定）
+- `rustdesk_always_use_relay` — 强制客户端走中继
+- `rustdesk_local_ip` / `rustdesk_mask` — 内网中继地址 / 内网判定 CIDR（如 `192.168.0.0/16`）
+
+优先级 default < 配置文件 < 环境变量 < CLI；但**一旦落库（打开过开关）就以 DB 为唯一事实来源**，配置文件只在首次 seed。完整部署/防火墙/密钥/真机验证见根目录 `RUSTDESK.md`。
+
 ## 测试
 
 - **单元测试**：位于各 crate 的 `src/` 内（`crates/{common,client,server}/src/`），源文件末尾 `#[cfg(test)] mod tests`（协议专属测试如 shadowsocks/trojan/http2/aliyun 均已合并回各自实现文件）。
-- **集成测试**：位于根元包 `tests/`，以黑盒 API/协议流程为主（`tunnel_basic.rs`、`api_auth.rs`、`stats_*.rs` 等）。
+- **集成测试**：位于根元包 `tests/`，以黑盒 API/协议流程为主（`tunnel_basic.rs`、`api_auth.rs`、`stats_*.rs`、`rustdesk_server.rs` 等）。
 
 ## CI/CD
 

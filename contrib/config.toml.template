@@ -52,6 +52,28 @@ trojan_password = "${TROJAN_PASSWORD}"
 # 认证失败时回退地址 (伪装为 HTTPS 站点)
 trojan_fallback = "127.0.0.1:80"
 
+# RustDesk 兼容服务配置 (hbbs 会合 + hbbr 中继，共用一个开关)
+# 端口：21116 TCP+UDP (会合信令 + 心跳/打洞)、21115 TCP (NAT 探测，= 会合端口 - 1)、
+# 21117 TCP (中继)。21116 的 UDP 半边是打洞成功的关键，防火墙只放 TCP 会退化为中继。
+rustdesk_enabled = false
+rustdesk_rendezvous_port = 21116
+rustdesk_relay_port = 21117
+# 密钥来自 Web UI (推荐：可轮换) 或 RUSTDESK_KEY / --rustdesk-key (基础设施托管)。
+# 这里刻意留空、不放占位符：key 是密钥对而非共享口令，若由 CI 注入，之后在 Web UI
+# 点「生成」轮换会被下一次部署覆盖，两者互相打架。
+# rustdesk_key = "${RUSTDESK_KEY}"
+# 不下发固定中继地址时留空，由客户端自行选择
+# rustdesk_relay_server = "relay.example.com:21117"
+# 强制客户端走中继
+rustdesk_always_use_relay = false
+# 内网直连场景下作为中继地址下发的本机 IP
+# rustdesk_local_ip = "192.168.1.10"
+# 内网判定掩码，形如 192.168.0.0/16；留空则不做内网判定
+# rustdesk_mask = "192.168.0.0/16"
+# RustDesk 四个监听(会合 TCP+UDP / NAT 探测 / 中继)绑定的本机 IP；默认 0.0.0.0。
+# 只在启动时读取一次，改动需重启服务；Web 管理页不提供此项（基础设施级设置）。
+# rustdesk_bind_addr = "0.0.0.0"
+
 # DNS 服务器配置
 dns_enabled = true
 dns_bind = "0.0.0.0:53"

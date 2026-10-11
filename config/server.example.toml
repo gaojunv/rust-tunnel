@@ -24,6 +24,15 @@
 #   TROJAN_PORT        -> trojan_port
 #   TROJAN_PASSWORD    -> trojan_password
 #   TROJAN_FALLBACK    -> trojan_fallback
+#   RUSTDESK_ENABLED          -> rustdesk_enabled
+#   RUSTDESK_RENDEZVOUS_PORT  -> rustdesk_rendezvous_port
+#   RUSTDESK_RELAY_PORT       -> rustdesk_relay_port
+#   RUSTDESK_KEY              -> rustdesk_key
+#   RUSTDESK_RELAY_SERVER     -> rustdesk_relay_server
+#   RUSTDESK_ALWAYS_USE_RELAY -> rustdesk_always_use_relay
+#   RUSTDESK_LOCAL_IP         -> rustdesk_local_ip
+#   RUSTDESK_MASK             -> rustdesk_mask
+#   RUSTDESK_BIND_ADDR        -> rustdesk_bind_addr
 #
 # 命令行参数：
 #   --config               指定配置文件路径
@@ -49,6 +58,15 @@
 #   --trojan-port          Trojan 监听端口
 #   --trojan-password      Trojan 密码
 #   --trojan-fallback      Trojan 回退地址
+#   --rustdesk-enabled          启用 RustDesk 会合/中继服务
+#   --rustdesk-rendezvous-port  RustDesk 会合(hbbs)端口
+#   --rustdesk-relay-port       RustDesk 中继(hbbr)端口
+#   --rustdesk-key              RustDesk 服务端公钥
+#   --rustdesk-relay-server     下发的中继地址
+#   --rustdesk-always-use-relay 是否强制客户端走中继
+#   --rustdesk-local-ip         内网直连场景下发的本机 IP
+#   --rustdesk-mask             内网判定掩码
+#   --rustdesk-bind-addr        RustDesk 四个监听的绑定 IP（默认 0.0.0.0）
 # ========================================
 
 # --------------------
@@ -189,6 +207,53 @@ trojan_enabled = false
 # 这使得 Trojan 端口看起来像一个普通的 HTTPS 站点
 # trojan_fallback = "127.0.0.1:80"
 
+# --------------------
+# RustDesk 兼容服务配置
+# --------------------
+
+# 启用内置的 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）
+# 该服务与标准 RustDesk 客户端/服务端互通：会合(hbbs)与中继(hbbr)
+# 是同一个逻辑服务，共用一个开关（同一主机、同一份配置）。
+# 默认值：false
+rustdesk_enabled = false
+
+# RustDesk 会合(hbbs)监听端口（启用时必填）
+# 客户端连接此端口进行注册与打洞协调；NAT 类型探测端口 = 此值 - 1。
+# 该端口必须 >= 2（会合端口为 1 时探测端口为 0，无法绑定）。
+# 默认值：21116
+rustdesk_rendezvous_port = 21116
+
+# RustDesk 中继(hbbr)监听端口（启用时必填，且与会合端口不同）
+# 无法直连的客户端经此端口转发流量。
+# 默认值：21117
+rustdesk_relay_port = 21117
+
+# RustDesk 服务端公钥（licence_key）
+# 客户端与服务器用它做身份校验 / 数据签名；留空则不校验、不签名。
+# 建议：使用高强度随机字符串，并与客户端配置保持一致
+# rustdesk_key = "your_rustdesk_public_key_here"
+
+# 下发给客户端的中继地址，格式 host:port
+# 留空则不下发中继地址，由客户端自行选择
+# rustdesk_relay_server = "relay.example.com:21117"
+
+# 是否强制客户端走中继（跳过直连打洞）
+# 默认值：false
+rustdesk_always_use_relay = false
+
+# 内网直连场景下作为中继地址下发的本机 IP
+# 适用于客户端与服务端处于同一内网的部署
+# rustdesk_local_ip = "192.168.1.10"
+
+# 内网判定掩码（IPv4 CIDR，如 192.168.0.0/16）
+# 非空时必须为合法 CIDR；留空则不进行内网判定
+# rustdesk_mask = "192.168.0.0/16"
+
+# RustDesk 四个监听（会合 TCP+UDP、NAT 探测、中继）绑定的本机 IP
+# 默认 0.0.0.0（监听所有网卡）；纯 IPv6 主机或需要限定网卡时在此指定。
+# 该值只在启动时读取一次，改动后需重启服务（Web 管理页不提供此项）。
+# rustdesk_bind_addr = "0.0.0.0"
+
 # ========================================
 # 生产环境推荐配置（取消注释使用）
 # ========================================
@@ -205,6 +270,10 @@ trojan_enabled = false
 # trojan_port = 443
 # trojan_password = "your_trojan_password_here"
 # trojan_fallback = "127.0.0.1:80"
+# rustdesk_enabled = true
+# rustdesk_rendezvous_port = 21116
+# rustdesk_relay_port = 21117
+# rustdesk_key = "your_rustdesk_public_key_here"
 # dns_enabled = true
 # dns_bind = "0.0.0.0:53"
 # dns_tunnel_domain = "tunnel.local"
