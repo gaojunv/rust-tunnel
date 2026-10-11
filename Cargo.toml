@@ -137,6 +137,8 @@ rust-tunnel-common = { path = "crates/common" }
 rust-tunnel-client = { path = "crates/client" }
 rust-tunnel-server = { path = "crates/server", features = ["rag"] }
 rust-tunnel-protocols = { path = "crates/protocols" }
+# e2e 远程控制数据面测试直接用引擎 crate（真实 RustDeskTransport + 两个 RemoteManager）
+rust-tunnel-remote = { path = "crates/remote" }
 # e2e 直接用协议库的 frame/proto/addr 驱动真实监听端口（不重复实现线上格式）
 rust-tunnel-rustdesk = { path = "crates/rustdesk" }
 tokio.workspace = true

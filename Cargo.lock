@@ -8179,6 +8179,7 @@ dependencies = [
  "rust-tunnel-client",
  "rust-tunnel-common",
  "rust-tunnel-protocols",
+ "rust-tunnel-remote",
  "rust-tunnel-rustdesk",
  "rust-tunnel-server",
  "rustls",
@@ -8258,6 +8259,7 @@ name = "rust-tunnel-client-gui"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "auto-launch",
  "clap",
  "directories",
@@ -8271,6 +8273,7 @@ dependencies = [
  "notify-rust",
  "rust-tunnel-client",
  "rust-tunnel-common",
+ "rust-tunnel-remote",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

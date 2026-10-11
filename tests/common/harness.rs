@@ -2,7 +2,7 @@
 //! isolated server (fresh tempdir, random ports) that lives until drop.
 
 use rust_tunnel_client::config::ClientConfig;
-use rust_tunnel_client::control::run_client;
+use rust_tunnel_client::control::{run_client, run_client_with_status};
 use rust_tunnel_server::auth::AuthConfig;
 use rust_tunnel_server::reverse_proxy::{
     tcp_proxy::TcpProxy, Backend, BackendKind, BackendProtocol, BackendScheme, ReverseProxyState,
@@ -268,11 +268,9 @@ impl TestHarness {
         self.spawn_client_with_agent(client_name, true)
     }
 
-    fn spawn_client_with_agent(
-        &mut self,
-        client_name: Option<&str>,
-        enable_agent: bool,
-    ) -> tokio::task::AbortHandle {
+    /// 构造连回本 harness 的客户端配置（`spawn_client_with_agent` /
+    /// `spawn_remote_client` 共用）。
+    fn client_config_for(&self, client_name: Option<&str>, enable_agent: bool) -> ClientConfig {
         let name = client_name
             .map(|s| s.to_string())
             .unwrap_or_else(|| "test-client".to_string());
@@ -280,7 +278,7 @@ impl TestHarness {
             .client_password
             .clone()
             .unwrap_or_else(|| "test-password".to_string());
-        let client_config = ClientConfig {
+        ClientConfig {
             server: self.control_addr.to_string(),
             name: Some(name),
             password,
@@ -293,10 +291,39 @@ impl TestHarness {
             enable_agent,
             agent_pty_port: rust_tunnel_client::pty::DEFAULT_PTY_PORT,
             log: "warn".to_string(),
-        };
+        }
+    }
+
+    fn spawn_client_with_agent(
+        &mut self,
+        client_name: Option<&str>,
+        enable_agent: bool,
+    ) -> tokio::task::AbortHandle {
+        let client_config = self.client_config_for(client_name, enable_agent);
 
         let handle = tokio::spawn(async move {
             let _ = run_client(client_config).await;
+        });
+        let abort = handle.abort_handle();
+        self.client_tasks.push(handle);
+        abort
+    }
+
+    /// Spawn a client with a remote-control bridge injected, so the server's
+    /// remote-control control plane (`RemoteCapability` / `RemotePeerList` /
+    /// `RemoteConnect*`) reaches the bridge over the real control channel.
+    ///
+    /// Unlike `spawn_client`, this calls `run_client_with_status` with the
+    /// `remote_bridge` argument (the 1-arg `run_client` path never injects one).
+    pub fn spawn_remote_client(
+        &mut self,
+        client_name: Option<&str>,
+        bridge: std::sync::Arc<dyn rust_tunnel_common::RemoteBridge>,
+    ) -> tokio::task::AbortHandle {
+        let client_config = self.client_config_for(client_name, false);
+
+        let handle = tokio::spawn(async move {
+            let _ = run_client_with_status(client_config, None, None, Some(bridge)).await;
         });
         let abort = handle.abort_handle();
         self.client_tasks.push(handle);
