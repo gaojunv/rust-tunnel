@@ -28,6 +28,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
@@ -37,7 +38,37 @@ pub const SESSION_PROTO_VERSION: u16 = 1;
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
 
 /// 心跳间隔。**必须小于 hbbr 的 30s idle_timeout**（由单测断言）。
+///
+/// # 为什么延迟读数最快也要 10s 一次
+///
+/// 会话循环用这条心跳的**往返**（`Heartbeat` → `HeartbeatAck`）测延迟，因此最快每
+/// [`HEARTBEAT_INTERVAL`] 才有一个样本。更快的探测需要新增数据面变体（`SessionMessage`
+/// 的硬相等版本校验会让混合版本的一端 bincode 解码失败而直接断链），代价远大于收益，故有意不加快。
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 由「发出时刻」与「收到应答时刻」算一次可信的 RTT 样本。
+///
+/// 丢弃 `>= HEARTBEAT_INTERVAL` 的样本：心跳是**零载荷**的固定往返，正常 RTT 必然远小于间隔；
+/// 一旦读数达到间隔量级，只可能是把一个迟到的 `HeartbeatAck` 与另一次（或已作废的）`Heartbeat`
+/// 配了对，或对端/链路卡了整整一个周期——两者都不可信，报给 UI 只会误导。抽成纯函数以便单测。
+#[must_use]
+pub fn trusted_rtt(sent: Instant, now: Instant) -> Option<Duration> {
+    let rtt = now.saturating_duration_since(sent);
+    (rtt < HEARTBEAT_INTERVAL).then_some(rtt)
+}
+
+/// 一次会话的结束信息：会话循环的返回值，也是管理器判定的唯一依据。
+///
+/// 放在本模块（而非 `manager`）是因为 `controller` / `controlled` 两个循环都要**返回**它；
+/// 若定义在 `manager` 就成了「循环依赖管理器、管理器依赖循环」的互相引用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEnd {
+    /// 面向用户的中文原因描述。
+    pub reason: String,
+    /// 是否**主动**结束（本端用户中断，或收到对端 `Bye`）。
+    /// `false` 表示连接是断的/失败的——这是断线自动重连的唯一判据。
+    pub deliberate: bool,
+}
 
 /// 长度前缀字节数。
 const LENGTH_PREFIX: usize = 4;
@@ -484,6 +515,24 @@ mod tests {
             HEARTBEAT_INTERVAL < Duration::from_secs(30),
             "心跳间隔必须严格小于中继空闲超时，否则静止会话会被断开"
         );
+    }
+
+    #[test]
+    fn trusted_rtt_keeps_fast_samples_and_drops_slow_ones() {
+        let base = Instant::now();
+        // 正常往返：远小于间隔，应采信。
+        assert_eq!(
+            trusted_rtt(base, base + Duration::from_millis(5)),
+            Some(Duration::from_millis(5))
+        );
+        // 恰好等于间隔、以及超过间隔：样本不可信，丢弃（只可能是丢包/错配）。
+        assert_eq!(trusted_rtt(base, base + HEARTBEAT_INTERVAL), None);
+        assert_eq!(
+            trusted_rtt(base, base + HEARTBEAT_INTERVAL + Duration::from_millis(1)),
+            None
+        );
+        // 时钟回拨/负差不应 panic，按 0 处理（仍是可信样本）。
+        assert_eq!(trusted_rtt(base, base), Some(Duration::ZERO));
     }
 
     #[test]

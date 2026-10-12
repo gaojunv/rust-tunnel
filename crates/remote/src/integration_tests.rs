@@ -14,8 +14,9 @@ use crate::screen::{
     Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton,
     RawFrame, ScreenSource, TileUpdate,
 };
-use crate::session::{plan_controller_handshake, SessionCodec, SessionMessage};
-use crate::transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
+use crate::session::{plan_controller_handshake, SessionCodec, SessionEnd, SessionMessage};
+use crate::stats::SessionStatsReporter;
+use crate::transport::{BoxDuplex, EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
 use async_trait::async_trait;
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
 use rust_tunnel_common::remote_bridge::RemoteBridge as _;
@@ -216,6 +217,8 @@ struct OneShotEstablisher {
     /// 是否模拟「建立阶段已流水线写出 Hello」。
     write_early: bool,
     calls: AtomicUsize,
+    /// 上报给管理器的路径（内存替身默认取保守值 [`TransportPath::Relay`]）。
+    path: TransportPath,
 }
 
 impl OneShotEstablisher {
@@ -224,13 +227,22 @@ impl OneShotEstablisher {
             slot: Mutex::new(Some(duplex)),
             write_early,
             calls: AtomicUsize::new(0),
+            path: TransportPath::Relay,
+        }
+    }
+
+    /// 同 [`Self::new`]，但指定上报的路径（用于断言路径透传到 UI 状态）。
+    fn with_path(duplex: BoxDuplex, write_early: bool, path: TransportPath) -> Self {
+        Self {
+            path,
+            ..Self::new(duplex, write_early)
         }
     }
 }
 
 #[async_trait]
 impl TransportEstablisher for OneShotEstablisher {
-    async fn establish(&self, request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+    async fn establish(&self, request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let mut duplex = self
             .slot
@@ -242,7 +254,10 @@ impl TransportEstablisher for OneShotEstablisher {
             duplex.write_all(&request.early).await?;
             duplex.flush().await?;
         }
-        Ok(duplex)
+        Ok(EstablishedStream {
+            stream: duplex,
+            path: self.path,
+        })
     }
 }
 
@@ -251,7 +266,7 @@ struct FailingEstablisher;
 
 #[async_trait]
 impl TransportEstablisher for FailingEstablisher {
-    async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+    async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
         Err(RemoteError::Signaling("测试失败".to_owned()))
     }
 }
@@ -566,6 +581,44 @@ async fn full_session_between_two_managers() {
     assert!(ctrl.snapshot().active.is_none(), "控制器 active 应清空");
 }
 
+/// 建立器上报的路径必须透传到 UI 状态：替身返回 `Direct` 时 `RemoteUiState.transport`
+/// 就应是 `Some(Direct)`。UI 靠这个字段告诉用户「现在是直连还是中继」，透传错了会误导。
+#[tokio::test]
+async fn controller_records_transport_path() {
+    let (a, b) = tokio::io::duplex(128 * 1024);
+    let ctrl_est = Arc::new(OneShotEstablisher::with_path(
+        Box::new(a),
+        true,
+        TransportPath::Direct,
+    ));
+    let ctld_est = Arc::new(OneShotEstablisher::new(Box::new(b), false));
+    let ctrl = manager(ctrl_est, false, "home-nas");
+    let ctld = manager(ctld_est, true, "office-pc");
+
+    let (ctrl_sink, _frame_rx) = RecordingSink::with_notify();
+    ctrl.install_frame_sink(ctrl_sink);
+    ctld.install_platform(Arc::new(FakeScreen), Arc::new(RecordingInput::default()));
+
+    establish_session_with_mode(&ctrl, &ctld, RemoteMode::Control, RemoteMode::Control).await;
+
+    // 建立是异步的：轮询到路径写入（或超时）。
+    let mut got = None;
+    for _ in 0..200 {
+        if let Some(path) = ctrl.snapshot().transport {
+            got = Some(path);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        got,
+        Some(TransportPath::Direct),
+        "建立器上报的路径应透传到 UI 状态"
+    );
+
+    ctrl.abort_active();
+}
+
 #[tokio::test]
 async fn wrong_token_is_rejected_by_controlled() {
     let (a, b) = tokio::io::duplex(64 * 1024);
@@ -592,12 +645,14 @@ async fn wrong_token_is_rejected_by_controlled() {
         pending,
         encode: EncodeOptions::default(),
         capture_watchdog: CAPTURE_WATCHDOG,
+        stats: SessionStatsReporter::noop(),
     };
     let ctrl_cfg = ControllerConfig {
         session_id: "sess-1".to_owned(),
         token: "tok-1".to_owned(),
         local_rd_id: "111111111".to_owned(),
         mode: RemoteMode::Control,
+        stats: SessionStatsReporter::noop(),
     };
 
     let (_input_tx, input_rx) = mpsc::channel(4);
@@ -663,6 +718,7 @@ async fn correct_token_completes_handshake_and_streams() {
             pending,
             encode: EncodeOptions::default(),
             capture_watchdog: CAPTURE_WATCHDOG,
+            stats: SessionStatsReporter::noop(),
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),
@@ -678,6 +734,7 @@ async fn correct_token_completes_handshake_and_streams() {
             token: "TOK".to_owned(),
             local_rd_id: "111111111".to_owned(),
             mode: RemoteMode::ViewOnly,
+            stats: SessionStatsReporter::noop(),
         },
         plan,
         input_rx,
@@ -791,6 +848,7 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
             token: token.to_owned(),
             local_rd_id: "111111111".to_owned(),
             mode: RemoteMode::Control,
+            stats: SessionStatsReporter::noop(),
         },
         plan,
         input_rx,
@@ -1290,7 +1348,7 @@ impl CountingEstablisher {
 
 #[async_trait]
 impl TransportEstablisher for CountingEstablisher {
-    async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+    async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         // 被控端只**接受**会话才会走到这里；拒绝/超时路径调用它即为回归。
         Err(RemoteError::Signaling("本用例不应建立数据面".to_owned()))
@@ -1310,7 +1368,7 @@ async fn handshake_against_unregistered_token(
     pending: Arc<PendingSessions>,
     session_id: &str,
     token: &str,
-) -> (RemoteResult<()>, SessionMessage) {
+) -> (RemoteResult<SessionEnd>, SessionMessage) {
     use futures_util::StreamExt as _;
     use tokio_util::codec::FramedRead;
 
@@ -1333,6 +1391,7 @@ async fn handshake_against_unregistered_token(
             pending,
             encode: EncodeOptions::default(),
             capture_watchdog: CAPTURE_WATCHDOG,
+            stats: SessionStatsReporter::noop(),
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),

@@ -53,6 +53,7 @@ pub mod manager;
 pub mod screen;
 pub mod session;
 pub mod signaling;
+pub mod stats;
 pub mod tiles;
 pub mod transfer;
 pub mod transport;
@@ -64,17 +65,20 @@ pub use approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_W
 pub use error::{RemoteError, RemoteResult};
 pub use file::{FileService, TransferMeta};
 pub use controller::ControllerCommand;
-pub use manager::{ActiveSessionInfo, RemoteManager, RemoteManagerConfig, RemoteUiState, SessionRole, SessionState};
+pub use manager::{
+    ActiveSessionInfo, RemoteManager, RemoteManagerConfig, RemoteUiState, SessionRole, SessionState,
+};
 pub use screen::{
     Clipboard, DecodedFrame, DecodedTile, DisplayInfo, EncodeOptions, EncodedFrame, FileEntry, FrameSink, InputEvent,
     InputSink, KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource, TILE_SIZE, TilePatch, TileUpdate,
 };
 pub use session::{
-    ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionFrame,
+    ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd, SessionFrame,
     SessionMessage, plan_controller_handshake,
 };
+pub use stats::{SessionStats, SessionStatsReporter};
 pub use tiles::{TileDiffer, TileEncodeResult};
 pub use transfer::{
     TransferCommand, TransferDirection, TransferEvent, TransferHub, TransferProgress, CHUNK_PAUSE, CHUNK_SIZE,
 };
-pub use transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
+pub use transport::{BoxDuplex, EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};

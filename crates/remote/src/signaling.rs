@@ -26,7 +26,7 @@
 //! 必需的。接入非本项目客户端或引入基于公钥的信任时需要补上（`rustdesk::key::ServerKey::verify_id_pk`）。
 
 use crate::error::{RemoteError, RemoteResult};
-use crate::transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
+use crate::transport::{EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use rust_tunnel_common::protocol::RemoteParams;
@@ -384,7 +384,7 @@ impl RustDeskTransport {
 
 #[async_trait]
 impl TransportEstablisher for RustDeskTransport {
-    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<BoxDuplex> {
+    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream> {
         match role {
             Role::Controller => {
                 if request.prefer_direct && !self.cfg.always_use_relay {
@@ -394,12 +394,18 @@ impl TransportEstablisher for RustDeskTransport {
                             stream.write_all(&request.early).await?;
                             stream.flush().await?;
                         }
-                        return Ok(Box::new(stream));
+                        return Ok(EstablishedStream {
+                            stream: Box::new(stream),
+                            path: TransportPath::Direct,
+                        });
                     }
                 }
                 self.notify_relay(&request.peer_rd_id, &request.session_id).await?;
                 let stream = self.connect_relay(&request.session_id, &request.early).await?;
-                Ok(Box::new(stream))
+                Ok(EstablishedStream {
+                    stream: Box::new(stream),
+                    path: TransportPath::Relay,
+                })
             }
             Role::Controlled => {
                 // 竞争直连接入与中继推送：谁先到用谁。
@@ -407,12 +413,18 @@ impl TransportEstablisher for RustDeskTransport {
                     direct = self.next_direct() => {
                         let stream = direct?;
                         let _ = stream.set_nodelay(true);
-                        Ok(Box::new(stream))
+                        Ok(EstablishedStream {
+                            stream: Box::new(stream),
+                            path: TransportPath::Direct,
+                        })
                     }
                     pushed = self.wait_relay_push(&request.session_id, RELAY_WAIT) => {
                         pushed?;
                         let stream = self.connect_relay(&request.session_id, &[]).await?;
-                        Ok(Box::new(stream))
+                        Ok(EstablishedStream {
+                            stream: Box::new(stream),
+                            path: TransportPath::Relay,
+                        })
                     }
                 }
             }
@@ -600,7 +612,7 @@ impl TransportEstablisher for LazyTransport {
         Ok(())
     }
 
-    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<BoxDuplex> {
+    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream> {
         let transport = self.transport_for(&request.params, &request.local_rd_id).await?;
         transport.establish(request, role).await
     }

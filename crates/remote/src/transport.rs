@@ -11,6 +11,8 @@
 //!   在 `RequestRelay` **之后、同一次 write** 里一并写出（流水线，省一个 RTT）；被控端
 //!   `early` 为空。因此会话循环**不再**发送 `Hello`，只等 `HelloAck`。
 //! - 握手必须容忍「刚连上就收到对端 `Hello`」（后到者场景），不得假设严格的先发后收顺序。
+//! - 建立方**必须如实报告实际走的路径**（[`EstablishedStream::path`]）：直连与中继的延迟
+//!   差一个数量级，UI 需要据实展示；「回退中继」尤其不能谎报成直连。
 
 use crate::error::RemoteResult;
 use async_trait::async_trait;
@@ -23,6 +25,35 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
 /// 装箱后的双向字节流。
 pub type BoxDuplex = Box<dyn Duplex>;
+
+/// 数据面实际走的路径。
+///
+/// 直连（同内网 P2P）与中继（hbbr 转发）的往返延迟通常差一个数量级，UI 要据实展示；是否走了
+/// 直连也是用户判断「为什么慢」的关键线索，因此建立方必须如实回报，**不得**把回退中继谎报成直连。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPath {
+    /// 同内网 P2P 直连（[`crate::signaling::RustDeskTransport`] 的 `try_direct` 成功）。
+    Direct,
+    /// hbbr 中继（跨 NAT 或直连不可用时的主路径）。
+    Relay,
+}
+
+/// 建立完成的一条数据面流：裸字节流 + **实际**走的路径。
+pub struct EstablishedStream {
+    /// 双向字节流，交给会话循环跑 [`crate::session`] 协议。
+    pub stream: BoxDuplex,
+    /// 该流实际走的路径（供 UI 展示「直连 / 中继」）。
+    pub path: TransportPath,
+}
+
+impl std::fmt::Debug for EstablishedStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `BoxDuplex` 不是 `Debug`，只打印路径即可（流本身没有可读信息）。
+        f.debug_struct("EstablishedStream")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
 
 /// 本端在会话中的角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +116,9 @@ pub trait TransportEstablisher: Send + Sync + 'static {
     /// 建立一条双向字节流。
     ///
     /// 实现必须遵守模块级「建立契约」：中继路径只发一帧 `RequestRelay` 后转裸字节、不等应答，
-    /// 并把 `req.early` 与之合并写出。
+    /// 并把 `req.early` 与之合并写出；返回的 [`EstablishedStream::path`] 必须如实反映实际路径。
     ///
     /// # Errors
     /// 信令失败、连接超时、参数缺失时返回 [`crate::error::RemoteError`]。
-    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<BoxDuplex>;
+    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream>;
 }

@@ -8,7 +8,11 @@ use crate::auth::{ack_mac, PendingSessions};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::screen::{Clipboard, EncodeOptions, InputSink, RawFrame, ScreenSource};
-use crate::session::{SessionCodec, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL, SESSION_PROTO_VERSION};
+use crate::session::{
+    trusted_rtt, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
+    HEARTBEAT_INTERVAL, SESSION_PROTO_VERSION,
+};
+use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::tiles::TileDiffer;
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
@@ -66,12 +70,15 @@ pub struct ControlledConfig {
     /// 做成字段而非直接读常量，是为了让测试用极短的值验证「采集 panic/挂死之后仍能恢复」，
     /// 生产路径统一传 [`CAPTURE_WATCHDOG`]。
     pub capture_watchdog: Duration,
+    /// 统计数据上报句柄（延迟读数）；无管理端时用 [`SessionStatsReporter::noop`]。
+    pub stats: SessionStatsReporter,
 }
 
 /// 跑一次被控端会话，直到取消、对端关闭或出错。
 ///
 /// # Errors
-/// 握手被拒（版本不符、鉴权失败）、编解码/IO 失败时返回 [`RemoteError`]；正常结束返回 `Ok(())`。
+/// 握手被拒（版本不符、鉴权失败）、编解码/IO 失败时返回 [`RemoteError`]；正常结束返回
+/// `Ok(`[`SessionEnd`]`)`，由调用方据此判定是否需要自动重连。
 #[expect(
     clippy::too_many_lines,
     reason = "握手 + 采集 + 注入 + 心跳的单会话循环，拆开反而丢失控制流全貌"
@@ -84,7 +91,7 @@ pub async fn run_controlled(
     clipboard: Option<Arc<dyn Clipboard>>,
     mut transfer: TransferHub,
     cancel: CancellationToken,
-) -> RemoteResult<()> {
+) -> RemoteResult<SessionEnd> {
     let (read_half, write_half) = tokio::io::split(duplex);
     let mut reader = FramedRead::new(read_half, SessionCodec::new());
     let mut writer = FramedWrite::new(write_half, SessionCodec::new());
@@ -173,7 +180,9 @@ pub async fn run_controlled(
         .map_or(0, |d| d.id);
 
     // 3) 主循环。
-    let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+    // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**，会话一建立就发
+    // 一次心跳，被控端横幅开屏即有延迟读数（与控制器侧同款手法，见 `controller.rs`）。
+    let mut heartbeat = interval_at(Instant::now(), HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // 出站文件块：只在有在途传输时启用。
     let mut file_tick = interval_at(Instant::now(), CHUNK_PAUSE);
@@ -202,14 +211,19 @@ pub async fn run_controlled(
     // 首帧（或切显示器/切档位之后）必须先发整帧：差分器没有基准就没有变化可言。
     let mut force_keyframe = true;
     let mut seq: u64 = 0;
+    // RTT 样本：发 `Heartbeat` 时记时刻，收到 `HeartbeatAck` 时配对算 RTT。**复用既有心跳往返**，
+    // 不新增数据面变体（见 `HEARTBEAT_INTERVAL`）。
+    let mut pending_heartbeat: Option<Instant> = None;
     let mut reason = String::from("会话结束");
-    let result = loop {
+    let result: RemoteResult<SessionEnd> = loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 "用户中断".clone_into(&mut reason);
-                break Ok(());
+                break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
             }
             _ = heartbeat.tick() => {
+                // 覆盖旧样本：上一个 ack 迟迟不来时，下一次心跳的往返才是与当前时刻相关的读数。
+                pending_heartbeat = Some(Instant::now());
                 if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
                     break Err(err);
                 }
@@ -390,10 +404,16 @@ pub async fn run_controlled(
                                 break Err(err);
                             }
                         }
-                        SessionMessage::HeartbeatAck => {}
+                        SessionMessage::HeartbeatAck => {
+                            if let Some(sent) = pending_heartbeat.take() {
+                                if let Some(rtt) = trusted_rtt(sent, Instant::now()) {
+                                    config.stats.report(SessionStats::Rtt(rtt));
+                                }
+                            }
+                        }
                         SessionMessage::Bye { reason: r } => {
                             reason = r;
-                            break Ok(());
+                            break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
                         }
                         file @ (SessionMessage::FileList { .. }
                         | SessionMessage::FileListRequest { .. }
@@ -427,7 +447,10 @@ pub async fn run_controlled(
                         other => debug!(?other, "被控端收到未处理的消息"),
                     },
                     Some(Err(err)) => break Err(RemoteError::Codec(err.to_string())),
-                    None => break Ok(()),
+                    None => {
+                        "对端已关闭连接".clone_into(&mut reason);
+                        break Ok(SessionEnd { reason: reason.clone(), deliberate: false });
+                    }
                 }
             }
         }
@@ -438,7 +461,10 @@ pub async fn run_controlled(
     let result = match result {
         Err(RemoteError::Cancelled) => {
             "用户中断".clone_into(&mut reason);
-            Ok(())
+            Ok(SessionEnd {
+                reason: reason.clone(),
+                deliberate: true,
+            })
         }
         other => other,
     };
@@ -900,6 +926,7 @@ mod tests {
             pending,
             encode: EncodeOptions::default(),
             capture_watchdog,
+            stats: SessionStatsReporter::noop(),
         }
     }
 

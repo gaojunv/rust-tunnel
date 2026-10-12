@@ -36,9 +36,10 @@ use crate::file::FileService;
 use crate::screen::{
     Clipboard, EncodeOptions, FileEntry, FrameSink, InputEvent, InputSink, NullFrameSink, QualityPreset, ScreenSource,
 };
-use crate::session::plan_controller_handshake;
+use crate::session::{plan_controller_handshake, SessionEnd};
+use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferCommand, TransferEvent, TransferHub, TransferProgress};
-use crate::transport::{BoxDuplex, EstablishRequest, Role, TransportEstablisher};
+use crate::transport::{EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams, RemotePeerInfo};
 use rust_tunnel_common::remote_bridge::RemoteBridge;
 use std::collections::VecDeque;
@@ -147,6 +148,31 @@ pub struct RemoteUiState {
     /// 没有别的标识可用。后果有二——服务端管理员把客户端改名后该条目即失效（新名字不在表里，
     /// 会重新弹窗）；且信任**只存内存**，进程退出即清空。这两点都是刻意的，不做持久化。
     pub trusted_peers: Vec<String>,
+    /// 最近实测延迟（毫秒，EMA 平滑）；无样本或会话已结束时为 `None`。
+    pub latency_ms: Option<u32>,
+    /// 本次会话的数据面路径（P2P 直连 / 中继）；会话未建立/已结束时为 `None`。
+    pub transport: Option<TransportPath>,
+    /// 最近一次**由会话循环观测到**的会话结束信息（session_id + 结束原因），供 UI 提示与断线
+    /// 自动重连判据。
+    ///
+    /// # 只在遇到「对端 `Bye`」或「数据面断了」时写入
+    ///
+    /// 本端**自己**收尾的路径（用户点中断/关窗走 [`RemoteManager::abort_active`]、服务端下发
+    /// `RemoteSessionEnd`、开关关闭等，即一切先经 `conclude_session` 的路径）**不会**写这里：那些
+    /// 路径先把 `active` 清空，随后会话循环返回的结果会因 `finish_session` 的「仍是当前会话」守卫
+    /// 而丢弃——这是**有意**的，不是漏写。
+    ///
+    /// 对重连判据而言这恰好是正确的极性：`deliberate == false` 只可能来自「对端 `Bye` 之外的
+    /// 失败」（EOF / 编解码错误），而本端主动结束本就不该触发自动重连（用户刚亲手挂断，再去重连
+    /// 只会打扰他）。反过来说，**不要**指望这里能给出「用户中断」这一条记录；那一路的信息由
+    /// `abort_active` 直接以 `ControlMessage::RemoteSessionEnd` 发给服务端，UI 只需知道「没有会话了」。
+    ///
+    /// # 读它的方式
+    ///
+    /// 这是个**事件**而非状态：消费方必须按 `session_id` 去重（同一场只处理一次），否则每帧都会
+    /// 重新判定，进而把重连计数清零、退避永不生效。且它不随新会话开始而清空，可能一直停在某场旧
+    /// 会话的记录上（新会话开始时会被置回 `None`，见两处 `s.session_end = None`）。
+    pub session_end: Option<(String, SessionEnd)>,
 }
 
 /// [`RemoteManager`] 的构造参数。
@@ -514,6 +540,14 @@ impl RemoteManager {
         self.send_command(ControllerCommand::ClipboardRequest);
     }
 
+    /// 立刻探测一次延迟（结果异步进 [`RemoteUiState::latency_ms`]，非阻塞）。
+    ///
+    /// 供 UI 的「测延迟」按钮与切到会话窗口时刷新读数用。会话循环**仅在当前无在途心跳样本时**
+    /// 才真的发一次心跳；周期读数仍由 10s 的心跳给出（见 [`crate::session::HEARTBEAT_INTERVAL`]）。
+    pub fn ping(&self) {
+        self.send_command(ControllerCommand::Ping);
+    }
+
     /// 列出被控端共享目录下的内容（结果进 [`RemoteUiState::remote_entries`]）。
     pub fn list_remote_dir(&self, path: &str) {
         self.update_ui(|s| {
@@ -739,7 +773,7 @@ impl RemoteManager {
         request: EstablishRequest,
         role: Role,
         cancel: &CancellationToken,
-    ) -> RemoteResult<BoxDuplex> {
+    ) -> RemoteResult<EstablishedStream> {
         let deadline = self.lock_inner().establish_timeout;
         let attempt = self.cfg.establisher.establish(request, role);
         tokio::select! {
@@ -852,11 +886,16 @@ impl RemoteManager {
         self.lock_inner().active.is_some()
     }
 
-    /// 把某会话标为 `Active`（若仍是当前会话）。
+    /// 把某会话标为 `Active`（若仍是当前会话），并记下数据面实际走的路径。
     ///
     /// 这是「数据面已建立」的唯一判定点：内部句柄的 `established` 与 UI 快照的
     /// [`SessionState::Active`] 一并置位。
-    fn mark_active(&self, session_id: &str) {
+    ///
+    /// 路径与 `Active` 同一次写入、同一个 `session_id` 守卫：`establish` 可能跑满
+    /// `establish_timeout`，期间会话完全可能已经被换掉（中断后自动重连就会），此时若无守卫地写
+    /// `transport`，会把**上一条**会话的路径留在 UI 上。两者绑在一起，「路径只在有会话时存在」
+    /// 就成了结构性的，而不是靠各处记得清零。
+    fn mark_active(&self, session_id: &str, path: TransportPath) {
         {
             let mut inner = self.lock_inner();
             if let Some(active) = inner.active.as_mut() {
@@ -869,13 +908,14 @@ impl RemoteManager {
             if let Some(active) = s.active.as_mut() {
                 if active.session_id == session_id {
                     active.state = SessionState::Active;
+                    s.transport = Some(path);
                 }
             }
         });
     }
 
     /// 会话收尾：仅当仍是当前会话时清理并通知对端。
-    fn finish_session(&self, session_id: &str, result: RemoteResult<()>) {
+    fn finish_session(&self, session_id: &str, result: RemoteResult<SessionEnd>) {
         let is_current = self
             .lock_inner()
             .active
@@ -886,16 +926,27 @@ impl RemoteManager {
         }
         self.take_active();
         self.lock_cmd().take();
-        let (reason, failed) = match result {
-            Ok(()) => ("会话结束".to_owned(), false),
-            Err(err) => (err.to_string(), true),
+        // `Err` 一律视为「连接是断的/失败的」（`deliberate: false`），这是断线自动重连的唯一判据；
+        // `Ok(SessionEnd)` 的 `deliberate` 由会话循环按结束原因给出。
+        let (reason, failed, deliberate) = match result {
+            Ok(end) => (end.reason, false, end.deliberate),
+            Err(err) => (err.to_string(), true, false),
         };
         self.send(ControlMessage::RemoteSessionEnd {
             session_id: session_id.to_owned(),
             reason: reason.clone(),
         });
+        let sid = session_id.to_owned();
+        let end = SessionEnd {
+            reason: reason.clone(),
+            deliberate,
+        };
         self.update_ui(move |s| {
             s.active = None;
+            // 会话结束：延迟与路径读数随即失效，清掉免得 UI 显示上一次会话的残留。
+            s.latency_ms = None;
+            s.transport = None;
+            s.session_end = Some((sid, end));
             if failed {
                 s.last_error = Some(reason);
             }
@@ -945,6 +996,9 @@ impl RemoteManager {
         self.lock_cmd().take();
         self.update_ui(move |s| {
             s.active = None;
+            // 会话已收尾：延迟与路径读数失效，清掉免得 UI 显示残留。
+            s.latency_ms = None;
+            s.transport = None;
             if let Some(err) = error {
                 s.last_error = Some(err);
             }
@@ -1073,6 +1127,10 @@ impl RemoteManager {
         self.update_ui(move |s| {
             s.active = Some(info);
             s.last_error = None;
+            // 新会话开始：清掉上一次会话的结束信息与遗留读数（路径由 establish 成功后写入）。
+            s.session_end = None;
+            s.latency_ms = None;
+            s.transport = None;
         });
 
         let grant = PendingGrant {
@@ -1141,7 +1199,7 @@ impl RemoteManager {
         mode: RemoteMode,
         cmd_rx: mpsc::Receiver<ControllerCommand>,
         cancel: CancellationToken,
-    ) -> RemoteResult<()> {
+    ) -> RemoteResult<SessionEnd> {
         let local_rd_id = self.local_rd_id();
         let handshake = plan_controller_handshake(&session_id, &token, &local_rd_id)?;
         let request = EstablishRequest {
@@ -1152,8 +1210,10 @@ impl RemoteManager {
             prefer_direct: true,
             early: handshake.hello_frame.clone(),
         };
-        let duplex = self.establish_guarded(request, Role::Controller, &cancel).await?;
-        self.mark_active(&session_id);
+        let established = self.establish_guarded(request, Role::Controller, &cancel).await?;
+        // 记录实际路径（直连 / 中继），供 UI 展示。
+        self.mark_active(&session_id, established.path);
+        let duplex = established.stream;
         // 落地目录可能还不存在（首次使用）；建不出来就让下载直接失败，别让它到 99% 才炸。
         if let Err(err) = tokio::fs::create_dir_all(&self.cfg.download_dir).await {
             warn!(error = %err, dir = %self.cfg.download_dir.display(), "创建下载目录失败");
@@ -1164,6 +1224,7 @@ impl RemoteManager {
             token,
             local_rd_id,
             mode,
+            stats: self.build_stats_reporter(cancel.clone()),
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
         let transfer = self.build_transfer_hub(None, self.cfg.download_dir.clone(), cancel.clone());
@@ -1194,6 +1255,20 @@ impl RemoteManager {
             });
         }
         hub
+    }
+
+    /// 造一个统计上报句柄，并把事件泵进 UI 状态。
+    ///
+    /// 与 [`Self::build_transfer_hub`] 同一套路：会话循环通过通道上报，泵任务（持弱指针，管理器
+    /// 释放即退出）把事件写进 [`RemoteUiState`]。`cancel` 随会话结束触发，泵随之退出，不留悬挂任务。
+    fn build_stats_reporter(self: &Arc<Self>, cancel: CancellationToken) -> SessionStatsReporter {
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(me) = self.self_weak.upgrade() {
+            tokio::spawn(async move {
+                pump_session_stats(me, rx, cancel).await;
+            });
+        }
+        SessionStatsReporter::new(tx)
     }
 
     /// 处理 `RemoteSessionIncoming`（被控端）。
@@ -1288,6 +1363,10 @@ impl RemoteManager {
         };
         self.update_ui(move |s| {
             s.active = Some(info);
+            // 新会话开始：清掉上一次会话的结束信息与遗留读数（路径由 establish 成功后写入）。
+            s.session_end = None;
+            s.latency_ms = None;
+            s.transport = None;
         });
 
         let Some(me) = self.self_weak.upgrade() else {
@@ -1310,7 +1389,7 @@ impl RemoteManager {
         screen: Arc<dyn ScreenSource>,
         input: Arc<dyn InputSink>,
         cancel: CancellationToken,
-    ) -> RemoteResult<()> {
+    ) -> RemoteResult<SessionEnd> {
         let pending = Arc::clone(&self.lock_inner().pending);
         let request = EstablishRequest {
             session_id: session_id.clone(),
@@ -1320,8 +1399,10 @@ impl RemoteManager {
             prefer_direct: true,
             early: Vec::new(),
         };
-        let duplex = self.establish_guarded(request, Role::Controlled, &cancel).await?;
-        self.mark_active(&session_id);
+        let established = self.establish_guarded(request, Role::Controlled, &cancel).await?;
+        // 记录实际路径（直连 / 中继），供 UI 展示。
+        self.mark_active(&session_id, established.path);
+        let duplex = established.stream;
         let config = ControlledConfig {
             session_id,
             local_rd_id: self.local_rd_id(),
@@ -1329,6 +1410,7 @@ impl RemoteManager {
             pending,
             encode: self.cfg.encode,
             capture_watchdog: CAPTURE_WATCHDOG,
+            stats: self.build_stats_reporter(cancel.clone()),
         };
         let clipboard = self
             .clipboard
@@ -1594,6 +1676,9 @@ impl RemoteBridge for RemoteManager {
             s.connected = false;
             s.active = None;
             s.pending_approval = None;
+            // 控制通道已断：延迟与路径读数不再可信，清掉。
+            s.latency_ms = None;
+            s.transport = None;
         });
     }
 }
@@ -1697,6 +1782,45 @@ fn apply_transfer_event(mgr: &RemoteManager, event: TransferEvent) {
     });
 }
 
+/// 把会话统计事件泵进 UI 状态，直到会话结束（reporter 被 drop，通道关闭）或管理器释放。
+async fn pump_session_stats(
+    mgr: Arc<RemoteManager>,
+    mut rx: mpsc::UnboundedReceiver<SessionStats>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let event = tokio::select! {
+            () = cancel.cancelled() => break,
+            event = rx.recv() => match event {
+                Some(event) => event,
+                // reporter 已随会话结束被 drop。
+                None => break,
+            },
+        };
+        apply_session_stats(&mgr, event);
+    }
+}
+
+/// 把一条统计事件写进 [`RemoteUiState`]。
+fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
+    match event {
+        SessionStats::Rtt(rtt) => {
+            // 毫秒足够 UI 展示；超长 RTT（> ~49 天）不可信，钳到 u32 上限即可，不 panic。
+            let sample = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
+            mgr.update_ui(|s| {
+                // EMA 平滑：`new = (old * 3 + sample) / 4`，无旧值时直接用样本。用 u64 中间量
+                // 避免 `old * 3` 溢出 u32；结果恒 <= 二者最大值，`try_from` 必成功。
+                s.latency_ms = Some(match s.latency_ms {
+                    Some(old) => {
+                        u32::try_from((u64::from(old) * 3 + u64::from(sample)) / 4).unwrap_or(u32::MAX)
+                    }
+                    None => sample,
+                });
+            });
+        }
+    }
+}
+
 /// 当前时间（毫秒，自 epoch）。
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1708,7 +1832,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::screen::{DecodedFrame, DisplayInfo};
-    use crate::transport::BoxDuplex;
+    use crate::transport::{EstablishedStream, TransportPath};
     use async_trait::async_trait;
 
     /// 一个永不成功的建立器（仅用于状态机单测，不触发真实会话）。
@@ -1716,7 +1840,7 @@ mod tests {
 
     #[async_trait]
     impl TransportEstablisher for NeverEstablisher {
-        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
             Err(RemoteError::Signaling("测试用建立器".to_owned()))
         }
     }
@@ -1745,7 +1869,7 @@ mod tests {
             Ok(())
         }
 
-        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
             Err(RemoteError::Signaling("测试用建立器".to_owned()))
         }
     }
@@ -2141,10 +2265,10 @@ mod tests {
 
     #[async_trait]
     impl TransportEstablisher for HangingEstablisher {
-        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<BoxDuplex> {
+        async fn establish(&self, _request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
             self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
             // 永不返回：只有取消或超时才能让这个 future 结束。
-            std::future::pending::<RemoteResult<BoxDuplex>>().await
+            std::future::pending::<RemoteResult<EstablishedStream>>().await
         }
     }
 
@@ -2459,5 +2583,63 @@ mod tests {
             mgr.lock_inner().early_accept.is_none(),
             "暂存应被消费掉，不留残留"
         );
+    }
+
+    /// `finish_session` 按输入定 `deliberate`：`Ok(deliberate:true)` → `true`（主动结束）；
+    /// `Ok(deliberate:false)` 与 `Err(_)` → `false`（连接是断的/失败的）。`false` 是断线自动
+    /// 重连的唯一判据，判错会让「用户主动挂断」被当成断线而自动重连回来。
+    #[tokio::test]
+    async fn finish_session_records_end_and_deliberate_flag() {
+        let cases = [
+            (
+                Ok(SessionEnd {
+                    reason: "用户中断".to_owned(),
+                    deliberate: true,
+                }),
+                true,
+            ),
+            (
+                Ok(SessionEnd {
+                    reason: "对端已关闭连接".to_owned(),
+                    deliberate: false,
+                }),
+                false,
+            ),
+            (Err(RemoteError::Signaling("boom".to_owned())), false),
+        ];
+        for (input, expected_deliberate) in cases {
+            let mgr = manager(true);
+            mgr.set_active(ActiveHandle {
+                session_id: "s1".to_owned(),
+                role: SessionRole::Controller,
+                cancel: CancellationToken::new(),
+                established: true,
+            });
+            mgr.update_ui(|s| {
+                s.active = Some(ActiveSessionInfo {
+                    session_id: "s1".to_owned(),
+                    role: SessionRole::Controller,
+                    peer_name: "peer".to_owned(),
+                    mode: RemoteMode::Control,
+                    state: SessionState::Active,
+                    started_at_ms: 0,
+                });
+                s.latency_ms = Some(42);
+                s.transport = Some(TransportPath::Relay);
+            });
+
+            mgr.finish_session("s1", input);
+
+            let snap = mgr.snapshot();
+            assert!(snap.active.is_none(), "会话应被清空");
+            assert_eq!(snap.latency_ms, None, "延迟读数应清零");
+            assert_eq!(snap.transport, None, "路径应清零");
+            let (sid, end) = snap.session_end.expect("应写入 session_end");
+            assert_eq!(sid, "s1");
+            assert_eq!(
+                end.deliberate, expected_deliberate,
+                "deliberate 判定错误：{end:?}"
+            );
+        }
     }
 }

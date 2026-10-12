@@ -8,7 +8,11 @@ use crate::auth::verify_ack_mac;
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
 use crate::screen::{decode_frame, FrameSink, InputEvent, QualityPreset};
-use crate::session::{ControllerHandshake, SessionCodec, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL};
+use crate::session::{
+    trusted_rtt, ControllerHandshake, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
+    HEARTBEAT_INTERVAL,
+};
+use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::tiles::decode_tiles;
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
@@ -46,6 +50,11 @@ pub enum ControllerCommand {
     ClipboardRequest,
     /// 文件传输操作。
     File(TransferCommand),
+    /// 立即探测一次延迟（**纯进程内命令，不上线**）。
+    ///
+    /// **仅当当前无在途心跳样本时**才真正发一次 `Heartbeat`：否则会覆盖既有样本，让那次往返
+    /// 的读数作废。用户切到会话窗口时 UI 可据此立刻刷一个读数，不必等下一个 [`HEARTBEAT_INTERVAL`]。
+    Ping,
 }
 
 /// 控制器会话配置。
@@ -60,6 +69,8 @@ pub struct ControllerConfig {
     pub local_rd_id: String,
     /// 会话模式。
     pub mode: RemoteMode,
+    /// 统计数据上报句柄（延迟读数）；无管理端时用 [`SessionStatsReporter::noop`]。
+    pub stats: SessionStatsReporter,
 }
 
 /// 跑一次控制器会话，直到取消、对端关闭或出错。
@@ -69,7 +80,7 @@ pub struct ControllerConfig {
 ///
 /// # Errors
 /// 握手被拒、编解码失败、IO 失败时返回 [`RemoteError`]；正常结束（收到 `Bye` / 对端关闭 /
-/// 取消）返回 `Ok(())`。
+/// 取消）返回 `Ok(`[`SessionEnd`]`)`，由调用方据此判定是否需要自动重连。
 #[expect(
     clippy::too_many_lines,
     reason = "握手校验 + 画面/输入/剪贴板/文件/心跳的单会话循环，拆开反而丢失控制流全貌"
@@ -82,7 +93,7 @@ pub async fn run_controller(
     mut transfer: TransferHub,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
-) -> RemoteResult<()> {
+) -> RemoteResult<SessionEnd> {
     let (read_half, write_half) = tokio::io::split(duplex);
     let mut reader = FramedRead::new(read_half, SessionCodec::new());
     let mut writer = FramedWrite::new(write_half, SessionCodec::new());
@@ -145,19 +156,36 @@ pub async fn run_controller(
     sink.on_displays(displays);
 
     // 3) 主循环。
-    let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+    // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**（起点已过去），
+    // 会话一建立就发一次心跳，用户开窗即有读数，不必空等一个 [`HEARTBEAT_INTERVAL`]。
+    let mut heartbeat = interval_at(Instant::now(), HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // 出站文件块：只在有在途传输时启用（`has_outgoing` 为假时该分支不被轮询，不产生空转）。
     let mut file_tick = interval_at(Instant::now(), CHUNK_PAUSE);
     file_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // RTT 样本：发 `Heartbeat` 时记时刻，收到 `HeartbeatAck` 时配对算 RTT。**复用既有心跳往返**，
+    // 不新增数据面变体（新增 `SessionMessage` 变体会让混合版本的一端直接断链，见 `HEARTBEAT_INTERVAL`）。
+    // 首个样本由上面那个「立即到期的 tick」给出，故这里先置空。
+    let mut pending_heartbeat: Option<Instant> = None;
     let mut reason = String::from("会话结束");
-    let result = loop {
+
+    let result: RemoteResult<SessionEnd> = loop {
         tokio::select! {
+            // 取消优先（`biased`）：收尾时 `cancel.cancel()` 与 `lock_cmd().take()` 是背靠背的两条
+            // 语句，本循环下一次轮询时两个分支**同时就绪**，而默认的随机轮询会任选其一——于是同一次
+            // 「用户主动挂断」有一半概率走下面 `recv() == None` 那条，被记成 `deliberate: false`。
+            // 那个 `false` 正是断线自动重连的唯一判据，本端会去重连用户刚刚亲手结束的会话；发给对端的
+            // `Bye.reason` 也会变成「会话命令通道已关闭」。`biased` 让取消分支恒定胜出，判定不再随机
+            // （与 `send_cancellable` 同一手法，见 `crates/remote/src/signaling.rs` 的取消优先）。
+            // 命令通道**单独**关闭（未取消）仍走原分支：那是上层异常丢弃，不是用户中断。
+            biased;
             () = cancel.cancelled() => {
                 "用户中断".clone_into(&mut reason);
-                break Ok(());
+                break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
             }
             _ = heartbeat.tick() => {
+                // 覆盖旧样本：上一个 ack 迟迟不来时，下一次心跳的往返才是与当前时刻相关的读数。
+                pending_heartbeat = Some(Instant::now());
                 if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
                     break Err(err);
                 }
@@ -167,7 +195,7 @@ pub async fn run_controller(
                 // `mpsc::Receiver::recv()` 每次都立刻返回 `Ready(None)`，继续轮询会 100% 空转。
                 let Some(cmd) = maybe_cmd else {
                     "会话命令通道已关闭".clone_into(&mut reason);
-                    break Ok(());
+                    break Ok(SessionEnd { reason: reason.clone(), deliberate: false });
                 };
                 match cmd {
                     ControllerCommand::Input(event) => {
@@ -212,6 +240,15 @@ pub async fn run_controller(
                         Ok(None) => {}
                         Err(err) => warn!(error = %err, "文件操作发起失败"),
                     },
+                    ControllerCommand::Ping => {
+                        // 已有在途样本时不打扰：否则会覆盖它、让那次往返的读数作废。
+                        if pending_heartbeat.is_none() {
+                            pending_heartbeat = Some(Instant::now());
+                            if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
+                                break Err(err);
+                            }
+                        }
+                    }
                 }
             }
             _ = file_tick.tick(), if transfer.has_outgoing() => {
@@ -258,10 +295,16 @@ pub async fn run_controller(
                                 break Err(err);
                             }
                         }
-                        SessionMessage::HeartbeatAck => {}
+                        SessionMessage::HeartbeatAck => {
+                            if let Some(sent) = pending_heartbeat.take() {
+                                if let Some(rtt) = trusted_rtt(sent, Instant::now()) {
+                                    config.stats.report(SessionStats::Rtt(rtt));
+                                }
+                            }
+                        }
                         SessionMessage::Bye { reason: r } => {
                             reason = r;
-                            break Ok(());
+                            break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
                         }
                         file @ (SessionMessage::FileList { .. }
                         | SessionMessage::FileListRequest { .. }
@@ -296,7 +339,10 @@ pub async fn run_controller(
                         other => debug!(?other, "控制器收到未处理的消息"),
                     },
                     Some(Err(err)) => break Err(RemoteError::Codec(err.to_string())),
-                    None => break Ok(()),
+                    None => {
+                        "对端已关闭连接".clone_into(&mut reason);
+                        break Ok(SessionEnd { reason: reason.clone(), deliberate: false });
+                    }
                 }
             }
         }
@@ -307,7 +353,10 @@ pub async fn run_controller(
     let result = match result {
         Err(RemoteError::Cancelled) => {
             "用户中断".clone_into(&mut reason);
-            Ok(())
+            Ok(SessionEnd {
+                reason: reason.clone(),
+                deliberate: true,
+            })
         }
         other => other,
     };
@@ -378,12 +427,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{ReadHalf, WriteHalf};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
     use tokio_util::codec::{FramedRead, FramedWrite};
     use tokio_util::sync::CancellationToken;
 
     /// 单条等待上限，避免测试挂死。
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// 取消 / 命令通道关闭**同时**就绪这一竞态的重复轮数（见用例 5）。
+    const RACE_ROUNDS: usize = 16;
 
     type PeerRead = FramedRead<ReadHalf<BoxDuplex>, SessionCodec>;
     type PeerWrite = FramedWrite<WriteHalf<BoxDuplex>, SessionCodec>;
@@ -469,6 +521,7 @@ mod tests {
             token: token.to_owned(),
             local_rd_id: "111111111".to_owned(),
             mode: RemoteMode::Control,
+            stats: SessionStatsReporter::noop(),
         }
     }
 
@@ -478,7 +531,7 @@ mod tests {
         cmd_rx: mpsc::Receiver<ControllerCommand>,
         sink: Arc<dyn FrameSink>,
         cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<RemoteResult<()>> {
+    ) -> tokio::task::JoinHandle<RemoteResult<SessionEnd>> {
         tokio::spawn(run_controller(
             stream,
             config("sess-1", "TOK"),
@@ -591,5 +644,117 @@ mod tests {
             Some("会话命令通道已关闭"),
             "收尾原因应指明命令通道关闭"
         );
+    }
+
+    /// 4. 会话一建立就发一次心跳，往返被算成延迟样本上报。
+    ///
+    /// UI 的「开窗即有读数」全靠这一点：心跳 interval 的起点写成 `now + HEARTBEAT_INTERVAL` 时，
+    /// 首个样本要等满一个周期（10s）才出现，用户开窗看到的是空白。所以这里用 **1s** 的上限锁住
+    /// 「立即」——远小于 [`HEARTBEAT_INTERVAL`]，写成延迟起点必然超时。
+    #[tokio::test]
+    async fn session_start_reports_rtt_immediately() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (mut peer_reader, mut peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+
+        // 被控端：把收到的 `Heartbeat` 回一个 `HeartbeatAck`（其余帧不管）。
+        let peer = tokio::spawn(async move {
+            while let Some(Ok(frame)) = peer_reader.next().await {
+                if matches!(frame.message, SessionMessage::Heartbeat)
+                    && peer_writer
+                        .send(SessionFrame::control(SessionMessage::HeartbeatAck))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let sink = Arc::new(FakeSink::default());
+        let (_cmd_tx, cmd_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let (stats_tx, mut stats_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_controller(
+            Box::new(a),
+            ControllerConfig {
+                stats: SessionStatsReporter::new(stats_tx),
+                ..config("sess-1", "TOK")
+            },
+            plan,
+            cmd_rx,
+            transfer_hub().0,
+            sink,
+            cancel.clone(),
+        ));
+
+        let sample = tokio::time::timeout(Duration::from_secs(1), stats_rx.recv())
+            .await
+            .expect("会话建立后 1s 内就该有延迟样本（首个 tick 立即到期）")
+            .expect("统计通道不该被关闭");
+        match sample {
+            SessionStats::Rtt(rtt) => assert!(rtt < Duration::from_secs(1), "内存管道 RTT 不该是 {rtt:?}"),
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, task).await;
+        peer.abort();
+    }
+
+    /// 5. 取消与命令发送端**同时**失效时，必须判定为「用户中断」，而不是「命令通道已关闭」。
+    ///
+    /// 这正是 `abort_active` 的真实时序：`conclude_session` 背靠背地 fire 取消、drop `cmd_tx`，
+    /// 本循环下一次轮询时两个分支同时就绪。没有 `biased` 时随机轮询会有一半概率走
+    /// `recv() == None` 分支，把一次「用户主动挂断」记成 `deliberate: false`——本端随即会去
+    /// **自动重连用户刚刚亲手结束的会话**，发给对端的 `Bye.reason` 也跟着变成错的。
+    ///
+    /// 两个信号在测试任务里同步 fire（中间不让出执行权），故任务被轮询时二者必然同时就绪；
+    /// 单轮的「漏判」概率约 1/2，重复 [`RACE_ROUNDS`] 次把漏网概率压到可忽略——真按随机轮询
+    /// 跑的实现在这里必然失败。等待首个心跳（起点取 `now`，首个 tick 立即到期）作为「已进入
+    /// 主循环」的确定信号，比 sleep 一个猜出来的时长可靠。
+    #[tokio::test]
+    async fn cancel_wins_over_closed_command_channel() {
+        for round in 0..RACE_ROUNDS {
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+            let (mut peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+
+            // 被控端只观察首个心跳并继续排空（让收尾的 `Bye` 能落地）。
+            let ready = Arc::new(Notify::new());
+            let peer_ready = ready.clone();
+            tokio::spawn(async move {
+                while let Some(Ok(frame)) = peer_reader.next().await {
+                    if matches!(frame.message, SessionMessage::Heartbeat) {
+                        peer_ready.notify_one();
+                    }
+                }
+            });
+
+            let sink = Arc::new(FakeSink::default());
+            let (cmd_tx, cmd_rx) = mpsc::channel::<ControllerCommand>(4);
+            let cancel = CancellationToken::new();
+            let task = controller_task(Box::new(a), plan, cmd_rx, sink.clone(), cancel.clone());
+
+            tokio::time::timeout(WAIT, ready.notified())
+                .await
+                .expect("会话应进入主循环并发出首个心跳");
+
+            // 同步 fire：轮询时取消与命令通道关闭同时就绪。
+            cancel.cancel();
+            drop(cmd_tx);
+
+            let end = tokio::time::timeout(WAIT, task)
+                .await
+                .expect("取消后循环必须退出")
+                .expect("任务不应 panic")
+                .expect("取消属正常收尾");
+            assert_eq!(end.reason, "用户中断", "第 {round} 轮：取消应压过命令通道关闭");
+            assert!(end.deliberate, "第 {round} 轮：用户主动中断必须是 deliberate，否则会触发自动重连");
+            assert_eq!(
+                sink.closed.lock().unwrap().as_deref(),
+                Some("用户中断"),
+                "第 {round} 轮：on_closed 的原因也应与之一致"
+            );
+        }
     }
 }
