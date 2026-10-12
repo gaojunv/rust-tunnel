@@ -13,8 +13,17 @@
 //!   控制通道下发 `RemoteCapability` 才拿到，而 [`rust_tunnel_remote::RemoteManager`] 在构造时
 //!   就要 `Arc<dyn TransportEstablisher>`。
 
+pub mod clipboard_sync;
+pub mod reconnect;
+pub mod view_scale;
+
+pub use clipboard_sync::{ClipboardAction, ClipboardSync};
+pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
+pub use view_scale::{display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER};
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 // enigo 的 `move_mouse` / `button` / `scroll` / `key` 由这两个 trait 提供，必须引入。
 use enigo::{Keyboard as _, Mouse as _};
@@ -22,7 +31,7 @@ use enigo::{Keyboard as _, Mouse as _};
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
     DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
-    RemoteManager, RemoteResult, ScreenSource, TileUpdate,
+    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, TileUpdate,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -725,6 +734,11 @@ pub struct FrameState {
     pub closed: Option<String>,
     /// 最近收到的对端剪贴板文本（UI 取走即清）。
     pub clipboard_in: Option<String>,
+    /// 累计到达的画面更新次数（整帧 + 增量瓦片都计一次）。UI 侧按秒差分算出帧率。
+    ///
+    /// 放在这里而不是引擎另开计数：帧到达本就要进这把锁，顺手自增是零成本；另开结构反而要再
+    /// 同步一次。计数器会回绕（`u32`），UI 用 `wrapping_sub` 取差。
+    pub frame_count: u32,
 }
 
 /// [`FrameSink`] 的 egui 实现：把帧塞进共享槽并唤醒 UI 重绘。
@@ -748,6 +762,7 @@ impl FrameSink for GuiFrameSink {
     fn on_frame(&self, frame: DecodedFrame) {
         if let Ok(mut guard) = self.shared.lock() {
             guard.latest = Some(frame);
+            guard.frame_count = guard.frame_count.wrapping_add(1);
         }
         self.ctx.request_repaint();
     }
@@ -756,6 +771,7 @@ impl FrameSink for GuiFrameSink {
         // 瓦片已是 RGBA，本线程（引擎运行时线程）只做搬运，解码/上传留给 UI 线程。
         if let Ok(mut guard) = self.shared.lock() {
             guard.tiles = Some(update);
+            guard.frame_count = guard.frame_count.wrapping_add(1);
         }
         self.ctx.request_repaint();
     }
@@ -798,7 +814,15 @@ pub struct SessionInputs {
 /// UI 线程读取（非阻塞）；「代」用于丢弃跨会话 / 被后续请求取代的陈旧结果。
 type ClipboardReadSlot = Arc<Mutex<Option<(u64, Result<String, String>)>>>;
 
-/// 远程会话窗口的 GUI 侧状态（纹理、输入边沿状态）。
+/// 远程会话窗口的 GUI 侧状态（纹理、输入边沿状态、独立窗口的展示态）。
+///
+/// 会被 [`Arc<Mutex<RemoteView>>`] 共享给 deferred viewport 的回调（它可能在别的线程、也可能在
+/// 父窗口休眠时执行），故**所有**字段都要能跨线程访问，且临界区要短——尤其绝不在持锁时再调
+/// `show_viewport_deferred`（`embed_viewports()` 为真时那个回调会当场同步执行 → 自死锁）。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "会话窗口的展示态是若干互不相关的独立开关，本结构不是状态机"
+)]
 pub struct RemoteView {
     /// 与 [`GuiFrameSink`] 共享的画面槽。
     shared: Arc<Mutex<FrameState>>,
@@ -816,21 +840,63 @@ pub struct RemoteView {
     last_mouse: Option<(i32, i32)>,
     /// 输入门控状态机（按下需门控、抬起按「是否转达过」处理）。
     gate: InputGate,
-    /// 本帧 [`Self::capture_input`] 是否运行过的戳记（egui 输入时间）；见
-    /// [`Self::reconcile_input_capture`]。
-    capture_stamp: Option<f64>,
     /// 后台读取本机剪贴板的结果槽（非阻塞）；携带发起请求时的「代」编号（见
     /// [`Self::request_local_clipboard`] 与 [`Self::take_clipboard_read`]）。
     clipboard_read: ClipboardReadSlot,
     /// 剪贴板读取的「代」：每次发起请求 +1；[`Self::reset_session`] 也 +1 以作废在途读取。
     /// 取回时只认当前代的结果，从而丢弃跨会话 / 被后续请求取代的陈旧结果。
     clipboard_read_gen: u64,
-    /// 接入确认弹窗的「本次运行内不再询问该对端」勾选态（请求消失时由弹窗清零）。
-    approval_remember: bool,
+    /// 子窗口是否应存在。回调收到关闭请求、或用户点「最小化窗口」时置 false；新会话开始时置 true，
+    /// 「远程」Tab 的「显示窗口」也可拉回。
+    pub window_open: bool,
+    /// 本帧 [`Self::capture_input`] 是否真的运行过。回调开头清零、捕获时置 true，回调结尾据它决定
+    /// 是否补发输入抬起（取代过去靠 egui 输入时间戳戳记的做法——独立窗口后不再有「每帧唯一入口」）。
+    pub capture_this_frame: bool,
+    /// 画面缩放档位（持久化镜像，见 `GuiPrefs::remote_view_scale`）。
+    pub scale: ViewScale,
+    /// 窗口尺寸档位（持久化镜像）。
+    pub window_size: WindowSize,
+    /// 当前应下发给子窗口的内尺寸（builder 里带着它，变化时 `patch` 会自动发 `InnerSize`）。
+    pub inner_size: egui::Vec2,
+    /// 工具条当前是否可见（自动隐藏的运行时状态）。
+    pub toolbar_visible: bool,
+    /// 最近一次指针活动时刻（工具条自动隐藏计时）。
+    pub last_pointer_move: Instant,
+    /// 统计角标是否常显（持久化镜像）。
+    pub stats_overlay: bool,
+    /// 剪贴板自动同步开关（持久化镜像）。
+    pub clipboard_sync_enabled: bool,
+    /// 自动同步去重状态机；仅同步开启时存在（关闭 / 换会话时置 `None`，下次启用重建）。
+    pub(crate) clipboard_sync: Option<ClipboardSync>,
+    /// 独占键盘：键盘事件全部发给远端，忽略本端 Ctrl+C 之类（退出组合键 `Ctrl/Cmd+Alt+Shift+K`
+    /// 除外，命中即关闭独占，见 [`Self::capture_input`]）。
+    pub exclusive_keyboard: bool,
+    /// 右侧（剪贴板 / 文件）面板是否展开。
+    pub side_panel_open: bool,
+    /// 当前是否全屏（由 viewport 信息同步，供 `Esc` 退出全屏的判定）。
+    pub fullscreen: bool,
+    /// 是否已锁定初始窗口尺寸（远端首帧到达后置 true，之后不跟用户拖拽打架）。
+    pub(crate) size_initialized: bool,
+    /// 当前（控制器）会话 ID；用于识别新会话：开窗、复位、重开统计。
+    last_session_id: Option<String>,
+    /// 已喂给重连状态机的会话结束 ID（按 id 去重；同一场只喂一次，否则退避每帧被清零）。
+    last_session_end_id: Option<String>,
+    /// 断线自动重连状态机（用户在窗口里点「立即重试 / 停止」也直接改它）。
+    pub reconnect: ReconnectState,
+    /// 重连状态机本帧的展示文案（由 [`Self::reconcile`] 算好，UI 只读）。
+    pub reconnect_note: Option<String>,
+    /// 是否正在重连（展示用，含按钮的可用性）。
+    pub reconnect_active: bool,
+    /// 帧率（每秒结算一次）。
+    pub fps: u32,
+    /// 上一次结算帧率时的累计帧数基线。
+    fps_base: u32,
+    /// 上一次结算帧率的时刻（`None` = 尚未开始统计）。
+    fps_since: Option<Instant>,
 }
 
 impl RemoteView {
-    /// 构造空视图。
+    /// 构造空视图（展示偏好取各自默认值）。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -842,11 +908,52 @@ impl RemoteView {
             inputs: SessionInputs::default(),
             last_mouse: None,
             gate: InputGate::default(),
-            capture_stamp: None,
             clipboard_read: Arc::new(Mutex::new(None)),
             clipboard_read_gen: 0,
-            approval_remember: false,
+            window_open: false,
+            capture_this_frame: false,
+            scale: ViewScale::default(),
+            window_size: WindowSize::default(),
+            inner_size: egui::vec2(960.0, 600.0),
+            toolbar_visible: true,
+            last_pointer_move: Instant::now(),
+            stats_overlay: false,
+            clipboard_sync_enabled: false,
+            clipboard_sync: None,
+            exclusive_keyboard: false,
+            side_panel_open: false,
+            fullscreen: false,
+            size_initialized: false,
+            last_session_id: None,
+            last_session_end_id: None,
+            reconnect: ReconnectState::default(),
+            reconnect_note: None,
+            reconnect_active: false,
+            fps: 0,
+            fps_base: 0,
+            fps_since: None,
         }
+    }
+
+    /// 从持久化偏好构造，把展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步）按上次的选择种下。
+    ///
+    /// 这些字段在 `RemoteView` 上是**运行时镜像**：工具条改它们，`GuiApp` 每帧比对后回写
+    /// `gui.toml`（见其 `sync_display_prefs`）。之所以镜像而非直接读偏好，是因为改动发生在
+    /// deferred viewport 的回调里——那个回调与 `GuiApp::update` 不在同一时刻执行，只能靠共享状态传回。
+    #[must_use]
+    pub fn from_prefs(prefs: &crate::prefs::GuiPrefs) -> Self {
+        let mut view = Self::new();
+        view.scale = prefs.remote_view_scale;
+        view.window_size = prefs.remote_window_size;
+        view.stats_overlay = prefs.remote_stats_overlay;
+        view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
+        view
+    }
+
+    /// 当前画面（纹理）的像素尺寸；尚未收到任何帧时为 `(0, 0)`。
+    #[must_use]
+    pub fn frame_dims(&self) -> (u32, u32) {
+        self.tex_size
     }
 
     /// 管理器就绪后安装 [`FrameSink`]（幂等；需 egui 上下文以唤醒重绘）。
@@ -864,13 +971,13 @@ impl RemoteView {
     /// 会话结束后清空纹理与输入门控状态。
     ///
     /// 这里**不**补发抬起：会话已经结束，引擎会丢弃输入事件。会话仍在、只是退出「完全控制」
-    /// 捕获的场景由 [`Self::reconcile_input_capture`] 负责补发抬起。
+    /// 捕获的场景由窗口回调结尾的收敛逻辑负责补发抬起。
     pub fn reset_session(&mut self) {
         self.texture = None;
         self.tex_size = (0, 0);
         self.last_mouse = None;
         self.gate.reset();
-        self.capture_stamp = None;
+        self.capture_this_frame = false;
         self.selected_display = None;
         // 本机剪贴板读取结果属于上一会话：清空槽位，并推进「代」以作废在途读取——后台线程若在
         // 复位之后才写回旧结果，其代号与当前不符，会被 `take_clipboard_read` 丢弃，不会流入下一
@@ -921,11 +1028,6 @@ impl RemoteView {
     pub fn take_closed(&mut self) -> Option<String> {
         let mut guard = self.shared.lock().ok()?;
         guard.closed.take()
-    }
-
-    /// 接入确认弹窗的「本次运行内不再询问该对端」勾选态（可编辑；无请求时由弹窗清零）。
-    pub fn approval_remember_mut(&mut self) -> &mut bool {
-        &mut self.approval_remember
     }
 
     /// 把最新画面（整帧或增量瓦片）落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
@@ -1012,8 +1114,14 @@ impl RemoteView {
         remote_w: u32,
         remote_h: u32,
     ) {
-        // 记录「本帧已捕获」的戳记：`reconcile_input_capture` 靠它判断捕获是否仍在进行。
-        self.capture_stamp = Some(ui.ctx().input(|i| i.time));
+        // 独占键盘的退出组合键**先**拦截：命中即关闭独占、本帧不转发任何输入（组合键不能泄给远端）。
+        // 不置 `capture_this_frame`，让窗口回调在本帧补发一次抬起——刚改了键盘语义，先松开最安全。
+        if self.exclusive_keyboard && exit_combo_pressed(ui.ctx()) {
+            self.exclusive_keyboard = false;
+            return;
+        }
+        // 记录「本帧已捕获」：窗口回调结尾据它决定是否补发抬起（见 [`RemoteView::capture_this_frame`]）。
+        self.capture_this_frame = true;
 
         let display = self.selected_display.unwrap_or(0);
 
@@ -1031,10 +1139,16 @@ impl RemoteView {
             }
         }
 
-        // 键盘门控：本窗口有焦点，且当前没有 egui 控件在吃键盘输入。否则用户在本地输入框
-        // （剪贴板 / 上传路径）里敲的字、Ctrl+C 之类会被同时注入远端——egui 不会把这些事件
-        // 从 `i.events` 里摘掉，必须由我们判断。
-        let keyboard_enabled = ui.ctx().input(|i| i.focused) && !ui.ctx().wants_keyboard_input();
+        // 键盘门控：本窗口有焦点，且（非独占键盘时）没有 egui 控件在吃键盘输入。否则用户在本地
+        // 输入框（剪贴板 / 上传路径）里敲的字、Ctrl+C 之类会被同时注入远端——egui 不会把这些事件
+        // 从 `i.events` 里摘掉，必须由我们判断。独占键盘模式**刻意**去掉「有控件吃键盘」这一项：
+        // 用户要的就是「所有键盘都给远端」。
+        let focused = ui.ctx().input(|i| i.focused);
+        let keyboard_enabled = if self.exclusive_keyboard {
+            focused
+        } else {
+            focused && !ui.ctx().wants_keyboard_input()
+        };
 
         // 2) 鼠标按键 / 滚轮 / 修饰键（经门控，按边沿发送）。
         let (buttons, scroll, mods) = ui.input(|i| {
@@ -1080,6 +1194,11 @@ impl RemoteView {
         for event in events {
             match event {
                 egui::Event::Key { key, pressed, .. } => {
+                    // 本窗口的本地快捷键不转发：`F11` 切全屏恒不转发；`Esc` 只在全屏时被本端
+                    // 消费（退出全屏），非全屏时照常透传给远端。
+                    if key == egui::Key::F11 || (key == egui::Key::Escape && self.fullscreen) {
+                        continue;
+                    }
                     if let Some(code) = egui_key_to_code(key) {
                         for out in self.gate.key(code, pressed, keyboard_enabled, mods) {
                             manager.send_input(out);
@@ -1096,27 +1215,233 @@ impl RemoteView {
         }
     }
 
-    /// 每帧收敛输入捕获状态：若本帧 [`Self::capture_input`] 没有运行（用户切到别的 Tab、模式
-    /// 不再是「完全控制」、会话已结束、或画面还没到），就把上一轮「已转达按下」的鼠标键 / 键 /
-    /// 修饰键补发抬起并清空门控，避免远端残留按下的键。
+    /// 本次会话结束事件是否该触发**断线自动重连**。
     ///
-    /// 「本帧是否捕获过」用 egui 的输入时间戳判断（同一帧的多次 pass 该值不变，跨帧递增）。
+    /// `ended_session` 是刚结束那场的 `session_id`。三个条件缺一不可：
     ///
-    /// 调用点：由 [`crate::ui::remote::approval_modal`] 每帧调用——它是 `GuiApp::update` 里
-    /// **每帧**都会执行、且同时拿到 `&mut RemoteView` 与 [`egui::Context`] 的唯一入口
-    /// （`ui::remote::show` 只在远程 Tab 被选中时才渲染）。
-    pub fn reconcile_input_capture(&mut self, ctx: &egui::Context, manager: Option<&Arc<RemoteManager>>) {
-        let now = ctx.input(|i| i.time);
-        if self.capture_stamp == Some(now) {
-            return; // 本帧已捕获输入，无需收敛
-        }
-        self.capture_stamp = None;
-        let releases = self.gate.release_all();
-        if let Some(manager) = manager {
-            for event in releases {
-                manager.send_input(event);
+    /// - 开关打开（用户没在设置里关掉）；
+    /// - `deliberate == false`，即结束是**失败**而非「本端/对端主动结束」（主动结束还去重连
+    ///   只会打扰用户，见 `crates/remote/src/manager.rs` 的 `session_end` 契约）；
+    /// - 结束的那场正是**本端当控制器**跟踪着的那场——[`Self::last_session_id`] 只在控制器会话里
+    ///   被 `begin_session` 写下，故它同时充当「跟踪目标」与角色判据。
+    ///
+    /// 最后一条不是洁癖：本端也可能**被别人控制**，而 `reconnect.target` 是用户上一次手动连接时
+    /// 记下的、会跨会话留存。少了这一条，本端「先控制过 Y、随后被 Z 控制」时，被 Z 那场断线也会
+    /// 让本端自动去拨 Y——Y 那边于是弹出一个**没人请求过**的接入确认弹窗。
+    #[must_use]
+    pub fn should_auto_reconnect(
+        &self,
+        ended_session: &str,
+        deliberate: bool,
+        auto_reconnect: bool,
+    ) -> bool {
+        auto_reconnect && !deliberate && self.last_session_id.as_deref() == Some(ended_session)
+    }
+
+    /// 父窗口每帧收敛一次会话相关的本地状态（新会话开窗复位、重连判定与推进、剪贴板、帧率）。
+    ///
+    /// 之所以集中在**父窗口**而不是 deferred viewport 回调里做：会话生命周期的转变（开窗 / 关窗 /
+    /// 断线）必须被观测，而回调只在窗口存在时才跑——用户把窗口最小化后回调就不再执行，重连也就无从
+    /// 启动。父窗口的 `update` 每帧都在跑，是唯一可靠的地方。
+    ///
+    /// `state` 为本帧的引擎快照（`manager.snapshot()`），由调用方复用避免多取。
+    pub fn reconcile(
+        &mut self,
+        manager: &Arc<RemoteManager>,
+        state: &RemoteUiState,
+        auto_reconnect: bool,
+        now: Instant,
+    ) {
+        // 1) 会话结束事件：按 session_id 去重，同一场只喂一次——否则每帧都会把重连计数清零、
+        //    退避永不生效。
+        if let Some((session_id, end)) = &state.session_end {
+            if self.last_session_end_id.as_deref() != Some(session_id.as_str()) {
+                self.last_session_end_id = Some(session_id.clone());
+                if self.should_auto_reconnect(session_id, end.deliberate, auto_reconnect) {
+                    self.reconnect.on_session_end(false, now);
+                }
             }
         }
+
+        // 2) 会话生命周期（只关心控制器侧；被控端的画面发送由引擎负责）。
+        let active_controller = state
+            .active
+            .as_ref()
+            .filter(|active| active.role == SessionRole::Controller);
+        match active_controller {
+            Some(active) => {
+                if self.last_session_id.as_deref() != Some(active.session_id.as_str()) {
+                    self.begin_session(&active.session_id);
+                }
+                // 会话已重新建立（可能是重连成功）→ 收起倒计时；目标保留，下次断线仍可自动重连。
+                if self.reconnect.is_active() {
+                    self.reconnect.cancel();
+                }
+            }
+            None => {
+                if self.last_session_id.is_some() {
+                    self.end_session(manager);
+                }
+            }
+        }
+
+        // 3) 推进重连状态机并把它本帧的结果落成展示文案（UI 只读，不再重复推进）。
+        let step = self.reconnect.poll(now);
+        if let ReconnectStep::Retry { target, .. } = &step {
+            manager.request_connect(&target.client_name, target.mode);
+        }
+        self.reconnect_active = self.reconnect.is_active();
+        self.reconnect_note = match step {
+            ReconnectStep::Waiting { attempt, total, remaining } => Some(format!(
+                "正在重连（{attempt}/{total}），{} 秒后重试",
+                remaining.as_secs().max(1)
+            )),
+            ReconnectStep::Retry { attempt, total, .. } => {
+                Some(format!("正在重连（{attempt}/{total}）…"))
+            }
+            ReconnectStep::Exhausted { total } => {
+                Some(format!("自动重连已放弃（已尝试 {total} 次）"))
+            }
+            ReconnectStep::Idle => None,
+        };
+    }
+
+    /// 新会话开始：复位上一场的残留、打开窗口、清掉独占键盘/全屏等一次性状态。
+    fn begin_session(&mut self, session_id: &str) {
+        self.reset_session();
+        self.reset_clipboard_sync();
+        self.reconnect_note = None;
+        self.reconnect_active = false;
+        self.last_session_id = Some(session_id.to_owned());
+        self.window_open = true;
+        self.size_initialized = false;
+        self.exclusive_keyboard = false;
+        self.fullscreen = false;
+        self.toolbar_visible = true;
+        self.fps = 0;
+        self.fps_since = None;
+        // 首帧到达前的初始窗口尺寸：远端分辨率这时还未知（`reset_session` 刚清空），先用一个
+        // 保守值占位；远端首帧一到，`ui::session_window::show` 会重算并锁定（见 `size_initialized`）。
+        self.inner_size = self.desired_inner(None);
+    }
+
+    /// 会话结束：补发一次输入抬起、复位视图、关掉窗口（重连若需要会重新开窗）。
+    fn end_session(&mut self, manager: &Arc<RemoteManager>) {
+        for event in self.gate.release_all() {
+            manager.send_input(event);
+        }
+        self.reset_session();
+        self.reset_clipboard_sync();
+        self.last_session_id = None;
+        self.window_open = false;
+        self.exclusive_keyboard = false;
+        self.fullscreen = false;
+        self.fps = 0;
+        self.fps_since = None;
+    }
+
+    /// 清空剪贴板自动同步的去重基线（换会话时对端可能已经不是原来那个，旧基线无从沿用）。
+    fn reset_clipboard_sync(&mut self) {
+        if let Some(sync) = self.clipboard_sync.as_mut() {
+            sync.reset();
+        }
+    }
+
+    /// 会话结束后补发一次输入抬起并复位视图（供**窗口回调**在关窗路径上复用；父窗口路径走
+    /// [`Self::end_session`]）。窗口回调不能改 `GuiApp` 状态，故这里只做与本视图有关的清理，
+    /// 真正的会话中断由回调调用 `manager.abort_active()` 完成。
+    pub fn release_input(&mut self, manager: &Arc<RemoteManager>) {
+        for event in self.gate.release_all() {
+            manager.send_input(event);
+        }
+    }
+
+    /// 算当前档位下应下发给子窗口的内尺寸（`FitScreen` 用远端分辨率，未知时用占位分辨率）。
+    #[must_use]
+    pub fn desired_inner(&self, monitor: Option<egui::Vec2>) -> egui::Vec2 {
+        match self.window_size {
+            WindowSize::FitScreen => {
+                let remote = match self.tex_size {
+                    (w, h) if w > 0 && h > 0 => (w, h),
+                    // 远端首帧还没到：退回引擎下发的显示器尺寸，再退回 1280×720 占位。
+                    _ => self
+                        .displays()
+                        .into_iter()
+                        .next()
+                        .map_or((1280, 720), |display| (display.width, display.height)),
+                };
+                initial_window_size(remote, monitor)
+            }
+            _ => self
+                .window_size
+                .inner_size()
+                .map_or(MIN_INNER, |size| size.max(MIN_INNER)),
+        }
+    }
+
+    /// 剪贴板：入向把对端文本写本机（自动同步开时）、出向轮询本机剪贴板发给对端、并取回后台读取
+    /// 的结果。由父窗口每帧调用一次（不依赖窗口是否可见——最小化时仍应同步）。
+    pub fn poll_clipboard(&mut self, manager: &Arc<RemoteManager>, active: bool, now: Instant) {
+        // 入向：对端发来的文本。始终留在本地输入态供展示；自动同步开时才写本机剪贴板。
+        if let Some(text) = self.take_clipboard() {
+            self.inputs.clipboard_in = Some(text.clone());
+            if self.clipboard_sync_enabled {
+                let sync = self.clipboard_sync.get_or_insert_with(ClipboardSync::default);
+                if let ClipboardAction::Apply(apply) = sync.on_remote(&text) {
+                    // 写本机剪贴板可能阻塞（X11 下要抢 selection），丢短命线程，绝不卡 UI。
+                    std::thread::spawn(move || {
+                        if let Err(err) = SystemClipboard.set(&apply) {
+                            tracing::warn!("自动写入本机剪贴板失败：{err}");
+                        }
+                    });
+                }
+            }
+        }
+
+        // 出向：仅会话活跃且同步开启时轮询（读取本身在后台线程，见 `request_local_clipboard`）。
+        if self.clipboard_sync_enabled && active {
+            let due = self
+                .clipboard_sync
+                .get_or_insert_with(ClipboardSync::default)
+                .should_poll(now);
+            if due {
+                self.request_local_clipboard();
+            }
+        }
+
+        // 取回后台读取结果（手动「读取本机」与自动轮询共用这一条结果通道）。
+        if let Some(result) = self.take_clipboard_read() {
+            match result {
+                Ok(text) => {
+                    self.inputs.clipboard_out.clone_from(&text);
+                    if self.clipboard_sync_enabled {
+                        let sync = self.clipboard_sync.get_or_insert_with(ClipboardSync::default);
+                        if let ClipboardAction::Send(send) = sync.on_local(&text) {
+                            manager.send_clipboard(send);
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!("读取本机剪贴板失败：{err}"),
+            }
+        }
+    }
+
+    /// 每秒结算一次帧率：读共享槽里的累计帧数（引擎运行时线程自增），按流逝秒数算平均。
+    pub fn poll_fps(&mut self, now: Instant) {
+        let count = self.shared.lock().map_or(0, |guard| guard.frame_count);
+        let Some(since) = self.fps_since else {
+            self.fps_since = Some(now);
+            self.fps_base = count;
+            return;
+        };
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let secs = u32::try_from(elapsed.as_secs().max(1)).unwrap_or(1);
+        self.fps = count.wrapping_sub(self.fps_base) / secs;
+        self.fps_base = count;
+        self.fps_since = Some(now);
     }
 
     /// 请求异步读取本机剪贴板：立刻返回，结果在下一次 [`Self::take_clipboard_read`] 取回。
@@ -1190,6 +1515,19 @@ fn scale_axis(offset: f32, extent: f32, max: u32) -> i32 {
 #[expect(clippy::cast_possible_truncation, reason = "滚动量为有界小整数")]
 fn round_i32(value: f32) -> i32 {
     value.round() as i32
+}
+
+/// 独占键盘的退出组合键是否本帧按下：`Ctrl/Cmd + Alt + Shift + K`。
+///
+/// 之所以要一个**专门**的退出组合键：独占键盘会把除它之外的所有键盘事件（含本端快捷键）都发给
+/// 远端，用户若没有一条本端通道就再也退不出来了。用四键组合是为了几乎不可能与远端应用冲突。
+fn exit_combo_pressed(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        (i.modifiers.ctrl || i.modifiers.command)
+            && i.modifiers.alt
+            && i.modifiers.shift
+            && i.key_pressed(egui::Key::K)
+    })
 }
 
 // ── 数据面建立（延迟构造）────────────────────────────────────────────
@@ -1518,5 +1856,28 @@ mod tests {
         assert_eq!(view.take_clipboard_read(), Some(Ok("当前会话".to_owned())));
         // 取走即清，第二次取回为空。
         assert_eq!(view.take_clipboard_read(), None);
+    }
+
+    /// 断线自动重连的判据：开关 + 非主动结束 + **结束的是本端当控制器的那场**。
+    ///
+    /// 最后一条是真实场景里最容易漏的：`reconnect.target` 是用户上次手动连接时记下的、跨会话
+    /// 留存，而本端也可能被别人控制。若不比对 `session_id`，被控会话断线会让本端去拨上一次的
+    /// 对端，对端那边弹出没人请求过的接入确认弹窗。
+    #[test]
+    fn auto_reconnect_requires_the_ended_session_to_be_our_own_controller_session() {
+        let mut view = RemoteView::new();
+        view.last_session_id = Some("sess-ctl".to_owned());
+
+        assert!(view.should_auto_reconnect("sess-ctl", false, true), "本端控制器会话断线 → 重连");
+        assert!(
+            !view.should_auto_reconnect("sess-other", false, true),
+            "结束的是别的会话（本端被控）→ 不该由本端拨号"
+        );
+        assert!(!view.should_auto_reconnect("sess-ctl", true, true), "主动结束 → 不重连");
+        assert!(!view.should_auto_reconnect("sess-ctl", false, false), "开关关闭 → 不重连");
+
+        // 从未跟踪过控制器会话（本端只被控过）：任何结束事件都不触发。
+        view.last_session_id = None;
+        assert!(!view.should_auto_reconnect("sess-ctl", false, true));
     }
 }

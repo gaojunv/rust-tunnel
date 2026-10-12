@@ -5,6 +5,16 @@ use std::path::PathBuf;
 use rust_tunnel_remote::ApprovalPolicy;
 
 use crate::config_store;
+use crate::remote::{ViewScale, WindowSize};
+
+/// 布尔字段的 `serde(default = ...)` 目标：缺省为 true。
+///
+/// 不能对「默认应为 true」的 bool 直接用裸 `#[serde(default)]`——`bool::default()` 是 false，
+/// 旧配置文件缺字段时会静默落到 false（对「自动重连」「工具条自动隐藏」这类默认开启的行为是
+/// 反直觉的）。
+fn default_true() -> bool {
+    true
+}
 
 /// 主题偏好（持久化值；egui 的 `ThemePreference` 未启用 serde，自行映射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -63,6 +73,10 @@ impl ThemePref {
 
 /// GUI 偏好根结构（serde(default) 保证前向兼容）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "GUI 偏好本就是一组互不相关的独立开关，拆成状态机只会更难读"
+)]
 pub struct GuiPrefs {
     /// 主题偏好。
     #[serde(default)]
@@ -75,6 +89,25 @@ pub struct GuiPrefs {
     /// 这是安全侧默认，不要改成 `Auto`。
     #[serde(default)]
     pub remote_approval: ApprovalPolicy,
+    /// 远程会话窗口：工具条是否自动隐藏（指针静止后淡出，移到上缘或移动指针再现）。
+    #[serde(default = "default_true")]
+    pub remote_toolbar_autohide: bool,
+    /// 远程会话窗口：画面缩放档位（持久化的是上次选择，不是每场的运行时值）。
+    #[serde(default)]
+    pub remote_view_scale: ViewScale,
+    /// 远程会话窗口：窗口尺寸档位。
+    #[serde(default)]
+    pub remote_window_size: WindowSize,
+    /// 剪贴板自动同步。**默认关闭**：自动同步会把本机剪贴板内容（可能含密码、token）悄悄发给
+    /// 对端，必须是用户的显式选择，且只在本端主动开启的会话里生效。
+    #[serde(default)]
+    pub remote_clipboard_sync: bool,
+    /// 断线自动重连。默认开启：会话因断线（非主动结束）时按退避重试，用户可随时停止。
+    #[serde(default = "default_true")]
+    pub remote_auto_reconnect: bool,
+    /// 会话窗口内的统计角标（延迟 / 路径 / 分辨率 / 帧率 / 时长）是否常显。
+    #[serde(default)]
+    pub remote_stats_overlay: bool,
 }
 
 /// GUI 偏好文件路径（与 client 配置同目录的 gui.toml）。

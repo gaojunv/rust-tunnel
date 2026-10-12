@@ -1,6 +1,12 @@
 //! rust-tunnel 桌面托盘客户端（winit + tray-icon + eframe）。
 
 #![allow(clippy::missing_docs_in_private_items, reason = "GUI 二进制")]
+// 单测豁免（与各 lib crate 的 `lib.rs` 头部一致）：restriction 组在测试里放宽。
+// 本 crate 是 bin，没有 lib.rs，故这行放在这里。
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 // Release 构建在 Windows 上隐藏控制台窗口（双击启动仅显示 GUI）
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -14,15 +20,15 @@ mod remote;
 mod tray;
 mod ui;
 
-use std::sync::{atomic::AtomicBool, Arc};
-use std::time::Duration;
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
-use rust_tunnel_remote::{ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig};
+use rust_tunnel_remote::{ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig, SessionRole};
 
-fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
+pub(crate) fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
     let bytes: &[u8] = include_bytes!("../icons/icon.png");
     let Some((rgba, w, h)) = tray::load_icon_rgba(bytes) else {
         tracing::warn!("窗口图标解码失败，回退为系统默认图标");
@@ -34,7 +40,6 @@ fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
         height: h,
     }))
 }
-
 struct GuiApp {
     app_state: Arc<app::AppState>,
     settings: ui::settings::SettingsState,
@@ -45,8 +50,12 @@ struct GuiApp {
     last_tray_texts: Option<(String, String, String)>,
     /// GUI 偏好（主题等），切换时落盘 gui.toml。
     prefs: prefs::GuiPrefs,
-    /// 远程会话窗口的 GUI 侧状态（纹理 + 输入捕获边沿状态）。
-    remote_view: remote::RemoteView,
+    /// 远程会话窗口的 GUI 侧状态。**共享**给独立会话窗口的回调（它可能在别的线程执行），
+    /// 故用 `Arc<Mutex<..>>`；临界区必须短，且绝不在持锁时注册 deferred viewport。
+    remote_view: Arc<Mutex<remote::RemoteView>>,
+    /// 接入确认弹窗的「本次运行内不再询问该对端」勾选态。放在这里而非 `RemoteView`：弹窗每帧都要
+    /// 可写，而视图已共享给子窗口回调，不该再承载与画面无关的弹窗状态。
+    approval_remember: bool,
     /// 上一帧待确认请求的会话 ID。用于检测 `None → Some` 跳变，仅在**首次出现**时
     /// 强制显示并聚焦窗口（见 `update`），避免每帧与用户抢焦点。
     last_pending_approval: Option<String>,
@@ -63,6 +72,7 @@ impl GuiApp {
             .as_ref()
             .map(ui::settings::SettingsState::from_config)
             .unwrap_or_default();
+        let remote_view = Arc::new(Mutex::new(remote::RemoteView::from_prefs(&prefs)));
         Self {
             app_state,
             settings,
@@ -70,7 +80,8 @@ impl GuiApp {
             tray,
             last_tray_texts: None,
             prefs,
-            remote_view: remote::RemoteView::new(),
+            remote_view,
+            approval_remember: false,
             last_pending_approval: None,
         }
     }
@@ -260,6 +271,39 @@ impl GuiApp {
                 ui.add_space(2.0);
             });
     }
+    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步）回写 `gui.toml`。
+    ///
+    /// 这些字段在 [`remote::RemoteView`] 上是运行时镜像——改动发生在 deferred viewport 的回调里
+    /// （与 `update` 不在同一时刻），只能靠每帧比对把差异落盘。`save` 只在确有变化时才写。
+    fn sync_display_prefs(&mut self) {
+        let view = self
+            .remote_view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        if self.prefs.remote_view_scale != view.scale {
+            self.prefs.remote_view_scale = view.scale;
+            changed = true;
+        }
+        if self.prefs.remote_window_size != view.window_size {
+            self.prefs.remote_window_size = view.window_size;
+            changed = true;
+        }
+        if self.prefs.remote_stats_overlay != view.stats_overlay {
+            self.prefs.remote_stats_overlay = view.stats_overlay;
+            changed = true;
+        }
+        if self.prefs.remote_clipboard_sync != view.clipboard_sync_enabled {
+            self.prefs.remote_clipboard_sync = view.clipboard_sync_enabled;
+            changed = true;
+        }
+        drop(view);
+        if changed {
+            if let Err(e) = prefs::save(&self.prefs) {
+                tracing::warn!("GUI 偏好保存失败：{e}");
+            }
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -273,10 +317,11 @@ impl eframe::App for GuiApp {
 
         // 远程引擎就绪后安装帧通道（幂等）；引擎由后台运行时线程注入 AppState。
         let remote_manager = self.app_state.remote();
-        // 一帧只取一次远程状态快照：托盘 tooltip 与「待确认请求首次出现」都基于它。
-        let pending_id = remote_manager
+        // 一帧只取一次远程状态快照：托盘 tooltip、会话生命周期收敛与重连都基于它。
+        let remote_state = remote_manager.as_ref().map(|m| m.snapshot());
+        let pending_id = remote_state
             .as_ref()
-            .and_then(|m| m.snapshot().pending_approval.map(|p| p.session_id));
+            .and_then(|s| s.pending_approval.as_ref().map(|p| p.session_id.clone()));
         self.refresh_tray(&status, pending_id.is_some());
         self.show_tabs(ctx);
 
@@ -288,13 +333,29 @@ impl eframe::App for GuiApp {
         }
         self.last_pending_approval = pending_id;
 
+        // 远程会话的每帧收敛（父窗口负责，因为它必须每帧都跑，而子窗口回调只在窗口存在时才跑）：
+        // 安装帧通道、开窗 / 关窗 / 断线重连、剪贴板同步、帧率结算。
         if let Some(manager) = remote_manager.as_ref() {
-            self.remote_view.ensure_sink(ctx, manager);
+            let now = Instant::now();
+            let mut view = self
+                .remote_view
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            view.ensure_sink(ctx, manager);
+            if let Some(state) = remote_state.as_ref() {
+                view.reconcile(manager, state, self.prefs.remote_auto_reconnect, now);
+                let active_controller = state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.role == SessionRole::Controller);
+                view.poll_clipboard(manager, active_controller, now);
+            }
+            view.poll_fps(now);
         }
 
         let mut remote_actions = ui::remote::RemoteTabActions::default();
         let settings = &mut self.settings;
-        let remote_view = &mut self.remote_view;
+        let remote_view = Arc::clone(&self.remote_view);
         let app_state = &self.app_state;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
@@ -304,8 +365,7 @@ impl eframe::App for GuiApp {
                 0 => ui::status::show(ui, &status),
                 1 => ui::mappings::show(ui, &status),
                 2 => {
-                    remote_actions =
-                        ui::remote::show(ui, remote_view, remote_manager.as_ref(), app_state);
+                    remote_actions = ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
                 }
                 3 => ui::settings::show(ui, settings, app_state),
                 4 => ui::logs::show(ui, &app_state.log_buffer),
@@ -319,7 +379,14 @@ impl eframe::App for GuiApp {
             self.apply_approval_policy(policy);
         }
         // 接入确认弹窗常驻所有 Tab 之上（与 `controlled_banner` 同理）。
-        ui::remote::approval_modal(ctx, &mut self.remote_view, remote_manager.as_ref());
+        ui::remote::approval_modal(ctx, &mut self.approval_remember, remote_manager.as_ref());
+
+        // 独立会话窗口本体（仅控制器会话且窗口应存在时注册）。
+        if let Some(manager) = remote_manager.as_ref() {
+            ui::session_window::show(ctx, &self.remote_view, manager, &self.prefs);
+        }
+
+        self.sync_display_prefs();
 
         let needs_repaint = !status.connected || status.last_error.is_some();
         if needs_repaint {

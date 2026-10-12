@@ -3,5 +3,6 @@
 pub mod logs;
 pub mod mappings;
 pub mod remote;
+pub mod session_window;
 pub mod settings;
 pub mod status;

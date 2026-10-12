@@ -1,24 +1,32 @@
-//! 「远程」Tab：可被远程控制的客户端列表、一键连接、被控横幅与会话窗口。
+//! 「远程」Tab：可被远程控制的客户端列表、一键连接、被控横幅与会话摘要。
+//!
+//! 画面 / 输入捕获 / 剪贴板 / 文件面板已整体迁到独立会话窗口（[`crate::ui::session_window`]）；本
+//! Tab 只留下**摘要卡**：会话状态、延迟、数据面路径、以及「显示窗口 / 中断会话」两个动作。会话窗
+//! 口可被最小化（会话继续保留），故这里必须留一个把它召回入口。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use egui::{RichText, Ui};
 use rust_tunnel_common::protocol::RemoteMode;
-use rust_tunnel_remote::{
-    ApprovalPolicy, QualityPreset, RemoteManager, RemoteUiState, SessionRole, SessionState,
-};
+use rust_tunnel_remote::{ApprovalPolicy, RemoteManager, RemoteUiState, SessionRole, SessionState};
 
 use crate::app::AppState;
-use crate::remote::{self, PermissionKind, RemoteView};
+use crate::remote::{self, PermissionKind, ReconnectTarget, RemoteView};
+use crate::ui::session_window::{latency_color, transport_label, viewport_id};
 
 /// 会话状态中文标签。
-fn state_label(state: SessionState) -> &'static str {
+pub fn state_label(state: SessionState) -> &'static str {
     match state {
         SessionState::Negotiating => "协商中",
         SessionState::Connecting => "建立连接中",
         SessionState::Active => "已连接",
         SessionState::Ended => "已结束",
     }
+}
+
+/// 取共享视图的锁（中毒时取回内部值，一个视图锁中毒不该拖垮整个 UI）。
+fn lock(view: &Arc<Mutex<RemoteView>>) -> MutexGuard<'_, RemoteView> {
+    view.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// 「远程」Tab 的用户操作结果，由 `GuiApp` 同步到引擎与偏好文件。
@@ -33,7 +41,7 @@ pub struct RemoteTabActions {
 /// 渲染「远程」Tab。返回本帧的用户操作，由调用方（`GuiApp`）同步到引擎、托盘与偏好文件。
 pub fn show(
     ui: &mut Ui,
-    view: &mut RemoteView,
+    view: &Arc<Mutex<RemoteView>>,
     manager: Option<&Arc<RemoteManager>>,
     _app_state: &Arc<AppState>,
 ) -> RemoteTabActions {
@@ -46,9 +54,10 @@ pub fn show(
 
     show_permissions(ui);
     let actions = show_switch(ui, &state);
+    show_reconnect(ui, view, manager);
     show_session(ui, view, manager, &state);
     show_trusted_peers(ui, &state, manager);
-    show_peers(ui, &state, manager);
+    show_peers(ui, &state, manager, view);
     actions
 }
 
@@ -83,6 +92,39 @@ fn show_permissions(ui: &mut Ui) {
     ui.add_space(8.0);
 }
 
+/// 断线自动重连提示条（与独立窗口里那条同源，这里给没打开窗口时的可见入口）。
+fn show_reconnect(ui: &mut Ui, view: &Arc<Mutex<RemoteView>>, manager: &Arc<RemoteManager>) {
+    let (note, active) = {
+        let v = lock(view);
+        (v.reconnect_note.clone(), v.reconnect_active)
+    };
+    let Some(note) = note else {
+        return;
+    };
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::from_rgba_unmultiplied(220, 160, 40, 30))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().warn_fg_color, note);
+                if active {
+                    if ui.button("立即重试").clicked() {
+                        if let Some(target) = lock(view).reconnect.retry_now(std::time::Instant::now()) {
+                            manager.request_connect(&target.client_name, target.mode);
+                        }
+                    }
+                    if ui.button("停止").clicked() {
+                        let mut v = lock(view);
+                        v.reconnect.cancel();
+                        v.reconnect_note = None;
+                        v.reconnect_active = false;
+                    }
+                }
+            });
+        });
+    ui.add_space(8.0);
+}
+
 /// 被控期间的常驻横幅（醒目提示 + 一键中断）。
 ///
 /// 由 `GuiApp` 在**所有 Tab 顶部**调用，确保被控时无论用户切到哪个页都能看到并随时中断。
@@ -112,12 +154,85 @@ pub fn controlled_banner(ui: &mut Ui, manager: Option<&Arc<RemoteManager>>) {
                     }
                 });
             });
+            // 延迟与数据面路径是被控方最关心的两项（卡不卡、走的直连还是中继）。
+            ui.horizontal(|ui| {
+                show_latency(ui, &state);
+            });
             // 被控时明确告知对外共享的目录，让用户一眼看到别人能读到什么。
             if let Some(dir) = manager.share_dir() {
                 ui.label(RichText::new(format!("对外共享目录：{}", dir.display())).weak().small());
             }
         });
     ui.add_space(8.0);
+}
+
+/// 会话摘要卡（画面与输入已迁到独立窗口，这里只留状态与动作）。
+fn show_session(
+    ui: &mut Ui,
+    view: &Arc<Mutex<RemoteView>>,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+) {
+    let Some(active) = state.active.as_ref() else {
+        if let Some(reason) = lock(view).take_closed() {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("会话已结束：{reason}"));
+            ui.add_space(8.0);
+        }
+        return;
+    };
+
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let role = match active.role {
+                    SessionRole::Controller => "控制中",
+                    SessionRole::Controlled => "被控中",
+                };
+                ui.label(RichText::new(format!("远程会话 · {role} · {}", state_label(active.state))).strong());
+                ui.label(RichText::new(format!("对端：{}", active.peer_name)).weak().small());
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                show_latency(ui, state);
+            });
+
+            if active.role == SessionRole::Controlled {
+                ui.add_space(4.0);
+                ui.label(RichText::new("本机画面正发送给控制方；如需终止请点「中断会话」。").weak());
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                // 控制器才有独立窗口：没打开（最小化 / 关窗后未结束）时给个召回入口。
+                if active.role == SessionRole::Controller
+                    && !lock(view).window_open
+                    && ui.button("显示窗口").clicked()
+                {
+                    lock(view).window_open = true;
+                    ui.ctx().send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Focus);
+                }
+                if ui.button("中断会话").clicked() {
+                    manager.abort_active();
+                }
+            });
+        });
+    ui.add_space(8.0);
+}
+
+/// 延迟（按阈值上色）与数据面路径。
+fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
+    match state.latency_ms {
+        Some(ms) => {
+            ui.colored_label(latency_color(ms), RichText::new(format!("延迟 {ms} ms")).small());
+        }
+        None => {
+            ui.label(RichText::new("延迟 —").weak().small());
+        }
+    }
+    if let Some(path) = state.transport {
+        ui.label(RichText::new(format!("路径 {}", transport_label(path))).weak().small());
+    }
 }
 
 /// 会话模式的中文说明。用户被要求交出的是键鼠控制权，故把「要什么权限」写清楚，
@@ -145,24 +260,20 @@ fn remaining_secs(deadline_ms: u64) -> u64 {
 ///
 /// 只展示 [`rust_tunnel_remote::PendingApproval`] 携带的字段——其中**不含**握手 token。
 /// 倒计时随 `GuiApp::update` 的 `request_repaint_after` 自然刷新，无需额外唤醒。
-pub fn approval_modal(ctx: &egui::Context, view: &mut RemoteView, manager: Option<&Arc<RemoteManager>>) {
-    // 每帧收敛输入捕获：本函数是 `GuiApp::update` 里**每帧**都会执行、且同时拿到
-    // `&mut RemoteView` 与 `egui::Context` 的唯一入口（`show` 只在远程 Tab 被选中时渲染）。
-    // 用户切到别的 Tab / 退出「完全控制」模式 / 会话结束时，`capture_input` 会停止运行，
-    // 由这里把「已转达按下」的键补发抬起，避免远端残留按下的键。
-    view.reconcile_input_capture(ctx, manager);
-
+///
+/// `remember` 是「本次运行内不再询问该对端」的勾选态，由 `GuiApp` 持有（独立窗口后视图不再适合
+/// 承载它——弹窗每帧都要可写，而视图已被共享给子窗口回调）。
+pub fn approval_modal(ctx: &egui::Context, remember: &mut bool, manager: Option<&Arc<RemoteManager>>) {
     let Some(manager) = manager else {
         return;
     };
     let state = manager.snapshot();
     let Some(pending) = state.pending_approval.as_ref() else {
         // 请求已消失（批准/拒绝/超时/断线）：清掉勾选态，别让它带到下一条请求。
-        *view.approval_remember_mut() = false;
+        *remember = false;
         return;
     };
 
-    let remember = view.approval_remember_mut();
     egui::Modal::new(egui::Id::new("remote_approval")).show(ctx, |ui| {
         ui.set_width(340.0);
         ui.heading("远程接入请求");
@@ -317,299 +428,8 @@ fn show_trusted_peers(ui: &mut Ui, state: &RemoteUiState, manager: &Arc<RemoteMa
     ui.add_space(8.0);
 }
 
-/// 会话窗口（画面 + 输入捕获 + 工具条）。
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "像素尺寸有界，f32 精度足够"
-)]
-fn show_session(
-    ui: &mut Ui,
-    view: &mut RemoteView,
-    manager: &Arc<RemoteManager>,
-    state: &RemoteUiState,
-) {
-    let Some(active) = state.active.as_ref() else {
-        view.reset_session();
-        if let Some(reason) = view.take_closed() {
-            ui.colored_label(ui.visuals().warn_fg_color, format!("会话已结束：{reason}"));
-            ui.add_space(8.0);
-        }
-        return;
-    };
-
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(10, 10))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let role = match active.role {
-                    SessionRole::Controller => "控制中",
-                    SessionRole::Controlled => "被控中",
-                };
-                ui.label(RichText::new(format!("远程会话 · {role} · {}", state_label(active.state))).strong());
-                ui.label(RichText::new(format!("对端：{}", active.peer_name)).weak().small());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("中断会话").clicked() {
-                        manager.abort_active();
-                    }
-                });
-            });
-            ui.add_space(6.0);
-
-            // 被控端不接收画面，只提示状态（画面/输入捕获是控制端的事）。
-            if active.role == SessionRole::Controlled {
-                ui.label(RichText::new("本机画面正发送给控制方；如需终止请点「中断会话」。").weak());
-                if let Some(dir) = manager.share_dir() {
-                    ui.label(RichText::new(format!("对外共享目录：{}", dir.display())).weak().small());
-                }
-                return;
-            }
-
-            // 显示器选择 + 画质档位（都由被控端生效）。
-            show_display_selector(ui, view, manager);
-            show_quality_selector(ui, manager, state.quality);
-            ui.add_space(4.0);
-
-            // 画面：等比缩放铺满可用宽度，高度上限 420。
-            if let Some((texture, width, height)) = view.upload(ui.ctx()) {
-                let avail = ui.available_size();
-                let avail = egui::vec2(avail.x.max(80.0), avail.y.clamp(60.0, 420.0));
-                let scale = (avail.x / width as f32)
-                    .min(avail.y / height as f32)
-                    .max(0.01);
-                let size = egui::vec2(
-                    (width as f32 * scale).max(1.0),
-                    (height as f32 * scale).max(1.0),
-                );
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                ui.painter().image(
-                    texture,
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-                // 仅控制器 + 完全控制模式捕获输入。
-                if active.role == SessionRole::Controller && active.mode == RemoteMode::Control {
-                    view.capture_input(ui, manager, &response, rect, width, height);
-                }
-            } else {
-                ui.add_space(24.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("等待画面…").weak());
-                });
-                ui.add_space(24.0);
-            }
-
-            // 剪贴板与文件面板（仅控制器侧有意义：被控端只应答）。
-            show_clipboard(ui, view, manager);
-            show_files(ui, view, manager, state);
-        });
-    ui.add_space(8.0);
-}
-
-/// 显示器选择：多显示器时逐台可点，单显示器时把当前显示器同步给引擎。
-fn show_display_selector(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>) {
-    let displays = view.displays();
-    if displays.len() > 1 {
-        let current = view
-            .selected_display()
-            .or_else(|| displays.first().map(|d| d.id));
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("显示器").weak().small());
-            for display in &displays {
-                if ui
-                    .selectable_label(current == Some(display.id), display.name.as_str())
-                    .clicked()
-                {
-                    view.set_selected_display(display.id, manager);
-                }
-            }
-        });
-    } else if let Some(display) = displays.first() {
-        view.set_selected_display(display.id, manager);
-    }
-}
-
-/// 画质档位选择（流畅/均衡/高清）；切换经会话命令下发，由被控端生效。
-fn show_quality_selector(ui: &mut Ui, manager: &Arc<RemoteManager>, current: QualityPreset) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("画质").weak().small());
-        for preset in QualityPreset::all() {
-            if ui.selectable_label(current == preset, preset.label()).clicked() {
-                manager.set_quality(preset);
-            }
-        }
-    });
-}
-
-/// 剪贴板同步：发送本机剪贴板、索取对端剪贴板、展示收到的对端文本。
-///
-/// 读取本机剪贴板借 [`remote::SystemClipboard`]（arboard）——egui 0.31 只提供**写**系统剪贴板的
-/// `Context::copy_text`，没有读取 API，故这里用平台实现读；读不到时可退回文本框里手填的内容。
-/// 「读取本机」不阻塞 UI 线程：点击只发起后台线程读取（见 [`RemoteView::request_local_clipboard`]），
-/// 结果在下一帧取回。
-fn show_clipboard(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>) {
-    // 对端发来的剪贴板：从共享槽取走并留在本地输入态，跨帧展示。
-    if let Some(text) = view.take_clipboard() {
-        view.inputs_mut().clipboard_in = Some(text);
-    }
-
-    // 后台读取结果（若有）在本帧取回并填入输入框；读取在短命线程里做，绝不阻塞 UI 线程。
-    if let Some(result) = view.take_clipboard_read() {
-        match result {
-            Ok(text) => view.inputs_mut().clipboard_out = text,
-            Err(err) => tracing::warn!("读取本机剪贴板失败：{err}"),
-        }
-    }
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("剪贴板").strong());
-        if ui.button("读取本机").clicked() {
-            // 只发起异步读取；结果下一帧经 `take_clipboard_read` 取回（见 `request_local_clipboard`）。
-            view.request_local_clipboard();
-        }
-        if ui.button("发送本机剪贴板").clicked() {
-            let text = view.inputs_mut().clipboard_out.clone();
-            manager.send_clipboard(text);
-        }
-        if ui.button("获取对端剪贴板").clicked() {
-            manager.request_clipboard();
-        }
-    });
-    ui.add(
-        egui::TextEdit::singleline(&mut view.inputs_mut().clipboard_out)
-            .desired_width(f32::INFINITY)
-            .hint_text("待发送给对端的文本（可点「读取本机」填入）"),
-    );
-    if let Some(text) = view.inputs_mut().clipboard_in.clone() {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("对端剪贴板").weak().small());
-            if ui.button("复制到本机").clicked() {
-                ui.ctx().copy_text(text.clone());
-            }
-            if ui.button("清空").clicked() {
-                view.inputs_mut().clipboard_in = None;
-            }
-        });
-        // 只读展示：传一份临时副本并关掉交互，用户仍可选中复制。
-        let mut shown = text;
-        ui.add(
-            egui::TextEdit::multiline(&mut shown)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .interactive(false),
-        );
-    }
-}
-
-/// 文件面板：浏览被控端共享目录、下载、上传、查看传输进度。
-#[expect(clippy::cast_precision_loss, reason = "传输字节数有界，f32 进度条精度足够")]
-fn show_files(ui: &mut Ui, view: &mut RemoteView, manager: &Arc<RemoteManager>, state: &RemoteUiState) {
-    ui.separator();
-    egui::CollapsingHeader::new("文件传输")
-        .default_open(false)
-        .show(ui, |ui| {
-            let shown_dir = if state.remote_dir.is_empty() {
-                "/".to_owned()
-            } else {
-                state.remote_dir.clone()
-            };
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("当前目录：{shown_dir}")).weak().small());
-                if ui.button("上级").clicked() {
-                    manager.list_remote_dir(&parent_virtual(&state.remote_dir));
-                }
-                if ui.button("刷新").clicked() {
-                    manager.list_remote_dir(&state.remote_dir);
-                }
-            });
-
-            if state.remote_entries.is_empty() {
-                ui.label(RichText::new("（空目录或尚未加载，点「刷新」）").weak().small());
-            }
-            for entry in &state.remote_entries {
-                ui.horizontal(|ui| {
-                    let label = if entry.is_dir {
-                        format!("[目录] {}", entry.name)
-                    } else {
-                        entry.name.clone()
-                    };
-                    if ui.selectable_label(false, label).clicked() {
-                        if entry.is_dir {
-                            manager.list_remote_dir(&entry.path);
-                        } else {
-                            manager.download_remote_file(&entry.path);
-                        }
-                    }
-                    if !entry.is_dir {
-                        ui.label(RichText::new(format!("{} B", entry.size)).weak().small());
-                    }
-                });
-            }
-
-            ui.add_space(4.0);
-            // 上传：无原生文件选择器（不为此引入文件对话框依赖），只能手填本机绝对路径。
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("上传").weak().small());
-                ui.add(
-                    egui::TextEdit::singleline(&mut view.inputs_mut().upload_local)
-                        .desired_width(150.0)
-                        .hint_text("本机绝对路径"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut view.inputs_mut().upload_name)
-                        .desired_width(110.0)
-                        .hint_text("目标文件名"),
-                );
-                if ui.button("上传").clicked() {
-                    let local = view.inputs_mut().upload_local.clone();
-                    let name = view.inputs_mut().upload_name.clone();
-                    if !local.is_empty() && !name.is_empty() {
-                        let remote = join_virtual(&state.remote_dir, &name);
-                        manager.upload_local_file(std::path::PathBuf::from(local), &remote);
-                    }
-                }
-            });
-
-            if let Some(note) = &state.transfer_note {
-                ui.label(RichText::new(note.as_str()).weak().small());
-            }
-            for transfer in &state.transfers {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{}（{}）", transfer.name, transfer.direction.label()));
-                    let fraction = transfer.done as f32 / transfer.total.max(1) as f32;
-                    ui.add(egui::ProgressBar::new(fraction).desired_width(120.0));
-                    if ui.button("取消").clicked() {
-                        manager.cancel_transfer(transfer.id);
-                    }
-                });
-            }
-
-            if let Some(dir) = manager.share_dir() {
-                ui.label(RichText::new(format!("本机对外共享：{}", dir.display())).weak().small());
-            }
-        });
-}
-
-/// 虚拟路径的上一级（已在根时返回根 `""`）。
-fn parent_virtual(path: &str) -> String {
-    match path.trim_end_matches('/').rsplit_once('/') {
-        Some((parent, _)) => parent.to_owned(),
-        None => String::new(),
-    }
-}
-
-/// 把当前虚拟目录与文件名拼成完整虚拟路径。
-fn join_virtual(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{}/{}", dir.trim_end_matches('/'), name)
-    }
-}
-
 /// 可被远程控制的在线客户端列表 + 一键连接。
-fn show_peers(ui: &mut Ui, state: &RemoteUiState, manager: &Arc<RemoteManager>) {
+fn show_peers(ui: &mut Ui, state: &RemoteUiState, manager: &Arc<RemoteManager>, view: &Arc<Mutex<RemoteView>>) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -633,13 +453,22 @@ fn show_peers(ui: &mut Ui, state: &RemoteUiState, manager: &Arc<RemoteManager>) 
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("仅观看").clicked() {
-                            manager.request_connect(&peer.client_name, RemoteMode::ViewOnly);
+                            connect(view, manager, &peer.client_name, RemoteMode::ViewOnly);
                         }
                         if ui.button("连接").clicked() {
-                            manager.request_connect(&peer.client_name, RemoteMode::Control);
+                            connect(view, manager, &peer.client_name, RemoteMode::Control);
                         }
                     });
                 });
             }
         });
+}
+
+/// 发起连接，并记下重连目标（断线时据此自动重连到同一个对端与模式）。
+fn connect(view: &Arc<Mutex<RemoteView>>, manager: &Arc<RemoteManager>, client_name: &str, mode: RemoteMode) {
+    lock(view).reconnect.note_connect(ReconnectTarget {
+        client_name: client_name.to_owned(),
+        mode,
+    });
+    manager.request_connect(client_name, mode);
 }
