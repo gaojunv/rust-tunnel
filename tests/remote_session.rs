@@ -27,8 +27,9 @@ use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
 use rust_tunnel_common::remote_bridge::RemoteBridge;
 use rust_tunnel_remote::signaling::{LazyTransport, RustDeskTransport, SignalingConfig};
 use rust_tunnel_remote::{
-    ApprovalPolicy, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent,
-    MouseButton, RawFrame, RemoteManager, RemoteManagerConfig, RemoteResult, ScreenSource,
+    ApprovalPolicy, DecodedFrame, DisplayInfo, EncodeOptions, EstablishedStream, EstablishRequest, FrameSink,
+    InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteManager, RemoteManagerConfig, RemoteResult, Role,
+    ScreenSource, TransportEstablisher, TransportPath,
 };
 use std::collections::HashSet;
 use std::net::{TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
@@ -497,13 +498,16 @@ impl FrameSink for RecordingSink {
 }
 
 /// 构造一个连到本 harness 的 [`RemoteManager`]。
+///
+/// `establisher` 收 `Arc<dyn TransportEstablisher>`（而非具体类型）：既接受真实
+/// [`RustDeskTransport`]，也接受测试自己的包装建立器（见 [`CuttableEstablisher`]）。
 fn manager(
     server_host: &str,
     name: &str,
     enabled: bool,
     rd_id: &str,
     params: &RemoteParams,
-    transport: Arc<RustDeskTransport>,
+    establisher: Arc<dyn TransportEstablisher>,
 ) -> Arc<RemoteManager> {
     let mgr = RemoteManager::new(RemoteManagerConfig {
         server_host: server_host.to_owned(),
@@ -511,7 +515,7 @@ fn manager(
         platform: "linux".to_owned(),
         displays: 1,
         enabled,
-        establisher: transport,
+        establisher,
         encode: EncodeOptions {
             quality: 60,
             scale: 1.0,
@@ -567,6 +571,76 @@ fn manager_lazy(
         rd_id: rd_id.to_owned(),
     });
     mgr
+}
+
+/// 控制器侧的「可掐断」建立器：`establish` 转发给真实 [`RustDeskTransport`]，但把返回的流穿过
+/// 一条内存管道；测试可随时 [`Self::cut`] 丢弃桥接，让会话循环在收到任何数据之前先读到 **EOF**。
+///
+/// # 为什么必须这样构造「断线」
+///
+/// 普通收尾路径**总会尽力**发一条 `Bye`（`controller.rs` / `controlled.rs` 的 `BYE_TIMEOUT`
+/// 收尾），而收到 `Bye` 就等价于「对端主动结束」（`deliberate = true`）。因此 `abort_active`
+/// 这类**优雅**结束永远走不到 `deliberate = false`。真实的「断线/失败」是**粗鲁**断开——对端
+/// 进程崩溃、网线被拔——控制器在收到任何结束帧之前先读到裸 EOF / IO 错误。内存 e2e 里没法让
+/// 对端进程凭空消失，故用这层可丢弃的桥接来复现：掐断桥接 = 数据面瞬断。
+///
+/// 桥接只搬字节，两端之间那条**真实**的中继链路照常建立（握手、鉴权、加密都走真实路径），
+/// 只是多了一跳进程内转发，测试据此拿到一个断线开关。
+struct CuttableEstablisher {
+    /// 真正的中继建立器。
+    inner: Arc<RustDeskTransport>,
+    /// 桥接任务句柄；`cut` 时 abort 之，管道两端随之关闭、会话循环读到 EOF。
+    bridge: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl CuttableEstablisher {
+    fn new(inner: Arc<RustDeskTransport>) -> Self {
+        Self {
+            inner,
+            bridge: Mutex::new(None),
+        }
+    }
+
+    /// 粗鲁切断数据面（模拟对端崩溃 / 掉线）。
+    fn cut(&self) {
+        if let Some(handle) = self.bridge.lock().expect("桥接锁").take() {
+            handle.abort();
+        }
+    }
+}
+
+/// `#[async_trait]` 脱糖后的 `establish` 返回类型。
+///
+/// 根元包的 `tests/` 不能新增 dev-dep（`async-trait` 未列入），所以这里**手写**展开后的
+/// `Pin<Box<dyn Future + Send>>` 形态来直接实现 trait，而不是加 `#[async_trait]` 标注。
+type BoxedEstablish<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RemoteResult<EstablishedStream>> + Send + 'a>>;
+
+impl TransportEstablisher for CuttableEstablisher {
+    fn establish<'life0, 'async_trait>(
+        &'life0 self,
+        request: EstablishRequest,
+        role: Role,
+    ) -> BoxedEstablish<'async_trait>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let established = self.inner.establish(request, role).await?;
+            let (local, mut remote) = tokio::io::duplex(256 * 1024);
+            let mut real = established.stream;
+            let handle = tokio::spawn(async move {
+                // 双向搬运；任一端关闭即返回，两个管道端随之 drop。
+                let _ = tokio::io::copy_bidirectional(&mut real, &mut remote).await;
+            });
+            *self.bridge.lock().expect("桥接锁") = Some(handle);
+            Ok(EstablishedStream {
+                stream: Box::new(local),
+                path: established.path,
+            })
+        })
+    }
 }
 
 /// B 部分：真实 hbbs/hbbr + 两个 RemoteManager，走中继路径建立会话并往返画面/输入。
@@ -669,6 +743,43 @@ async fn data_plane_relay_session_between_two_managers() {
         "应收到显示器列表"
     );
 
+    // ── 阶段 3 新增①：数据面路径如实上报 ────────────────────────────────
+    // 本链路 `always_use_relay = true`，两端都实打实走 hbbr 中继，`transport` 就必须报
+    // [`TransportPath::Relay`]。建立方若把「实际走了中继」谎报成 `Direct`，UI 会向用户宣称一条
+    // 根本不存在的内网直连，误导「为什么这么慢」的判断。这是 `EstablishedStream::path` →
+    // `RemoteUiState::transport` 这条透传链路的真实网络版对照（内存版见 `crates/remote` 的
+    // `controller_records_transport_path`）。两侧都断言：控制器与被控端各自独立回报路径。
+    assert!(
+        wait_within(Duration::from_secs(3), || ctrl.snapshot().transport == Some(TransportPath::Relay)).await,
+        "控制器应如实上报中继路径，实得 {:?}",
+        ctrl.snapshot().transport
+    );
+    assert!(
+        wait_within(Duration::from_secs(3), || ctld.snapshot().transport == Some(TransportPath::Relay)).await,
+        "被控端应如实上报中继路径，实得 {:?}",
+        ctld.snapshot().transport
+    );
+
+    // ── 阶段 3 新增②：延迟读数「开窗即有」 ──────────────────────────────
+    // 会话循环**复用既有** `Heartbeat` → `HeartbeatAck` 往返测 RTT（数据面变体一个都不加），
+    // 经 `SessionStatsReporter` 上报，管理器 EMA 平滑后写入 `latency_ms`。本断言的关键不是「有
+    // 读数」，而是「**很快**有」：心跳 interval 的首个 tick **立即到期**，所以会话一建立就有样本。
+    // 这里 3s 的上限远小于 `HEARTBEAT_INTERVAL`（10s）——把心跳起点改回 `now + HEARTBEAT_INTERVAL`
+    // （首个样本要等满一个周期）必然让本断言超时。回环 + hbbr 中继的 RTT 只可能是亚毫秒到毫秒级，
+    // 2000ms 是宽松上限。两侧各跑一次心跳循环，故两侧都应有读数。
+    assert!(
+        wait_within(Duration::from_secs(3), || ctrl.snapshot().latency_ms.is_some()).await,
+        "控制器应在会话建立后 3s 内就有延迟读数（首个心跳 tick 立即到期），实得 {:?}",
+        ctrl.snapshot().latency_ms
+    );
+    let latency = ctrl.snapshot().latency_ms.expect("刚断言过有读数");
+    assert!(latency < 2000, "中继回环延迟应是合理小值，实得 {latency}ms");
+    assert!(
+        wait_within(Duration::from_secs(3), || ctld.snapshot().latency_ms.is_some()).await,
+        "被控端应在会话建立后 3s 内就有延迟读数，实得 {:?}",
+        ctld.snapshot().latency_ms
+    );
+
     // 控制器回传输入 → 被控端注入。
     ctrl.send_input(InputEvent::MouseMove {
         x: 10,
@@ -699,8 +810,144 @@ async fn data_plane_relay_session_between_two_managers() {
     assert!(ctrl.snapshot().active.is_none(), "控制器 active 应清空");
     assert!(ctld.snapshot().active.is_none(), "被控端 active 应清空");
 
+    // ── 阶段 3 新增③：会话结束语义（`deliberate` 是断线重连的唯一判据）──────────
+    // 用户主动中断是**主动结束**，`deliberate` 必须为 `true`。`client-gui` 的断线自动重连**只**
+    // 看这一个布尔（见 `crates/client-gui/src/remote/reconnect.rs::on_session_end`）：判成
+    // `false` 会把「用户点了挂断」当成一次断线而自动重连回来。
+    //
+    // 这里断言**被控端**侧的快照：控制器 `abort_active()` 后数据面 `Bye` 会把这次「主动结束」
+    // 传过去，被控端据此记录 `deliberate = true`。（控制器**自身**主动中断后其 `session_end`
+    // 不被写入——`abort_active` → `conclude_session` 先清空 `active`，会话任务随后返回时
+    // `finish_session` 因 `active` 已空而早退、丢弃了那个 `SessionEnd`。这是本阶段发现的引擎侧
+    // 问题，已在交付说明中记录；不在这里把它放宽成同义反复的断言。）
+    //
+    // 被控端 `active` 置空与 `session_end` 写入发生在**同一个** `update_ui` 闭包里
+    // （`finish_session`），所以上面那轮轮询退出时 `session_end` 必然已就位，无需再等。
+    //
+    // **不断言**结束原因字符串：控制器侧收尾时，`cancel`（→「用户中断」）与命令通道被
+    // `conclude_session` 关掉（→「会话命令通道已关闭」）是 `select!` 里的两个竞速分支，
+    // 结束原因因此不确定（两条都是本端主动收尾）。被控端经 `Bye` 收到的永远是 `deliberate=true`，
+    // 这才是本条要锁的不变量。
+    let (end_sid, end) = ctld
+        .snapshot()
+        .session_end
+        .expect("被控端应记录到一次会话结束");
+    assert_eq!(end_sid, "sess-1", "session_end 应指向本次会话");
+    assert!(end.deliberate, "用户主动中断应记为 deliberate=true，实得 {end:?}");
+    assert!(!end.reason.is_empty(), "结束原因不应为空，实得 {end:?}");
+
     // 传输现在靠 `Drop` 取消后台登记/直连任务（见 `signaling.rs` 的 `impl Drop`）；本用例断言
     // 已完成，两个 `Arc<RustDeskTransport>` 随函数结束一起释放即可，无需显式关闭。
+    drop((ctrl_transport, ctld_transport));
+}
+
+/// B 部分续：数据面被**粗鲁切断**时，控制器必须把结束记成 `deliberate = false`。
+///
+/// 锁的不变量：`SessionEnd.deliberate` 是断线自动重连的**唯一**判据（`client-gui` 的
+/// `reconnect.rs::on_session_end`）——`false` 才触发重连、`true` 不触发。优雅收尾永远带一条
+/// `Bye`（`deliberate = true`），所以「断线」只能走**裸 EOF / IO 错误**这条路径；把它错记成
+/// `true`，一次真实的网络闪断就会被当成「用户主动挂断」而**永不重连**（用户看到画面卡死后
+/// 再无反应）。这里用 [`CuttableEstablisher`] 强制走这条路径：真实中继链路照常建立，随后
+/// 掐断桥接模拟对端掉线。
+#[tokio::test]
+async fn abrupt_disconnect_is_recorded_as_non_deliberate_end() {
+    let harness = TestHarness::spawn(HarnessOpts::default()).await;
+    let ports = alloc_rustdesk_ports();
+    // always_use_relay=true：强制中继（回环两端同 IP 会被 hbbs 判成同内网走直连）。
+    let resp = enable(&harness.api_client(), &ports, true).await;
+    let public_key = resp["key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("generate_key 应回传公钥: {resp}"))
+        .to_owned();
+
+    let server_host = harness.control_addr.to_string();
+    let params = RemoteParams {
+        rendezvous_host: String::new(),
+        rendezvous_port: ports.rendezvous,
+        relay_port: ports.relay,
+        relay_server: String::new(),
+        public_key,
+        always_use_relay: true,
+    };
+
+    let ctrl_transport = RustDeskTransport::new(SignalingConfig::from_params(
+        &params,
+        "111111111".to_owned(),
+        &server_host,
+    ))
+    .await
+    .expect("构造控制器传输");
+    let ctld_transport = RustDeskTransport::new(SignalingConfig::from_params(
+        &params,
+        "222222222".to_owned(),
+        &server_host,
+    ))
+    .await
+    .expect("构造被控端传输");
+
+    // 控制器侧套一层可掐断的桥接；被控端用真实传输——它的正常收尾 `Bye` 会被已断的桥接吞掉，
+    // 于是控制器只看到裸 EOF，正是「断线」而非「对端主动结束」。
+    let cuttable = Arc::new(CuttableEstablisher::new(ctrl_transport.clone()));
+    let ctrl = manager(&server_host, "home-nas", false, "111111111", &params, cuttable.clone());
+    let ctld = manager(&server_host, "office-pc", true, "222222222", &params, ctld_transport.clone());
+
+    let (ctrl_sink, mut frame_rx) = RecordingSink::with_notify();
+    let (ctld_input, _input_rx) = RecordingInput::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), ctld_input);
+
+    let (ctrl_tx, _ctrl_upstream) = mpsc::channel(64);
+    let (ctld_tx, mut ctld_upstream) = mpsc::channel(64);
+    ctrl.attach(ctrl_tx);
+    ctld.attach(ctld_tx);
+
+    // 等两端在 hbbs 登记完成再发起（原因同 B 部分：UDP 登记没有 ack）。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    ctrl.handle_control_message(ControlMessage::RemoteConnectGrant {
+        session_id: "sess-drop".to_owned(),
+        token: "tok-drop".to_owned(),
+        target_rd_id: "222222222".to_owned(),
+        target_platform: "linux".to_owned(),
+        params: params.clone(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteSessionIncoming {
+        session_id: "sess-drop".to_owned(),
+        token: "tok-drop".to_owned(),
+        from_name: "home-nas".to_owned(),
+        mode: RemoteMode::Control,
+    });
+    relay_acceptance(&mut ctld_upstream, &ctrl).await;
+
+    // 先确认会话真的跑起来了（收到一帧并如实报了中继路径），否则后面的「断线」无从谈起。
+    tokio::time::timeout(WAIT, frame_rx.recv())
+        .await
+        .expect("等画面超时")
+        .expect("画面通道关闭");
+    assert!(
+        wait_within(Duration::from_secs(3), || ctrl.snapshot().transport == Some(TransportPath::Relay)).await,
+        "会话应经中继建立，实得 {:?}",
+        ctrl.snapshot().transport
+    );
+
+    // 粗鲁切断：控制器应在收到任何结束帧之前读到裸 EOF（对端掉线）→ deliberate=false。
+    cuttable.cut();
+
+    assert!(
+        wait_within(Duration::from_secs(5), || ctrl
+            .snapshot()
+            .session_end
+            .as_ref()
+            .is_some_and(|(sid, end)| sid == "sess-drop" && !end.deliberate))
+        .await,
+        "断线必须记为 deliberate=false（否则断线自动重连永远不会触发），实得 {:?}",
+        ctrl.snapshot().session_end
+    );
+    let snap = ctrl.snapshot();
+    assert!(snap.active.is_none(), "断线后控制器 active 应清空");
+    assert_eq!(snap.transport, None, "会话结束后路径读数应清零");
+    assert_eq!(snap.latency_ms, None, "会话结束后延迟读数应清零");
+
     drop((ctrl_transport, ctld_transport));
 }
 
@@ -794,6 +1041,24 @@ async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     cond()
+}
+
+/// 在 `budget` 内轮询等待条件成立；超时返回条件的最终值。
+///
+/// 与 [`wait_for`]（上限 10s）分开，是为了让「延迟读数必须**很快**出现」这类断言真的能失败：
+/// 它的上限必须明显小于 `HEARTBEAT_INTERVAL`（10s），否则把心跳起点写成「延迟一个周期到期」也
+/// 照样通过——断言就锁不住「首个 tick 立即到期」这条不变量。
+async fn wait_within(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// 起一个直接挂在**真实控制通道**上的 [`RemoteManager`]（桥接就是 manager 本身）。
