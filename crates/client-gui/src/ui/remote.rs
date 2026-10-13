@@ -12,7 +12,7 @@ use rust_tunnel_remote::{ApprovalPolicy, RemoteManager, RemoteUiState, SessionRo
 
 use crate::app::AppState;
 use crate::remote::{self, PermissionKind, ReconnectTarget, RemoteView};
-use crate::ui::session_window::{latency_color, transport_label, viewport_id};
+use crate::ui::session_window::{format_kbps, latency_color, transport_label, viewport_id};
 
 /// 会话状态中文标签。
 pub fn state_label(state: SessionState) -> &'static str {
@@ -220,7 +220,7 @@ fn show_session(
     ui.add_space(8.0);
 }
 
-/// 延迟（按阈值上色）与数据面路径。
+/// 延迟（按阈值上色）与数据面路径；本端作为**被控端**时另有编码侧读数（阶段 3 QoS）。
 fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
     match state.latency_ms {
         Some(ms) => {
@@ -232,6 +232,13 @@ fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
     }
     if let Some(path) = state.transport {
         ui.label(RichText::new(format!("路径 {}", transport_label(path))).weak().small());
+    }
+    // 被控端编码侧读数（由编码任务每秒经进程内通道上报）：编码耗时 / 实测帧率 / 当前生效码率。
+    // 控制器侧恒为 `None`，此处不显示。
+    if let Some(ms) = state.encode_ms {
+        let fps = state.encode_fps.map_or("—".to_owned(), |f| format!("{f} fps"));
+        let kbps = state.encode_kbps.map_or("—".to_owned(), format_kbps);
+        ui.label(RichText::new(format!("编码 {ms} ms · {fps} · {kbps}")).weak().small());
     }
 }
 

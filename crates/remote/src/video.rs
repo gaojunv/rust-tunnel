@@ -378,6 +378,42 @@ impl VideoEncoder {
         (self.width, self.height)
     }
 
+    /// 当前生效的目标码率（kbps）。
+    #[must_use]
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.inner.bitrate_kbps()
+    }
+
+    /// 当前生效的帧率。
+    #[must_use]
+    pub fn fps(&self) -> u32 {
+        self.inner.fps()
+    }
+
+    /// **在线**重配置目标码率（不重建编码器、不插 IDR）。
+    ///
+    /// QoS 闭环（AIMD）每秒动一次码率，走的就是这条路（vendor 补丁 6 → `vpx_codec_enc_config_set`）。
+    /// **绝不能改成重建编码器**：重建会强制一个 IDR，闭环每秒一个关键帧，正好把阶段 2 消掉的
+    /// 带宽尖峰引回来。
+    ///
+    /// # Errors
+    /// libvpx 拒绝该配置时返回 [`RemoteError::Encode`]（调用方应丢弃编码器、下一帧重建）。
+    pub fn set_bitrate(&mut self, kbps: u32) -> RemoteResult<()> {
+        self.inner
+            .set_bitrate(kbps)
+            .map_err(|err| RemoteError::Encode(format!("在线改码率失败: {err}")))
+    }
+
+    /// **在线**重配置帧率（不重建编码器、不插 IDR）。同 [`VideoEncoder::set_bitrate`]。
+    ///
+    /// # Errors
+    /// libvpx 拒绝该配置时返回 [`RemoteError::Encode`]。
+    pub fn set_fps(&mut self, fps: u8) -> RemoteResult<()> {
+        self.inner
+            .set_fps(u32::from(fps))
+            .map_err(|err| RemoteError::Encode(format!("在线改帧率失败: {err}")))
+    }
+
     /// 把一帧 `src_width × src_height` 的 RGBA 编码成 VP9。
     ///
     /// `force_keyframe` 为真时本帧必为 IDR（会话首帧、配置变更、收到 `RequestKeyframe`）。

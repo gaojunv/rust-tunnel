@@ -16,11 +16,19 @@
 //! 的 P 帧，后续引用它的帧在解码端永远解不出来（花屏且不自愈，只能等下一个 IDR）。所以背压的
 //! 出口只能放在**编码之前**——输出队列满就跳过这一帧（等价于降帧率，语义合法），绝不在编码之后
 //! 丢弃。**不要把这条改成「编码后丢弃」，那不是优化，是花屏。**
+//!
+//! # QoS 闭环（阶段 3）
+//!
+//! 主循环持有 [`RateController`]（AIMD）：每收到一条控制器的 `QosFeedback` 就决策一次，把新的
+//! **生效值**（[`EncodeRates`]）交给下一次编码任务。码率/帧率变化由编码任务**在线重配置**
+//! （vendor 补丁 6），**不重建、不插 IDR**；只有降编码分辨率（几何变化）才重建 + 强制 IDR。
+//! 详见 [`crate::qos`] 的模块文档。
 
 use crate::auth::{ack_mac, PendingSessions};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{Clipboard, EncodeOptions, InputSink, RawFrame, ScreenSource};
+use crate::qos::{Feedback, RateController};
+use crate::screen::{Clipboard, EncodeOptions, EncodeRates, InputSink, RawFrame, ScreenSource};
 use crate::session::{
     trusted_rtt, CodecId, SessionCodec, SessionEnd, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL,
     SESSION_PROTO_VERSION, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
@@ -51,6 +59,9 @@ const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 画面帧是大头（可达 MiB 级），队列过深会在写侧卡住时把内存顶上去；过浅则正常突发下容易丢帧。
 /// 4 足以吸收一次采集与心跳的抖动，同时把最坏内存压在「4 × 单帧」量级。
 const WRITER_QUEUE: usize = 4;
+
+/// 编码侧读数的上报间隔（见 [`EncodeStatsWindow`]）。
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 投给出站写任务的一条消息。
 enum WriterMsg {
@@ -93,7 +104,10 @@ pub struct ControlledConfig {
     pub mode: RemoteMode,
     /// 挂起会话表（握手鉴权用）。
     pub pending: Arc<PendingSessions>,
-    /// 屏幕编码参数（会话中可被控制器的 `SetQuality` 覆盖）。
+    /// 屏幕编码参数**上限**（会话中可被控制器的 `SetQuality` 覆盖）。
+    ///
+    /// 自阶段 3 起它是档位**上限**，不是实际生效值——实际值由 QoS 闭环
+    /// （[`crate::qos::RateController`]）在上限之下浮动，见 [`crate::screen::EncodeRates`]。
     pub encode: EncodeOptions,
     /// 在途采集的看门狗时限（见 [`CAPTURE_WATCHDOG`]）。
     ///
@@ -208,11 +222,19 @@ pub async fn run_controlled(
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
     let (encode_tx, encode_rx) = mpsc::channel::<EncodeJob>(1);
-    let encode_task = tokio::spawn(encode_loop(encode_rx, tx.clone(), cancel.clone()));
+    let encode_task = tokio::spawn(encode_loop(
+        encode_rx,
+        tx.clone(),
+        cancel.clone(),
+        config.stats.clone(),
+    ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
-    let mut encode = config.encode;
+    // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
+    // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
+    let mut rate = RateController::new(config.encode);
+    let mut encode = rate.current();
     let mut display_id = displays
         .iter()
         .find(|d| d.primary)
@@ -269,11 +291,12 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { generation, .. }) if generation != capture_generation => {
                         debug!(generation, "丢弃过期的采集结果");
                     }
-                    Some(CaptureOutcome { frame, .. }) => {
+                    Some(CaptureOutcome { frame, capture_ms, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
                         if let Some(frame) = frame {
-                            let job = EncodeJob { display: display_id, encode, force_keyframe, frame };
+                            debug!(capture_ms, "采集一帧");
+                            let job = EncodeJob { display: display_id, rates: encode, force_keyframe, frame };
                             // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
                             // 帧（等价降帧率）。关键帧请求保留到真正投递成功的那一次。
                             match encode_tx.try_send(job) {
@@ -359,9 +382,42 @@ pub async fn run_controlled(
                             }
                         }
                         SessionMessage::SetQuality { preset } => {
-                            encode = preset.options();
+                            // 档位是**上限**：换上限并把闭环重置到新上限（用户显式意图，不带降级历史）。
+                            rate.set_ceiling(preset.options());
+                            encode = rate.current();
                             capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
                             force_keyframe = true;
+                        }
+                        SessionMessage::QosFeedback { rtt_ms, recv_kbps, decode_ms, backlog } => {
+                            // 控制器的每秒反馈 + 本端出站队列积压 → 一次 AIMD 决策。
+                            // **码率/帧率走在线重配置（不重建、不插 IDR）**，只有降分辨率才置
+                            // `force_keyframe`（几何变化，见 [`crate::qos`]）。
+                            let local_backlog =
+                                u32::try_from(WRITER_QUEUE.saturating_sub(tx.capacity())).unwrap_or(u32::MAX);
+                            let decision = rate.on_feedback(
+                                Feedback { rtt_ms, recv_kbps, decode_ms, backlog },
+                                local_backlog,
+                            );
+                            if decision.rates.fps != encode.fps {
+                                // 帧率变了：采集节拍要立刻跟着变（与 `SetQuality` 同款）。
+                                capture_tick.as_mut().reset(Instant::now() + decision.rates.capture_interval());
+                            }
+                            encode = decision.rates;
+                            if decision.force_keyframe {
+                                force_keyframe = true;
+                            }
+                            debug!(
+                                rtt_ms,
+                                recv_kbps,
+                                decode_ms,
+                                backlog,
+                                local_backlog,
+                                action = ?decision.action,
+                                bitrate_kbps = encode.bitrate_kbps,
+                                fps = encode.fps,
+                                scale = encode.scale,
+                                "QoS 决策"
+                            );
                         }
                         SessionMessage::RequestKeyframe { display } => {
                             // 控制器解码失败/丢弃了参考帧时的恢复请求。
@@ -580,17 +636,20 @@ struct CaptureOutcome {
     generation: u64,
     /// 采集到的原始帧；采集失败时为 `None`。
     frame: Option<RawFrame>,
+    /// 本次采集耗时（毫秒；采集失败时也记实际耗时）。**测量**用，不参与控制决策。
+    capture_ms: u64,
 }
 
 /// 交给编码任务的一帧。
 ///
-/// `display`/`encode`/`force_keyframe` 由会话循环带上：编码任务据此判断是否需要重建编码器
-/// （尺寸/码率/帧率变化）与是否强制关键帧（首帧、切显示器、切档位、`RequestKeyframe`）。
+/// `display`/`rates`/`force_keyframe` 由会话循环带上：编码任务据此判断是否需要**重建**编码器
+/// （只有几何变化才重建）与是否强制关键帧（首帧、切显示器、切档位、`RequestKeyframe`、降分辨率）。
+/// **码率/帧率不触发重建**——它们在编码任务里在线重配置（见 [`encode_loop`]）。
 struct EncodeJob {
     /// 来源显示器编号。
     display: u32,
-    /// 当前编码参数。
-    encode: EncodeOptions,
+    /// 当前**生效**编码参数（≤ 档位上限）。
+    rates: EncodeRates,
     /// 本帧是否强制关键帧。
     force_keyframe: bool,
     /// 原始帧。
@@ -606,6 +665,7 @@ struct EncodeJob {
 /// 本函数**可能 panic**（平台实现 bug）：`spawn_blocking` 的 `JoinHandle` 被丢弃后 panic 会被
 /// 吞掉、结果永不回传，由调用方的看门狗兜底（见 [`CAPTURE_WATCHDOG`]）。
 fn run_capture(screen: &dyn ScreenSource, display: u32, generation: u64, tx: &mpsc::Sender<CaptureOutcome>) {
+    let started = Instant::now();
     let frame = match screen.capture(display) {
         Ok(frame) => Some(frame),
         Err(err) => {
@@ -613,11 +673,77 @@ fn run_capture(screen: &dyn ScreenSource, display: u32, generation: u64, tx: &mp
             None
         }
     };
+    let capture_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     // 接收端随会话循环存活；会话已结束时发送失败是正常的，忽略。
-    let _ = tx.blocking_send(CaptureOutcome { generation, frame });
+    let _ = tx.blocking_send(CaptureOutcome {
+        generation,
+        frame,
+        capture_ms,
+    });
 }
 
-/// 编码任务：独占编码器，去重 → 编码 → 投递。
+/// 编码侧读数累加器：按 [`STATS_INTERVAL`] 汇总一次，经进程内 [`SessionStatsReporter`] 送到 UI。
+///
+/// **不进热路径的锁**：只在编码任务里累加几个整数，到点发一条无界通道消息（接收端缺席即丢弃）。
+struct EncodeStatsWindow {
+    /// 本窗口起点。
+    start: Instant,
+    /// 本窗口编码成功的帧数。
+    frames: u32,
+    /// 本窗口出码字节数。
+    bytes: u64,
+    /// 本窗口编码耗时合计（毫秒）。
+    encode_ms: u64,
+}
+
+impl EncodeStatsWindow {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            frames: 0,
+            bytes: 0,
+            encode_ms: 0,
+        }
+    }
+
+    /// 记一帧的产出与耗时。
+    fn record(&mut self, bytes: usize, encode_ms: u64) {
+        self.frames = self.frames.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.encode_ms = self.encode_ms.saturating_add(encode_ms);
+    }
+
+    /// 到点则上报一次并重置窗口。`bitrate_kbps` 是**当前生效的目标码率**（闭环值，非实测出码率）。
+    fn maybe_report(&mut self, stats: &SessionStatsReporter, bitrate_kbps: u32) {
+        let elapsed = self.start.elapsed();
+        if elapsed < STATS_INTERVAL {
+            return;
+        }
+        let secs = elapsed.as_secs_f64().max(f64::EPSILON);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "帧率为有界非负值，取整后落在 u32 内"
+        )]
+        let fps = (f64::from(self.frames) / secs).round() as u32;
+        let encode_ms = if self.frames == 0 {
+            0
+        } else {
+            u32::try_from(self.encode_ms / u64::from(self.frames)).unwrap_or(u32::MAX)
+        };
+        stats.report(SessionStats::Encode {
+            encode_ms,
+            fps,
+            bitrate_kbps,
+        });
+        self.start = Instant::now();
+        self.frames = 0;
+        self.bytes = 0;
+        self.encode_ms = 0;
+    }
+}
+
+/// 编码任务：独占编码器，去重 → （在线重配置）→ 编码 → 投递。
 ///
 /// # 丢弃策略（**改动前先读模块文档**）
 ///
@@ -625,17 +751,28 @@ fn run_capture(screen: &dyn ScreenSource, display: u32, generation: u64, tx: &mp
 ///   不转换、不编码、不发送。这是「带宽趋零」的唯一来源。
 /// - **输出队列满 → 在编码之前跳过这一帧**（等价降帧率）。**绝不**先编码再丢弃：时域编码的
 ///   参考链是串起来的，丢掉一个已编码的 P 帧会让后续引用它的帧在解码端永远解不出来。
-/// - 配置（编码尺寸/码率/帧率）变化时重建编码器，并在尺寸变化时重发 `ScreenConfig`。
+///
+/// # 重建 vs 在线重配置（**本阶段最容易踩的坑**）
+///
+/// 只有**几何**（编码宽高，即 `rates.scale` 推出的尺寸）变化才重建编码器并重发 `ScreenConfig`。
+/// **码率 / 帧率变化走 [`VideoEncoder::set_bitrate`] / [`VideoEncoder::set_fps`] 在线重配置，
+/// 不重建、不插 IDR**。把码率放进重建键会让 AIMD 每秒插一个关键帧，正好把阶段 2 消掉的带宽
+/// 尖峰引回来（见 `vendor/shiguredo_libvpx` 的补丁 6 与 [`crate::qos`]）。
 #[expect(
     clippy::too_many_lines,
-    reason = "去重 → 配置重建 → 编码 → 投递是一条不可分割的流水线，拆成多个函数反而要来回传编码器与基准状态"
+    reason = "去重 → 几何重建 → 在线重配置 → 编码 → 投递是一条不可分割的流水线，拆成多个函数反而要来回传编码器与基准状态"
 )]
-async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<WriterMsg>, cancel: CancellationToken) {
+async fn encode_loop(
+    mut rx: mpsc::Receiver<EncodeJob>,
+    out: mpsc::Sender<WriterMsg>,
+    cancel: CancellationToken,
+    stats: SessionStatsReporter,
+) {
     let mut encoder: Option<VideoEncoder> = None;
+    // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
+    let mut encoder_dims: Option<(u32, u32)> = None;
     // 上一帧的原始 RGBA（去重基准）。保留它是去重的定义：memcmp 远快于密码学哈希。
     let mut prev_rgba: Option<Vec<u8>> = None;
-    // 当前编码器的配置键 `(宽, 高, 目标码率 kbps, 帧率)`；变化即重建。
-    let mut config_key: Option<(u32, u32, u32, u8)> = None;
     // 已下发的 `ScreenConfig` 尺寸；变化时重发。
     let mut sent_dims: Option<(u32, u32)> = None;
     // 因出站队列满而被跳过的那一帧若曾要求关键帧，这里记下来，**下一帧编码时补上**。
@@ -645,6 +782,7 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
     // 用户看到的是「画面卡住十几秒」。关键帧请求不能因为一次背压丢弃而蒸发。
     let mut pending_keyframe = false;
     let mut seq: u64 = 0;
+    let mut window = EncodeStatsWindow::new();
 
     while let Some(job) = rx.recv().await {
         if cancel.is_cancelled() {
@@ -652,15 +790,17 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
         }
         let EncodeJob {
             display,
-            encode,
+            rates,
             force_keyframe,
             frame,
         } = job;
-        let (width, height) = encode_dimensions(frame.width, frame.height, encode.scale, MAX_ENCODE_WIDTH);
-        let key = (width, height, encode.target_bitrate_kbps, encode.max_fps);
-        let rebuild = config_key != Some(key);
-        if rebuild {
-            // 尺寸变化才需要重发 `ScreenConfig`（码率/帧率变化不影响几何）。
+        // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
+        window.maybe_report(&stats, rates.bitrate_kbps);
+
+        let (width, height) = encode_dimensions(frame.width, frame.height, rates.scale, MAX_ENCODE_WIDTH);
+        // **几何变化才重建**：码率/帧率在下方在线重配置。
+        let geometry_changed = encoder_dims != Some((width, height));
+        if geometry_changed {
             if sent_dims != Some((width, height)) {
                 let config = SessionMessage::ScreenConfig {
                     display,
@@ -675,9 +815,9 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
             }
             encoder = None;
             prev_rgba = None;
-            config_key = Some(key);
+            encoder_dims = Some((width, height));
         }
-        let force = force_keyframe || rebuild || pending_keyframe;
+        let force = force_keyframe || geometry_changed || pending_keyframe;
 
         // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
         if !force && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
@@ -691,7 +831,7 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
             continue;
         }
         if encoder.is_none() {
-            match VideoEncoder::new(width, height, encode.target_bitrate_kbps, encode.max_fps) {
+            match VideoEncoder::new(width, height, rates.bitrate_kbps, rates.fps) {
                 Ok(enc) => encoder = Some(enc),
                 Err(err) => {
                     warn!(error = %err, "编码器创建失败，跳过本帧");
@@ -705,10 +845,12 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
         };
         let (src_width, src_height) = (frame.width, frame.height);
         let rgba = frame.rgba;
+        let started = Instant::now();
         // 编码是阻塞调用，移出 async worker；编码器随闭包移入、随结果移出（独占持有）。
+        // 码率/帧率的在线重配置也在这里做（`reconfig_and_encode`），与编码同一次阻塞调用。
         let joined = tokio::task::spawn_blocking(move || {
             let mut enc = enc;
-            let result = enc.encode(&rgba, src_width, src_height, force);
+            let result = reconfig_and_encode(&mut enc, &rates, &rgba, src_width, src_height, force);
             (enc, result, rgba)
         })
         .await;
@@ -722,6 +864,7 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
                 continue;
             }
         };
+        let encode_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match result {
             Ok(packet) => {
                 encoder = Some(enc);
@@ -732,8 +875,9 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
                     continue;
                 }
                 seq = seq.wrapping_add(1);
+                window.record(packet.data.len(), encode_ms);
                 let mut flags = 0u8;
-                if rebuild {
+                if geometry_changed {
                     flags |= VIDEO_FLAG_CONFIG;
                 }
                 if packet.keyframe {
@@ -753,7 +897,8 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
                 }
             }
             Err(err) => {
-                // 编码失败后编码器内部状态不可信：丢弃它，下一帧重建（并因 `rebuild` 强制关键帧）。
+                // 编码/重配置失败后编码器内部状态不可信：丢弃它，下一帧重建（几何未变，但
+                // `pending_keyframe` 会强制关键帧）。
                 warn!(error = %err, "画面编码失败，重建编码器");
                 encoder = None;
                 prev_rgba = None;
@@ -762,6 +907,30 @@ async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<Writer
             }
         }
     }
+}
+
+/// 先在线重配置码率/帧率（若与编码器当前值不同），再编码。
+///
+/// **绝不重建编码器**：重建会强制 IDR，闭环每秒动一次就是每秒一个关键帧。几何不变时
+/// `set_bitrate` / `set_fps` 走 vendor 补丁 6（`vpx_codec_enc_config_set`）。
+///
+/// # Errors
+/// libvpx 拒绝重配置或编码失败时返回 [`RemoteError::Encode`]（调用方丢弃编码器、下一帧重建）。
+fn reconfig_and_encode(
+    enc: &mut VideoEncoder,
+    rates: &EncodeRates,
+    rgba: &[u8],
+    src_width: u32,
+    src_height: u32,
+    force: bool,
+) -> RemoteResult<crate::video::EncodedVideo> {
+    if enc.bitrate_kbps() != rates.bitrate_kbps {
+        enc.set_bitrate(rates.bitrate_kbps)?;
+    }
+    if enc.fps() != u32::from(rates.fps) {
+        enc.set_fps(rates.fps)?;
+    }
+    enc.encode(rgba, src_width, src_height, force)
 }
 
 /// 把一帧画面消息投给出站写任务，**绝不丢弃**。
@@ -898,7 +1067,8 @@ mod tests {
     use crate::crypto::{derive_session_keys, Cipher};
     use crate::error::RemoteResult;
     use crate::screen::{
-        Clipboard, DisplayInfo, EncodeOptions, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, ScreenSource,
+        Clipboard, DisplayInfo, EncodeOptions, EncodeRates, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame,
+        ScreenSource,
     };
     use crate::session::{plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage};
     use crate::transfer::{TransferEvent, TransferHub};
@@ -1291,6 +1461,135 @@ mod tests {
         assert!(cond(), "等待条件超时");
     }
 
+    /// 取出下一个视频包（跳过 `ScreenConfig` 等非画面帧），返回 `(flags, width, height)`。
+    async fn next_video(out_rx: &mut mpsc::Receiver<WriterMsg>) -> (u8, u32, u32) {
+        loop {
+            match out_rx.recv().await {
+                Some(WriterMsg::Frame(SessionFrame {
+                    message: SessionMessage::VideoPacket { flags, width, height, .. },
+                    ..
+                })) => return (flags, width, height),
+                Some(_) => {}
+                None => panic!("出站队列已关闭"),
+            }
+        }
+    }
+
+    /// **阶段 3 关键不变量**：码率/帧率变化必须**在线重配置**——不重建编码器、不插 IDR。
+    ///
+    /// 锁住本阶段最容易踩的坑：把码率放进「重建键」会让 AIMD 每秒插一个关键帧，正好把阶段 2
+    /// 消掉的带宽尖峰引回来。几何不变时 `encode_loop` 只能走 `set_bitrate` / `set_fps`（补丁 6）。
+    #[tokio::test]
+    async fn rate_change_reconfigures_online_without_idr() {
+        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+        ));
+
+        let hi = EncodeRates::ceiling(EncodeOptions::default());
+        let lo = EncodeRates {
+            bitrate_kbps: 500,
+            fps: 8,
+            ..hi
+        };
+
+        // 首帧：强制关键帧（建立参考链）。
+        job_tx
+            .send(EncodeJob {
+                display: 0,
+                rates: hi,
+                force_keyframe: true,
+                frame: shaded(0, 64, 48, 10),
+            })
+            .await
+            .expect("投递首帧");
+        let (flags, w0, h0) = next_video(&mut out_rx).await;
+        assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "首帧应是关键帧");
+
+        // 同几何、改码率与帧率、内容变化：必须是 P 帧（在线重配置，不插 IDR）。
+        job_tx
+            .send(EncodeJob {
+                display: 0,
+                rates: lo,
+                force_keyframe: false,
+                frame: shaded(0, 64, 48, 40),
+            })
+            .await
+            .expect("投递改码率帧");
+        let (flags, w1, h1) = next_video(&mut out_rx).await;
+        assert_eq!(
+            flags & VIDEO_FLAG_KEYFRAME,
+            0,
+            "改码率/帧率不得插 IDR（否则闭环每秒一个关键帧）"
+        );
+        assert_eq!(
+            flags & VIDEO_FLAG_CONFIG,
+            0,
+            "码率/帧率变化不是几何变化，不应带 CONFIG 标志"
+        );
+        assert_eq!((w1, h1), (w0, h0), "码率变化不应改变编码尺寸");
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
+    /// **阶段 3 关键不变量**：降编码分辨率（几何变化）必须**重建 + 重发 ScreenConfig + 强制 IDR**。
+    ///
+    /// 与上一条相对：这是唯一允许插 IDR 的路径（AIMD 的「大幅下调」）。
+    #[tokio::test]
+    async fn resolution_change_rebuilds_and_forces_keyframe() {
+        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+        ));
+
+        let hi = EncodeRates::ceiling(EncodeOptions::default());
+        // scale 减半 → 编码尺寸减半（几何变化）。
+        let half = EncodeRates { scale: 0.5, ..hi };
+
+        job_tx
+            .send(EncodeJob {
+                display: 0,
+                rates: hi,
+                force_keyframe: true,
+                frame: shaded(0, 64, 48, 10),
+            })
+            .await
+            .expect("投递首帧");
+        let (_, w0, h0) = next_video(&mut out_rx).await;
+        assert_eq!((w0, h0), (64, 48));
+
+        job_tx
+            .send(EncodeJob {
+                display: 0,
+                rates: half,
+                force_keyframe: false,
+                frame: shaded(0, 64, 48, 40),
+            })
+            .await
+            .expect("投递降分辨率帧");
+        // 先应收到新的 `ScreenConfig`（32×24），再是关键帧。
+        let (flags, w1, h1) = next_video(&mut out_rx).await;
+        assert_eq!((w1, h1), (32, 24), "降分辨率应改变编码尺寸");
+        assert!(
+            flags & VIDEO_FLAG_KEYFRAME != 0,
+            "降分辨率（几何变化）必须强制关键帧"
+        );
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
     /// 被背压跳过的那一帧若曾要求关键帧，请求**不能蒸发**：下一帧必须补上 IDR。
     ///
     /// 少了这条，控制器进入 `awaiting_keyframe` 后只请求一次 IDR，若那一帧恰好因出站队列满被跳过，
@@ -1307,11 +1606,16 @@ mod tests {
         let filler = out_tx.clone();
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(JOB_CAP);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(encode_loop(job_rx, out_tx, cancel.clone()));
-        let opts = EncodeOptions::default();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+        ));
+        let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
             display: 0,
-            encode: opts,
+            rates: opts,
             force_keyframe: force,
             frame,
         };

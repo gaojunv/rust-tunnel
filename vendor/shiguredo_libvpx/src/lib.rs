@@ -828,6 +828,20 @@ pub struct Encoder {
     deadline: EncodingDeadline,
     image_format: ImageFormat,
     plane_sizes: PlaneSizes,
+
+    // PATCH: 初期化に使った `vpx_codec_enc_cfg_t` のコピーを保持する。
+    //
+    // 动机：`vpx_codec_enc_config_set` は「アプリ側が保持する cfg を渡す」設計
+    // （libvpx の公式サンプルもそうしている）。保持しないと、実行期の再設定で
+    // `vpx_codec_enc_config_default` から作り直すことになり、そこには
+    // g_w/g_h/g_profile など**設定してはいけない**既定値（0 など）が入るため、
+    // 幾何・プロファイルを壊してしまう。
+    //
+    // 上游原本的行为：初期化後は cfg を破棄し、実行期の再設定口が無い。
+    //
+    // 去掉它会怎样：`Encoder::set_bitrate` / `set_fps` が成立せず、QoS 闭环は
+    // エンコーダ再構築（= 毎回 IDR）に頼らざるを得なくなる。
+    enc_cfg: sys::vpx_codec_enc_cfg,
 }
 
 impl Encoder {
@@ -1027,6 +1041,8 @@ impl Encoder {
                 deadline: encoder_config.deadline,
                 image_format: encoder_config.image_format,
                 plane_sizes,
+                // PATCH: 保持 cfg のコピー（`Encoder::set_bitrate` / `set_fps` が使う）。
+                enc_cfg: vpx_config,
             };
             // NOTE: これ以降の操作に失敗しても ctx は Drop によって確実に解放される
 
@@ -1447,6 +1463,71 @@ impl Encoder {
             }
         }
         None
+    }
+
+    /// 実行期に目標ビットレートを変更する（エンコーダ再構築なし・IDR 挿入なし）。
+    ///
+    // PATCH: `vpx_codec_enc_config_set` を露出する。
+    //
+    // 动机：QoS 闭环（AIMD）需要「不重建编码器、不插关键帧」地调目标码率。重建编码器
+    // 会强制一个 IDR——AIMD 每秒动一次码率，就变成每秒一个关键帧，正好把带宽尖峰引回来，
+    // 闭环的收益被自己的副作用吃掉。
+    //
+    // 上游原本的行为：只在初始化时读一次 `EncoderConfig`，之后没有任何运行期重配置口。
+    //
+    // 去掉它会怎样：闭环只能靠「销毁 + 重建编码器」实现，每次调码率都插一个 IDR。
+    //
+    // 单位：`kbps` は **kbps**（libvpx の `rc_target_bitrate` の慣例）で、bps ではない。
+    // 运行期修改できるのは `rc_target_bitrate` / `rc_buf_*` / `g_timebase` などの
+    // 限られたフィールドだけ。`g_w`/`g_h`/`g_profile` などの几何・形式フィールドは
+    // libvpx が `VPX_CODEC_INVALID_PARAM` で拒否するため、ここでは触らない（几何変更は
+    // 引き続きエンコーダ再構築の経路）。
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), Error> {
+        let mut cfg = self.enc_cfg;
+        cfg.rc_target_bitrate = kbps as c_uint;
+        let code = unsafe { sys::vpx_codec_enc_config_set(&mut self.ctx, &cfg) };
+        Error::check(code, "vpx_codec_enc_config_set", Some(&self.ctx))?;
+        self.enc_cfg = cfg;
+        Ok(())
+    }
+
+    /// 実行期にフレームレートを変更する（エンコーダ再構築なし・IDR 挿入なし）。
+    ///
+    // PATCH: `set_bitrate` と同じ口（`vpx_codec_enc_config_set`）で `g_timebase` を書き換える。
+    //
+    // 动机：AIMD は码率だけでなく帧率も落とす（带域が狭いときは帧を間引く方が効く）。
+    // 帧率を変えるたびにエンコーダを再構築すると、やはり毎回 IDR になる。
+    //
+    // 上游原本的行为：帧率は初期化時に `g_timebase` へ書くだけ。
+    //
+    // 去掉它会怎样：帧率変更がエンコーダ再構築（= IDR）に落ち、闭环の副作用が大きくなる。
+    //
+    // `g_timebase` は `num/den` 秒 = 1 フレーム。`fps_denominator = 1` 前提なので
+    // `num = 1`, `den = fps`（`init` の書き方と一致）。
+    pub fn set_fps(&mut self, fps: u32) -> Result<(), Error> {
+        let mut cfg = self.enc_cfg;
+        cfg.g_timebase.num = 1;
+        cfg.g_timebase.den = fps as c_int;
+        let code = unsafe { sys::vpx_codec_enc_config_set(&mut self.ctx, &cfg) };
+        Error::check(code, "vpx_codec_enc_config_set", Some(&self.ctx))?;
+        self.enc_cfg = cfg;
+        Ok(())
+    }
+
+    /// 現在の目標ビットレート（kbps）。
+    //
+    // PATCH: `set_bitrate` で保持した cfg から読み戻す。上位が「変更が必要か」を
+    // 判定するためのゲッター。
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.enc_cfg.rc_target_bitrate
+    }
+
+    /// 現在のフレームレート。
+    //
+    // PATCH: `set_fps` で保持した `g_timebase` から読み戻す（`den / num`）。
+    pub fn fps(&self) -> u32 {
+        let num = self.enc_cfg.g_timebase.num.max(1) as u32;
+        self.enc_cfg.g_timebase.den.max(0) as u32 / num
     }
 }
 

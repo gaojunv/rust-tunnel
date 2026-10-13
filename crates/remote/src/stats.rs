@@ -15,6 +15,22 @@ use tokio::sync::mpsc;
 pub enum SessionStats {
     /// 一次心跳往返测得的 RTT（复用既有 `Heartbeat` → `HeartbeatAck`，不新增数据面变体）。
     Rtt(Duration),
+    /// 被控端**编码侧**读数（每秒一次，由编码任务上报）。
+    Encode {
+        /// 最近一秒的平均单帧编码耗时（毫秒）。
+        encode_ms: u32,
+        /// 最近一秒实测编码帧率（帧/秒，即实际出帧速度，非目标值）。
+        fps: u32,
+        /// 当前**生效**的目标码率（kbps，闭环在上限之下浮动后的值）。
+        bitrate_kbps: u32,
+    },
+    /// 控制器**解码侧**读数（每秒一次，与 `QosFeedback` 同一节拍）。
+    Decode {
+        /// 最近一帧的解码耗时（毫秒）。
+        decode_ms: u32,
+        /// 最近一秒的接收码率（kbps）。
+        recv_kbps: u32,
+    },
 }
 
 /// 上报句柄。

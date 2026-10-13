@@ -252,16 +252,58 @@ pub trait Clipboard: Send + Sync + 'static {
     fn set(&self, text: &str) -> RemoteResult<()>;
 }
 
-/// 屏幕编码参数。
+/// 屏幕编码参数——自阶段 3 起是**档位上限**。
+///
+/// 语义变更（阶段 3 QoS 闭环）：本结构描述的是「这个档位最多给到多少」，**不是**实际生效值。
+/// 实际生效值由被控端的 AIMD（[`crate::qos::RateController`]）在上限之下浮动——弱网时降码率 /
+/// 帧率 / 分辨率，链路恢复后逐步回升。要拿「当前生效值」用 [`EncodeRates`]。
+///
+/// 由此产生的一条硬约束：**上限字段的变化路径与生效值不同**。几何（`scale` → 编码尺寸）变化
+/// 需要重建编码器 + 强制 IDR；而 `target_bitrate_kbps` / `max_fps` 由闭环**在线重配置**，不重建、
+/// 不插 IDR（见 `vendor/shiguredo_libvpx` 的补丁 6）。把码率放进「重建键」会让闭环每秒插一个关键帧。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EncodeOptions {
-    /// 目标码率（kbps）。VP9 CBR 的目标值；实际码率由 [`crate::video`] 的 `rc_buffer_size_ms`
-    /// （交互级 300 ms）在秒级以下尺度上收敛。
+    /// 目标码率**上限**（kbps）。VP9 CBR 的目标值；实际值由闭环在 `[BR_MIN, 本值]` 内浮动。
+    /// 秒级以下的收敛由 [`crate::video`] 的 `rc_buffer_size_ms`（交互级 300 ms）保证。
     pub target_bitrate_kbps: u32,
-    /// 缩放比例（1.0 = 原始尺寸）。编码尺寸还会被 [`crate::video::MAX_ENCODE_WIDTH`] 封顶。
+    /// 缩放比例**上限**（1.0 = 原始尺寸）。编码尺寸还会被 [`crate::video::MAX_ENCODE_WIDTH`] 封顶；
+    /// 闭环可在必要时进一步下调（降编码分辨率）。
     pub scale: f32,
-    /// 目标帧率上限（被控端据此定采集间隔，也写进编码器的 `fps`）。
+    /// 目标帧率**上限**（被控端据此定采集间隔，也写进编码器的 `fps`）。
     pub max_fps: u8,
+}
+
+/// 闭环**当前生效**的编码参数（各字段均 ≤ 对应的 [`EncodeOptions`] 上限）。
+///
+/// 由 [`crate::qos::RateController`] 产出，随每个编码任务交给编码流水线。与 [`EncodeOptions`]
+/// 分开，是为了让「上限」与「生效值」在类型上不可混用——把上限当生效值用会悄悄绕过闭环。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EncodeRates {
+    /// 当前生效目标码率（kbps）。
+    pub bitrate_kbps: u32,
+    /// 当前生效帧率。
+    pub fps: u8,
+    /// 当前生效缩放比例（越小分辨率越低）。
+    pub scale: f32,
+}
+
+impl EncodeRates {
+    /// 取某档位上限对应的初始生效值（闭环起步点 = 上限）。
+    #[must_use]
+    pub fn ceiling(options: EncodeOptions) -> Self {
+        Self {
+            bitrate_kbps: options.target_bitrate_kbps,
+            fps: options.max_fps,
+            scale: options.scale,
+        }
+    }
+
+    /// 取该生效值的采集间隔（`fps` 为 0 时按 1 fps 兜底，避免除零）。
+    #[must_use]
+    pub fn capture_interval(&self) -> std::time::Duration {
+        let fps = self.fps.max(1);
+        std::time::Duration::from_millis(1000 / u64::from(fps))
+    }
 }
 
 impl Default for EncodeOptions {
@@ -282,19 +324,22 @@ impl EncodeOptions {
 /// 画质档位：UI 只暴露这三档，映射到具体的 [`EncodeOptions`]。
 ///
 /// 档位经 `SessionMessage::SetQuality` 下发给被控端，**由被控端生效**（编码在它那边）。
+///
+/// 自阶段 3 起档位是**上限**而非固定参数：切换档位把闭环的封顶值改成该档位，实际生效值仍由
+/// AIMD 在上限之下浮动（弱网时可能低于档位标称值）。UI 选择器因此显示的是「最高给到多少」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum QualityPreset {
-    /// 流畅：半分辨率 + 低码率 + 8 fps。窄带/跨地域中继场景。
+    /// 流畅：半分辨率 + 低码率 + 8 fps（上限）。窄带/跨地域中继场景。
     Smooth,
-    /// 均衡：原始分辨率（≤ [`crate::video::MAX_ENCODE_WIDTH`]）+ 中码率 + 12 fps。默认档。
+    /// 均衡：原始分辨率（≤ [`crate::video::MAX_ENCODE_WIDTH`]）+ 中码率 + 12 fps（上限）。默认档。
     #[default]
     Balanced,
-    /// 高清：原始分辨率（≤ 封顶宽度）+ 高码率 + 20 fps。同内网直连场景。
+    /// 高清：原始分辨率（≤ 封顶宽度）+ 高码率 + 20 fps（上限）。同内网直连场景。
     Hd,
 }
 
 impl QualityPreset {
-    /// 映射到编码参数。
+    /// 映射到编码参数**上限**。
     #[must_use]
     pub fn options(self) -> EncodeOptions {
         match self {

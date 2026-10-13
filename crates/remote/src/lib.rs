@@ -58,6 +58,7 @@ pub mod crypto;
 pub mod error;
 pub mod file;
 pub mod manager;
+pub mod qos;
 pub mod screen;
 pub mod session;
 pub mod signaling;
@@ -76,9 +77,10 @@ pub use controller::ControllerCommand;
 pub use manager::{
     ActiveSessionInfo, RemoteManager, RemoteManagerConfig, RemoteUiState, SessionRole, SessionState,
 };
+pub use qos::{Feedback, QosAction, QosDecision, QosParams, RateController};
 pub use screen::{
-    Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FileEntry, FrameSink, InputEvent, InputSink, KeyEvent,
-    MouseButton, QualityPreset, RawFrame, ScreenSource,
+    Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, EncodeRates, FileEntry, FrameSink, InputEvent, InputSink,
+    KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource,
 };
 pub use session::{
     CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd,

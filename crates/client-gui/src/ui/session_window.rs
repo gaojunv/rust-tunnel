@@ -497,6 +497,13 @@ fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo
                     ui.label(RichText::new("帧率").weak().small());
                     ui.label(format!("{} fps", v.fps));
                     ui.end_row();
+                    // 解码耗时 / 收码率：控制器侧本地实测（阶段 3 QoS 观测量）。
+                    ui.label(RichText::new("解码").weak().small());
+                    ui.label(state.decode_ms.map_or("—".to_owned(), |ms| format!("{ms} ms")));
+                    ui.end_row();
+                    ui.label(RichText::new("收码率").weak().small());
+                    ui.label(state.recv_kbps.map_or("—".to_owned(), format_kbps));
+                    ui.end_row();
                     ui.label(RichText::new("时长").weak().small());
                     ui.label(format!("{:02}:{:02}", secs / 60, secs % 60));
                     ui.end_row();
@@ -661,6 +668,15 @@ pub(crate) fn transport_label(path: TransportPath) -> &'static str {
     match path {
         TransportPath::Direct => "P2P 直连",
         TransportPath::Relay => "中继",
+    }
+}
+
+/// 码率显示：`≥1000 kbps` 用 Mbps（一位小数），否则 kbps。
+pub(crate) fn format_kbps(kbps: u32) -> String {
+    if kbps >= 1000 {
+        format!("{:.1} Mbps", f64::from(kbps) / 1000.0)
+    } else {
+        format!("{kbps} kbps")
     }
 }
 

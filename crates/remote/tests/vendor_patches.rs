@@ -17,6 +17,9 @@
 //!   仍成功（control 路径不被上游结构体变更破坏）。
 //! - 补丁 5（`VP9E_SET_COLOR_SPACE` / `VP9E_SET_COLOR_RANGE`）：断言码流头里的
 //!   `color_space` / `color_range` 与配置一致，而不是恒为 `CS_UNKNOWN` + limited。
+//! - 补丁 6（`Encoder::set_bitrate` / `set_fps`，即 `vpx_codec_enc_config_set`）：
+//!   `runtime_bitrate_change_does_not_force_keyframe` 断言在线改码率后不产生 IDR、
+//!   码流仍可解；`runtime_fps_change_is_accepted` 断言在线改帧率被 libvpx 接受。
 
 // 测试代码豁免 panic 风险 lint（与仓库既有集成测试一致）。
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -288,4 +291,105 @@ fn profile1_i444_decodes_full_chroma() {
         frame.u_plane().len() > (HEIGHT / 2) * u_stride,
         "U plane must be larger than the 4:2:0 half-height slice"
     );
+}
+
+/// 造一个 64×64 的 profile 1 / I444 编码器（供补丁 6 的用例复用）。
+///
+/// 与 [`encode_keyframe`] 的区别：这里返回编码器本身，供用例在两次 `encode` 之间调用
+/// 运行期重配置。
+fn runtime_encoder() -> Encoder {
+    let vp9 = Vp9Config {
+        profile: Vp9Profile::Profile1,
+        color_space: Some(ColorSpace::Bt709),
+        color_range: Some(ColorRange::Full),
+        ..Default::default()
+    };
+    let mut config = EncoderConfig::new(WIDTH, HEIGHT, ImageFormat::I444, CodecConfig::Vp9(vp9));
+    config.target_bitrate = 2_000_000;
+    config.deadline = EncodingDeadline::Realtime;
+    config.lag_in_frames = Some(NonZeroUsize::new(1).unwrap());
+    config.rc_buffer_size_ms = Some(NonZeroUsize::new(300).unwrap());
+    Encoder::new(config).expect("failed to create VP9 encoder")
+}
+
+/// 造一对 I444 平面（内容随 `shade` 变化，避免第二帧退化成「无变化」）。
+fn i444_planes(shade: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut y = vec![0u8; WIDTH * HEIGHT];
+    for (i, px) in y.iter_mut().enumerate() {
+        *px = (((i * 7) % 256) as u8).wrapping_add(shade);
+    }
+    (y, vec![128u8; WIDTH * HEIGHT], vec![128u8; WIDTH * HEIGHT])
+}
+
+/// 编码一帧并取回码流字节；返回 `(字节, 是否关键帧)`。
+///
+/// **必须把 `next_frame()` 抽干**（抽到 `None` 才会重置内部迭代器），否则下一次 `encode()`
+/// 会报 "still need to call next_frame()"。
+fn encode_packet(encoder: &mut Encoder, shade: u8, force_keyframe: bool) -> (Vec<u8>, bool) {
+    let (y, u, v) = i444_planes(shade);
+    encoder
+        .encode(
+            &ImageData::I444 { y: &y, u: &u, v: &v },
+            &EncodeOptions { force_keyframe },
+        )
+        .expect("encode() must succeed");
+    let mut last = None;
+    let mut keyframe = false;
+    while let Some(packet) = encoder.next_frame() {
+        keyframe |= packet.is_keyframe();
+        last = Some(packet.data().to_vec());
+    }
+    (last.expect("encoder produced no packet"), keyframe)
+}
+
+/// 补丁 6：在线改码率**不**产生 IDR，且码流仍可解。
+///
+/// 这是 AIMD 闭环的前提：码率每秒动一次，若每次都重建编码器就会每秒一个关键帧，
+/// 正好把阶段 2 要消掉的带宽尖峰引回来。断言 `set_bitrate` 走
+/// `vpx_codec_enc_config_set` 的在线路径（而非重建）。
+#[test]
+fn runtime_bitrate_change_does_not_force_keyframe() {
+    let mut encoder = runtime_encoder();
+    assert_eq!(encoder.bitrate_kbps(), 2000, "初始码率应为 2 Mbps");
+
+    // 首帧关键帧，建立参考链。
+    let (keyframe, is_key) = encode_packet(&mut encoder, 0, true);
+    assert!(is_key, "首帧应为关键帧");
+    assert!(parse_vp9_header(&keyframe).is_some(), "首帧应为关键帧");
+
+    // 在线改码率（补丁 6）。单位是 kbps。
+    encoder.set_bitrate(700).expect("set_bitrate 必须成功（补丁 6）");
+    assert_eq!(encoder.bitrate_kbps(), 700, "set_bitrate 后码率应更新");
+
+    // 下一帧：不得是关键帧。
+    let (pframe, is_key) = encode_packet(&mut encoder, 40, false);
+    assert!(
+        !is_key,
+        "在线改码率不得插入 IDR（否则每秒一个关键帧，闭环收益被吃掉）"
+    );
+
+    // 码流仍可解（关键帧 → P 帧）。
+    let mut decoder = Decoder::new(DecoderConfig { codec: DecoderCodec::Vp9 }).expect("decoder");
+    decoder.decode(&keyframe).expect("decode keyframe");
+    while decoder.next_frame().expect("frame").is_some() {}
+    decoder.decode(&pframe).expect("decode P frame after set_bitrate");
+    let frame = decoder.next_frame().expect("frame").expect("decoded frame");
+    assert_eq!(frame.width(), WIDTH);
+    assert_eq!(frame.height(), HEIGHT);
+}
+
+/// 补丁 6：在线改帧率被 libvpx 接受，且不产生 IDR。
+#[test]
+fn runtime_fps_change_is_accepted() {
+    let mut encoder = runtime_encoder();
+    let (keyframe, is_key) = encode_packet(&mut encoder, 0, true);
+    assert!(is_key);
+    assert!(parse_vp9_header(&keyframe).is_some());
+
+    // 12 → 8 fps。
+    encoder.set_fps(8).expect("set_fps 必须成功（补丁 6）");
+    assert_eq!(encoder.fps(), 8, "set_fps 后帧率应更新");
+
+    let (_pframe, is_key) = encode_packet(&mut encoder, 60, false);
+    assert!(!is_key, "在线改帧率不得插入 IDR");
 }

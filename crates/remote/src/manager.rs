@@ -150,6 +150,17 @@ pub struct RemoteUiState {
     pub trusted_peers: Vec<String>,
     /// 最近实测延迟（毫秒，EMA 平滑）；无样本或会话已结束时为 `None`。
     pub latency_ms: Option<u32>,
+    /// 被控端最近上报的**编码侧**读数（见 [`SessionStats::Encode`]）：平均单帧编码耗时（毫秒）。
+    /// 仅被控端填；控制器侧恒为 `None`。
+    pub encode_ms: Option<u32>,
+    /// 被控端最近上报的**实测编码帧率**（帧/秒）。仅被控端填。
+    pub encode_fps: Option<u32>,
+    /// 被控端最近上报的**当前生效码率**（kbps，闭环在上限之下浮动后的值）。仅被控端填。
+    pub encode_kbps: Option<u32>,
+    /// 控制器最近上报的**解码侧**读数：最近一帧解码耗时（毫秒）。仅控制器填。
+    pub decode_ms: Option<u32>,
+    /// 控制器最近上报的**接收码率**（kbps）。仅控制器填。
+    pub recv_kbps: Option<u32>,
     /// 本次会话的数据面路径（P2P 直连 / 中继）；会话未建立/已结束时为 `None`。
     pub transport: Option<TransportPath>,
     /// 最近一次**由会话循环观测到**的会话结束信息（session_id + 结束原因），供 UI 提示与断线
@@ -1816,6 +1827,24 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
                     }
                     None => sample,
                 });
+            });
+        }
+        SessionStats::Encode {
+            encode_ms,
+            fps,
+            bitrate_kbps,
+        } => {
+            // 被控端编码侧读数：直接写入，不做平滑（数值本身已是 1s 窗口的平均）。
+            mgr.update_ui(|s| {
+                s.encode_ms = Some(encode_ms);
+                s.encode_fps = Some(fps);
+                s.encode_kbps = Some(bitrate_kbps);
+            });
+        }
+        SessionStats::Decode { decode_ms, recv_kbps } => {
+            mgr.update_ui(|s| {
+                s.decode_ms = Some(decode_ms);
+                s.recv_kbps = Some(recv_kbps);
             });
         }
     }

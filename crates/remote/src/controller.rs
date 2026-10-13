@@ -18,6 +18,8 @@ use crate::transport::BoxDuplex;
 use crate::video::{VideoDecoder, MAX_FRAME_DIM};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
@@ -38,6 +40,19 @@ const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 则正常抖动就丢帧；8 兼作**抖动缓冲**，把最坏内存压在「8 × 单帧载荷」量级。队列满即丢帧——
 /// 丢弃会打断 VP9 的参考链，故解码任务用**序号断层**检测到它并请求关键帧（见 [`decode_loop`]）。
 const DECODE_QUEUE: usize = 8;
+
+/// QoS 反馈间隔（秒级）。每秒向被控端发一条 `QosFeedback`（含 RTT / 收码率 / 解码耗时 / 积压），
+/// 驱动被控端的 AIMD 闭环（见 [`crate::qos`]）。同时按同一节拍把解码侧读数经进程内
+/// [`SessionStatsReporter`] 送到 UI。
+const QOS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 「长时间无帧」的判据（超过它即请求关键帧并告警）。
+///
+/// 静止桌面**合法地**不产帧（被控端 memcmp 去重后完全不喂编码器），所以这不是错误检测，而是
+/// **卡死检测**：对端采集/编码挂住、或中继半死时，画面会永久冻结且毫无报错。取 3s——足够区分
+/// 「静止」与「卡死」，代价是被控端在静止桌面上每 3s 补一个 IDR（1080p 静止帧 CBR 下仅 ~97 B，
+/// 可忽略）。请求本身也按同一窗口限频，避免刷屏。
+const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 一条待解码的画面载荷（尚未 VP9 解码）。
 enum DecodeJob {
@@ -179,7 +194,7 @@ pub async fn run_controller(
     writer.encoder_mut().set_cipher(Cipher::new(keys.send)?);
     debug!(session = %config.session_id, "控制器会话已加密");
 
-    sink.on_displays(displays);
+    sink.on_displays(displays.clone());
 
     // 解码任务：VP9 解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
     // 被它占住。故把解码挪到独立任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
@@ -190,11 +205,15 @@ pub async fn run_controller(
     // 解码任务 → 循环的关键帧请求通道（无界：只承载「重置后请对端补一个 IDR」这种低频控制）。
     // 循环自己保留 `keyframe_tx`，故 `recv()` 永不返回 `None`（否则会 100% 空转）。
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<u32>();
+    // 最近一帧的解码耗时（毫秒），由解码任务写、主循环读（填进 `QosFeedback`）。原子而非锁：
+    // 写的是热路径（每帧一次），读的是每秒一次，两者几乎不重叠，`Relaxed` 足够。
+    let decode_ms_shared = Arc::new(AtomicU32::new(0));
     let decode_task = tokio::spawn(decode_loop(
         decode_rx,
         keyframe_tx.clone(),
         std::sync::Arc::clone(&sink),
         cancel.clone(),
+        Arc::clone(&decode_ms_shared),
     ));
 
     // 3) 主循环。
@@ -205,10 +224,34 @@ pub async fn run_controller(
     // 出站文件块：只在有在途传输时启用（`has_outgoing` 为假时该分支不被轮询，不产生空转）。
     let mut file_tick = interval_at(Instant::now(), CHUNK_PAUSE);
     file_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // QoS 反馈节拍：每秒一条 `QosFeedback`（驱动被控端 AIMD）+ 一次解码侧读数上报。
+    // 起点取 `now + QOS_INTERVAL`：第一个样本要有一整秒的统计窗口才有意义。
+    let mut qos_tick = interval_at(Instant::now() + QOS_INTERVAL, QOS_INTERVAL);
+    qos_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // RTT 样本：发 `Heartbeat` 时记时刻，收到 `HeartbeatAck` 时配对算 RTT。**复用既有心跳往返**，
     // 不新增数据面变体（新增 `SessionMessage` 变体会让混合版本的一端直接断链，见 `HEARTBEAT_INTERVAL`）。
     // 首个样本由上面那个「立即到期的 tick」给出，故这里先置空。
     let mut pending_heartbeat: Option<Instant> = None;
+    // 最近一次可信 RTT（毫秒）：填进 `QosFeedback`。无样本时为 0（闭环此时按「未知」处理，
+    // 不会误判为健康——`0 < fast_threshold` 但队列非空时仍可能判拥塞）。
+    let mut last_rtt_ms: Option<u32> = None;
+    // QoS 窗口内收到的画面字节数（算收码率）。
+    let mut recv_bytes: u64 = 0;
+    let mut qos_window_start = Instant::now();
+    // 最近一次收到画面帧的时刻（「长时间无帧」看门狗用）。
+    let mut last_frame_at = Instant::now();
+    // 最近一次请求关键帧的时刻（限频，避免静止桌面上刷屏）。
+    let mut last_keyframe_request_at: Option<Instant> = None;
+    // 自最近一次收到画面帧以来已发出的关键帧请求数：0 = 这次是首次请求（静止桌面的常规情况，
+    // 只记 `debug`），≥1 = 上次请求没换回帧（对端可能真挂住，升到 `warn`）。收到帧即清零。
+    let mut stall_requests: u32 = 0;
+    // 当前观看的显示器：请求关键帧要指名道姓（被控端只认自己正在采集的那台）。
+    // 初值与 UI 的选择器一致：优先主显示器，否则第一台。
+    let mut selected_display = displays
+        .iter()
+        .find(|d| d.primary)
+        .or_else(|| displays.first())
+        .map_or(0, |d| d.id);
     let mut reason = String::from("会话结束");
 
     let result: RemoteResult<SessionEnd> = loop {
@@ -232,6 +275,67 @@ pub async fn run_controller(
                     break Err(err);
                 }
             }
+            _ = qos_tick.tick() => {
+                // 每秒一条 `QosFeedback`，驱动被控端 AIMD（见 [`crate::qos`]）。**不新增数据面
+                // 变体**——`QosFeedback` 自阶段 2 起就在协议里，阶段 2 只是定义未消费。
+                let elapsed = qos_window_start.elapsed().as_secs_f64().max(f64::EPSILON);
+                let window_bytes = f64::from(u32::try_from(recv_bytes).unwrap_or(u32::MAX));
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "收码率为有界非负值，取整后落在 u32 内"
+                )]
+                let recv_kbps = (window_bytes * 8.0 / 1000.0 / elapsed).round() as u32;
+                let decode_ms = decode_ms_shared.load(Ordering::Relaxed);
+                let backlog = u32::try_from(DECODE_QUEUE.saturating_sub(decode_tx.capacity())).unwrap_or(u32::MAX);
+                let feedback = SessionMessage::QosFeedback {
+                    rtt_ms: last_rtt_ms.unwrap_or(0),
+                    recv_kbps,
+                    decode_ms,
+                    backlog,
+                };
+                if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(feedback)).await {
+                    break Err(err);
+                }
+                // 同节拍把解码侧读数经进程内通道送到 UI（不落线）。
+                config.stats.report(SessionStats::Decode { decode_ms, recv_kbps });
+                recv_bytes = 0;
+                qos_window_start = Instant::now();
+
+                // 「长时间无帧」看门狗（阶段 3）：对端采集/编码挂住、或中继半死时，画面会永久冻结
+                // 且毫无报错。静止桌面**合法地**不产帧（被控端 memcmp 去重），故这不是错误检测——
+                // 只请求一次关键帧并按同一窗口限频（见 [`NO_FRAME_TIMEOUT`]）。
+                if last_frame_at.elapsed() >= NO_FRAME_TIMEOUT {
+                    let due = last_keyframe_request_at.is_none_or(|t| t.elapsed() >= NO_FRAME_TIMEOUT);
+                    if due {
+                        // **静止桌面上这条看门狗每 3s 必触发一次，且是假警报**：被控端的 memcmp 去重
+                        // 让静止画面合法地不产帧，关键帧请求会立刻换回一帧。所以常规情况只记 `debug`——
+                        // `warn` 会被 `ClientLogLayer` 批量上报到服务端并落 SQLite，一个静止会话就是
+                        // 1200 条/小时，既冲垮服务端日志库也淹没真正的告警。只有**上一次请求也没换回帧**
+                        // （对端采集/编码真的挂住）才升到 `warn`，那时它才是真信号。
+                        if stall_requests == 0 {
+                            debug!(
+                                since_ms = last_frame_at.elapsed().as_millis(),
+                                "长时间未收到画面帧，请求关键帧"
+                            );
+                        } else {
+                            warn!(
+                                since_ms = last_frame_at.elapsed().as_millis(),
+                                stall_requests,
+                                "请求关键帧后仍无画面帧，对端采集或编码可能已挂住"
+                            );
+                        }
+                        stall_requests = stall_requests.saturating_add(1);
+                        let request = SessionMessage::RequestKeyframe {
+                            display: selected_display,
+                        };
+                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(request)).await {
+                            break Err(err);
+                        }
+                        last_keyframe_request_at = Some(Instant::now());
+                    }
+                }
+            }
             maybe_cmd = cmd_rx.recv() => {
                 // 发送端被 drop = 会话已被上层收走，按正常结束处理。**不能 `continue`**：已关闭的
                 // `mpsc::Receiver::recv()` 每次都立刻返回 `Ready(None)`，继续轮询会 100% 空转。
@@ -251,6 +355,9 @@ pub async fn run_controller(
                         {
                             break Err(err);
                         }
+                        // 记住当前观看的显示器：`RequestKeyframe` 要指名道姓（被控端只认自己正在
+                        // 采集的那台）。
+                        selected_display = display;
                     }
                     ControllerCommand::SetQuality(preset) => {
                         if let Err(err) =
@@ -330,6 +437,11 @@ pub async fn run_controller(
                             ..
                         } => {
                             // 只投递原始载荷；解码在独立任务里做（见 `decode_loop`）。
+                            // 同时记收码率窗口与「最近收帧时刻」（QoS 反馈 / 无帧看门狗用）。
+                            recv_bytes = recv_bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                            last_frame_at = Instant::now();
+                            // 帧到了：看门狗若是「首次请求」路径，计数回到 0，下次仍只记 `debug`。
+                            stall_requests = 0;
                             if !enqueue_decode(&decode_tx, DecodeJob::Packet {
                                 display,
                                 seq,
@@ -370,6 +482,8 @@ pub async fn run_controller(
                         SessionMessage::HeartbeatAck => {
                             if let Some(sent) = pending_heartbeat.take() {
                                 if let Some(rtt) = trusted_rtt(sent, Instant::now()) {
+                                    // 存一份毫秒读数：`QosFeedback` 要用它填 `rtt_ms`。
+                                    last_rtt_ms = Some(u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
                                     config.stats.report(SessionStats::Rtt(rtt));
                                 }
                             }
@@ -467,11 +581,18 @@ pub async fn run_controller(
 /// - `awaiting_keyframe` 期间**丢弃所有非关键帧**，只等 IDR；收到 IDR 后恢复。
 ///
 /// 被控端会周期性发关键帧作兜底，但**不能只靠它**——请求关键帧是丢帧后唯一的快速恢复路径。
+///
+/// # 解码耗时（阶段 3）
+///
+/// 每次 `decode` 的耗时（含 I444→RGBA 转换）写进 `decode_ms_shared`，由主循环每秒读一次填进
+/// `QosFeedback`。它是被控端「降编码分辨率」的**唯一**依据（4K 解码实测 37–58 ms 是瓶颈，
+/// 编码仅 7.9/7.7 ms 不是）。
 async fn decode_loop(
     mut rx: mpsc::Receiver<DecodeJob>,
     keyframe_tx: mpsc::UnboundedSender<u32>,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
+    decode_ms_shared: Arc<AtomicU32>,
 ) {
     let mut decoder: Option<VideoDecoder> = None;
     // 参考链已断，只等 IDR。
@@ -535,8 +656,11 @@ async fn decode_loop(
         let Some(dec) = decoder.as_mut() else {
             continue;
         };
+        let started = Instant::now();
         match dec.decode(&data) {
             Ok(Some(frame)) => {
+                let decode_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+                decode_ms_shared.store(decode_ms, Ordering::Relaxed);
                 awaiting_keyframe = false;
                 sink.on_frame(DecodedFrame {
                     display: monitor,
@@ -887,17 +1011,55 @@ mod tests {
             cancel.clone(),
         ));
 
-        let sample = tokio::time::timeout(Duration::from_secs(1), stats_rx.recv())
-            .await
-            .expect("会话建立后 1s 内就该有延迟样本（首个 tick 立即到期）")
-            .expect("统计通道不该被关闭");
-        match sample {
-            SessionStats::Rtt(rtt) => assert!(rtt < Duration::from_secs(1), "内存管道 RTT 不该是 {rtt:?}"),
-        }
+        // 首个样本应是 RTT（心跳的起点取 `now`，首个 tick 立即到期）；解码侧读数要等 1s 的
+        // QoS 窗口，故这里跳过非 RTT 事件，直到拿到 RTT 或超时。
+        let rtt = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match stats_rx.recv().await {
+                    Some(SessionStats::Rtt(rtt)) => break rtt,
+                    // 解码侧读数（每秒一条）先于 RTT 到达时跳过它。
+                    Some(_) => {}
+                    None => panic!("统计通道不该被关闭"),
+                }
+            }
+        })
+        .await
+        .expect("会话建立后 1s 内就该有延迟样本（首个 tick 立即到期）");
+        assert!(rtt < Duration::from_secs(1), "内存管道 RTT 不该是 {rtt:?}");
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, task).await;
         peer.abort();
+    }
+
+    /// 6. 控制器每秒发一条 `QosFeedback`（阶段 3 闭环的输入端；不新增协议变体）。
+    ///
+    /// 首个 QoS tick 在 `+1s`，故这里用 1.5s 的上限锁住「每秒一条」；写成「不发」必然超时。
+    #[tokio::test]
+    async fn controller_sends_qos_feedback_periodically() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (mut peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+
+        let sink = Arc::new(FakeSink::default());
+        let (_cmd_tx, cmd_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let task = controller_task(Box::new(a), plan, cmd_rx, sink, cancel.clone());
+
+        let saw = tokio::time::timeout(Duration::from_millis(1500), async {
+            while let Some(Ok(frame)) = peer_reader.next().await {
+                if matches!(frame.message, SessionMessage::QosFeedback { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("1.5s 内应收到一条 QosFeedback（每秒一条）");
+        assert!(saw, "被控端应收到 QosFeedback");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, task).await;
     }
 
     /// 5. 取消与命令发送端**同时**失效时，必须判定为「用户中断」，而不是「命令通道已关闭」。
