@@ -186,6 +186,26 @@ pub struct RemoteUiState {
     pub session_end: Option<(String, SessionEnd)>,
 }
 
+impl RemoteUiState {
+    /// 清空**会话级读数**：延迟、数据面路径、QoS 编解码读数（阶段 3）。
+    ///
+    /// 这些读数只在**一次**会话内有效——它们描述的是「那一条流」的实测值。会话结束、控制通道
+    /// 断开、新会话开始时都必须清掉，否则 UI 会把上一次会话的数字当成当前会话的显示出来
+    /// （新会话起来后要等约 1s 才收到第一份读数，这段时间窗口里旧值就是纯粹的假象）。
+    ///
+    /// **新增会话级读数时把它加到这里**，不要在几个调用点各抄一遍——`latency_ms` 当初就是那样
+    /// 抄了五处，阶段 3 加编解码读数时漏掉了四处，于是旧值跨会话残留。
+    fn clear_session_readings(&mut self) {
+        self.latency_ms = None;
+        self.transport = None;
+        self.encode_ms = None;
+        self.encode_fps = None;
+        self.encode_kbps = None;
+        self.decode_ms = None;
+        self.recv_kbps = None;
+    }
+}
+
 /// [`RemoteManager`] 的构造参数。
 pub struct RemoteManagerConfig {
     /// 本机连接的服务端 `host:port`（用于补齐留空的 `rendezvous_host`）。
@@ -954,9 +974,8 @@ impl RemoteManager {
         };
         self.update_ui(move |s| {
             s.active = None;
-            // 会话结束：延迟与路径读数随即失效，清掉免得 UI 显示上一次会话的残留。
-            s.latency_ms = None;
-            s.transport = None;
+            // 会话结束：会话级读数随即失效，清掉免得 UI 显示上一次会话的残留。
+            s.clear_session_readings();
             s.session_end = Some((sid, end));
             if failed {
                 s.last_error = Some(reason);
@@ -1007,9 +1026,8 @@ impl RemoteManager {
         self.lock_cmd().take();
         self.update_ui(move |s| {
             s.active = None;
-            // 会话已收尾：延迟与路径读数失效，清掉免得 UI 显示残留。
-            s.latency_ms = None;
-            s.transport = None;
+            // 会话已收尾：会话级读数失效，清掉免得 UI 显示残留。
+            s.clear_session_readings();
             if let Some(err) = error {
                 s.last_error = Some(err);
             }
@@ -1140,8 +1158,7 @@ impl RemoteManager {
             s.last_error = None;
             // 新会话开始：清掉上一次会话的结束信息与遗留读数（路径由 establish 成功后写入）。
             s.session_end = None;
-            s.latency_ms = None;
-            s.transport = None;
+            s.clear_session_readings();
         });
 
         let grant = PendingGrant {
@@ -1376,8 +1393,7 @@ impl RemoteManager {
             s.active = Some(info);
             // 新会话开始：清掉上一次会话的结束信息与遗留读数（路径由 establish 成功后写入）。
             s.session_end = None;
-            s.latency_ms = None;
-            s.transport = None;
+            s.clear_session_readings();
         });
 
         let Some(me) = self.self_weak.upgrade() else {
@@ -1687,9 +1703,8 @@ impl RemoteBridge for RemoteManager {
             s.connected = false;
             s.active = None;
             s.pending_approval = None;
-            // 控制通道已断：延迟与路径读数不再可信，清掉。
-            s.latency_ms = None;
-            s.transport = None;
+            // 控制通道已断：会话级读数不再可信，清掉。
+            s.clear_session_readings();
         });
     }
 }
@@ -2655,6 +2670,12 @@ mod tests {
                 });
                 s.latency_ms = Some(42);
                 s.transport = Some(TransportPath::Relay);
+                // 阶段 3 的编解码读数同样是**会话级**的，必须一起清（曾经漏掉，旧值跨会话残留）。
+                s.encode_ms = Some(8);
+                s.encode_fps = Some(12);
+                s.encode_kbps = Some(4000);
+                s.decode_ms = Some(11);
+                s.recv_kbps = Some(3800);
             });
 
             mgr.finish_session("s1", input);
@@ -2663,6 +2684,11 @@ mod tests {
             assert!(snap.active.is_none(), "会话应被清空");
             assert_eq!(snap.latency_ms, None, "延迟读数应清零");
             assert_eq!(snap.transport, None, "路径应清零");
+            assert_eq!(snap.encode_ms, None, "编码耗时读数应清零");
+            assert_eq!(snap.encode_fps, None, "编码帧率读数应清零");
+            assert_eq!(snap.encode_kbps, None, "编码码率读数应清零");
+            assert_eq!(snap.decode_ms, None, "解码耗时读数应清零");
+            assert_eq!(snap.recv_kbps, None, "收码率读数应清零");
             let (sid, end) = snap.session_end.expect("应写入 session_end");
             assert_eq!(sid, "s1");
             assert_eq!(

@@ -1077,7 +1077,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
-    use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf, ReadHalf, WriteHalf};
     use tokio::sync::mpsc;
     use tokio_util::codec::{FramedRead, FramedWrite};
     use tokio_util::sync::CancellationToken;
@@ -1715,25 +1717,75 @@ mod tests {
         drop(peer_writer);
     }
 
+    /// 测试用 duplex 包装：统计写侧 `poll_write` 返回 `Pending` 的次数。
+    ///
+    /// 这是「发送确实被背压卡住」的**机械信号**：`Pending` 只在写缓冲已满时出现，等价于
+    /// `send().await` 会挂起。用它替代「帧必然比容量大」的注释推理——若哪天帧小到填不满缓冲，
+    /// 计数为 0，断言立即失败，而不是让用例在什么都没锁住的情况下静默通过。
+    struct BackpressureProbe {
+        inner: tokio::io::DuplexStream,
+        blocked: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for BackpressureProbe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BackpressureProbe {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+            if poll.is_pending() {
+                this.blocked.fetch_add(1, Ordering::SeqCst);
+            }
+            poll
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
     /// 取消必须能打断被控端编码任务里**被背压卡住的发送**。
     ///
     /// 阶段 2 起画面发送不再发生在会话 `select!` 循环里，而在独立的编码任务中（[`encode_loop`]
     /// → [`send_video`]）。这条回归护栏的语义因此变成：编码任务阻塞在出站队列的 `send` 上时，
     /// 取消仍必须让整个 `run_controlled` 在有限时间内返回（`send_video` 对取消敏感）。
     ///
-    /// 构造是**确定性**的：duplex 容量远小于任何一帧 VP9 关键帧（噪声整帧必然远超 1 KiB），
-    /// 故首帧发送必然阻塞；对端自始至终不读（读端一消费，被卡住的发送就能推进，测试就测不到
-    /// 取消了）。收尾的 `Bye` 只能等满 `BYE_TIMEOUT`（2s），返回时间以 3s 为上界。
+    /// 「发送被阻塞」由**构造 + 机械断言**共同保证，不靠注释推理：
+    /// - duplex 容量只有 1024 字节，而噪声整帧的 VP9 关键帧实测 **861,138 字节**（800×600
+    ///   噪声，见 [`NoiseScreen`]），远超容量；握手/心跳/ScreenConfig 等控制帧都在 1024 以内，
+    ///   故第一个撞上背压的必是画面帧；
+    /// - 对端自始至终不读（读端一消费，被卡住的发送就能推进，测试就测不到取消了）；
+    /// - [`BackpressureProbe`] 直接观测写侧 `poll_write` 是否返回 `Pending`——**这就是「发送
+    ///   已挂起」的信号**；帧若小到填不满缓冲，下面的断言会超时失败而非静默通过。
+    ///
+    /// 收尾的 `Bye` 只能等满 `BYE_TIMEOUT`（2s），返回时间以 3s 为上界。
     #[tokio::test]
     async fn cancel_interrupts_blocked_send_on_controlled() {
-        // duplex 容量远小于首帧 VP9 关键帧：写缓冲很快填满，发送必然挂起。
         let (a, b) = tokio::io::duplex(1024);
+        // 包一层探针：写侧一旦撞上满缓冲（`poll_write` 返回 `Pending`）即计数。
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let probe = BackpressureProbe {
+            inner: b,
+            blocked: Arc::clone(&blocked),
+        };
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
 
         let (input, _input_rx) = RecordingInput::with_notify();
         let cancel = CancellationToken::new();
         let ctld = tokio::spawn(run_controlled(
-            Box::new(b),
+            Box::new(probe),
             config(pending_with("TOK"), RemoteMode::Control),
             Arc::new(NoiseScreen),
             input,
@@ -1743,7 +1795,15 @@ mod tests {
         ));
 
         let (_peer_reader, _peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 机械验证「发送确实被阻塞」：等写侧撞上背压。若帧填不满 1024 字节缓冲，这里会超时失败。
+        tokio::time::timeout(WAIT, async {
+            while blocked.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("写侧应撞上背压：首帧 VP9 关键帧必须填满 1024 字节缓冲，否则用例根本没覆盖到「取消打断被阻塞的发送」");
 
         cancel.cancel();
         let result = tokio::time::timeout(Duration::from_secs(3), ctld)
