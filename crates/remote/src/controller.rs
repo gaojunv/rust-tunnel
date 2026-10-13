@@ -7,7 +7,7 @@
 use crate::auth::verify_ack_mac;
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{decode_frame, FrameSink, InputEvent, QualityPreset};
+use crate::screen::{decode_frame, FrameSink, InputEvent, QualityPreset, TilePatch};
 use crate::session::{
     trusted_rtt, ControllerHandshake, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
     HEARTBEAT_INTERVAL,
@@ -31,6 +31,38 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 收尾 `Bye` 的发送上限。对端可能已停读（写缓冲满），不加限时会让 teardown 永久卡住、`on_closed`
 /// 永不投递；`Bye` 只是尽力通知，超时丢弃即可。
 const BYE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 待解码载荷队列深度。
+///
+/// 解码在独立任务里串行进行（4K 单帧 ~53 ms ≈ 19 fps）。队列太深会在解码跟不上时堆积内存，太浅
+/// 则正常抖动就丢帧；4 足够吸收一个采集周期的抖动，把最坏内存压在「4 × 单帧载荷」量级。
+const DECODE_QUEUE: usize = 4;
+
+/// 一条待解码的画面载荷（尚未 JPEG 解码）。
+enum DecodeJob {
+    /// 整帧 JPEG。
+    Frame {
+        /// 来源显示器编号。
+        display: u32,
+        /// 帧序号。
+        seq: u64,
+        /// JPEG 字节。
+        jpeg: Vec<u8>,
+    },
+    /// 增量瓦片批次。
+    Tiles {
+        /// 来源显示器编号。
+        display: u32,
+        /// 帧序号。
+        seq: u64,
+        /// 编码坐标系的整帧宽。
+        width: u32,
+        /// 编码坐标系的整帧高。
+        height: u32,
+        /// 变化瓦片。
+        tiles: Vec<TilePatch>,
+    },
+}
 
 /// UI 投递给控制器会话的一条命令。
 ///
@@ -155,6 +187,15 @@ pub async fn run_controller(
 
     sink.on_displays(displays);
 
+    // 解码任务：JPEG/瓦片解码是 CPU 密集的**同步**调用（4K 单帧 ~53 ms），放在会话 `select!` 的
+    // 分支里执行会让输入转发被它占住——每秒有六成以上的时间循环都卡在解码上。故把解码挪到独立
+    // 任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
+    //
+    // 注意：解码任务会占住运行时的**一个** worker 线程（解码期间不同让）。这是 CPU 密集工作的
+    // 必然代价，且比原先占住会话循环本身好得多；阶段 2 换掉 JPEG 路径后这条会一并重做。
+    let (decode_tx, decode_rx) = mpsc::channel::<DecodeJob>(DECODE_QUEUE);
+    let decode_task = tokio::spawn(decode_loop(decode_rx, std::sync::Arc::clone(&sink), cancel.clone()));
+
     // 3) 主循环。
     // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**（起点已过去），
     // 会话一建立就发一次心跳，用户开窗即有读数，不必空等一个 [`HEARTBEAT_INTERVAL`]。
@@ -272,15 +313,20 @@ pub async fn run_controller(
                 match incoming {
                     Some(Ok(frame)) => match frame.message {
                         SessionMessage::Video { display, seq, jpeg, .. } => {
-                            match decode_frame(display, seq, &jpeg) {
-                                Ok(decoded) => sink.on_frame(decoded),
-                                Err(err) => warn!(error = %err, "画面解码失败，跳过该帧"),
+                            // 只投递原始载荷；解码在独立任务里做（见 `decode_loop`）。
+                            if !enqueue_decode(&decode_tx, DecodeJob::Frame { display, seq, jpeg }) {
+                                break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
                             }
                         }
                         SessionMessage::VideoTiles { display, width, height, seq, tiles } => {
-                            match decode_tiles(display, seq, width, height, &tiles) {
-                                Ok(update) => sink.on_tiles(update),
-                                Err(err) => warn!(error = %err, "瓦片解码失败，跳过该批"),
+                            if !enqueue_decode(&decode_tx, DecodeJob::Tiles {
+                                display,
+                                seq,
+                                width,
+                                height,
+                                tiles,
+                            }) {
+                                break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
                             }
                         }
                         SessionMessage::DisplayList(list) => sink.on_displays(list),
@@ -370,8 +416,66 @@ pub async fn run_controller(
         writer.send(SessionFrame::control(SessionMessage::Bye { reason: reason.clone() })),
     )
     .await;
+    // 解码任务持有 `sink`：必须先让它停下，`on_closed` 之后才不会有画面再投进来。
+    drop(decode_tx);
+    let mut decode_task = decode_task;
+    let _ = timeout(BYE_TIMEOUT, &mut decode_task).await;
+    decode_task.abort();
     sink.on_closed(reason);
     result
+}
+
+/// 画面解码任务：从有界队列取原始载荷，串行解码后交给 [`FrameSink`]。
+///
+/// 独立成任务是为了把 CPU 密集的解码移出会话 `select!` 循环（见 `run_controller` 的说明）。
+/// 取消一旦触发即退出；队列关闭（会话结束）时把已入队的载荷解完再退出，保证顺序不乱。
+async fn decode_loop(
+    mut rx: mpsc::Receiver<DecodeJob>,
+    sink: std::sync::Arc<dyn FrameSink>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let job = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            job = rx.recv() => match job {
+                Some(job) => job,
+                None => break,
+            },
+        };
+        match job {
+            DecodeJob::Frame { display, seq, jpeg } => match decode_frame(display, seq, &jpeg) {
+                Ok(decoded) => sink.on_frame(decoded),
+                Err(err) => warn!(error = %err, "画面解码失败，跳过该帧"),
+            },
+            DecodeJob::Tiles {
+                display,
+                seq,
+                width,
+                height,
+                tiles,
+            } => match decode_tiles(display, seq, width, height, &tiles) {
+                Ok(update) => sink.on_tiles(update),
+                Err(err) => warn!(error = %err, "瓦片解码失败，跳过该批"),
+            },
+        }
+    }
+}
+
+/// 投递一条待解码载荷；返回 `false` 表示解码任务已结束。
+///
+/// 队列满时**丢弃**该批而不是 `await`：在 `select!` 分支里等解码腾出位置会重新把循环卡住（正是
+/// 本次要修的问题）。丢一帧整帧由下一个关键帧恢复；丢一批瓦片会让那块区域滞留到下一次关键帧
+/// （[`crate::tiles::KEYFRAME_INTERVAL_FRAMES`] 帧之内），这是解码跟不上时的必然代价。
+fn enqueue_decode(tx: &mpsc::Sender<DecodeJob>, job: DecodeJob) -> bool {
+    match tx.try_send(job) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!("解码队列已满，丢弃一批画面");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 /// 可取消的发送：`select!` 的 handler 里直接 `.await` 会让循环看不见取消信号。

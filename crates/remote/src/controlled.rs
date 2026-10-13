@@ -9,8 +9,8 @@ use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::screen::{Clipboard, EncodeOptions, InputSink, RawFrame, ScreenSource};
 use crate::session::{
-    trusted_rtt, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
-    HEARTBEAT_INTERVAL, SESSION_PROTO_VERSION,
+    trusted_rtt, Lane, SessionCodec, SessionEnd, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL,
+    SESSION_PROTO_VERSION,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::tiles::TileDiffer;
@@ -32,6 +32,23 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 收尾 `Bye` 的发送上限。对端可能已停读（写缓冲满），不加限时会让 teardown 永久卡住；`Bye`
 /// 只是尽力通知，超时丢弃即可。
 const BYE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 出站帧队列深度。
+///
+/// 画面帧是大头（可达 MiB 级），队列过深会在写侧卡住时把内存顶上去；过浅则正常突发下容易丢帧。
+/// 4 足以吸收一次采集与心跳的抖动，同时把最坏内存压在「4 × 单帧」量级。
+const WRITER_QUEUE: usize = 4;
+
+/// 投给出站写任务的一条消息。
+enum WriterMsg {
+    /// 普通出站帧：写侧被取消或出错即停止后续发送。
+    Frame(SessionFrame),
+    /// 收尾帧（`Bye`）：**不再理会取消令牌**，限时尽力写出后结束写任务。
+    ///
+    /// 取消正是最常见的结束原因，若让取消令牌把它一并掐掉，对端就只能看到「连接被断开」，
+    /// 把一次用户主动中断记成 `deliberate: false`（进而触发自动重连）。
+    Close(SessionFrame),
+}
 
 /// 在途采集的看门狗时限。
 ///
@@ -170,6 +187,11 @@ pub async fn run_controlled(
     writer.encoder_mut().set_cipher(Cipher::new(keys.send)?);
     debug!(session = %config.session_id, "被控端会话已加密");
 
+    // 出站写任务：独占写半边。会话 `select!` 循环只把帧投进有界队列，**不再在分支里 await 写**
+    // ——否则写侧被背压卡住时（对端停读、中继停走），输入/心跳分支完全得不到轮询，形成队头阻塞。
+    let (tx, rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
+    let writer_task = tokio::spawn(writer_loop(writer, rx, cancel.clone()));
+
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
     let mut encode = config.encode;
@@ -224,7 +246,7 @@ pub async fn run_controlled(
             _ = heartbeat.tick() => {
                 // 覆盖旧样本：上一个 ack 迟迟不来时，下一次心跳的往返才是与当前时刻相关的读数。
                 pending_heartbeat = Some(Instant::now());
-                if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
+                if let Err(err) = enqueue(&tx, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
                     break Err(err);
                 }
             }
@@ -248,7 +270,7 @@ pub async fn run_controlled(
                         if let Some(msg) = message {
                             // `run_capture` 用同一基值（`seq + 1`）算帧序号；同一时刻只有一次采集在途。
                             seq = seq.wrapping_add(1);
-                            if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(msg)).await {
+                            if let Err(err) = enqueue(&tx, &cancel, SessionFrame::screen(msg)).await {
                                 break Err(err);
                             }
                         }
@@ -317,7 +339,7 @@ pub async fn run_controlled(
             _ = file_tick.tick(), if transfer.has_outgoing() => {
                 match transfer.next_outbound().await {
                     Ok(Some(msg)) => {
-                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::file(msg)).await {
+                        if let Err(err) = enqueue(&tx, &cancel, SessionFrame::file(msg)).await {
                             break Err(err);
                         }
                     }
@@ -325,7 +347,7 @@ pub async fn run_controlled(
                     Err(err) => {
                         warn!(error = %err, "文件读取失败，中断该次传输");
                         // 回发 `FileError`：发送方不再有 chunk 流动，对端的 `Incoming` 会一直挂着。
-                        if let Err(send_err) = send_file_errors(&mut writer, &cancel, transfer.abort_all(&err.to_string())).await {
+                        if let Err(send_err) = send_file_errors(&tx, &cancel, transfer.abort_all(&err.to_string())).await {
                             break Err(send_err);
                         }
                     }
@@ -393,14 +415,12 @@ pub async fn run_controlled(
                                 },
                                 None => String::new(),
                             };
-                            if let Err(err) =
-                                send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Clipboard { text })).await
-                            {
+                            if let Err(err) = enqueue(&tx, &cancel, SessionFrame::control(SessionMessage::Clipboard { text })).await {
                                 break Err(err);
                             }
                         }
                         SessionMessage::Heartbeat => {
-                            if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::HeartbeatAck)).await {
+                            if let Err(err) = enqueue(&tx, &cancel, SessionFrame::control(SessionMessage::HeartbeatAck)).await {
                                 break Err(err);
                             }
                         }
@@ -427,7 +447,7 @@ pub async fn run_controlled(
                                 Ok(replies) => {
                                     let mut write_err = None;
                                     for reply in replies {
-                                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::file(reply)).await {
+                                        if let Err(err) = enqueue(&tx, &cancel, SessionFrame::file(reply)).await {
                                             write_err = Some(err);
                                             break;
                                         }
@@ -438,7 +458,7 @@ pub async fn run_controlled(
                                 }
                                 Err(err) => {
                                     warn!(error = %err, "文件落盘失败，中断该次传输");
-                                    if let Err(send_err) = send_file_errors(&mut writer, &cancel, transfer.abort_all(&err.to_string())).await {
+                                    if let Err(send_err) = send_file_errors(&tx, &cancel, transfer.abort_all(&err.to_string())).await {
                                         break Err(send_err);
                                     }
                                 }
@@ -472,12 +492,107 @@ pub async fn run_controlled(
     // 会话正在收尾：在途传输一并作废。这里**不必**回发 `abort_all` 的 `FileError`——`Bye` 马上
     // 就到，对端收尾时同样会清掉自己的在途传输，不会挂在半途。
     let _ = transfer.abort_all(&reason);
+    // 收尾帧经同一队列交给写任务：即便取消已触发，写任务仍会限时尽力写出 `Bye`（见 `writer_loop`），
+    // 使对端把它记成「主动结束」而不是「连接断开」。队列满时 `send` 会等写侧腾出位置，故同样限时。
     let _ = timeout(
         BYE_TIMEOUT,
-        writer.send(SessionFrame::control(SessionMessage::Bye { reason: reason.clone() })),
+        tx.send(WriterMsg::Close(SessionFrame::control(SessionMessage::Bye {
+            reason: reason.clone(),
+        }))),
     )
     .await;
+    drop(tx);
+    // 写任务自己的 `Bye` 发送也限时（`BYE_TIMEOUT`），这里再给一个上界；超时则中止它——写任务
+    // 仍卡在停读的对端上时，只有丢弃写半边（= 关闭 socket）才能避免把连接泄漏到 TCP 超时。
+    let mut writer_task = writer_task;
+    let _ = timeout(BYE_TIMEOUT, &mut writer_task).await;
+    writer_task.abort();
     result
+}
+
+/// 出站写任务：独占写半边，从有界队列取帧写线。
+///
+/// 取消语义：普通帧的发送同时等取消令牌（[`send_cancellable`]），取消一旦触发就丢弃后续普通帧、
+/// 只等收尾帧——这样「取消能立刻打断被背压卡住的发送」与「收尾 `Bye` 仍能尽力发出」两件事同时成立。
+async fn writer_loop(
+    mut writer: FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
+    mut rx: mpsc::Receiver<WriterMsg>,
+    cancel: CancellationToken,
+) {
+    // 取消后不再写普通帧，只等收尾帧。
+    let mut cancelled = false;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            WriterMsg::Frame(frame) => {
+                if cancelled {
+                    continue;
+                }
+                match send_cancellable(&mut writer, &cancel, frame).await {
+                    Ok(()) => {}
+                    Err(RemoteError::Cancelled) => cancelled = true,
+                    Err(err) => {
+                        debug!(error = %err, "出站写失败，写任务结束");
+                        break;
+                    }
+                }
+            }
+            WriterMsg::Close(frame) => {
+                // 收尾帧不理会取消令牌（取消正是最常见的结束原因），限时尽力写出。
+                let _ = timeout(BYE_TIMEOUT, writer.send(frame)).await;
+                break;
+            }
+        }
+    }
+}
+
+/// 投递一帧给出站写任务。
+///
+/// # 为什么按 lane 区分丢弃策略
+///
+/// 队头阻塞的成因是**画面帧**：它是 MiB 级的大块，写侧被背压卡住时会把有界队列塞满。而
+/// **控制帧**只有几十字节、**文件帧**本身已由 [`CHUNK_PAUSE`] 节流。故：
+///
+/// - **画面帧**：`try_send`，满则丢弃。它是过期数据（下一帧/下一个关键帧就覆盖了），丢一帧的
+///   代价远小于「在 `select!` 分支里 await 队列腾空」把输入与心跳一起卡住。
+/// - **控制帧与文件帧**：**绝不可丢**。丢一条 `FileChunk` 会让接收侧静默少收一截字节
+///   （`TransferHub::on_done` 的字节数校验会把这种损坏变成显式错误，但正确做法是根本不丢），
+///   丢一条控制帧会让心跳/剪贴板应答凭空消失。队列被画面帧暂时塞满时**可取消地等**它腾空；
+///   取消令牌保证「用户点中断能立刻脱身」这一既有语义不受影响（与改动前 `send_cancellable`
+///   的行为一致）。
+///
+/// **不要**把这两种策略「统一」成同一个 `try_send`——那会把静默的文件损坏重新引回来。
+///
+/// # Errors
+/// 等待队列腾空时被取消返回 [`RemoteError::Cancelled`]；写任务已结束（链路断开）返回
+/// [`RemoteError::Io`]。
+async fn enqueue(
+    tx: &mpsc::Sender<WriterMsg>,
+    cancel: &CancellationToken,
+    frame: SessionFrame,
+) -> RemoteResult<()> {
+    if frame.lane == Lane::Screen {
+        return match tx.try_send(WriterMsg::Frame(frame)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("出站队列已满，丢弃一帧画面");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(link_closed()),
+        };
+    }
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(RemoteError::Cancelled),
+        res = tx.send(WriterMsg::Frame(frame)) => res.map_err(|_| link_closed()),
+    }
+}
+
+/// 出站写任务已结束（链路断开）时的会话级错误。
+fn link_closed() -> RemoteError {
+    RemoteError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "出站写任务已结束",
+    ))
 }
 
 /// 一次后台采集的结果：要发的消息（静止画面或采集/编码失败时为 `None`）+ 归还的差分器。
@@ -537,8 +652,10 @@ fn run_capture(
                 },
                 None => SessionMessage::VideoTiles {
                     display: frame.display,
-                    width: frame.width,
-                    height: frame.height,
+                    // 编码坐标系（缩放后）的尺寸：控制器持有的整帧就是按这个尺寸缩放的，
+                    // 瓦片坐标必须与它同格。
+                    width: result.width,
+                    height: result.height,
                     seq,
                     tiles: result.tiles,
                 },
@@ -571,15 +688,14 @@ fn reset_differ(differ: &mut Option<TileDiffer>, pending: &mut bool) {
     }
 }
 
-/// 可取消的发送：`select!` 的 handler 里直接 `.await` 会让循环看不见取消信号。
+/// 可取消的发送（由出站写任务 [`writer_loop`] 使用）。
 ///
-/// tokio 的 `select!` 在 handler 求值期间**不再轮询其它分支**，所以对端停读（中继停走、TCP
-/// 零窗口）把写缓冲填满后，`writer.send` 会永久挂起，`cancel.cancelled()` 分支再也得不到轮询
-/// ——会话不结束、任务与 socket 一起泄漏到 TCP 超时。故每次发送都同时等取消令牌，取消优先
-/// （`biased`）。
+/// 对端停读（中继停走、TCP 零窗口）会把写缓冲填满，`writer.send` 随即永久挂起。写任务必须能
+/// 被取消信号打断，否则用户点「中断」后写任务会一直挂到 TCP 超时，会话收尾被永久拖住。故每次
+/// 发送都同时等取消令牌，取消优先（`biased`）。
 ///
 /// 发送被中途取消是安全的：会话正要结束，半截帧不会被对端当成完整帧（长度前缀 + bincode
-/// 自校验），且此后不会再发新帧。
+/// 自校验），且此后不会再发新帧（写任务转入「只等收尾帧」）。
 ///
 /// # Errors
 /// 取消令牌触发时返回 [`RemoteError::Cancelled`]；发送失败时透传底层 IO 错误。
@@ -595,17 +711,17 @@ async fn send_cancellable(
     }
 }
 
-/// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次写出。
+/// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次投给出站写任务。
 ///
 /// **必须回发**：发送方读文件失败后不会再有任何 chunk 流动，对端既等不到 `FileDone` 也等不到
-/// 错误，会一直挂在半途（UI 停在 99%）。写失败按会话级错误处理，与其它发送一致。
+/// 错误，会一直挂在半途（UI 停在 99%）。走 [`enqueue`] 的文件帧路径（满队列时可取消地等，不丢）。
 async fn send_file_errors(
-    writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
+    tx: &mpsc::Sender<WriterMsg>,
     cancel: &CancellationToken,
     msgs: Vec<SessionMessage>,
 ) -> RemoteResult<()> {
     for msg in msgs {
-        send_cancellable(writer, cancel, SessionFrame::file(msg)).await?;
+        enqueue(tx, cancel, SessionFrame::file(msg)).await?;
     }
     Ok(())
 }

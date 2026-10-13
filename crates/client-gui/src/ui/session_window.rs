@@ -450,7 +450,7 @@ fn paint_image(
     image: (egui::TextureId, u32, u32),
     size: egui::Vec2,
 ) {
-    let (texture, width, height) = image;
+    let (texture, _width, _height) = image;
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     ui.painter().image(
         texture,
@@ -460,7 +460,8 @@ fn paint_image(
     );
     // 只有「完全控制」模式捕获输入：仅观看 / 仅文件传输不该注入键鼠。
     if active.mode == RemoteMode::Control {
-        v.capture_input(ui, manager, &response, rect, width, height);
+        // 坐标按所选显示器的尺寸映射（由 `capture_input` 内部取），与纹理是否缩放无关。
+        v.capture_input(ui, manager, &response, rect);
     }
 }
 

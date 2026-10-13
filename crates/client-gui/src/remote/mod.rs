@@ -996,6 +996,22 @@ impl RemoteView {
             .map_or_else(|e| e.into_inner().displays.clone(), |guard| guard.displays.clone())
     }
 
+    /// 输入坐标应映射到的目标尺寸。
+    ///
+    /// **必须用所选显示器的尺寸（[`DisplayInfo`]），而不是纹理像素尺寸**：注入端（`enigo`）与
+    /// 显示器原点查询（`xcap`）用的是同一套「全局显示坐标」，而纹理是**编码坐标系**下的尺寸——
+    /// 「流畅」档缩放到一半（`scale = 0.5`），高 DPI 屏上还会与物理像素再差一个缩放因子。按纹理
+    /// 像素算坐标会让注入坐标整体偏移（偏差与这些缩放因子同阶，鼠标落点明显不对）。
+    /// 显示器尺寸未知（列表尚未到达、读取失败或为零）时退回纹理尺寸。
+    fn input_target_size(&self, display: u32) -> (u32, u32) {
+        self.displays()
+            .into_iter()
+            .find(|d| d.id == display)
+            .map(|d| (d.width, d.height))
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .unwrap_or(self.tex_size)
+    }
+
     /// 当前观看的显示器编号。
     #[must_use]
     pub fn selected_display(&self) -> Option<u32> {
@@ -1098,8 +1114,9 @@ impl RemoteView {
 
     /// 捕获会话窗口内的鼠标/键盘并转成 [`InputEvent`] 投递给引擎。
     ///
-    /// `rect` 为画面显示区域，`remote_w`/`remote_h` 为远程帧像素尺寸；鼠标坐标从窗口内
-    /// 显示区域**反变换**到远程屏幕坐标（画面可能被等比缩放）。
+    /// `rect` 为画面显示区域；鼠标坐标从窗口内显示区域**反变换**到远程屏幕坐标（画面可能被等比
+    /// 缩放）。目标坐标系是**所选显示器的尺寸**（见 [`Self::input_target_size`]），不是纹理像素
+    /// 尺寸——纹理处在编码坐标系里（可能被缩放），用它算坐标会让注入落到错误位置。
     ///
     /// 事件来源是**整窗**的，故按键/滚轮/键盘都要经 [`InputGate`] 门控（详见其文档）：鼠标
     /// 按下只在指针位于画面上时转达、抬起只要曾转达过就无条件转达；滚轮只在指针位于画面上
@@ -1111,8 +1128,6 @@ impl RemoteView {
         manager: &Arc<RemoteManager>,
         response: &egui::Response,
         rect: egui::Rect,
-        remote_w: u32,
-        remote_h: u32,
     ) {
         // 独占键盘的退出组合键**先**拦截：命中即关闭独占、本帧不转发任何输入（组合键不能泄给远端）。
         // 不置 `capture_this_frame`，让窗口回调在本帧补发一次抬起——刚改了键盘语义，先松开最安全。
@@ -1124,6 +1139,8 @@ impl RemoteView {
         self.capture_this_frame = true;
 
         let display = self.selected_display.unwrap_or(0);
+        // 目标坐标系 = 所选显示器的尺寸（与注入端同一套全局显示坐标），不是纹理像素尺寸。
+        let (target_w, target_h) = self.input_target_size(display);
 
         // 指针是否在画面内：拖动本控件（画面）期间 `hovered()` 会变 false，故把
         // `is_pointer_button_down_on()` 也算进来，让「在画面上按下后拖出画面」的拖动继续生效。
@@ -1131,8 +1148,8 @@ impl RemoteView {
 
         // 1) 鼠标移动（去重后发送；仅在指针位于画面上时更新）。
         if let Some(pos) = response.hover_pos() {
-            let x = scale_axis(pos.x - rect.min.x, rect.width(), remote_w);
-            let y = scale_axis(pos.y - rect.min.y, rect.height(), remote_h);
+            let x = scale_axis(pos.x - rect.min.x, rect.width(), target_w);
+            let y = scale_axis(pos.y - rect.min.y, rect.height(), target_h);
             if self.last_mouse != Some((x, y)) {
                 self.last_mouse = Some((x, y));
                 manager.send_input(InputEvent::MouseMove { x, y, display });

@@ -360,7 +360,7 @@ impl TransferHub {
                 size,
             } => self.on_accept(id, accepted, reason, size, &mut out).await?,
             SessionMessage::FileChunk { id, data } => self.on_chunk(id, data, &mut out).await?,
-            SessionMessage::FileDone { id } => self.on_done(id).await?,
+            SessionMessage::FileDone { id } => self.on_done(id, &mut out).await?,
             SessionMessage::FileError { id, reason } => {
                 // `abort_transfer` 现在会连 id 匹配的待决槽位一起撤掉，所以这里不再无差别地
                 // 清空两个待决槽位——否则一个无关 id 的错误会把正当等待中的请求也抹掉。
@@ -575,8 +575,32 @@ impl TransferHub {
     }
 
     /// `FileDone`：只有「本端在收」时它才是完成信号；本端刚发完最后一块时它是对端回的确认。
-    async fn on_done(&mut self, id: u64) -> RemoteResult<()> {
+    ///
+    /// **必须校验字节数**：`FileDone` 只是对端单方宣布「发完了」，而 [`Self::on_chunk`] 不校验块
+    /// 连续性（单条 TCP 流本就保序，正常路径下无需校验），所以任何一个 `FileChunk` 在途中丢失
+    /// （发送侧被丢弃、源文件被改动、实现跑飞）都会让本端静默少收一截字节。若不校验就
+    /// `sync_all` + `Finished`，用户拿到的是一个**被截断却报「已完成」**的文件——数据损坏比报错
+    /// 危险得多。故这里做纵深防御：字节数不符即判定损坏，回 `FileError` 让对端也按失败收尾。
+    async fn on_done(&mut self, id: u64, out: &mut Vec<SessionMessage>) -> RemoteResult<()> {
         if let Some(incoming) = self.incoming.take_if(|i| i.id == id) {
+            if incoming.done != incoming.total {
+                let reason = format!(
+                    "接收字节数不符（收到 {} / 应为 {}），传输已损坏",
+                    incoming.done, incoming.total
+                );
+                warn!(
+                    id,
+                    done = incoming.done,
+                    total = incoming.total,
+                    "入站传输字节数不符，判定为损坏"
+                );
+                out.push(SessionMessage::FileError {
+                    id,
+                    reason: reason.clone(),
+                });
+                self.emit(TransferEvent::Failed { id, reason });
+                return Ok(());
+            }
             incoming.file.sync_all().await?;
             self.emit(TransferEvent::Finished {
                 id,
@@ -978,6 +1002,46 @@ mod tests {
             .unwrap();
         assert!(has_file_error(&out, 2), "超上限应回 FileError");
         assert!(ctrl.incoming.is_none(), "超上限应中断该次传输");
+    }
+
+    /// 收满的字节数与受理时声明的总数不符 = 有块在途中丢失：必须回 `FileError`，**不得**报
+    /// `Finished`（否则用户拿到一个被静默截断却显示「已完成」的文件）。这是纵深防御的机械锁：
+    /// 无论截断来自丢弃、源文件改动还是实现跑飞，都要变成显式错误。
+    #[tokio::test]
+    async fn short_incoming_transfer_reports_error_not_finished() {
+        let local = TempRoot::new("short-incoming");
+        let (mut ctrl, mut rx) = hub(None, local.0.clone());
+        let dest = local.0.join("short.bin");
+        let file = tokio::fs::File::create(&dest).await.unwrap();
+        ctrl.incoming = Some(Incoming {
+            id: 7,
+            file,
+            // 声明应收 100，实际只收到 40（中间丢了一块）。
+            done: 40,
+            total: 100,
+            local_path: dest.clone(),
+        });
+
+        let out = ctrl
+            .on_message(SessionMessage::FileDone { id: 7 })
+            .await
+            .unwrap();
+        assert!(has_file_error(&out, 7), "字节数不符应回 FileError");
+        assert!(ctrl.incoming.is_none(), "损坏的传输应被清掉");
+
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TransferEvent::Finished { .. })),
+            "不得报 Finished：那会让 UI 把截断文件当成完成"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TransferEvent::Failed { id: 7, .. })),
+            "应报 Failed 让 UI 看到损坏"
+        );
     }
 
     /// `abort_all` 对 outgoing / incoming 各回一条 `FileError` 并清空状态，本地 `Failed` 照发。
