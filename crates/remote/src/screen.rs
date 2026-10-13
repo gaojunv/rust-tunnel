@@ -12,30 +12,23 @@
 //!
 //! # 编码
 //!
-//! 两条路径，都在引擎的运行时线程里完成，[`FrameSink`] 拿到的永远是**已解码的 RGBA**
-//! （UI 线程只负责上传纹理，避免在 egui 线程里解码掉帧）：
-//!
-//! - **整帧**：[`encode_frame`] 是纯函数，输入「上一帧的原始 RGBA」与当前 RGBA 帧，相同则返回
-//!   `None`（静止桌面零输出）。用作首帧与关键帧。
-//! - **瓦片差分**：[`crate::tiles`] 把整帧切成 [`TILE_SIZE`] 见方的瓦片，只编码变化的那些，
-//!   经 [`FrameSink::on_tiles`] 交给 UI 做局部纹理更新。这是带宽的关键——整帧 JPEG 在
-//!   1080p@10fps 约 15–25 Mbps，经中继不可接受；静止桌面下瓦片路径趋近零流量。
+//! 数据面自阶段 2 起走 **VP9 4:4:4 时域编码**（见 [`crate::video`]）：编解码都在引擎的运行时
+//! 线程里完成，[`FrameSink`] 拿到的永远是**已解码的整帧 RGBA**（UI 线程只负责上传纹理）。
+//! 静止画面由上层 memcmp 去重后**完全不喂编码器**，这是带宽趋零的来源。
 //!
 //! 画质档位见 [`QualityPreset`]，帧率上限见 [`EncodeOptions::max_fps`]。
 
 use crate::error::{RemoteError, RemoteResult};
-use image::codecs::jpeg::JpegEncoder;
-use image::imageops::FilterType;
-use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 use serde::{Deserialize, Serialize};
 
 /// 每像素字节数（RGBA）。
 pub const BYTES_PER_PIXEL: usize = 4;
 
-/// 瓦片边长（像素）。见 [`crate::tiles`] 的差分说明。
-pub const TILE_SIZE: u32 = 64;
-
 /// 一台显示器的元信息。
+///
+/// **一个字段都不能加、不能改**：它内嵌在 `SessionMessage::HelloAck.displays` 里，改形状会破坏
+/// 「混合版本先解出 `Hello`/`HelloAck`、再明文干净拒绝」这条路径。所有新的每显示器元数据
+/// （codec、编码尺寸）都走握手后的 `SessionMessage::ScreenConfig`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayInfo {
     /// 平台显示器编号（采集/注入时回填）。
@@ -123,51 +116,6 @@ pub struct KeyEvent {
     pub text: Option<String>,
     /// 修饰键位掩码（Ctrl/Alt/Shift/Meta，位序由上层约定）。
     pub modifiers: u8,
-}
-
-/// 一块瓦片补丁（只含变化区域，JPEG 编码）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TilePatch {
-    /// 瓦片左上角 X（整帧像素坐标）。
-    pub x: u32,
-    /// 瓦片左上角 Y（整帧像素坐标）。
-    pub y: u32,
-    /// 瓦片宽（像素，边缘瓦片可小于 [`TILE_SIZE`]）。
-    pub width: u32,
-    /// 瓦片高（像素，边缘瓦片可小于 [`TILE_SIZE`]）。
-    pub height: u32,
-    /// JPEG 字节。
-    pub jpeg: Vec<u8>,
-}
-
-/// 已解码的一块瓦片（交给 UI 做局部纹理更新）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedTile {
-    /// 瓦片左上角 X（整帧像素坐标）。
-    pub x: u32,
-    /// 瓦片左上角 Y（整帧像素坐标）。
-    pub y: u32,
-    /// 瓦片宽（像素）。
-    pub width: u32,
-    /// 瓦片高（像素）。
-    pub height: u32,
-    /// RGBA8 像素数据，长度 = `width * height * 4`。
-    pub rgba: Vec<u8>,
-}
-
-/// 一次增量画面更新（整帧坐标系 + 若干已解码瓦片）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TileUpdate {
-    /// 来源显示器编号。
-    pub display: u32,
-    /// 整帧宽（像素）。
-    pub width: u32,
-    /// 整帧高（像素）。
-    pub height: u32,
-    /// 帧序号（对端递增）。
-    pub seq: u64,
-    /// 本次更新的瓦片。
-    pub tiles: Vec<DecodedTile>,
 }
 
 /// 目录项（文件传输用；`crate::file` 与 UI 共用）。
@@ -269,23 +217,13 @@ pub trait InputSink: Send + Sync + 'static {
 
 /// 控制器侧的画面上报目标（UI 实现）。
 ///
-/// **调用发生在引擎的运行时线程**：`on_frame` / `on_tiles` 收到的已是解码后的 RGBA，
-/// UI 线程只需上传纹理。
+/// **调用发生在引擎的运行时线程**：`on_frame` 收到的已是解码后的 RGBA，UI 线程只需上传纹理。
 pub trait FrameSink: Send + Sync + 'static {
     /// 显示器列表（会话建立时下发一次，变更时再次下发）。
     fn on_displays(&self, displays: Vec<DisplayInfo>);
 
-    /// 一帧已解码**整帧**画面（首帧与关键帧走这里）。
+    /// 一帧已解码画面（VP9 时域编码下**一律是整帧**）。
     fn on_frame(&self, frame: DecodedFrame);
-
-    /// 一次增量瓦片更新（只含变化区域）。
-    ///
-    /// 默认实现为空操作：忽略它的 sink 会在下一个整帧（关键帧）自行恢复——被控端保证
-    /// 周期性发关键帧，所以这不是正确性缺口，只是「静止画面之外的更新被推迟到关键帧」。
-    /// egui 实现应覆写它并用 `TextureHandle::set_partial` 做局部更新。
-    fn on_tiles(&self, update: TileUpdate) {
-        let _ = update;
-    }
 
     /// 对端（被控端）发来的剪贴板文本。
     ///
@@ -317,12 +255,12 @@ pub trait Clipboard: Send + Sync + 'static {
 /// 屏幕编码参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EncodeOptions {
-    /// JPEG 质量（0..=100）。
-    pub quality: u8,
-    /// 缩放比例（1.0 = 原始尺寸）。既决定整帧编码尺寸，也决定瓦片差分所在的坐标系
-    /// （见 [`crate::tiles`]：差分在缩放后的帧上进行，保证瓦片与控制器持有的整帧同格）。
+    /// 目标码率（kbps）。VP9 CBR 的目标值；实际码率由 [`crate::video`] 的 `rc_buffer_size_ms`
+    /// （交互级 300 ms）在秒级以下尺度上收敛。
+    pub target_bitrate_kbps: u32,
+    /// 缩放比例（1.0 = 原始尺寸）。编码尺寸还会被 [`crate::video::MAX_ENCODE_WIDTH`] 封顶。
     pub scale: f32,
-    /// 目标帧率上限（被控端据此定采集间隔）。
+    /// 目标帧率上限（被控端据此定采集间隔，也写进编码器的 `fps`）。
     pub max_fps: u8,
 }
 
@@ -346,12 +284,12 @@ impl EncodeOptions {
 /// 档位经 `SessionMessage::SetQuality` 下发给被控端，**由被控端生效**（编码在它那边）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum QualityPreset {
-    /// 流畅：半分辨率 + 低质量 + 8 fps。窄带/跨地域中继场景。
+    /// 流畅：半分辨率 + 低码率 + 8 fps。窄带/跨地域中继场景。
     Smooth,
-    /// 均衡：原始分辨率 + 中质量 + 12 fps。默认档。
+    /// 均衡：原始分辨率（≤ [`crate::video::MAX_ENCODE_WIDTH`]）+ 中码率 + 12 fps。默认档。
     #[default]
     Balanced,
-    /// 高清：原始分辨率 + 高质量 + 20 fps。同内网直连场景。
+    /// 高清：原始分辨率（≤ 封顶宽度）+ 高码率 + 20 fps。同内网直连场景。
     Hd,
 }
 
@@ -361,17 +299,17 @@ impl QualityPreset {
     pub fn options(self) -> EncodeOptions {
         match self {
             Self::Smooth => EncodeOptions {
-                quality: 45,
+                target_bitrate_kbps: 1200,
                 scale: 0.5,
                 max_fps: 8,
             },
             Self::Balanced => EncodeOptions {
-                quality: 70,
+                target_bitrate_kbps: 4000,
                 scale: 1.0,
                 max_fps: 12,
             },
             Self::Hd => EncodeOptions {
-                quality: 85,
+                target_bitrate_kbps: 8000,
                 scale: 1.0,
                 max_fps: 20,
             },
@@ -395,24 +333,6 @@ impl QualityPreset {
     }
 }
 
-/// 一帧编码结果。
-///
-/// **不带哈希**：帧去重的判据是「与上一帧的像素是否逐字节相同」，[`encode_frame`] 已经用返回值
-/// （`None` = 与上一帧相同）表达了这个信息，再挂一个哈希字段既冗余、又容易让人误以为它是密码学
-/// 意义上的完整性摘要。去重本身也不需要哈希，直接比对上一帧的 RGBA 副本即可（memcmp 远快于
-/// SHA-256：4K 逐帧实测 54 ms → 数 ms）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncodedFrame {
-    /// 来源显示器编号。
-    pub display: u32,
-    /// 编码后尺寸的宽度。
-    pub width: u32,
-    /// 编码后尺寸的高度。
-    pub height: u32,
-    /// JPEG 字节。
-    pub jpeg: Vec<u8>,
-}
-
 /// 按比例计算缩放后的尺寸（下限 1 像素）。
 // 缩放比例是有界浮点、尺寸远小于 u32 上限，截断/符号转换在此安全。
 #[expect(
@@ -429,76 +349,6 @@ pub(crate) fn scaled_dimension(original: u32, scale: f32) -> u32 {
     }
 }
 
-/// 把一帧 RGBA 编码为 JPEG；**与上一帧像素完全相同则返回 `None`**。
-///
-/// 这是本模块的核心纯函数：`prev_rgba` 为上一帧的原始 RGBA（无上一帧时传 `None`）。
-/// 比对基于**原始 RGBA**，因此缩放不影响去重判定。
-///
-/// 用切片相等（memcmp）而不是密码学哈希：去重只需要「与上一帧是否相同」这一个布尔答案，不需要
-/// 抗碰撞性。保留上一帧的副本是必须的——这正是去重的定义。
-///
-/// # Errors
-/// 帧尺寸与像素数据不匹配、JPEG 编码失败时返回 [`RemoteError::Encode`]。
-pub fn encode_frame(
-    prev_rgba: Option<&[u8]>,
-    frame: &RawFrame,
-    options: &EncodeOptions,
-) -> RemoteResult<Option<EncodedFrame>> {
-    frame.validate()?;
-    if prev_rgba == Some(frame.rgba.as_slice()) {
-        return Ok(None);
-    }
-
-    let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())
-        .ok_or_else(|| RemoteError::Encode("无法从 RGBA 构造图像".to_owned()))?;
-
-    let (out_w, out_h) = if (options.scale - 1.0).abs() < f32::EPSILON {
-        (frame.width, frame.height)
-    } else {
-        (
-            scaled_dimension(frame.width, options.scale),
-            scaled_dimension(frame.height, options.scale),
-        )
-    };
-    let image = if (out_w, out_h) == (frame.width, frame.height) {
-        image
-    } else {
-        image::imageops::resize(&image, out_w, out_h, FilterType::Triangle)
-    };
-
-    // image 的 JPEG 编码器不支持 RGBA8，需先去掉 alpha 通道转 RGB8（桌面画面本就不透明）。
-    let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
-    let mut jpeg = Vec::new();
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg, options.quality.min(100));
-    encoder
-        .write_image(rgb.as_raw(), out_w, out_h, ExtendedColorType::Rgb8)
-        .map_err(|err| RemoteError::Encode(format!("JPEG 编码失败: {err}")))?;
-
-    Ok(Some(EncodedFrame {
-        display: frame.display,
-        width: out_w,
-        height: out_h,
-        jpeg,
-    }))
-}
-
-/// 把一帧 JPEG 解码为 RGBA。
-///
-/// # Errors
-/// JPEG 数据非法时返回 [`RemoteError::Encode`]。
-pub fn decode_frame(display: u32, seq: u64, jpeg: &[u8]) -> RemoteResult<DecodedFrame> {
-    let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
-        .map_err(|err| RemoteError::Encode(format!("JPEG 解码失败: {err}")))?;
-    let rgba = image.to_rgba8();
-    Ok(DecodedFrame {
-        display,
-        width: rgba.width(),
-        height: rgba.height(),
-        seq,
-        rgba: rgba.into_raw(),
-    })
-}
-
 /// 一个什么都不做的 [`FrameSink`]（UI 尚未安装时的兜底，避免会话因缺 sink 而失败）。
 #[derive(Debug, Default)]
 pub struct NullFrameSink;
@@ -513,85 +363,12 @@ impl FrameSink for NullFrameSink {
 mod tests {
     use super::*;
 
-    /// 造一帧纯色 RGBA。
-    fn solid(display: u32, w: u32, h: u32, color: [u8; 4]) -> RawFrame {
-        let mut rgba = Vec::with_capacity((w * h) as usize * BYTES_PER_PIXEL);
-        for _ in 0..(w * h) {
-            rgba.extend_from_slice(&color);
-        }
-        RawFrame {
-            display,
-            width: w,
-            height: h,
-            rgba,
-        }
-    }
-
     #[test]
-    fn same_frame_yields_no_output() {
-        let opts = EncodeOptions::default();
-        let frame = solid(0, 32, 24, [10, 20, 30, 255]);
-        encode_frame(None, &frame, &opts).unwrap().expect("首帧应有输出");
-        // 同一帧（像素逐字节相同）→ 零输出。基准就是上一帧的 RGBA 副本。
-        let second = encode_frame(Some(&frame.rgba), &frame, &opts).unwrap();
-        assert!(second.is_none(), "同帧应零输出");
-    }
-
-    #[test]
-    fn different_frame_yields_output() {
-        let opts = EncodeOptions::default();
-        let a = solid(0, 32, 24, [10, 20, 30, 255]);
-        let b = solid(0, 32, 24, [200, 100, 50, 255]);
-        let eb = encode_frame(Some(&a.rgba), &b, &opts).unwrap().expect("不同帧应有输出");
-        assert!(!eb.jpeg.is_empty());
-    }
-
-    #[test]
-    fn scale_changes_encoded_dimensions_not_dedup() {
-        let opts = EncodeOptions {
-            quality: 80,
-            scale: 0.5,
-            ..EncodeOptions::default()
-        };
-        let frame = solid(1, 40, 20, [1, 2, 3, 255]);
-        let encoded = encode_frame(None, &frame, &opts).unwrap().unwrap();
-        assert_eq!((encoded.width, encoded.height), (20, 10), "缩放后尺寸应为一半");
-        // 去重基于原始 RGBA，与是否缩放无关：同一原始帧仍判为「无变化」。
-        assert!(
-            encode_frame(Some(&frame.rgba), &frame, &opts).unwrap().is_none(),
-            "缩放不应影响同帧去重"
-        );
-    }
-
-    #[test]
-    fn roundtrip_encode_decode() {
-        let opts = EncodeOptions::default();
-        let frame = solid(0, 16, 16, [123, 45, 67, 255]);
-        let encoded = encode_frame(None, &frame, &opts).unwrap().unwrap();
-        let decoded = decode_frame(0, 7, &encoded.jpeg).unwrap();
-        assert_eq!(decoded.display, 0);
-        assert_eq!(decoded.seq, 7);
-        assert_eq!((decoded.width, decoded.height), (16, 16));
-        assert_eq!(decoded.rgba.len(), 16 * 16 * BYTES_PER_PIXEL);
-        // 纯色 JPEG 解码后各通道应基本还原（允许有损误差）。
-        assert!((i32::from(decoded.rgba[0]) - 123).abs() <= 8, "R 通道还原偏差过大");
-    }
-
-    #[test]
-    fn mismatched_rgba_length_is_rejected() {
-        let opts = EncodeOptions::default();
-        let bad = RawFrame {
-            display: 0,
-            width: 4,
-            height: 4,
-            rgba: vec![0u8; 10],
-        };
-        assert!(matches!(encode_frame(None, &bad, &opts), Err(RemoteError::Encode(_))));
-    }
-
-    #[test]
-    fn garbage_jpeg_is_rejected() {
-        assert!(matches!(decode_frame(0, 0, b"not a jpeg"), Err(RemoteError::Encode(_))));
+    fn scaled_dimension_has_floor_of_one_pixel() {
+        assert_eq!(scaled_dimension(1920, 0.5), 960);
+        assert_eq!(scaled_dimension(1920, 1.0), 1920);
+        // 极小值不会塌到 0（0 尺寸会让后续网格/分配除零）。
+        assert_eq!(scaled_dimension(1, 0.01), 1);
     }
 
     #[test]
@@ -599,8 +376,11 @@ mod tests {
         let smooth = QualityPreset::Smooth.options();
         let balanced = QualityPreset::Balanced.options();
         let hd = QualityPreset::Hd.options();
-        // 画质、帧率单调递增；流畅档降分辨率。
-        assert!(smooth.quality < balanced.quality && balanced.quality < hd.quality);
+        // 码率、帧率单调递增；流畅档降分辨率。
+        assert!(
+            smooth.target_bitrate_kbps < balanced.target_bitrate_kbps
+                && balanced.target_bitrate_kbps < hd.target_bitrate_kbps
+        );
         assert!(smooth.max_fps < balanced.max_fps && balanced.max_fps < hd.max_fps);
         assert!(smooth.scale < 1.0, "流畅档应降分辨率以省带宽");
         assert!((balanced.scale - 1.0).abs() < f32::EPSILON);
@@ -623,3 +403,4 @@ mod tests {
         );
     }
 }
+

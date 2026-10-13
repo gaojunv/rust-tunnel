@@ -3,19 +3,32 @@
 //! 只在 `enabled == true` 且收到合法 [`rust_tunnel_common::protocol::ControlMessage::RemoteSessionIncoming`]
 //! 时才由 [`crate::manager::RemoteManager`] 启动。握手校验失败一律拒绝并记原因；会话结束/
 //! 中断立即停循环、关连接。
+//!
+//! # 编码流水线（阶段 2）
+//!
+//! `select!` 循环只保留 cancel / heartbeat / 输入 / 文件 / 控制消息。画面走一条三阶段流水线：
+//!
+//! ```text
+//! 采集(spawn_blocking) --有界(1)--> 编码任务(spawn_blocking) --有界(WRITER_QUEUE)--> 发送(独占 writer)
+//! ```
+//!
+//! **丢弃策略是这个管线里最关键的正确性决定**：时域编码的参考链是串起来的，丢掉一个**已编码**
+//! 的 P 帧，后续引用它的帧在解码端永远解不出来（花屏且不自愈，只能等下一个 IDR）。所以背压的
+//! 出口只能放在**编码之前**——输出队列满就跳过这一帧（等价于降帧率，语义合法），绝不在编码之后
+//! 丢弃。**不要把这条改成「编码后丢弃」，那不是优化，是花屏。**
 
 use crate::auth::{ack_mac, PendingSessions};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::screen::{Clipboard, EncodeOptions, InputSink, RawFrame, ScreenSource};
 use crate::session::{
-    trusted_rtt, Lane, SessionCodec, SessionEnd, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL,
-    SESSION_PROTO_VERSION,
+    trusted_rtt, CodecId, SessionCodec, SessionEnd, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL,
+    SESSION_PROTO_VERSION, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
-use crate::tiles::TileDiffer;
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
+use crate::video::{encode_dimensions, VideoEncoder, MAX_ENCODE_WIDTH};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::sync::Arc;
@@ -192,6 +205,11 @@ pub async fn run_controlled(
     let (tx, rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
     let writer_task = tokio::spawn(writer_loop(writer, rx, cancel.clone()));
 
+    // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
+    // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
+    let (encode_tx, encode_rx) = mpsc::channel::<EncodeJob>(1);
+    let encode_task = tokio::spawn(encode_loop(encode_rx, tx.clone(), cancel.clone()));
+
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
     let mut encode = config.encode;
@@ -213,26 +231,20 @@ pub async fn run_controlled(
     // 采集节拍用「可重置的 sleep」而不是固定 interval：画质档位会改 `max_fps`，档位一变
     // 节拍要立刻跟着变（`interval_at` 的周期改不了，只能重建）。
     let mut capture_tick = Box::pin(sleep(encode.capture_interval()));
-    // 差分器在采集期间被**移进**阻塞任务（采集与整帧/瓦片编码都阻塞，见 `run_capture`），
-    // 故用 `Option` 装、采集回来时归还。采集在途时若收到「重置基准」请求（切显示器/切档位），
-    // `differ` 不在手上，先记进 `pending_differ_reset`，等它随结果回来再补做。
-    let mut differ: Option<TileDiffer> = Some(TileDiffer::new());
-    let mut pending_differ_reset = false;
     // 在途采集的结果经通道回传。`capture_deadline` 非空即代表有一次采集在途，保证同一时刻最多
     // 一次采集（并发两次会把阻塞线程池堆满）。循环自己保留 `capture_tx`，故 `recv()` 永不返回
     // `None`。
     let (capture_tx, mut capture_rx) = mpsc::channel::<CaptureOutcome>(1);
-    // 在途采集的截止时刻（看门狗，见 `CAPTURE_WATCHDOG`）；`None` = 当前没有采集在途。
+    // 在途采集的截止时刻（看门狗，见 [`CAPTURE_WATCHDOG`]）；`None` = 当前没有采集在途。
     let mut capture_deadline: Option<Instant> = None;
     // 采集代次：被看门狗判定为「已丢失」的那次采集，其阻塞任务仍可能**稍后**才把结果投进通道
     // （panic 被吞掉后由后续代码路径、或挂住之后终于返回）。带上代次才能把这种过期结果丢掉，
-    // 否则会用旧基准发出错误的增量瓦片。
+    // 否则会喂给编码器一帧陈旧画面（虽然无害，但白费一次编码）。
     let mut capture_generation: u64 = 0;
-    // 连续超时次数：见 `MAX_CAPTURE_TIMEOUTS`。
+    // 连续超时次数：见 [`MAX_CAPTURE_TIMEOUTS`]。
     let mut capture_timeouts: u32 = 0;
-    // 首帧（或切显示器/切档位之后）必须先发整帧：差分器没有基准就没有变化可言。
+    // 首帧（或切显示器/切档位/收到 RequestKeyframe 之后）必须先发关键帧：解码侧要有可重建的参考。
     let mut force_keyframe = true;
-    let mut seq: u64 = 0;
     // RTT 样本：发 `Heartbeat` 时记时刻，收到 `HeartbeatAck` 时配对算 RTT。**复用既有心跳往返**，
     // 不新增数据面变体（见 `HEARTBEAT_INTERVAL`）。
     let mut pending_heartbeat: Option<Instant> = None;
@@ -252,26 +264,24 @@ pub async fn run_controlled(
             }
             outcome = capture_rx.recv(), if capture_deadline.is_some() => {
                 match outcome {
-                    // 过期结果：看门狗已判定该次采集丢失并重建了基准，这一帧与当前基准不匹配，
-                    // 必须丢弃（发出错误的增量瓦片比丢一帧更糟）。此时**不能**清 `capture_deadline`
-                    // ——在途的是另一次（更晚）的采集。
+                    // 过期结果：看门狗已判定该次采集丢失。丢掉它（在途的是另一次更晚的采集，
+                    // **不能**清 `capture_deadline`）。
                     Some(CaptureOutcome { generation, .. }) if generation != capture_generation => {
                         debug!(generation, "丢弃过期的采集结果");
                     }
-                    Some(CaptureOutcome { message, differ: mut restored, .. }) => {
+                    Some(CaptureOutcome { frame, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
-                        // `capture_tx` 常驻于循环 → 只要还有发送端就不会 `None`。
-                        if pending_differ_reset {
-                            restored.reset();
-                            pending_differ_reset = false;
-                        }
-                        differ = Some(restored);
-                        if let Some(msg) = message {
-                            // `run_capture` 用同一基值（`seq + 1`）算帧序号；同一时刻只有一次采集在途。
-                            seq = seq.wrapping_add(1);
-                            if let Err(err) = enqueue(&tx, &cancel, SessionFrame::screen(msg)).await {
-                                break Err(err);
+                        if let Some(frame) = frame {
+                            let job = EncodeJob { display: display_id, encode, force_keyframe, frame };
+                            // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
+                            // 帧（等价降帧率）。关键帧请求保留到真正投递成功的那一次。
+                            match encode_tx.try_send(job) {
+                                Ok(()) => force_keyframe = false,
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    debug!("编码队列已满，跳过本轮采集（编码前丢帧，不破坏参考链）");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break Err(link_closed()),
                             }
                         }
                     }
@@ -279,13 +289,11 @@ pub async fn run_controlled(
                     None => capture_deadline = None,
                 }
             }
-            // 看门狗：采集 panic/挂死时结果永不回传，见 `CAPTURE_WATCHDOG`。到点即判定该次采集
-            // 丢失：放弃它（`differ` 已随闭包一起丢失，置 `None` 让下一轮采集新建基准）并强制整帧，
-            // 画面因此会在下一拍恢复；连续多次才终止会话（见 `MAX_CAPTURE_TIMEOUTS`）。
+            // 看门狗：采集 panic/挂死时结果永不回传，见 [`CAPTURE_WATCHDOG`]。到点即判定该次采集
+            // 丢失：放弃它并继续下一拍（**不必**强制关键帧——丢的是**未编码**的采集，编码器的参考
+            // 链完好无损）；连续多次才终止会话（见 [`MAX_CAPTURE_TIMEOUTS`]）。
             () = sleep(capture_deadline.unwrap_or_else(Instant::now).saturating_duration_since(Instant::now())), if capture_deadline.is_some() => {
                 capture_deadline = None;
-                differ = None;
-                force_keyframe = true;
                 capture_timeouts = capture_timeouts.saturating_add(1);
                 if capture_timeouts >= MAX_CAPTURE_TIMEOUTS {
                     warn!(count = capture_timeouts, "采集连续超时，判定采集侧已失效，结束会话");
@@ -293,47 +301,22 @@ pub async fn run_controlled(
                         "屏幕采集连续 {capture_timeouts} 次超时（每次超过 {CAPTURE_WATCHDOG:?}）"
                     )));
                 }
-                warn!(count = capture_timeouts, "在途采集超过看门狗时限，判定已丢失并重建差分基线");
+                warn!(count = capture_timeouts, "在途采集超过看门狗时限，判定已丢失");
             }
             () = &mut capture_tick, if capture => {
                 capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
                 // 串行采集：上一次还没回来就跳过本轮，避免把阻塞线程池堆满。
                 if capture_deadline.is_none() {
-                    // 基准丢失时（看门狗放弃过一次采集）新建差分器：它没有基准，故必须整帧。
-                    if differ.is_none() {
-                        differ = Some(TileDiffer::new());
-                        force_keyframe = true;
-                    }
-                    if let Some(differ) = differ.take() {
-                        capture_generation = capture_generation.wrapping_add(1);
-                        capture_deadline = Some(Instant::now() + config.capture_watchdog);
-                        // 采集开始时消费掉「强制关键帧」：`diff(force_keyframe=true)` 必产出整帧
-                        // （关键帧路径传 `prev_hash=None`），故与「产出后再清标志」等价；期间若切了
-                        // 档位/显示器，那一侧会把它重新置真，让下一轮再发关键帧。
-                        let force = force_keyframe;
-                        force_keyframe = false;
-                        let screen = Arc::clone(&screen);
-                        let encode_now = encode;
-                        let display_now = display_id;
-                        let seq_now = seq.wrapping_add(1);
-                        let generation_now = capture_generation;
-                        let tx = capture_tx.clone();
-                        // 采集 + 编码是阻塞调用，整体挪出 async worker（见 `run_capture`）。
-                        tokio::task::spawn_blocking(move || {
-                            run_capture(
-                                &*screen,
-                                CaptureJob {
-                                    display: display_now,
-                                    encode: encode_now,
-                                    force_keyframe: force,
-                                    seq: seq_now,
-                                    generation: generation_now,
-                                },
-                                differ,
-                                &tx,
-                            );
-                        });
-                    }
+                    capture_generation = capture_generation.wrapping_add(1);
+                    capture_deadline = Some(Instant::now() + config.capture_watchdog);
+                    let screen = Arc::clone(&screen);
+                    let display_now = display_id;
+                    let generation_now = capture_generation;
+                    let tx = capture_tx.clone();
+                    // 采集是阻塞调用（xcap 的 portal 路径可能数秒），整体挪出 async worker。
+                    tokio::task::spawn_blocking(move || {
+                        run_capture(&*screen, display_now, generation_now, &tx);
+                    });
                 }
             }
             _ = file_tick.tick(), if transfer.has_outgoing() => {
@@ -366,10 +349,9 @@ pub async fn run_controlled(
                             }
                         }
                         SessionMessage::SelectDisplay { display: target } => {
-                            // 切换采集目标后差分基准作废：分辨率/内容都变了，必须重发整帧。
+                            // 切换采集目标后参考画面作废：分辨率/内容都变了，必须重发关键帧。
                             if displays.iter().any(|d| d.id == target) {
                                 display_id = target;
-                                reset_differ(&mut differ, &mut pending_differ_reset);
                                 force_keyframe = true;
                             } else {
                                 // `display` 会与 `tracing::display` 撞名，故用 target 命名。
@@ -379,8 +361,13 @@ pub async fn run_controlled(
                         SessionMessage::SetQuality { preset } => {
                             encode = preset.options();
                             capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
-                            reset_differ(&mut differ, &mut pending_differ_reset);
                             force_keyframe = true;
+                        }
+                        SessionMessage::RequestKeyframe { display } => {
+                            // 控制器解码失败/丢弃了参考帧时的恢复请求。
+                            if display == display_id {
+                                force_keyframe = true;
+                            }
                         }
                         SessionMessage::Clipboard { text } => {
                             if let Some(cb) = clipboard.clone() {
@@ -501,6 +488,12 @@ pub async fn run_controlled(
         }))),
     )
     .await;
+    // 编码任务先停：它可能正阻塞在出站队列的 `send` 上（对端停读）。关掉它的输入队列并限时等待，
+    // 超时则中止——它的 `send` 在写任务退出后会拿到 `Closed`，正常收场。
+    drop(encode_tx);
+    let mut encode_task = encode_task;
+    let _ = timeout(BYE_TIMEOUT, &mut encode_task).await;
+    encode_task.abort();
     drop(tx);
     // 写任务自己的 `Bye` 发送也限时（`BYE_TIMEOUT`），这里再给一个上界；超时则中止它——写任务
     // 仍卡在停读的对端上时，只有丢弃写半边（= 关闭 socket）才能避免把连接泄漏到 TCP 超时。
@@ -545,22 +538,18 @@ async fn writer_loop(
     }
 }
 
-/// 投递一帧给出站写任务。
+/// 投递一帧给出站写任务（**控制帧与文件帧**专用）。
 ///
-/// # 为什么按 lane 区分丢弃策略
+/// # 为什么这里可以等、画面帧却不能走这条路
 ///
-/// 队头阻塞的成因是**画面帧**：它是 MiB 级的大块，写侧被背压卡住时会把有界队列塞满。而
-/// **控制帧**只有几十字节、**文件帧**本身已由 [`CHUNK_PAUSE`] 节流。故：
+/// 队头阻塞的成因是**画面帧**：它曾是大块（MiB 级 JPEG），写侧被背压卡住时会把有界队列塞满。
+/// 而**控制帧**只有几十字节、**文件帧**本身已由 [`CHUNK_PAUSE`] 节流，故它们**绝不可丢**：
+/// 丢一条 `FileChunk` 会让接收侧静默少收一截字节（`TransferHub::on_done` 的字节数校验会把这种
+/// 损坏变成显式错误，但正确做法是根本不丢），丢一条控制帧会让心跳/剪贴板应答凭空消失。队列被
+/// 暂时塞满时**可取消地等**它腾空；取消令牌保证「用户点中断能立刻脱身」这一既有语义不受影响。
 ///
-/// - **画面帧**：`try_send`，满则丢弃。它是过期数据（下一帧/下一个关键帧就覆盖了），丢一帧的
-///   代价远小于「在 `select!` 分支里 await 队列腾空」把输入与心跳一起卡住。
-/// - **控制帧与文件帧**：**绝不可丢**。丢一条 `FileChunk` 会让接收侧静默少收一截字节
-///   （`TransferHub::on_done` 的字节数校验会把这种损坏变成显式错误，但正确做法是根本不丢），
-///   丢一条控制帧会让心跳/剪贴板应答凭空消失。队列被画面帧暂时塞满时**可取消地等**它腾空；
-///   取消令牌保证「用户点中断能立刻脱身」这一既有语义不受影响（与改动前 `send_cancellable`
-///   的行为一致）。
-///
-/// **不要**把这两种策略「统一」成同一个 `try_send`——那会把静默的文件损坏重新引回来。
+/// **画面帧不走这里**：它在编码任务里经 [`send_video`] 投递——那条路径**绝不丢弃**（见模块文档），
+/// 背压出口在编码之前。
 ///
 /// # Errors
 /// 等待队列腾空时被取消返回 [`RemoteError::Cancelled`]；写任务已结束（链路断开）返回
@@ -570,16 +559,6 @@ async fn enqueue(
     cancel: &CancellationToken,
     frame: SessionFrame,
 ) -> RemoteResult<()> {
-    if frame.lane == Lane::Screen {
-        return match tx.try_send(WriterMsg::Frame(frame)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                debug!("出站队列已满，丢弃一帧画面");
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(link_closed()),
-        };
-    }
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(RemoteError::Cancelled),
@@ -595,96 +574,206 @@ fn link_closed() -> RemoteError {
     ))
 }
 
-/// 一次后台采集的结果：要发的消息（静止画面或采集/编码失败时为 `None`）+ 归还的差分器。
+/// 一次后台采集的结果：原始帧（编码在独立任务里做）。
 struct CaptureOutcome {
     /// 采集代次（见循环里的 `capture_generation`）：用于丢弃被看门狗判定为丢失的过期结果。
     generation: u64,
-    message: Option<SessionMessage>,
-    differ: TileDiffer,
+    /// 采集到的原始帧；采集失败时为 `None`。
+    frame: Option<RawFrame>,
 }
 
-/// 一次采集任务的入参。成组传递是为了让 [`run_capture`] 的签名保持可读（8 个裸参数会触发
-/// `clippy::too_many_arguments`）。
+/// 交给编码任务的一帧。
 ///
-/// `Copy`：全是标量/小结构，采集线程按值拿走一份即可（也让 clippy 不再要求改成引用）。
-#[derive(Clone, Copy)]
-struct CaptureJob {
+/// `display`/`encode`/`force_keyframe` 由会话循环带上：编码任务据此判断是否需要重建编码器
+/// （尺寸/码率/帧率变化）与是否强制关键帧（首帧、切显示器、切档位、`RequestKeyframe`）。
+struct EncodeJob {
+    /// 来源显示器编号。
     display: u32,
+    /// 当前编码参数。
     encode: EncodeOptions,
+    /// 本帧是否强制关键帧。
     force_keyframe: bool,
-    seq: u64,
-    generation: u64,
+    /// 原始帧。
+    frame: RawFrame,
 }
 
-/// 在阻塞线程里采集一帧并做差分编码。
+/// 在阻塞线程里采集一帧。
 ///
-/// `ScreenSource::capture`（xcap）与整帧/瓦片 JPEG 编码都是 CPU/IO 阻塞调用：1080p 整帧几十
-/// 毫秒，Wayland 的 xcap portal 路径可能数秒。跑在 async worker 上会饿死同一 worker 上的控制
-/// 通道读循环与心跳，故整体移进 `spawn_blocking`。`differ` 随闭包移入、随结果移出，既保证采集
-/// 串行（同一时刻只有一份基准状态），也避免每帧新建差分器。
+/// `ScreenSource::capture`（xcap）是 CPU/IO 阻塞调用：1080p 几十毫秒，Wayland 的 xcap portal
+/// 路径可能数秒。跑在 async worker 上会饿死同一 worker 上的控制通道读循环与心跳，故整体移进
+/// `spawn_blocking`。
 ///
 /// 本函数**可能 panic**（平台实现 bug）：`spawn_blocking` 的 `JoinHandle` 被丢弃后 panic 会被
 /// 吞掉、结果永不回传，由调用方的看门狗兜底（见 [`CAPTURE_WATCHDOG`]）。
-fn run_capture(
-    screen: &dyn ScreenSource,
-    job: CaptureJob,
-    mut differ: TileDiffer,
-    tx: &mpsc::Sender<CaptureOutcome>,
-) {
-    let CaptureJob {
-        display,
-        encode,
-        force_keyframe,
-        seq,
-        generation,
-    } = job;
-    let message = match screen.capture(display) {
-        Ok(frame) => match differ.diff(&frame, &encode, force_keyframe) {
-            Ok(Some(result)) => Some(match result.full {
-                // 关键帧与瓦片批次都走 Screen lane：控制器侧只有「整帧替换」和「局部更新」
-                // 两种消费方式，不需要靠 lane 区分。
-                Some(full) => SessionMessage::Video {
-                    display: full.display,
-                    width: full.width,
-                    height: full.height,
-                    seq,
-                    jpeg: full.jpeg,
-                },
-                None => SessionMessage::VideoTiles {
-                    display: frame.display,
-                    // 编码坐标系（缩放后）的尺寸：控制器持有的整帧就是按这个尺寸缩放的，
-                    // 瓦片坐标必须与它同格。
-                    width: result.width,
-                    height: result.height,
-                    seq,
-                    tiles: result.tiles,
-                },
-            }),
-            Ok(None) => None, // 静止画面：零输出，只留心跳。
-            Err(err) => {
-                warn!(error = %err, "画面编码失败");
-                None
-            }
-        },
+fn run_capture(screen: &dyn ScreenSource, display: u32, generation: u64, tx: &mpsc::Sender<CaptureOutcome>) {
+    let frame = match screen.capture(display) {
+        Ok(frame) => Some(frame),
         Err(err) => {
             warn!(error = %err, "屏幕采集失败");
             None
         }
     };
     // 接收端随会话循环存活；会话已结束时发送失败是正常的，忽略。
-    let _ = tx.blocking_send(CaptureOutcome {
-        generation,
-        message,
-        differ,
-    });
+    let _ = tx.blocking_send(CaptureOutcome { generation, frame });
 }
 
-/// 重置差分基准。差分器若正被采集任务持有（采集在途），当场重置不了，先记下、等它随结果回来再
-/// 补做（`force_keyframe` 已同时置真，下一帧本就必是整帧，这里只是让基准语义保持明确）。
-fn reset_differ(differ: &mut Option<TileDiffer>, pending: &mut bool) {
-    match differ.as_mut() {
-        Some(differ) => differ.reset(),
-        None => *pending = true,
+/// 编码任务：独占编码器，去重 → 编码 → 投递。
+///
+/// # 丢弃策略（**改动前先读模块文档**）
+///
+/// - **静止画面完全不喂编码器**：与上一帧原始 RGBA 逐字节相同（且不强制关键帧）时直接跳过——
+///   不转换、不编码、不发送。这是「带宽趋零」的唯一来源。
+/// - **输出队列满 → 在编码之前跳过这一帧**（等价降帧率）。**绝不**先编码再丢弃：时域编码的
+///   参考链是串起来的，丢掉一个已编码的 P 帧会让后续引用它的帧在解码端永远解不出来。
+/// - 配置（编码尺寸/码率/帧率）变化时重建编码器，并在尺寸变化时重发 `ScreenConfig`。
+#[expect(
+    clippy::too_many_lines,
+    reason = "去重 → 配置重建 → 编码 → 投递是一条不可分割的流水线，拆成多个函数反而要来回传编码器与基准状态"
+)]
+async fn encode_loop(mut rx: mpsc::Receiver<EncodeJob>, out: mpsc::Sender<WriterMsg>, cancel: CancellationToken) {
+    let mut encoder: Option<VideoEncoder> = None;
+    // 上一帧的原始 RGBA（去重基准）。保留它是去重的定义：memcmp 远快于密码学哈希。
+    let mut prev_rgba: Option<Vec<u8>> = None;
+    // 当前编码器的配置键 `(宽, 高, 目标码率 kbps, 帧率)`；变化即重建。
+    let mut config_key: Option<(u32, u32, u32, u8)> = None;
+    // 已下发的 `ScreenConfig` 尺寸；变化时重发。
+    let mut sent_dims: Option<(u32, u32)> = None;
+    // 因出站队列满而被跳过的那一帧若曾要求关键帧，这里记下来，**下一帧编码时补上**。
+    //
+    // 少了它就有个真实的坑：控制器进入 `awaiting_keyframe` 后只请求一次 IDR，若那一帧恰好因
+    // 队列满被跳过，控制器就要一直等到 `KEYFRAME_INTERVAL` 的周期性兜底（数百帧）才恢复——
+    // 用户看到的是「画面卡住十几秒」。关键帧请求不能因为一次背压丢弃而蒸发。
+    let mut pending_keyframe = false;
+    let mut seq: u64 = 0;
+
+    while let Some(job) = rx.recv().await {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let EncodeJob {
+            display,
+            encode,
+            force_keyframe,
+            frame,
+        } = job;
+        let (width, height) = encode_dimensions(frame.width, frame.height, encode.scale, MAX_ENCODE_WIDTH);
+        let key = (width, height, encode.target_bitrate_kbps, encode.max_fps);
+        let rebuild = config_key != Some(key);
+        if rebuild {
+            // 尺寸变化才需要重发 `ScreenConfig`（码率/帧率变化不影响几何）。
+            if sent_dims != Some((width, height)) {
+                let config = SessionMessage::ScreenConfig {
+                    display,
+                    codec: CodecId::Vp9,
+                    width,
+                    height,
+                };
+                if !send_video(&out, &cancel, config).await {
+                    break;
+                }
+                sent_dims = Some((width, height));
+            }
+            encoder = None;
+            prev_rgba = None;
+            config_key = Some(key);
+        }
+        let force = force_keyframe || rebuild || pending_keyframe;
+
+        // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
+        if !force && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
+            continue;
+        }
+        // 背压出口在**编码之前**：出站队列满就跳过这一帧。绝不能改成「编码后丢弃」。
+        // 被跳过的关键帧请求必须留下（`pending_keyframe`），否则控制器的恢复请求会蒸发。
+        if out.capacity() == 0 {
+            pending_keyframe |= force;
+            debug!("出站队列已满，跳过本轮编码（编码前丢帧，不破坏参考链）");
+            continue;
+        }
+        if encoder.is_none() {
+            match VideoEncoder::new(width, height, encode.target_bitrate_kbps, encode.max_fps) {
+                Ok(enc) => encoder = Some(enc),
+                Err(err) => {
+                    warn!(error = %err, "编码器创建失败，跳过本帧");
+                    pending_keyframe |= force;
+                    continue;
+                }
+            }
+        }
+        let Some(enc) = encoder.take() else {
+            continue;
+        };
+        let (src_width, src_height) = (frame.width, frame.height);
+        let rgba = frame.rgba;
+        // 编码是阻塞调用，移出 async worker；编码器随闭包移入、随结果移出（独占持有）。
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut enc = enc;
+            let result = enc.encode(&rgba, src_width, src_height, force);
+            (enc, result, rgba)
+        })
+        .await;
+        let (enc, result, rgba) = match joined {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(error = %err, "编码任务失败");
+                encoder = None;
+                prev_rgba = None;
+                pending_keyframe |= force;
+                continue;
+            }
+        };
+        match result {
+            Ok(packet) => {
+                encoder = Some(enc);
+                prev_rgba = Some(rgba);
+                // `force` 为真时本帧必是 IDR，请求已被满足。
+                pending_keyframe = false;
+                if packet.is_empty() {
+                    continue;
+                }
+                seq = seq.wrapping_add(1);
+                let mut flags = 0u8;
+                if rebuild {
+                    flags |= VIDEO_FLAG_CONFIG;
+                }
+                if packet.keyframe {
+                    flags |= VIDEO_FLAG_KEYFRAME;
+                }
+                let msg = SessionMessage::VideoPacket {
+                    display,
+                    seq,
+                    codec: CodecId::Vp9,
+                    flags,
+                    width,
+                    height,
+                    data: packet.data,
+                };
+                if !send_video(&out, &cancel, msg).await {
+                    break;
+                }
+            }
+            Err(err) => {
+                // 编码失败后编码器内部状态不可信：丢弃它，下一帧重建（并因 `rebuild` 强制关键帧）。
+                warn!(error = %err, "画面编码失败，重建编码器");
+                encoder = None;
+                prev_rgba = None;
+                sent_dims = None;
+                pending_keyframe |= force;
+            }
+        }
+    }
+}
+
+/// 把一帧画面消息投给出站写任务，**绝不丢弃**。
+///
+/// 与 [`enqueue`] 的区别只在语义：画面帧一旦编码就不能丢（参考链），故这里 `send().await`
+/// 直到队列腾空；背压由编码任务之前的「跳过采集」出口消化（见 [`encode_loop`]）。
+/// 返回 `false` 表示会话正在收尾（取消触发或写任务已结束），编码任务据此退出。
+async fn send_video(out: &mpsc::Sender<WriterMsg>, cancel: &CancellationToken, msg: SessionMessage) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        res = out.send(WriterMsg::Frame(SessionFrame::screen(msg))) => res.is_ok(),
     }
 }
 
@@ -863,7 +952,7 @@ mod tests {
         }
     }
 
-    /// 大分辨率**噪声**帧：JPEG 远大于小容量 duplex，首帧发送必然阻塞。
+    /// 大分辨率**噪声**帧：VP9 关键帧远大于小容量 duplex，首帧发送必然阻塞。
     struct NoiseScreen;
 
     impl ScreenSource for NoiseScreen {
@@ -1095,6 +1184,176 @@ mod tests {
         (reader, writer)
     }
 
+    /// 协议版本不匹配必须**明文干净拒绝**，而不是 bincode 解码失败导致的硬断链。
+    ///
+    /// 锁的不变量（见 `SESSION_PROTO_VERSION` 的文档与计划「硬约束 1」）：被控端要能先解出
+    /// `Hello`、读到 `proto_version`、回一个 `HelloAck { accepted: false, reason }`。这条路径成立
+    /// 的前提是 `Hello`/`HelloAck` 的字节形状**逐字节不变**（由 `session::tests` 的两条机械锁守着）
+    /// ——改坏它们，混合版本就会退化成「连接被莫名断开」。
+    ///
+    /// 这里手工造一个 `proto_version` 不匹配的 `Hello` 喂给被控端：版本校验在鉴权**之前**，故
+    /// `hmac` 填垃圾也无妨（校验根本走不到那一步）。
+    #[tokio::test]
+    async fn mismatched_proto_version_is_rejected_cleanly() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let bad_hello = SessionMessage::Hello {
+            session_id: "sess-1".to_owned(),
+            proto_version: SESSION_PROTO_VERSION.wrapping_add(1),
+            controller_rd_id: "111111111".to_owned(),
+            nonce: plan.nonce.clone(),
+            hmac: vec![0u8; 32],
+            x25519_pub: plan.keypair.public_bytes().to_vec(),
+        };
+
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config(pending_with("TOK"), RemoteMode::Control),
+            Arc::new(EmptyScreenSource),
+            input,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+
+        // 手工写 Hello（明文），随后读回明文 HelloAck。
+        let (read_half, write_half) = tokio::io::split(Box::new(a));
+        let mut reader = FramedRead::new(read_half, SessionCodec::new());
+        let mut writer = FramedWrite::new(write_half, SessionCodec::new());
+        let mut codec = SessionCodec::new();
+        let hello_bytes = codec
+            .encode_frame_bytes(&SessionFrame::control(bad_hello))
+            .expect("编码 Hello");
+        writer.get_mut().write_all(&hello_bytes).await.expect("写 Hello");
+        writer.get_mut().flush().await.expect("flush Hello");
+
+        // 关键断言①：对端回的是一个**明文可解**的 HelloAck（干净拒绝），不是解码失败。
+        let ack = tokio::time::timeout(WAIT, reader.next())
+            .await
+            .expect("应收到 HelloAck（干净拒绝）")
+            .expect("HelloAck 必须能明文解码")
+            .expect("HelloAck 解码不应出错");
+        match ack.message {
+            SessionMessage::HelloAck { accepted, reason, .. } => {
+                assert!(!accepted, "版本不匹配必须拒绝");
+                let reason = reason.unwrap_or_default();
+                assert!(reason.contains("proto"), "拒绝原因应点名版本，实得 {reason}");
+            }
+            other => panic!("期望 HelloAck，实得 {other:?}"),
+        }
+
+        // 关键断言②：被控端以握手错误收场（而不是 panic / IO 错误）。
+        let result = tokio::time::timeout(WAIT, ctld)
+            .await
+            .expect("被控端应结束")
+            .expect("任务不应 panic");
+        assert!(
+            matches!(result, Err(RemoteError::Handshake(_))),
+            "应为握手错误，实得 {result:?}"
+        );
+    }
+
+    /// 造一帧带明暗的 RGBA（内容随 `shade` 变化，用于制造「画面有变化」）。
+    fn shaded(display: u32, w: u32, h: u32, shade: u8) -> RawFrame {
+        let mut rgba = Vec::with_capacity((w * h) as usize * 4);
+        for i in 0..(w * h) as usize {
+            rgba.extend_from_slice(&[shade, u8::try_from(i % 251).unwrap_or(0), 40, 255]);
+        }
+        RawFrame {
+            display,
+            width: w,
+            height: h,
+            rgba,
+        }
+    }
+
+    /// 一条出站消息是否为关键帧视频包。
+    fn is_keyframe(msg: &WriterMsg) -> bool {
+        matches!(
+            msg,
+            WriterMsg::Frame(SessionFrame {
+                message: SessionMessage::VideoPacket { flags, .. },
+                ..
+            }) if flags & VIDEO_FLAG_KEYFRAME != 0
+        )
+    }
+
+    /// 轮询等待条件成立（有界；超时即断言失败）。
+    async fn wait_for(mut cond: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(cond(), "等待条件超时");
+    }
+
+    /// 被背压跳过的那一帧若曾要求关键帧，请求**不能蒸发**：下一帧必须补上 IDR。
+    ///
+    /// 少了这条，控制器进入 `awaiting_keyframe` 后只请求一次 IDR，若那一帧恰好因出站队列满被跳过，
+    /// 就要一直等到 `KEYFRAME_INTERVAL` 的周期性兜底（数百帧）才恢复——用户看到画面卡住十几秒。
+    ///
+    /// 构造是**确定性**的：出站队列容量 2，用 `Receiver::len()` / `Sender::capacity()` 作同步点
+    /// ——编码任务从取到任务到下一次 `await` 之间的判断全是同步的（尺寸计算、去重、容量检查），
+    /// 故这两个读数足以确定它的状态，不靠 sleep 猜时长。
+    #[tokio::test]
+    async fn skipped_forced_keyframe_is_retried_on_next_frame() {
+        const JOB_CAP: usize = 4;
+        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(2);
+        // 供测试自己往出站队列里塞占位帧（模拟背压），故先克隆一份。
+        let filler = out_tx.clone();
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(JOB_CAP);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(job_rx, out_tx, cancel.clone()));
+        let opts = EncodeOptions::default();
+        let job = |frame: RawFrame, force: bool| EncodeJob {
+            display: 0,
+            encode: opts,
+            force_keyframe: force,
+            frame,
+        };
+        let placeholder = || WriterMsg::Frame(SessionFrame::control(SessionMessage::Heartbeat));
+
+        // 首帧：先下发 `ScreenConfig`，随后是关键帧。
+        job_tx.send(job(shaded(0, 64, 48, 10), true)).await.expect("投递首帧");
+        assert!(
+            matches!(
+                out_rx.recv().await,
+                Some(WriterMsg::Frame(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. }))
+            ),
+            "首帧前应先下发 ScreenConfig"
+        );
+        let first = out_rx.recv().await.expect("应收到首帧");
+        assert!(is_keyframe(&first), "首帧应是关键帧");
+
+        // 用占位帧把出站队列塞满（容量 2）。
+        filler.send(placeholder()).await.expect("占位 1");
+        filler.send(placeholder()).await.expect("占位 2");
+        assert_eq!(out_rx.len(), 2, "队列应已满");
+
+        // 队列已满时投递一个**要求关键帧**的任务 → 编码任务只能在编码前跳过它。
+        job_tx.send(job(shaded(0, 64, 48, 30), true)).await.expect("投递被跳过的帧");
+        // 任务取走该任务并回到等待（跳过后立即 `continue` 到下一次 `recv`）→ 跳过已发生。
+        wait_for(|| job_tx.capacity() == JOB_CAP).await;
+
+        // 腾出位置后投递一个**不要求**关键帧的任务：它必须补上被跳过的那个 IDR。
+        assert!(out_rx.recv().await.is_some(), "腾出一格");
+        assert!(out_rx.recv().await.is_some(), "腾出另一格");
+        job_tx.send(job(shaded(0, 64, 48, 40), false)).await.expect("投递下一帧");
+        let retried = out_rx.recv().await.expect("应收到补发帧");
+        assert!(
+            is_keyframe(&retried),
+            "被跳过的关键帧请求必须在下一帧补上（否则控制器会卡到周期性兜底）"
+        );
+
+        // 关掉任务队列让编码任务自然退出（不必等满 `WAIT`）。
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
     /// 慢采集不得饿死入站处理：采集在阻塞线程里跑，循环仍应及时处理控制器的输入。
     ///
     /// 修复前 `capture` 在会话 `select!` 的分支里**同步**执行，循环会卡在它上面直到 300ms 结束，
@@ -1152,11 +1411,19 @@ mod tests {
         drop(peer_writer);
     }
 
-    /// 取消必须能打断被控端「已阻塞在发送里」的会话循环（`send_cancellable` 的回归护栏）。
+    /// 取消必须能打断被控端编码任务里**被背压卡住的发送**。
+    ///
+    /// 阶段 2 起画面发送不再发生在会话 `select!` 循环里，而在独立的编码任务中（[`encode_loop`]
+    /// → [`send_video`]）。这条回归护栏的语义因此变成：编码任务阻塞在出站队列的 `send` 上时，
+    /// 取消仍必须让整个 `run_controlled` 在有限时间内返回（`send_video` 对取消敏感）。
+    ///
+    /// 构造是**确定性**的：duplex 容量远小于任何一帧 VP9 关键帧（噪声整帧必然远超 1 KiB），
+    /// 故首帧发送必然阻塞；对端自始至终不读（读端一消费，被卡住的发送就能推进，测试就测不到
+    /// 取消了）。收尾的 `Bye` 只能等满 `BYE_TIMEOUT`（2s），返回时间以 3s 为上界。
     #[tokio::test]
     async fn cancel_interrupts_blocked_send_on_controlled() {
-        // duplex 容量远小于大帧 JPEG：首帧发送即填满写缓冲并挂起。
-        let (a, b) = tokio::io::duplex(16 * 1024);
+        // duplex 容量远小于首帧 VP9 关键帧：写缓冲很快填满，发送必然挂起。
+        let (a, b) = tokio::io::duplex(1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
 
         let (input, _input_rx) = RecordingInput::with_notify();
@@ -1171,9 +1438,6 @@ mod tests {
             cancel.clone(),
         ));
 
-        // 对端此时不读，让大帧发送阻塞住。**不能**在取消后再读对端：读端一消费，被卡住的发送
-        // 就能推进、连修复前的代码也会「自行恢复」，测试就测不到取消了。故对端自始至终不读，
-        // 收尾的 `Bye` 只能等满 `BYE_TIMEOUT`（2s），返回时间以 3s 为上界。
         let (_peer_reader, _peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 

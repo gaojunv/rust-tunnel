@@ -31,7 +31,7 @@ use enigo::{Keyboard as _, Mouse as _};
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
     DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
-    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, TileUpdate,
+    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -724,17 +724,15 @@ fn query_origins() -> Vec<(u32, i32, i32)> {
 /// 引擎侧 [`FrameSink`] 与 UI 共享的画面槽。
 #[derive(Default)]
 pub struct FrameState {
-    /// 最新一帧**整帧**（首帧/关键帧）。UI 取走即清；未消费时被覆盖，只保留最新。
+    /// 最新一帧**整帧**（VP9 数据面下每一帧都是整帧）。UI 取走即清；未消费时被覆盖，只保留最新。
     pub latest: Option<DecodedFrame>,
-    /// 最新一次增量瓦片更新。UI 取走即清；被整帧（关键帧）作废（差分相对旧帧，不可再用）。
-    pub tiles: Option<TileUpdate>,
     /// 显示器列表（会话建立时下发一次）。
     pub displays: Vec<DisplayInfo>,
     /// 会话关闭原因（UI 取走即清）。
     pub closed: Option<String>,
     /// 最近收到的对端剪贴板文本（UI 取走即清）。
     pub clipboard_in: Option<String>,
-    /// 累计到达的画面更新次数（整帧 + 增量瓦片都计一次）。UI 侧按秒差分算出帧率。
+    /// 累计到达的画面帧数。UI 侧按秒差分算出帧率。
     ///
     /// 放在这里而不是引擎另开计数：帧到达本就要进这把锁，顺手自增是零成本；另开结构反而要再
     /// 同步一次。计数器会回绕（`u32`），UI 用 `wrapping_sub` 取差。
@@ -762,15 +760,6 @@ impl FrameSink for GuiFrameSink {
     fn on_frame(&self, frame: DecodedFrame) {
         if let Ok(mut guard) = self.shared.lock() {
             guard.latest = Some(frame);
-            guard.frame_count = guard.frame_count.wrapping_add(1);
-        }
-        self.ctx.request_repaint();
-    }
-
-    fn on_tiles(&self, update: TileUpdate) {
-        // 瓦片已是 RGBA，本线程（引擎运行时线程）只做搬运，解码/上传留给 UI 线程。
-        if let Ok(mut guard) = self.shared.lock() {
-            guard.tiles = Some(update);
             guard.frame_count = guard.frame_count.wrapping_add(1);
         }
         self.ctx.request_repaint();
@@ -1046,12 +1035,11 @@ impl RemoteView {
         guard.closed.take()
     }
 
-    /// 把最新画面（整帧或增量瓦片）落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
+    /// 把最新画面落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
     ///
-    /// 整帧（首帧/关键帧）优先：它会让任何在途瓦片失效（瓦片是相对旧帧的差分）。瓦片只在
-    /// **已有纹理、尺寸一致、且属于当前显示器**时应用，否则整批丢弃——下一个关键帧会修正。
+    /// VP9 时域编码下每一帧都是**整帧**（`FrameSink::on_frame` 收到的已是完整 RGBA），故这里
+    /// 只有「重建纹理 / 整幅 `set`」一条路径。
     pub fn upload(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, u32, u32)> {
-        // 1) 整帧（首帧/关键帧）：重建或整幅更新纹理。
         let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
@@ -1066,50 +1054,11 @@ impl RemoteView {
                 }
                 self.tex_size = (width, height);
             }
-            // 关键帧已重建整幅画面，任何在途瓦片都相对旧帧，作废。
-            if let Ok(mut guard) = self.shared.lock() {
-                guard.tiles = None;
-            }
-        }
-
-        // 2) 增量瓦片：应用在**同一帧**返回的纹理上，UI 本帧即可看到更新。
-        if let Some(update) = self.shared.lock().ok().and_then(|mut guard| guard.tiles.take()) {
-            self.apply_tiles(&update);
         }
 
         self.texture
             .as_ref()
             .map(|texture| (texture.id(), self.tex_size.0, self.tex_size.1))
-    }
-
-    /// 把一次增量瓦片更新应用到当前纹理（尚无纹理/尺寸或显示器不符时整批丢弃）。
-    fn apply_tiles(&mut self, update: &TileUpdate) {
-        // 尚无纹理（首帧未到）或尺寸不符（切显示器/切档位后的陈旧更新）→ 丢弃，等关键帧重建。
-        if (update.width, update.height) != self.tex_size {
-            return;
-        }
-        // 不属于当前观看的显示器 → 丢弃。
-        if self.selected_display.is_some_and(|display| display != update.display) {
-            return;
-        }
-        let Some(texture) = self.texture.as_mut() else {
-            return;
-        };
-        for tile in &update.tiles {
-            let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
-                usize::try_from(tile.x),
-                usize::try_from(tile.y),
-                usize::try_from(tile.width),
-                usize::try_from(tile.height),
-            ) else {
-                continue;
-            };
-            if w == 0 || h == 0 || tile.rgba.len() != w * h * 4 {
-                continue;
-            }
-            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &tile.rgba);
-            texture.set_partial([x, y], image, egui::TextureOptions::LINEAR);
-        }
     }
 
     /// 捕获会话窗口内的鼠标/键盘并转成 [`InputEvent`] 投递给引擎。

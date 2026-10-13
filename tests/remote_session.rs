@@ -458,6 +458,8 @@ struct RecordingSink {
     frames: AtomicUsize,
     displays: Mutex<Vec<DisplayInfo>>,
     closed: Mutex<Option<String>>,
+    /// 最近一帧的 `(显示编号, 宽, 高, RGBA 长度)`——用于断言「收到的是能解码出正确尺寸的帧」。
+    last_frame: Mutex<Option<(u32, u32, u32, usize)>>,
     notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
@@ -481,8 +483,11 @@ impl FrameSink for RecordingSink {
         }
     }
 
-    fn on_frame(&self, _frame: DecodedFrame) {
+    fn on_frame(&self, frame: DecodedFrame) {
         self.frames.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = self.last_frame.lock() {
+            *guard = Some((frame.display, frame.width, frame.height, frame.rgba.len()));
+        }
         if let Ok(guard) = self.notify.lock() {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(());
@@ -517,7 +522,7 @@ fn manager(
         enabled,
         establisher,
         encode: EncodeOptions {
-            quality: 60,
+            target_bitrate_kbps: 2000,
             scale: 1.0,
             max_fps: 10,
         },
@@ -555,7 +560,7 @@ fn manager_lazy(
         enabled,
         establisher: Arc::new(LazyTransport::new(server_host.to_owned())),
         encode: EncodeOptions {
-            quality: 60,
+            target_bitrate_kbps: 2000,
             scale: 1.0,
             max_fps: 10,
         },
@@ -741,6 +746,23 @@ async fn data_plane_relay_session_between_two_managers() {
         ctrl_sink.displays.lock().unwrap().len(),
         1,
         "应收到显示器列表"
+    );
+
+    // ── 阶段 2 新增：收到的是**能解码出正确尺寸的 VP9 帧** ──────────────────
+    // 阶段 1 只断言「收到帧」；阶段 2 的数据面是 VP9，故必须断言解码结果的几何与 RGBA 长度：
+    // 帧能到达 sink 本身就证明它被 libvpx 成功解码（解码失败会在引擎里被丢弃并请求关键帧），
+    // 尺寸与 FakeScreen 的显示器一致则证明「编码尺寸 → 解码尺寸」这条链没错位。
+    let (display, width, height, rgba_len) = ctrl_sink
+        .last_frame
+        .lock()
+        .unwrap()
+        .expect("应有已解码帧");
+    assert_eq!(display, 0, "帧应来自主显示器");
+    assert_eq!((width, height), (32, 24), "解码尺寸应与被控端显示器一致");
+    assert_eq!(
+        rgba_len,
+        (width * height) as usize * 4,
+        "RGBA 长度应为 width*height*4"
     );
 
     // ── 阶段 3 新增①：数据面路径如实上报 ────────────────────────────────
@@ -1072,7 +1094,7 @@ fn control_channel_manager(server_host: &str, name: &str, enabled: bool) -> Arc<
         // 本用例不建立数据面（被拒），用延迟建立器即可——只有真的走到 `establish` 才会构造传输。
         establisher: Arc::new(LazyTransport::new(server_host.to_owned())),
         encode: EncodeOptions {
-            quality: 60,
+            target_bitrate_kbps: 2000,
             scale: 1.0,
             max_fps: 10,
         },

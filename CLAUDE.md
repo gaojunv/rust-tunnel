@@ -62,7 +62,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `crates/client-gui`（`rust-tunnel-client-gui`）— 桌面托盘客户端（eframe/egui + winit + tray-icon），「状态/映射/设置/日志/远程」五个 Tab
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
 - `crates/rustdesk`（`rust-tunnel-rustdesk`）— 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**（`frame`/`proto`/`addr`/`key`/`peer`/`relay`/`rendezvous`）
-- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环/瓦片差分/文件传输），**不含任何平台或 UI 依赖**
+- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环/VP9 4:4:4 视频编码/文件传输），**无平台或 UI 依赖**（但含 vendored 的便携 C 编解码器 `vendor/shiguredo_libvpx`）
 - 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）
 - **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
@@ -122,15 +122,15 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - 有意未实现：WebSocket 端口 21118/21119（Web 客户端不可用，原生桌面端不受影响）、WebRTC 通道、`KeyExchange`/`kx_version` 前向安全升级
 - 部署/防火墙/密钥/真机验证清单见根目录 `RUSTDESK.md`（`docs/` 被 gitignore，不放交付文档）
 
-**`crates/remote/src/`** — GUI 客户端互相远程控制的协议 + 引擎（**零平台/UI 依赖**）
-- `session.rs` — 会话帧（4 字节大端长度前缀 + bincode，上限 16 MiB——屏幕帧远大于 `common::protocol` 的 1 MiB）+ `Lane{Control,Screen,File}` 多路复用车道（`File` 预留给文件传输）
+**`crates/remote/src/`** — GUI 客户端互相远程控制的协议 + 引擎（**无平台/UI 依赖**；但含内联的便携 C 编解码器 `vendor/shiguredo_libvpx`，见下）
+- `session.rs` — 会话帧（4 字节大端长度前缀 + bincode，上限 16 MiB——屏幕帧远大于 `common::protocol` 的 1 MiB）+ `Lane{Control,Screen,File}` 多路复用车道（`File` 预留给文件传输）。**`SESSION_PROTO_VERSION` 已到 2**（阶段 2 换成 VP9 数据面），两端靠 `Hello.proto_version` 硬相等实现「混合版本明文干净拒绝」——`Hello`(判别式 0)/`HelloAck`(1) 与内嵌的 `DisplayInfo` **逐字节冻结**（`discriminant_golden` + `hello_and_helloack_wire_bytes_are_frozen` 两条机械锁），新变体一律追加在末尾
 - `crypto.rs` — X25519 临时密钥交换 + ChaCha20-Poly1305，双向独立密钥与 nonce 计数器。**一次性 token 进 KDF（别去掉）**：裸 ECDH 挡不住中继方——`Hello`/`HelloAck` 都是明文，它可替换两端临时公钥做完整 MITM；token 经加密控制通道下发且从不上数据面，攻击者不知道它就算不出密钥 → 两端密钥必然不一致 → 首帧 AEAD 认证失败。另拒绝低阶点（`was_contributory`）
 - `auth.rs` — 握手 HMAC-SHA256，字段用 **8 字节长度前缀**（`nonce`/公钥是二进制，固定分隔符会有拼接歧义）；`Hello` 的 MAC 覆盖控制器临时公钥，`HelloAck` 的 `hmac_ack` 绑定被控端临时公钥，控制器**真正校验**它；挂起会话 TTL 60s、鉴权成功即消费（重放被拒）、MAC 失败保留以允许重试
 - `signaling.rs` — RustDesk 会合/中继客户端（注册/心跳/打洞/中继请求）；`RustDeskTransport` 是真实数据面建立的唯一实现，`LazyTransport` 把它的构造推迟到 `RemoteParams` 到手（GUI 与 e2e 共用）
 - `transport.rs` — 数据面传输抽象（`BoxDuplex`/`EstablishRequest`/`TransportEstablisher`），把「建立一条双向字节流」与「会话跑在这条流上」解耦；**建立契约**写在模块文档里（中继路径只发一帧 `RequestRelay` 后转裸字节、不等应答，并把 `early` 与之合并写出）
-- `controller.rs`/`controlled.rs` — 两侧会话循环（握手 → 画面/输入/心跳/文件）；控制器把 `Hello` 帧流水线进建立阶段，因此**会话循环不再发 `Hello`，只等 `HelloAck`**。UI 命令统一走 `ControllerCommand`（输入/切显示器/切画质/剪贴板/文件），单通道保证顺序与用户操作一致
-- `screen.rs` — `ScreenSource`/`InputSink`/`FrameSink`/`Clipboard` 平台 trait + JPEG 编解码 + 帧哈希去重（静止画面零输出）；`FrameSink` 的 `on_tiles`/`on_clipboard` 默认空实现，控制器侧不必实现 `Clipboard`（它读写的是**本机**剪贴板，由 UI 直接处理）。剪贴板是**单向按需**的：只有控制器会发 `ClipboardRequest`（被控端只应答），控制器侧收到它是异常，只记日志
-- `tiles.rs` — 瓦片差分（64×64 网格）：只编码变化的瓦片，静止桌面流量趋近于零。**关键不变量：瓦片永远是原生分辨率，缩放帧只能整帧发**——所以 `scale != 1.0` 一律强制关键帧，否则缩放关键帧与原生瓦片混在一起会错位。`KEYFRAME_INTERVAL_FRAMES=120` / `KEYFRAME_CHANGE_RATIO=0.6` 是重发整帧的两个阈值
+- `controller.rs`/`controlled.rs` — 两侧会话循环（握手 → 画面/输入/心跳/文件）；控制器把 `Hello` 帧流水线进建立阶段，因此**会话循环不再发 `Hello`，只等 `HelloAck`**。UI 命令统一走 `ControllerCommand`（输入/切显示器/切画质/剪贴板/文件），单通道保证顺序与用户操作一致。**画面流水线**（被控端）：`采集(spawn_blocking) --有界(1)--> 编码任务(spawn_blocking) --有界--> 发送(独占 writer)`，`select!` 循环只留 cancel/心跳/输入/文件/控制。**丢弃策略两端方向相反**：被控端**编码之后绝不丢帧**（时域编码参考链一断就花屏且不自愈），背压出口只能在**编码之前**（队列满就跳过这一帧）；控制器可以丢，但必须按**序号断层**检测到并请求关键帧（`RequestKeyframe`），进入 `awaiting_keyframe` 只等 IDR
+- `screen.rs` — `ScreenSource`/`InputSink`/`FrameSink`/`Clipboard` 平台 trait；`FrameSink::on_frame` 拿到的**一律是整帧** RGBA（瓦片路径已删除），`on_clipboard` 默认空实现，控制器侧不必实现 `Clipboard`（它读写的是**本机**剪贴板，由 UI 直接处理）。剪贴板是**单向按需**的：只有控制器会发 `ClipboardRequest`（被控端只应答），控制器侧收到它是异常，只记日志
+- `video.rs` — VP9 4:4:4 编解码封装 + RGBA↔YUV444 转换（BT.709 **full range**，与编码器补丁 5 设的 `color_space`/`color_range` **严格一致**，两端共用同一份常数）。关键参数：`Profile1`（补丁 1，上游表达不了）、`lag_in_frames = Some(1)`（**必设**，`None` 会让 libvpx 缓冲前 25 帧）、`cpu_used = 8`、`rc_buffer_size_ms ≈ 300`（补丁 4）、`EncodingDeadline::Realtime` + `Cbr`。**默认编码宽度 ≤ `MAX_ENCODE_WIDTH`（1920）**——4K 解码单线程 37–58 ms 与 JPEG 同档，只能作显式选项。实测 libvpx 在 realtime+CBR 下**不**按场景切换自动插 IDR（`keyframes_only_at_the_configured_interval` 锁定），故无需 `kf_min_dist` 补丁。`Encoder`/`Decoder` 是 `Send` 非 `Sync`（编译期断言钉住），只能独占移进 `spawn_blocking`
 - `file.rs` — 被控端共享目录的沙箱文件服务（虚拟 `/` 路径）。**两层校验缺一不可**：`validate_virtual_path` 管语法（拒 `..`/`.`/`\`/盘符/控制字符/空段），`FileService::resolve` 管语义（对**最深的已存在祖先**做 canonicalize 后 `Path::starts_with(canonical_root)`，故符号链接逃逸会被拒）。`list` 里指向根外的符号链接项直接跳过
 - `transfer.rs` — 会话内文件传输状态机（两端共用）。只有**控制器**能发起（浏览/下载/上传），被控端只应答。同一时刻只允许一次传输；`CHUNK_SIZE=64 KiB` 且每块之间 `CHUNK_PAUSE=4ms` **主动让出调度**，会话循环的 `select!` 才有机会插入画面帧（中继只给一条字节流，画面与文件天然共享带宽）
 - `approval.rs` — 被控端**接入确认**策略与待确认请求（`ApprovalPolicy{Auto,Confirm}`、`PendingApproval`、`APPROVAL_TIMEOUT=45s` / `APPROVAL_WAIT_TIMEOUT=60s`）。`Confirm` 是默认：被控端收到 `RemoteSessionIncoming` 后**不回响应、不登记 token、不派生任务**，只挂起等用户 `approve_pending`/`reject_pending`，到点自动拒绝。**token 绝不进 `PendingApproval`**——那是 UI 状态，凭证只在管理器内部持有。`APPROVAL_TIMEOUT` 必须明显小于服务端 `REMOTE_SESSION_TTL`（60s，见 `crates/server/src/control_plane/remote.rs`）：用户拍板的**整个过程**都要落在那个窗口内，否则响应会被服务端当未知会话丢弃，用户看到的是「卡住」而不是「被拒」
@@ -141,7 +141,13 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 **控制面走既有控制通道**（复用 `ControlMessage` + `ClientEntry.control_sender`），不新开 HTTP 鉴权面——GUI 客户端只有客户端 token，没有管理员 JWT。
 
-**向后兼容靠版本门控，不动 `protocol_version`**：服务端只在客户端版本 ≥ `MIN_REMOTE_CLIENT_VERSION`（`crates/agent/src/runner/version_gate.rs`，当前 `(0,10,0)`）时才下发 `RemoteCapability`；客户端只在收到它之后才发新的上行变体。新客户端 + 老服务端 → 老服务端不下发 → 新客户端全程不发新变体；老客户端 + 新服务端 → 门控拦住。两边都不会因 bincode 未知变体而断连。**新增 S→C 推送时必须过 `client_supports_remote`**，否则老客户端反序列化失败会直接断连。
+**向后兼容靠版本门控**：服务端只在客户端版本 ≥ `MIN_REMOTE_CLIENT_VERSION`（`crates/agent/src/runner/version_gate.rs`）时才下发 `RemoteCapability`；客户端只在收到它之后才发新的上行变体。新客户端 + 老服务端 → 老服务端不下发 → 新客户端全程不发新变体；老客户端 + 新服务端 → 门控拦住。两边都不会因 bincode 未知变体而断连。**新增 S→C 推送时必须过 `client_supports_remote`**，否则老客户端反序列化失败会直接断连。
+
+**数据面另有 `SESSION_PROTO_VERSION` 一道门控**（当前 2）：它**不是**控制通道的 `protocol_version`，而是数据面 `Hello` 里的字段，两端**硬相等**校验，不匹配就在握手阶段明文拒绝（`HelloAck{accepted:false}`），因此混合版本不会退化成 bincode 解码失败导致的硬断链——**前提是 `Hello`/`HelloAck`/`DisplayInfo` 的字节形状冻结**（两条机械锁守着，见上）。
+
+**阶段 2 的发布顺序刻意分两步**（`MIN_REMOTE_CLIENT_VERSION` 上的注释写明了）：先把 0.11 客户端铺开（`SESSION_PROTO_VERSION = 2` 生效，0.11↔0.10 在握手阶段干净拒绝），**之后**再部署新服务端并把门控抬到 `(0,11,0)`。抬门控会让 0.10.x **彻底失去**远程控制（功能消失，非降级），所以必须等客户端铺开。**注意客户端上报的是 `CARGO_PKG_VERSION`**，而 `release-client.yml` 的 `VERSION` 只取 git tag、不写回 `Cargo.toml`——所以 `crates/client`/`crates/client-gui` 的版本号要手工抬。
+
+**`crates/remote` 有 vendored 原生依赖**：VP9 4:4:4 需要 profile 1，上游 `shiguredo_libvpx` 表达不了，故 `vendor/shiguredo_libvpx/`（wrapper Apache-2.0 + 内联 libvpx BSD，与项目 MIT/Apache 相容，**无 GPL/AGPL**）打了 5 处补丁，根 `Cargo.toml` 的 `[patch.crates-io]` 重定向，机械锁在 `crates/remote/tests/vendor_patches.rs`。预编译库覆盖 `aarch64-apple-darwin` / `x86_64-pc-windows-gnu` / `x86_64-unknown-linux-gnu`；**不覆盖** `x86_64-apple-darwin`（build.rs 直接 panic，已放弃该 target）与 MSVC（预编译是 mingw）。`crates/server` 不依赖 `remote`，musl 静态编译不受影响。
 
 **`rd_id` 由服务端分配并持久化**到 `clients.remote_id`（9 位数字，满足 `MIN_PEER_ID_LEN=6`）。同一 NAT 下多个客户端共用一个公网 IP，所以不能由客户端自选；用户全程看不到也不需要配置 ID。
 

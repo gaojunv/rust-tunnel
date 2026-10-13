@@ -2,8 +2,9 @@
 set -euo pipefail
 # 组装 RustTunnel.app（ad-hoc 签名，不含公证）。
 # 用法: VERSION=v0.8.0 GUI_BIN=target/.../rust-tunnel-client-gui scripts/bundle-macos.sh
+# 只出 arm64（macOS x86_64 已放弃：shiguredo_libvpx 无该 target 的预编译）。
 VERSION="${VERSION:-${GITHUB_REF_NAME:-v0.0.0}}"
-GUI_BIN="${GUI_BIN:-target/universal2/rust-tunnel-client-gui}"
+GUI_BIN="${GUI_BIN:-target/aarch64-apple-darwin/release/rust-tunnel-client-gui}"
 APP="dist/RustTunnel.app"
 ICON_SRC="crates/client-gui/icons/icon.png"
 
@@ -45,7 +46,7 @@ if command -v codesign >/dev/null 2>&1; then
 fi
 
 # 产出 dmg（若 create-dmg/hdiutil 可用）
-DMG="dist/RustTunnel-${VERSION}-macos-universal2.dmg"
+DMG="dist/RustTunnel-${VERSION}-macos-aarch64.dmg"
 if command -v create-dmg >/dev/null 2>&1; then
   create-dmg --volname "RustTunnel ${VERSION}" --window-size 540 380 --icon-size 96 \
     --app-drop-link 380 150 --icon RustTunnel.app 120 150 \

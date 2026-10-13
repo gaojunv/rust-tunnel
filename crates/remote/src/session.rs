@@ -12,8 +12,8 @@
 //! 装上 [`crate::crypto::Cipher`] 后为「密文 ‖ tag」。`lane` 保持明文，为阶段 2 的多路复用
 //! 留出「不解密即可路由」的能力。
 //!
-//! 上限 [`MAX_SESSION_FRAME`]（16 MiB）：**不复用**控制通道的 1 MiB 上限，因为整屏 JPEG
-//! 轻易超过 1 MiB。
+//! 上限 [`MAX_SESSION_FRAME`]（16 MiB）：**不复用**控制通道的 1 MiB 上限。VP9 的关键帧远小于
+//! 此值，但文件块（`File` lane）与将来可能的更大分辨率仍需要它。
 //!
 //! # 保活
 //!
@@ -23,7 +23,7 @@
 use crate::auth::handshake_mac;
 use crate::crypto::{random_nonce, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{DisplayInfo, FileEntry, InputEvent, QualityPreset, TilePatch};
+use crate::screen::{DisplayInfo, FileEntry, InputEvent, QualityPreset};
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -32,7 +32,18 @@ use tokio::time::Instant;
 use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
-pub const SESSION_PROTO_VERSION: u16 = 1;
+///
+/// # 为什么是 2
+///
+/// 阶段 2 把数据面从 JPEG 瓦片换成 VP9（[`SessionMessage::VideoPacket`]），并**删掉了**
+/// [`SessionMessage`] 的两个旧变体。数据面没有任何会话内能力协商，两端靠 `Hello.proto_version`
+/// 的**硬相等**校验实现「混合版本干净拒绝」——旧端与新端不会解码对方的画面帧，因为它们在
+/// 版本校验通过之前就被拒了。
+///
+/// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
+/// `MIN_REMOTE_CLIENT_VERSION`）。本常量与它必须**分两步发布**（见计划「交付顺序」）：先把
+/// 0.11 客户端铺开，再部署新服务端并抬门控。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 2;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -104,7 +115,34 @@ impl Lane {
     }
 }
 
+/// 视频编解码器标识（预留扩展位，将来可加 `Jpeg`/`H265`/硬件实现）。
+///
+/// 它是 [`SessionMessage::VideoPacket`] 与 [`SessionMessage::ScreenConfig`] 的**字段**而不是
+/// `SessionMessage` 的新变体，所以给它追加变体不影响 `SessionMessage` 的判别式布局。
+/// 但这**不等于**可以不动版本号：老对端收到不认识的 `CodecId` 判别式一样会在 bincode 解码时失败，
+/// 故阶段 5（硬件编码）仍须抬 `SESSION_PROTO_VERSION` + `MIN_REMOTE_CLIENT_VERSION`，并在握手后
+/// 交换「本端支持的 codec 列表」，只发对端声明支持的 codec。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodecId {
+    /// VP9 profile 1（8-bit 4:4:4），软件编码。
+    Vp9,
+}
+
+/// [`SessionMessage::VideoPacket::flags`]：本包携带编码器配置变更（编码尺寸/色度格式）。
+///
+/// 收到它意味着后续帧的几何/格式可能与之前不同，解码侧应重建解码器并等待关键帧。
+pub const VIDEO_FLAG_CONFIG: u8 = 0b0000_0001;
+
+/// [`SessionMessage::VideoPacket::flags`]：本包含 IDR（解码器可由此重建参考帧）。
+pub const VIDEO_FLAG_KEYFRAME: u8 = 0b0000_0010;
+
 /// 会话消息。
+///
+/// # 判别式布局（**硬约束，见 `discriminant_golden` 机械锁**）
+///
+/// `Hello` 恒为 0、`HelloAck` 恒为 1，新变体一律**追加在末尾**。两端靠「先解出 `Hello`、
+/// 读到 `proto_version`、再明文干净拒绝」实现混合版本不断链，因此这两个变体的字节形状与
+/// 判别式**一个字都不能动**。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionMessage {
     /// 控制器发起握手。
@@ -135,37 +173,6 @@ pub enum SessionMessage {
         /// `HMAC-SHA256(token, session_id ‖ responder_pub ‖ initiator_pub)`，证明被控端持有 token
         /// 并绑定自己的临时公钥（防中继方替换 `x25519_pub`）。
         hmac_ack: Vec<u8>,
-    },
-    /// 一帧画面（JPEG，整帧）。
-    ///
-    /// 首帧与关键帧走这里；两次关键帧之间只发 [`SessionMessage::VideoTiles`]。
-    Video {
-        /// 来源显示器编号。
-        display: u32,
-        /// 编码宽度。
-        width: u32,
-        /// 编码高度。
-        height: u32,
-        /// 帧序号（被控端递增）。
-        seq: u64,
-        /// JPEG 字节。
-        jpeg: Vec<u8>,
-    },
-    /// 增量瓦片更新（只含变化区域）。
-    ///
-    /// 收到它的控制器**应当**做局部更新而不是整帧替换；忽略它也能工作，只是要等下一个关键帧
-    /// （[`crate::tiles::KEYFRAME_INTERVAL_FRAMES`] 帧之内）才看到变化。
-    VideoTiles {
-        /// 来源显示器编号。
-        display: u32,
-        /// 整帧宽（瓦片坐标以此为参照）。
-        width: u32,
-        /// 整帧高。
-        height: u32,
-        /// 帧序号（被控端递增，与 `Video` 共用同一计数器）。
-        seq: u64,
-        /// 变化的瓦片。
-        tiles: Vec<TilePatch>,
     },
     /// 一条输入事件。
     Input(InputEvent),
@@ -259,6 +266,58 @@ pub enum SessionMessage {
         id: u64,
         /// 原因。
         reason: String,
+    },
+    // ── 视频数据面（阶段 2；走 `Screen` lane，判别式追加在末尾）──
+    /// 一帧视频（VP9，时域编码）。关键帧与增量帧都走这里。
+    ///
+    /// `data` 是**一个或多个**长度前缀（u32 大端）拼接的 VP9 帧；解码侧按同一前缀切分后逐帧
+    /// `decode`。正常路径下 `lag_in_frames = 1` 时每次 `encode` 恰好产出一帧，前缀是为健壮性保留。
+    VideoPacket {
+        /// 来源显示器编号。
+        display: u32,
+        /// 帧序号（被控端递增，跨关键帧连续）。
+        seq: u64,
+        /// 编解码器。
+        codec: CodecId,
+        /// 标志位（[`VIDEO_FLAG_CONFIG`] | [`VIDEO_FLAG_KEYFRAME`]）。
+        flags: u8,
+        /// **编码**尺寸的宽（不等于显示尺寸）。
+        width: u32,
+        /// **编码**尺寸的高。
+        height: u32,
+        /// VP9 帧数据。
+        data: Vec<u8>,
+    },
+    /// 控制器请求关键帧（解码失败、丢弃了参考帧、或长时间无帧）。
+    RequestKeyframe {
+        /// 目标显示器编号。
+        display: u32,
+    },
+    /// 被控端下行屏幕配置：编码尺寸 + codec（握手后发一次，变更时重发）。
+    ///
+    /// **显示尺寸不在这里**——它在 `HelloAck.displays` 的 [`DisplayInfo`] 里，而
+    /// `HelloAck` 的字节形状一个字都不能动（见 [`SessionMessage`] 的判别式布局说明）。
+    /// `width`/`height` 是**编码**尺寸，即后续 [`SessionMessage::VideoPacket`] 会声明的尺寸。
+    ScreenConfig {
+        /// 目标显示器编号。
+        display: u32,
+        /// 编解码器。
+        codec: CodecId,
+        /// 编码尺寸的宽。
+        width: u32,
+        /// 编码尺寸的高。
+        height: u32,
+    },
+    /// 控制器回报 QoS 观测量（阶段 3 的 AIMD 闭环用；阶段 2 只定义不消费）。
+    QosFeedback {
+        /// 心跳往返（毫秒）。
+        rtt_ms: u32,
+        /// 接收码率（kbps）。
+        recv_kbps: u32,
+        /// 解码耗时（毫秒，最近一帧）。
+        decode_ms: u32,
+        /// 待解码积压（帧数）。
+        backlog: u32,
     },
 }
 
@@ -497,7 +556,53 @@ pub fn plan_controller_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen::{FileEntry, KeyEvent, MouseButton, QualityPreset, TilePatch};
+    use crate::screen::{FileEntry, KeyEvent, MouseButton, QualityPreset};
+
+    /// `Hello` / `HelloAck` 的固定线上字节（机械锁；见 `hello_and_helloack_wire_bytes_are_frozen`）。
+    const FROZEN_HELLO_BYTES: &[u8] = &[
+        // 判别式 Hello = 0
+        0, 0, 0, 0,
+        // session_id "sess-1"
+        6, 0, 0, 0, 0, 0, 0, 0, b's', b'e', b's', b's', b'-', b'1',
+        // proto_version = 2
+        2, 0,
+        // controller_rd_id "111111111"
+        9, 0, 0, 0, 0, 0, 0, 0, b'1', b'1', b'1', b'1', b'1', b'1', b'1', b'1', b'1',
+        // nonce [1, 2, 3, 4]
+        4, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4,
+        // hmac [7; 32]
+        32, 0, 0, 0, 0, 0, 0, 0,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        // x25519_pub [9; 32]
+        32, 0, 0, 0, 0, 0, 0, 0,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    ];
+    const FROZEN_HELLO_ACK_BYTES: &[u8] = &[
+        // 判别式 HelloAck = 1
+        1, 0, 0, 0,
+        // accepted = true
+        1,
+        // reason = None
+        0,
+        // displays = [DisplayInfo { id: 0, width: 1920, height: 1080, name: "main", primary: true }]
+        1, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+        128, 7, 0, 0,
+        56, 4, 0, 0,
+        4, 0, 0, 0, 0, 0, 0, 0, b'm', b'a', b'i', b'n',
+        1,
+        // x25519_pub [8; 32]
+        32, 0, 0, 0, 0, 0, 0, 0,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        // hmac_ack [6; 32]
+        32, 0, 0, 0, 0, 0, 0, 0,
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    ];
+
 
     fn codec_roundtrip(message: SessionMessage, lane: Lane) -> SessionFrame {
         let mut enc = SessionCodec::new();
@@ -566,12 +671,14 @@ mod tests {
                 Lane::Control,
             ),
             (
-                SessionMessage::Video {
+                SessionMessage::VideoPacket {
                     display: 0,
+                    seq: 42,
+                    codec: CodecId::Vp9,
+                    flags: VIDEO_FLAG_KEYFRAME,
                     width: 640,
                     height: 480,
-                    seq: 42,
-                    jpeg: vec![0xFF, 0xD8, 0xFF],
+                    data: vec![0x10, 0x20, 0x30],
                 },
                 Lane::Screen,
             ),
@@ -629,10 +736,10 @@ mod tests {
         // 锁的不变量：**每一个** `SessionMessage` 变体都能 bincode 编解码往返，且 lane 保持。
         //
         // 这是数据面的线上契约：`messages_roundtrip` 只覆盖了约 6 个变体，全部 `File*`、
-        // `VideoTiles`、`SetQuality`、`SelectDisplay`、`Clipboard`、`ClipboardRequest`、
+        // `VideoPacket`、`SetQuality`、`SelectDisplay`、`Clipboard`、`ClipboardRequest`、
         // `DisplayList`、`HeartbeatAck` 从未被序列化过。某个变体的字段一旦漂移（改类型、
         // 调字段序），只有真机联调才会炸——这条用例把契约钉死在单测里。
-        // 每个变体都带上非空与边界内容（空 tiles、空 entries、空 data、空字符串路径）。
+        // 每个变体都带上非空与边界内容（空 entries、空 data、空字符串路径）。
         let cases: Vec<(SessionMessage, Lane)> = vec![
             (
                 SessionMessage::Hello {
@@ -656,48 +763,56 @@ mod tests {
                 Lane::Control,
             ),
             (
-                SessionMessage::Video {
+                SessionMessage::VideoPacket {
                     display: 0,
+                    seq: 42,
+                    codec: CodecId::Vp9,
+                    flags: VIDEO_FLAG_KEYFRAME | VIDEO_FLAG_CONFIG,
                     width: 640,
                     height: 480,
-                    seq: 42,
-                    jpeg: vec![0xFF, 0xD8, 0xFF],
+                    data: vec![0x10, 0x20, 0x30],
                 },
                 Lane::Screen,
             ),
+            // 边界：空 VP9 数据（编码器本轮无输出）。
             (
-                SessionMessage::VideoTiles {
+                SessionMessage::VideoPacket {
                     display: 1,
-                    width: 192,
-                    height: 128,
-                    seq: 7,
-                    tiles: vec![
-                        TilePatch {
-                            x: 0,
-                            y: 0,
-                            width: 64,
-                            height: 64,
-                            jpeg: vec![0xAB; 8],
-                        },
-                        TilePatch {
-                            x: 128,
-                            y: 64,
-                            width: 64,
-                            height: 64,
-                            jpeg: vec![],
-                        },
-                    ],
+                    seq: 0,
+                    codec: CodecId::Vp9,
+                    flags: 0,
+                    width: 0,
+                    height: 0,
+                    data: vec![],
                 },
                 Lane::Screen,
             ),
-            // 边界：空瓦片批次（静止画面之外的空更新）。
+            (SessionMessage::RequestKeyframe { display: 2 }, Lane::Screen),
             (
-                SessionMessage::VideoTiles {
+                SessionMessage::ScreenConfig {
                     display: 0,
-                    width: 64,
-                    height: 64,
-                    seq: 0,
-                    tiles: vec![],
+                    codec: CodecId::Vp9,
+                    width: 1920,
+                    height: 1080,
+                },
+                Lane::Screen,
+            ),
+            // 边界：全零 QoS 观测。
+            (
+                SessionMessage::QosFeedback {
+                    rtt_ms: 0,
+                    recv_kbps: 0,
+                    decode_ms: 0,
+                    backlog: 0,
+                },
+                Lane::Screen,
+            ),
+            (
+                SessionMessage::QosFeedback {
+                    rtt_ms: 250,
+                    recv_kbps: 4000,
+                    decode_ms: 17,
+                    backlog: 3,
                 },
                 Lane::Screen,
             ),
@@ -814,6 +929,156 @@ mod tests {
         assert!(dec.decode(&mut buf).is_err(), "越界的枚举判别式必须被拒绝");
     }
 
+    /// 固定的 `Hello`（判别式/字节恒等机械锁用；字段值覆盖二进制与字符串两类）。
+    fn frozen_hello() -> SessionMessage {        SessionMessage::Hello {
+            session_id: "sess-1".into(),
+            proto_version: SESSION_PROTO_VERSION,
+            controller_rd_id: "111111111".into(),
+            nonce: vec![1, 2, 3, 4],
+            hmac: vec![7u8; 32],
+            x25519_pub: vec![9u8; 32],
+        }
+    }
+
+    /// 固定的 `HelloAck`（同上）。
+    fn frozen_hello_ack() -> SessionMessage {
+        SessionMessage::HelloAck {
+            accepted: true,
+            reason: None,
+            displays: vec![DisplayInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                name: "main".into(),
+                primary: true,
+            }],
+            x25519_pub: vec![8u8; 32],
+            hmac_ack: vec![6u8; 32],
+        }
+    }
+
+    /// **判别式黄金测试**：逐个断言 `SessionMessage` 每个变体的序号。
+    ///
+    /// 锁的不变量（见 [`SessionMessage`] 的判别式布局说明与计划「硬约束 2」）：
+    /// `Hello` = 0、`HelloAck` = 1，新变体一律**追加在末尾**。两端靠「先解出 `Hello`、读到
+    /// `proto_version`、再明文干净拒绝」实现混合版本不断链；任何**插入式**改动（把新变体插到
+    /// 中间）都会让判别式错位，使 `Hello`/`HelloAck` 不再是 0/1，整个方案立刻退化成 bincode
+    /// 解码失败导致的硬断链。bincode 1.3 默认 fixint：判别式是 u32 小端，故直接读前 4 字节。
+    #[test]
+    fn discriminant_golden() {
+        let cases: Vec<(&str, SessionMessage, u32)> = vec![
+            ("Hello", frozen_hello(), 0),
+            ("HelloAck", frozen_hello_ack(), 1),
+            (
+                "Input",
+                SessionMessage::Input(InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                }),
+                2,
+            ),
+            ("SelectDisplay", SessionMessage::SelectDisplay { display: 0 }, 3),
+            ("SetQuality", SessionMessage::SetQuality { preset: QualityPreset::Hd }, 4),
+            ("Clipboard", SessionMessage::Clipboard { text: "x".into() }, 5),
+            ("ClipboardRequest", SessionMessage::ClipboardRequest, 6),
+            ("DisplayList", SessionMessage::DisplayList(vec![]), 7),
+            ("Heartbeat", SessionMessage::Heartbeat, 8),
+            ("HeartbeatAck", SessionMessage::HeartbeatAck, 9),
+            ("Bye", SessionMessage::Bye { reason: String::new() }, 10),
+            (
+                "FileListRequest",
+                SessionMessage::FileListRequest { id: 1, path: String::new() },
+                11,
+            ),
+            (
+                "FileList",
+                SessionMessage::FileList { id: 1, path: "/".into(), entries: vec![] },
+                12,
+            ),
+            (
+                "FileDownloadRequest",
+                SessionMessage::FileDownloadRequest { id: 1, path: "/a".into() },
+                13,
+            ),
+            (
+                "FileUploadRequest",
+                SessionMessage::FileUploadRequest { id: 1, path: "/a".into(), size: 0 },
+                14,
+            ),
+            (
+                "FileAccept",
+                SessionMessage::FileAccept { id: 1, accepted: true, reason: None, size: 0 },
+                15,
+            ),
+            ("FileChunk", SessionMessage::FileChunk { id: 1, data: vec![] }, 16),
+            ("FileDone", SessionMessage::FileDone { id: 1 }, 17),
+            ("FileError", SessionMessage::FileError { id: 1, reason: String::new() }, 18),
+            (
+                "VideoPacket",
+                SessionMessage::VideoPacket {
+                    display: 0,
+                    seq: 0,
+                    codec: CodecId::Vp9,
+                    flags: 0,
+                    width: 0,
+                    height: 0,
+                    data: vec![],
+                },
+                19,
+            ),
+            ("RequestKeyframe", SessionMessage::RequestKeyframe { display: 0 }, 20),
+            (
+                "ScreenConfig",
+                SessionMessage::ScreenConfig {
+                    display: 0,
+                    codec: CodecId::Vp9,
+                    width: 0,
+                    height: 0,
+                },
+                21,
+            ),
+            (
+                "QosFeedback",
+                SessionMessage::QosFeedback {
+                    rtt_ms: 0,
+                    recv_kbps: 0,
+                    decode_ms: 0,
+                    backlog: 0,
+                },
+                22,
+            ),
+        ];
+        for (name, msg, want) in &cases {
+            let bytes = bincode::serialize(msg).unwrap();
+            let got = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(got, *want, "变体 `{name}` 的判别式错位（应为 {want}）");
+        }
+        // 序号必须连续无洞：任何「删一个变体」的改动都会让这张表与实现脱节。
+        for (i, (_, _, want)) in cases.iter().enumerate() {
+            assert_eq!(usize::try_from(*want).unwrap(), i, "判别式必须从 0 起连续");
+        }
+    }
+
+    /// **`Hello` / `HelloAck` 字节恒等测试**：固定输入编码后比对精确字节向量。
+    ///
+    /// 锁的不变量（计划「硬约束 1」）：这两个结构**一个字都不能加、不能改**，`DisplayInfo`
+    /// （内嵌在 `HelloAck.displays`）也一样。它们承载「混合版本先解出 `Hello`、读到
+    /// `proto_version`、再明文干净拒绝」这条路径；改坏它，混合版本就会退化成 bincode 解码失败
+    /// 导致的硬断链。
+    #[test]
+    fn hello_and_helloack_wire_bytes_are_frozen() {
+        assert_eq!(
+            bincode::serialize(&frozen_hello()).unwrap(),
+            FROZEN_HELLO_BYTES,
+            "Hello 的线上字节变了——混合版本的干净拒绝方案会塌掉"
+        );
+        assert_eq!(
+            bincode::serialize(&frozen_hello_ack()).unwrap(),
+            FROZEN_HELLO_ACK_BYTES,
+            "HelloAck 的线上字节变了（含内嵌的 DisplayInfo）——同上"
+        );
+    }
+
     #[test]
     fn short_length_prefix_awaits_more_data() {
         // 锁的不变量：长度前缀不足 4 字节时必须返回 `Ok(None)`（半包，等待更多数据），
@@ -846,12 +1111,14 @@ mod tests {
         let mut enc = SessionCodec::new();
         enc.set_max_frame(8);
         let mut wire = BytesMut::new();
-        let big = SessionMessage::Video {
+        let big = SessionMessage::VideoPacket {
             display: 0,
+            seq: 0,
+            codec: CodecId::Vp9,
+            flags: 0,
             width: 1,
             height: 1,
-            seq: 0,
-            jpeg: vec![0u8; 64],
+            data: vec![0u8; 64],
         };
         assert!(enc.encode(SessionFrame::screen(big), &mut wire).is_err());
 

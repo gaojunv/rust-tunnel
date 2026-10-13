@@ -948,6 +948,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "log",
+ "prettyplease 0.2.37",
  "proc-macro2",
  "quote",
  "regex",
@@ -8225,7 +8227,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tunnel-client"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -8256,7 +8258,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tunnel-client-gui"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -8462,12 +8464,12 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "futures-util",
  "hmac 0.12.1",
- "image",
  "rand 0.8.8",
  "rust-tunnel-common",
  "rust-tunnel-rustdesk",
  "serde",
  "sha2 0.10.9",
+ "shiguredo_libvpx",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -9375,6 +9377,20 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
+name = "shiguredo_libvpx"
+version = "2026.1.0"
+dependencies = [
+ "bindgen",
+ "shiguredo_toml",
+]
+
+[[package]]
+name = "shiguredo_toml"
+version = "2026.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b475c218cf15d056ed3e48c9e98693135b261b79530881e63b162650b236fdec"
 
 [[package]]
 name = "shlex"

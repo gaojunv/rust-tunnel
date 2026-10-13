@@ -1,7 +1,7 @@
 // 测试代码豁免 panic 风险 lint（生产代码仍告警）。
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-//! rust-tunnel 远程控制引擎：**纯协议 + 引擎，不含任何平台/ UI 依赖**。
+//! rust-tunnel 远程控制引擎：**纯协议 + 引擎，无平台/ UI 依赖**。
 //!
 //! # 定位
 //!
@@ -9,6 +9,12 @@
 //! 只负责「协议 + 编排」：把控制通道下发的远程消息翻译成数据面会话，把屏幕/输入这类
 //! 平台相关动作抽象成 trait 交给上层实现。截屏（`xcap`）、输入注入（`enigo`）、egui
 //! 渲染都在 `crates/client-gui`，本 crate 一行平台代码都没有。
+//!
+//! **但它并非「零原生依赖」**：数据面自阶段 2 起用 VP9 4:4:4 编解码（[`video`]），实现来自
+//! vendored 的 `shiguredo_libvpx`（`vendor/shiguredo_libvpx/`，根 `Cargo.toml` 的
+//! `[patch.crates-io]` 重定向）——它内联 libvpx 的**便携 C 实现**，构建期下载/编译静态库。
+//! 故本 crate 有原生构建步骤与平台矩阵约束（见 `CLAUDE.md`）。许可仍为宽松（wrapper
+//! Apache-2.0，内联 libvpx 为 BSD 风格），与项目 MIT/Apache 相容。
 //!
 //! # 分层
 //!
@@ -23,7 +29,7 @@
 //!   这是「连接中」会停留若干秒的原因。时限见 [`approval`]。
 //! - 平台抽象：[`screen::ScreenSource`] / [`screen::InputSink`] / [`screen::FrameSink`] /
 //!   [`screen::Clipboard`] 四个 trait 定义在 [`screen`]，实现在上层。
-//! - 会话内功能：瓦片差分（[`tiles`]）、文件传输（[`file`] 沙箱 + [`transfer`] 状态机）、
+//! - 会话内功能：VP9 视频编码（[`video`]）、文件传输（[`file`] 沙箱 + [`transfer`] 状态机）、
 //!   多显示器切换、画质档位、剪贴板，全部由 [`controller`]/[`controlled`] 的会话循环编排。
 //!
 //! # 数据面协议（自研，跑在中继/直连建立的裸字节流上）
@@ -33,6 +39,8 @@
 //! - 握手鉴权：服务端经控制通道下发一次性 `token`，控制器发
 //!   `HMAC-SHA256(token, session_id ‖ controller_rd_id ‖ nonce)`，被控端用挂起 pending
 //!   会话的 token 常数时间比对（`hmac::verify_slice`），TTL 60s、一次性。
+//! - 版本：`Hello.proto_version` 硬相等校验（[`session::SESSION_PROTO_VERSION`]）。混合版本在
+//!   握手阶段**明文干净拒绝**，不会退化成 bincode 解码失败导致的硬断链。
 //! - 保活：[`session::HEARTBEAT_INTERVAL`]（10s，硬性小于 hbbr 的 30s `idle_timeout`）。
 //! - 加密：握手交换 X25519 临时公钥，ChaCha20-Poly1305 加密后续帧（见 [`crypto`]）。
 //!
@@ -54,9 +62,9 @@ pub mod screen;
 pub mod session;
 pub mod signaling;
 pub mod stats;
-pub mod tiles;
 pub mod transfer;
 pub mod transport;
+pub mod video;
 
 #[cfg(test)]
 mod integration_tests;
@@ -69,16 +77,18 @@ pub use manager::{
     ActiveSessionInfo, RemoteManager, RemoteManagerConfig, RemoteUiState, SessionRole, SessionState,
 };
 pub use screen::{
-    Clipboard, DecodedFrame, DecodedTile, DisplayInfo, EncodeOptions, EncodedFrame, FileEntry, FrameSink, InputEvent,
-    InputSink, KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource, TILE_SIZE, TilePatch, TileUpdate,
+    Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FileEntry, FrameSink, InputEvent, InputSink, KeyEvent,
+    MouseButton, QualityPreset, RawFrame, ScreenSource,
 };
 pub use session::{
-    ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd, SessionFrame,
-    SessionMessage, plan_controller_handshake,
+    CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd,
+    SessionFrame, SessionMessage, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
 };
 pub use stats::{SessionStats, SessionStatsReporter};
-pub use tiles::{TileDiffer, TileEncodeResult};
 pub use transfer::{
     TransferCommand, TransferDirection, TransferEvent, TransferHub, TransferProgress, CHUNK_PAUSE, CHUNK_SIZE,
 };
 pub use transport::{BoxDuplex, EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
+pub use video::{
+    DecodedVideoFrame, EncodedVideo, MAX_ENCODE_WIDTH, MAX_FRAME_DIM, VideoDecoder, VideoEncoder, encode_dimensions,
+};

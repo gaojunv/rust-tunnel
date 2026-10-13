@@ -1,6 +1,9 @@
 [package]
 name = "rust-tunnel-client"
-version = "0.10.0"
+# 远程控制数据面 v2（VP9 4:4:4）要求客户端 ≥ 0.11.0：服务端按 `CARGO_PKG_VERSION` 上报的版本
+# 做门控（`MIN_REMOTE_CLIENT_VERSION`），而 release-client.yml 的 VERSION 只取 git tag、不写回
+# Cargo.toml —— 这里漏抬会让门控把所有客户端一起挡掉。
+version = "0.11.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"

@@ -22,8 +22,10 @@ tracing = "0.1"
 rand = "0.8"
 thiserror = "1.0"
 async-trait = "0.1"
-# 屏幕编码：只开 jpeg，编码/解码走 image 内置 codec，不引入 png/tiff 等无关体积。
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# VP9 编解码（远程控制数据面）。根 Cargo.toml 的 `[patch.crates-io]` 把它重定向到
+# vendor/shiguredo_libvpx —— 上游 2026.1.0 表达不了 profile 1（8-bit 4:4:4）。
+# JPEG 编码器（`image` crate）已随瓦片路径一并删除。
+shiguredo_libvpx = "2026.1.0"
 sha2 = "0.10"
 hmac = "0.12"
 uuid = { version = "1.0", features = ["v4"] }

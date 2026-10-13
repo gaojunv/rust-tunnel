@@ -1,6 +1,8 @@
 [package]
 name = "rust-tunnel-client-gui"
-version = "0.10.0"
+# 与 `crates/client` 同步抬版：客户端上报的是 `CARGO_PKG_VERSION`，服务端门控按它判定。见
+# `crates/agent/src/runner/version_gate.rs` 的 `MIN_REMOTE_CLIENT_VERSION` 注释。
+version = "0.11.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"

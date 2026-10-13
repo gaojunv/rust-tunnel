@@ -7,15 +7,15 @@
 use crate::auth::verify_ack_mac;
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{decode_frame, FrameSink, InputEvent, QualityPreset, TilePatch};
+use crate::screen::{DecodedFrame, FrameSink, InputEvent, QualityPreset};
 use crate::session::{
     trusted_rtt, ControllerHandshake, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
-    HEARTBEAT_INTERVAL,
+    HEARTBEAT_INTERVAL, VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
-use crate::tiles::decode_tiles;
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
+use crate::video::{VideoDecoder, MAX_FRAME_DIM};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::time::Duration;
@@ -34,33 +34,27 @@ const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 待解码载荷队列深度。
 ///
-/// 解码在独立任务里串行进行（4K 单帧 ~53 ms ≈ 19 fps）。队列太深会在解码跟不上时堆积内存，太浅
-/// 则正常抖动就丢帧；4 足够吸收一个采集周期的抖动，把最坏内存压在「4 × 单帧载荷」量级。
-const DECODE_QUEUE: usize = 4;
+/// 解码在独立任务里串行进行（1080p 单帧约十几毫秒）。队列太深会在解码跟不上时堆积内存，太浅
+/// 则正常抖动就丢帧；8 兼作**抖动缓冲**，把最坏内存压在「8 × 单帧载荷」量级。队列满即丢帧——
+/// 丢弃会打断 VP9 的参考链，故解码任务用**序号断层**检测到它并请求关键帧（见 [`decode_loop`]）。
+const DECODE_QUEUE: usize = 8;
 
-/// 一条待解码的画面载荷（尚未 JPEG 解码）。
+/// 一条待解码的画面载荷（尚未 VP9 解码）。
 enum DecodeJob {
-    /// 整帧 JPEG。
-    Frame {
+    /// 一个视频包（长度前缀拼接的 VP9 帧）。
+    Packet {
         /// 来源显示器编号。
         display: u32,
-        /// 帧序号。
+        /// 帧序号（被控端递增；用于检测「有包被丢弃」的断层）。
         seq: u64,
-        /// JPEG 字节。
-        jpeg: Vec<u8>,
-    },
-    /// 增量瓦片批次。
-    Tiles {
-        /// 来源显示器编号。
-        display: u32,
-        /// 帧序号。
-        seq: u64,
-        /// 编码坐标系的整帧宽。
+        /// 标志位（[`VIDEO_FLAG_KEYFRAME`] 等）。
+        flags: u8,
+        /// 声明的**编码**宽度。
         width: u32,
-        /// 编码坐标系的整帧高。
+        /// 声明的**编码**高度。
         height: u32,
-        /// 变化瓦片。
-        tiles: Vec<TilePatch>,
+        /// VP9 帧数据。
+        data: Vec<u8>,
     },
 }
 
@@ -108,7 +102,7 @@ pub struct ControllerConfig {
 /// 跑一次控制器会话，直到取消、对端关闭或出错。
 ///
 /// `cmd_rx` 是 UI 经 [`crate::manager::RemoteManager`] 投递的命令流；`sink` 接收已解码画面
-/// （[`FrameSink::on_frame`] / [`FrameSink::on_tiles`] 拿到的是 RGBA，不在 UI 线程解码）。
+/// （[`FrameSink::on_frame`] 拿到的是 RGBA，不在 UI 线程解码）。
 ///
 /// # Errors
 /// 握手被拒、编解码失败、IO 失败时返回 [`RemoteError`]；正常结束（收到 `Bye` / 对端关闭 /
@@ -187,14 +181,21 @@ pub async fn run_controller(
 
     sink.on_displays(displays);
 
-    // 解码任务：JPEG/瓦片解码是 CPU 密集的**同步**调用（4K 单帧 ~53 ms），放在会话 `select!` 的
-    // 分支里执行会让输入转发被它占住——每秒有六成以上的时间循环都卡在解码上。故把解码挪到独立
-    // 任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
+    // 解码任务：VP9 解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
+    // 被它占住。故把解码挪到独立任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
     //
-    // 注意：解码任务会占住运行时的**一个** worker 线程（解码期间不同让）。这是 CPU 密集工作的
-    // 必然代价，且比原先占住会话循环本身好得多；阶段 2 换掉 JPEG 路径后这条会一并重做。
+    // 解码任务会占住运行时的**一个** worker 线程（解码期间不同让）。这是 CPU 密集工作的必然代价，
+    // 且比原先占住会话循环本身好得多。
     let (decode_tx, decode_rx) = mpsc::channel::<DecodeJob>(DECODE_QUEUE);
-    let decode_task = tokio::spawn(decode_loop(decode_rx, std::sync::Arc::clone(&sink), cancel.clone()));
+    // 解码任务 → 循环的关键帧请求通道（无界：只承载「重置后请对端补一个 IDR」这种低频控制）。
+    // 循环自己保留 `keyframe_tx`，故 `recv()` 永不返回 `None`（否则会 100% 空转）。
+    let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<u32>();
+    let decode_task = tokio::spawn(decode_loop(
+        decode_rx,
+        keyframe_tx.clone(),
+        std::sync::Arc::clone(&sink),
+        cancel.clone(),
+    ));
 
     // 3) 主循环。
     // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**（起点已过去），
@@ -292,6 +293,13 @@ pub async fn run_controller(
                     }
                 }
             }
+            // 解码任务请求关键帧（解码失败 / 丢弃了参考帧）：转达给被控端，让它补一个 IDR。
+            // `keyframe_tx` 常驻于本函数 → `recv()` 不会返回 `None`，本分支只在真的有请求时触发。
+            Some(display) = keyframe_rx.recv() => {
+                if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(SessionMessage::RequestKeyframe { display })).await {
+                    break Err(err);
+                }
+            }
             _ = file_tick.tick(), if transfer.has_outgoing() => {
                 match transfer.next_outbound().await {
                     Ok(Some(msg)) => {
@@ -312,22 +320,40 @@ pub async fn run_controller(
             incoming = reader.next() => {
                 match incoming {
                     Some(Ok(frame)) => match frame.message {
-                        SessionMessage::Video { display, seq, jpeg, .. } => {
+                        SessionMessage::VideoPacket {
+                            display,
+                            seq,
+                            flags,
+                            width,
+                            height,
+                            data,
+                            ..
+                        } => {
                             // 只投递原始载荷；解码在独立任务里做（见 `decode_loop`）。
-                            if !enqueue_decode(&decode_tx, DecodeJob::Frame { display, seq, jpeg }) {
-                                break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
-                            }
-                        }
-                        SessionMessage::VideoTiles { display, width, height, seq, tiles } => {
-                            if !enqueue_decode(&decode_tx, DecodeJob::Tiles {
+                            if !enqueue_decode(&decode_tx, DecodeJob::Packet {
                                 display,
                                 seq,
+                                flags,
                                 width,
                                 height,
-                                tiles,
+                                data,
                             }) {
                                 break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
                             }
+                        }
+                        // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
+                        SessionMessage::ScreenConfig { display: monitor, codec, width, height } => {
+                            // 编码尺寸/codec 的通告。解码器本身能在关键帧处跟随分辨率变化
+                            // （由 `video` 的单测锁定），故这里只记录、不重建。
+                            debug!(monitor, ?codec, width, height, "收到屏幕配置");
+                        }
+                        SessionMessage::RequestKeyframe { .. } => {
+                            // 该变体只应由**控制器**发出；收到即说明对端实现异常。
+                            debug!("控制器收到 RequestKeyframe，忽略");
+                        }
+                        SessionMessage::QosFeedback { .. } => {
+                            // 该变体只应由**控制器**发出；收到即说明对端实现异常。
+                            debug!("控制器收到 QosFeedback，忽略");
                         }
                         SessionMessage::DisplayList(list) => sink.on_displays(list),
                         SessionMessage::Clipboard { text } => sink.on_clipboard(text),
@@ -429,11 +455,29 @@ pub async fn run_controller(
 ///
 /// 独立成任务是为了把 CPU 密集的解码移出会话 `select!` 循环（见 `run_controller` 的说明）。
 /// 取消一旦触发即退出；队列关闭（会话结束）时把已入队的载荷解完再退出，保证顺序不乱。
+///
+/// # 丢弃与恢复（**改动前先读这段**）
+///
+/// 控制器**可以**丢帧（解码跟不上时不可避免），但 VP9 是时域编码：丢掉一个 P 帧会断掉参考链，
+/// 后续引用它的帧在解码端永远解不出来。故本任务维护「参考链是否完好」这一状态：
+///
+/// - **序号断层**（`seq` 不等于预期）说明会话循环因队列满丢弃过包 → 重置解码器、进入
+///   `awaiting_keyframe`，并请求对端补一个 IDR。
+/// - **解码失败**（数据损坏/缺参考帧）同上。
+/// - `awaiting_keyframe` 期间**丢弃所有非关键帧**，只等 IDR；收到 IDR 后恢复。
+///
+/// 被控端会周期性发关键帧作兜底，但**不能只靠它**——请求关键帧是丢帧后唯一的快速恢复路径。
 async fn decode_loop(
     mut rx: mpsc::Receiver<DecodeJob>,
+    keyframe_tx: mpsc::UnboundedSender<u32>,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
 ) {
+    let mut decoder: Option<VideoDecoder> = None;
+    // 参考链已断，只等 IDR。
+    let mut awaiting_keyframe = false;
+    // 下一个期望的帧序号（被控端按发送顺序递增；断层 = 中间有包被丢弃）。
+    let mut expected_seq: Option<u64> = None;
     loop {
         let job = tokio::select! {
             biased;
@@ -443,21 +487,73 @@ async fn decode_loop(
                 None => break,
             },
         };
-        match job {
-            DecodeJob::Frame { display, seq, jpeg } => match decode_frame(display, seq, &jpeg) {
-                Ok(decoded) => sink.on_frame(decoded),
-                Err(err) => warn!(error = %err, "画面解码失败，跳过该帧"),
-            },
-            DecodeJob::Tiles {
-                display,
-                seq,
-                width,
-                height,
-                tiles,
-            } => match decode_tiles(display, seq, width, height, &tiles) {
-                Ok(update) => sink.on_tiles(update),
-                Err(err) => warn!(error = %err, "瓦片解码失败，跳过该批"),
-            },
+        // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
+        let DecodeJob::Packet {
+            display: monitor,
+            seq,
+            flags,
+            width,
+            height,
+            data,
+        } = job;
+
+        // 声明尺寸的纵深防御：真正的解码尺寸由码流决定（下方解码后还会再校验一次），但先挡掉
+        // 明显非法的声明，避免把畸形值传下去。
+        if width == 0 || height == 0 || width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+            warn!(monitor, width, height, "视频包声明的编码尺寸非法，丢弃");
+            continue;
+        }
+
+        let keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
+        // 序号断层 = 会话循环丢弃过包 → 参考链已断，重置解码器并等关键帧。
+        if expected_seq.is_some_and(|expected| seq != expected) {
+            debug!(seq, ?expected_seq, "视频序号断层，重置解码器并等待关键帧");
+            decoder = None;
+            awaiting_keyframe = true;
+            let _ = keyframe_tx.send(monitor);
+        }
+        expected_seq = Some(seq.wrapping_add(1));
+
+        if awaiting_keyframe && !keyframe {
+            continue;
+        }
+        // 尚无解码器时必须从关键帧起步，否则 P 帧无从参考。
+        if decoder.is_none() && !keyframe {
+            awaiting_keyframe = true;
+            let _ = keyframe_tx.send(monitor);
+            continue;
+        }
+        if decoder.is_none() {
+            match VideoDecoder::new() {
+                Ok(dec) => decoder = Some(dec),
+                Err(err) => {
+                    warn!(error = %err, "解码器创建失败");
+                    continue;
+                }
+            }
+        }
+        let Some(dec) = decoder.as_mut() else {
+            continue;
+        };
+        match dec.decode(&data) {
+            Ok(Some(frame)) => {
+                awaiting_keyframe = false;
+                sink.on_frame(DecodedFrame {
+                    display: monitor,
+                    width: frame.width,
+                    height: frame.height,
+                    seq,
+                    rgba: frame.rgba,
+                });
+            }
+            // 本批无输出（理论路径；`lag_in_frames = 1` 下每次都有）。
+            Ok(None) => awaiting_keyframe = false,
+            Err(err) => {
+                warn!(error = %err, "画面解码失败，重置解码器并请求关键帧");
+                decoder = None;
+                awaiting_keyframe = true;
+                let _ = keyframe_tx.send(monitor);
+            }
         }
     }
 }
@@ -465,13 +561,13 @@ async fn decode_loop(
 /// 投递一条待解码载荷；返回 `false` 表示解码任务已结束。
 ///
 /// 队列满时**丢弃**该批而不是 `await`：在 `select!` 分支里等解码腾出位置会重新把循环卡住（正是
-/// 本次要修的问题）。丢一帧整帧由下一个关键帧恢复；丢一批瓦片会让那块区域滞留到下一次关键帧
-/// （[`crate::tiles::KEYFRAME_INTERVAL_FRAMES`] 帧之内），这是解码跟不上时的必然代价。
+/// 本次要修的问题）。丢包会打断 VP9 的参考链，故解码任务用**序号断层**检测到它、重置解码器并
+/// 请求关键帧（见 [`decode_loop`]）——丢帧本身安全，静默花屏才不安全。
 fn enqueue_decode(tx: &mpsc::Sender<DecodeJob>, job: DecodeJob) -> bool {
     match tx.try_send(job) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
-            debug!("解码队列已满，丢弃一批画面");
+            debug!("解码队列已满，丢弃一批画面（解码侧将按序号断层请求关键帧）");
             true
         }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -523,7 +619,7 @@ mod tests {
     use crate::auth::ack_mac;
     use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
     use crate::error::RemoteResult;
-    use crate::screen::{DecodedFrame, DisplayInfo, FrameSink, TileUpdate};
+    use crate::screen::{DecodedFrame, DisplayInfo, FrameSink};
     use crate::session::{plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage};
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
@@ -553,7 +649,6 @@ mod tests {
     impl FrameSink for FakeSink {
         fn on_displays(&self, _displays: Vec<DisplayInfo>) {}
         fn on_frame(&self, _frame: DecodedFrame) {}
-        fn on_tiles(&self, _update: TileUpdate) {}
         fn on_closed(&self, reason: String) {
             if let Ok(mut guard) = self.closed.lock() {
                 *guard = Some(reason);

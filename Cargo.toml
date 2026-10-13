@@ -8,6 +8,15 @@ license = "MIT OR Apache-2.0"
 [workspace]
 members = ["crates/agent", "crates/client", "crates/client-gui", "crates/common", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/remote", "crates/rustdesk", "crates/server", "crates/stats", "crates/wiki-core", "crates/wiki-serve"]
 
+# ── vendor 的第三方 crate ────────────────────────────────────────────
+# shiguredo_libvpx 2026.1.0 表达不了 VP9 profile 1（8-bit 4:4:4）——wrapper 无
+# Profile1 变体、解码侧只放行 I420、色度平面按 4:2:0 写死。远程控制数据面改用
+# VP9 4:4:4 必须打补丁，故 vendor 到 vendor/shiguredo_libvpx 并在此重定向；
+# 补丁清单与动机见该目录 src/lib.rs 里的 `PATCH:` 注释，机械锁测试见
+# crates/remote/tests/vendor_patches.rs。
+[patch.crates-io]
+shiguredo_libvpx = { path = "vendor/shiguredo_libvpx" }
+
 [workspace.lints.clippy]
 # 企业级 lint 基线：pedantic 组已在批次 9/10 全仓清零，转 deny 硬门禁。
 # 新增违反必须就地修正，或加 `#[expect(lint, reason = "中文理由")]` 显式豁免。

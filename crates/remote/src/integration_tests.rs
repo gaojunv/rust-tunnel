@@ -12,7 +12,7 @@ use crate::error::{RemoteError, RemoteResult};
 use crate::manager::{RemoteManager, RemoteManagerConfig, SessionState};
 use crate::screen::{
     Clipboard, DecodedFrame, DisplayInfo, EncodeOptions, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton,
-    RawFrame, ScreenSource, TileUpdate,
+    RawFrame, ScreenSource,
 };
 use crate::session::{plan_controller_handshake, SessionCodec, SessionEnd, SessionMessage};
 use crate::stats::SessionStatsReporter;
@@ -157,10 +157,6 @@ struct RecordingSink {
     frames: AtomicUsize,
     displays: Mutex<Vec<DisplayInfo>>,
     closed: Mutex<Option<String>>,
-    /// 收到的瓦片更新批次数。
-    tiles: AtomicUsize,
-    /// 收到的瓦片更新（供断言矩形与尺寸）。
-    tile_updates: Mutex<Vec<TileUpdate>>,
     /// 最近一次收到的剪贴板文本。
     clipboard: Mutex<Option<String>>,
     notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
@@ -191,12 +187,6 @@ impl FrameSink for RecordingSink {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(());
             }
-        }
-    }
-    fn on_tiles(&self, update: TileUpdate) {
-        self.tiles.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut guard) = self.tile_updates.lock() {
-            guard.push(update);
         }
     }
     fn on_clipboard(&self, text: String) {
@@ -302,7 +292,7 @@ fn manager_with_dirs(
         enabled,
         establisher,
         encode: EncodeOptions {
-            quality: 60,
+            target_bitrate_kbps: 2000,
             scale: 1.0,
             max_fps: 10,
         },
@@ -867,52 +857,43 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
     }
 }
 
-/// 瓦片差分：静止画面零瓦片输出，局部变化才产生瓦片。
+/// VP9 数据面：静止画面零输出，局部变化才继续出帧。
 #[tokio::test]
-async fn static_screen_emits_no_tiles_and_change_emits_tiles() {
+async fn static_screen_emits_no_frames_and_change_emits_frames() {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let ctrl = manager(Arc::new(OneShotEstablisher::new(Box::new(a), true)), false, "home-nas");
     let ctld = manager(Arc::new(OneShotEstablisher::new(Box::new(b), false)), true, "office-pc");
 
     let (ctrl_sink, _frame_rx) = RecordingSink::with_notify();
     ctrl.install_frame_sink(ctrl_sink.clone());
-    // 192x128 → 3x2 = 6 块瓦片；先给一张纯色静止帧。
     let screen = Arc::new(MutableScreen::new(solid(0, 192, 128, [10, 20, 30, 255])));
     ctld.install_platform(screen.clone(), Arc::new(RecordingInput::default()));
 
     establish_session(&ctrl, &ctld).await;
 
-    // 首帧是关键帧（整帧 Video），不是瓦片。
+    // 首帧是关键帧（IDR），应到达控制器。
     assert!(
         poll_until(|| ctrl_sink.frames.load(Ordering::Relaxed) >= 1).await,
         "应收到首帧关键帧"
     );
 
-    // 静止画面：再等一段，瓦片输出必须为零。
+    // 静止画面：再等一段，不应有任何**新增**帧（被控端完全不喂编码器）。
+    let after_first = ctrl_sink.frames.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(ctrl_sink.tiles.load(Ordering::Relaxed), 0, "静止画面不应有瓦片输出");
+    assert_eq!(
+        ctrl_sink.frames.load(Ordering::Relaxed),
+        after_first,
+        "静止画面不应有新帧（带宽趋零的来源）"
+    );
 
-    // 只改左上角瓦片 (0,0) 内的一小块区域。
+    // 改一块区域 → 应产生新的编码帧。
     {
         let mut frame = screen.frame.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         fill_rect(&mut frame, 10, 10, 20, 20, [250, 10, 10, 255]);
     }
-
-    // 变化应产生至少一次瓦片更新。
     assert!(
-        poll_until(|| ctrl_sink.tiles.load(Ordering::Relaxed) >= 1).await,
-        "画面变化应产生瓦片"
-    );
-    let updates = ctrl_sink.tile_updates.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let update = updates.last().expect("应有瓦片更新");
-    assert_eq!((update.display, update.width, update.height), (0, 192, 128), "瓦片应带整帧尺寸");
-    assert!(
-        update
-            .tiles
-            .iter()
-            .any(|t| (t.x, t.y, t.width, t.height) == (0, 0, 64, 64)),
-        "应含左上角 64x64 瓦片，实得 {:?}",
-        update.tiles.iter().map(|t| (t.x, t.y, t.width, t.height)).collect::<Vec<_>>()
+        poll_until(|| ctrl_sink.frames.load(Ordering::Relaxed) > after_first).await,
+        "画面变化应产生新帧"
     );
 }
 
@@ -1621,9 +1602,8 @@ async fn file_transfer_mode_sends_no_video_but_allows_files() {
         "FileTransfer 下应能下载文件"
     );
 
-    // 全程零画面帧 / 零瓦片：被控端根本不采集。
+    // 全程零画面帧：被控端根本不采集。
     assert_eq!(ctrl_sink.frames.load(Ordering::Relaxed), 0, "FileTransfer 不应有任何画面帧");
-    assert_eq!(ctrl_sink.tiles.load(Ordering::Relaxed), 0, "FileTransfer 不应有任何瓦片");
 
     let _ = std::fs::remove_dir_all(&share);
     let _ = std::fs::remove_dir_all(&dl);

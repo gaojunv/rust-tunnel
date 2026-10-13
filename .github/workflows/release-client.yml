@@ -106,7 +106,10 @@ jobs:
             binary: rust-tunnel-client-gui
             asset: rust-tunnel-client-gui-linux-x86_64
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            # shiguredo_libvpx 的预编译 libvpx 是 GNU/mingw-w64 产物（`Built by MSYS2
+            # project`、符号 `___chkstk_ms`），MSVC 链不了，故本 leg 走 GNU 工具链。
+            # 只改 GUI：CLI 客户端（build-client）不依赖 rust-tunnel-remote，保持 msvc。
+            target: x86_64-pc-windows-gnu
             binary: rust-tunnel-client-gui.exe
             asset: rust-tunnel-client-gui-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
@@ -120,6 +123,11 @@ jobs:
         with:
           cache-targets: true
           cache-on-failure: true
+      # windows-latest 自带 MSYS2 但默认不在 PATH，GNU 工具链需要其中的 mingw 链接器。
+      - name: Add MinGW to PATH
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: pwsh
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install Linux GUI deps
         if: runner.os == 'Linux'
         # 远程控制新增的构建依赖（xcap 0.9 / enigo 0.6，二者在 Linux 上无条件编译）：
@@ -162,21 +170,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          # 只发 arm64：shiguredo_libvpx 没有 macos_x86_64 预编译，其 build.rs 对该
+          # target 直接 panic（`unsupported target: os=macos, arch=x86_64`），
+          # 用户已决定放弃 macOS x86_64（不再 lipo 出 universal2）。
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: true
           cache-on-failure: true
-      - name: Build universal2 binary
+      - name: Build arm64 binary
         run: |
           cargo build --release -p rust-tunnel-client-gui --target aarch64-apple-darwin
-          cargo build --release -p rust-tunnel-client-gui --target x86_64-apple-darwin
-          mkdir -p target/universal2
-          lipo -create target/aarch64-apple-darwin/release/rust-tunnel-client-gui target/x86_64-apple-darwin/release/rust-tunnel-client-gui -output target/universal2/rust-tunnel-client-gui
       - name: Bundle .app and dmg
         env:
           VERSION: ${{ github.ref_name }}
-          GUI_BIN: target/universal2/rust-tunnel-client-gui
+          GUI_BIN: target/aarch64-apple-darwin/release/rust-tunnel-client-gui
         run: |
           bash scripts/bundle-macos.sh
           ls -lh dist/
@@ -196,7 +204,7 @@ jobs:
           chmod 600 "${KEY}"
           PORT="${SSH_PORT:-22}"
           DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
-          DMG="dist/RustTunnel-${GITHUB_REF_NAME}-macos-universal2.dmg"
+          DMG="dist/RustTunnel-${GITHUB_REF_NAME}-macos-aarch64.dmg"
           SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
           ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
           scp "${SSH_OPTS[@]}" -P "${PORT}" "$DMG" "${SSH_USER}@${SSH_HOST}:${DEST}/"
