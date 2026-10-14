@@ -90,9 +90,29 @@ fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
 }
 
-/// 编码线程数 = 逻辑核数（`available_parallelism` 取不到时回退 1）。
-fn encode_threads() -> NonZeroUsize {
+/// 编解码线程数 = 本机逻辑核数（`available_parallelism` 取不到时回退 1）。
+///
+/// 编码（被控端）与解码（控制器）各按**自己所在机器**的核数取——两端通常是两台机器。
+fn video_threads() -> NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+}
+
+/// 按编码宽度选 VP9 **瓦片列数**档位（`tile_columns` 是 log2 的瓦片列数：0=1 列，1=2 列，2=4 列）。
+///
+/// 瓦片是解码侧并行的**切分单位**（解码器默认只在瓦片边界起线程）：列数太少，多核在边界上
+/// 空等；列数太多，每瓦片的熵编码上下文变差、压缩率下降。每个瓦片需 ≥256 像素宽，故档位随
+/// 宽度阶梯上升：宽度 ≥1024 → 4 列（2），≥512 → 2 列（1），否则 1 列（0）。上限 6（64 列）
+/// 远超实际需要，不取。
+///
+/// **不改线上格式**：瓦片列数写在 VP9 未压缩帧头里，老解码器照样能解，故**无需**版本门控
+/// （[`SESSION_PROTO_VERSION`](crate::session::SESSION_PROTO_VERSION) 与
+/// `MIN_REMOTE_CLIENT_VERSION` 都不用动）。
+fn tile_columns_for(width: u32) -> i32 {
+    match width {
+        1024.. => 2,
+        512..=1023 => 1,
+        _ => 0,
+    }
 }
 
 /// 按缩放比例与宽度上限计算**编码尺寸**。
@@ -337,6 +357,13 @@ impl VideoEncoder {
             // 补丁 5：显式声明 BT.709 + full range，与 `rgb_to_yuv` 的常数严格一致。
             color_space: Some(ColorSpace::Bt709),
             color_range: Some(ColorRange::Full),
+            // 解码侧并行（配合 vendor 补丁 7）：切瓦片给解码器提供并行切分点。
+            tile_columns: Some(tile_columns_for(width)),
+            // 编码器自身也开行级多线程（`VP9E_SET_ROW_MT`），与解码侧的 row-mt 对称。
+            row_mt: true,
+            // **不设 `frame_parallel_decoding`**：它与 `error_resilient = true` 语义冲突
+            // （error-resilient 模式要求帧并行解码关闭），且在低延迟（`lag_in_frames = 1`）
+            // 下没有收益。
             ..Default::default()
         };
         let mut config = EncoderConfig::new(
@@ -353,7 +380,7 @@ impl VideoEncoder {
         config.fps_numerator = usize::from(max_fps.max(1));
         config.fps_denominator = 1;
         config.cpu_used = Some(CPU_USED);
-        config.threads = Some(encode_threads());
+        config.threads = Some(video_threads());
         // 必设：`None` 只是「不覆盖」，libvpx 默认会把前 25 帧全缓冲住。
         config.lag_in_frames = Some(NonZeroUsize::MIN);
         config.error_resilient = true;
@@ -487,15 +514,21 @@ impl std::fmt::Debug for VideoDecoder {
 }
 
 impl VideoDecoder {
-    /// 构造一个 VP9 解码器。
+    /// 构造一个 VP9 解码器（**多线程 + row-mt**，见 vendor 补丁 7）。
+    ///
+    /// 解码是控制器侧的瓶颈：4K 单线程解码每帧十几到数十毫秒，跟不上被控端出帧。多线程 +
+    /// row-mt **不改变解码结果**（`crates/remote/tests/vendor_patches.rs` 有逐字节比对锁），
+    /// 也**不改线上格式**——线程数与 row-mt 都是本机解码器配置，不写进码流，故**无需**版本
+    /// 门控（`SESSION_PROTO_VERSION` / `MIN_REMOTE_CLIENT_VERSION` 都不用动）。
     ///
     /// # Errors
     /// libvpx 初始化失败时返回 [`RemoteError::Encode`]。
     pub fn new() -> RemoteResult<Self> {
-        let inner = Decoder::new(DecoderConfig {
-            codec: DecoderCodec::Vp9,
-        })
-        .map_err(|err| RemoteError::Encode(format!("VP9 解码器创建失败: {err}")))?;
+        let mut config = DecoderConfig::new(DecoderCodec::Vp9);
+        config.threads = Some(video_threads());
+        config.row_mt = true;
+        let inner = Decoder::new(config)
+            .map_err(|err| RemoteError::Encode(format!("VP9 解码器创建失败: {err}")))?;
         Ok(Self { inner })
     }
 
@@ -569,6 +602,7 @@ impl VideoDecoder {
 mod tests {
     use super::*;
     use crate::screen::QualityPreset;
+    use std::time::Instant;
 
     /// 造一帧带纹理的 RGBA（纯色会让编码器退化，颜色往返也测不出东西）。
     fn textured(width: u32, height: u32) -> Vec<u8> {
@@ -764,5 +798,108 @@ mod tests {
             let enc = VideoEncoder::new(w, h, opts.target_bitrate_kbps, opts.max_fps);
             assert!(enc.is_ok(), "{preset:?} 应能构造编码器：{enc:?}");
         }
+    }
+
+    // =======================================================================
+    // 基准（`#[ignore]`）：解码并行化的 before/after 锚点
+    // =======================================================================
+
+    /// 生成一帧确定性渐变 + 逐帧轻微改动的 RGBA。
+    ///
+    /// 纯色/静止内容会让编码器退化（帧内预测全命中、参考链不被走），基准耗时没有代表性。
+    /// 这里用渐变底 + 每帧移动的亮块，保证逐帧都有真实残差要编、参考链真的被走。
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "r/g/b 与 x/y 是色彩/坐标领域的通用记法，改名反而难读"
+    )]
+    fn bench_frame(width: u32, height: u32, tick: u32) -> Vec<u8> {
+        let w = usize::try_from(width).unwrap_or(0);
+        let h = usize::try_from(height).unwrap_or(0);
+        let mut rgba = Vec::with_capacity(w * h * BYTES_PER_PIXEL);
+        let box_w = (width / 8).max(1);
+        let box_h = (height / 8).max(1);
+        let box_x = tick.wrapping_mul(7) % width.max(box_w);
+        let box_y = tick.wrapping_mul(5) % height.max(box_h);
+        for y in 0..height {
+            for x in 0..width {
+                let mut r = u8::try_from((x * 255 / width.max(1)) % 256).unwrap_or(0);
+                let mut g = u8::try_from((y * 255 / height.max(1)) % 256).unwrap_or(0);
+                let b = u8::try_from(((x + y) * 3) % 256).unwrap_or(0);
+                // 每帧移动的亮块：给参考链制造真实残差。
+                if x >= box_x && x < box_x + box_w && y >= box_y && y < box_y + box_h {
+                    r = 255 - r;
+                    g = 255 - g;
+                }
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            }
+        }
+        rgba
+    }
+
+    /// 去掉前 `warmup` 个样本后，返回 `(中位数, 均值)`（毫秒）。
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "样本数远小于 2^53，转 f64 求均值不损精度"
+    )]
+    fn bench_stats(samples: &[f64], warmup: usize) -> (f64, f64) {
+        let mut kept: Vec<f64> = samples.iter().skip(warmup).copied().collect();
+        kept.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = kept[kept.len() / 2];
+        let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+        (median, mean)
+    }
+
+    /// 跑一组尺寸的编解码基准并打印。
+    ///
+    /// 走**生产封装**（[`VideoEncoder`]/[`VideoDecoder`]）而非裸 shiguredo 类型，测的是真实
+    /// 管线。编码 1 个强制关键帧 + 30 个 P 帧，解码按同序喂回，逐帧记时；丢弃前 [`WARMUP`]
+    /// 帧预热后取中位数与均值。
+    fn run_video_bench(width: u32, height: u32, label: &str, bitrate_kbps: u32) {
+        const PFRAMES: usize = 30;
+        const WARMUP: usize = 5;
+
+        let mut enc = VideoEncoder::new(width, height, bitrate_kbps, 30).expect("编码器");
+        let mut packets: Vec<Vec<u8>> = Vec::with_capacity(PFRAMES + 1);
+        let mut encode_ms: Vec<f64> = Vec::with_capacity(PFRAMES + 1);
+        for i in 0..=PFRAMES {
+            let frame = bench_frame(width, height, u32::try_from(i).unwrap_or(0));
+            let start = Instant::now();
+            let out = enc
+                .encode(&frame, width, height, i == 0)
+                .expect("编码应成功");
+            encode_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            packets.push(out.data);
+        }
+
+        let mut dec = VideoDecoder::new().expect("解码器");
+        let mut decode_ms: Vec<f64> = Vec::with_capacity(packets.len());
+        for packet in &packets {
+            let start = Instant::now();
+            let frame = dec.decode(packet).expect("解码应成功").expect("应有输出帧");
+            decode_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&frame.rgba);
+        }
+
+        let (enc_med, enc_mean) = bench_stats(&encode_ms, WARMUP);
+        let (dec_med, dec_mean) = bench_stats(&decode_ms, WARMUP);
+        println!(
+            "[video_bench] {label} {width}x{height}: 编码 中位数 {enc_med:.2} ms / 均值 {enc_mean:.2} ms；\
+             解码 中位数 {dec_med:.2} ms / 均值 {dec_mean:.2} ms（丢弃前 {WARMUP} 帧预热，共 {} 帧）",
+            encode_ms.len()
+        );
+    }
+
+    /// 编解码基准（`#[ignore]`，**必须 release 跑**）：
+    /// `cargo test -p rust-tunnel-remote --release --lib -- --ignored --nocapture video_bench`
+    ///
+    /// debug 下 RGBA↔YUV 转换会主导耗时，数字没有代表性。覆盖 1080p 与 4K——后者是解码瓶颈
+    /// 所在。打印 `available_parallelism`（编码线程数与之同源）。
+    #[test]
+    #[ignore = "基准测试：需 release 且手动触发，常规 cargo test 不受影响"]
+    fn video_bench_encode_decode() {
+        let threads = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        println!("[video_bench] available_parallelism = {threads}");
+        run_video_bench(1920, 1080, "1080p", 8_000);
+        run_video_bench(3840, 2160, "4K", 16_000);
     }
 }

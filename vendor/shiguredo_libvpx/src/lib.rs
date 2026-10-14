@@ -119,12 +119,39 @@ pub enum DecoderCodec {
 pub struct DecoderConfig {
     /// デコードするコーデック
     pub codec: DecoderCodec,
+
+    // PATCH: デコード側の並列化（スレッド数 + row-mt）を露出する。
+    //
+    // 动机：上游恒以 `cfg = NULL` 调 `vpx_codec_dec_init_ver`，libvpx 于是按
+    // `threads = 1` 建解码器——4K VP9 单线程解码是本项目控制器侧的瓶颈（每帧十几到数十
+    // 毫秒），而生成绑定里 `vpx_codec_dec_cfg_t` 与 `VP9D_SET_ROW_MT` 都已具备，上游却
+    // 一个都没接。
+    //
+    // 上游原本的行为：`DecoderConfig` 只有 `codec`，`init` 写死 `std::ptr::null()`，
+    // 既不能开多线程，也不能开行级并行（row-mt）。
+    //
+    // 去掉它会怎样：解码恒为单线程，4K 场景控制器跟不上被控端出帧，只能靠降分辨率规避；
+    // 置 `Some(n)` + `row_mt = true` 后解码可跨线程切分（且不改变解码结果，见
+    // `crates/remote/tests/vendor_patches.rs` 的逐字节比对锁）。
+    /// デコードに使う最大スレッド数（`None` で上游従来どおり `cfg = NULL`＝libvpx 既定の 1）
+    pub threads: Option<NonZeroUsize>,
+
+    /// 行マルチスレッド（VP9D_SET_ROW_MT）を有効にするか
+    ///
+    /// `threads` が `Some` のときのみ意味を持つ（1 スレッドでは行並列の意味がない）。
+    pub row_mt: bool,
 }
 
 impl DecoderConfig {
     /// 指定したコーデックでデコーダー設定を生成する
+    ///
+    /// `threads = None` / `row_mt = false`＝上游従来の挙動（単スレッド・row-mt 無効）。
     pub fn new(codec: DecoderCodec) -> Self {
-        Self { codec }
+        Self {
+            codec,
+            threads: None,
+            row_mt: false,
+        }
     }
 }
 
@@ -142,22 +169,58 @@ impl Decoder {
                 DecoderCodec::Vp8 => sys::vpx_codec_vp8_dx(),
                 DecoderCodec::Vp9 => sys::vpx_codec_vp9_dx(),
             };
-            Self::init(iface)
+            Self::init(iface, &config)
         }
     }
 
-    fn init(iface: *const sys::vpx_codec_iface) -> Result<Self, Error> {
+    fn init(iface: *const sys::vpx_codec_iface, config: &DecoderConfig) -> Result<Self, Error> {
         let mut ctx = MaybeUninit::<sys::vpx_codec_ctx>::zeroed();
         unsafe {
+            // PATCH: `threads` 指定時は `vpx_codec_dec_cfg_t` を渡して並列デコードを有効化する。
+            //
+            // 动机：上游恒传 `NULL`，libvpx 按 `threads = 1` 建解码器。4K 屏幕内容的解码
+            // 开销全在控制器侧，多线程是唯一**不改码流**就能降耗时的旋钮。
+            //
+            // 上游原本的行为：cfg 恒为 `std::ptr::null()`，线程数不可配置。
+            //
+            // 去掉它会怎样：解码退回单线程（本项目 4K 实测每帧十几到数十毫秒），控制器侧
+            // 积压，只能靠降分辨率规避。
+            //
+            // `w` / `h` 保持 0：libvpx 会在解出首帧时按码流尺寸自行确定——屏幕尺寸在会话
+            // 中可变（切显示器 / 切档位），写死反而更差。
+            let cfg = config.threads.map(|threads| sys::vpx_codec_dec_cfg_t {
+                threads: threads.get() as c_uint,
+                w: 0,
+                h: 0,
+            });
+            let cfg_ptr = cfg.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
             let code = sys::vpx_codec_dec_init_ver(
                 ctx.as_mut_ptr(),
                 iface,
-                std::ptr::null(), // cfg
-                0,                // flags
+                cfg_ptr, // cfg
+                0,       // flags
                 sys::VPX_DECODER_ABI_VERSION as i32,
             );
-            let ctx = ctx.assume_init();
+            let mut ctx = ctx.assume_init();
             Error::check(code, "vpx_codec_dec_init_ver", Some(&ctx))?;
+
+            // PATCH: row-mt（VP9D_SET_ROW_MT）で行レベルの並列デコードを有効化する。
+            //
+            // 动机：libvpx 的 VP9 解码多线程默认只在**瓦片边界**并行——编码器若不切瓦片
+            // （或瓦片数少于线程数），多线程几乎不起作用。`VP9D_SET_ROW_MT` 允许解码器在
+            // 帧内按宏块行切分，配合编码侧的 `tile_columns` 才吃得满多核。
+            //
+            // 上游原本的行为：完全没暴露该 control，无法开启行级并行。
+            //
+            // 去掉它会怎样：多线程解码在瓦片数少时收益接近零（线程空转），解码仍是瓶颈。
+            if config.row_mt {
+                let code = sys::vpx_codec_control_(
+                    &mut ctx,
+                    sys::vp8_dec_control_id_VP9D_SET_ROW_MT as c_int,
+                    1,
+                );
+                Error::check(code, "vpx_codec_control_", Some(&ctx))?;
+            }
 
             Ok(Self {
                 ctx,
@@ -1579,17 +1642,13 @@ mod tests {
 
     #[test]
     fn init_vp8_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp8,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp8);
         assert!(Decoder::new(config).is_ok());
     }
 
     #[test]
     fn init_vp9_decoder() {
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp9,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp9);
         assert!(Decoder::new(config).is_ok());
     }
 
@@ -1625,9 +1684,7 @@ mod tests {
             123, 39, 56, 123, 39, 56, 123, 39, 56, 123, 39, 56, 123, 39, 56, 123, 39, 55, 128, 254,
             250, 215, 128,
         ];
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp8,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp8);
         let mut decoder = Decoder::new(config).expect("failed to create decoder");
         let mut decoded_count = 0;
 
@@ -1660,9 +1717,7 @@ mod tests {
             240, 227, 199, 143, 30, 28, 238, 113, 218, 24, 0, 103, 26, 154, 224, 98, 35, 126, 68,
             120, 240, 227, 199, 143, 30, 28, 238, 113, 218, 24, 0,
         ];
-        let config = DecoderConfig {
-            codec: DecoderCodec::Vp9,
-        };
+        let config = DecoderConfig::new(DecoderCodec::Vp9);
         let mut decoder = Decoder::new(config).expect("failed to create decoder");
         let mut decoded_count = 0;
 

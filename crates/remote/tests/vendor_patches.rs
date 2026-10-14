@@ -20,6 +20,11 @@
 //! - 补丁 6（`Encoder::set_bitrate` / `set_fps`，即 `vpx_codec_enc_config_set`）：
 //!   `runtime_bitrate_change_does_not_force_keyframe` 断言在线改码率后不产生 IDR、
 //!   码流仍可解；`runtime_fps_change_is_accepted` 断言在线改帧率被 libvpx 接受。
+//! - 补丁 7（`DecoderConfig::threads` / `row_mt`，即 `vpx_codec_dec_cfg_t` +
+//!   `VP9D_SET_ROW_MT`）：`multithreaded_row_mt_decode_is_bit_exact` 断言同一段码流用
+//!   「单线程 + 关 row-mt」与「多线程 + 开 row-mt」解出的平面**逐字节相同**（并行不改变
+//!   解码结果）；`encoder_accepts_tile_columns_and_row_mt` 断言编码器接受
+//!   `tile_columns` + `row_mt` 并产出可解码流。
 
 // 测试代码豁免 panic 风险 lint（与仓库既有集成测试一致）。
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -253,10 +258,8 @@ fn profile0_i444_encode_fails() {
 fn profile1_i444_decodes_full_chroma() {
     let packet = encode_keyframe(Vp9Profile::Profile1, None);
 
-    let mut decoder = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Vp9,
-    })
-    .expect("failed to create decoder");
+    let mut decoder =
+        Decoder::new(DecoderConfig::new(DecoderCodec::Vp9)).expect("failed to create decoder");
     decoder
         .decode(&packet)
         .expect("decode() must accept a profile 1 stream");
@@ -369,7 +372,7 @@ fn runtime_bitrate_change_does_not_force_keyframe() {
     );
 
     // 码流仍可解（关键帧 → P 帧）。
-    let mut decoder = Decoder::new(DecoderConfig { codec: DecoderCodec::Vp9 }).expect("decoder");
+    let mut decoder = Decoder::new(DecoderConfig::new(DecoderCodec::Vp9)).expect("decoder");
     decoder.decode(&keyframe).expect("decode keyframe");
     while decoder.next_frame().expect("frame").is_some() {}
     decoder.decode(&pframe).expect("decode P frame after set_bitrate");
@@ -392,4 +395,146 @@ fn runtime_fps_change_is_accepted() {
 
     let (_pframe, is_key) = encode_packet(&mut encoder, 60, false);
     assert!(!is_key, "在线改帧率不得插入 IDR");
+}
+
+// ===========================================================================
+// 补丁 7：解码侧并行（threads + row-mt）
+// ===========================================================================
+
+/// 补丁 7 的测试尺寸：小到秒级，又给瓦片留出余量（256 宽 → 2 列时每瓦片 128 像素）。
+const PW: usize = 256;
+/// 见 [`PW`]。
+const PH: usize = 192;
+
+/// 造一个开了 `tile_columns` + `row_mt` 的 I444 编码器（形状与 `video.rs` 的编码配置一致）。
+///
+/// `tile_columns = 1` 是 log2 的瓦片列数（即 2 列）——给解码器提供瓦片边界作为并行切分点。
+fn tiled_encoder() -> Encoder {
+    let vp9 = Vp9Config {
+        profile: Vp9Profile::Profile1,
+        color_space: Some(ColorSpace::Bt709),
+        color_range: Some(ColorRange::Full),
+        tile_columns: Some(1),
+        row_mt: true,
+        ..Default::default()
+    };
+    let mut config = EncoderConfig::new(PW, PH, ImageFormat::I444, CodecConfig::Vp9(vp9));
+    config.target_bitrate = 2_000_000;
+    config.deadline = EncodingDeadline::Realtime;
+    config.lag_in_frames = Some(NonZeroUsize::new(1).unwrap());
+    config.rc_buffer_size_ms = Some(NonZeroUsize::new(300).unwrap());
+    Encoder::new(config).expect("failed to create VP9 encoder")
+}
+
+/// 造 PW×PH 的 I444 平面（内容随 `shade` 变化，避免第二帧退化成「无变化」）。
+fn tiled_planes(shade: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut y = vec![0u8; PW * PH];
+    for (i, px) in y.iter_mut().enumerate() {
+        *px = (((i * 7) % 256) as u8).wrapping_add(shade);
+    }
+    let mut u = vec![0u8; PW * PH];
+    for (i, px) in u.iter_mut().enumerate() {
+        *px = (((i * 3) % 200) as u8).wrapping_add(shade);
+    }
+    let mut v = vec![0u8; PW * PH];
+    for (i, px) in v.iter_mut().enumerate() {
+        *px = (((i * 5) % 200) as u8).wrapping_add(shade);
+    }
+    (y, u, v)
+}
+
+/// 编一段「1 个关键帧 + `frames - 1` 个 P 帧」的码流（编码器开了 tile_columns + row_mt），
+/// 返回逐帧字节。
+fn encode_tiled_stream(frames: usize) -> Vec<Vec<u8>> {
+    let mut encoder = tiled_encoder();
+    let mut packets = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let (y, u, v) = tiled_planes(u8::try_from(i).unwrap_or(0).wrapping_mul(17));
+        encoder
+            .encode(
+                &ImageData::I444 { y: &y, u: &u, v: &v },
+                &EncodeOptions {
+                    force_keyframe: i == 0,
+                },
+            )
+            .expect("encode must succeed with tile_columns + row_mt");
+        let mut last = None;
+        while let Some(packet) = encoder.next_frame() {
+            last = Some(packet.data().to_vec());
+        }
+        packets.push(last.expect("encoder produced no packet"));
+    }
+    packets
+}
+
+/// 用给定配置的解码器解完整段码流，返回每帧的「Y ‖ U ‖ V 平面字节」拼接。
+///
+/// 平面字节是解码输出里唯一会变的量；RGBA 是它的**确定性纯函数**（见
+/// `video::i444_to_rgba`），故平面逐字节相同 ⟹ RGBA 逐字节相同。
+fn decode_all(config: DecoderConfig, packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut decoder = Decoder::new(config).expect("failed to create decoder");
+    let mut out = Vec::with_capacity(packets.len());
+    for packet in packets {
+        decoder.decode(packet).expect("decode must succeed");
+        let mut frame_out = None;
+        while let Some(frame) = decoder.next_frame().expect("next_frame") {
+            let mut planes = Vec::new();
+            planes.extend_from_slice(frame.y_plane());
+            planes.extend_from_slice(frame.u_plane());
+            planes.extend_from_slice(frame.v_plane());
+            frame_out = Some(planes);
+        }
+        out.push(frame_out.expect("decoder produced no frame"));
+    }
+    out
+}
+
+/// 补丁 7 核心断言：**多线程 + row-mt 不改变解码结果**。
+///
+/// 同一段码流分别用「单线程 + 关 row-mt」（上游行为）与「多线程 + 开 row-mt」解，逐字节
+/// 比对解码平面必须完全相同。耗时在 CI 上不可比，这条锁的是「并行没有改变解码结果」，
+/// 比断言耗时可靠得多。
+#[test]
+fn multithreaded_row_mt_decode_is_bit_exact() {
+    let packets = encode_tiled_stream(6);
+
+    // 上游行为：threads = None（cfg = NULL）、row_mt = false。
+    let single = DecoderConfig::new(DecoderCodec::Vp9);
+    let single_out = decode_all(single, &packets);
+
+    // 补丁 7：多线程 + 行级并行。
+    let mut multi = DecoderConfig::new(DecoderCodec::Vp9);
+    multi.threads = NonZeroUsize::new(4);
+    multi.row_mt = true;
+    let multi_out = decode_all(multi, &packets);
+
+    assert_eq!(single_out.len(), packets.len(), "单线程侧应解出每一帧");
+    assert_eq!(multi_out.len(), packets.len(), "多线程侧应解出每一帧");
+    // 非退化：输出不应是空/全零（否则「相同」没有意义）。
+    assert!(!multi_out[0].is_empty(), "解码输出不应为空");
+    assert!(
+        multi_out.iter().any(|p| p.iter().any(|&b| b != 0)),
+        "解码输出不应全零"
+    );
+    assert_eq!(
+        single_out, multi_out,
+        "并行解码（threads + row-mt）必须与单线程逐字节一致"
+    );
+}
+
+/// 补丁 7 smoke：编码器接受 `tile_columns` + `row_mt`，且产出的码流可被解码。
+#[test]
+fn encoder_accepts_tile_columns_and_row_mt() {
+    let packets = encode_tiled_stream(2);
+    assert_eq!(packets.len(), 2);
+    assert!(!packets[0].is_empty(), "首帧（关键帧）不应为空");
+
+    let mut decoder = Decoder::new(DecoderConfig::new(DecoderCodec::Vp9)).expect("decoder");
+    decoder.decode(&packets[0]).expect("decode keyframe");
+    let frame = decoder
+        .next_frame()
+        .expect("next_frame must not error")
+        .expect("decoder produced no frame");
+    assert_eq!(frame.width(), PW);
+    assert_eq!(frame.height(), PH);
 }
