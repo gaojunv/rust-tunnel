@@ -117,12 +117,20 @@ fn is_safe_segment(segment: &str) -> bool {
 
 /// 从 CI 产物名解析 `(os, arch, format)`。
 ///
-/// 形如 `rust-tunnel-client-<os>-<arch>[.exe]` 或 `wiki-desktop-<os>-<arch>[-setup].<ext>`，
-/// 按已知扩展名与前缀剥离后，首段为 os、次段为 arch，其余丢弃。
-/// 不符合该形态时回退 `("unknown", <剩余部分>, format)`，保证列表不因命名变化而漏文件。
+/// 先按已知扩展名剥离后缀、再剥掉已知前缀（`rust-tunnel-client-` / `wiki-desktop-`），
+/// 然后在剩余部分里按 `-` 切段，走两条路径：
+///
+/// 1. **已知 OS 记号优先**：定位第一个等于 `linux` / `macos` / `windows` 的段，取其
+///    下一段作为 arch。产物名里 os 前可能夹着别的东西（如 macOS dmg 的
+///    `RustTunnel-<tag>-macos-aarch64.dmg`，`<tag>` 挡在 os 前面），位置法会认错，
+///    记号法不受前缀和夹层影响。
+/// 2. **位置回退兜底**：没有可用的 OS 记号（找不到，或记号后没有段）时，退回"前两段"
+///    解析——首段 os、次段 arch；连两段都凑不齐时返回 `("unknown", <剩余部分>, format)`。
+///    这条兜底保证列表不因命名变化而漏文件。
 fn platform_from_filename(name: &str) -> (String, String, Option<String>) {
     const KNOWN_EXTS: &[&str] = &["dmg", "msi", "exe", "deb", "AppImage", "rpm", "zip"];
     const KNOWN_PREFIXES: &[&str] = &["rust-tunnel-client-", "wiki-desktop-"];
+    const KNOWN_OS: &[&str] = &["linux", "macos", "windows"];
 
     let (stem, format) = match name.rsplit_once('.') {
         Some((prefix, suffix))
@@ -143,8 +151,19 @@ fn platform_from_filename(name: &str) -> (String, String, Option<String>) {
         }
     }
 
-    let mut parts = rest.split('-');
-    match (parts.next(), parts.next()) {
+    let segments: Vec<&str> = rest.split('-').collect();
+
+    // 路径 1：已知 OS 记号优先，取其下一段作为 arch
+    if let Some(index) = segments.iter().position(|seg| KNOWN_OS.contains(seg)) {
+        if let Some(&arch) = segments.get(index + 1) {
+            if !arch.is_empty() {
+                return (segments[index].to_string(), arch.to_string(), format);
+            }
+        }
+    }
+
+    // 路径 2：位置回退，首段 os、次段 arch
+    match (segments.first(), segments.get(1)) {
         (Some(os), Some(arch)) if !os.is_empty() && !arch.is_empty() => {
             (os.to_string(), arch.to_string(), format)
         }
@@ -604,6 +623,26 @@ mod tests {
         assert_eq!(
             platform_from_filename("wiki-desktop-windows-x86_64-setup.exe"),
             ("windows".into(), "x86_64".into(), Some("exe".into()))
+        );
+    }
+
+    #[test]
+    fn platform_parsed_by_known_os_marker() {
+        // macOS dmg 的 CI 产物名带 tag：os 记号前夹着 `RustTunnel-<tag>-`，
+        // 位置法会把 os 认成 `RustTunnel`、arch 认成 tag，记号法必须纠正
+        assert_eq!(
+            platform_from_filename("RustTunnel-v0.11.0-macos-aarch64.dmg"),
+            ("macos".into(), "aarch64".into(), Some("dmg".into()))
+        );
+        // OS 记号出现在剩余部分更靠后的位置同样命中
+        assert_eq!(
+            platform_from_filename("my-tool-v1.2.3-windows-x86_64.exe"),
+            ("windows".into(), "x86_64".into(), Some("exe".into()))
+        );
+        // OS 记号后没有段时退回位置法（首段 os、次段 arch），不退化成 unknown
+        assert_eq!(
+            platform_from_filename("some-tool-macos"),
+            ("some".into(), "tool".into(), None)
         );
     }
 
