@@ -46,8 +46,10 @@ enigo = "0.6.1"
 # 被控端剪贴板同步。arboard 各平台后端由 crate 内部 cfg 处理，无需再门控。
 arboard = "3"
 
-[build-dependencies]
-embed-resource = "3"
+# 无 [build-dependencies]：Windows 图标（`build.rs`）直接调 mingw 的 windres，
+# 不再走 embed-resource——它的后端按 **host** 选，MSVC host 交叉编 gnu target 时会产出
+# MSVC 格式的 .lib 而 mingw 的 ld 读不了。且它的 MSVC 分支对本 crate 本就是死代码：
+# GUI 编不出 MSVC 版本（shiguredo_libvpx 的预编译 libvpx 是 mingw 产物）。
 
 # keyring 3.x 没有 default feature——不显式选 store 会静默退化成进程内 mock
 # （Entry::new/set_password 全返回 Ok，但重启即丢）。按平台声明原生后端。

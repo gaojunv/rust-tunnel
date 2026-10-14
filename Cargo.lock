@@ -8268,7 +8268,6 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
- "embed-resource",
  "enigo",
  "image",
  "keyring",
