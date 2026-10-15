@@ -108,6 +108,9 @@ jobs:
           - os: windows-latest
             # shiguredo_libvpx 的预编译 libvpx 是 GNU/mingw-w64 产物（`Built by MSYS2
             # project`、符号 `___chkstk_ms`），MSVC 链不了，故本 leg 走 GNU 工具链。
+            # 而且它具体是 **msvcrt 味**的 mingw-w64 构建（依据：它引用 `__imp__setjmp`，
+            # 而 `_setjmp` 只存在于 msvcrt 的导入库）——链接器也必须用 msvcrt 味的，
+            # 见下面那条 "Use MSVCRT-flavored MinGW" step。
             # 只改 GUI：CLI 客户端（build-client）不依赖 rust-tunnel-remote，保持 msvc。
             target: x86_64-pc-windows-gnu
             binary: rust-tunnel-client-gui.exe
@@ -123,11 +126,42 @@ jobs:
         with:
           cache-targets: true
           cache-on-failure: true
-      # windows-latest 自带 MSYS2 但默认不在 PATH，GNU 工具链需要其中的 mingw 链接器。
-      - name: Add MinGW to PATH
+      # 本 leg 的 GNU 链接器必须是 **MSVCRT 味**的 mingw-w64，不能用镜像自带的 `C:\mingw64`。
+      #
+      # 镜像里的 `C:\mingw64` 是 niXman/mingw-builds 的 **UCRT** 构建（一手来源：runner-images
+      # 的 `images/windows/toolsets/toolset-2025.json` 写着 `"mingw": {"version": "15.*",
+      # "runtime": "ucrt"}`），而镜像用 `Add-MachinePathItem "C:\mingw64\bin"` 把它放上了
+      # PATH——**它本来就排在前面**，所以往 GITHUB_PATH 追加 `C:\msys64\mingw64\bin` 是空操作
+      # （原实现正是这么写的，白写了）。
+      #
+      # 为什么 UCRT 链不了：vendored 的预编译 libvpx 是 **msvcrt 味**的构建，它引用
+      # `__imp__setjmp`（mingw-w64 的 `setjmp.h` 把 `setjmp` 宏成 `_setjmp`，声明带 `_CRTIMP`）。
+      # 这个导入槽**只有 msvcrt 的导入库提供**：mingw-w64 的 `msvcrt.def.in` 里有
+      # `F_NON_ARM64(_setjmp)`，而 `ucrtbase-common.def.in` 里没有（UCRT 只导出 `setjmp` 与
+      # `__intrinsic_setjmp`）。于是 UCRT 链接器报 `undefined reference to '__imp__setjmp'`，
+      # 且**只**报这一个——libvpx 的其余导入（`__acrt_iob_func`、`_errno`、`longjmp`、
+      # `Sleep`/`QueryPerformanceCounter`）两边的导入库都有。
+      #
+      # MSYS2 的 `mingw64` 环境（包名 `mingw-w64-x86_64-*`）就是 msvcrt 味；UCRT 味是**另一个**
+      # 环境 `ucrt64`（`mingw-w64-ucrt-x86_64-*`）。镜像虽预装 MSYS2，但**不装任何 mingw 包**
+      # （toolset 里 `MsysPackages.mingw` 是空的），故这里先装上，再前置到 PATH 头部。
+      - name: Use MSVCRT-flavored MinGW (MSYS2 mingw64)
         if: matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
-        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run: |
+          & C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm --needed mingw-w64-x86_64-gcc"
+          if ($LASTEXITCODE -ne 0) { throw "pacman 装 mingw-w64-x86_64-gcc 失败（exit $LASTEXITCODE）" }
+          $dir = 'C:\msys64\mingw64\bin'
+          if (-not (Test-Path "$dir\x86_64-w64-mingw32-gcc.exe")) {
+            throw "MSYS2 的 mingw64 工具链没装上：$dir 下没有 x86_64-w64-mingw32-gcc.exe"
+          }
+          # 前置而非追加：镜像的 C:\mingw64\bin 已在 PATH 上且排在前，只有前置才赢得过它。
+          $lines = @($dir)
+          if (Test-Path $env:GITHUB_PATH) { $lines += @(Get-Content $env:GITHUB_PATH) }
+          [System.IO.File]::WriteAllLines($env:GITHUB_PATH, [string[]]$lines)
+          # 再显式钉住链接器：rustc 直接按绝对路径调它，不吃 PATH 先后的亏。
+          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$dir\x86_64-w64-mingw32-gcc.exe" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install Linux GUI deps
         if: runner.os == 'Linux'
         # 远程控制新增的构建依赖（xcap 0.9 / enigo 0.6，二者在 Linux 上无条件编译）：
