@@ -11,9 +11,15 @@
 //!
 //! 撮合分两条路：
 //!
-//! - **打洞**：A 发 `PunchHoleRequest`，服务器把 A 的地址推给 B（`PunchHole`）；B 回
-//!   `PunchHoleSent`，服务器把它转成 `PunchHoleResponse`（含 B 的公钥签名）推给 A。
-//!   两端同时向对方发包，从而在各自的 NAT 上打出通路。
+//! - **打洞**：A 发 `PunchHoleRequest`（`udp_port` 里自报它本地的 UDP 端口），服务器把 A 的
+//!   地址推给 B（`PunchHole`）；B 回 `PunchHoleSent`，服务器把它转成 `PunchHoleResponse`
+//!   （含 B 的公钥签名）推给 A。两端同时向对方发包，从而在各自的 NAT 上打出通路。
+//!
+//!   两处地址的取值是**刻意不同**的，不要「顺手统一」：`PunchHole.socket_addr` 必须是 A 的
+//!   **信令 TCP 源地址**（B 原样回填它，服务器靠它在 `sinks` 里找到 A 那条连接、把应答推回去），
+//!   而 `PunchHoleResponse.socket_addr` 必须是 B **已登记的 UDP 映射**——那才是能打出洞的地址，
+//!   信令 TCP 的源地址只是个没人监听的临时端口。hbbs 无从自行得知 A 的 UDP 端口（信令 TCP
+//!   源端口 ≠ UDP 登记端口），所以由 A 在 `PunchHoleRequest.udp_port` 里自报、服务器原样透传。
 //! - **中继**：打洞不可用时改走 [`crate::relay`]（hbbr）。A 发 `RequestRelay` 请服务器
 //!   转给 B，B 用 `RelayResponse` 应答，服务器再转回 A 并附上 B 的公钥。
 //!
@@ -53,6 +59,11 @@
 //!   推送。本实现保留到连接结束，因此一条连接可以接受多次推送。
 //! - **不实现回环文本控制台**（`blacklist-add` / `limit-speed` 等）与软件更新提示：
 //!   前者与本项目 Web 管理面重复，后者本项目有自己的分发链路。
+//! - **NAT 探测端口多一个 UDP 半边，且主 UDP 端口也应答 `TestNatRequest`**：上游只在
+//!   NAT 探测端口的 **TCP** 半边应答。客户端要自判「是否在对称 NAT 后面」，唯一的办法是从
+//!   同一个套接字向**两个不同目的端口**各探一次、比对观测到的源端口——对称 NAT 对每个
+//!   `(源IP, 源端口, 目的)` 三元组独立映射，单一目的地看不出差别。两个端口都应答是小常数
+//!   （刻意不带 `cu`），放大系数 < 1，反反射性质不因此受损。
 
 use crate::addr::{self, try_into_v4};
 use crate::frame::{FrameCodec, FrameError};
@@ -274,6 +285,18 @@ pub struct RendezvousServer {
     relay_rotation: AtomicUsize,
 }
 
+/// NAT 探测在 **UDP** 上的应答：只回报服务端看到的源端口，**刻意不带配置更新**。
+///
+/// `cu` 会随汇合服务器列表变长，留着它「应答是小常数、放大系数 < 1」这条反反射属性就只是
+/// 「当前 `serial` 恰好为 0」的巧合，而不是结构不变量——`serial` 一旦被配上非 0 值就会悄悄
+/// 失效。TCP 半边（`serve_nat_test_connection`）照旧下发 `cu`，与上游客户端行为一致。
+fn nat_probe_response(remote: SocketAddr) -> RendezvousMessage {
+    RendezvousMessage::with(rendezvous_message::Union::TestNatResponse(TestNatResponse {
+        port: i32::from(remote.port()),
+        ..Default::default()
+    }))
+}
+
 impl RendezvousServer {
     /// 构造汇合服务器。
     #[must_use]
@@ -389,6 +412,61 @@ impl RendezvousServer {
         }
         tasks.shutdown().await;
         info!("rustdesk NAT 探测端口已停止");
+        Ok(())
+    }
+
+    /// NAT 探测端口的 UDP 半边：**只**应答 `TestNatRequest`。
+    ///
+    /// 为什么与主端口的 `handle_datagram` 分开：那边会受理 `RegisterPeer`/`RegisterPk`
+    /// 并把来源地址写进登记表。若 NAT 端口也受理它们，「面向 NAT 端口的映射」就会被
+    /// 当成打洞用的映射写进 `peers`，污染对端拿到地址的语义。故这里只认 `TestNatRequest`，
+    /// 其余一律静默丢弃——**不回复**，因此不会被当成反射/放大工具。
+    async fn handle_nat_datagram(&self, udp: &UdpSocket, payload: &[u8], remote: SocketAddr) {
+        let remote = try_into_v4(remote);
+        let Ok(msg) = RendezvousMessage::decode(payload) else {
+            debug!(%remote, "NAT 探测 UDP 数据报不是合法 protobuf，丢弃");
+            return;
+        };
+        if matches!(msg.union, Some(rendezvous_message::Union::TestNatRequest(_))) {
+            self.send_datagram(udp, &nat_probe_response(remote), remote)
+                .await;
+        } else {
+            debug!(%remote, "NAT 探测端口只应答 TestNatRequest，其余静默丢弃");
+        }
+    }
+
+    /// NAT 探测端口的 UDP 监听循环（与 `serve_nat_test` 的 TCP 半边同端口号）。
+    ///
+    /// 客户端从**登记用的那个 UDP 套接字**向本端口发 `TestNatRequest`，据此比对两次
+    /// 观测到的源端口以判断是否在对称 NAT 后面。
+    ///
+    /// # Errors
+    /// `recv_from` 失败时返回该错误；`shutdown` 是正常返回路径。
+    pub async fn serve_nat_udp(
+        self: Arc<Self>,
+        udp: Arc<UdpSocket>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        info!(addr = %udp.local_addr()?, "rustdesk NAT 探测端口（UDP）已启动");
+        // 处理是内存操作 + 一次 UDP 回包，就地做完即可，不必为每个数据报起任务
+        // （起任务反而会让洪水流量把任务表撑大）——与 `serve_rendezvous` 的 UDP 分支同理。
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        loop {
+            tokio::select! {
+                received = udp.recv_from(&mut buf) => {
+                    let (len, remote) = received?;
+                    if let Some(payload) = buf.get(..len) {
+                        self.handle_nat_datagram(&udp, payload, remote).await;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("rustdesk NAT 探测端口（UDP）已停止");
         Ok(())
     }
 
@@ -521,6 +599,17 @@ impl RendezvousServer {
                 )
                 .await;
             }
+            // NAT 探测**也走主端口**：客户端要判「是否在对称 NAT 后面」，唯一的办法是从同一个
+            // 套接字向**两个不同目的端口**各探一次、比对观测到的源端口——只探 NAT 探测端口是
+            // 判不出来的（对称 NAT 对每个 `(源IP, 源端口, 目的)` 三元组独立映射，单一目的地
+            // 看不出差别）。所以两个 UDP 端口都得应答。
+            //
+            // 反反射仍然成立：应答是小常数（见 `nat_probe_response`，刻意不带 `cu`），
+            // 放大系数 < 1；且**不写登记表**，否则「面向主端口的映射」之外还会多出噪声。
+            Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                self.send_datagram(udp, &nat_probe_response(remote), remote)
+                    .await;
+            }
             // 有意不支持：这三类若走 UDP，源地址可以伪造，服务器会变成反射/放大工具。
             Some(
                 rendezvous_message::Union::PunchHoleRequest(_)
@@ -640,10 +729,17 @@ impl RendezvousServer {
             }))
         } else {
             debug!(%remote, id = %ph.id, %peer_addr, "打洞请求");
+            // `udp_port` 是请求方**自报**的本地 UDP 端口，透传给目标端后由它组成打洞地址
+            // `(socket_addr 的 IP, udp_port)`。`0` 表示老客户端没报（此时目标端拿不到端口，
+            // 只能退回今天的行为：打洞不可用、走中继）。
+            //
+            // `socket_addr` 一个字都不能动：`forward_punch_result` 靠目标端回显的它去
+            // `sinks` 表里找请求方那条信令 TCP 连接（按信令源地址索引），改了应答就找不到路由。
             RendezvousMessage::with(rendezvous_message::Union::PunchHole(PunchHole {
                 socket_addr,
                 nat_type: ph.nat_type,
                 relay_server,
+                udp_port: ph.udp_port,
                 ..Default::default()
             }))
         };
@@ -676,8 +772,19 @@ impl RendezvousServer {
             debug!(%remote, "PunchHoleSent 里的地址无法解出，忽略");
             return;
         };
+        // 打洞目标要用目标端**已登记的 UDP 映射**，而不是它这条信令 TCP 连接的源地址——
+        // 后者是个没人监听的临时端口，跨 NAT 下「拿到地址就直连」必然失败。
+        //
+        // `phs.id` 是发送方（被控端）自己的 ID（`sign_pk` 已经在用它签自己的 IdPk），
+        // 所以用它查登记表拿到的正是它自己那条 UDP 映射。
+        //
+        // 未登记 UDP 映射时（老客户端 / 尚未走完 RegisterPk）逐字节退回旧行为：用信令源地址。
+        let punch_addr = match self.peers.lookup(&phs.id).await {
+            Some(peer) if peer.socket_addr.port() != 0 => peer.socket_addr,
+            _ => remote,
+        };
         let mut response = PunchHoleResponse {
-            socket_addr: addr::encode(remote),
+            socket_addr: addr::encode(punch_addr),
             pk: self.sign_pk(&phs.version, &phs.id).await,
             relay_server: phs.relay_server,
             ..Default::default()
@@ -915,8 +1022,10 @@ mod tests {
         tcp: SocketAddr,
         /// 主端口的 UDP 地址（心跳与推送）。
         udp: SocketAddr,
-        /// NAT 探测端口。
+        /// NAT 探测端口（TCP）。
         nat: SocketAddr,
+        /// NAT 探测端口（UDP 半边，与 TCP 半边同端口号）。
+        nat_udp: SocketAddr,
         /// 服务端密钥，用于校验签名。
         key: Arc<ServerKey>,
         peers: Arc<PeerRegistry>,
@@ -958,6 +1067,12 @@ mod tests {
         let tcp = tcp_listener.local_addr().expect("应能取地址");
         let nat_listener = TcpListener::bind("127.0.0.1:0").await.expect("应能绑定");
         let nat = nat_listener.local_addr().expect("应能取地址");
+        // NAT 探测的 UDP 半边单独取一个临时端口，而**不**复用 TCP 半边的端口号：
+        // macOS 的 TCP/UDP 临时端口池是共用的，`TcpListener::bind(0)` 拿到的端口随时可能
+        // 已被并行用例的某个 UDP 套接字占用，复用就会 AddrInUse 抖动。真实部署里两个半边
+        // 同端口号，但那由服务端 `bind_listeners` 保证，与这里的测试夹具无关。
+        let nat_udp_socket = UdpSocket::bind("127.0.0.1:0").await.expect("应能绑定");
+        let nat_udp = nat_udp_socket.local_addr().expect("应能取地址");
         let udp_socket = UdpSocket::bind(udp_bind).await.expect("应能绑定");
         let udp = udp_socket.local_addr().expect("应能取地址");
 
@@ -968,12 +1083,14 @@ mod tests {
                 Arc::new(udp_socket),
                 rx.clone(),
             )),
-            tokio::spawn(Arc::clone(&server).serve_nat_test(nat_listener, rx)),
+            tokio::spawn(Arc::clone(&server).serve_nat_test(nat_listener, rx.clone())),
+            tokio::spawn(Arc::clone(&server).serve_nat_udp(Arc::new(nat_udp_socket), rx)),
         ];
         TestServer {
             tcp,
             udp,
             nat,
+            nat_udp,
             key,
             peers,
             server,
@@ -1449,6 +1566,9 @@ mod tests {
         // UDP 侧在 [::1]、TCP 侧在 127.0.0.1，两端 IP 不同，走打洞分支。
         let server = start_split_signing_server().await;
         let target = client_udp_on("[::1]").await;
+        // 目标端登记时的 UDP 源地址——(b) 之后 `PunchHoleResponse.socket_addr` 就该是它
+        // （打洞目标），而不再是目标端信令 TCP 的源地址。
+        let target_udp = target.local_addr().expect("应能取本地地址");
         let target_pk = b"target-public-key".to_vec();
         register_online(&target, &server, "peer-b-id", &target_pk).await;
 
@@ -1463,7 +1583,6 @@ mod tests {
 
         // 目标端用同一条地址回 PunchHoleSent（真实客户端也是这样回填的）。
         let mut responder = Signaler::connect(&server).await;
-        let responder_addr = responder.local_addr();
         responder
             .send(&RendezvousMessage::with(
                 rendezvous_message::Union::PunchHoleSent(PunchHoleSent {
@@ -1485,10 +1604,12 @@ mod tests {
             panic!("请求方应收到 PunchHoleResponse");
         };
         assert_eq!(response.failure, 0, "不应带失败原因");
+        // 这里刻意不比对 responder（信令 TCP）的源地址：那是没人监听的临时端口，
+        // 跨 NAT 下拿它当打洞目标必然失败。填进去的应是目标端已登记的 UDP 映射。
         assert_eq!(
             addr::decode(&response.socket_addr),
-            Some(responder_addr),
-            "应答里的地址应是目标端信令连接的源地址"
+            Some(target_udp),
+            "应答里的地址应是目标端已登记的 UDP 映射"
         );
         assert_eq!(response.relay_server, "relay.example:21117");
         assert_eq!(
@@ -1501,6 +1622,200 @@ mod tests {
             .key
             .verify_id_pk("peer-b-id", &target_pk, &response.pk)
             .expect("公钥签名应能用服务端公钥验证");
+    }
+
+    /// 请求方自报的 `udp_port` 必须原样透传进推给目标端的 `PunchHole.udp_port`；
+    /// 同时 `socket_addr` **仍须**是请求方的信令 TCP 源地址——目标端会原样回填它，
+    /// 服务端靠它去 `sinks` 表里找请求方那条连接。把 UDP 映射塞进 `socket_addr`
+    /// 就等于打断应答路由，这条测试锁死这一点。
+    #[tokio::test]
+    async fn punch_hole_request_carries_the_requesters_udp_port_to_the_target() {
+        let server = start_split_plain_server().await;
+        let target = client_udp_on("[::1]").await;
+        register_online(&target, &server, "peer-b-id", b"pk-b").await;
+
+        let mut requester = Signaler::connect(&server).await;
+        let requester_addr = requester.local_addr();
+        requester
+            .send(&RendezvousMessage::with(
+                rendezvous_message::Union::PunchHoleRequest(PunchHoleRequest {
+                    id: "peer-b-id".to_owned(),
+                    version: "1.2.2".to_owned(),
+                    udp_port: 54321,
+                    ..Default::default()
+                }),
+            ))
+            .await;
+
+        match recv_udp(&target).await.union {
+            Some(rendezvous_message::Union::PunchHole(ph)) => {
+                assert_eq!(ph.udp_port, 54321, "请求方自报的 UDP 端口应透传给目标端");
+                assert_eq!(
+                    addr::decode(&ph.socket_addr),
+                    Some(requester_addr),
+                    "socket_addr 仍须是请求方的信令 TCP 源地址（应答路由靠它）"
+                );
+            }
+            other => panic!("期望 PunchHole，实得 {other:?}"),
+        }
+    }
+
+    /// (b) 的兜底：目标端**未登记** UDP 映射（老客户端 / 尚未走完 RegisterPk）时，
+    /// `PunchHoleResponse.socket_addr` 逐字节退回旧行为——用它的信令 TCP 源地址。
+    #[tokio::test]
+    async fn punch_hole_response_falls_back_to_the_signaling_source_without_a_registered_mapping() {
+        let server = start_split_plain_server().await;
+        let mut requester = Signaler::connect(&server).await;
+        let requester_addr = requester.local_addr();
+
+        // 一个**未登记**的 ID 回 PunchHoleSent：登记表里查不到它 → 走兜底分支。
+        let mut responder = Signaler::connect(&server).await;
+        let responder_addr = responder.local_addr();
+        responder
+            .send(&RendezvousMessage::with(
+                rendezvous_message::Union::PunchHoleSent(PunchHoleSent {
+                    socket_addr: addr::encode(requester_addr),
+                    id: "unregistered-id".to_owned(),
+                    version: "1.2.2".to_owned(),
+                    ..Default::default()
+                }),
+            ))
+            .await;
+        responder.expect_closed().await;
+
+        let Some(rendezvous_message::Union::PunchHoleResponse(response)) =
+            requester.recv().await.and_then(|m| m.union)
+        else {
+            panic!("请求方应收到 PunchHoleResponse");
+        };
+        assert_eq!(
+            addr::decode(&response.socket_addr),
+            Some(responder_addr),
+            "未登记 UDP 映射时应退回信令源地址（旧行为）"
+        );
+    }
+
+    /// NAT 探测必须**两个 UDP 端口都应答**：客户端要判「是否在对称 NAT 后面」，唯一的办法是
+    /// 从同一个套接字向两个不同目的端口各探一次、比对观测到的源端口——只探 NAT 探测端口判不
+    /// 出来。这条锁的是打洞预判成立的前提，漏了它预判会永远得到 `Unknown`（fail-open 照打，
+    /// 对称 NAT 下白等 3 秒）。
+    ///
+    /// 刻意用**会下发配置更新**的 config：锁住「应答不带 `cu`」在**主端口**上也是结构性的。
+    #[tokio::test]
+    async fn nat_probe_is_answered_on_the_main_udp_port_too() {
+        let key = Arc::new(ServerKey::parse("").expect("空 key 应可解析"));
+        let config = RendezvousConfig {
+            serial: 1,
+            rendezvous_servers: vec!["hbbs.example:21116".to_owned()],
+            ..RendezvousConfig::default()
+        };
+        let server = start_server(config, key).await;
+        let sock = client_udp().await;
+        let local_port = sock.local_addr().expect("应能取本地地址").port();
+        send_udp(
+            &sock,
+            &RendezvousMessage::with(rendezvous_message::Union::TestNatRequest(
+                TestNatRequest { serial: 0 },
+            )),
+            server.udp,
+        )
+        .await;
+
+        match recv_udp(&sock).await.union {
+            Some(rendezvous_message::Union::TestNatResponse(res)) => {
+                assert_eq!(res.port, i32::from(local_port), "应回报观察到的源端口");
+                assert!(res.cu.is_none(), "NAT 探测应答不得携带配置更新");
+            }
+            other => panic!("期望 TestNatResponse，实得 {other:?}"),
+        }
+        // 探测不是注册：不得往登记表里写任何东西。
+        assert!(
+            server.peers.is_empty().await,
+            "NAT 探测不得写登记表（否则会污染打洞地址语义）"
+        );
+    }
+
+    /// NAT 探测端口的 UDP 半边必须应答 `TestNatRequest`，回报观察到的源端口。
+    #[tokio::test]
+    async fn nat_udp_port_answers_test_nat_request() {
+        let server = start_plain_server().await;
+        let sock = client_udp().await;
+        let local_port = sock.local_addr().expect("应能取本地地址").port();
+        send_udp(
+            &sock,
+            &RendezvousMessage::with(rendezvous_message::Union::TestNatRequest(
+                TestNatRequest { serial: 7 },
+            )),
+            server.nat_udp,
+        )
+        .await;
+
+        match recv_udp(&sock).await.union {
+            Some(rendezvous_message::Union::TestNatResponse(res)) => {
+                assert_eq!(res.port, i32::from(local_port), "应回报观察到的源端口");
+            }
+            other => panic!("期望 TestNatResponse，实得 {other:?}"),
+        }
+    }
+
+    /// NAT 探测端口**只**认 `TestNatRequest`：其余一律静默丢弃（反反射/放大），
+    /// 且不得把来源地址写进登记表（否则「面向 NAT 端口的映射」会污染打洞地址语义）。
+    #[tokio::test]
+    async fn nat_udp_port_ignores_other_messages() {
+        let server = start_plain_server().await;
+        let sock = client_udp().await;
+        send_udp(&sock, &register_peer_msg("nat-probe-id", 0), server.nat_udp).await;
+
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(Duration::from_millis(300), sock.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "NAT 探测 UDP 端口不应对非 TestNatRequest 的消息回应答"
+        );
+        assert!(
+            server.peers.lookup("nat-probe-id").await.is_none(),
+            "NAT 探测端口不得把来源写进登记表"
+        );
+    }
+
+    /// 放大系数锁：应答是小常数，不随请求大小增长（一个 1400 字节的数据报也只能换回
+    /// 几个字节）。
+    ///
+    /// 这里刻意用一个**会下发配置更新**的 config（`serial = 1` 且汇合服务器列表非空）：
+    /// 否则这条测试只证明「默认 config 恰好不带 `cu`」，而不是「NAT 探测应答结构上就是小常数」。
+    /// TCP 半边仍照旧下发 `cu`，只有 UDP 半边刻意丢掉它。
+    #[tokio::test]
+    async fn nat_udp_response_is_a_small_constant() {
+        let key = Arc::new(ServerKey::parse("").expect("空 key 应可解析"));
+        let config = RendezvousConfig {
+            serial: 1,
+            rendezvous_servers: vec!["hbbs.example:21116".to_owned()],
+            ..RendezvousConfig::default()
+        };
+        let server = start_server(config, key).await;
+        let sock = client_udp().await;
+        send_udp(
+            &sock,
+            &RendezvousMessage::with(rendezvous_message::Union::TestNatRequest(
+                TestNatRequest { serial: 0 },
+            )),
+            server.nat_udp,
+        )
+        .await;
+        let resp = recv_udp(&sock).await;
+        match &resp.union {
+            Some(rendezvous_message::Union::TestNatResponse(res)) => assert!(
+                res.cu.is_none(),
+                "NAT 探测的 UDP 应答不得携带配置更新（否则大小随服务器列表增长）"
+            ),
+            other => panic!("期望 TestNatResponse，实得 {other:?}"),
+        }
+        assert!(
+            resp.encode_to_vec().len() <= 16,
+            "NAT 探测应答必须是小的常数，实得 {} 字节",
+            resp.encode_to_vec().len()
+        );
     }
 
     #[tokio::test]

@@ -79,8 +79,10 @@ fn seed() -> u64 {
 /// 步骤：
 /// 1. 在 `20000..32000` 取候选 —— 该区间低于 macOS（49152）与 Linux（32768）的临时
 ///    端口下界，避开其他 e2e 用例由 `bind(0)` 拿到的临时端口；
-/// 2. **同时**绑定四个探测套接字（TCP `P`、UDP `P`、TCP `P-1`、TCP `Q`）确认全空闲，
-///    再一起释放，把「探测→真正 bind」的 TOCTOU 窗口压到最小；
+/// 2. **同时**绑定五个探测套接字（TCP `P`、UDP `P`、TCP `P-1`、UDP `P-1`、TCP `Q`）
+///    确认全空闲，再一起释放，把「探测→真正 bind」的 TOCTOU 窗口压到最小。
+///    NAT 探测端口现在 TCP 与 UDP 两个半边都要绑，少探一个就等于放弃「全空闲」的保证，
+///    真实 bind 会偶发失败；
 /// 3. 进程内全局集合记录已发放端口，保证同二进制内并发用例不重号。
 ///
 /// 服务端绑定的是 `0.0.0.0:<port>`，故探测也用 `0.0.0.0` 对齐。
@@ -104,11 +106,12 @@ fn alloc_rustdesk_ports() -> RustdeskPorts {
             StdTcpListener::bind(("0.0.0.0", rendezvous)),
             StdUdpSocket::bind(("0.0.0.0", rendezvous)),
             StdTcpListener::bind(("0.0.0.0", nat)),
+            StdUdpSocket::bind(("0.0.0.0", nat)),
             StdTcpListener::bind(("0.0.0.0", relay)),
         );
-        // 四个探测同时持有；任一失败即放弃这组候选。
-        if let (Ok(t_rp), Ok(u_rp), Ok(t_nat), Ok(t_relay)) = probes {
-            drop((t_rp, u_rp, t_nat, t_relay));
+        // 五个探测同时持有；任一失败即放弃这组候选。
+        if let (Ok(t_rp), Ok(u_rp), Ok(t_nat), Ok(u_nat), Ok(t_relay)) = probes {
+            drop((t_rp, u_rp, t_nat, u_nat, t_relay));
             used.insert(rendezvous);
             used.insert(nat);
             used.insert(relay);
@@ -639,6 +642,15 @@ async fn disabling_closes_all_three_ports() {
     })
     .await
     .expect("停用后端口应在超时内全部拒连");
+
+    // NAT 探测的 **UDP 半边**是新增的第 4 个监听套接字，TCP 侧拒连证明不了它已释放。
+    // 泄漏的后果很具体：下一次启用同端口会在 `bind_listeners` 里 EADDRINUSE——正是本文件
+    // 「改端口重启不撞旧端口」那条保证要防的事。所以这里真去绑一次，不能只看 TCP。
+    wait_until("停用后 NAT 探测的 UDP 半边可重新绑定", || async move {
+        StdUdpSocket::bind(("0.0.0.0", nat)).map(|_| ()).ok()
+    })
+    .await
+    .expect("停用后 NAT 探测 UDP 端口应可重新绑定");
 
     let (_, raw) = get_raw(&harness.api_base).await;
     let v = parse_json(&raw);

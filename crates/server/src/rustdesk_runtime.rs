@@ -68,7 +68,7 @@ fn relay_servers_from(relay_server: &str) -> Vec<String> {
     }
 }
 
-/// 四个监听套接字。
+/// 五个监听套接字。
 struct Listeners {
     /// hbbs 信令 TCP（与心跳共用端口号）。
     signaling_tcp: TcpListener,
@@ -76,6 +76,8 @@ struct Listeners {
     heartbeat_udp: UdpSocket,
     /// NAT 探测 TCP。
     nat_tcp: TcpListener,
+    /// NAT 探测 UDP（与 TCP 半边同端口号；客户端靠它比对两次观测到的源端口判 NAT 类型）。
+    nat_udp: UdpSocket,
     /// hbbr 中继 TCP。
     relay_tcp: TcpListener,
 }
@@ -92,7 +94,7 @@ fn effective_bind_addr(raw: &str) -> &str {
     }
 }
 
-/// 应用一份 RustDesk 配置：停旧 → 解析密钥/掩码 → 绑定四个监听 → 启动四个任务。
+/// 应用一份 RustDesk 配置：停旧 → 解析密钥/掩码 → 绑定五个监听 → 启动五个任务。
 ///
 /// 停旧采用「触发 abort 并逐个 await 任务句柄」的有界等待策略：句柄返回即证明旧
 /// 监听套接字已 drop、旧统计轮询任务已跑完收尾，因此改端口重启不存在「旧端口尚未
@@ -105,9 +107,10 @@ pub async fn apply_rustdesk_config(
     state: &ServerState,
     cfg: &RustdeskDynamicConfig,
 ) -> Result<(), String> {
-    // 1. 停掉现有实例：触发 abort 后有界 await 四个任务句柄（会合 TCP/UDP、NAT 探测、
-    //    中继、统计轮询）。句柄返回即代表旧 `TcpListener`/`UdpSocket` 已 drop，且旧
-    //    poller 已跑完幻影连接数释放——这正是「改端口重启不撞旧端口」的确定性保证。
+    // 1. 停掉现有实例：触发 abort 后有界 await 五个任务句柄（会合 TCP/UDP、NAT 探测
+    //    TCP、NAT 探测 UDP、中继、统计轮询）。句柄返回即代表旧 `TcpListener`/`UdpSocket`
+    //    已 drop，且旧 poller 已跑完幻影连接数释放——这正是「改端口重启不撞旧端口」的
+    //    确定性保证。
     stop_existing(state).await;
 
     if !cfg.enabled {
@@ -149,7 +152,7 @@ pub async fn apply_rustdesk_config(
         Err(e) => return record_error(state, e).await,
     };
 
-    // 5. 编译服务实例一次，四个任务共享同一批 Arc（统计与登记表口径一致）
+    // 5. 编译服务实例一次，五个任务共享同一批 Arc（统计与登记表口径一致）
     let key = Arc::new(key);
     let peers = Arc::new(PeerRegistry::new());
     let rendezvous_cfg = RendezvousConfig {
@@ -168,7 +171,7 @@ pub async fn apply_rustdesk_config(
 
     // 6. 统一 abort channel：句柄存 state 供后续 apply/停用，每个任务取一份订阅。
     //
-    //    先取出会合侧统计句柄：`spawn_nat_test` 会按值消费 rendezvous Arc，
+    //    先取出会合侧统计句柄：`spawn_nat_udp` 会按值消费 rendezvous Arc，
     //    而统计轮询任务持续读会合/中继两侧的累计计数（⑦/⑧ 的消费口径）。
     let rendezvous_stats = rendezvous.stats();
     let relay_stats = relay.stats();
@@ -180,7 +183,8 @@ pub async fn apply_rustdesk_config(
         listeners.heartbeat_udp,
         &abort_tx,
     );
-    let nat_test_task = spawn_nat_test(rendezvous, listeners.nat_tcp, &abort_tx);
+    let nat_test_task = spawn_nat_test(rendezvous.clone(), listeners.nat_tcp, &abort_tx);
+    let nat_udp_task = spawn_nat_udp(rendezvous, listeners.nat_udp, &abort_tx);
     let relay_task = spawn_relay(relay.clone(), listeners.relay_tcp, &abort_tx);
     let stats_task = spawn_stats_poller(
         state.clone(),
@@ -190,10 +194,10 @@ pub async fn apply_rustdesk_config(
         cfg.relay_port,
         &abort_tx,
     );
-    // 四个句柄登记到 state：下一次 stop_existing 会逐个有界 await，保证旧监听已释放、
+    // 五个句柄登记到 state：下一次 stop_existing 会逐个有界 await，保证旧监听已释放、
     // 旧 poller 收尾已完成，新一代码才能写状态（幻影连接数不会泄漏）。
     *state.proxy_ports.rustdesk_tasks.write().await =
-        vec![rendezvous_task, nat_test_task, relay_task, stats_task];
+        vec![rendezvous_task, nat_test_task, nat_udp_task, relay_task, stats_task];
 
     // 7. 写入运行状态（含三项瞬时计数与两项累计计数；之后由统计轮询任务持续刷新）
     let relay_snapshot = relay_stats.snapshot();
@@ -217,7 +221,7 @@ pub async fn apply_rustdesk_config(
         };
     }
     info!(
-        "RustDesk 已启动：hbbs 会合 {}/udp、NAT 探测 {}、hbbr 中继 {}",
+        "RustDesk 已启动：hbbs 会合 {}/udp、NAT 探测 {}（TCP+UDP）、hbbr 中继 {}",
         cfg.rendezvous_port,
         nat_test_port(cfg.rendezvous_port),
         cfg.relay_port
@@ -225,7 +229,7 @@ pub async fn apply_rustdesk_config(
     Ok(())
 }
 
-/// 停止现有实例：触发 abort，然后有界 await 四个任务句柄（未运行时为 no-op）。
+/// 停止现有实例：触发 abort，然后有界 await 五个任务句柄（未运行时为 no-op）。
 ///
 /// 锁纪律（防死锁）：先在锁内把 abort 句柄与任务句柄 `take` 出来，**释放锁之后**再
 /// `send(true)` 并 await 任务——绝不能在持有异步锁时等待任务，否则任务收尾回写
@@ -272,7 +276,7 @@ async fn record_error(state: &ServerState, msg: String) -> Result<(), String> {
     Err(msg)
 }
 
-/// 绑定四个监听；任一失败返回中文错误串（含端口与 OS 错误）。
+/// 绑定五个监听；任一失败返回中文错误串（含端口与 OS 错误）。
 ///
 /// `bind_addr` 为已归一化的生效地址（见 [`effective_bind_addr`]），由启动路径从
 /// `state.proxy_ports.rustdesk_bind_addr` 注入，支持纯 IPv6 主机指定具体网卡地址。
@@ -286,11 +290,17 @@ async fn bind_listeners(cfg: &RustdeskDynamicConfig, bind_addr: &str) -> Result<
         .await
         .map_err(|e| bind_err("会合(hbbs) UDP", rendezvous_port, &e))?;
     let nat_tcp = bind_tcp("NAT 探测", bind_addr, nat_port).await?;
+    // NAT 探测端口必须有 UDP 半边：客户端从登记用的那个 UDP 套接字发 TestNatRequest，
+    // 靠两次观测到的源端口是否一致来判定自己是否在对称 NAT 后面。
+    let nat_udp = UdpSocket::bind((bind_addr, nat_port))
+        .await
+        .map_err(|e| bind_err("NAT 探测", nat_port, &e))?;
     let relay_tcp = bind_tcp("中继(hbbr)", bind_addr, relay_port).await?;
     Ok(Listeners {
         signaling_tcp,
         heartbeat_udp,
         nat_tcp,
+        nat_udp,
         relay_tcp,
     })
 }
@@ -325,7 +335,7 @@ fn spawn_rendezvous(
     })
 }
 
-/// 启动 NAT 探测端口任务（主端口 - 1）。
+/// 启动 NAT 探测端口任务（主端口 - 1）的 TCP 半边。
 fn spawn_nat_test(
     server: Arc<RendezvousServer>,
     tcp: TcpListener,
@@ -335,6 +345,21 @@ fn spawn_nat_test(
     tokio::spawn(async move {
         if let Err(e) = server.serve_nat_test(tcp, abort).await {
             tracing::error!("RustDesk NAT 探测监听错误: {}", e);
+        }
+    })
+}
+
+/// 启动 NAT 探测端口任务（主端口 - 1）的 UDP 半边（与 TCP 半边同端口号）。
+fn spawn_nat_udp(
+    server: Arc<RendezvousServer>,
+    udp: UdpSocket,
+    abort_tx: &watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let udp = Arc::new(udp);
+    let abort = abort_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(e) = server.serve_nat_udp(udp, abort).await {
+            tracing::error!("RustDesk NAT 探测（UDP）监听错误: {}", e);
         }
     })
 }
@@ -663,8 +688,8 @@ mod tests {
             assert_eq!(rt.rejected_total, 0);
         }
 
-        // 收停：四个任务句柄已登记，停用后被 drain 并 await 干净
-        assert_eq!(state.proxy_ports.rustdesk_tasks.read().await.len(), 4);
+        // 收停：五个任务句柄已登记，停用后被 drain 并 await 干净
+        assert_eq!(state.proxy_ports.rustdesk_tasks.read().await.len(), 5);
         let disabled = RustdeskDynamicConfig {
             enabled: false,
             ..ephemeral_cfg()
