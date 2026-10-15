@@ -22,7 +22,8 @@
 //!   的 9 个远程变体。本 crate 的 [`manager::RemoteManager`] 实现
 //!   [`rust_tunnel_common::remote_bridge::RemoteBridge`]，由 `crates/client` 的读循环驱动。
 //! - 数据面：会话帧协议跑在一条**双向字节流**上，由 [`transport::TransportEstablisher`]
-//!   建立。以 **hbbr 中继为主路径**，同内网直连为优化；跨 NAT 打洞不做。
+//!   建立。建立策略是**三条路径**：**跨 NAT UDP 打洞**（优先，走 [`reliable`] 可靠层）→
+//!   **同内网 TCP 直连**（优化）→ **hbbr 中继兜底**（所有 NAT 场景可用）。
 //! - 接入确认：被控端默认 [`approval::ApprovalPolicy::Confirm`]——收到 `RemoteSessionIncoming`
 //!   后先弹窗等本机用户拍板，**批准了才登记 token 并回 `accepted:true`**（未批准前不登记、
 //!   不回包、不派生采集任务）。因此控制器把数据面建立**推迟到看见 `accepted:true` 之后**，

@@ -12,8 +12,21 @@
 //!   补给对端——因此把 `RequestRelay` 与会话 `Hello` 写在**同一次 write** 可以省一个 RTT。
 //! - 同内网直连：控制器发 `PunchHoleRequest` → 服务端推 `FetchLocalAddr` 给被控端 →
 //!   被控端回 `LocalAddr`（带自己的内网地址）→ 服务端回 `PunchHoleResponse{is_local}` 给
-//!   控制器 → 控制器直连该地址。跨 NAT 的 `PunchHoleResponse.socket_addr` 是**目标端信令
-//!   TCP 的源地址**（临时端口，目标端并未在那里监听），因此阶段 1 不据此打洞，只回退中继。
+//!   控制器 → 控制器直连该地址。
+//! - 跨 NAT 打洞：控制器发 `PunchHoleRequest`（`udp_port` 填**公网观测端口**，见下）→ 服务端把
+//!   请求方地址推给被控端（`PunchHole`，含请求方 `socket_addr` 与 `udp_port`）→ 被控端回
+//!   `PunchHoleSent`（`socket_addr` **原样回显**请求方地址）**并反向打洞** → 服务端把目标端
+//!   **已登记的 UDP 映射**转成 `PunchHoleResponse` 回给控制器那条信令连接 → 两端对打 UDP。
+//!   路径由 `PunchHoleResponse.socket_addr` 是「内网 TCP 地址」还是「UDP 映射」经 oneof
+//!   (`IsLocal(true)`) 区分。
+//!
+//! # 为什么 UDP 打洞**不需要**端口复用
+//!
+//! TCP 同时打开才要求两端在同一端口上收发（故需 SO_REUSEADDR/端口复用）；UDP 不需要——
+//! 从**已注册的那个 UDP 套接字**向对端发一个数据报，就为「本端 → 对端」建立了一条 NAT 映射，
+//! 对端从它自己的套接字发过来的包便能穿过本端 NAT（cone 下）。这正是 UDP 打洞比 TCP 同时打开
+//! 简单的地方，也是本实现让 NAT 探测、demux、可靠层发送**共用同一个 UDP 套接字**的原因
+//! （换了套接字，映射就对不上）。
 //!
 //! # `licence_key` 与 `IdPk` 验签
 //!
@@ -26,20 +39,25 @@
 //! 必需的。接入非本项目客户端或引入基于公钥的信任时需要补上（`rustdesk::key::ServerKey::verify_id_pk`）。
 
 use crate::error::{RemoteError, RemoteResult};
+use crate::nat::{classify, NatCache, NatClass, NAT_PROBE_TIMEOUT};
+use crate::punch::{self, PunchRegistry, PUNCH_BUDGET};
+use crate::reliable::{self, DatagramRx};
 use crate::transport::{EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use rust_tunnel_common::protocol::RemoteParams;
 use rust_tunnel_rustdesk::addr;
 use rust_tunnel_rustdesk::frame::{frame, FrameCodec};
+use rust_tunnel_rustdesk::proto::punch_hole_response;
 use rust_tunnel_rustdesk::proto::rendezvous_message::Union;
 use rust_tunnel_rustdesk::proto::{
-    FetchLocalAddr, LocalAddr, ProstMessage, PunchHoleRequest, PunchHoleResponse, RegisterPeer, RegisterPk,
-    RendezvousMessage, RequestRelay,
+    FetchLocalAddr, LocalAddr, ProstMessage, PunchHole, PunchHoleRequest, PunchHoleSent, RegisterPeer, RegisterPk,
+    RendezvousMessage, RequestRelay, TestNatRequest,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -62,19 +80,30 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 等待 `PunchHoleResponse` 的超时（**不是** [`RELAY_WAIT`]，见下）。
 ///
+/// # 它覆盖的是什么
+///
+/// 无论同内网还是跨 NAT，hbbs 都会回一条 `PunchHoleResponse`——只是路径不同：
+///
+/// - 同内网：`PunchHoleRequest` → 服务端推 `FetchLocalAddr` → 目标端回 `LocalAddr` → 服务端把
+///   内网地址转成 `PunchHoleResponse{IsLocal(true)}` 回给请求方；
+/// - 跨 NAT：`PunchHoleRequest` → 服务端推 `PunchHole` 给目标端 → 目标端回 `PunchHoleSent`（并
+///   反向打洞）→ 服务端把它转成 `PunchHoleResponse` 回给请求方那条连接。
+///
+/// 所以这个超时覆盖的是「约 3 个 RTT」，不再是阶段 1 那句「跨 NAT 永远等不到应答」。
+///
 /// # 为什么必须远小于 `RELAY_WAIT`
 ///
-/// hbbs 的 `handle_punch_hole_request` 只在**同内网**（`peer_is_lan && remote_is_lan` 或
-/// 两端公网 IP 相同）时才回 `PunchHoleResponse`——它走 `FetchLocalAddr`，目标端立刻回
-/// `LocalAddr`，请求方很快拿到应答。**跨 NAT 时它改推一条 `PunchHole` 给目标端然后就不管了**
-/// （`handle_punch_hole_request` 返回 `None`），而本实现不处理 `PunchHole`（跨 NAT 打洞在
-/// 当前 hbbs 语义下不成立，见 `transport` 模块文档），因此**永远等不到应答**。
+/// 若这里沿用 `RELAY_WAIT`(25s)，而 hbbs 因网络故障/对端未登记而**真的**不回（例如
+/// `PunchHoleRequest` 落到一个静默的服务端），控制器要空等 25s 才去发中继信令，而被控端的
+/// `wait_relay_push(RELAY_WAIT)` 几乎同时超时 → **会话直接失败**，用户看到的是「卡在连接中」
+/// 25 秒。故给它一个短窗口：拿不到就立刻回退中继。
 ///
-/// 若这里沿用 `RELAY_WAIT`(25s)，跨 NAT 场景（两端各在自家 NAT 后，即最常见的部署形态）会是：
-/// 控制器空等 25s 才去发中继信令 → 被控端的 `wait_relay_push(RELAY_WAIT)` 几乎同时超时 →
-/// **会话直接失败**，而且用户看到的是「卡在连接中」25 秒。所以直连只是一个**同内网的快速
-/// 优化**，给它一个短窗口：拿不到就立刻回退中继。
-const DIRECT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
+/// # 预算不等式（打洞全链路）
+///
+/// 控制器最坏耗时 = `DIRECT_SIGNAL_TIMEOUT`(3s) + [`PUNCH_BUDGET`](3s) = **6s**，必须 **≪**
+/// 被控端 `RELAY_WAIT`(25s)，否则会出现「控制器还在打洞、被控端已放弃转中继」的错位。
+/// 配 `try_direct_gives_up_quickly_when_hbbs_never_answers` 锁定。
+const DIRECT_SIGNAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 会合/中继客户端配置。
 #[derive(Debug, Clone)]
@@ -170,6 +199,25 @@ async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> RemoteResult<Rend
     }
 }
 
+/// 打洞信令的两种结果（`PunchHoleResponse.socket_addr` **一个字段两种含义**，只能靠 oneof 判别）。
+enum PunchSignal {
+    /// 同内网：该地址是目标端的**内网 TCP 监听地址** → 走 TCP 直连。
+    Local(SocketAddr),
+    /// 跨 NAT：该地址是目标端**已登记的 UDP 映射** → 走 UDP 打洞。**绝不要**对它
+    /// `TcpStream::connect`（会白等满 [`DIRECT_CONNECT_TIMEOUT`] 才去尝试打洞）。
+    Punch(SocketAddr),
+}
+
+/// 被控端三个建立候选的胜出者。
+enum Candidate {
+    /// UDP 打洞成功（已建立可靠层字节流）。
+    Punch(DuplexStream),
+    /// TCP 直连接入成功。
+    Direct(TcpStream),
+    /// 中继推送到达（后续再连 hbbr）。
+    Relay,
+}
+
 /// RustDesk 客户端传输建立器。
 pub struct RustDeskTransport {
     /// 配置。
@@ -180,13 +228,25 @@ pub struct RustDeskTransport {
     relay_addr: SocketAddr,
     /// 本端直连监听地址（同内网优化用）。
     direct_addr: SocketAddr,
+    /// **共享**的 UDP 套接字：NAT 探测、demux、可靠层发送三方共用同一个（否则 NAT 映射对不上）。
+    udp: Arc<UdpSocket>,
+    /// 本端 UDP 套接字的**本地**端口（NAT 探测失败时兜底填进 `PunchHoleRequest.udp_port`）。
+    local_udp_port: u16,
+    /// 服务端观测到的**公网** UDP 源端口（仅主端口探测成功时有值）。见 [`Self::udp_port_for_peer`]。
+    public_udp_port: Option<u16>,
+    /// 本端 NAT 类型（`new()` 里预判一次）。
+    nat_class: NatClass,
+    /// 打洞失败缓存（按对端 `rd_id` 索引；仅控制器侧使用，见 `establish`）。
+    nat_cache: NatCache,
+    /// 打洞会话的 `conn_id` → 数据报投递端（demux 据此路由）。
+    punch_registry: Arc<PunchRegistry>,
     /// 服务端经 UDP 推送的消息队列。
     pushes: Mutex<mpsc::UnboundedReceiver<RendezvousMessage>>,
     /// 直连接入的流队列。
     direct_rx: Mutex<mpsc::UnboundedReceiver<TcpStream>>,
     /// 关闭信号。
     cancel: CancellationToken,
-    /// 后台登记任务。
+    /// 后台 demux 任务（UDP 心跳 + 推送处理 + 打洞数据报分发）。
     _registration: JoinHandle<()>,
     /// 后台直连接受任务。
     _acceptor: JoinHandle<()>,
@@ -232,9 +292,15 @@ impl RustDeskTransport {
         };
         let relay_addr = resolve(&relay_host, cfg.relay_port).await?;
 
-        let udp = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|err| RemoteError::Signaling(format!("绑定 UDP 失败: {err}")))?;
+        let udp = Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|err| RemoteError::Signaling(format!("绑定 UDP 失败: {err}")))?,
+        );
+        let local_udp_port = udp
+            .local_addr()
+            .map_err(|err| RemoteError::Signaling(format!("取 UDP 地址失败: {err}")))?
+            .port();
         let listener = TcpListener::bind("0.0.0.0:0")
             .await
             .map_err(|err| RemoteError::Signaling(format!("绑定直连监听失败: {err}")))?;
@@ -245,16 +311,22 @@ impl RustDeskTransport {
         let local_ip = probe_local_ip(hbbs).await;
         let direct_addr = SocketAddr::new(local_ip, listen_port);
 
+        // NAT 预判**必须在 spawn demux 之前**做完：demux 是 UDP 套接字唯一的 `recv_from` 读者，
+        // 两条读路径会互相偷走数据报（这里偷走心跳应答、那里偷走探测应答）。见 `probe_nat`。
+        let (nat_class, public_udp_port) = probe_nat(&udp, hbbs, cfg.rendezvous_port).await;
+
         let (push_tx, push_rx) = mpsc::unbounded_channel();
         let (direct_tx, direct_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
+        let punch_registry = Arc::new(PunchRegistry::new());
 
-        let registration = tokio::spawn(registration_task(
-            udp,
+        let registration = tokio::spawn(udp_demux_task(
+            Arc::clone(&udp),
             cfg.clone(),
             hbbs,
             direct_addr,
             push_tx,
+            Arc::clone(&punch_registry),
             cancel.clone(),
         ));
         let acceptor = tokio::spawn(accept_task(listener, direct_tx, cancel.clone()));
@@ -264,6 +336,12 @@ impl RustDeskTransport {
             hbbs,
             relay_addr,
             direct_addr,
+            udp,
+            local_udp_port,
+            public_udp_port,
+            nat_class,
+            nat_cache: NatCache::new(),
+            punch_registry,
             pushes: Mutex::new(push_rx),
             direct_rx: Mutex::new(direct_rx),
             cancel,
@@ -276,6 +354,51 @@ impl RustDeskTransport {
     #[must_use]
     pub fn direct_addr(&self) -> SocketAddr {
         self.direct_addr
+    }
+
+    /// 填进 `PunchHoleRequest.udp_port` 的端口。
+    ///
+    /// **必须是公网观测端口，不是本地端口**：对端拿 `(socket_addr 的 IP, udp_port)` 组地址反向
+    /// 打洞，若填本地端口而 NAT 不做端口保持（很常见），那个端口在本端 NAT 上**没有映射**，包会
+    /// 被直接丢掉。探测失败/老服务端（无观测值）时兜底填**本地端口**——退化成上游行为，不会更差。
+    fn udp_port_for_peer(&self) -> i32 {
+        i32::from(self.public_udp_port.unwrap_or(self.local_udp_port))
+    }
+
+    /// 本端 NAT 分类（单测断言用）。
+    #[cfg(test)]
+    fn nat_class_for_test(&self) -> NatClass {
+        self.nat_class
+    }
+
+    /// 公网观测端口（单测断言用）。
+    #[cfg(test)]
+    fn public_udp_port_for_test(&self) -> Option<u16> {
+        self.public_udp_port
+    }
+
+    /// 登记一个打洞会话，返回按 `conn_id` 路由进来的数据报接收端。
+    ///
+    /// 队列容量 256：demux 用 `try_send`，满了就丢这一条——UDP 语义本就允许丢包，可靠层会按 RTO
+    /// 重传；**绝不能阻塞 demux**（会拖垮所有会话）。
+    ///
+    /// # 注销绑在会话生命周期上
+    ///
+    /// 可靠层建立后 `rx` 被移进协议任务，**后续所有数据报仍须经 [`PunchRegistry`] 路由进来**——
+    /// 所以**不能**在 `connect`/`accept` 返回时立刻注销（那会让本端从那一刻起收不到对端任何
+    /// 数据报，会话半死）。而 `conn_id` 由一次性 token 派生、永不复用，一直留在表里则是**每会话
+    /// 一条**的泄漏。故派生一个清理任务：`rx` 被丢弃（会话结束）时 `Sender::closed()` 就绪，
+    /// 随即注销。既保证会话期间路由不断，又不留悬挂表项。
+    async fn register_punch_session(&self, conn_id: u64) -> DatagramRx {
+        let (tx, rx) = mpsc::channel(256);
+        self.punch_registry.register(conn_id, tx.clone()).await;
+        let registry = Arc::clone(&self.punch_registry);
+        tokio::spawn(async move {
+            // 通道关闭 = 会话结束（可靠层任务退出、`rx` 被丢弃）。
+            tx.closed().await;
+            registry.unregister(conn_id).await;
+        });
+        rx
     }
 
     /// 向 hbbs 发一帧 `RequestRelay`（`id` = 目标端），让服务端把请求推给目标端。
@@ -341,44 +464,209 @@ impl RustDeskTransport {
             .ok_or_else(|| RemoteError::Signaling("直连监听已关闭".to_owned()))
     }
 
-    /// 尝试同内网直连；不可行时返回 `None`。
-    async fn try_direct(&self, peer_rd_id: &str) -> RemoteResult<Option<TcpStream>> {
-        let mut stream = TcpStream::connect(self.hbbs).await?;
+    /// 打洞信令：向 hbbs 发 `PunchHoleRequest`，等 `PunchHoleResponse` 并按 oneof 分流。
+    ///
+    /// # 为什么这条 TCP 连接必须保持打开直到读到应答
+    ///
+    /// hbbs 靠这条连接的**源地址**在 `sinks` 表里找回路由（`push_to_connection`）：目标端的
+    /// `PunchHoleSent` 经 hbbs 转成 `PunchHoleResponse` 后，正是推回**发起请求的那条连接**。若
+    /// 提前关闭，应答就找不到路由（静默丢弃），控制器只会看到超时。读完再关。
+    ///
+    /// # 关键分流
+    ///
+    /// 改动 (b) 之后 `PunchHoleResponse.socket_addr` **一个字段两种含义**，只能靠 oneof 判别：
+    ///
+    /// - `IsLocal(true)` → 目标端**内网 TCP 监听地址** → [`PunchSignal::Local`]（TCP 直连）；
+    /// - 其余（`None` / `NatType(_)`）→ 目标端**已登记的 UDP 映射** → [`PunchSignal::Punch`]
+    ///   （UDP 打洞）。**绝不要**对它做 `TcpStream::connect`：那会白等满
+    ///   [`DIRECT_CONNECT_TIMEOUT`] 才去尝试打洞。
+    ///
+    /// `failure != 0`、地址解不出、超时、连接失败一律返回 `None`（调用方回退中继）。
+    async fn signal_punch(&self, peer_rd_id: &str) -> Option<PunchSignal> {
+        let mut stream = match TcpStream::connect(self.hbbs).await {
+            Ok(s) => s,
+            Err(err) => {
+                debug!(error = %err, "连接会合服务器失败");
+                return None;
+            }
+        };
         let msg = RendezvousMessage::with(Union::PunchHoleRequest(PunchHoleRequest {
             id: peer_rd_id.to_owned(),
             licence_key: self.cfg.licence_key.clone(),
             version: CLIENT_VERSION.to_owned(),
+            // 公网观测端口（见 `udp_port_for_peer`），不是本地端口。
+            udp_port: self.udp_port_for_peer(),
             ..Default::default()
         }));
-        stream.write_all(&encode_message(&msg)?).await?;
-        stream.flush().await?;
+        let Ok(wire) = encode_message(&msg) else {
+            return None;
+        };
+        if let Err(err) = stream.write_all(&wire).await {
+            debug!(error = %err, "发送打洞请求失败");
+            return None;
+        }
+        if let Err(err) = stream.flush().await {
+            debug!(error = %err, "刷新打洞请求失败");
+            return None;
+        }
 
-        // 短窗口等待：同内网会立刻回 `PunchHoleResponse`，跨 NAT 永远不会回（见常量文档）。
+        // 短窗口等待：同内网/跨 NAT 都会回（见常量文档），网络故障则放弃、回退中继。
         let response = match timeout(DIRECT_SIGNAL_TIMEOUT, read_message(&mut stream)).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(err)) => {
                 debug!(error = %err, "读打洞应答失败");
-                return Ok(None);
+                return None;
             }
             Err(_) => {
-                debug!("等待打洞应答超时（跨 NAT 或对端未登记），回退中继");
-                return Ok(None);
+                debug!("等待打洞应答超时，回退中继");
+                return None;
             }
         };
-        let Some(Union::PunchHoleResponse(PunchHoleResponse { socket_addr, .. })) = response.union else {
-            return Ok(None);
+        let Some(Union::PunchHoleResponse(resp)) = response.union else {
+            return None;
         };
-        let Some(target) = addr::decode(&socket_addr) else {
-            return Ok(None);
-        };
-        // 跨 NAT 时该地址是目标端信令连接源地址（未监听），连接会失败 → 回退中继。
-        if let Ok(Ok(stream)) = timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-            let _ = stream.set_nodelay(true);
-            Ok(Some(stream))
-        } else {
-            debug!(%target, "直连失败，回退中继");
-            Ok(None)
+        if resp.failure != 0 {
+            debug!(failure = resp.failure, "打洞请求被服务端拒绝");
+            return None;
         }
+        let Some(target) = addr::decode(&resp.socket_addr) else {
+            debug!("打洞应答里的地址无法解出");
+            return None;
+        };
+        match resp.union {
+            Some(punch_hole_response::Union::IsLocal(true)) => Some(PunchSignal::Local(target)),
+            _ => Some(PunchSignal::Punch(target)),
+        }
+    }
+
+    /// TCP 直连一个已知目标（同内网路径）。失败返回 `None`。
+    async fn try_direct_tcp(&self, target: SocketAddr) -> Option<TcpStream> {
+        match timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                Some(stream)
+            }
+            Ok(Err(err)) => {
+                debug!(error = %err, %target, "直连失败，回退中继");
+                None
+            }
+            Err(_) => {
+                debug!(%target, "直连超时，回退中继");
+                None
+            }
+        }
+    }
+
+    /// UDP 打洞（跨 NAT 路径）。失败返回 `None`。
+    ///
+    /// 打洞前先过 [`NatCache::should_punch`]：对称 NAT 直接回 `None`（**零额外等待**直接回中继），
+    /// 该对端在 TTL 内刚失败过也回 `None`（省下一次白付的 [`PUNCH_BUDGET`]）。
+    async fn try_punch(&self, cookie: [u8; 8], peer_rd_id: &str, target: SocketAddr) -> Option<DuplexStream> {
+        if !self.nat_cache.should_punch(peer_rd_id, self.nat_class) {
+            debug!(%peer_rd_id, "NAT 预判/失败缓存判定不打洞，直接回退中继");
+            return None;
+        }
+        let conn_id = u64::from_be_bytes(cookie);
+        let rx = self.register_punch_session(conn_id).await;
+        match reliable::connect(self.udp.clone(), conn_id, rx, target, PUNCH_BUDGET).await {
+            Ok(stream) => {
+                self.nat_cache.record_success(peer_rd_id);
+                Some(stream)
+            }
+            Err(err) => {
+                self.nat_cache.record_failure(peer_rd_id);
+                debug!(error = %err, %target, "UDP 打洞失败，回退中继");
+                None
+            }
+        }
+    }
+
+    /// 被控端的建立：`always_use_relay` 时直接走中继；否则三个候选**并发竞争**。
+    ///
+    /// `always_use_relay` 是**两侧**的 kill switch。补上被控端这一侧（旧实现忽略它，导致规则
+    /// 不对称：控制器强制中继、被控端仍去打洞/直连）。
+    async fn establish_controlled(&self, request: &EstablishRequest) -> RemoteResult<EstablishedStream> {
+        if self.cfg.always_use_relay {
+            self.wait_relay_push(&request.session_id, RELAY_WAIT).await?;
+            let stream = self.connect_relay(&request.session_id, &[]).await?;
+            return Ok(EstablishedStream {
+                stream: Box::new(stream),
+                path: TransportPath::Relay,
+            });
+        }
+
+        // 三个候选：UDP 打洞 accept、TCP 直连接入、中继推送。谁先到用谁。
+        //
+        // 打洞只在 `prefer_direct` 且本端**不是**对称 NAT 时启用：本端对称 NAT 下打洞无望，
+        // 省下 3 秒预算与无用的反向探测。
+        //
+        // 被控端**不用** `nat_cache` 的失败缓存：`EstablishRequest.peer_rd_id` 在被控端是空串
+        // （`RemoteSessionIncoming` 不带 `from_rd_id`），拿空串当 key 会把「所有对端」一起抑制
+        // 10 分钟。
+        let punch_enabled = request.prefer_direct && self.nat_class != NatClass::Symmetric;
+        let conn_id = u64::from_be_bytes(request.punch_cookie);
+        let punch_fut = async {
+            if punch_enabled {
+                let rx = self.register_punch_session(conn_id).await;
+                reliable::accept(self.udp.clone(), conn_id, rx, PUNCH_BUDGET).await
+            } else {
+                // 由 `if punch_enabled` 守卫，本分支永不被轮询；仅用于统一类型。
+                std::future::pending().await
+            }
+        };
+        let direct_fut = self.next_direct();
+        let relay_fut = self.wait_relay_push(&request.session_id, RELAY_WAIT);
+        // **必须先建好再 pin**：`wait_relay_push` 内部自己算 `Instant::now() + wait` 的 deadline。
+        // 若每轮 `select!` 里重新调用它，超时会一轮一轮往后推（总等待变成 25s + 25s …）。pin 之后
+        // 用 `&mut` 跨轮次复用同一个 future。
+        tokio::pin!(punch_fut, direct_fut, relay_fut);
+
+        let mut punch_active = punch_enabled;
+        let mut direct_active = true;
+        let candidate = loop {
+            tokio::select! {
+                res = &mut punch_fut, if punch_active => match res {
+                    Ok(stream) => break Candidate::Punch(stream),
+                    Err(err) => {
+                        // 打洞失败**必须继续等** direct/relay，不能直接返回错误。
+                        debug!(error = %err, "UDP 打洞接受失败，继续等直连/中继");
+                        punch_active = false;
+                    }
+                },
+                res = &mut direct_fut, if direct_active => match res {
+                    Ok(stream) => break Candidate::Direct(stream),
+                    Err(err) => {
+                        debug!(error = %err, "直连接入通道已关闭");
+                        direct_active = false;
+                    }
+                },
+                res = &mut relay_fut => {
+                    res?;
+                    break Candidate::Relay;
+                }
+            }
+        };
+
+        Ok(match candidate {
+            Candidate::Punch(stream) => EstablishedStream {
+                stream: Box::new(stream),
+                path: TransportPath::Punch,
+            },
+            Candidate::Direct(stream) => {
+                let _ = stream.set_nodelay(true);
+                EstablishedStream {
+                    stream: Box::new(stream),
+                    path: TransportPath::Direct,
+                }
+            }
+            Candidate::Relay => {
+                let stream = self.connect_relay(&request.session_id, &[]).await?;
+                EstablishedStream {
+                    stream: Box::new(stream),
+                    path: TransportPath::Relay,
+                }
+            }
+        })
     }
 }
 
@@ -387,17 +675,38 @@ impl TransportEstablisher for RustDeskTransport {
     async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream> {
         match role {
             Role::Controller => {
+                // 三条路径按优先级尝试：UDP 打洞 → 同内网 TCP 直连 → hbbr 中继兜底。
                 if request.prefer_direct && !self.cfg.always_use_relay {
-                    if let Some(mut stream) = self.try_direct(&request.peer_rd_id).await? {
-                        // 直连路径没有中继帧可流水线，直接补写 Hello。
-                        if !request.early.is_empty() {
-                            stream.write_all(&request.early).await?;
-                            stream.flush().await?;
+                    match self.signal_punch(&request.peer_rd_id).await {
+                        Some(PunchSignal::Local(addr)) => {
+                            if let Some(mut stream) = self.try_direct_tcp(addr).await {
+                                // 直连路径没有中继帧可流水线，补写 Hello。
+                                if !request.early.is_empty() {
+                                    stream.write_all(&request.early).await?;
+                                    stream.flush().await?;
+                                }
+                                return Ok(EstablishedStream {
+                                    stream: Box::new(stream),
+                                    path: TransportPath::Direct,
+                                });
+                            }
                         }
-                        return Ok(EstablishedStream {
-                            stream: Box::new(stream),
-                            path: TransportPath::Direct,
-                        });
+                        Some(PunchSignal::Punch(addr)) => {
+                            if let Some(mut stream) = self.try_punch(request.punch_cookie, &request.peer_rd_id, addr).await
+                            {
+                                // 打洞路径同样没有中继帧可流水线，补写 Hello。
+                                if !request.early.is_empty() {
+                                    stream.write_all(&request.early).await?;
+                                    stream.flush().await?;
+                                }
+                                return Ok(EstablishedStream {
+                                    stream: Box::new(stream),
+                                    path: TransportPath::Punch,
+                                });
+                            }
+                        }
+                        // 无应答/被拒/直连失败/打洞失败 → 直接回退中继（不额外等待）。
+                        None => {}
                     }
                 }
                 self.notify_relay(&request.peer_rd_id, &request.session_id).await?;
@@ -407,27 +716,7 @@ impl TransportEstablisher for RustDeskTransport {
                     path: TransportPath::Relay,
                 })
             }
-            Role::Controlled => {
-                // 竞争直连接入与中继推送：谁先到用谁。
-                tokio::select! {
-                    direct = self.next_direct() => {
-                        let stream = direct?;
-                        let _ = stream.set_nodelay(true);
-                        Ok(EstablishedStream {
-                            stream: Box::new(stream),
-                            path: TransportPath::Direct,
-                        })
-                    }
-                    pushed = self.wait_relay_push(&request.session_id, RELAY_WAIT) => {
-                        pushed?;
-                        let stream = self.connect_relay(&request.session_id, &[]).await?;
-                        Ok(EstablishedStream {
-                            stream: Box::new(stream),
-                            path: TransportPath::Relay,
-                        })
-                    }
-                }
-            }
+            Role::Controlled => self.establish_controlled(&request).await,
         }
     }
 }
@@ -440,13 +729,28 @@ async fn probe_local_ip(remote: SocketAddr) -> std::net::IpAddr {
     }
 }
 
-/// 后台登记任务：UDP 心跳 + 处理服务端推送。
-async fn registration_task(
-    udp: UdpSocket,
+/// 后台 demux 任务：**唯一**的 UDP `recv_from` 读者——UDP 心跳、服务端推送、打洞数据报全在这里分派。
+///
+/// # 每条数据报的分派顺序（**不可乱**）
+///
+/// 1. **可靠层数据报**：`peek_conn_id` 命中（前 4 字节 == `RTP1` 且长度 ≥ 27）→ 按 `conn_id` 路由。
+///    命中即 `continue`。
+/// 2. **未命中则继续往下走 protobuf 路径**（**不要直接丢**）。理由：`peek_conn_id` 只做廉价判定，
+///    理论上存在首 4 字节恰为 `RTP1` 的合法会合消息；落回 protobuf 解析的代价是零（真打洞数据报
+///    会解析失败被丢），却能保证**心跳路径逐字节不变**。
+/// 3. **protobuf 路径**：与接线前**逐字节一致**，排最后。
+///
+/// # 安全不变量（配机械锁）
+///
+/// 未命中登记表的 `conn_id` **永远不被投递给任何会话、且永远不产生任何回复**（反反射）。解析失败
+/// / 未知变体一律静默丢弃。
+async fn udp_demux_task(
+    udp: Arc<UdpSocket>,
     cfg: SignalingConfig,
     hbbs: SocketAddr,
     direct_addr: SocketAddr,
     pushes: mpsc::UnboundedSender<RendezvousMessage>,
+    punch_registry: Arc<PunchRegistry>,
     cancel: CancellationToken,
 ) {
     let device_uuid = uuid::Uuid::new_v4().into_bytes().to_vec();
@@ -472,8 +776,17 @@ async fn registration_task(
                 }
             }
             received = udp.recv_from(&mut buf) => {
-                let Ok((len, _)) = received else { continue };
+                let Ok((len, from)) = received else { continue };
                 let Some(payload) = buf.get(..len) else { continue };
+
+                // 1) 可靠层快速路径：magic 命中 → 按 conn_id 路由（未命中则落回 protobuf）。
+                if let Some(conn_id) = punch::peek_conn_id(payload) {
+                    if punch_registry.route(conn_id, from, bytes::Bytes::copy_from_slice(payload)).await {
+                        continue;
+                    }
+                }
+
+                // 2/3) protobuf 路径（与接线前逐字节一致）。
                 let Ok(msg) = RendezvousMessage::decode(payload) else { continue };
                 match msg.union.clone() {
                     Some(Union::RegisterPeerResponse(resp)) if resp.request_pk => {
@@ -498,12 +811,115 @@ async fn registration_task(
                             debug!("中继推送无人接收，丢弃");
                         }
                     }
+                    Some(Union::PunchHole(ph)) => {
+                        // 1) 回 PunchHoleSent：让 hbbs 把「我们已登记的 UDP 映射」回给请求方。
+                        tokio::spawn(reply_punch_hole_sent(hbbs, cfg.rd_id.clone(), ph.clone()));
+                        // 2) 反向打洞：打开本端 NAT 的过滤窗口（见 `punch::punch_back`）。
+                        //    `udp_port` 必须是**合法非零**端口才反向打：0 是老请求方没报端口，
+                        //    负数/超界是恶意或损坏的 `PunchHole`——直接打向端口 0 只会白跑满预算。
+                        let port = u16::try_from(ph.udp_port).ok().filter(|p| *p != 0);
+                        if let (Some(port), Some(ip)) = (port, addr::decode(&ph.socket_addr).map(|a| a.ip())) {
+                            tokio::spawn(punch::punch_back(udp.clone(), SocketAddr::new(ip, port), PUNCH_BUDGET));
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
-    debug!("会合登记任务结束");
+    debug!("UDP demux 任务结束");
+}
+
+/// 回应 `PunchHole`：把本端 ID 与**原样回显的请求方地址**经 TCP 回报给 hbbs。
+///
+/// **`socket_addr` 必须原样回显 `ph.socket_addr`**：hbbs 的 `forward_punch_result` 靠解码它去
+/// `sinks` 表（按信令 TCP 源地址索引）里找请求方那条连接。填错/填空就找不到路由，请求方永远
+/// 收不到 `PunchHoleResponse`，于是白等满 [`DIRECT_SIGNAL_TIMEOUT`] 才回退中继。
+///
+/// 形状照抄既有 [`reply_local_addr`]：新建一条 TCP 连 hbbs、发一帧、不管应答。
+async fn reply_punch_hole_sent(hbbs: SocketAddr, rd_id: String, ph: PunchHole) {
+    let Ok(mut stream) = TcpStream::connect(hbbs).await else {
+        debug!("回报打洞结果时连接失败");
+        return;
+    };
+    let msg = RendezvousMessage::with(Union::PunchHoleSent(PunchHoleSent {
+        socket_addr: ph.socket_addr,
+        id: rd_id,
+        version: CLIENT_VERSION.to_owned(),
+        ..Default::default()
+    }));
+    if let Ok(wire) = encode_message(&msg) {
+        if stream.write_all(&wire).await.is_err() {
+            warn!("回报打洞结果失败");
+        }
+    }
+}
+
+/// NAT 预判：**并发**向 hbbs 主端口与 NAT 探测端口（主端口 − 1）各发一条 `TestNatRequest`，
+/// 再比对服务端观测到的源端口。
+///
+/// 返回 `(分类, 公网观测端口)`；观测端口取**主端口那次**应答（cone 下两次相同；对称 NAT 本来就
+/// 不打洞，这个值不必可信）。
+///
+/// # 为什么并发而不是串行
+///
+/// `new()` 在会话关键路径上（`LazyTransport` 拿到 `RemoteCapabilities` 即构造）。串行最坏要
+/// 2 × [`NAT_PROBE_TIMEOUT`]，白白拖慢每一次建立。
+///
+/// # 为什么必须在 spawn demux 之前做完
+///
+/// `udp_demux_task` 是 UDP 套接字**唯一**的 `recv_from` 读者（否则两条读路径会互相偷走数据报）。
+/// 本函数自己 `recv_from`，故必须在 demux 起之前完成。
+///
+/// # 老服务端 / 探测端口被墙
+///
+/// 超时 → [`NatClass::Unknown`] → **fail-open**，照打一次洞（见 [`crate::nat`]）。
+async fn probe_nat(udp: &UdpSocket, hbbs: SocketAddr, rendezvous_port: u16) -> (NatClass, Option<u16>) {
+    // `rendezvous_port - 1` 下溢保护：端口 0/1 时无法探测。
+    if rendezvous_port < 2 {
+        return (NatClass::Unknown, None);
+    }
+    let nat_port = rendezvous_port - 1;
+    let nat_addr = SocketAddr::new(hbbs.ip(), nat_port);
+
+    // 两条探测**并发**发出（同一套接字、两个不同目的端口——这是分类成立的前提，见 `nat`）。
+    let req_main = RendezvousMessage::with(Union::TestNatRequest(TestNatRequest { serial: 1 })).encode_to_vec();
+    let req_nat = RendezvousMessage::with(Union::TestNatRequest(TestNatRequest { serial: 2 })).encode_to_vec();
+    if udp.send_to(&req_main, hbbs).await.is_err() || udp.send_to(&req_nat, nat_addr).await.is_err() {
+        return (NatClass::Unknown, None);
+    }
+
+    let deadline = Instant::now() + NAT_PROBE_TIMEOUT;
+    let mut port_main = None;
+    let mut port_nat = None;
+    let mut buf = vec![0u8; 2048];
+    while port_main.is_none() || port_nat.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Ok((len, from))) = timeout(remaining, udp.recv_from(&mut buf)).await else {
+            break;
+        };
+        // 只接受来自 hbbs 主机的应答（挡掉无关流量）。
+        if from.ip() != hbbs.ip() {
+            continue;
+        }
+        let Ok(msg) = RendezvousMessage::decode(&buf[..len]) else {
+            continue;
+        };
+        let Some(Union::TestNatResponse(resp)) = msg.union else {
+            continue;
+        };
+        // 应答的**源端口**等于我们探测的目的端口，据此把两条应答对上两个目的地。
+        let observed = u16::try_from(resp.port).ok();
+        if from.port() == hbbs.port() {
+            port_main = observed;
+        } else if from.port() == nat_port {
+            port_nat = observed;
+        }
+    }
+    (classify(port_main, port_nat), port_main)
 }
 
 /// 回应 `FetchLocalAddr`：把本端内网监听地址经 TCP 回报给 hbbs。
@@ -621,6 +1037,12 @@ impl TransportEstablisher for LazyTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::punch::{conn_id_from_token, peek_conn_id};
+    use crate::reliable::{self, DatagramSender, SEGMENT_HEADER_LEN};
+    use bytes::Bytes;
+    use rust_tunnel_rustdesk::proto::{PunchHoleResponse, TestNatResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn signaling_config_fills_host_from_local_when_params_empty() {
@@ -697,16 +1119,15 @@ mod tests {
         );
     }
 
-    /// 跨 NAT 时 hbbs **不会**回 `PunchHoleResponse`：`handle_punch_hole_request` 只给目标端推
-    /// 一条 `PunchHole` 就返回 `None`，而本实现不处理 `PunchHole`（跨 NAT 打洞在当前 hbbs 语义
-    /// 下不成立），因此请求方永远等不到应答。
+    /// hbbs **永不回** `PunchHoleResponse`（网络故障 / 静默服务端）：`signal_punch` 必须在**短窗口**
+    /// 内放弃并回退中继。
     ///
-    /// 回归用例：`try_direct` 必须在**短窗口**内放弃并回退中继。若沿用 `RELAY_WAIT`(25s)，
-    /// 控制器要空等 25s 才去发中继信令，而被控端的 `wait_relay_push(RELAY_WAIT)` 几乎同时超时
-    /// ——跨 NAT（最常见的部署形态）下会话**必现失败**，用户看到的是「卡在连接中」25 秒。
+    /// 回归用例：若沿用 `RELAY_WAIT`(25s)，控制器要空等 25s 才去发中继信令，而被控端的
+    /// `wait_relay_push(RELAY_WAIT)` 几乎同时超时——跨 NAT（最常见的部署形态）下会话**必现失败**，
+    /// 用户看到的是「卡在连接中」25 秒。
     #[tokio::test]
     async fn try_direct_gives_up_quickly_when_hbbs_never_answers() {
-        // 假 hbbs：接受 TCP 连接后保持沉默，正是跨 NAT 时的真实行为。
+        // 假 hbbs：接受 TCP 连接后保持沉默。
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hbbs_port = listener.local_addr().unwrap().port();
         let held = tokio::spawn(async move {
@@ -730,11 +1151,11 @@ mod tests {
         .unwrap();
 
         let started = Instant::now();
-        let result = transport.try_direct("222222222").await;
+        let result = transport.signal_punch("222222222").await;
         let elapsed = started.elapsed();
         held.abort();
 
-        assert!(matches!(result, Ok(None)), "无应答时应放弃直连、回退中继");
+        assert!(result.is_none(), "无应答时应放弃打洞/直连、回退中继");
         assert!(
             elapsed >= DIRECT_SIGNAL_TIMEOUT,
             "不该在应答窗口结束前就放弃（实测 {elapsed:?}）"
@@ -743,5 +1164,639 @@ mod tests {
             elapsed < Duration::from_secs(6),
             "必须在远小于 RELAY_WAIT({RELAY_WAIT:?}) 的时间内放弃，实测 {elapsed:?}"
         );
+    }
+
+    // ─────────────── 假 hbbs / 假 hbbr / 假对端（真实 UDP+TCP，本地回环） ───────────────
+
+    /// 假 hbbs 的共享状态。
+    #[derive(Default)]
+    struct HbbsState {
+        /// 收到的全部 TCP 会合消息（断言用）。
+        received: StdMutex<Vec<RendezvousMessage>>,
+        /// 最近一次 NAT 探测的观测源（= 客户端 UDP 套接字地址）。
+        client_udp: StdMutex<Option<SocketAddr>>,
+        /// 收到 `PunchHoleRequest` 时回给请求方的应答（`None` = 保持沉默）。
+        punch_response: StdMutex<Option<PunchHoleResponse>>,
+        /// 两个 NAT 探测端口是否回**不同**的观测端口（模拟对称 NAT）。
+        symmetric_nat: AtomicBool,
+        /// 是否完全不回 NAT 探测应答（模拟老服务端 / 端口被墙）。
+        silent_nat: AtomicBool,
+    }
+
+    /// 假 hbbs（UDP 主端口 + UDP NAT 端口 + TCP 信令端口）+ 假 hbbr（TCP 中继端口）。
+    struct FakeHbbs {
+        /// 会合主端口（= UDP 主端口 = TCP 信令端口）。
+        main_port: u16,
+        /// 假 hbbr 中继端口。
+        relay_port: u16,
+        /// 共享状态。
+        state: Arc<HbbsState>,
+        /// 后台任务（`Drop` 时全部 abort）。
+        tasks: Vec<JoinHandle<()>>,
+    }
+
+    impl Drop for FakeHbbs {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+        }
+    }
+
+    impl FakeHbbs {
+        async fn start() -> Self {
+            // NAT 探测端口必须 = 主端口 − 1（`probe_nat` 的硬约束），故先绑主端口再绑 main−1。
+            let (udp_main, udp_nat, main_port) = bind_udp_pair().await;
+            let tcp = TcpListener::bind(("127.0.0.1", main_port)).await.unwrap();
+            let hbbr = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let relay_port = hbbr.local_addr().unwrap().port();
+            let state = Arc::new(HbbsState::default());
+
+            let mut tasks = Vec::new();
+            tasks.push(tokio::spawn(nat_responder(udp_main, Arc::clone(&state), 0)));
+            // NAT 端口用 delta=1：`symmetric_nat` 打开时两个端口观测不同 → 对称 NAT。
+            tasks.push(tokio::spawn(nat_responder(udp_nat, Arc::clone(&state), 1)));
+            tasks.push(tokio::spawn(tcp_handler(tcp, Arc::clone(&state))));
+            tasks.push(tokio::spawn(async move {
+                // 假 hbbr：接受连接后拿着不放（中继路径只需 TCP 连上）。
+                let mut keep = Vec::new();
+                while let Ok((stream, _)) = hbbr.accept().await {
+                    keep.push(stream);
+                }
+            }));
+            Self {
+                main_port,
+                relay_port,
+                state,
+                tasks,
+            }
+        }
+
+        fn make_config(&self, always_use_relay: bool) -> SignalingConfig {
+            SignalingConfig {
+                rd_id: "111111111".into(),
+                licence_key: String::new(),
+                host: "127.0.0.1".into(),
+                rendezvous_port: self.main_port,
+                relay_port: self.relay_port,
+                relay_server: "127.0.0.1".into(),
+                always_use_relay,
+            }
+        }
+
+        async fn make_transport(&self) -> Arc<RustDeskTransport> {
+            self.make_transport_with(false).await
+        }
+
+        async fn make_transport_with(&self, always_use_relay: bool) -> Arc<RustDeskTransport> {
+            RustDeskTransport::new(self.make_config(always_use_relay))
+                .await
+                .unwrap()
+        }
+
+        /// 配置 `PunchHoleRequest` 的应答（`socket_addr` 会被编码）。
+        fn set_punch_response(&self, socket_addr: SocketAddr, union: Option<punch_hole_response::Union>) {
+            let resp = PunchHoleResponse {
+                socket_addr: addr::encode(socket_addr),
+                union,
+                ..Default::default()
+            };
+            *self.state.punch_response.lock().unwrap() = Some(resp);
+        }
+
+        fn received(&self) -> Vec<RendezvousMessage> {
+            self.state.received.lock().unwrap().clone()
+        }
+
+        fn client_udp(&self) -> Option<SocketAddr> {
+            *self.state.client_udp.lock().unwrap()
+        }
+    }
+
+    /// 绑一对相邻的 UDP 端口（`main` 与 `main − 1`）。
+    async fn bind_udp_pair() -> (UdpSocket, UdpSocket, u16) {
+        for _ in 0..100 {
+            let main = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = main.local_addr().unwrap().port();
+            if port >= 2 {
+                if let Ok(nat) = UdpSocket::bind(("127.0.0.1", port - 1)).await {
+                    return (main, nat, port);
+                }
+            }
+        }
+        panic!("无法绑到相邻的 UDP 端口对");
+    }
+
+    /// NAT 探测应答器：回 `from.port() + bump`（`symmetric_nat` 下两个端口 bump 不同）。
+    async fn nat_responder(udp: UdpSocket, state: Arc<HbbsState>, delta: i32) {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let Ok((len, from)) = udp.recv_from(&mut buf).await else {
+                continue;
+            };
+            let Ok(msg) = RendezvousMessage::decode(&buf[..len]) else {
+                continue;
+            };
+            if !matches!(msg.union, Some(Union::TestNatRequest(_))) {
+                continue;
+            }
+            // 即便保持沉默也要记下观测源（未知分类的用例要用它当「本地端口」）。
+            if let Ok(mut guard) = state.client_udp.lock() {
+                *guard = Some(from);
+            }
+            if state.silent_nat.load(Ordering::SeqCst) {
+                continue;
+            }
+            let bump = if state.symmetric_nat.load(Ordering::SeqCst) {
+                delta
+            } else {
+                0
+            };
+            let port = i32::from(from.port()).saturating_add(bump);
+            let resp = RendezvousMessage::with(Union::TestNatResponse(TestNatResponse {
+                port,
+                ..Default::default()
+            }));
+            let _ = udp.send_to(&resp.encode_to_vec(), from).await;
+        }
+    }
+
+    /// 假 hbbs 的 TCP 信令处理：记录消息；`PunchHoleRequest` 时按配置回一条应答。
+    async fn tcp_handler(listener: TcpListener, state: Arc<HbbsState>) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                loop {
+                    let Ok(msg) = read_message(&mut stream).await else {
+                        break;
+                    };
+                    let is_punch = matches!(msg.union, Some(Union::PunchHoleRequest(_)));
+                    if let Ok(mut guard) = state.received.lock() {
+                        guard.push(msg);
+                    }
+                    if is_punch {
+                        let resp = state.punch_response.lock().ok().and_then(|guard| guard.clone());
+                        if let Some(resp) = resp {
+                            let wire = RendezvousMessage::with(Union::PunchHoleResponse(resp)).encode_to_vec();
+                            if let Ok(framed) = frame(&wire) {
+                                let _ = stream.write_all(&framed).await;
+                                let _ = stream.flush().await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// 轮询等待条件成立（有界）。
+    async fn wait_for<T>(mut cond: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..200 {
+            if let Some(v) = cond() {
+                return Some(v);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// 造一个 UDP 套接字 + 自建 demux（`peek_conn_id` → `try_send`），返回套接字、地址、接收端。
+    async fn spawn_udp_endpoint(conn_id: u64) -> (Arc<UdpSocket>, SocketAddr, DatagramRx) {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(256);
+        let demux_sock = Arc::clone(&sock);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((len, from)) = demux_sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                if peek_conn_id(&buf[..len]) == Some(conn_id) {
+                    let _ = tx.try_send((from, Bytes::copy_from_slice(&buf[..len])));
+                }
+            }
+        });
+        (sock, addr, rx)
+    }
+
+    /// 假对端（被控端角色）：跑 `reliable::accept`。
+    async fn spawn_fake_acceptor(conn_id: u64) -> (SocketAddr, JoinHandle<RemoteResult<DuplexStream>>) {
+        let (sock, addr, rx) = spawn_udp_endpoint(conn_id).await;
+        let link: Arc<dyn DatagramSender> = sock;
+        let handle = tokio::spawn(async move { reliable::accept(link, conn_id, rx, PUNCH_BUDGET).await });
+        (addr, handle)
+    }
+
+    /// 假对端（控制器角色）：跑 `reliable::connect`，向 `peer` 发 SYN。
+    async fn spawn_fake_connector(
+        conn_id: u64,
+        peer: SocketAddr,
+    ) -> (SocketAddr, JoinHandle<RemoteResult<DuplexStream>>) {
+        let (sock, addr, rx) = spawn_udp_endpoint(conn_id).await;
+        let link: Arc<dyn DatagramSender> = sock;
+        let handle = tokio::spawn(async move { reliable::connect(link, conn_id, rx, peer, PUNCH_BUDGET).await });
+        (addr, handle)
+    }
+
+    fn dummy_request(session_id: &str, peer_rd_id: &str, cookie: [u8; 8], early: Vec<u8>) -> EstablishRequest {
+        EstablishRequest {
+            session_id: session_id.to_owned(),
+            local_rd_id: "111111111".to_owned(),
+            peer_rd_id: peer_rd_id.to_owned(),
+            params: RemoteParams {
+                rendezvous_host: "127.0.0.1".into(),
+                rendezvous_port: 21116,
+                relay_port: 21117,
+                relay_server: String::new(),
+                public_key: String::new(),
+                always_use_relay: false,
+            },
+            prefer_direct: true,
+            early,
+            punch_cookie: cookie,
+        }
+    }
+
+    // ───────────────────────────── 打洞端到端 ─────────────────────────────
+
+    /// **最重要的一条**：控制器打洞成功 → `TransportPath::Punch`，且流上双向字节真的通。
+    #[tokio::test]
+    async fn punch_succeeds_end_to_end_on_controller_side() {
+        let hbbs = FakeHbbs::start().await;
+        let conn_id = conn_id_from_token("session-token-abc");
+        let (peer_addr, peer_handle) = spawn_fake_acceptor(conn_id).await;
+        // union: None → socket_addr 是目标端已登记的 UDP 映射。
+        hbbs.set_punch_response(peer_addr, None);
+        let transport = hbbs.make_transport().await;
+
+        let established = transport
+            .establish(
+                dummy_request("sess-1", "222222222", conn_id.to_be_bytes(), b"HELLO".to_vec()),
+                Role::Controller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(established.path, TransportPath::Punch, "应走 UDP 打洞路径");
+        let mut stream = established.stream;
+
+        // 对端应收到建立阶段补写的 early（打洞路径没有中继帧可流水线）。
+        let mut peer = peer_handle.await.unwrap().unwrap();
+        let mut hello = [0u8; 5];
+        peer.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"HELLO", "打洞路径也要补写 early（Hello）");
+
+        // 双向字节真的通。
+        peer.write_all(b"pong").await.unwrap();
+        let mut back = [0u8; 4];
+        stream.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"pong", "对端 → 控制器方向应通");
+        stream.write_all(b"ping").await.unwrap();
+        let mut fwd = [0u8; 4];
+        peer.read_exact(&mut fwd).await.unwrap();
+        assert_eq!(&fwd, b"ping", "控制器 → 对端方向应通");
+    }
+
+    /// 被控端角色：假对端跑 `connect`，被控端 `establish` 走打洞 `accept`。
+    #[tokio::test]
+    async fn punch_succeeds_end_to_end_on_controlled_side() {
+        let hbbs = FakeHbbs::start().await;
+        let conn_id = conn_id_from_token("token-controlled");
+        let transport = hbbs.make_transport().await;
+        let udp_addr = hbbs.client_udp().expect("NAT 探测应已记录客户端 UDP 地址");
+        let (_peer_addr, peer_handle) = spawn_fake_connector(conn_id, udp_addr).await;
+
+        let established = transport
+            .establish(
+                dummy_request("sess-2", "", conn_id.to_be_bytes(), Vec::new()),
+                Role::Controlled,
+            )
+            .await
+            .unwrap();
+        assert_eq!(established.path, TransportPath::Punch, "被控端应走 UDP 打洞");
+        let mut stream = established.stream;
+        let mut peer = peer_handle.await.unwrap().unwrap();
+
+        stream.write_all(b"from-controlled").await.unwrap();
+        let mut buf = [0u8; 15];
+        peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"from-controlled");
+        peer.write_all(b"hi").await.unwrap();
+        let mut reply = [0u8; 2];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"hi");
+    }
+
+    /// `IsLocal(true)` → 该地址是内网 TCP 监听地址 → 走 TCP 直连，**不是**打洞。
+    #[tokio::test]
+    async fn is_local_response_takes_tcp_direct_path() {
+        let hbbs = FakeHbbs::start().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        hbbs.set_punch_response(direct_addr, Some(punch_hole_response::Union::IsLocal(true)));
+        let transport = hbbs.make_transport().await;
+
+        let established = transport
+            .establish(
+                dummy_request("s", "222222222", conn_id_from_token("t").to_be_bytes(), Vec::new()),
+                Role::Controller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            established.path,
+            TransportPath::Direct,
+            "IsLocal(true) 应走 TCP 直连而非打洞"
+        );
+        assert!(accepted.await.unwrap().is_ok(), "控制器应真的连上目标监听");
+    }
+
+    /// 打洞失败必须在预算内**如实**回退中继（不谎报 `Punch`，也不拖到更久/报错）。
+    #[tokio::test]
+    async fn punch_failure_falls_back_to_relay_within_budget() {
+        let hbbs = FakeHbbs::start().await;
+        // 一个没人回应的 UDP 地址（绑住但不读不回，避免 ICMP 干扰）。
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        hbbs.set_punch_response(dead_addr, None);
+        let transport = hbbs.make_transport().await;
+
+        let started = Instant::now();
+        let established = transport
+            .establish(
+                dummy_request("s", "222222222", conn_id_from_token("t").to_be_bytes(), Vec::new()),
+                Role::Controller,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(established.path, TransportPath::Relay, "打洞失败必须如实回退中继");
+        assert!(
+            elapsed < PUNCH_BUDGET + Duration::from_secs(2),
+            "应在打洞预算 + 余量内回退，实测 {elapsed:?}"
+        );
+        drop(dead);
+    }
+
+    // ───────────────────────────── 反向打洞 ─────────────────────────────
+
+    /// 收到 `PunchHole` 必须：① 回 `PunchHoleSent`（地址原样回显、id = 本端 rd_id）；
+    /// ② 向请求方地址反向发裸探测段（27 字节、magic `RTP1`、`conn_id == 0`）。
+    #[tokio::test]
+    async fn punch_hole_triggers_reverse_punch_and_punch_hole_sent() {
+        let hbbs = FakeHbbs::start().await;
+        let _transport = hbbs.make_transport().await;
+        let client_udp = hbbs.client_udp().expect("应记录客户端 UDP 地址");
+
+        // 假请求方：一个 UDP 套接字（收反向探测）。
+        let requester = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let requester_addr = requester.local_addr().unwrap();
+        let ph_socket_addr = addr::encode(requester_addr);
+
+        // 往 transport 的 UDP 套接字推一条 PunchHole。
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ph = RendezvousMessage::with(Union::PunchHole(PunchHole {
+            socket_addr: ph_socket_addr.clone(),
+            udp_port: i32::from(requester_addr.port()),
+            ..Default::default()
+        }))
+        .encode_to_vec();
+        sender.send_to(&ph, client_udp).await.unwrap();
+
+        // (a) 假 hbbs 应收到 PunchHoleSent。
+        let sent = wait_for(&|| {
+            hbbs.received().iter().find_map(|m| match &m.union {
+                Some(Union::PunchHoleSent(s)) => Some(s.clone()),
+                _ => None,
+            })
+        })
+        .await
+        .expect("收到 PunchHole 后应回 PunchHoleSent");
+        assert_eq!(sent.socket_addr, ph_socket_addr, "socket_addr 必须原样回显请求方地址");
+        assert_eq!(sent.id, "111111111", "id 必须是本端 rd_id");
+
+        // (b) 假请求方应收到反向探测。
+        let mut buf = vec![0u8; 64];
+        let (len, _from) = tokio::time::timeout(Duration::from_secs(2), requester.recv_from(&mut buf))
+            .await
+            .expect("假请求方应在预算内收到反向探测")
+            .unwrap();
+        assert_eq!(len, SEGMENT_HEADER_LEN, "反向探测应是 27 字节裸段");
+        assert_eq!(&buf[..4], b"RTP1", "magic 必须正确");
+        assert_eq!(peek_conn_id(&buf[..len]), Some(0), "反向探测 conn_id 必须是 0 哨兵");
+    }
+
+    /// `udp_port == 0`（老请求方没报端口）时**不**反向打洞（仍回 `PunchHoleSent`）。
+    #[tokio::test]
+    async fn punch_hole_with_zero_udp_port_does_not_reverse_punch() {
+        let hbbs = FakeHbbs::start().await;
+        let _transport = hbbs.make_transport().await;
+        let client_udp = hbbs.client_udp().unwrap();
+        let requester = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let requester_addr = requester.local_addr().unwrap();
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ph = RendezvousMessage::with(Union::PunchHole(PunchHole {
+            socket_addr: addr::encode(requester_addr),
+            udp_port: 0,
+            ..Default::default()
+        }))
+        .encode_to_vec();
+        sender.send_to(&ph, client_udp).await.unwrap();
+
+        assert!(
+            wait_for(&|| {
+                hbbs.received()
+                    .iter()
+                    .any(|m| matches!(m.union, Some(Union::PunchHoleSent(_))))
+                    .then_some(())
+            })
+            .await
+            .is_some(),
+            "仍应回 PunchHoleSent"
+        );
+
+        let mut buf = vec![0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), requester.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "udp_port == 0 时不应反向打洞"
+        );
+    }
+
+    /// **反反射**：合法格式但 `conn_id` 未登记的段，必须静默丢弃、绝不回复。
+    #[tokio::test]
+    async fn unregistered_conn_id_never_gets_a_reply() {
+        let hbbs = FakeHbbs::start().await;
+        let _transport = hbbs.make_transport().await;
+        let client_udp = hbbs.client_udp().unwrap();
+
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let seg = reliable::SegmentHeader {
+            conn_id: 0xDEAD_BEEF_DEAD_BEEF,
+            seq: 0,
+            ack: 0,
+            ack_bits: 0,
+            flags: reliable::SegmentHeader::SYN,
+            window: 64,
+            len: 0,
+        }
+        .encode();
+        attacker.send_to(&seg, client_udp).await.unwrap();
+
+        let mut buf = vec![0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), attacker.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "未命中登记表的数据报必须静默丢弃、绝不回复"
+        );
+    }
+
+    // ───────────────────────────── NAT 预判 ─────────────────────────────
+
+    /// 两个目的端口观测到**相同**源端口 → `Cone`，且记下公网观测端口并填进 `PunchHoleRequest`。
+    #[tokio::test]
+    async fn nat_probe_classifies_cone_and_fills_observed_port() {
+        let hbbs = FakeHbbs::start().await;
+        let transport = hbbs.make_transport().await;
+        assert_eq!(
+            transport.nat_class_for_test(),
+            NatClass::Cone,
+            "两个目的端口观测一致应判为 cone"
+        );
+        let observed = hbbs.client_udp().unwrap().port();
+        assert_eq!(
+            transport.public_udp_port_for_test(),
+            Some(observed),
+            "应记下服务端观测到的源端口"
+        );
+
+        hbbs.set_punch_response("127.0.0.1:1".parse().unwrap(), Some(punch_hole_response::Union::IsLocal(true)));
+        let _ = transport.signal_punch("222222222").await;
+        let req = wait_for(&|| {
+            hbbs.received().iter().find_map(|m| match &m.union {
+                Some(Union::PunchHoleRequest(r)) => Some(r.clone()),
+                _ => None,
+            })
+        })
+        .await
+        .expect("应收到 PunchHoleRequest");
+        assert_eq!(req.udp_port, i32::from(observed), "udp_port 必须填公网观测端口");
+    }
+
+    /// 两个目的端口观测到**不同**源端口 → `Symmetric`（打洞无望）。
+    #[tokio::test]
+    async fn nat_probe_detects_symmetric_nat() {
+        let hbbs = FakeHbbs::start().await;
+        hbbs.state.symmetric_nat.store(true, Ordering::SeqCst);
+        let transport = hbbs.make_transport().await;
+        assert_eq!(
+            transport.nat_class_for_test(),
+            NatClass::Symmetric,
+            "两个目的端口观测不同应判为对称 NAT"
+        );
+
+        hbbs.set_punch_response("127.0.0.1:1".parse().unwrap(), Some(punch_hole_response::Union::IsLocal(true)));
+        let _ = transport.signal_punch("222222222").await;
+        let req = wait_for(&|| {
+            hbbs.received().iter().find_map(|m| match &m.union {
+                Some(Union::PunchHoleRequest(r)) => Some(r.clone()),
+                _ => None,
+            })
+        })
+        .await
+        .expect("应收到 PunchHoleRequest");
+        // 本机无 NAT：观测端口 == 本地端口，故此处等价于「兜底本地端口」。
+        let local = hbbs.client_udp().unwrap().port();
+        assert_eq!(req.udp_port, i32::from(local));
+    }
+
+    /// 探测**无应答** → `Unknown`（fail-open），`udp_port` 兜底本地端口。
+    #[tokio::test]
+    async fn nat_probe_is_unknown_without_response() {
+        let hbbs = FakeHbbs::start().await;
+        hbbs.state.silent_nat.store(true, Ordering::SeqCst);
+        let transport = hbbs.make_transport().await;
+        assert_eq!(
+            transport.nat_class_for_test(),
+            NatClass::Unknown,
+            "无应答应判为未知（fail-open）"
+        );
+        assert_eq!(transport.public_udp_port_for_test(), None, "无观测值");
+
+        hbbs.set_punch_response("127.0.0.1:1".parse().unwrap(), Some(punch_hole_response::Union::IsLocal(true)));
+        let _ = transport.signal_punch("222222222").await;
+        let req = wait_for(&|| {
+            hbbs.received().iter().find_map(|m| match &m.union {
+                Some(Union::PunchHoleRequest(r)) => Some(r.clone()),
+                _ => None,
+            })
+        })
+        .await
+        .expect("应收到 PunchHoleRequest");
+        let local = hbbs.client_udp().unwrap().port();
+        assert_eq!(req.udp_port, i32::from(local), "无观测值时 udp_port 兜底本地端口");
+    }
+
+    // ───────────────────────────── always_use_relay（两侧） ─────────────────────────────
+
+    /// `always_use_relay` 控制器侧：直接走中继，**不**发 `PunchHoleRequest`。
+    #[tokio::test]
+    async fn always_use_relay_skips_punch_on_controller_side() {
+        let hbbs = FakeHbbs::start().await;
+        hbbs.set_punch_response("127.0.0.1:1".parse().unwrap(), None);
+        let transport = hbbs.make_transport_with(true).await;
+
+        let established = transport
+            .establish(
+                dummy_request("s", "222222222", conn_id_from_token("t").to_be_bytes(), Vec::new()),
+                Role::Controller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(established.path, TransportPath::Relay, "always_use_relay 应直接走中继");
+        assert!(
+            !hbbs
+                .received()
+                .iter()
+                .any(|m| matches!(m.union, Some(Union::PunchHoleRequest(_)))),
+            "强制中继时不应发出 PunchHoleRequest"
+        );
+    }
+
+    /// `always_use_relay` 被控端侧：也直接走中继（旧实现忽略它，规则不对称）。
+    #[tokio::test]
+    async fn always_use_relay_skips_punch_on_controlled_side() {
+        let hbbs = FakeHbbs::start().await;
+        let transport = hbbs.make_transport_with(true).await;
+        let client_udp = hbbs.client_udp().unwrap();
+        let session_id = "sess-relay";
+
+        // 并发：establish 等中继推送；从旁发一条 UDP RequestRelay 把它唤醒。
+        let est = transport.establish(
+            dummy_request(session_id, "", [0u8; 8], Vec::new()),
+            Role::Controlled,
+        );
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let push = RendezvousMessage::with(Union::RequestRelay(RequestRelay {
+            id: "111111111".into(),
+            uuid: session_id.into(),
+            ..Default::default()
+        }))
+        .encode_to_vec();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sender.send_to(&push, client_udp).await.unwrap();
+
+        let established = tokio::time::timeout(Duration::from_secs(5), est)
+            .await
+            .expect("应在预算内完成")
+            .unwrap();
+        assert_eq!(established.path, TransportPath::Relay);
     }
 }

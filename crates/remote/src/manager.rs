@@ -1237,9 +1237,12 @@ impl RemoteManager {
             params,
             prefer_direct: true,
             early: handshake.hello_frame.clone(),
+            // 打洞会话标识由一次性 token 派生：两端各自算出同一个值，hbbs 的明文会合流量里
+            // 看不到它（见 `crate::punch`）。`token` 就在手边。
+            punch_cookie: crate::punch::conn_id_from_token(&token).to_be_bytes(),
         };
         let established = self.establish_guarded(request, Role::Controller, &cancel).await?;
-        // 记录实际路径（直连 / 中继），供 UI 展示。
+        // 记录实际路径（打洞 / 直连 / 中继），供 UI 展示。
         self.mark_active(&session_id, established.path);
         let duplex = established.stream;
         // 落地目录可能还不存在（首次使用）；建不出来就让下载直接失败，别让它到 99% 才炸。
@@ -1362,6 +1365,9 @@ impl RemoteManager {
         screen: Arc<dyn ScreenSource>,
         input: Arc<dyn InputSink>,
     ) {
+        // **在 `req.token` 被 move 进 `PendingSession` 之前**算出打洞会话标识，作为参数传给
+        // `controlled_task`（`PendingSession::new` 会 move 掉 `req.token`，顺序不能反）。
+        let punch_cookie = crate::punch::conn_id_from_token(&req.token).to_be_bytes();
         // 登记一次性 token（握手时消费），再回 accepted。
         self.lock_inner().pending.insert(PendingSession::new(
             req.session_id.clone(),
@@ -1402,7 +1408,9 @@ impl RemoteManager {
         let sid = req.session_id;
         let mode = req.mode;
         let task = async move {
-            let result = me.controlled_task(sid.clone(), mode, screen, input, cancel).await;
+            let result = me
+                .controlled_task(sid.clone(), mode, punch_cookie, screen, input, cancel)
+                .await;
             me.finish_session(&sid, result);
         };
         self.spawn_detached(task);
@@ -1413,6 +1421,7 @@ impl RemoteManager {
         self: &Arc<Self>,
         session_id: String,
         mode: RemoteMode,
+        punch_cookie: [u8; 8],
         screen: Arc<dyn ScreenSource>,
         input: Arc<dyn InputSink>,
         cancel: CancellationToken,
@@ -1425,9 +1434,11 @@ impl RemoteManager {
             params: self.current_params()?,
             prefer_direct: true,
             early: Vec::new(),
+            // 与被控端 token 同源的打洞会话标识（在 `accept_incoming` 里、token 被 move 前算出）。
+            punch_cookie,
         };
         let established = self.establish_guarded(request, Role::Controlled, &cancel).await?;
-        // 记录实际路径（直连 / 中继），供 UI 展示。
+        // 记录实际路径（打洞 / 直连 / 中继），供 UI 展示。
         self.mark_active(&session_id, established.path);
         let duplex = established.stream;
         let config = ControlledConfig {
@@ -1918,6 +1929,36 @@ mod tests {
         }
     }
 
+    /// 捕获 `EstablishRequest` 的建立器替身（验证 `punch_cookie` 传递）。
+    #[derive(Default)]
+    struct CaptureEstablisher {
+        /// 收到的全部建立请求。
+        requests: std::sync::Mutex<Vec<EstablishRequest>>,
+    }
+
+    impl CaptureEstablisher {
+        /// 取已捕获请求的 `punch_cookie` 快照。
+        fn cookies(&self) -> Vec<[u8; 8]> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.punch_cookie)
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl TransportEstablisher for CaptureEstablisher {
+        async fn establish(&self, request: EstablishRequest, _role: Role) -> RemoteResult<EstablishedStream> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Err(RemoteError::Signaling("测试用建立器".to_owned()))
+        }
+    }
+
     /// 以指定建立器构造管理器（`server_host` 固定为 `tunnel.example:8080`）。
     fn manager_with(enabled: bool, establisher: Arc<dyn TransportEstablisher>) -> Arc<RemoteManager> {
         RemoteManager::new(RemoteManagerConfig {
@@ -1983,6 +2024,68 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(spy.calls().is_empty(), "未开启被控时不应预登记");
+    }
+
+    /// `punch_cookie` 必须是**会话一次性 token** 派生的打洞标识——控制器与被控端两条路径都要在
+    /// `EstablishRequest` 里带上它，否则打洞会话无法建立（`PunchHole` 协议本身不带任何会话标识，
+    /// 两端只能各自从 token 算出同一个值来对上会话）。
+    #[tokio::test]
+    async fn establish_request_carries_punch_cookie_from_session_token() {
+        let cap = Arc::new(CaptureEstablisher::default());
+        let mgr = manager_with(true, cap.clone());
+
+        // 控制器路径：capability → grant(token = "t1") → accepted。
+        mgr.handle_control_message(ControlMessage::RemoteCapability {
+            params: Some(params()),
+            rd_id: "111111111".to_owned(),
+        });
+        mgr.handle_control_message(ControlMessage::RemoteConnectGrant {
+            session_id: "s-ctl".to_owned(),
+            token: "t1".to_owned(),
+            target_rd_id: "987654321".to_owned(),
+            target_platform: "linux".to_owned(),
+            params: params(),
+        });
+        mgr.handle_control_message(ControlMessage::RemoteSessionResponse {
+            session_id: "s-ctl".to_owned(),
+            accepted: true,
+            reason: None,
+        });
+        assert!(
+            wait_until(|| !cap.cookies().is_empty()).await,
+            "控制器应发起建立并带上 punch_cookie"
+        );
+        assert!(
+            wait_until(|| mgr.snapshot().active.is_none()).await,
+            "控制器会话应先收尾，被控端才不会被「已有进行中的会话」拒掉"
+        );
+
+        // 被控端路径：装平台 → RemoteSessionIncoming(token = "t2")（Auto 策略直接接受）。
+        mgr.install_platform(
+            Arc::new(crate::controlled::EmptyScreenSource),
+            Arc::new(crate::controlled::NullInputSink),
+        );
+        mgr.handle_control_message(ControlMessage::RemoteSessionIncoming {
+            session_id: "s-ctl2".to_owned(),
+            token: "t2".to_owned(),
+            from_name: "peer".to_owned(),
+            mode: RemoteMode::Control,
+        });
+        assert!(
+            wait_until(|| cap.cookies().len() >= 2).await,
+            "被控端也应发起建立并带上 punch_cookie，实得 {:?}",
+            cap.cookies()
+        );
+
+        let cookies = cap.cookies();
+        assert!(
+            cookies.contains(&crate::punch::conn_id_from_token("t1").to_be_bytes()),
+            "控制器侧 cookie 应由 token t1 派生，实得 {cookies:?}"
+        );
+        assert!(
+            cookies.contains(&crate::punch::conn_id_from_token("t2").to_be_bytes()),
+            "被控端侧 cookie 应由 token t2 派生，实得 {cookies:?}"
+        );
     }
 
     /// 先收到能力、后打开开关：打开时应补登记（托盘/UI 切换路径）。

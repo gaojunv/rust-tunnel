@@ -1,7 +1,8 @@
 //! 数据面传输抽象：把「建立一条双向字节流」与「会话跑在这条流上」解耦。
 //!
-//! 阶段 1 的建立策略是 **hbbr 中继为主路径**（[`crate::signaling::RustDeskTransport`]），
-//! 同内网直连为优化。测试用 `tokio::io::duplex` 注入内存替身。
+//! 建立策略是**三条路径**（[`crate::signaling::RustDeskTransport`] 实现）：
+//! **跨 NAT UDP 打洞**（优先，`Punch`）→ **同内网 TCP 直连**（`Direct`）→ **hbbr 中继兜底**
+//! （`Relay`，所有 NAT 场景可用）。测试用 `tokio::io::duplex` 注入内存替身。
 //!
 //! # 建立契约（务必遵守）
 //!
@@ -9,10 +10,12 @@
 //!   不要等待任何应答。
 //! - 控制器的 `Hello` 帧（[`crate::session::ControllerHandshake::hello_frame`]）由建立方
 //!   在 `RequestRelay` **之后、同一次 write** 里一并写出（流水线，省一个 RTT）；被控端
-//!   `early` 为空。因此会话循环**不再**发送 `Hello`，只等 `HelloAck`。
+//!   `early` 为空。因此会话循环**不再**发送 `Hello`，只等 `HelloAck`。**非中继路径**（直连/
+//!   打洞）没有中继帧可流水线，建立方要在拿到流后把 `early` 补写进去再返回。
 //! - 握手必须容忍「刚连上就收到对端 `Hello`」（后到者场景），不得假设严格的先发后收顺序。
-//! - 建立方**必须如实报告实际走的路径**（[`EstablishedStream::path`]）：直连与中继的延迟
-//!   差一个数量级，UI 需要据实展示；「回退中继」尤其不能谎报成直连。
+//! - 建立方**必须如实报告实际走的路径**（[`EstablishedStream::path`]）：直连/打洞与中继的延迟
+//!   差一个数量级，UI 需要据实展示；「回退中继」尤其不能谎报成直连，`Punch` 也**绝不能**是
+//!   「打洞失败后凑出来的」——**谎报路径等于骗用户**。
 
 use crate::error::RemoteResult;
 use async_trait::async_trait;
@@ -28,21 +31,27 @@ pub type BoxDuplex = Box<dyn Duplex>;
 
 /// 数据面实际走的路径。
 ///
-/// 直连（同内网 P2P）与中继（hbbr 转发）的往返延迟通常差一个数量级，UI 要据实展示；是否走了
-/// 直连也是用户判断「为什么慢」的关键线索，因此建立方必须如实回报，**不得**把回退中继谎报成直连。
+/// 三条路径的往返延迟通常相差一个数量级（中继 > 打洞 > 同内网直连），UI 要据实展示；是否走了
+/// 打洞/直连也是用户判断「为什么慢」的关键线索，因此建立方必须如实回报，**不得**把回退中继
+/// 谎报成打洞或直连。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportPath {
-    /// 同内网 P2P 直连（[`crate::signaling::RustDeskTransport`] 的 `try_direct` 成功）。
+    /// 同内网 TCP 直连：hbbs 判定双方同内网后回目标端的内网监听地址，控制器 `TcpStream::connect`。
     Direct,
-    /// hbbr 中继（跨 NAT 或直连不可用时的主路径）。
+    /// hbbr 中继：跨 NAT 或打洞/直连不可用时的兜底（所有 NAT 场景可用）。
     Relay,
+    /// 跨 NAT UDP 打洞成功：经 hbbs 交换双方公网 UDP 映射后对打，走 [`crate::reliable`] 可靠层。
+    ///
+    /// **必须**只在打洞握手（`SYN`/`SYN|ACK` 双向可达）真正成功后回报；打洞失败回退中继时
+    /// 必须报 [`TransportPath::Relay`]。
+    Punch,
 }
 
 /// 建立完成的一条数据面流：裸字节流 + **实际**走的路径。
 pub struct EstablishedStream {
     /// 双向字节流，交给会话循环跑 [`crate::session`] 协议。
     pub stream: BoxDuplex,
-    /// 该流实际走的路径（供 UI 展示「直连 / 中继」）。
+    /// 该流实际走的路径（供 UI 展示「打洞 / 直连 / 中继」）。
     pub path: TransportPath,
 }
 
@@ -75,10 +84,26 @@ pub struct EstablishRequest {
     pub peer_rd_id: String,
     /// 会合/中继参数。
     pub params: RemoteParams,
-    /// 是否优先尝试同内网直连（失败回退中继）。
+    /// 是否优先尝试打洞/直连（失败回退中继）。
     pub prefer_direct: bool,
     /// 中继路径下与 `RequestRelay` 帧写在同一次 write 的前置字节（控制器为预编码 `Hello` 帧）。
     pub early: Vec<u8>,
+    /// 打洞会话标识（= [`crate::punch::conn_id_from_token`]`(token).to_be_bytes()`）。
+    ///
+    /// # 为什么必须有
+    ///
+    /// RustDesk 的 `PunchHole` 协议里**没有任何会话标识**——hbbs 只按「请求方地址 ↔ 目标端地址」
+    /// 牵线，不携带会话 id。多标签页 / 并发会话下，两端若各自凭地址猜会话就会**串线**。因此打洞
+    /// 数据面必须自带一个双方各自算出、且第三方推不出的会话标识：它由服务端经**加密控制通道**
+    /// 下发的一次性 `token` 派生（见 [`crate::punch`]），hbbs 的**明文**会合流量里看不到它。
+    ///
+    /// # 为什么是 `[u8; 8]` 而不是 `String`
+    ///
+    /// 传的是**派生结果**而不是 `token` 本身：`token` 是数据面 KDF 与握手 HMAC 的秘密，不该为了
+    /// 一个会话标识而扩散到更多结构里。8 字节正是可靠层段头里 `conn_id`（`u64`）的宽度。
+    ///
+    /// 这是 **Rust 内部类型、不上线**（`PunchHole` 报文字段一个都不动）。
+    pub punch_cookie: [u8; 8],
 }
 
 /// 数据面建立器。
