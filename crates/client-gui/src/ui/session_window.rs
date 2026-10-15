@@ -668,6 +668,7 @@ pub(crate) fn transport_label(path: TransportPath) -> &'static str {
     match path {
         TransportPath::Direct => "P2P 直连",
         TransportPath::Relay => "中继",
+        TransportPath::Punch => "P2P 打洞",
     }
 }
 
@@ -694,5 +695,31 @@ fn join_virtual(dir: &str, name: &str) -> String {
         name.to_owned()
     } else {
         format!("{}/{}", dir.trim_end_matches('/'), name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三条路径的标签**必须互不相同**。
+    ///
+    /// `transport_label` 的 match 已经是穷尽的（加变体会编译失败），但穷尽**管不住写错值**：
+    /// 把 `Punch` 写成「中继」照样编译通过，而它恰好是用户唯一能看见的「字节有没有过服务器」
+    /// 的信号——中继与打洞的差别正是本项目要暴露给用户的那一件事。这条锁住「别把两条路合并
+    /// 成一个标签」。
+    #[test]
+    fn transport_labels_are_distinct() {
+        let labels = [
+            transport_label(TransportPath::Punch),
+            transport_label(TransportPath::Direct),
+            transport_label(TransportPath::Relay),
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            assert!(!a.is_empty(), "标签不得为空：{labels:?}");
+            for b in &labels[i + 1..] {
+                assert_ne!(a, b, "不同路径不得共用同一个标签：{labels:?}");
+            }
+        }
     }
 }
