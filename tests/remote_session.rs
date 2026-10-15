@@ -76,7 +76,14 @@ fn seed() -> u64 {
     nanos ^ (u64::from(std::process::id())).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0
 }
 
-/// 分配「会合端口 P + NAT 端口 P-1 + 中继端口 Q」三元组：同时探测四个套接字确认全空闲。
+/// 分配「会合端口 P + NAT 端口 P-1 + 中继端口 Q」三元组：同时探测**五个**套接字确认全空闲。
+///
+/// # 为什么是五个（别退回四个）
+///
+/// S0 之后服务端在 **NAT 探测端口（= rendezvous − 1）上同时绑 TCP 和 UDP**（UDP 半边供客户端
+/// 自判 NAT 映射类型，见 `crates/server/src/rustdesk_runtime.rs`）。这里少探那个 UDP 半边，
+/// 「端口全空闲」的保证就不再成立——若某次分配恰好选中一个已被他人占用的 UDP 端口，
+/// `bind_listeners` 会**偶发失败**（表现为随机红，最难查）。
 fn alloc_rustdesk_ports() -> RustdeskPorts {
     let mut used = used_ports().lock().expect("端口集合锁");
     let mut state = seed();
@@ -97,10 +104,11 @@ fn alloc_rustdesk_ports() -> RustdeskPorts {
             StdTcpListener::bind(("0.0.0.0", rendezvous)),
             StdUdpSocket::bind(("0.0.0.0", rendezvous)),
             StdTcpListener::bind(("0.0.0.0", nat)),
+            StdUdpSocket::bind(("0.0.0.0", nat)),
             StdTcpListener::bind(("0.0.0.0", relay)),
         );
-        if let (Ok(t_rp), Ok(u_rp), Ok(t_nat), Ok(t_relay)) = probes {
-            drop((t_rp, u_rp, t_nat, t_relay));
+        if let (Ok(t_rp), Ok(u_rp), Ok(t_nat), Ok(u_nat), Ok(t_relay)) = probes {
+            drop((t_rp, u_rp, t_nat, u_nat, t_relay));
             used.insert(rendezvous);
             used.insert(nat);
             used.insert(relay);
@@ -860,6 +868,299 @@ async fn data_plane_relay_session_between_two_managers() {
 
     // 传输现在靠 `Drop` 取消后台登记/直连任务（见 `signaling.rs` 的 `impl Drop`）；本用例断言
     // 已完成，两个 `Arc<RustDeskTransport>` 随函数结束一起释放即可，无需显式关闭。
+    drop((ctrl_transport, ctld_transport));
+}
+
+/// 取一个**与控制器侧不同的**本机 IPv4，用作被控端的 `rendezvous_host`（S5 打洞 e2e 的前提）。
+///
+/// # 为什么需要它（否则打洞一次都走不到）
+///
+/// hbbs 判「同内网」用的是 `peer_addr.ip() == remote.ip()`——两端**观测到的源 IP 是否相等**。
+/// harness 里控制服务器与 RustDesk 监听都绑 `127.0.0.1` / `0.0.0.0`，若两端都用 `127.0.0.1` 连
+/// hbbs，源 IP 相同 ⇒ 恒判同内网 ⇒ 只走 TCP 直连，UDP 打洞**一次都不会被走到**。让被控端换一个
+/// **不同的本机 IP** 去连 hbbs，源 IP 就不同 ⇒ 跨 NAT 分支 ⇒ hbbs 才会推 `PunchHole`。
+///
+/// # 为什么只动 `rendezvous_host`、不动 `server_host`
+///
+/// `server_host` 同时是**控制服务器**地址，而控制服务器只绑 `127.0.0.1`——改它会让客户端连不上
+/// 控制面（会话根本起不来）。`rendezvous_host` 是 `RemoteParams` 里独立字段，只影响 hbbs/hbbr
+/// 地址（`SignalingConfig::from_params` 优先取它），故只动它。harness 的 RustDesk 监听绑
+/// `0.0.0.0`（`rustdesk_bind_addr: None` → `effective_bind_addr` 兜底），所以被控端用
+/// `192.168.x.x` 也连得上 hbbs。
+///
+/// # 取地址的两步
+///
+/// 1. 先试 `127.0.0.2`：Linux 的 lo 覆盖整个 `127/8`，绑得上；它是**与 `127.0.0.1` 不同**的地址，
+///    足以让 `same_intranet` 为假（hbbs 只比「是否相等」，不关心它是不是回环）。macOS 的 lo0
+///    只有 `127.0.0.1`，这一步必然失败（`Errno 49`），落到第 2 步。
+/// 2. 纯 std 让内核按路由选源地址：`connect` 到 TEST-NET-1（`192.0.2.1:9`）**不发任何包**，只为
+///    让内核把 `local_addr()` 填成出网卡地址。
+///
+/// **取不到就 panic，绝不静默跳过**：`#[tokio::test]` 直接返回即算通过——静默跳过会让这条 e2e
+/// 永远不跑，而它正是本任务要建立的那条保证（「打洞在一台机器上真的走通」必须每次真被验证）。
+fn second_rendezvous_ipv4() -> std::net::Ipv4Addr {
+    if let Ok(sock) = StdUdpSocket::bind(("127.0.0.2", 0)) {
+        if let Ok(addr) = sock.local_addr() {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                // 127.0.0.2 属 127/8，但它是**另一个**地址——hbbs 只比相等性。
+                if v4 != std::net::Ipv4Addr::LOCALHOST && !v4.is_unspecified() {
+                    return v4;
+                }
+            }
+        }
+    }
+    let sock = StdUdpSocket::bind("0.0.0.0:0").expect("绑定源地址探测套接字");
+    // TEST-NET-1：只用于让内核选源地址，不真的发包。
+    sock.connect(("192.0.2.1", 9)).expect("connect 到 TEST-NET-1 选源地址");
+    match sock.local_addr().expect("取探测套接字本地地址").ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => v4,
+        other => panic!(
+            "取不到第二个非回环 IPv4（实得 {other}）——本机打洞 e2e 无法运行；\
+             **绝不静默跳过**（跳过 = 这条用例永远不跑，正是本任务要避免的事）"
+        ),
+    }
+}
+
+/// S5：**本机真的走到 UDP 打洞路径**的 e2e——两侧各自独立上报 `TransportPath::Punch`，且画面真的到达。
+///
+/// # 怎么让一台机器上的两端「跨 NAT」
+///
+/// 见 [`second_rendezvous_ipv4`]：逐侧给不同的 `rendezvous_host`（控制器 `127.0.0.1`、被控端本机
+/// 第二个 IPv4）→ hbbs 观测到两个不同源 IP → 走跨 NAT 分支。除 `rendezvous_host` 外，两侧的
+/// `rendezvous_port`/`relay_port`/`relay_server`/`public_key`/`always_use_relay` 完全一致。
+///
+/// # 强断言为什么成立（这是本条 e2e 的全部价值）
+///
+/// 本用例把**中继设成死的**：`relay_server = "127.0.0.1"`（不含端口）+ `relay_port = 1`（无人监听）。
+/// **这两个字段必须分开设**——`signaling.rs::resolve(host, port)` **永远使用 `port` 实参**，并先用
+/// `strip_port` 把 host 串里嵌的端口剥掉。所以把 `relay_server` 写成 `"127.0.0.1:1"` 会被解析成
+/// `127.0.0.1:<relay_port>`，即**真实活着的中继端口**，强断言当场变成假的。别「顺手合并」回去。
+///
+/// 于是：中继兜底**不可能成功**（TCP 连端口 1 必被拒）⇒ 会话只要能跑通，就**只可能**是打洞路径。
+/// 这正是敢断言 `Punch`、而不是「`Punch` 或 `Relay`」的理由——放宽成后者会把这条 e2e 的价值抹掉。
+#[tokio::test]
+async fn data_plane_punch_session_between_two_managers() {
+    let harness = TestHarness::spawn(HarnessOpts::default()).await;
+    let ports = alloc_rustdesk_ports();
+    // always_use_relay=false：两侧都必须允许打洞（传 true 会让两侧直接走那条死中继、会话必失败）。
+    let resp = enable(&harness.api_client(), &ports, false).await;
+    let public_key = resp["key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("generate_key 应回传公钥: {resp}"))
+        .to_owned();
+
+    // server_host 两侧都是控制服务器地址（只绑 127.0.0.1），**不能改**——差异只在 rendezvous_host。
+    let server_host = harness.control_addr.to_string();
+    let base = RemoteParams {
+        rendezvous_host: String::new(),
+        rendezvous_port: ports.rendezvous,
+        // 死中继：端口 1 无人监听。`relay_server` 不含端口，端口由 `relay_port` 单独给（见上文）。
+        relay_port: 1,
+        relay_server: "127.0.0.1".to_owned(),
+        public_key,
+        always_use_relay: false,
+    };
+    let mut ctrl_params = base.clone();
+    ctrl_params.rendezvous_host = "127.0.0.1".to_owned();
+    let mut ctld_params = base;
+    ctld_params.rendezvous_host = second_rendezvous_ipv4().to_string();
+
+    // rd_id 用一组**未被本文件其他用例占用**的值（part B / B续 / C 用 111111111 / 222222222）；
+    // 并行用例共用同一个 hbbs 进程，登记表按 id 索引，撞号会互相覆盖。
+    let ctrl_transport = RustDeskTransport::new(SignalingConfig::from_params(
+        &ctrl_params,
+        "333333333".to_owned(),
+        &server_host,
+    ))
+    .await
+    .expect("构造控制器传输");
+    let ctld_transport = RustDeskTransport::new(SignalingConfig::from_params(
+        &ctld_params,
+        "444444444".to_owned(),
+        &server_host,
+    ))
+    .await
+    .expect("构造被控端传输");
+
+    let ctrl = manager(
+        &server_host,
+        "home-nas",
+        false,
+        "333333333",
+        &ctrl_params,
+        ctrl_transport.clone(),
+    );
+    let ctld = manager(
+        &server_host,
+        "office-pc",
+        true,
+        "444444444",
+        &ctld_params,
+        ctld_transport.clone(),
+    );
+
+    let (ctrl_sink, mut frame_rx) = RecordingSink::with_notify();
+    let (ctld_input, _input_rx) = RecordingInput::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), ctld_input);
+
+    let (ctrl_tx, _ctrl_upstream) = mpsc::channel(64);
+    let (ctld_tx, mut ctld_upstream) = mpsc::channel(64);
+    ctrl.attach(ctrl_tx);
+    ctld.attach(ctld_tx);
+
+    // UDP `RegisterPeer` 心跳没有 ack：等两端在 hbbs 登记完成再发起（理由同 part B）。被控端那条
+    // 登记尤其关键——hbbs 要拿它的**已登记 UDP 映射**当打洞目标回给控制器。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    ctrl.handle_control_message(ControlMessage::RemoteConnectGrant {
+        session_id: "sess-punch".to_owned(),
+        token: "tok-punch".to_owned(),
+        target_rd_id: "444444444".to_owned(),
+        target_platform: "linux".to_owned(),
+        params: ctrl_params.clone(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteSessionIncoming {
+        session_id: "sess-punch".to_owned(),
+        token: "tok-punch".to_owned(),
+        from_name: "home-nas".to_owned(),
+        mode: RemoteMode::Control,
+    });
+    relay_acceptance(&mut ctld_upstream, &ctrl).await;
+
+    // ── 强断言①：两侧都独立上报「真的走了打洞」─────────────────────────────
+    // 控制器最坏耗时 = DIRECT_SIGNAL_TIMEOUT(3s) + PUNCH_BUDGET(3s) = 6s，10s 是裕量。两侧各断言
+    // 一次：控制器与被控端**各自独立**上报路径（`EstablishedStream::path` → `RemoteUiState::transport`）。
+    assert!(
+        wait_within(Duration::from_secs(10), || ctrl.snapshot().transport == Some(TransportPath::Punch)).await,
+        "控制器应如实上报打洞路径（中继是死的 ⇒ 只可能是打洞），实得 {:?}",
+        ctrl.snapshot().transport
+    );
+    assert!(
+        wait_within(Duration::from_secs(10), || ctld.snapshot().transport == Some(TransportPath::Punch)).await,
+        "被控端应如实上报打洞路径，实得 {:?}",
+        ctld.snapshot().transport
+    );
+
+    // ── 强断言②：至少一帧画面真的到达 ─────────────────────────────────────
+    // 证明会话**真的跑在这条打洞链路上**，而不只是「路径标签对了」。
+    tokio::time::timeout(WAIT, frame_rx.recv())
+        .await
+        .expect("等画面超时——会话没有真的跑在打洞链路上")
+        .expect("画面通道关闭");
+    assert!(ctrl_sink.frames.load(Ordering::Relaxed) >= 1, "应收到画面");
+
+    drop((ctrl_transport, ctld_transport));
+}
+
+/// S5 负对照：**证明「死中继」这个技巧真的有效**——否则上面那条 e2e 的强断言就是假的。
+///
+/// 配置与 [`data_plane_punch_session_between_two_managers`] 完全相同（含那条死中继），**只**把两侧
+/// `always_use_relay` 改成 `true`：两侧都被禁止打洞、只能走死中继 ⇒ 会话**必然建不起来**。若中继
+/// 其实还活着（比如端口写错了），这里会意外地建起来——那正是要防的「强断言是假的」。
+///
+/// # 有界，不挂死
+///
+/// 被控端在 `establish_controlled` 里会等 `RELAY_WAIT`(25s)，但控制器侧 `connect_relay` 连端口 1
+/// 会被**立刻**拒（ECONNREFUSED），故断言预算压在 10s 内即可，到点判过、不陪被控端等满 25s。
+/// 两个 `RemoteManager` 随 `Arc` drop 而停（会话任务持有的传输在 manager 释放后失去引用）。
+#[tokio::test]
+async fn dead_relay_negative_control_makes_the_session_fail() {
+    let harness = TestHarness::spawn(HarnessOpts::default()).await;
+    let ports = alloc_rustdesk_ports();
+    // always_use_relay=true：两侧都禁止打洞（与上一条用例的唯一差异）。
+    let resp = enable(&harness.api_client(), &ports, true).await;
+    let public_key = resp["key"]
+        .as_str()
+        .unwrap_or_else(|| panic!("generate_key 应回传公钥: {resp}"))
+        .to_owned();
+
+    let server_host = harness.control_addr.to_string();
+    let base = RemoteParams {
+        rendezvous_host: String::new(),
+        rendezvous_port: ports.rendezvous,
+        relay_port: 1,
+        relay_server: "127.0.0.1".to_owned(),
+        public_key,
+        always_use_relay: true, // ← 与上一条的唯一差异。
+    };
+    let mut ctrl_params = base.clone();
+    ctrl_params.rendezvous_host = "127.0.0.1".to_owned();
+    let mut ctld_params = base;
+    ctld_params.rendezvous_host = second_rendezvous_ipv4().to_string();
+
+    let ctrl_transport = RustDeskTransport::new(SignalingConfig::from_params(
+        &ctrl_params,
+        "333333333".to_owned(),
+        &server_host,
+    ))
+    .await
+    .expect("构造控制器传输");
+    let ctld_transport = RustDeskTransport::new(SignalingConfig::from_params(
+        &ctld_params,
+        "444444444".to_owned(),
+        &server_host,
+    ))
+    .await
+    .expect("构造被控端传输");
+
+    let ctrl = manager(
+        &server_host,
+        "home-nas",
+        false,
+        "333333333",
+        &ctrl_params,
+        ctrl_transport.clone(),
+    );
+    let ctld = manager(
+        &server_host,
+        "office-pc",
+        true,
+        "444444444",
+        &ctld_params,
+        ctld_transport.clone(),
+    );
+
+    let (ctrl_sink, mut frame_rx) = RecordingSink::with_notify();
+    let (ctld_input, _input_rx) = RecordingInput::with_notify();
+    ctrl.install_frame_sink(ctrl_sink.clone());
+    ctld.install_platform(Arc::new(FakeScreen), ctld_input);
+
+    let (ctrl_tx, _ctrl_upstream) = mpsc::channel(64);
+    let (ctld_tx, mut ctld_upstream) = mpsc::channel(64);
+    ctrl.attach(ctrl_tx);
+    ctld.attach(ctld_tx);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    ctrl.handle_control_message(ControlMessage::RemoteConnectGrant {
+        session_id: "sess-deadrelay".to_owned(),
+        token: "tok-deadrelay".to_owned(),
+        target_rd_id: "444444444".to_owned(),
+        target_platform: "linux".to_owned(),
+        params: ctrl_params.clone(),
+    });
+    ctld.handle_control_message(ControlMessage::RemoteSessionIncoming {
+        session_id: "sess-deadrelay".to_owned(),
+        token: "tok-deadrelay".to_owned(),
+        from_name: "home-nas".to_owned(),
+        mode: RemoteMode::Control,
+    });
+    // 转达 accepted：控制器据此**才会**去建立数据面（否则它停在协商态、什么都没试，负对照就空了）。
+    relay_acceptance(&mut ctld_upstream, &ctrl).await;
+
+    // 画面永远不到：预算内 `recv()` 必须超时（`Err`）。
+    let frame = tokio::time::timeout(Duration::from_secs(10), frame_rx.recv()).await;
+    assert!(frame.is_err(), "死中继下不应有任何画面，实得 {frame:?}");
+    // 会话建立不起来：控制器从未记录数据面路径（连不上死中继 ⇒ `establish` 返回 Err）。
+    assert_eq!(
+        ctrl.snapshot().transport,
+        None,
+        "死中继下控制器不应上报任何数据面路径，实得 {:?}",
+        ctrl.snapshot().transport
+    );
+    assert_eq!(ctrl_sink.frames.load(Ordering::Relaxed), 0, "不应有任何画面帧");
+
     drop((ctrl_transport, ctld_transport));
 }
 
