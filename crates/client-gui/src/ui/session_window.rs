@@ -451,7 +451,9 @@ fn paint_image(
     size: egui::Vec2,
 ) {
     let (texture, _width, _height) = image;
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    // 仍然要占位分配这个区域（布局与可交互性不能变），但输入捕获不再依赖 `response`
+    // （见 `RemoteView::capture_input`：`hovered()` 会被 egui 的交互簿记影响）。
+    let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     ui.painter().image(
         texture,
         rect,
@@ -461,7 +463,7 @@ fn paint_image(
     // 只有「完全控制」模式捕获输入：仅观看 / 仅文件传输不该注入键鼠。
     if active.mode == RemoteMode::Control {
         // 坐标按所选显示器的尺寸映射（由 `capture_input` 内部取），与纹理是否缩放无关。
-        v.capture_input(ui, manager, &response, rect);
+        v.capture_input(ui, manager, rect);
     }
 }
 
@@ -503,6 +505,11 @@ fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo
                     ui.end_row();
                     ui.label(RichText::new("收码率").weak().small());
                     ui.label(state.recv_kbps.map_or("—".to_owned(), format_kbps));
+                    ui.end_row();
+                    // 输入速率：本端**捕获并注入**的事件数（不是远端是否响应）。用来一眼分辨
+                    // 「UI 压根没产生事件」与「事件已注入但远端没反应」。
+                    ui.label(RichText::new("输入").weak().small());
+                    ui.label(format!("{}/s", v.input_rate));
                     ui.end_row();
                     ui.label(RichText::new("时长").weak().small());
                     ui.label(format!("{:02}:{:02}", secs / 60, secs % 60));

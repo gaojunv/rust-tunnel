@@ -327,7 +327,7 @@ const MODIFIER_CODES: [(u8, u32); 4] = [
     (modifier::META, keycode::META),
 ];
 
-/// 鼠标键顺序（下标与 `mouse_seen` / `mouse_forwarded` 对应）。
+/// 鼠标键顺序（下标与 `mouse_forwarded` 对应）。
 const MOUSE_BUTTONS: [MouseButton; 3] = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
 
 /// 组一个键盘 [`InputEvent`]（减少重复字面量）。
@@ -341,6 +341,16 @@ fn mouse_index(button: MouseButton) -> usize {
         MouseButton::Left => 0,
         MouseButton::Right => 1,
         MouseButton::Middle => 2,
+    }
+}
+
+/// egui 的指针键 → 引擎鼠标键；只认 [`MOUSE_BUTTONS`] 里的三个，侧键（`Extra1`/`Extra2`）不转达。
+fn mouse_button_of(button: egui::PointerButton) -> Option<MouseButton> {
+    match button {
+        egui::PointerButton::Primary => Some(MouseButton::Left),
+        egui::PointerButton::Secondary => Some(MouseButton::Right),
+        egui::PointerButton::Middle => Some(MouseButton::Middle),
+        egui::PointerButton::Extra1 | egui::PointerButton::Extra2 => None,
     }
 }
 
@@ -358,14 +368,13 @@ fn mouse_index(button: MouseButton) -> usize {
 /// - **抬起必须无条件转达**：只要这次按下**曾经**转达过，其抬起就必须发出去——哪怕指针已
 ///   移出画面、甚至移出窗口。否则远端会残留一个按下的键或鼠标键。
 ///
-/// 为此这里分别跟踪「观察到的物理状态」（`*_seen`，做边沿检测）与「已转达按下、等待抬起」
-/// 的集合（`*_forwarded`）。键盘与修饰键同一门控：只有「本窗口有焦点」且「没有 egui 控件在
-/// 吃键盘输入」时才转发按下，避免把用户在本地输入框里敲的字、Ctrl+C 之类同时注入远端。
+/// 为此这里跟踪「已转达按下、等待抬起」的集合（`*_forwarded`）；**鼠标键不做自己的边沿检测**，
+/// 而是要求调用方直接喂「按下边沿」（见 [`Self::mouse_button`]）。键盘与修饰键同一门控：只有
+/// 「本窗口有焦点」且「没有 egui 控件在吃键盘输入」时才转发按下，避免把用户在本地输入框里敲的
+/// 字、Ctrl+C 之类同时注入远端。
 #[derive(Debug, Default)]
 pub struct InputGate {
-    /// 上一帧观察到的鼠标键是否按下（下标见 [`MOUSE_BUTTONS`]）。
-    mouse_seen: [bool; 3],
-    /// 已转达按下、尚未转达抬起的鼠标键。
+    /// 已转达按下、尚未转达抬起的鼠标键（下标见 [`MOUSE_BUTTONS`]）。
     mouse_forwarded: [bool; 3],
     /// 已转达按下、尚未转达抬起的特殊键（跨平台键码；文本键无配对抬起，不进此集合）。
     keys_forwarded: BTreeSet<u32>,
@@ -376,17 +385,22 @@ pub struct InputGate {
 }
 
 impl InputGate {
-    /// 鼠标按键门控。`down` 为**本帧该键是否处于按下态**（不是「刚按下」——边沿由本结构自行
-    /// 判断）；`pointer_in_image` 为指针是否位于画面内。返回要转达的按下/抬起事件，不转达时
-    /// 为 `None`。语义见类型文档。
+    /// 鼠标按键门控。`pressed` 为**本帧是否发生「按下」边沿**（不是「当前是否按住」——
+    /// egui 的 `i.events` 里每次都带一条独立的 `PointerButton{pressed:false}` 抬起事件，边沿由
+    /// 调用方直接从事件流取，不要用 [`egui::PointerState::button_down`] 这类**电平**替代）；
+    /// `pointer_in_image` 为按下那一刻指针是否位于画面内。返回要转达的按下/抬起事件，不转达时为
+    /// `None`。语义见类型文档。
+    ///
+    /// **为什么必须是边沿而不是电平**：`button_down()` 是电平，而 egui 自己的文档就写着「a press
+    /// can be shorter than one frame」——按下与抬起都落在两次 egui pass 之间的那次短按，在下一帧
+    /// 读到的电平已经是 `false`，电平式边沿检测会把**整个点击**吞掉（而鼠标移动是读指针位置的
+    /// 电平，照常工作，于是表现成「画面在动、悬停正常，就是点不动」）。更糟的是 `PointerState.down[]`
+    /// 跨帧保持、只由按键事件改写：漏掉一次抬起事件会让电平**永久**停在按下，此后每一次按下都被当成
+    /// 「无变化」丢掉。改成边沿后这两条都不复存在：事件流里有什么边沿就转达什么边沿。
     #[must_use]
-    pub fn mouse_button(&mut self, button: MouseButton, down: bool, pointer_in_image: bool) -> Option<InputEvent> {
+    pub fn mouse_button(&mut self, button: MouseButton, pressed: bool, pointer_in_image: bool) -> Option<InputEvent> {
         let idx = mouse_index(button);
-        if down == self.mouse_seen[idx] {
-            return None; // 无状态变化
-        }
-        self.mouse_seen[idx] = down;
-        if down {
+        if pressed {
             // 按下：只有指针在画面上才转达。
             if !pointer_in_image {
                 return None;
@@ -490,7 +504,6 @@ impl InputGate {
         out.extend(self.release_modifiers());
         out.extend(self.release_keys());
         // 观察基线一并清零：重新进入捕获时不因残留基线凭空产生边沿。
-        self.mouse_seen = [false; 3];
         self.modifiers_seen = 0;
         out
     }
@@ -510,7 +523,6 @@ impl InputGate {
 
     /// 清空所有状态、**不**补发事件（会话已确定不可达、或纯 UI 复位时用）。
     pub fn reset(&mut self) {
-        self.mouse_seen = [false; 3];
         self.mouse_forwarded = [false; 3];
         self.keys_forwarded.clear();
         self.modifiers_seen = 0;
@@ -882,6 +894,15 @@ pub struct RemoteView {
     fps_base: u32,
     /// 上一次结算帧率的时刻（`None` = 尚未开始统计）。
     fps_since: Option<Instant>,
+    /// 本次会话累计转达的输入事件数（[`Self::forward_input`] 自增，用于结算速率）。
+    input_count: u32,
+    /// 上一次结算输入速率时的累计事件数基线。
+    input_base: u32,
+    /// 输入事件速率（每秒结算一次）——展示在会话统计角标里，用来一眼分辨「UI 压根没产生事件」与
+    /// 「事件已经注入、但远端没反应」。
+    pub input_rate: u32,
+    /// 上一次结算输入速率的时刻（`None` = 尚未开始统计）。
+    input_since: Option<Instant>,
 }
 
 impl RemoteView {
@@ -921,6 +942,10 @@ impl RemoteView {
             fps: 0,
             fps_base: 0,
             fps_since: None,
+            input_count: 0,
+            input_base: 0,
+            input_rate: 0,
+            input_since: None,
         }
     }
 
@@ -968,6 +993,11 @@ impl RemoteView {
         self.gate.reset();
         self.capture_this_frame = false;
         self.selected_display = None;
+        // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
+        self.input_count = 0;
+        self.input_base = 0;
+        self.input_rate = 0;
+        self.input_since = None;
         // 本机剪贴板读取结果属于上一会话：清空槽位，并推进「代」以作废在途读取——后台线程若在
         // 复位之后才写回旧结果，其代号与当前不符，会被 `take_clipboard_read` 丢弃，不会流入下一
         // 个会话的输入框。
@@ -1067,17 +1097,13 @@ impl RemoteView {
     /// 缩放）。目标坐标系是**所选显示器的尺寸**（见 [`Self::input_target_size`]），不是纹理像素
     /// 尺寸——纹理处在编码坐标系里（可能被缩放），用它算坐标会让注入落到错误位置。
     ///
-    /// 事件来源是**整窗**的，故按键/滚轮/键盘都要经 [`InputGate`] 门控（详见其文档）：鼠标
-    /// 按下只在指针位于画面上时转达、抬起只要曾转达过就无条件转达；滚轮只在指针位于画面上
-    /// 时转达；键盘只在窗口有焦点且无控件吃键盘输入时转达。鼠标移动仍只在指针位于画面上时
-    /// 更新（`hover_pos` 本身即以 `hovered()` 为准）。
-    pub fn capture_input(
-        &mut self,
-        ui: &egui::Ui,
-        manager: &Arc<RemoteManager>,
-        response: &egui::Response,
-        rect: egui::Rect,
-    ) {
+    /// 「指针是否在画面上」的判据是 **`rect ∩ ui.clip_rect()` 包含指针位置**，**且**该位置最上层的
+    /// 可交互 area 是本面板（挡住画面的浮层不算画面，见 `capture_input` 里的注释）。事件来源是
+    /// **整窗**的，故按键/滚轮/键盘都要经 [`InputGate`] 门控（详见其文档）：鼠标按下只在指针位于
+    /// 画面上时转达、抬起只要曾转达过就无条件转达；滚轮只在指针位于画面上时转达；键盘只在窗口
+    /// 有焦点且无控件吃键盘输入时转达。鼠标键按下/抬起直接取 `i.events` 里的 `PointerButton`
+    /// **边沿**（电平式 `button_down()` 会吞掉整帧内完成的短按，见 [`InputGate::mouse_button`]）。
+    pub fn capture_input(&mut self, ui: &egui::Ui, manager: &Arc<RemoteManager>, rect: egui::Rect) {
         // 独占键盘的退出组合键**先**拦截：命中即关闭独占、本帧不转发任何输入（组合键不能泄给远端）。
         // 不置 `capture_this_frame`，让窗口回调在本帧补发一次抬起——刚改了键盘语义，先松开最安全。
         if self.exclusive_keyboard && exit_combo_pressed(ui.ctx()) {
@@ -1091,17 +1117,26 @@ impl RemoteView {
         // 目标坐标系 = 所选显示器的尺寸（与注入端同一套全局显示坐标），不是纹理像素尺寸。
         let (target_w, target_h) = self.input_target_size(display);
 
-        // 指针是否在画面内：拖动本控件（画面）期间 `hovered()` 会变 false，故把
-        // `is_pointer_button_down_on()` 也算进来，让「在画面上按下后拖出画面」的拖动继续生效。
-        let pointer_in_image = response.hovered() || response.is_pointer_button_down_on();
+        // 有效画面区域：画面矩形再与本 UI 的裁剪矩形相交（画面被滚动区裁掉时，露在外面的部分才可交互）。
+        // 还要**再加半条层级判据**：该位置最上层的可交互 area 必须是本面板。否则浮在画面之上的会话
+        // 统计角标（`egui::Window`）与任何弹出层都会被当成画面——点它们会同时注入远端一次点击。
+        // 旧的 `hovered()` 天然含这一条（"本控件在最上层"就是它的语义），换成几何判据后必须自己补。
+        // 面板（工具条/侧栏）不占画面矩形，故不受影响。
+        let clip = rect.intersect(ui.clip_rect());
+        let panel_layer = ui.layer_id();
+        let in_image =
+            |pos: egui::Pos2| clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(panel_layer);
 
-        // 1) 鼠标移动（去重后发送；仅在指针位于画面上时更新）。
-        if let Some(pos) = response.hover_pos() {
+        // 1) 鼠标移动（去重后发送）。取**原始**指针位置而不是 `response.hover_pos()`——`hovered()`
+        //    会被 egui 的交互簿记影响（任何别的控件被拖动、或画面上方有别的 layer 覆盖时它为
+        //    `false`），远端输入不该由它决定；用「指针是否落在画面矩形内」这个判据，语义更直接也更稳。
+        //    `latest_pos()` 在 `PointerGone`（指针离开视口）后为 `None`，故不会拿陈旧坐标继续注入。
+        if let Some(pos) = ui.input(|i| i.pointer.latest_pos()).filter(|pos| in_image(*pos)) {
             let x = scale_axis(pos.x - rect.min.x, rect.width(), target_w);
             let y = scale_axis(pos.y - rect.min.y, rect.height(), target_h);
             if self.last_mouse != Some((x, y)) {
                 self.last_mouse = Some((x, y));
-                manager.send_input(InputEvent::MouseMove { x, y, display });
+                self.forward_input(manager, InputEvent::MouseMove { x, y, display });
             }
         }
 
@@ -1116,33 +1151,30 @@ impl RemoteView {
             focused && !ui.ctx().wants_keyboard_input()
         };
 
-        // 2) 鼠标按键 / 滚轮 / 修饰键（经门控，按边沿发送）。
-        let (buttons, scroll, mods) = ui.input(|i| {
-            (
-                [
-                    i.pointer.button_down(egui::PointerButton::Primary),
-                    i.pointer.button_down(egui::PointerButton::Secondary),
-                    i.pointer.button_down(egui::PointerButton::Middle),
-                ],
-                i.raw_scroll_delta,
-                egui_modifiers(i.modifiers),
-            )
-        });
-        for (button, down) in [
-            (MouseButton::Left, buttons[0]),
-            (MouseButton::Right, buttons[1]),
-            (MouseButton::Middle, buttons[2]),
-        ] {
-            if let Some(event) = self.gate.mouse_button(button, down, pointer_in_image) {
-                manager.send_input(event);
+        // 本帧的原始事件（鼠标按键 / 键盘 / 文本都在其中）：只克隆一次，下面两处判定共用。
+        let events = ui.input(|i| i.events.clone());
+        let (scroll, mods) = ui.input(|i| (i.raw_scroll_delta, egui_modifiers(i.modifiers)));
+
+        // 2) 鼠标按键：**按事件流里的边沿**转达（按下/抬起各是独立一条 `PointerButton` 事件）。
+        //    egui 会把同一帧内发生的按下与抬起**两条都留在 `i.events` 里**（参见其
+        //    `button_pressed`/`any_pressed` 的文档注记），所以这条路径不会丢短按；按顺序扫描保证
+        //    「按下→抬起」的先后关系不被颠倒。
+        for event in &events {
+            if let egui::Event::PointerButton { pos, button, pressed, .. } = event {
+                let Some(button) = mouse_button_of(*button) else { continue }; // 只认左/右/中键
+                if let Some(event) = self.gate.mouse_button(button, *pressed, in_image(*pos)) {
+                    self.forward_input(manager, event);
+                }
             }
         }
+        // 滚轮：gate 不变，但「指针是否在画面上」取当前原始指针位置（滚轮事件不带坐标）。
+        let pointer_in_image = ui.input(|i| i.pointer.latest_pos()).is_some_and(in_image);
         // egui 的滚动量为正表示内容上移，enigo 正值为向下滚动 → 取反。
         if let Some(event) = InputGate::wheel(pointer_in_image, -round_i32(scroll.x), -round_i32(scroll.y)) {
-            manager.send_input(event);
+            self.forward_input(manager, event);
         }
         for event in self.gate.modifiers(mods, keyboard_enabled) {
-            manager.send_input(event);
+            self.forward_input(manager, event);
         }
         // 键盘门控关闭（失焦 / 有控件在吃键盘输入）时每帧收敛：把「已转达按下」的特殊键补发抬起。
         // 这里不能只依赖下面的事件循环——egui 在窗口失焦时不会合成 key-up，若不在门控关闭的这一帧
@@ -1150,35 +1182,43 @@ impl RemoteView {
         // 状态清空后重复调用返回空，故不会每帧重发抬起。
         if !keyboard_enabled {
             for event in self.gate.release_keys() {
-                manager.send_input(event);
+                self.forward_input(manager, event);
             }
         }
 
         // 3) 键盘事件（特殊键走 code；文本走 TEXT）。控制字符（Enter/Tab 等）已由 Key 事件
-        //    处理，`InputGate::text` 会把纯控制文本滤掉，避免重复。
-        let events = ui.input(|i| i.events.clone());
-        for event in events {
+        //    处理，`InputGate::text` 会把纯控制文本滤掉，避免重复。复用上面那份事件列表。
+        for event in &events {
             match event {
                 egui::Event::Key { key, pressed, .. } => {
                     // 本窗口的本地快捷键不转发：`F11` 切全屏恒不转发；`Esc` 只在全屏时被本端
                     // 消费（退出全屏），非全屏时照常透传给远端。
-                    if key == egui::Key::F11 || (key == egui::Key::Escape && self.fullscreen) {
+                    if *key == egui::Key::F11 || (*key == egui::Key::Escape && self.fullscreen) {
                         continue;
                     }
-                    if let Some(code) = egui_key_to_code(key) {
-                        for out in self.gate.key(code, pressed, keyboard_enabled, mods) {
-                            manager.send_input(out);
+                    if let Some(code) = egui_key_to_code(*key) {
+                        for out in self.gate.key(code, *pressed, keyboard_enabled, mods) {
+                            self.forward_input(manager, out);
                         }
                     }
                 }
                 egui::Event::Text(text) => {
-                    if let Some(out) = InputGate::text(&text, keyboard_enabled, mods) {
-                        manager.send_input(out);
+                    if let Some(out) = InputGate::text(text, keyboard_enabled, mods) {
+                        self.forward_input(manager, out);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// 投递一条捕获到的输入事件并计数（计数用于会话统计角标里的「输入」读数列）。
+    ///
+    /// 捕获路径**一律**经此投递，避免漏计；`release_input` / `end_session` 的收尾补发走
+    /// [`InputGate::release_all`] 直接 `send_input`，那是清理而非用户输入，不计入速率。
+    fn forward_input(&mut self, manager: &Arc<RemoteManager>, event: InputEvent) {
+        self.input_count = self.input_count.wrapping_add(1);
+        manager.send_input(event);
     }
 
     /// 本次会话结束事件是否该触发**断线自动重连**。
@@ -1392,22 +1432,33 @@ impl RemoteView {
         }
     }
 
-    /// 每秒结算一次帧率：读共享槽里的累计帧数（引擎运行时线程自增），按流逝秒数算平均。
+    /// 每秒结算一次帧率与输入速率。
+    ///
+    /// 帧率读共享槽里的累计帧数（引擎运行时线程自增）；输入速率读本视图的 [`Self::input_count`]
+    /// （捕获路径自增）。两者都按流逝秒数算平均。
     pub fn poll_fps(&mut self, now: Instant) {
-        let count = self.shared.lock().map_or(0, |guard| guard.frame_count);
-        let Some(since) = self.fps_since else {
-            self.fps_since = Some(now);
-            self.fps_base = count;
+        let frames = self.shared.lock().map_or(0, |guard| guard.frame_count);
+        Self::settle_rate(frames, &mut self.fps_base, &mut self.fps, &mut self.fps_since, now);
+        let inputs = self.input_count;
+        Self::settle_rate(inputs, &mut self.input_base, &mut self.input_rate, &mut self.input_since, now);
+    }
+
+    /// 结算一个「每秒速率」计数器的通用步骤：距上次结算不足 1 秒不动；否则按流逝秒数算平均并推进
+    /// 基线。首次调用只记下基线（`None` 起步的计数器在第二个采样窗口才有读数）。
+    fn settle_rate(count: u32, base: &mut u32, rate: &mut u32, since: &mut Option<Instant>, now: Instant) {
+        let Some(last) = *since else {
+            *since = Some(now);
+            *base = count;
             return;
         };
-        let elapsed = now.saturating_duration_since(since);
+        let elapsed = now.saturating_duration_since(last);
         if elapsed < Duration::from_secs(1) {
             return;
         }
         let secs = u32::try_from(elapsed.as_secs().max(1)).unwrap_or(1);
-        self.fps = count.wrapping_sub(self.fps_base) / secs;
-        self.fps_base = count;
-        self.fps_since = Some(now);
+        *rate = count.wrapping_sub(*base) / secs;
+        *base = count;
+        *since = Some(now);
     }
 
     /// 请求异步读取本机剪贴板：立刻返回，结果在下一次 [`Self::take_clipboard_read`] 取回。
@@ -1532,11 +1583,37 @@ mod tests {
     }
 
     #[test]
-    fn mouse_press_inside_image_is_forwarded_once() {
+    fn mouse_press_inside_image_is_forwarded() {
         let mut gate = InputGate::default();
         assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
-        // 仍按住（无新边沿）→ 不重复发。
-        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), None);
+    }
+
+    /// 同一帧内完成的「按下 + 抬起」：两条边沿都必须转达（点击不能凭空消失）。
+    ///
+    /// 回归锁：修之前这里读的是 `PointerState::button_down()` 的**电平**，而 egui 文档明说
+    /// 「a press can be shorter than one frame」——短按的那一帧读到的电平已经是 `false`，电平式
+    /// 边沿检测把整次点击吞掉；而鼠标移动是读指针位置（电平），照常工作，于是现场表现就是
+    /// 「画面在动、悬停正常，唯独点击没反应」。
+    #[test]
+    fn press_and_release_in_one_frame_are_both_forwarded() {
+        let mut gate = InputGate::default();
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        assert_eq!(gate.mouse_button(MouseButton::Left, false, true), Some(mouse_btn(MouseButton::Left, false)));
+    }
+
+    /// 漏掉一次「抬起」事件之后，下一次「按下」仍必须转达。
+    ///
+    /// 回归锁：修之前门控用 `mouse_seen[idx]` 电平做边沿检测，而电平跨帧保持、只由按键事件改写——
+    /// 一次漏掉的抬起会让它**永久**停在「按下」，此后每次按下都被当成「无状态变化」丢掉，表现为
+    /// 「点过一次之后鼠标键彻底失效」。改成边沿后，事件流里有什么边沿就转达什么边沿。
+    #[test]
+    fn missed_release_does_not_swallow_the_next_press() {
+        let mut gate = InputGate::default();
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        // 抬起事件丢了（未调用 `mouse_button(.., false, ..)`）→ 直接又来一次按下边沿，仍要转达。
+        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        // 远端此刻只见过按下：会话收尾的 `release_all` 会把抬起补齐（幂等，重复调用返回空）。
+        assert_eq!(gate.release_all(), vec![mouse_btn(MouseButton::Left, false)]);
     }
 
     #[test]
@@ -1564,8 +1641,8 @@ mod tests {
     fn mouse_drag_starting_in_image_releases_when_outside() {
         let mut gate = InputGate::default();
         assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
-        // 拖动期间指针离开画面：`pointer_in_image` 由 hovered||is_pointer_button_down_on 决定，
-        // 这里直接验证「指针在画面外」时按下状态不变则不重复发、抬起照发。
+        // 拖动期间指针离开画面：`pointer_in_image` 由「指针是否落在画面矩形内」决定，这里验证
+        // 「指针在画面外」时不会凭空多出一次按下、抬起照发。
         assert_eq!(gate.mouse_button(MouseButton::Left, true, false), None);
         assert_eq!(gate.mouse_button(MouseButton::Left, false, false), Some(mouse_btn(MouseButton::Left, false)));
     }
