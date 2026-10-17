@@ -1,0 +1,22 @@
+[package]
+name = "rust-tunnel-win-service"
+# 与 `crates/client-gui` 同一条发布列车（见 `crates/win-platform/Cargo.toml` 的说明）。
+version = "0.11.0"
+edition = "2021"
+description = "rust-tunnel unattended Windows host: SYSTEM service that launches the client instance into the console session"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rust-tunnel-client-service"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-tunnel-win-platform = { path = "../win-platform" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

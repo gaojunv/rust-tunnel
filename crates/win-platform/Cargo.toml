@@ -1,0 +1,21 @@
+[package]
+name = "rust-tunnel-win-platform"
+# 与 `crates/client-gui` 同一条发布列车：服务端门控比对的是 `CARGO_PKG_VERSION`，
+# 而本 crate 与承载客户端身份的 GUI 实例是同版本一起下发的，抬版必须同步。
+version = "0.11.0"
+edition = "2021"
+description = "rust-tunnel Windows platform layer: secure-desktop capture/inject, session/token launch, service control"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+# Windows FFI 只在这个 target 下才构建：macOS/Linux 上本 crate 是**零依赖**的纯逻辑
+# crate（可移植模块照常全量单测），根目录 `cargo build` / `cargo test` 不被拖入
+# windows-sys。FFI 层自身可用 `cargo check --target x86_64-pc-windows-gnu` 在
+# 非 Windows 主机上做类型检查（check 不链接）。
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

@@ -63,7 +63,10 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
 - `crates/rustdesk`（`rust-tunnel-rustdesk`）— 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**（`frame`/`proto`/`addr`/`key`/`peer`/`relay`/`rendezvous`）
 - `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环/VP9 4:4:4 视频编码/文件传输），**无平台或 UI 依赖**（但含 vendored 的便携 C 编解码器 `vendor/shiguredo_libvpx`）
-- 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）
+- `crates/win-platform`（`rust-tunnel-win-platform`）— Windows 无人值守被控端的**平台层**：可移植模块（`error`/`pixels`/`report`/`session`/`desktop`/`monitor`/`inject`/`token`/`sysinfo`，纯 std、macOS 上全量单测）+ 仅在 Windows 编译的裸 FFI 模块（`capture`/`handle`/`service`/`probe`/`process`）。用 `windows-sys`（无 wrapper、无 libvpx），故本机可 `--target x86_64-pc-windows-gnu` 做**类型**检查
+- `crates/win-service`（`rust-tunnel-client-service`）— Windows 无人值守被控端的 **SYSTEM 服务** bin（哑监督者：SCM 注册/安装卸载、把实例拉进控制台会话、随会话变化重启）。**阶段 0 只有探针**（`--probe`/`--probe-in-service`/`--probe-instance`/`--uninstall`；`--install` 与裸 `--run` 是有意的报错）
+- 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）；`win-platform ← win-service`，且 `win-platform` **不得**依赖 `remote`（否则 libvpx 会被拖进服务 exe，而服务 exe 走 MSVC、没有预编译库）
+- **Windows 锁屏/登录界面为什么必须走服务**：`WinSta0\Winlogon` 桌面的 ACL 只放行 LocalSystem（Administrators 不在名单里）+ UIPI（LogonUI 是 System 完整性）+ 会话隔离（服务在会话 0）。**管理员身份运行无效**。详见根目录 `WINDOWS-SECURE-DESKTOP.md`（含阶段 0 真机探针清单与闸门）
 - **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
 ### 核心数据流
@@ -178,6 +181,16 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 **中继约束**：hbbr 按 uuid 配对，先发**恰好一个**带帧的 `RequestRelay` 然后转裸字节、**没有 ack**；`pair_window` 与 `idle_timeout` 都是 30s（任何字节都会重置 idle，每 3s 检查一次）。因此会话必须靠应用层心跳保活（`HEARTBEAT_INTERVAL` 低于 30s），**静止画面也不例外**。配对超时不会有任何错误通知，控制器必须自己按窗口超时提示，否则用户看到的是「卡在连接中」。
 
+#### Windows 无人值守被控端（阶段 0：探针）
+
+**要解决的问题**：控制 Windows 客户端的**锁屏/登录界面**时点击无反应。根因三层且缺一不可（Winlogon 桌面 ACL 不放行 Administrators + UIPI + 会话隔离），**「以管理员身份运行」无效**——唯一正路是 SYSTEM 服务把进程拉进控制台会话。完整清单/闸门/排障见根目录 `WINDOWS-SECURE-DESKTOP.md`。
+
+**阶段 0 的产物是日志不是特性**：现在 `rust-tunnel-client-service.exe` 只会跑探针，阶段 1 才把子实例换成 `rust-tunnel-client-gui.exe --instance`。**在真机探针的闸门通过之前不要开始阶段 1**——闸门判据是「Winlogon 桌面上 `SendInput` 确实生效」（光标真的到达目标点，而不只是 `SendInput` 返回值全接受）。
+
+**探针的三条跑法**：`--probe`（对照组，已登录未锁屏）/ `--probe-in-service`（**闸门趟**，敲完命令立刻 Win+L）/ 装完重启（开机停在登录界面，靠服务 `SERVICE_AUTO_START`）。后两趟**不能**「先锁屏再敲命令」——那时没有控制台，所以反过来让测试体自己等：子实例等安全桌面（`CHILD_SECURE_WAIT` 60s），服务侧等控制台会话出现（`CONSOLE_SESSION_WAIT` 60s，开机时服务比 LogonUI 先起）。两个等待之和必须明显小于 `win-service` 的 `SERVICE_PROBE_TIMEOUT`（有单测钉住）。
+
+**几处容易踩的坑（都带注释）**：① 服务在会话 0，那里的窗口站是 `Service-0x0-3e7$`，**够不着**控制台会话的 `WinSta0`，所以测量必须由 `CreateProcessAsUserW` 拉起的子实例做，且 `lpDesktop` 明确写 `winsta0\default`；② `SetThreadDesktop` 只能在**一次性专用线程**上调用（不能复用、不能用 `spawn_blocking` 的池线程、挂载前线程不得拥有窗口）；③ **父进程预先算出子实例的报告路径**再把时间戳用 `--probe-instance <戳>` 交给它——两边各算各的「当前时刻」会跨秒对不上，一次**成功**的测量会被报成「子实例没写出报告」（戳必须过 `sysinfo::is_valid_stamp`，它会拼进文件名）；④ 采集用 BitBlt（`biHeight` 取负 = 自顶向下），BMP 落盘的是**原始 BGRA**（只把第 4 个字节的 alpha 统一写成 255，否则「honor alpha」的看图工具会把这张**证据图**显示成全透明、被误读成采集失败；B/G/R 逐字节原样）、ASCII 缩略图来自转换后的 RGBA——刻意不让两者共用一条通道，通道顺序错了才看得出来。⑤ **判据必须 fail-closed**：`OpenInputDesktop` 成功不等于线程切过去了，所以挂载后要重新读 `GetThreadDesktop` 比对（报告里的 `挂载后是否等于输入桌面`），不等就**跳过注入**；光标判据带 ±1 像素容差（归一化坐标的取整约定差一点就是 1 像素，逐像素相等会把一次成功判成「存疑」），且注入前光标已在目标点时要标 `⚠ 本次鼠标判据无效`。服务侧**抓子实例报告下结论时必须先看 `是否安全桌面: true`**——否则默认桌面的对照组读数会被当成闸门通过。
+
 ### 前端架构
 - 位于 `frontend/`，构建产物输出到 `frontend-dist/`（gitignored，由 `rust-embed` 嵌入）
 - **react-router-dom v6** — `App.tsx` 中 `createBrowserRouter` + `ProtectedRoute` 守卫路由
@@ -252,7 +265,14 @@ GitHub Actions 工作流：
   （`--features rag,embed-frontend`）→ 从 `contrib/config.toml.template` 渲染配置（占位符替换后校验）
   → SCP 二进制 + systemd 服务 + 配置 → SSH 重启服务
 - `release-client.yml`（tag `v*` / 手动）— 四平台矩阵构建客户端二进制，各 runner 直接 SCP 到
-  `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 在服务端生成 `SHA256SUMS` 并更新 `latest` 软链
+  `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 在服务端生成 `SHA256SUMS` 并更新 `latest` 软链。
+  Windows/MSVC leg 额外构建并上传 `rust-tunnel-client-service-windows-x86_64.exe`
+  （无人值守服务；**不依赖 libvpx** 故走 MSVC 即可，不需要 GNU leg 那套 MSYS2 曲折；
+  资产名必须以 `rust-tunnel-client-` 开头，`finalize-client` 的 glob 与下载页的
+  `platform_from_filename` 才认得它），并在同一 leg 跑
+  `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service`
+  ——那批单测是 `#[cfg(windows)]`（`probe`/`service`/`process`/`host`），
+  **这个 runner 是仓库里唯一能真正跑它们的机器**，本机 macOS 只能做类型检查
 - `release-wiki-client.yml`（tag `wiki-v*` / 手动）— wiki 桌面端（Tauri 2）安装包：macOS
   aarch64/x86_64 `.dmg` + Windows `.msi`/NSIS `.exe`，产物重命名为
   `wiki-desktop-<os>-<arch>[-setup].<ext>` 后 SCP 到 `${DEPLOY_PATH}/wiki/<version>/`（版本目录名 =

@@ -66,6 +66,15 @@ jobs:
           RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release -p rust-tunnel-client --target ${{ matrix.target }}
 
+      # 无人值守被控端的平台层与服务，有一大批单测**只在 Windows 上编译**
+      # （`probe`/`service`/`process`/`host` 全是 `#[cfg(windows)]`），本机 macOS
+      # 只能对它们做类型检查。这个 runner 是仓库里唯一能真正跑它们的机器，所以在这里跑：
+      # 它们是阶段 0 探针的机械锁（三态判据与报告结论行的逐字匹配、父子进程报告文件名
+      # 一致、报价/引号、服务状态映射）。测试失败就该拦住发布。
+      - name: Test Windows-only modules
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service
+
       - name: Strip binary (non-Windows)
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
@@ -94,6 +103,49 @@ jobs:
           scp "${SSH_OPTS[@]}" -P "${PORT}" \
             "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
             "${SSH_USER}@${SSH_HOST}:${DEST}/${{ matrix.asset }}"
+          rm -f "${KEY}"
+
+      # 无人值守被控端服务（仅 Windows）：`rust-tunnel-client-service.exe`，
+      # 一个把客户端实例拉进控制台会话的 SYSTEM 服务。
+      # 它**不依赖 rust-tunnel-remote**（不牵入 libvpx），所以走 MSVC 即可，
+      # 不需要 build-gui 那条 leg 的 MSYS2 mingw-w64 曲折；RUSTFLAGS 与上面的
+      # `Build client` 一致（静态 CRT，用户机器上不需要额外运行库）。
+      # 资产名必须以 `rust-tunnel-client-` 开头：`finalize-client` 的
+      # `rust-tunnel-client-*` glob（chmod + sha256sum）与下载页的
+      # `platform_from_filename` 都靠它解析平台/架构/扩展名——
+      # `rust-tunnel-client-service-windows-x86_64.exe` 会被解析成
+      # (windows, x86_64, exe)，与客户端本体同一套规则。
+      - name: Build and upload Windows unattended service
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ secrets.SERVER_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          cargo build --release -p rust-tunnel-win-service --target ${{ matrix.target }}
+          # 产物名取自 `crates/win-service/Cargo.toml` 的 `[[bin]] name`；
+          # 上传时改名成带平台/架构的资产名（下载页要靠它认平台）。
+          SRC="target/${{ matrix.target }}/release/rust-tunnel-client-service.exe"
+          ASSET="rust-tunnel-client-service-windows-x86_64.exe"
+          # 上传方式与上面 `Upload binary to remote server` 逐字对齐（原生 ssh/scp，
+          # 因为 appleboy/scp-action 是 Docker action，只能在 Linux runner 上跑）。
+          mkdir -p "${HOME}/.ssh"
+          KEY="${HOME}/.ssh/rt_deploy_key"
+          printf '%s\n' "${SSH_KEY}" > "${KEY}"
+          chmod 600 "${KEY}"
+          PORT="${SSH_PORT:-22}"
+          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
+          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+          echo "Uploading ${ASSET} -> ${DEST}/"
+          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
+          scp "${SSH_OPTS[@]}" -P "${PORT}" \
+            "${SRC}" \
+            "${SSH_USER}@${SSH_HOST}:${DEST}/${ASSET}"
           rm -f "${KEY}"
 
   build-gui:

@@ -10,6 +10,10 @@
 - 除「原生 RustDesk 客户端接入」外，本服务还支撑**两个 rust-tunnel GUI 客户端之间**的远程控制
   （用户无需接触任何 ID/公钥），见下文「客户端互控」一节。
 
+> **相邻但独立**：从别的机器控制一台 Windows 的**锁屏/登录界面**需要另装一个 SYSTEM 服务
+> （`rust-tunnel-client-service.exe`），与 hbbs/hbbr 无关，见 `WINDOWS-SECURE-DESKTOP.md`。
+> 那个服务的数据面同样经由本服务的会合/中继，但它的安装、安全模型与真机验证是独立的一套流程。
+
 ## 端口与防火墙
 
 | 端口 | 组件 | 传输 | 用途 |

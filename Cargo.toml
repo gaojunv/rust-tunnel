@@ -6,7 +6,7 @@ description = "A simple intranet penetration tool with server and client"
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = ["crates/agent", "crates/client", "crates/client-gui", "crates/common", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/remote", "crates/rustdesk", "crates/server", "crates/stats", "crates/wiki-core", "crates/wiki-serve"]
+members = ["crates/agent", "crates/client", "crates/client-gui", "crates/common", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/remote", "crates/rustdesk", "crates/server", "crates/stats", "crates/win-platform", "crates/win-service", "crates/wiki-core", "crates/wiki-serve"]
 
 # ── vendor 的第三方 crate ────────────────────────────────────────────
 # shiguredo_libvpx 2026.1.0 表达不了 VP9 profile 1（8-bit 4:4:4）——wrapper 无
@@ -112,6 +112,29 @@ libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
 open = "5"
+
+# ── Windows 无人值守被控端（crates/win-platform + crates/win-service）────
+# 只做 Win32 裸 FFI（无 wrapper、无额外传递依赖），故用 windows-sys 而非 windows。
+# feature 清单即 FFI 表面积的显式清单：桌面/窗口站、GDI 采集、令牌与权限、
+# 会话（WTS）、进程创建（CreateProcessAsUser）、服务控制管理器、环境块、注册表
+# （读系统版本号）、系统信息（本地时间）。新增 API 前先确认它在哪个 feature 下。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # ── 内置 RustDesk 兼容服务（crates/rustdesk）────────────────────────
 # prost 手写 derive 声明消息体，不经 protoc：仓库无需 protoc 构建依赖，
