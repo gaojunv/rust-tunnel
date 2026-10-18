@@ -19,7 +19,9 @@ pub mod view_scale;
 
 pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
-pub use view_scale::{display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER};
+pub use view_scale::{
+    display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER, TOOLBAR_FALLBACK_HEIGHT,
+};
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -863,6 +865,19 @@ pub struct RemoteView {
     pub toolbar_visible: bool,
     /// 最近一次指针活动时刻（工具条自动隐藏计时）。
     pub last_pointer_move: Instant,
+    /// 工具条是否自动隐藏（**持久化镜像**，见 `GuiPrefs::remote_toolbar_autohide`）。
+    ///
+    /// 工具条上的开关改它，`GuiApp::sync_display_prefs` 每帧比对后回写 `gui.toml`。
+    pub toolbar_autohide: bool,
+    /// 工具条面板**上一帧**的实测矩形（热区判据：指针是否停在工具条上）。
+    ///
+    /// 存实测矩形而非硬编码高度，是因为工具条用 `horizontal_wrapped`——窗口变窄时折行成两三行，
+    /// 硬编码 44px 会让第二行按钮落在热区外，工具条从指针底下消失。首帧尚未测得时为 `None`。
+    pub toolbar_rect: Option<egui::Rect>,
+    /// 工具条面板的**缓存内容高度**（隐藏时用它占位，使中央区域不因可见性变化）。
+    ///
+    /// 可见时每帧以实测值覆盖；首帧未知时用 [`TOOLBAR_FALLBACK_HEIGHT`] 兜底。
+    pub toolbar_height: f32,
     /// 统计角标是否常显（持久化镜像）。
     pub stats_overlay: bool,
     /// 剪贴板自动同步开关（持久化镜像）。
@@ -927,6 +942,9 @@ impl RemoteView {
             inner_size: egui::vec2(960.0, 600.0),
             toolbar_visible: true,
             last_pointer_move: Instant::now(),
+            toolbar_autohide: false,
+            toolbar_rect: None,
+            toolbar_height: TOOLBAR_FALLBACK_HEIGHT,
             stats_overlay: false,
             clipboard_sync_enabled: false,
             clipboard_sync: None,
@@ -949,7 +967,8 @@ impl RemoteView {
         }
     }
 
-    /// 从持久化偏好构造，把展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步）按上次的选择种下。
+    /// 从持久化偏好构造，把展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏）
+    /// 按上次的选择种下。
     ///
     /// 这些字段在 `RemoteView` 上是**运行时镜像**：工具条改它们，`GuiApp` 每帧比对后回写
     /// `gui.toml`（见其 `sync_display_prefs`）。之所以镜像而非直接读偏好，是因为改动发生在
@@ -961,6 +980,7 @@ impl RemoteView {
         view.window_size = prefs.remote_window_size;
         view.stats_overlay = prefs.remote_stats_overlay;
         view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
+        view.toolbar_autohide = prefs.remote_toolbar_autohide;
         view
     }
 
@@ -1323,6 +1343,9 @@ impl RemoteView {
         self.size_initialized = false;
         self.exclusive_keyboard = false;
         self.fullscreen = false;
+        // 新会话总是从「工具条可见」开始（首帧不该是空的）。`toolbar_autohide` 是**持久化镜像**，
+        // 与 `scale`/`window_size` 一样跨会话保留——**不在这里复位**；`toolbar_rect`/`toolbar_height`
+        // 同理（下一帧渲染时会以实测值覆盖）。
         self.toolbar_visible = true;
         self.fps = 0;
         self.fps_since = None;

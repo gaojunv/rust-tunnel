@@ -271,7 +271,7 @@ impl GuiApp {
                 ui.add_space(2.0);
             });
     }
-    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步）回写 `gui.toml`。
+    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏）回写 `gui.toml`。
     ///
     /// 这些字段在 [`remote::RemoteView`] 上是运行时镜像——改动发生在 deferred viewport 的回调里
     /// （与 `update` 不在同一时刻），只能靠每帧比对把差异落盘。`save` 只在确有变化时才写。
@@ -295,6 +295,10 @@ impl GuiApp {
         }
         if self.prefs.remote_clipboard_sync != view.clipboard_sync_enabled {
             self.prefs.remote_clipboard_sync = view.clipboard_sync_enabled;
+            changed = true;
+        }
+        if self.prefs.remote_toolbar_autohide != view.toolbar_autohide {
+            self.prefs.remote_toolbar_autohide = view.toolbar_autohide;
             changed = true;
         }
         drop(view);
@@ -383,7 +387,7 @@ impl eframe::App for GuiApp {
 
         // 独立会话窗口本体（仅控制器会话且窗口应存在时注册）。
         if let Some(manager) = remote_manager.as_ref() {
-            ui::session_window::show(ctx, &self.remote_view, manager, &self.prefs);
+            ui::session_window::show(ctx, &self.remote_view, manager);
         }
 
         self.sync_display_prefs();

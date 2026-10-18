@@ -136,6 +136,12 @@ impl WindowSize {
 /// 窗口最小内尺寸：再小工具条就会折成一团，画面也不剩多少。
 pub const MIN_INNER: Vec2 = Vec2::new(640.0, 480.0);
 
+/// 工具条高度的**兜底值**（逻辑点）：首帧尚未实测到工具条矩形时，用它作热区高度与隐藏占位高度。
+///
+/// 这是 [`crate::remote::RemoteView::toolbar_height`] 的初值，也是隐藏时占位的下限——工具条
+/// 折行后会更高，可见时每帧以实测值覆盖它。
+pub const TOOLBAR_FALLBACK_HEIGHT: f32 = 44.0;
+
 /// 自适应开窗时，窗口最多占本机屏幕的这个比例（留出边距与任务栏）。
 const SCREEN_FRACTION: f32 = 0.9;
 
