@@ -27,8 +27,9 @@ use rust_tunnel_remote::{
     ActiveSessionInfo, QualityPreset, RemoteManager, RemoteUiState, SessionRole, TransportPath,
 };
 
-use crate::prefs::GuiPrefs;
-use crate::remote::{display_size, RemoteView, ViewScale, WindowSize, MIN_INNER};
+use crate::remote::{
+    display_size, RemoteView, ViewScale, WindowSize, MIN_INNER, TOOLBAR_FALLBACK_HEIGHT,
+};
 use crate::ui::remote::state_label;
 
 /// 会话窗口的 viewport ID（父窗口定位子窗口、子窗口发给自身都用它）。
@@ -41,10 +42,8 @@ pub fn viewport_id() -> egui::ViewportId {
 /// 工具条静止多久后自动隐藏。
 const TOOLBAR_IDLE: Duration = Duration::from_secs(3);
 
-/// 指针进入窗口上缘这条带内即视为「想看工具条」（点不到按钮时的手动召回）。
+/// 指针进入窗口上缘这条带内即视为「想看工具条」（工具条隐藏时的手动召回）。
 const TOOLBAR_HOT: f32 = 6.0;
-/// 悬停在工具条所在高度区域也算活动——否则用户把指针停在按钮上不动，工具条会从指下淡出。
-const TOOLBAR_ROW: f32 = 44.0;
 
 /// 取会话窗口的锁（中毒时取回内部值：一个视图锁中毒不该拖垮整个 UI）。
 fn lock(view: &Arc<Mutex<RemoteView>>) -> MutexGuard<'_, RemoteView> {
@@ -60,12 +59,7 @@ fn window_icon() -> Option<Arc<egui::IconData>> {
 /// 渲染/维护远程会话窗口。每帧由 `GuiApp::update` 调用一次。
 ///
 /// 只在「本端是控制器 + 有活跃会话 + `window_open`」时注册 viewport；否则直接返回（等于关闭子窗口）。
-pub fn show(
-    ctx: &egui::Context,
-    view: &Arc<Mutex<RemoteView>>,
-    manager: &Arc<RemoteManager>,
-    prefs: &GuiPrefs,
-) {
+pub fn show(ctx: &egui::Context, view: &Arc<Mutex<RemoteView>>, manager: &Arc<RemoteManager>) {
     let state = manager.snapshot();
     let Some(active) = state
         .active
@@ -76,8 +70,9 @@ pub fn show(
     };
     let title = format!("远程控制 — {} · {}", active.peer_name, state_label(active.state));
 
-    // 锁内取值算好 builder 参数，**锁外**再注册（见模块文档：持锁注册会自死锁）。
-    let inner = {
+    // 锁内取值算好 builder 参数，**锁外**再注册（见模块文档：持锁注册会自死锁）。工具条自动隐藏
+    // 开关也在这里读——它由工具条上的开关改动（写在回调里），必须在锁内取到最新镜像。
+    let (inner, autohide) = {
         let mut v = lock(view);
         if !v.window_open {
             return; // 用户最小化 / 关窗
@@ -90,7 +85,7 @@ pub fn show(
                 v.size_initialized = true;
             }
         }
-        v.inner_size
+        (v.inner_size, v.toolbar_autohide)
     };
 
     let mut builder = egui::ViewportBuilder::default()
@@ -105,7 +100,6 @@ pub fn show(
 
     let view_cb = Arc::clone(view);
     let manager_cb = Arc::clone(manager);
-    let autohide = prefs.remote_toolbar_autohide;
     ctx.show_viewport_deferred(viewport_id(), builder, move |ctx, class| {
         session_viewport_ui(ctx, class, &view_cb, &manager_cb, autohide);
     });
@@ -177,34 +171,130 @@ fn handle_shortcuts(ctx: &egui::Context, v: &mut RemoteView) {
     }
 }
 
-/// 工具条自动隐藏：指针移动、位于热区、或指针按下时显示并重置计时；静止超时后不再渲染该 panel。
+/// 工具条自动隐藏：指针移动、位于工具条**实测矩形**内、或指针按下时显示并重置计时；静止超时后隐藏。
 ///
-/// 热区宽度随状态变化：**隐藏时**只认上缘 [`TOOLBAR_HOT`]（6px，对应计划里的「移到上缘召回」），
-/// **可见时**放宽到整条 [`TOOLBAR_ROW`]——否则用户把指针停在按钮上不动，计时一到工具条就从指下消失。
+/// 热区判据分两态：**可见时**用工具条面板上一帧的实测矩形（[`RemoteView::toolbar_rect`]，
+/// 覆盖 `horizontal_wrapped` 折行后的第二、三行——否则指针停在第二行按钮上时判据为 false，
+/// 工具条会从指针底下消失）；**隐藏时**只认上缘窄带 [`TOOLBAR_HOT`]（移到窗口上缘召回）。
+///
+/// # 为什么用上一帧的矩形
+///
+/// egui 是立即模式：本帧渲染工具条时还不知道本帧的矩形（工具条自己就是被渲染对象）。用上一帧
+/// 实测的矩形是标准做法，一帧延迟对「指针是否停在按钮上」无感。首帧尚未测得时用
+/// [`toolbar_fallback_rect`] 兜底。
 fn update_toolbar_visibility(ctx: &egui::Context, v: &mut RemoteView, autohide: bool) {
-    if !autohide {
-        v.toolbar_visible = true;
-        return;
-    }
     let now = Instant::now();
-    let visible = v.toolbar_visible;
-    let (moved, hot, down) = ctx.input(|i| {
-        let hover_y = i.pointer.hover_pos().map(|p| p.y);
-        let hot = hover_y.is_some_and(|y| {
-            if visible {
-                y <= TOOLBAR_ROW
-            } else {
-                y <= TOOLBAR_HOT
-            }
-        });
-        (i.pointer.delta() != egui::Vec2::ZERO, hot, i.pointer.any_down())
+    let (moved, down, pointer) = ctx.input(|i| {
+        (
+            i.pointer.delta() != egui::Vec2::ZERO,
+            i.pointer.any_down(),
+            i.pointer.hover_pos(),
+        )
     });
-    if moved || hot || down {
+    let decision = decide_toolbar_visibility(ToolbarInputs {
+        autohide,
+        was_visible: v.toolbar_visible,
+        pointer,
+        toolbar_rect: v.toolbar_rect.unwrap_or_else(toolbar_fallback_rect),
+        moved,
+        down,
+        idle: now.saturating_duration_since(v.last_pointer_move),
+    });
+    if decision.reset_activity {
         v.last_pointer_move = now;
-        v.toolbar_visible = true;
-    } else if now.saturating_duration_since(v.last_pointer_move) >= TOOLBAR_IDLE {
-        v.toolbar_visible = false;
     }
+    v.toolbar_visible = decision.visible;
+}
+
+/// 工具条可见性决策的输入（摊平成纯数据，便于表格驱动单测）。
+#[derive(Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "输入就是若干个独立的布尔条件（开关 / 上一帧状态 / 指针动作），拆枚举只会更难读"
+)]
+struct ToolbarInputs {
+    /// 是否开启自动隐藏。
+    autohide: bool,
+    /// 上一帧工具条是否可见。
+    was_visible: bool,
+    /// 指针当前位置（不在窗口内时为 `None`）。
+    pointer: Option<egui::Pos2>,
+    /// 工具条**上一帧**的实测矩形（见 [`update_toolbar_visibility`] 对一帧延迟的说明）。
+    toolbar_rect: egui::Rect,
+    /// 本帧指针是否移动。
+    moved: bool,
+    /// 本帧是否有指针按下。
+    down: bool,
+    /// 距上次指针活动的空闲时长。
+    idle: Duration,
+}
+
+/// 决策结果。
+struct ToolbarDecision {
+    /// 本帧工具条是否可见。
+    visible: bool,
+    /// 是否应把「最近活动时刻」重置为现在。
+    reset_activity: bool,
+}
+
+/// 工具条自动隐藏的**纯决策**：给定上一帧状态与指针，算出本帧是否可见、是否应重置活动计时。
+///
+/// 把输入摊平成 [`ToolbarInputs`] 后，三态（常驻 / 指针在工具条上 / 空闲超时）都能用表格断言
+/// 钉死（见本模块单测）——这正是缺陷「工具条莫名消失」的机械锁。
+fn decide_toolbar_visibility(i: ToolbarInputs) -> ToolbarDecision {
+    if !i.autohide {
+        // 关闭自动隐藏：恒可见，且无需重置计时。
+        return ToolbarDecision {
+            visible: true,
+            reset_activity: false,
+        };
+    }
+    let hot = i.pointer.is_some_and(|p| {
+        if i.was_visible {
+            // 可见时：整条**实测**矩形都算热区（含折行后的第二、三行）。
+            i.toolbar_rect.contains(p)
+        } else {
+            // 隐藏时：只认上缘窄带。
+            p.y <= TOOLBAR_HOT
+        }
+    });
+    if i.moved || hot || i.down {
+        ToolbarDecision {
+            visible: true,
+            reset_activity: true,
+        }
+    } else if i.idle >= TOOLBAR_IDLE {
+        ToolbarDecision {
+            visible: false,
+            reset_activity: false,
+        }
+    } else {
+        // 无活动但尚未超时：保持当前状态。
+        ToolbarDecision {
+            visible: i.was_visible,
+            reset_activity: false,
+        }
+    }
+}
+
+/// 首帧尚未实测到工具条矩形时的兜底热区：窗口上缘一条 [`TOOLBAR_FALLBACK_HEIGHT`] 高的满宽带。
+fn toolbar_fallback_rect() -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2(1.0e6, TOOLBAR_FALLBACK_HEIGHT),
+    )
+}
+
+/// 工具条面板**隐藏**时要用缓存高度占位（返回 `Some(h)`）；可见时返回 `None`（高度由内容实测）。
+///
+/// # 为什么隐藏时也必须占位（缺陷「隐现挪动/缩放画面」的机械锁）
+///
+/// `TopBottomPanel` 注册时会从中央区域扣除自身高度。过去隐藏时整条面板不注册（占位 = 0），
+/// 中央区域因此变高，`scene()` 用新的 `available_size()` 重算画面——`Fit` 档画面**尺寸改变**、
+/// 固定档画面**原点上移**，隐现瞬间的点击还会落到远端错误坐标。本函数保证隐藏分支**永不**返回
+/// `Some(0.0)`：占位高度恒为缓存高度，于是两种可见性下中央区域完全一致。
+fn toolbar_reserve(cached_height: f32, visible: bool) -> Option<f32> {
+    (!visible).then_some(cached_height)
 }
 
 /// 渲染窗口主体。`embedded` 分支（集成不支持多窗口时的兜底）退化为一个 egui 窗口承载同样内容。
@@ -223,6 +313,9 @@ fn render(
             .show(ctx, |ui| {
                 if v.toolbar_visible {
                     toolbar(ui, v, manager, state);
+                } else {
+                    // 与 deferred 路径同理：隐藏也占位，画面不因工具条隐现而上下位移。
+                    ui.add_space(v.toolbar_height);
                 }
                 reconnect_strip(ui, v, manager);
                 if v.side_panel_open {
@@ -233,10 +326,29 @@ fn render(
         return;
     }
 
-    if v.toolbar_visible {
-        egui::TopBottomPanel::top("session_toolbar").show(ctx, |ui| {
+    // 工具条**常驻注册**（缺陷「隐现挪动/缩放画面」的修复）：无论可见与否都注册这个面板。
+    // `TopBottomPanel` 注册时会从中央区域扣除自身高度；过去隐藏时整条 `.show()` 都不执行，
+    // 中央区域于是变高、上边缘上移，`scene()` 用新的 `available_size()` 重算画面（`Fit` 档尺寸变、
+    // 固定档原点上移），隐现瞬间的点击还会落到远端错误坐标。常驻后隐藏时面板内不画内容、只用
+    // 缓存高度占位，`CentralPanel` 的可用矩形恒定。
+    let reserve = toolbar_reserve(v.toolbar_height, v.toolbar_visible);
+    let mut content_height: Option<f32> = None;
+    let panel = egui::TopBottomPanel::top("session_toolbar").show(ctx, |ui| {
+        if let Some(height) = reserve {
+            // 隐藏：不画内容，但占住缓存高度（`set_min_height` 作用在**内容**上，故缓存的是内容高度）。
+            ui.set_min_height(height);
+        } else {
             toolbar(ui, v, manager, state);
-        });
+            // 记下**内容**高度（不含面板 frame 内边距）：隐藏时以同一个值 `set_min_height`，
+            // 面板总高才与可见时严格一致。
+            content_height = Some(ui.min_rect().height());
+        }
+    });
+    // 实测矩形供**下一帧**的热区判据用（egui 立即模式，见 `update_toolbar_visibility`）。
+    v.toolbar_rect = Some(panel.response.rect);
+    // 只在测得正值时覆盖缓存高度：退化的 0 会让隐藏时占位也为 0，把缺陷放回来。
+    if let Some(height) = content_height.filter(|h| *h > 0.0) {
+        v.toolbar_height = height;
     }
     if v.reconnect_note.is_some() {
         egui::TopBottomPanel::top("session_reconnect").show(ctx, |ui| {
@@ -308,6 +420,16 @@ fn toolbar(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, state:
         }
         if ui.selectable_label(v.side_panel_open, "侧栏").clicked() {
             v.side_panel_open = !v.side_panel_open;
+        }
+        // 自动隐藏开关：这是**唯一**能让用户关掉「工具条偶尔消失」的入口（偏好默认值改了也只对
+        // 全新配置生效——老用户的 gui.toml 早已把旧默认钉死）。改动写进运行时镜像，由父窗口的
+        // `sync_display_prefs` 回写 gui.toml。
+        if ui
+            .selectable_label(v.toolbar_autohide, "自动隐藏")
+            .on_hover_text("指针静止 3 秒后隐藏工具条（移到窗口上缘召回）；关闭后工具条常驻")
+            .clicked()
+        {
+            v.toolbar_autohide = !v.toolbar_autohide;
         }
         ui.separator();
         if ui
@@ -707,6 +829,10 @@ fn join_virtual(dir: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! 纯逻辑单测：工具条可见性状态机、「隐现不改画面」的几何不变量，以及传输路径标签。
+    //! 真实的 egui 布局（面板注册、实测矩形）与真实链路都无法在无头环境验证，只能由这些单测
+    //! 锁住判定规则。
+
     use super::*;
 
     /// 三条路径的标签**必须互不相同**。
@@ -728,5 +854,123 @@ mod tests {
                 assert_ne!(a, b, "不同路径不得共用同一个标签：{labels:?}");
             }
         }
+    }
+
+    /// 造一条位于窗口上缘、指定高度的工具条矩形（满宽）。
+    fn toolbar_rect(height: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, height))
+    }
+
+    /// 造一份决策输入（默认指针未移动、未按下）。
+    fn inputs(
+        autohide: bool,
+        was_visible: bool,
+        pointer: Option<egui::Pos2>,
+        height: f32,
+        idle: Duration,
+    ) -> ToolbarInputs {
+        ToolbarInputs {
+            autohide,
+            was_visible,
+            pointer,
+            toolbar_rect: toolbar_rect(height),
+            moved: false,
+            down: false,
+            idle,
+        }
+    }
+
+    #[test]
+    fn autohide_off_keeps_toolbar_always_visible() {
+        // autohide=false：无论指针在哪、空闲多久，都可见，且不重置活动计时。
+        for pointer in [None, Some(egui::pos2(500.0, 400.0))] {
+            for idle in [Duration::ZERO, Duration::from_secs(60)] {
+                let d = decide_toolbar_visibility(inputs(false, false, pointer, 44.0, idle));
+                assert!(d.visible, "关闭自动隐藏后工具条必须常驻");
+                assert!(!d.reset_activity);
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_on_wrapped_second_row_keeps_toolbar_visible() {
+        // 缺陷 3 的机械锁：工具条折行成两行（实测矩形高 88），指针停在第二行（y≈70）时仍算热区。
+        // 旧判据硬编码 `y <= 44`，此时为 false → 工具条会从指针底下消失。
+        let d = decide_toolbar_visibility(inputs(
+            true,
+            true,
+            Some(egui::pos2(300.0, 70.0)),
+            88.0,
+            Duration::from_secs(10),
+        ));
+        assert!(d.visible, "指针停在折行后的第二行按钮上，工具条不该消失");
+        assert!(d.reset_activity, "停在工具条上应重置空闲计时");
+    }
+
+    #[test]
+    fn idle_pointer_away_hides_toolbar() {
+        // 指针不在工具条矩形内且空闲超时 → 隐藏。
+        let d = decide_toolbar_visibility(inputs(
+            true,
+            true,
+            Some(egui::pos2(500.0, 400.0)),
+            44.0,
+            TOOLBAR_IDLE,
+        ));
+        assert!(!d.visible);
+        assert!(!d.reset_activity);
+    }
+
+    #[test]
+    fn pointer_at_top_edge_recalls_hidden_toolbar() {
+        // 隐藏后指针移到上缘窄带（y <= TOOLBAR_HOT）→ 重新可见。
+        let d = decide_toolbar_visibility(inputs(
+            true,
+            false,
+            Some(egui::pos2(500.0, 2.0)),
+            44.0,
+            Duration::from_secs(10),
+        ));
+        assert!(d.visible);
+    }
+
+    #[test]
+    fn hidden_toolbar_still_reserves_its_height() {
+        // 缺陷 2 的机械锁（状态机侧）：隐藏时占位高度是缓存高度，绝不是 0；可见时返回 None
+        // （高度由内容实测）。
+        let hidden = toolbar_reserve(TOOLBAR_FALLBACK_HEIGHT, false);
+        assert!(hidden.is_some_and(|h| (h - TOOLBAR_FALLBACK_HEIGHT).abs() < f32::EPSILON));
+        assert!(toolbar_reserve(TOOLBAR_FALLBACK_HEIGHT, true).is_none());
+    }
+
+    #[test]
+    fn scene_rect_is_independent_of_toolbar_visibility() {
+        // 缺陷 2 的机械锁（几何侧）：工具条常驻占位，可见与隐藏得到**同一**中央可用尺寸，
+        // 从而对同一 `avail`/图像尺寸给出同一 `display_size`——`Fit` 档不再改画面尺寸、固定档
+        // 不再移位。
+        // 中央区域刻意选**高度受限**的比例：这样工具条高度才会改变 Fit 档的缩放比，
+        // 反例才有意义（宽度受限时两个 avail 会算出同一尺寸，断言形同虚设）。
+        let central = egui::vec2(1280.0, 600.0);
+        let image = (1920u32, 1080u32);
+        // 可见时高度由内容决定（模型里取缓存值）；隐藏时用 `toolbar_reserve` 的占位高度。
+        let visible_h = TOOLBAR_FALLBACK_HEIGHT;
+        let hidden_h = toolbar_reserve(TOOLBAR_FALLBACK_HEIGHT, false).unwrap_or(0.0);
+        let avail_visible = egui::vec2(central.x, central.y - visible_h);
+        let avail_hidden = egui::vec2(central.x, central.y - hidden_h);
+        assert_eq!(avail_visible, avail_hidden, "可见性不该改变中央可用尺寸");
+        for scale in ViewScale::ALL {
+            assert_eq!(
+                display_size(scale, avail_visible, image),
+                display_size(scale, avail_hidden, image),
+                "{scale:?} 档下工具条可见性不该改变画面矩形",
+            );
+        }
+        // 反例（缺陷 2 的原行为）：隐藏时面板不注册（占位 0）→ 中央区域变高 → Fit 档画面尺寸改变。
+        let avail_buggy_hidden = central;
+        assert_ne!(
+            display_size(ViewScale::Fit, avail_buggy_hidden, image),
+            display_size(ViewScale::Fit, avail_visible, image),
+            "占位为 0 时 Fit 档画面尺寸会变——这正是被修掉的缺陷",
+        );
     }
 }
