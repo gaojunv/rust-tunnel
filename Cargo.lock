@@ -8276,6 +8276,7 @@ dependencies = [
  "rust-tunnel-client",
  "rust-tunnel-common",
  "rust-tunnel-remote",
+ "rust-tunnel-win-platform",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

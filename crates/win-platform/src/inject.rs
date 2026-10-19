@@ -40,6 +40,8 @@ pub const MOUSEEVENTF_MIDDLEDOWN: u32 = 0x0020;
 pub const MOUSEEVENTF_MIDDLEUP: u32 = 0x0040;
 /// `MOUSEEVENTF_WHEEL`。
 pub const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+/// `MOUSEEVENTF_HWHEEL`：横向滚轮。
+pub const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
 /// `MOUSEEVENTF_VIRTUALDESK`：把绝对坐标解释为整个虚拟桌面。
 pub const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
 /// `MOUSEEVENTF_ABSOLUTE`：坐标是归一化的绝对坐标而非相对位移。
@@ -103,9 +105,18 @@ pub enum InjectStep {
         /// `true` = 按下，`false` = 抬起。
         pressed: bool,
     },
-    /// 滚轮。
+    /// 竖向滚轮。
     Wheel {
         /// 带符号的滚动量，正数向上，单位是 `WHEEL_DELTA`。
+        delta: i32,
+    },
+    /// 横向滚轮（`MOUSEEVENTF_HWHEEL`）。
+    ///
+    /// 单独一个变体而不是复用 [`Self::Wheel`]：两者在 `SendInput` 里是不同的 `dwFlags`，
+    /// 合在一起就得在数据里额外塞一个「哪个轴」的字段。阶段 1 的实例用它转发控制器的
+    /// 横向滚动（`enigo` 的横向路径发的是 `MOUSEEVENTF_HWHEEL`）。
+    HWheel {
+        /// 带符号的滚动量，正数向右，单位是 `WHEEL_DELTA`。
         delta: i32,
     },
     /// 按下或抬起一个虚拟键码（**走扫描码表**，受当前键盘布局影响）。
@@ -352,6 +363,12 @@ fn build_inputs(
             u32::from_ne_bytes(delta.to_ne_bytes()),
             MOUSEEVENTF_WHEEL,
         )],
+        InjectStep::HWheel { delta } => vec![mouse(
+            0,
+            0,
+            u32::from_ne_bytes(delta.to_ne_bytes()),
+            MOUSEEVENTF_HWHEEL,
+        )],
         InjectStep::KeyVk { vk, pressed } => {
             let flags = if *pressed { 0 } else { KEYEVENTF_KEYUP };
             vec![key(*vk, 0, flags)]
@@ -551,6 +568,7 @@ mod tests {
         assert_eq!(MOUSEEVENTF_MIDDLEDOWN, km::MOUSEEVENTF_MIDDLEDOWN);
         assert_eq!(MOUSEEVENTF_MIDDLEUP, km::MOUSEEVENTF_MIDDLEUP);
         assert_eq!(MOUSEEVENTF_WHEEL, km::MOUSEEVENTF_WHEEL);
+        assert_eq!(MOUSEEVENTF_HWHEEL, km::MOUSEEVENTF_HWHEEL);
         assert_eq!(MOUSEEVENTF_ABSOLUTE, km::MOUSEEVENTF_ABSOLUTE);
         assert_eq!(MOUSEEVENTF_VIRTUALDESK, km::MOUSEEVENTF_VIRTUALDESK);
         assert_eq!(KEYEVENTF_KEYUP, km::KEYEVENTF_KEYUP);

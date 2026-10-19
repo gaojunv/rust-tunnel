@@ -7,10 +7,6 @@
 //!   （`AXIsProcessTrusted`）。缺失时不能静默黑屏，UI 必须提示并引导授权。
 //! - **设置跳转**：`open x-apple.systempreferences:...` 直达对应隐私面板。
 
-use std::sync::Arc;
-
-use rust_tunnel_remote::{InputSink, ScreenSource};
-
 /// 平台标识。
 pub const NAME: &str = "macos";
 
@@ -57,14 +53,11 @@ pub fn open_settings(kind: super::PermissionKind) {
     }
 }
 
-/// 构造屏幕采集源。
+/// 构造平台实现三件套。
+///
+/// macOS 上 `--instance` 是无头模式且不可用（Windows 专用），故 `mode` 一律走 GUI 那套
+/// （`xcap` + `enigo` + `arboard`）。
 #[must_use]
-pub fn screen_source() -> Arc<dyn ScreenSource> {
-    Arc::new(super::XcapScreen)
-}
-
-/// 构造输入注入目标。
-#[must_use]
-pub fn input_sink() -> Arc<dyn InputSink> {
-    Arc::new(super::EnigoInput::new())
+pub fn screen_and_input(_mode: super::PlatformMode) -> super::PlatformHandles {
+    super::gui_platform_handles()
 }

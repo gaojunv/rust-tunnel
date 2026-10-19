@@ -22,10 +22,11 @@
 //!   （BGRA→RGBA、ASCII 缩略图、BMP 编码）、[`report`]（探针报告）、[`session`]
 //!   （控制台会话语义）、[`desktop`]（桌面名分类）、[`monitor`]（显示器/虚拟桌面几何与
 //!   绝对坐标归一化）、[`inject`]（注入步骤与规划）、[`token`]（完整性级别 RID 语义）、
-//!   [`sysinfo`]（时间格式化）。**纯 std、零依赖**，是设计风险的大头。
+//!   [`sysinfo`]（时间格式化）、[`paths`]（产品目录的规范落点）、[`instance_lock`]
+//!   （单实例锁的名字常量）。**纯 std、零依赖**，是设计风险的大头。
 //! - **FFI 层**（`#[cfg(windows)]`）：[`monitor`]/[`desktop`]/[`capture`]/[`inject`]/
-//!   [`token`]/[`process`]/[`service`]/[`sysinfo`] 里那些直接调 Win32 的函数。本机
-//!   （macOS）可用 `cargo check --target x86_64-pc-windows-gnu` 做**类型**检查，
+//!   [`token`]/[`process`]/[`service`]/[`sysinfo`]/[`security`] 里那些直接调 Win32 的函数。
+//!   本机（macOS）可用 `cargo check --target x86_64-pc-windows-gnu` 做**类型**检查，
 //!   但行为只能上真机验。
 //!
 //! # 为什么自持而不复用 `xcap`/`enigo`
@@ -47,9 +48,14 @@
 //! - 所有 `unsafe` 都必须带 `// SAFETY:` 说明调用契约。
 
 pub mod desktop;
+// 自提权（UAC）：参数拼接可移植，`ShellExecuteExW` 那部分 `#[cfg(windows)]`。
+pub mod elevate;
 pub mod error;
 pub mod inject;
+// 单实例锁：名字常量可移植，`CreateMutexW` 那部分 `#[cfg(windows)]`。
+pub mod instance_lock;
 pub mod monitor;
+pub mod paths;
 pub mod pixels;
 pub mod process;
 pub mod report;
@@ -65,6 +71,8 @@ pub mod capture;
 pub mod handle;
 #[cfg(windows)]
 pub mod probe;
+#[cfg(windows)]
+pub mod security;
 #[cfg(windows)]
 pub mod service;
 

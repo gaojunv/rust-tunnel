@@ -1,0 +1,130 @@
+name: CI
+
+# 推送/PR 阶段的 Windows 目标编译与测试门禁。
+#
+# 现状：codeql.yml 是**唯一**的 push/PR 工作流，而它用 build-mode: none（只抽取源码、
+# 在宿主目标上做静态分析，不编译）；与 Windows 相关的 release-client.yml /
+# release-server.yml 只在打 tag 或手动触发时跑。也就是说，push/PR 阶段**没有任何
+# 东西编译或测试 Windows 目标的代码**。
+#
+# 先澄清一个常见误解：`#[cfg(windows)]` 的单测**并非从不运行**——
+# release-client.yml 在 x86_64-pc-windows-msvc 那条 leg 上已经跑了
+# `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service`（约 62 个用例：
+# win-platform 的 service/probe/process/token/capture/handle/desktop 与 win-service 的
+# host），那是仓库里唯一能真正跑它们（本机 macOS 连编译都做不到）的机器。
+# 真正的缺口是**时机**：它们只在打 tag 时跑，回归要到发布那一刻才暴露。
+#
+# 而真正**完全没人覆盖**的是 GNU leg：出厂 Windows GUI 正是用
+# x86_64-pc-windows-gnu 构建的（release-client.yml 的 build-client-gui job），
+# 打 tag 之前没有任何东西对它做类型检查。
+#
+# 本工作流**不覆盖**的部分（别把它读成「Windows 已全面覆盖」）：
+# - rust-tunnel-client-gui 的**宿主目标（Linux）单测不在这里跑**：在 Linux 上链接
+#   eframe/egui 需要一整套 X11/Wayland/GL 开发库，作者无法从 macOS 机器上验证，
+#   而提交一条未经验证的红色 job 比如实记录缺口更糟。因此它那约 106 个可移植测试
+#   （service_ui / service_watch / input_queue / desktop_follow 的机械锁）目前仍只在
+#   维护者本机运行。
+# - cargo check / clippy 是**类型检查**：它们不链接，也完全说明不了运行时行为。
+#   Windows 安全桌面特性的真正验收必须在真 Windows 机器上做（见
+#   WINDOWS-SECURE-DESKTOP.md）。
+#
+# 说明：全部命令用 `-p` 指定 crate，**绝不用 `--workspace`**——后者会把第三方
+# qdrant-edge 依赖拖进来，又慢又脆。这里也**不**构建/测试 rust-tunnel-server
+# （它需要 `--features rag` 与 qdrant-edge，超出本工作流的范围且耗时）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # 手动重跑偶发失败的 job
+
+# 最小权限：仅需 checkout 拉代码；缓存用 runtime token，不依赖 GITHUB_TOKEN
+permissions:
+  contents: read
+
+jobs:
+  # 把 release-client.yml 已经在 msvc leg 上跑的那两条测试命令也接进 push/PR，
+  # 让 Windows 专属单测成为提交门禁，而不只是 tag 门禁。
+  windows-tests:
+    name: Windows tests (MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # windows-latest 默认就是 MSVC 工具链，无需任何额外工具链配置：这两个 crate
+      # 在 windows-sys 之上是纯 Rust，且都不牵入 libvpx（libvpx 只经
+      # rust-tunnel-remote 进来），所以 MSVC 链接它们没有问题——release-client.yml:76
+      # 已经证明了这一点。
+      - name: Install Rust with target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Test Windows-only modules
+        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service
+
+  # 出厂 Windows GUI 的 GNU leg 的类型检查。
+  windows-gnu-typecheck:
+    name: Windows GNU typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust with target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-gnu
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+
+      # mingw-w64 是必需的，**不是为了链接**，而是因为 build script 与 C 编译都在
+      # `cargo check` 里真跑。两个**独立的**依赖，缺哪个都会让这个 job 红：
+      #
+      # 1. `gcc`——crates/client-gui 依赖 vendored 的 shiguredo_libvpx，其 build.rs 经
+      #    cc-rs 编译 C；缺了它报 `failed to find tool "x86_64-w64-mingw32-gcc"`。
+      # 2. `windres`——crates/client-gui/build.rs 对 `*-pc-windows-gnu` 目标**硬要求**
+      #    资源编译器（编 icons/app.rc），两个候选名都跑不起来时它直接
+      #    `std::process::exit(1)`（那是刻意的：静默降级会产出没图标的 exe 而没人发现）。
+      #    这条先于编译失败，所以它是本 job 真正的第一个失败点。
+      #
+      # `binutils-mingw-w64-x86-64` 是显式列出的：它其实经
+      # `gcc-mingw-w64-x86-64` → `-posix` 传递而来，但上面第 2 条是**硬失败**路径，
+      # 不该把「windres 在不在」押在一条可能变化的传递依赖上。显式列出同时也让
+      # windres 这个真实需求在文件里可见，而不是只写 gcc。
+      - name: Install mingw-w64 toolchain (gcc + windres)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+          version: 1.0
+
+      # 别把 release-client.yml 里那套 MSYS2 mingw64 的曲折照搬到这里。那份文件详细
+      # 论证了它的 Windows runner 必须用 **msvcrt 味**的 mingw-w64（MSYS2 的 mingw64
+      # 环境）而非 UCRT 味，因为 vendored 的预编译 libvpx 是 msvcrt 味的构建、引用了
+      # `__imp__setjmp`。**那条约束是关于链接的，而 cargo check / cargo clippy 根本
+      # 不链接**——所以它对本 job 不适用，发行版的 gcc-mingw-w64-x86-64 包就够用。
+      # 这里只需要 gcc 把 libvpx 的 C 编成对象文件供类型检查，不涉及任何特定运行库的
+      # 导入库。
+      #
+      # -D warnings 是诚实的门禁：workspace 的 [workspace.lints] 已经 deny 了
+      # clippy::pedantic、missing_docs、unwrap_used、expect_used 与 panic，这条只是
+      # 把同一条纪律延伸到普通 warning，而这些 crate 在宿主目标上当前是零 warning 的。
+      - name: Type-check GNU target
+        run: |
+          cargo check  --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-client-gui
+          cargo clippy --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-client-gui -- -D warnings

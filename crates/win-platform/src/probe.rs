@@ -48,8 +48,8 @@
 //!
 //! # 落盘
 //!
-//! 报告与截图写到 [`ProbeOptions::out_dir`]（默认 `C:\Users\Public\rust-tunnel-probe\`，
-//! 那个目录**任何用户都能读**，所以从别的机器上取日志不需要提权）：
+//! 报告与截图写到 [`ProbeOptions::out_dir`]（默认 [`default_out_dir`] =
+//! `%ProgramData%\rust-tunnel\probe\`，DACL 收敛到 SYSTEM + Administrators）：
 //! `probe-<时间戳>-<模式>.txt`、`shot-<时间戳>-<模式>.bmp`。
 //! BMP 是**原始采集的 BGRA**（真值），ASCII 缩略图来自转换后的 RGBA——
 //! 刻意不让两者共用一条通道转换，这样通道顺序的错误才会暴露而不是互相抵消。
@@ -63,8 +63,18 @@ use crate::WinError;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// 默认落盘目录：`C:\Users\Public\...`，**所有用户可读**（取日志不必提权）。
-pub const DEFAULT_OUT_DIR: &str = r"C:\Users\Public\rust-tunnel-probe";
+/// 默认落盘目录：[`crate::paths::probe_dir()`]（`%ProgramData%\rust-tunnel\probe`）。
+///
+/// 阶段 0 曾把报告与截图写在 `C:\Users\Public\rust-tunnel-probe\`——那是个**全局可写**
+/// 目录：任何本机用户都能预建 junction 把 SYSTEM 的写入重定向到任意位置（junction
+/// 不需要 `SeCreateSymbolicLinkPrivilege`），而报告里含**锁屏/登录界面的截图**。
+/// 换到这里意味着「取日志不必提权」这个便利没有了——**现在读报告要管理员**。
+/// 这可以接受：探针本身就需要管理员（见 `win-service` 的 USAGE），而且产物落在一个
+/// 能证明只有 SYSTEM + Administrators 可写的目录里，比「随手能读」重要得多。
+#[must_use]
+pub fn default_out_dir() -> PathBuf {
+    crate::paths::probe_dir()
+}
 
 /// 子实例的模式标签（进文件名）。
 pub const TAG_INSTANCE: &str = "instance";
@@ -169,7 +179,7 @@ pub struct ProbeOptions {
 impl Default for ProbeOptions {
     fn default() -> Self {
         Self {
-            out_dir: PathBuf::from(DEFAULT_OUT_DIR),
+            out_dir: default_out_dir(),
             sweep_steps: 8,
             click: true,
             inject_keys: false,
@@ -212,6 +222,25 @@ pub struct ProbeOutcome {
     pub secure_desktop_injection_worked: Option<bool>,
 }
 
+/// 在**任何写入之前**把输出目录（及其父目录）的 DACL 收敛到 SYSTEM + Administrators。
+///
+/// 必须在采集**之前**调用：截图是锁屏/登录界面的画面，写进全局可写目录就等于把登录
+/// 界面公开；而且任何本机用户都能预建 junction 把 SYSTEM 的写入重定向走（见
+/// [`default_out_dir`]）。**父目录也要加固**——只加固叶子、而父目录
+/// （`%ProgramData%\rust-tunnel`）保留继承来的宽松 DACL 的话，非管理员仍能改名或替换
+/// 整个探针目录。两者都幂等（见 `security::harden_directory`）。
+///
+/// # Errors
+///
+/// 加固失败即整体失败（fail-closed）：宁可不写报告，也不把敏感截图落到一个没能证明
+/// 安全的目录里。这与 [`run`]/[`run_from_service`] 的「只有写不出去才 `Err`」一致
+/// ——拒绝写就是写不出去。
+fn harden_output_dir(out_dir: &Path) -> crate::WinResult<()> {
+    crate::security::harden_directory(&crate::paths::program_data_root())?;
+    crate::security::harden_directory(out_dir)?;
+    Ok(())
+}
+
 /// 跑一遍**本地**探针（在调用线程上）。`--probe` 与 `--probe-instance` 都走它。
 ///
 /// # Errors
@@ -219,6 +248,8 @@ pub struct ProbeOutcome {
 /// 只有「报告写不出去」会成为 `Err`：单步失败全部记进报告，
 /// 因为**探针的价值就在于把失败也带回来**（多半我们现在还没权限失败）。
 pub fn run(options: &ProbeOptions) -> crate::WinResult<ProbeOutcome> {
+    // 先加固再采集：截图必须在「已证明只有 SYSTEM + Administrators 可写」的目录里产生。
+    harden_output_dir(&options.out_dir)?;
     let started = local_now();
     let mut report = ProbeReport::new("rust-tunnel Windows 无人值守探针");
 
@@ -264,6 +295,8 @@ pub fn run(options: &ProbeOptions) -> crate::WinResult<ProbeOutcome> {
 ///
 /// 只有「报告写不出去」会成为 `Err`（理由同 [`run`]）。
 pub fn run_from_service(child_options: &ProbeOptions) -> crate::WinResult<ProbeOutcome> {
+    // 先加固再拉起子实例：服务侧报告与子实例产物都落在这个目录里。
+    harden_output_dir(&child_options.out_dir)?;
     let started = local_now();
     let mut report = ProbeReport::new("rust-tunnel Windows 无人值守探针（服务侧）");
 
@@ -837,13 +870,23 @@ fn collect_token_paths(report: &mut ProbeReport) {
     match crate::token::current_process_token() {
         Ok(token) => {
             report.field("A: 取自身令牌", "成功");
-            report.step(
-                "A: 启用 SeTcbPrivilege",
-                &crate::token::enable_privilege(&token, "SeTcbPrivilege"),
-            );
-            report.step(
-                "A: 启用 SeAssignPrimaryTokenPrivilege",
-                &crate::token::enable_privilege(&token, "SeAssignPrimaryTokenPrivilege"),
+            // 特权清单与服务侧共用（`process::INSTANCE_LAUNCH_PRIVILEGES`）：少一个就是
+            // 1314，而那个码看起来像「权限不够」，容易被误判成别的原因。
+            // `enable_launch_privileges` 返回的是**没真正启用**的项（含「持有但没被赋予」，
+            // 那类在 `AdjustTokenPrivileges` 上返回 TRUE、只有 last-error 能看出来）——
+            // 故这里逐项渲染，别把它压成「全部成功」。
+            let failures = crate::process::enable_launch_privileges(&token);
+            report.field(
+                "A: 启用 CreateProcessAsUser 的三个特权",
+                if failures.is_empty() {
+                    format!("全部成功（{}）", crate::process::INSTANCE_LAUNCH_PRIVILEGES.join("、"))
+                } else {
+                    failures
+                        .iter()
+                        .map(|(name, outcome)| crate::process::privilege_enable_text(name, outcome))
+                        .collect::<Vec<_>>()
+                        .join("；")
+                },
             );
             report.step(
                 "A: DuplicateTokenEx + TokenSessionId → 会话 id",
@@ -985,7 +1028,7 @@ fn spawn_instance_and_collect(
         // 子实例的输出目录只能是默认值：命令行没有传目录的入口，
         // 它自己的 `ProbeOptions` 来自 `ProbeOptions::default()`。跟着父进程的
         // `out_dir` 走会去一个空目录里找报告，把成功的测量报成「没跑起来」。
-        out_dir: std::path::PathBuf::from(DEFAULT_OUT_DIR),
+        out_dir: default_out_dir(),
         ..child_options.clone()
     };
     let command_line = crate::process::build_command_line(
@@ -994,7 +1037,7 @@ fn spawn_instance_and_collect(
     );
     report.field("子实例命令行", &command_line);
 
-    let token = pick_instance_token(report, session)?;
+    let token = report_and_pick_instance_token(report, session)?;
     report.step(
         "所选令牌的会话 id（必须等于目标会话）",
         &crate::token::token_session_id(&token),
@@ -1085,45 +1128,36 @@ fn spawn_instance_and_collect(
     }
 }
 
-/// 决定用哪条路的令牌拉起子实例：先 B（winlogon），不行再 A（自持 + 会话）。
+/// 取实例令牌并把两条路的成败写进报告（`None` = 两条都不通）。
 ///
-/// B 优先是因为 winlogon 的令牌天然就在控制台会话里（RustDesk/TeamViewer 的做法），
-/// 少一次 `SetTokenInformation`；A 的价值是**不依赖任何别的进程**。
-/// 两条都失败时返回 `None`，原因已写进报告。
-fn pick_instance_token(
+/// 取令牌用的是**与服务侧共用**的那份实现（[`crate::process::pick_instance_token`]）：
+/// 两份实现必然漂移，而这条链是无人值守被控端能不能起来的关键路径。
+fn report_and_pick_instance_token(
     report: &mut ProbeReport,
     session: u32,
 ) -> Option<crate::handle::OwnedHandle> {
-    match crate::process::winlogon_primary_token(Some(session)) {
-        Ok(token) => {
-            report.field("取令牌", "B：复制 winlogon.exe 的主令牌");
-            return Some(token);
-        }
-        Err(err) => {
-            report.field("B 路不可用", format!("{err}"));
-        }
+    let picked = crate::process::pick_instance_token(session);
+    for (name, outcome) in &picked.privilege_failures {
+        // 逐项渲染：`NotAssigned`（持有但没生效）会被渲染成「未生效(ERROR_NOT_ALL_ASSIGNED)」，
+        // 而不是被压成「全部成功」——那正是「CreateProcessAsUserW 报 1314 却看不出原因」
+        // 这条排障死路的来源。
+        report.field(
+            "启用特权",
+            crate::process::privilege_enable_text(name, outcome),
+        );
     }
-
-    let own = match crate::token::current_process_token() {
-        Ok(own) => own,
-        Err(err) => {
-            report.field("A 路也不可用", format!("{err}"));
-            return None;
-        }
+    if let Some(err) = &picked.winlogon_error {
+        report.field("B 路不可用", format!("{err}"));
+    }
+    if let Some(err) = &picked.own_token_error {
+        report.field("A 路也不可用", format!("{err}"));
+    }
+    let (Some(token), Some(source)) = (picked.token, picked.source) else {
+        report.field("取令牌", "两条路都不可用（见上面两条失败原因）");
+        return None;
     };
-    // 失败不算致命：`duplicate_primary_for_session` 自己会在需要时报错。
-    let _ = crate::token::enable_privilege(&own, "SeTcbPrivilege");
-    let _ = crate::token::enable_privilege(&own, "SeAssignPrimaryTokenPrivilege");
-    match crate::token::duplicate_primary_for_session(&own, session) {
-        Ok(token) => {
-            report.field("取令牌", "A：自身令牌 + TokenSessionId");
-            Some(token)
-        }
-        Err(err) => {
-            report.field("A 路也不可用", format!("{err}"));
-            None
-        }
-    }
+    report.field("取令牌", source.as_str());
+    Some(token)
 }
 
 /// 从子实例的报告文本里刮出注入结论那行。
@@ -1136,8 +1170,8 @@ fn pick_instance_token(
 /// 结论行是在**每个**桌面上都会写的：子实例等安全桌面**等超时**时会「到点照样测」，
 /// 于是在默认桌面上注入——那当然成功——并写下 `本桌面注入结论: 生效（…）`。
 /// 只匹配那一行的话，「Win+L 没来得及按」或「开机时 LogonUI 还没起来」就会得到一份
-/// 「生效 —— 闸门通过，可以进阶段 1」的假报告，而闸门结论正是本阶段唯一的交付物：
-/// 拿一份**从没碰过 Winlogon** 的测量去给阶段 1 放行，是这个项目最坏的一种错。
+/// 「生效 —— 闸门通过」的假报告，而闸门结论正是本阶段唯一的交付物：
+/// 拿一份**从没碰过 Winlogon** 的测量去给登录页那一半放行，是这个项目最坏的一种错。
 /// 故先要求子实例自己记的「是否安全桌面」为 `true`，否则返回 `None`（＝没结论）。
 fn child_verdict(text: &str) -> Option<bool> {
     let secure = text.lines().find(|l| l.starts_with("是否安全桌面:"))?;
@@ -1159,13 +1193,13 @@ fn write_verdict(report: &mut ProbeReport, verdict: Option<bool>, options: &Prob
         Some(true) => {
             report.field(
                 "安全桌面注入",
-                "生效 —— 闸门通过，可以进阶段 1（实例 + 面板）",
+                "生效 —— 闸门通过：Winlogon 桌面上注入确实落地，登录页/锁屏那一半可用",
             );
         }
         Some(false) => {
             report.field(
                 "安全桌面注入",
-                "未生效 —— **闸门未通过，先停下来**：把本报告贴回去一起看，\
+                "未生效 —— **闸门未通过**：登录页/锁屏那一半不能声称可用。把本报告贴回去一起看，\
                  重点是「输入桌面种类」「SendInput（鼠标扫动）」「光标是否到达目标点」三行",
             );
         }
@@ -1259,7 +1293,15 @@ mod tests {
         assert!(!options.inject_keys);
         assert!(options.click, "左上角的点击是安全的，默认开着");
         assert!(options.sweep_steps >= 2, "至少两点才看得出「在动」");
-        assert!(options.out_dir.to_string_lossy().contains("Public"));
+        // 默认落盘目录必须是**规范落点**（`%ProgramData%\rust-tunnel\probe`），而不是
+        // 相对 CWD 的路径：服务/实例的工作目录不可控，相对路径会落到莫名其妙的地方。
+        // 真机上 `ProgramData` 一定存在，故那时还要求它是绝对路径；macOS 上环境变量
+        // 缺席、两份默认值都退化成相对路径，只能断言「是同一个落点」。
+        assert_eq!(options.out_dir, crate::paths::probe_dir());
+        assert!(options.out_dir.ends_with("probe"), "{}", options.out_dir.display());
+        if std::env::var_os("ProgramData").is_some() {
+            assert!(options.out_dir.is_absolute(), "{}", options.out_dir.display());
+        }
         // 对照组**不等**桌面：等一等就把「当时到底在哪个桌面」这个对照信息弄丢了。
         assert!(options.wait_secure.is_none());
     }
@@ -1393,7 +1435,7 @@ mod tests {
     /// **闸门那条假阳性必须锁死**：子实例等安全桌面没等到时会「到点照样测」，
     /// 于是在**默认**桌面上注入——那当然成功——并写下 `本桌面注入结论: 生效（…）`，
     /// 同时在报告里把「是否安全桌面」如实记成 `false`。父进程若只刮结论行，
-    /// 「Win+L 没来得及按」就会得到一份「生效 —— 闸门通过，可以进阶段 1」的假报告。
+    /// 「Win+L 没来得及按」就会得到一份「生效 —— 闸门通过」的假报告。
     #[test]
     fn a_default_desktop_success_is_never_read_as_a_gate_pass() {
         let mut report = ProbeReport::new("t");

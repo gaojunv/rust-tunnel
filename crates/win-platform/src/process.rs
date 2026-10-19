@@ -192,6 +192,198 @@ pub fn winlogon_primary_token(
     crate::token::duplicate_primary_for_session(&token, session)
 }
 
+/// `CreateProcessAsUserW` 要求**调用方**持有的三个特权。
+///
+/// 为什么是这三个（都开在**调用方自己**的令牌上，见 [`enable_launch_privileges`]）：
+/// - `SeTcbPrivilege`：`SetTokenInformation(TokenSessionId)` 改令牌会话 id 要用它；
+/// - `SeAssignPrimaryTokenPrivilege`：`CreateProcessAsUser` 换主令牌要用它；
+/// - `SeIncreaseQuotaPrivilege`：给新进程分配配额要用它。
+///
+/// SYSTEM 默认**持有**这三个但**不启用**——不显式启用的话，`CreateProcessAsUserW` 会以
+/// 1314（`ERROR_PRIVILEGE_NOT_HELD`）失败，那个码在日志里长得像「权限不够」，
+/// 其实是这里少做了一步。
+pub const INSTANCE_LAUNCH_PRIVILEGES: [&str; 3] = [
+    "SeTcbPrivilege",
+    "SeAssignPrimaryTokenPrivilege",
+    "SeIncreaseQuotaPrivilege",
+];
+
+/// 启用一个特权的结果（[`crate::token::enable_privilege`] 的 `WinResult<bool>` 归类）。
+///
+/// **三态而不是两态**：`AdjustTokenPrivileges` 在「特权在令牌里**持有但没被赋予**」时
+/// 返回 `TRUE` 并把 last-error 置成 `ERROR_NOT_ALL_ASSIGNED`(1300)——那**不是**成功，
+/// `CreateProcessAsUserW` 随后会以 1314（`ERROR_PRIVILEGE_NOT_HELD`）失败。若把它压进
+/// `Err`/`Ok` 两态（先前 [`enable_launch_privileges`] 只收 `Err` 就是这么做的），
+/// 「持有但没生效」会被**静默当成成功**：探针报告写「全部成功」、服务日志一声不吭，
+/// 而真机上的表现是 `CreateProcessAsUserW` 报 1314——排障的人会去别处找原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivilegeEnable {
+    /// 确实启用了（`AdjustTokenPrivileges` 返回 TRUE 且 last-error 是 `ERROR_SUCCESS`）。
+    Enabled,
+    /// 特权**持有但没被赋予**（`AdjustTokenPrivileges` 返回 TRUE，last-error 是
+    /// `ERROR_NOT_ALL_ASSIGNED` = 1300）。
+    NotAssigned,
+    /// 调用本身失败（名字无效，或 `AdjustTokenPrivileges` 直接失败）。
+    Failed(crate::WinError),
+}
+
+impl PrivilegeEnable {
+    /// 是否**真的**启用了（**只有** [`PrivilegeEnable::Enabled`] 是 `true`）。
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// 把 `enable_privilege` 的 `WinResult<bool>` 归类成 [`PrivilegeEnable`]。
+///
+/// **纯函数、可移植**，故 macOS 上也能单测——而这条归类正是那处回归的核心：
+/// `Ok(false)` 是「持有但没生效」，绝不能当成成功。
+#[must_use]
+pub fn classify_privilege_enable(result: crate::WinResult<bool>) -> PrivilegeEnable {
+    match result {
+        Ok(true) => PrivilegeEnable::Enabled,
+        Ok(false) => PrivilegeEnable::NotAssigned,
+        Err(err) => PrivilegeEnable::Failed(err),
+    }
+}
+
+/// 把一条「启用特权」结果渲染成报告/日志用的一行文本（**可移植**，有单测）。
+///
+/// `NotAssigned` 用**和失败不同的词**（`未生效(ERROR_NOT_ALL_ASSIGNED)`）：
+/// 它和「调用失败」是两种不同的处置（前者是令牌策略问题，后者是 API/名字问题），
+/// 混成一句话就会把排障引到错的方向。
+#[must_use]
+pub fn privilege_enable_text(name: &str, outcome: &PrivilegeEnable) -> String {
+    match outcome {
+        PrivilegeEnable::Enabled => format!("{name}: 成功"),
+        PrivilegeEnable::NotAssigned => format!("{name}: 未生效(ERROR_NOT_ALL_ASSIGNED)"),
+        PrivilegeEnable::Failed(err) => format!("{name}: 失败 {err}"),
+    }
+}
+
+/// 在**调用方**的令牌上启用 [`INSTANCE_LAUNCH_PRIVILEGES`]，返回**没真正启用**的项。
+///
+/// # 为什么必须在「取令牌」之前、且只开在调用方自己的令牌上
+///
+/// `CreateProcessAsUserW` 检查的是**调用方**（也就是服务进程自己）的令牌，不是被拉起的
+/// 那个令牌。原先把这段启用逻辑写在 A 路（自持令牌）里，于是 B 路（复制 `winlogon.exe`
+/// 的主令牌）一成功，这三行就**一次都没跑过**——而 B 路恰恰是更常用的那条。抽成共用实现
+/// 时保留这个语义：两条取令牌路径之前都要先调它。
+///
+/// # 返回值为什么是 [`PrivilegeEnable`] 而不是 `WinError`
+///
+/// 「返回启用失败的项」这句话有个陷阱：**没启用**不等于**调用失败**。
+/// `AdjustTokenPrivileges` 在特权「持有但没被赋予」时返回 `TRUE`、只把 last-error 置成
+/// 1300——那是 `Ok(false)`，不是 `Err`。早先这里只收 `Err`，于是这一类被静默当成成功
+/// （探针写「全部成功」、服务日志不吭声），而 `CreateProcessAsUserW` 接着报 1314。
+/// 返回三态就把这个区分钉住了（见 [`PrivilegeEnable`]）。
+///
+/// 没启用**不致命**：真缺了会在 [`spawn_with_token`] 那一步以 1314 报出来，这里只是留痕
+/// （日志里出现「未生效/失败」就能把它和别的 1314 成因分开）。
+#[cfg(windows)]
+#[must_use]
+pub fn enable_launch_privileges(
+    token: &crate::handle::OwnedHandle,
+) -> Vec<(&'static str, PrivilegeEnable)> {
+    let mut failures = Vec::new();
+    for name in INSTANCE_LAUNCH_PRIVILEGES {
+        let outcome = classify_privilege_enable(crate::token::enable_privilege(token, name));
+        if !outcome.is_enabled() {
+            failures.push((name, outcome));
+        }
+    }
+    failures
+}
+
+/// 实例令牌的来源（[`pick_instance_token`] 最终选了哪条路）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSource {
+    /// B 路：复制 `winlogon.exe` 的主令牌（天然就在控制台会话里）。
+    Winlogon,
+    /// A 路：自身令牌 + `SetTokenInformation(TokenSessionId)`。
+    OwnToken,
+}
+
+impl TokenSource {
+    /// 稳定名（写进日志/报告，别用 `Debug`）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Winlogon => "B：复制 winlogon.exe 的主令牌",
+            Self::OwnToken => "A：自身令牌 + TokenSessionId",
+        }
+    }
+}
+
+/// [`pick_instance_token`] 的结果：选中的令牌 + 两条路的尝试记录。
+///
+/// 为什么把「失败原因」也带出来而不是只给 `Option`：探针报告与服务工作日志都需要
+/// 说清「为什么两条路都不通」，只给一个 `None` 会让真机排障变成猜谜。
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct InstanceToken {
+    /// 选中的令牌；两条路都失败时为 `None`。
+    pub token: Option<crate::handle::OwnedHandle>,
+    /// 选中的来源；`token` 为 `None` 时也是 `None`。
+    pub source: Option<TokenSource>,
+    /// 启用 [`INSTANCE_LAUNCH_PRIVILEGES`] 时**没真正启用**的项（非空**不一定**是错误：
+    /// 「持有但没被赋予」（[`PrivilegeEnable::NotAssigned`]）也会出现在这里）。
+    pub privilege_failures: Vec<(&'static str, PrivilegeEnable)>,
+    /// B 路失败原因；成功时为 `None`。
+    pub winlogon_error: Option<crate::WinError>,
+    /// A 路失败原因；成功或未尝试时为 `None`。
+    pub own_token_error: Option<crate::WinError>,
+}
+
+/// 决定用哪条路的令牌把实例拉进控制台会话：先 B（winlogon），不行再 A（自持 + 会话）。
+///
+/// B 优先是因为 winlogon 的令牌天然就在控制台会话里（RustDesk/TeamViewer 的做法），
+/// 少一次 `SetTokenInformation`；A 的价值是**不依赖任何别的进程**。
+/// 两条都失败时 `token` 为 `None`，原因已写进返回的结构。
+///
+/// **探针与服务共用这一份实现**（原先探针里有一份私有的、签名还带着探针报告的版本）：
+/// 两份实现必然漂移，而这条链是无人值守被控端能不能起来的关键路径。
+#[cfg(windows)]
+#[must_use]
+pub fn pick_instance_token(session: u32) -> InstanceToken {
+    let mut out = InstanceToken {
+        token: None,
+        source: None,
+        privilege_failures: Vec::new(),
+        winlogon_error: None,
+        own_token_error: None,
+    };
+
+    // 特权开在**我们自己**（调用方）的令牌上，且**必须在两条取令牌路径之前**执行——
+    // 见 [`enable_launch_privileges`] 的说明（B 路一成功就跳过启用正是原 bug 的形状）。
+    let own = crate::token::current_process_token();
+    if let Ok(token) = &own {
+        out.privilege_failures = enable_launch_privileges(token);
+    }
+
+    match winlogon_primary_token(Some(session)) {
+        Ok(token) => {
+            out.token = Some(token);
+            out.source = Some(TokenSource::Winlogon);
+            return out;
+        }
+        Err(err) => out.winlogon_error = Some(err),
+    }
+
+    match &own {
+        Ok(token) => match crate::token::duplicate_primary_for_session(token, session) {
+            Ok(dup) => {
+                out.token = Some(dup);
+                out.source = Some(TokenSource::OwnToken);
+            }
+            Err(err) => out.own_token_error = Some(err),
+        },
+        Err(err) => out.own_token_error = Some(err.clone()),
+    }
+    out
+}
+
 /// 新建一个「句柄一关就把里面的进程全杀掉」的作业对象。
 ///
 /// 服务把自己的实例进程放进这个作业：服务一退出（正常或崩溃），作业句柄随进程
@@ -405,9 +597,96 @@ pub fn exit_code(process: &crate::handle::OwnedHandle) -> crate::WinResult<u32> 
     Ok(code)
 }
 
+/// 强制结束一个进程（`TerminateProcess`）。
+///
+/// 服务停实例时用它：作业对象（`KILL_ON_JOB_CLOSE`）是「句柄关闭时才杀」的兜底，
+/// 但它要求实例**确实被放进了作业**（[`assign_to_job`] 可能失败）。显式 `TerminateProcess`
+/// 是那条兜底路径之外的直接手段——两者都用，才不依赖任何单一机制。
+///
+/// # Errors
+///
+/// 进程已退出、或句柄缺 `PROCESS_TERMINATE` 时返回 [`crate::WinError`]。
+/// **进程已退出不算异常**：调用方通常忽略这个错误（它要的结果已经达成了）。
+#[cfg(windows)]
+pub fn terminate_process(
+    process: &crate::handle::OwnedHandle,
+    code: u32,
+) -> crate::WinResult<()> {
+    // SAFETY: process 是有效的进程句柄（`CreateProcessAsUserW` 给的句柄默认带
+    // PROCESS_TERMINATE）；TerminateProcess 只读这个句柄与退出码。
+    let ok = unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(process.raw(), code)
+    };
+    crate::error::check_bool("TerminateProcess", ok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_sources_have_stable_distinct_names() {
+        // 稳定名要进日志：写错一个，排障时分不清走的是 B 路还是 A 路。
+        assert!(TokenSource::Winlogon.as_str().contains("winlogon"));
+        assert!(TokenSource::OwnToken.as_str().contains("TokenSessionId"));
+        assert_ne!(TokenSource::Winlogon.as_str(), TokenSource::OwnToken.as_str());
+    }
+
+    #[test]
+    fn the_launch_privilege_list_is_exactly_the_three_create_process_as_user_needs() {
+        // 这三个是 `CreateProcessAsUserW` 的硬要求，少一个就是 1314（看起来像「权限不够」）。
+        assert_eq!(INSTANCE_LAUNCH_PRIVILEGES.len(), 3);
+        assert!(INSTANCE_LAUNCH_PRIVILEGES.contains(&"SeTcbPrivilege"));
+        assert!(INSTANCE_LAUNCH_PRIVILEGES.contains(&"SeAssignPrimaryTokenPrivilege"));
+        assert!(INSTANCE_LAUNCH_PRIVILEGES.contains(&"SeIncreaseQuotaPrivilege"));
+    }
+
+    #[test]
+    fn not_assigned_is_not_treated_as_success() {
+        // 这处回归的核心：`enable_privilege` 的 `Ok(false)` 是「持有但没被赋予」
+        // （`AdjustTokenPrivileges` 返回 TRUE、last-error 是 1300），必须归到
+        // NotAssigned，绝不能被当成 Enabled——否则真机上紧随其后的 1314 会被掩盖。
+        assert_eq!(classify_privilege_enable(Ok(true)), PrivilegeEnable::Enabled);
+        assert_eq!(
+            classify_privilege_enable(Ok(false)),
+            PrivilegeEnable::NotAssigned
+        );
+        assert!(classify_privilege_enable(Ok(true)).is_enabled());
+        assert!(!classify_privilege_enable(Ok(false)).is_enabled());
+    }
+
+    #[test]
+    fn a_failed_call_keeps_the_raw_error() {
+        // 调用本身失败（名字无效 / AdjustTokenPrivileges 失败）保留原始错误码：
+        // 它与「持有但没生效」是两种处置，不能合并。
+        let err = crate::WinError::new("AdjustTokenPrivileges", 5);
+        assert_eq!(
+            classify_privilege_enable(Err(err.clone())),
+            PrivilegeEnable::Failed(err)
+        );
+    }
+
+    #[test]
+    fn the_three_outcomes_render_with_distinct_words() {
+        // 「没生效」必须与「调用失败」用不同的词：两者处置不同（令牌策略 vs API/名字），
+        // 混成一句会把排障引到错的方向。
+        let enabled = privilege_enable_text("SeTcbPrivilege", &PrivilegeEnable::Enabled);
+        let not_assigned = privilege_enable_text("SeTcbPrivilege", &PrivilegeEnable::NotAssigned);
+        let failed = privilege_enable_text(
+            "SeTcbPrivilege",
+            &PrivilegeEnable::Failed(crate::WinError::new("LookupPrivilegeValueW", 87)),
+        );
+        assert!(enabled.contains("成功"), "{enabled}");
+        assert!(
+            not_assigned.contains("未生效") && not_assigned.contains("ERROR_NOT_ALL_ASSIGNED"),
+            "{not_assigned}"
+        );
+        assert!(failed.contains("失败"), "{failed}");
+        // 三者两两不同：一个词串了两类，排障时分不清是哪种。
+        assert_ne!(enabled, not_assigned);
+        assert_ne!(not_assigned, failed);
+        assert_ne!(enabled, failed);
+    }
 
     #[test]
     fn plain_arguments_are_left_alone() {

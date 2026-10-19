@@ -10,6 +10,40 @@
 //! **正常返回**，不是错误），而它在服务启动早期、以及机器无人登录时都可能这样。
 //! 这一层把这套 raw 语义包装成 [`ConsoleSession`]，让调用方不必到处写魔数。
 
+// ── 会话变化事件的类型（`SERVICE_CONTROL_SESSIONCHANGE` 的 `event_type`）──
+//
+// 值抄自 WTSAPI32.h（`WTS_EVENT_*` / `WTS_*` 宏）。**可移植地**放在这里而不是只在
+// `#[cfg(windows)]` 分支里用：判断「哪些事件要重建实例」是一条纯逻辑，必须在 macOS 上
+// 也能被单测钉住（见 `win-service` 的 `supervise::classify_session_change`）。
+//
+// 语义上真正用得到的两条：
+// - `WTS_SESSION_LOCK` / `WTS_SESSION_UNLOCK`：**锁屏/解锁不改控制台会话 id**，
+//   而那正是无人值守被控端要覆盖的场景，故**不重建**（路径上零重启）。
+// - 其余（注销/登录/控制台接入断开）：会话真的变了，实例必须跟着换。
+
+/// `WTS_CONSOLE_CONNECT`：有会话接入了控制台（物理屏幕）。
+pub const WTS_CONSOLE_CONNECT: u32 = 0x1;
+/// `WTS_CONSOLE_DISCONNECT`：控制台会话断开（如快速用户切换把它切走）。
+pub const WTS_CONSOLE_DISCONNECT: u32 = 0x2;
+/// `WTS_REMOTE_CONNECT`：有会话通过远程（RDP）接入。
+pub const WTS_REMOTE_CONNECT: u32 = 0x3;
+/// `WTS_REMOTE_DISCONNECT`：远程会话断开。
+pub const WTS_REMOTE_DISCONNECT: u32 = 0x4;
+/// `WTS_SESSION_LOGON`：某会话完成登录。
+pub const WTS_SESSION_LOGON: u32 = 0x5;
+/// `WTS_SESSION_LOGOFF`：某会话注销。
+pub const WTS_SESSION_LOGOFF: u32 = 0x6;
+/// `WTS_SESSION_LOCK`：某会话锁屏（**控制台会话 id 不变**）。
+pub const WTS_SESSION_LOCK: u32 = 0x7;
+/// `WTS_SESSION_UNLOCK`：某会话解锁（**控制台会话 id 不变**）。
+pub const WTS_SESSION_UNLOCK: u32 = 0x8;
+/// `WTS_SESSION_REMOTE_CONTROL`：某会话被远程控制（不是本项目的远程控制）。
+pub const WTS_SESSION_REMOTE_CONTROL: u32 = 0x9;
+/// `WTS_SESSION_CREATE`：新会话被创建。
+pub const WTS_SESSION_CREATE: u32 = 0xA;
+/// `WTS_SESSION_TERMINATE`：某会话被终止。
+pub const WTS_SESSION_TERMINATE: u32 = 0xB;
+
 /// `WTSGetActiveConsoleSessionId` 表示「当前没有控制台会话」的哨兵值。
 pub const CONSOLE_SESSION_NONE: u32 = u32::MAX;
 
@@ -141,6 +175,41 @@ mod tests {
         }
         assert_eq!(ConsoleSession::Inactive.raw(), CONSOLE_SESSION_NONE);
         assert_eq!(ConsoleSession::Inactive.id(), None);
+    }
+
+    /// 机械锁：这些值抄自 WTSAPI32.h，是 SCM 传回来的 ABI（`SERVICE_CONTROL_SESSIONCHANGE`
+    /// 的 `event_type`）。改错一个，监督逻辑就会把「注销」认成「锁屏」而不重建实例。
+    #[test]
+    fn wts_event_types_match_the_win32_abi() {
+        assert_eq!(WTS_CONSOLE_CONNECT, 0x1);
+        assert_eq!(WTS_CONSOLE_DISCONNECT, 0x2);
+        assert_eq!(WTS_REMOTE_CONNECT, 0x3);
+        assert_eq!(WTS_REMOTE_DISCONNECT, 0x4);
+        assert_eq!(WTS_SESSION_LOGON, 0x5);
+        assert_eq!(WTS_SESSION_LOGOFF, 0x6);
+        assert_eq!(WTS_SESSION_LOCK, 0x7);
+        assert_eq!(WTS_SESSION_UNLOCK, 0x8);
+        assert_eq!(WTS_SESSION_REMOTE_CONTROL, 0x9);
+        assert_eq!(WTS_SESSION_CREATE, 0xA);
+        assert_eq!(WTS_SESSION_TERMINATE, 0xB);
+        // 两两不同：撞值会让分类把一种事件当成另一种。
+        let all = [
+            WTS_CONSOLE_CONNECT,
+            WTS_CONSOLE_DISCONNECT,
+            WTS_REMOTE_CONNECT,
+            WTS_REMOTE_DISCONNECT,
+            WTS_SESSION_LOGON,
+            WTS_SESSION_LOGOFF,
+            WTS_SESSION_LOCK,
+            WTS_SESSION_UNLOCK,
+            WTS_SESSION_REMOTE_CONTROL,
+            WTS_SESSION_CREATE,
+            WTS_SESSION_TERMINATE,
+        ];
+        let mut sorted: Vec<u32> = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "事件码必须两两不同");
     }
 
     #[test]

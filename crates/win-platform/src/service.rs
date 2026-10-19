@@ -115,6 +115,15 @@ const SERVICE_DELETE: u32 = 0x0001_0000;
 /// 依赖）不划算；200ms 的唤醒代价在服务生命周期里可以忽略。
 const STOP_POLL_STEP: Duration = Duration::from_millis(200);
 
+/// `SERVICE_STOP_PENDING` 上报给 SCM 的等待提示（毫秒）。
+///
+/// **必须盖住 [`run`] 的收尾回调的最长耗时**：那个回调在 `publish(SERVICE_STOPPED)`
+/// **之前**跑，`win-service` 那份要杀实例并 join 监督线程，上限 20 秒。给 5 秒会让 SCM
+/// 在收尾还没完时就判「服务没有及时响应停止」（事件日志里的一条告警），而服务其实
+/// 正在正常收尾。30 秒 = 20 秒上限 + 余量；等待提示只是「多久之内别来催」的约定，
+/// 调大不会延长任何硬超时。
+const STOP_WAIT_HINT_MS: u32 = 30_000;
+
 // ── 状态与事件 ───────────────────────────────────────────────────
 
 /// 服务在 SCM 眼里的状态。
@@ -546,6 +555,32 @@ pub fn stop() -> WinResult<()> {
     check_bool("ControlService", ok)
 }
 
+/// **服务自己**要求停止：置停止标志，`service_main` 的轮询看到后照常收尾并上报
+/// `SERVICE_STOPPED`。
+///
+/// # 为什么不能复用 [`stop`]
+///
+/// [`stop`] 要走一趟 SCM（`OpenServiceW` + `ControlService(SERVICE_CONTROL_STOP)`），
+/// 而 SCM 在服务还处于 `START_PENDING` 时会以 1061（`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`）
+/// 拒掉这个控制码——这正是 `crates/win-service` 的 `request_stop()` 必须带重试与 sleep 的
+/// 原因（见那里「为什么要重试」）。更根本的是：一个「发现自己**根本无法提供服务**」的服务
+/// 必须能**无条件、干净**地停下来，不能把「停得下来」这件事押在一条可能被拒（1061）、或
+/// 干脆失败的 SCM 往返上（服务被禁用、系统正在关机……）。
+///
+/// # 效果与 `SERVICE_CONTROL_STOP` 完全一样
+///
+/// 置标志这条路径与 `ctrl_handler` 收到 `SERVICE_CONTROL_STOP` 时**走的是同一段逻辑**：
+/// `service_main` 退出轮询 → 跑调用方的收尾回调（杀实例、join 监督线程）→ 上报
+/// `SERVICE_STOPPED`（`dwWin32ExitCode` 为 0，即一次**正常停止**）。于是 SCM **不会**触发
+/// 安装时写下的 `SC_ACTION_RESTART` 失败动作（见 [`write_failure_actions`]），GUI 每 3 秒
+/// 的 SCM 轮询也能立刻拿回客户端身份。
+///
+/// [`run`] 开头会把标志重置（`STOP_REQUESTED.store(false, …)`），所以它**不会**在两次
+/// `run` 之间泄漏；在 `run` 之外调它只是把一个没人看的布尔置真，没有副作用。
+pub fn request_self_stop() {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 // ── 服务主循环（`run`）──────────────────────────────────────────
 
 /// 服务名（NUL 结尾 UTF-16），由 [`run`] **写一次**。
@@ -562,6 +597,24 @@ static SERVICE_NAME_WIDE: OnceLock<Box<[u16]>> = OnceLock::new();
 /// `extern "system" fn`**，没有地方挂闭包环境。锁只在这两处极短地持有
 /// （取一个函数指针出来再调用），不会自锁。
 static EVENT_SINK: Mutex<Option<fn(ServiceEvent)>> = Mutex::new(None);
+
+/// `run` 注册的**收尾回调**：在 `service_main` 看到停止标志之后、
+/// `publish(SERVICE_STOPPED, …)` **之前**跑一次。
+///
+/// # 为什么收尾必须在 `SERVICE_STOPPED` 之前
+///
+/// `SERVICE_STOPPED` 是「服务进程已经退出/即将退出」的信号：`--install` 的
+/// 「先停旧服务」正是靠轮询到它来判定「旧 exe 已经不占了、可以覆盖了」。若在
+/// 调用方的收尾（杀实例、join 监督线程）跑完**之前**就上报 `SERVICE_STOPPED`，
+/// SCM 会把状态显示成 `Stopped` 而服务进程**还活着、exe 映像还映射着**，紧接着的
+/// `std::fs::copy` 覆盖那个 exe 会以共享冲突（「另一个程序正在使用此文件」）**间歇**失败
+/// ——一个只在时间窗口上撞运气才复现的升级故障。
+///
+/// 用 `Box<dyn FnOnce() + Send>` 而不是 `fn` 指针：收尾通常要带上调用方的几个自由函数
+/// （`win-service` 那份是 `request_supervisor_stop` + `join_supervisor`），闭包形式最直接。
+/// `Send` 是必需的——它在 `service_main` 那条线程上被调，与注册它的线程不同。
+/// **回调不得 panic**（它也在 `extern "system"` 边界的调用链上，见 [`run`]）。
+static SHUTDOWN_SINK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 /// SCM 要求停止的标志。`service_main` 小步轮询它。
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -593,6 +646,23 @@ static CURRENT_STATUS: Mutex<SERVICE_STATUS> = Mutex::new(SERVICE_STATUS {
 /// 而 `unwrap()` 会让 handler 自己 panic——那正是本模块最不能发生的事。
 fn lock_sink() -> MutexGuard<'static, Option<fn(ServiceEvent)>> {
     EVENT_SINK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 取 [`SHUTDOWN_SINK`] 的锁，理由同 [`lock_sink`]。
+fn lock_shutdown() -> MutexGuard<'static, Option<Box<dyn FnOnce() + Send>>> {
+    SHUTDOWN_SINK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 取走收尾回调；没有注册过时返回一个空操作。
+///
+/// 空操作兜底是必需的：`service_main` 不能在「没注册回调」时 panic（它在
+/// `extern "system"` 边界内被调），而「没注册」在 `run` 之外的调用路径上可能发生。
+fn take_shutdown() -> Box<dyn FnOnce() + Send> {
+    lock_shutdown()
+        .take()
+        .unwrap_or_else(|| Box::new(|| {}))
 }
 
 /// 取 [`CURRENT_STATUS`] 的锁，理由同 [`lock_sink`]。
@@ -693,6 +763,11 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
         std::thread::sleep(STOP_POLL_STEP);
     }
+    // 顺序是硬要求：先跑调用方的收尾（杀实例、join 监督线程），**再**上报 STOPPED。
+    // 反过来的话，SCM 会在服务进程还活着、exe 映像还映射着时就显示 `Stopped`，
+    // `--install` 的「先停旧服务」据此返回并开始覆盖 exe——共享冲突会间歇复现。
+    // 回调可能阻塞到 ~20 秒，STOP_PENDING 的等待提示已按这个上限抬高（见 STOP_WAIT_HINT_MS）。
+    take_shutdown()();
     publish(SERVICE_STOPPED, 0, 0, 0);
 }
 
@@ -711,8 +786,9 @@ unsafe extern "system" fn ctrl_handler(
         SERVICE_CONTROL_STOP => {
             // 顺序：先置标志（service_main 会看到并退出轮询）→ 再报 STOP_PENDING →
             // 最后通知上层。反过来会让上层在状态还写着 RUNNING 时就开始收尾。
+            // 等待提示要盖住调用方收尾回调的最长耗时（见 STOP_WAIT_HINT_MS）。
             STOP_REQUESTED.store(true, Ordering::SeqCst);
-            publish(SERVICE_STOP_PENDING, 0, 0, 5_000);
+            publish(SERVICE_STOP_PENDING, 0, 0, STOP_WAIT_HINT_MS);
             notify(ServiceEvent::Stop);
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
@@ -753,21 +829,35 @@ unsafe extern "system" fn ctrl_handler(
 /// - 它**不得 panic**：它是在 `extern "system"` 边界内被调的，panic 是未定义行为，
 ///   还会把整个服务进程带走。
 ///
+/// # `on_shutdown` 的契约
+///
+/// 它在 `service_main` 看到停止标志之后、`publish(SERVICE_STOPPED, …)` **之前**被调一次，
+/// 用来做调用方的收尾（`win-service` 那份是杀实例 + join 监督线程，上限约 20 秒）。
+/// 它可能阻塞——等待提示已按这个上限抬高（见 [`STOP_WAIT_HINT_MS`]）——但**不得 panic**
+/// （理由同 `on_event`）。之所以要有它，见 [`SHUTDOWN_SINK`] 的说明。
+///
 /// # 不是被 SCM 启动时
 ///
 /// `StartServiceCtrlDispatcherW` 立刻失败，错误码是
 /// `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`(1063)。本函数**原样返回这个 `Err`**，
 /// 让 bin 能据此打印「请用 `--console` 前台运行」之类的提示——**这不是崩溃**。
+/// 这条路径上 `on_shutdown` **不会**被调（`service_main` 压根没跑），调用方要自己兜住
+/// 「提前返回也要收尾」（`win-service` 在 `run` 返回后又做了一遍，幂等）。
 ///
 /// # Errors
 ///
 /// 上述 1063；或 SCM 连接的其它失败（服务进程被 SCM 以外的东西启动、
 /// 名字与 SCM 里的登记对不上等）。
-pub fn run(name: &str, on_event: fn(ServiceEvent)) -> WinResult<()> {
+pub fn run(
+    name: &str,
+    on_event: fn(ServiceEvent),
+    on_shutdown: impl FnOnce() + Send + 'static,
+) -> WinResult<()> {
     // 写一次。同一进程内二次调用只保留第一次的名字（不报错）：名字在整个
     // 服务生命周期里必须稳定，改它等于让 handler 注册到别的名字上。
     let _ = SERVICE_NAME_WIDE.set(to_wide(name).into_boxed_slice());
     *lock_sink() = Some(on_event);
+    *lock_shutdown() = Some(Box::new(on_shutdown));
     STOP_REQUESTED.store(false, Ordering::SeqCst);
 
     let Some(name_buf) = SERVICE_NAME_WIDE.get() else {

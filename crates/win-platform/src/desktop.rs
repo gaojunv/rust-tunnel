@@ -177,6 +177,40 @@ impl InputDesktop {
         self.attached = true;
         Ok(())
     }
+
+    /// 关闭句柄，**即使它曾 [`Self::attach_to_current_thread`] 成功**。
+    ///
+    /// # 调用约定（与 `Drop` 的规则配套）
+    ///
+    /// 只能在**该线程即将退出、且不再使用这个桌面**时调用。`CloseDesktop` 对「仍被本线程
+    /// 使用」的桌面会失败（常见是 170 `ERROR_BUSY`）——那只是一次**尽力回收**，失败不报错，
+    /// 句柄最终随进程退出交还系统。调用方若想彻底回收，需要先让线程不再使用该桌面（退出，
+    /// 或由**另一条**线程在它退出后关——但那要求句柄能跨线程传递，见下）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// `Drop` 对已挂载的句柄**刻意不关**（见其注释），那是为「一次性探针进程」设计的。
+    /// 阶段 1 的实例会**按桌面变化销毁并重建**专用线程，若不在退出前回收，每次锁屏/解锁都会
+    /// 留下一个永不回收的 `HDESK`。这与 `Drop` 注释里写的「阶段 1 的专用线程在退出前自行
+    /// 关闭」正是同一件事。
+    ///
+    /// **注意**：`InputDesktop` 目前**不是 `Send`**（`HDESK` 在当前 `windows-sys` 里是
+    /// `*mut c_void`），所以句柄**无法**移交另一条线程去关。想做成「退出后由监管线程关」
+    /// 需要给本类型加 `unsafe impl Send`（Win32 句柄是进程级的，线程级的只是「挂载」），
+    /// 或另开一个关原始句柄的入口。
+    pub fn close_on_exit(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        // SAFETY: handle 由 OpenInputDesktop 返回、本对象独占且已确认非空；
+        // CloseDesktop 只影响本对象持有的这个引用，不动桌面对象本身。
+        unsafe {
+            windows_sys::Win32::System::StationsAndDesktops::CloseDesktop(self.handle);
+        }
+        self.handle = std::ptr::null_mut();
+        // 标记为「未挂载」，让 Drop 不再重复关闭（句柄已置空，Drop 也会自行跳过）。
+        self.attached = false;
+    }
 }
 
 #[cfg(windows)]
@@ -186,7 +220,9 @@ impl Drop for InputDesktop {
         // 在该线程仍使用它时 `CloseDesktop` 会失败，而强行关掉会让线程的桌面悬空。
         // 阶段 0 的探针进程做完一次实验就退出，句柄随进程回收；阶段 1 的
         // 专用线程在**退出前**自行关闭（那时线程已经不再使用该桌面）。
-        if self.attached {
+        // `close_on_exit` 已把句柄置空并置 `attached = false`，这里必须一并跳过，
+        // 否则会拿一个空句柄去 CloseDesktop。
+        if self.attached || self.handle.is_null() {
             return;
         }
         // SAFETY: handle 非空（open() 里已校验）且未挂到任何线程上，本对象独占它。

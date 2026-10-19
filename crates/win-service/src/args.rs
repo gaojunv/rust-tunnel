@@ -17,14 +17,15 @@
 pub const USAGE: &str = "\
 rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务）
 
-本程序有两个身份，别在错误的上下文里跑错命令：
-  · 控制台侧的调试/诊断命令（--probe / --probe-in-service / --uninstall）
-    需要**管理员**权限（要动 SCM）。
+本程序有三个身份，别在错误的上下文里跑错命令：
+  · 安装/卸载/启停（--install / --uninstall / --start / --stop）需要**管理员**权限
+    （要动 SCM、要写 %ProgramFiles%）。其中 --start / --stop 是**幂等**的（见各自的说明）。
+  · 控制台侧的调试/诊断命令（--probe / --probe-in-service）同样要管理员（要动 SCM）。
   · 服务进程本身（--run / --probe-instance）由 SCM 启动，不该手工运行。
 
 命令：
   --probe                对照组探针：在当前（已登录的）会话里跑一遍采集与注入。
-                         结果写到 C:\\Users\\Public\\rust-tunnel-probe\\。
+                         结果写到 %ProgramData%\\rust-tunnel\\probe\\（要管理员才读得到）。
   --probe-in-service     闸门探针：安装（若未装）并启动服务，由服务以 SYSTEM 身份把
                          子实例拉进控制台会话，在**当时的输入桌面**（锁屏时是 Winlogon）
                          上做同一套采集与注入。跑完服务会自己停下来。
@@ -32,19 +33,49 @@ rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务�
                          再按 Win+L 锁屏，锁上之后它才动手测。
                          服务是自动启动的，故「开机停在登录界面」那一趟的做法是：
                          装一次（本命令）→ 重启机器 → 登录后看报告。
-  --uninstall            卸载服务（幂等；服务不在也算成功）。
+  --install [--gui-exe <路径>]
+                         安装无人值守被控端：把服务 exe 与实例（GUI）exe 复制到
+                         %ProgramFiles%\\rust-tunnel\\（DACL 收敛到 SYSTEM + Administrators）、
+                         建好 %ProgramData%\\rust-tunnel\\ 与它的 DACL，再把服务注册成自动启动。
+                         需要**管理员**权限。
+                         --gui-exe 指定实例 exe 的位置；省略时在**本 exe 所在目录**里按
+                         rust-tunnel-client-gui.exe / rust-tunnel-client-gui-windows-x86_64.exe
+                         查找（CI 把两个产物并排放在同一个目录里）。
+                         **装完还要自己写 host.toml**（含服务端地址与客户端 token）：
+                         本程序不生成它——那个 token 只有服务端 Web 界面能给。
+  --uninstall            卸载服务（幂等；服务不在也算成功）。**不删**已复制到
+                         %ProgramFiles% / %ProgramData% 的文件。
+  --start                启动已安装的服务（StartServiceW），并**确认它真的在跑**：看到
+                         「运行中」后稳 1.5 秒复查，若它已自行停下就报失败。需要**管理员**权限。
+                         **幂等**：已经在跑也算成功（SCM 报 1056 会被当成「无需启动」）。
+                         这里**不**预检 host.toml——缺 host.toml 时服务**自己**会拒跑并停下
+                         （把客户端身份交回 GUI），本命令只是把这个结果报出来。不预检是为了
+                         --probe-in-service 那趟真机验收：它直接调 StartServiceW、不经过本命令，
+                         且探针实例压根不读那个文件。
+  --stop                 停止已安装的服务（ControlService(SERVICE_CONTROL_STOP)）并**等它真的停下**
+                         （上限 30 秒），好让 GUI 立刻看到状态变化。需要**管理员**权限。
+                         **幂等**：本来就没在跑也算成功。
   --run [--probe]        服务入口，**由 SCM 调用**（不要手工跑）。
+                         不带 --probe 时是服务本体：把实例拉进控制台会话并监督它。
   --probe-instance [戳]  子实例入口，**由服务用 CreateProcessAsUser 拉起**（不要手工跑）。
                          戳是服务算好的时间戳（YYYYMMDD-HHMMSS），用来让父子两边
                          算出同一个报告文件名；手工跑时省略，用当前时刻。
-  --install              阶段 0 暂不提供（服务本体属于阶段 1，装了也没活干）。
   --help, -h             本说明。
 
 典型流程（在**管理员**命令行里）：
-  1) 登录着、没锁屏：      rust-tunnel-client-service --probe
-  2) 敲完这条后立刻 Win+L： rust-tunnel-client-service --probe-in-service
-  3) 重启机器（服务已装好，会自动起）：登录后看报告
-  4) 收尾：                rust-tunnel-client-service --uninstall
+
+  A) 装无人值守被控端：
+       1) rust-tunnel-client-service --install --gui-exe <rust-tunnel-client-gui.exe>
+       2) 写 %ProgramData%\\rust-tunnel\\host.toml（服务端地址 + 客户端 token + 审批策略）
+       3) 立刻起它（不想重启就先起；重启后服务也会自动起）：
+          rust-tunnel-client-service --start
+       4) 重启机器验证「登录界面上也能被控」
+
+  B) 阶段 0 的真机探针（仍在）：
+       1) 登录着、没锁屏：      rust-tunnel-client-service --probe
+       2) 敲完这条后立刻 Win+L： rust-tunnel-client-service --probe-in-service
+       3) 重启机器（服务已装好，会自动起）：登录后看报告
+       4) 收尾：                rust-tunnel-client-service --uninstall
 ";
 
 /// 解析出来的动作。
@@ -71,10 +102,20 @@ pub enum Command {
         /// 是否跑探针（`--run --probe`）。
         probe: bool,
     },
-    /// `--install`。
-    Install,
+    /// `--install [--gui-exe <路径>]`：把两个 exe 复制到 `%ProgramFiles%`、建目录、注册服务。
+    Install {
+        /// 实例（GUI）exe 的显式路径；`None` = 在服务 exe 同目录里按已知文件名找。
+        ///
+        /// 这个路径**不进服务的命令行**（只用于安装时的文件复制），故不构成
+        /// `ImagePath` 注入面——与 [`Command::Run`] 的 `extra_args` 是两回事。
+        gui_exe: Option<String>,
+    },
     /// `--uninstall`。
     Uninstall,
+    /// `--start`：启动已安装的服务（**幂等**；见 [`USAGE`]）。
+    Start,
+    /// `--stop`：停止已安装的服务并等它真的停下（**幂等**；见 [`USAGE`]）。
+    Stop,
 }
 
 /// 解析命令行（不含 argv[0]）。
@@ -106,8 +147,18 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         // 顺序固定成 `--run --probe`：SCM 的 ImagePath 是我们自己写进去的，
         // 不做「任意顺序」这种宽容——宽容只会让写错的地方晚一点被发现。
         ["--run", "--probe"] => Ok(Command::Run { probe: true }),
-        ["--install"] => Ok(Command::Install),
+        ["--install"] => Ok(Command::Install { gui_exe: None }),
+        // 同样只认一种写法：`--install --gui-exe <路径>`。
+        ["--install", "--gui-exe", path] => Ok(Command::Install {
+            gui_exe: Some((*path).to_owned()),
+        }),
+        // 只给 `--gui-exe` 而没给 `--install` 是错的写法：它只在安装时用得到。
+        ["--gui-exe", path] => Err(format!(
+            "--gui-exe 只能与 --install 一起用（收到的是「{path}」）"
+        )),
         ["--uninstall"] => Ok(Command::Uninstall),
+        ["--start"] => Ok(Command::Start),
+        ["--stop"] => Ok(Command::Stop),
         other => Err(format!("无法识别的命令行：{}", other.join(" "))),
     }
 }
@@ -146,8 +197,29 @@ mod tests {
             parse_str("--run --probe").unwrap(),
             Command::Run { probe: true }
         );
-        assert_eq!(parse_str("--install").unwrap(), Command::Install);
+        assert_eq!(
+            parse_str("--install").unwrap(),
+            Command::Install { gui_exe: None }
+        );
+        assert_eq!(
+            parse_str("--install --gui-exe C:\\dl\\rust-tunnel-client-gui.exe").unwrap(),
+            Command::Install {
+                gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe"))
+            }
+        );
         assert_eq!(parse_str("--uninstall").unwrap(), Command::Uninstall);
+        assert_eq!(parse_str("--start").unwrap(), Command::Start);
+        assert_eq!(parse_str("--stop").unwrap(), Command::Stop);
+    }
+
+    #[test]
+    fn gui_exe_is_only_meaningful_with_install() {
+        // 单给 `--gui-exe` 是写错了：它只在安装时用来定位要复制的实例 exe。
+        let err = parse_str("--gui-exe C:\\x.exe").unwrap_err();
+        assert!(err.contains("--install"), "{err}");
+        // 反过来（`--gui-exe` 在前）也不接受：命令行只认一种写法，宽容只会让写错的
+        // 地方晚一点被发现。
+        assert!(parse_str("--gui-exe C:\\x.exe --install").is_err());
     }
 
     #[test]
@@ -159,6 +231,10 @@ mod tests {
         // 顺序固定：`--probe --run` 是错的写法（SCM 里的 ImagePath 由我们写，
         // 不做宽容只会让写错的地方早一点暴露）。
         assert!(parse_str("--probe --run").is_err());
+        // 启停各自独立，不接受组合写法。
+        assert!(parse_str("--start --stop").is_err());
+        assert!(parse_str("--stop --start").is_err());
+        assert!(parse_str("--start extra").is_err());
     }
 
     #[test]
@@ -185,7 +261,12 @@ mod tests {
             "--probe-instance",
             "--run",
             "--install",
+            "--gui-exe",
             "--uninstall",
+            "--start",
+            "--stop",
+            "host.toml",
+            "%ProgramFiles%",
             "锁屏",
             "登录界面",
         ] {

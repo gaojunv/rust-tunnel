@@ -5,10 +5,6 @@
 //!
 //! **未在本平台编译验证**：开发机为 macOS，本文件只在 `target_os = "linux"` 下编译。
 
-use std::sync::Arc;
-
-use rust_tunnel_remote::{InputSink, ScreenSource};
-
 /// 平台标识。
 pub const NAME: &str = "linux";
 
@@ -25,14 +21,8 @@ pub fn permissions() -> super::Permissions {
 /// Linux 无统一的隐私面板跳转，空操作。
 pub fn open_settings(_kind: super::PermissionKind) {}
 
-/// 构造屏幕采集源。
+/// 构造平台实现三件套（Linux 上 `--instance` 不可用，`mode` 一律走 GUI 那套）。
 #[must_use]
-pub fn screen_source() -> Arc<dyn ScreenSource> {
-    Arc::new(super::XcapScreen)
-}
-
-/// 构造输入注入目标。
-#[must_use]
-pub fn input_sink() -> Arc<dyn InputSink> {
-    Arc::new(super::EnigoInput::new())
+pub fn screen_and_input(_mode: super::PlatformMode) -> super::PlatformHandles {
+    super::gui_platform_handles()
 }

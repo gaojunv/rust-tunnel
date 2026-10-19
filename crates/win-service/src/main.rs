@@ -13,15 +13,19 @@
 //!
 //! 本文件只是入口；两个身份的实际逻辑在：
 //! - [`args`] —— 闭合的命令行解析（哪几个参数、什么组合，一眼看完）
+//! - [`supervise`] —— 监督策略的**纯逻辑**（会话变化 → 是否重建、退避阶梯、实例命令行），
+//!   无平台分支，故在 macOS 上也有单测
 //! - `host`（仅 Windows）—— 控制台工具 / 服务进程 / 子实例三条路径
 //!
-//! 平台层（采集、注入、令牌、会话、服务控制）在 `rust-tunnel-win-platform`。
+//! 平台层（采集、注入、令牌、会话、服务控制、目录加固）在 `rust-tunnel-win-platform`。
 //!
-//! # 当前进度：阶段 0（探针）
+//! # 当前进度：阶段 1（服务本体）
 //!
-//! 现在这个 exe 只会跑**真机探针**：把「SYSTEM 令牌能不能把进程拉进控制台会话」
-//! 与「在 Winlogon 桌面上 `SendInput` 到底落不落地」两件事打到真机上出结论。
-//! 阶段 1 才会把子实例换成真正的客户端（`rust-tunnel-client-gui.exe --instance`）。
+//! `--run` 已经是**真正的服务本体**：等控制台会话 → 取令牌 → 用
+//! `CreateProcessAsUserW` 把 `rust-tunnel-client-gui.exe --instance` 拉进控制台会话 →
+//! 放进 `KILL_ON_JOB_CLOSE` 的作业对象 → 监督（退出即退避重启，会话变化即重建）。
+//! `--install` 会把服务与实例两个 exe 复制到 `%ProgramFiles%\rust-tunnel\`（并把 DACL
+//! 收敛到 SYSTEM + Administrators），再注册服务。阶段 0 的真机探针（`--probe*`）原样保留。
 //! 交付与验收流程见根目录 `WINDOWS-SECURE-DESKTOP.md`。
 //!
 //! # 非 Windows 上编译成什么
@@ -31,6 +35,7 @@
 //! **可移植的 `args` 模块仍能在本机跑单测**，而平台专属代码一行都不参与编译。
 
 mod args;
+mod supervise;
 
 #[cfg(windows)]
 mod host;

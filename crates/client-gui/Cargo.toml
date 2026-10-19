@@ -61,6 +61,9 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# 无头实例（`--instance`）的平台层：安全桌面采集/注入、桌面跟随、虚拟桌面几何归一化。
+# 只在 Windows 上编译（macOS/Linux 上本 crate 是零依赖的纯逻辑 crate）。
+rust-tunnel-win-platform = { path = "../win-platform" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }

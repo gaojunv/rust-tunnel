@@ -14,8 +14,15 @@
 //!   就要 `Arc<dyn TransportEstablisher>`。
 
 pub mod clipboard_sync;
+pub mod desktop_follow;
+pub mod input_queue;
 pub mod reconnect;
 pub mod view_scale;
+// 实例（`--instance`）的采集/注入/剪贴板：win-platform 支撑 + 桌面绑定的专用线程。
+// 整模块只在 Windows 上编译；它引用的可测纯逻辑在 `desktop_follow` / `input_queue`。
+// 私有模块：只有 `windows` 分派会调它的 `screen_and_input`，不对外暴露实现类型。
+#[cfg(target_os = "windows")]
+mod win_desktop;
 
 pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
@@ -36,9 +43,10 @@ use rust_tunnel_remote::{
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
 //
-// 每个平台模块提供：`NAME` / `permissions()` / `open_settings()` / `screen_source()` /
-// `input_sink()`。截屏与注入的实体在三个平台完全一致（xcap/enigo 内部消化差异），
-// 故仅权限与设置跳转按平台分派。
+// 每个平台模块提供：`NAME` / `permissions()` / `open_settings()` /
+// `screen_and_input(mode)`。GUI 模式下截屏与注入的实体在三个平台完全一致
+// （xcap/enigo 内部消化差异），故仅权限与设置跳转按平台分派；`PlatformMode::Instance`
+// 只有 Windows 有对应实现（见 `win_desktop`），其余平台按 GUI 那套返回。
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
@@ -102,10 +110,67 @@ pub fn open_permission_settings(kind: PermissionKind) {
     platform::open_settings(kind);
 }
 
-/// 安装平台实现到引擎（截屏 + 输入注入 + 剪贴板）。
-pub fn install_platform(manager: &Arc<RemoteManager>) {
-    manager.install_platform(platform::screen_source(), platform::input_sink());
-    manager.install_clipboard(Arc::new(SystemClipboard));
+/// 平台实现的选定模式。
+///
+/// # 为什么必须在**构造期**定下来
+///
+/// 引擎在**受理会话时**就把 `Arc<dyn ScreenSource>` / `Arc<dyn InputSink>` 克隆走了
+/// （`crates/remote/src/manager.rs` 的 `platform_arc()`），此后 `install_platform` 再覆盖
+/// 也只对**未来**的会话生效。所以「用 `xcap`/`enigo` 还是用 `win-platform` + 桌面跟随」
+/// 必须在构造 `RemoteManager` 的那一次调用里定下来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformMode {
+    /// 用户会话里的常规 GUI 路径：`xcap` 采集 + `enigo` 注入。
+    Gui,
+    /// SYSTEM 服务拉进控制台会话的无头实例：`win-platform` 采集/注入 + 桌面跟随。
+    Instance,
+}
+
+/// 被控端平台在会话结束时的收尾钩子：补发一次「全部抬起」。
+///
+/// 控制器侧的 [`InputGate::release_all`] 在会话结束时会把抬起事件发过线来；但**链路被硬
+/// 切断**（进程被杀、网络断）时那些事件到不了，被控端若正按住某个键/鼠标键就会永久卡住它。
+/// 这个钩子让实例运行时在观察到会话结束时补一次（见 `crate::instance`）。
+pub trait SessionRelease: Send + Sync + 'static {
+    /// 补发一次「全部抬起」（幂等：没有按住的项时是空操作）。
+    fn release_all(&self);
+}
+
+/// 平台实现四件套：采集源、注入目标、剪贴板，以及（仅实例模式）会话收尾钩子。
+pub struct PlatformHandles {
+    /// 屏幕采集源。
+    pub screen: Arc<dyn ScreenSource>,
+    /// 输入注入目标。
+    pub input: Arc<dyn InputSink>,
+    /// 被控端剪贴板实现。
+    pub clipboard: Arc<dyn rust_tunnel_remote::Clipboard>,
+    /// 会话收尾钩子（仅实例模式有；GUI 为 `None`）。
+    pub release: Option<Arc<dyn SessionRelease>>,
+}
+
+/// 安装平台实现到引擎（截屏 + 输入注入 + 剪贴板），返回会话收尾钩子（仅实例模式）。
+///
+/// `mode` 决定用哪一套实现；GUI 路径传 [`PlatformMode::Gui`]，实例传
+/// [`PlatformMode::Instance`]（见 [`PlatformMode`] 关于「构造期选定」的说明）。
+pub fn install_platform(
+    manager: &Arc<RemoteManager>,
+    mode: PlatformMode,
+) -> Option<Arc<dyn SessionRelease>> {
+    let handles = platform::screen_and_input(mode);
+    manager.install_platform(handles.screen, handles.input);
+    manager.install_clipboard(handles.clipboard);
+    handles.release
+}
+
+/// 构造 GUI 路径的默认平台三件套（`xcap` + `enigo` + `arboard`，无收尾钩子）。
+#[must_use]
+pub(crate) fn gui_platform_handles() -> PlatformHandles {
+    PlatformHandles {
+        screen: Arc::new(XcapScreen),
+        input: Arc::new(EnigoInput::new()),
+        clipboard: Arc::new(SystemClipboard),
+        release: None,
+    }
 }
 
 /// 控制器下载文件的落地目录（系统「下载」目录；取不到时回落到临时目录）。
@@ -310,6 +375,71 @@ pub fn code_to_enigo(code: u32) -> Option<enigo::Key> {
             *F_KEYS.get(usize::try_from(offset).ok()?)?
         }
     })
+}
+
+/// 跨平台键码 → **Windows 虚拟键码（VK）**；未知码返回 `None`（静默忽略）。
+///
+/// 实例（`--instance`）用 `win-platform` 的 `SendInput` 注入，走的是 VK（`InjectStep::KeyVk`），
+/// 而不是 `enigo` 的键枚举。这张表与 [`code_to_enigo`] 是同一套跨平台键码的两个后端，
+/// 故放在一起、并各有单测（VK 值是手抄的常量，与 `windows-sys` 的常量同名同值）。
+///
+/// 文本键（[`keycode::TEXT`]）不在表里：它走 `KEYEVENTF_UNICODE`，不受键盘布局影响。
+#[cfg_attr(
+    not(target_os = "windows"),
+    allow(dead_code, reason = "只有 Windows 实例路径（remote::win_desktop）调用它")
+)]
+#[must_use]
+pub fn code_to_vk(code: u32) -> Option<u16> {
+    /// `VK_*` 常量（手抄自 `windows-sys` 的 `Win32::UI::Input::KeyboardAndMouse`）。
+    const VK_BACK: u16 = 0x08;
+    const VK_TAB: u16 = 0x09;
+    const VK_RETURN: u16 = 0x0D;
+    const VK_SHIFT: u16 = 0x10;
+    const VK_CONTROL: u16 = 0x11;
+    const VK_MENU: u16 = 0x12; // Alt
+    const VK_ESCAPE: u16 = 0x1B;
+    const VK_SPACE: u16 = 0x20;
+    const VK_PRIOR: u16 = 0x21; // PageUp
+    const VK_NEXT: u16 = 0x22; // PageDown
+    const VK_END: u16 = 0x23;
+    const VK_HOME: u16 = 0x24;
+    const VK_LEFT: u16 = 0x25;
+    const VK_UP: u16 = 0x26;
+    const VK_RIGHT: u16 = 0x27;
+    const VK_DOWN: u16 = 0x28;
+    const VK_DELETE: u16 = 0x2E;
+    const VK_LWIN: u16 = 0x5B;
+    const VK_F1: u16 = 0x70;
+
+    match code {
+        keycode::ENTER => Some(VK_RETURN),
+        keycode::TAB => Some(VK_TAB),
+        keycode::BACKSPACE => Some(VK_BACK),
+        keycode::ESCAPE => Some(VK_ESCAPE),
+        keycode::DELETE => Some(VK_DELETE),
+        keycode::ARROW_LEFT => Some(VK_LEFT),
+        keycode::ARROW_RIGHT => Some(VK_RIGHT),
+        keycode::ARROW_UP => Some(VK_UP),
+        keycode::ARROW_DOWN => Some(VK_DOWN),
+        keycode::HOME => Some(VK_HOME),
+        keycode::END => Some(VK_END),
+        keycode::PAGE_UP => Some(VK_PRIOR),
+        keycode::PAGE_DOWN => Some(VK_NEXT),
+        keycode::SPACE => Some(VK_SPACE),
+        keycode::CTRL => Some(VK_CONTROL),
+        keycode::SHIFT => Some(VK_SHIFT),
+        keycode::ALT => Some(VK_MENU),
+        keycode::META => Some(VK_LWIN),
+        _ => {
+            // F1..=F12 是连续区间（`VK_F1..=VK_F12`）。
+            let offset = code.checked_sub(keycode::F1)?;
+            if offset < 12 {
+                Some(VK_F1 + u16::try_from(offset).ok()?)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 // ── 输入门控 ─────────────────────────────────────────────────────────
@@ -1811,6 +1941,41 @@ mod tests {
         assert_eq!(code_to_enigo(keycode::TEXT), None);
         assert_eq!(code_to_enigo(keycode::F1 + 12), None);
         assert_eq!(code_to_enigo(u32::MAX), None);
+    }
+
+    /// 跨平台键码 → Windows 虚拟键码（实例注入路径）。锁住几个易错项：
+    /// 方向键的 VK 顺序、F1..=F12 的连续区间、以及「文本键/未知码不给 VK」。
+    #[test]
+    fn code_to_vk_maps_specials_and_f_keys() {
+        assert_eq!(code_to_vk(keycode::ENTER), Some(0x0D));
+        assert_eq!(code_to_vk(keycode::TAB), Some(0x09));
+        assert_eq!(code_to_vk(keycode::BACKSPACE), Some(0x08));
+        assert_eq!(code_to_vk(keycode::ESCAPE), Some(0x1B));
+        assert_eq!(code_to_vk(keycode::DELETE), Some(0x2E));
+        // 方向键不是按上下左右的「直觉顺序」排的：LEFT/UP/RIGHT/DOWN = 25/26/27/28。
+        assert_eq!(code_to_vk(keycode::ARROW_LEFT), Some(0x25));
+        assert_eq!(code_to_vk(keycode::ARROW_UP), Some(0x26));
+        assert_eq!(code_to_vk(keycode::ARROW_RIGHT), Some(0x27));
+        assert_eq!(code_to_vk(keycode::ARROW_DOWN), Some(0x28));
+        assert_eq!(code_to_vk(keycode::HOME), Some(0x24));
+        assert_eq!(code_to_vk(keycode::END), Some(0x23));
+        assert_eq!(code_to_vk(keycode::PAGE_UP), Some(0x21));
+        assert_eq!(code_to_vk(keycode::PAGE_DOWN), Some(0x22));
+        assert_eq!(code_to_vk(keycode::SPACE), Some(0x20));
+        assert_eq!(code_to_vk(keycode::CTRL), Some(0x11));
+        assert_eq!(code_to_vk(keycode::SHIFT), Some(0x10));
+        assert_eq!(code_to_vk(keycode::ALT), Some(0x12));
+        assert_eq!(code_to_vk(keycode::META), Some(0x5B));
+        // F1..=F12 是 0x70..=0x7B 的连续区间（跨平台键码只给 F1，F12 = F1 + 11）。
+        assert_eq!(code_to_vk(keycode::F1), Some(0x70));
+        assert_eq!(code_to_vk(keycode::F1 + 11), Some(0x7B));
+        for i in 0..12 {
+            assert_eq!(code_to_vk(keycode::F1 + i), Some(0x70 + u16::try_from(i).unwrap()));
+        }
+        // 文本键与未知码不给 VK（文本走 KEYEVENTF_UNICODE）。
+        assert_eq!(code_to_vk(keycode::TEXT), None);
+        assert_eq!(code_to_vk(keycode::F1 + 12), None);
+        assert_eq!(code_to_vk(u32::MAX), None);
     }
 
     #[test]

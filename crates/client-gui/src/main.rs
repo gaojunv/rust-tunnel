@@ -14,12 +14,16 @@ mod app;
 mod autostart;
 mod config_store;
 mod fonts;
+mod instance;
 mod notify;
 mod prefs;
 mod remote;
+mod service_ui;
+mod service_watch;
 mod tray;
 mod ui;
 
+use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +31,8 @@ use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
 use rust_tunnel_remote::{ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig, SessionRole};
+
+use service_watch::IdentityOwner;
 
 pub(crate) fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
     let bytes: &[u8] = include_bytes!("../icons/icon.png");
@@ -46,8 +52,8 @@ struct GuiApp {
     selected_tab: usize,
     /// 托盘句柄（保持 `TrayIcon` 生命周期，随窗口同生共死）。
     tray: Option<tray::TrayHandle>,
-    /// 上次已写入托盘的文案签名（首行/服务器行/tooltip），逐字段比较避免每帧写托盘。
-    last_tray_texts: Option<(String, String, String)>,
+    /// 上次已写入托盘的文案签名（首行/服务器行/tooltip/服务行），逐字段比较避免每帧写托盘。
+    last_tray_texts: Option<(String, String, String, String)>,
     /// GUI 偏好（主题等），切换时落盘 gui.toml。
     prefs: prefs::GuiPrefs,
     /// 远程会话窗口的 GUI 侧状态。**共享**给独立会话窗口的回调（它可能在别的线程执行），
@@ -59,6 +65,8 @@ struct GuiApp {
     /// 上一帧待确认请求的会话 ID。用于检测 `None → Some` 跳变，仅在**首次出现**时
     /// 强制显示并聚焦窗口（见 `update`），避免每帧与用户抢焦点。
     last_pending_approval: Option<String>,
+    /// 无人值守被控端的操作与状态（在途操作 / 最近结果 / 服务状态缓存），跨帧存活。
+    service_ui: service_ui::ServiceOps,
 }
 
 impl GuiApp {
@@ -83,6 +91,7 @@ impl GuiApp {
             remote_view,
             approval_remember: false,
             last_pending_approval: None,
+            service_ui: service_ui::ServiceOps::default(),
         }
     }
 
@@ -167,6 +176,13 @@ impl GuiApp {
                     // 「设置」Tab 下标（见 show_tabs 的标签数组：状态/映射/远程/设置/日志）。
                     self.selected_tab = 3;
                 }
+                tray::TrayAction::Service => {
+                    // 与 `Settings` 同落地（设置就是那个 Tab）；菜单里分成两项只为让语义对上
+                    // 用户意图——「服务设置…」直接把用户带到无人值守被控端那一节。
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.selected_tab = 3;
+                }
                 tray::TrayAction::Reconnect => {
                     self.app_state
                         .reconnect_requested
@@ -196,15 +212,21 @@ impl GuiApp {
     /// `pending_approval` 为真时覆盖 tooltip：此时窗口可能已隐藏到托盘，tooltip 是用户
     /// 唯一能看到的线索，提示有接入请求待确认。
     fn refresh_tray(&mut self, status: &ClientStatus, pending_approval: bool) {
+        // 服务接管身份时托盘不能再说「已连接/离线」——本窗口根本没注册，那两句话都是假的。
+        // 归属直接从 `AppState` 读（由 `service_watch` 的轮询任务持续刷新）。
+        let owner = self.app_state.service_owner();
         let tooltip = if pending_approval {
             "rust-tunnel — 有远程接入请求待确认".to_owned()
         } else {
-            tray::tooltip_text(status)
+            tray::tooltip_text_with_service(status, owner)
         };
+        // 服务状态行（只读项）：装/没装、跑/没跑由它给出（1 秒缓存，见 `service_ui::ServiceOps`）。
+        let service_text = service_ui::service_menu_text(self.service_ui.presence());
         let sig = (
-            tray::status_menu_text(status),
+            tray::status_menu_text_with_service(status, owner),
             tray::server_menu_text(status),
             tooltip,
+            service_text,
         );
         if self.last_tray_texts.as_ref() == Some(&sig) {
             return;
@@ -216,6 +238,9 @@ impl GuiApp {
             }
             if prev.map(|p| &p.1) != Some(&sig.1) {
                 handle.server_item.set_text(&sig.1);
+            }
+            if prev.map(|p| &p.3) != Some(&sig.3) {
+                handle.service_item.set_text(&sig.3);
             }
             if prev.map(|p| &p.2) != Some(&sig.2) {
                 if let Err(e) = handle.icon.set_tooltip(Some(sig.2.clone())) {
@@ -312,6 +337,8 @@ impl eframe::App for GuiApp {
             return;
         }
         self.drain_tray_actions(ctx);
+        // 抽干服务操作的结果通道：一次 --install 要跑约二十秒，结果只能在后续帧里看到。
+        self.service_ui.poll();
 
         let status = self.app_state.status_rx.borrow().clone();
 
@@ -355,6 +382,7 @@ impl eframe::App for GuiApp {
 
         let mut remote_actions = ui::remote::RemoteTabActions::default();
         let settings = &mut self.settings;
+        let service_ui = &mut self.service_ui;
         let remote_view = Arc::clone(&self.remote_view);
         let app_state = &self.app_state;
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -362,12 +390,16 @@ impl eframe::App for GuiApp {
             // 被控横幅常驻所有 Tab 顶部：无论用户切到哪个页都能看到并随时中断。
             ui::remote::controlled_banner(ui, remote_manager.as_ref());
             match self.selected_tab {
-                0 => ui::status::show(ui, &status),
+                0 => ui::status::show(ui, &status, app_state.service_owner()),
                 1 => ui::mappings::show(ui, &status),
                 2 => {
                     remote_actions = ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
                 }
-                3 => ui::settings::show(ui, settings, app_state),
+                3 => {
+                    ui::settings::show(ui, settings, app_state);
+                    // 「无人值守被控端」一节独立于 `show`（那已背着 too_many_lines 豁免）。
+                    ui::settings::show_service_section(ui, app_state, service_ui);
+                }
                 4 => ui::logs::show(ui, &app_state.log_buffer),
                 _ => {}
             }
@@ -388,7 +420,9 @@ impl eframe::App for GuiApp {
 
         self.sync_display_prefs();
 
-        let needs_repaint = !status.connected || status.last_error.is_some();
+        // 服务操作在途时也要勤刷：结果要靠 `poll` 才被看到（在途期间按钮已禁用）。
+        let service_busy = self.service_ui.in_flight().is_some();
+        let needs_repaint = !status.connected || status.last_error.is_some() || service_busy;
         if needs_repaint {
             ctx.request_repaint_after(Duration::from_millis(300));
         } else {
@@ -397,29 +431,63 @@ impl eframe::App for GuiApp {
     }
 }
 
+/// 构造远程控制引擎的选项。
+///
+/// GUI 与无头实例（`--instance`）的开关、平台实现与目录来源都不同，故集中在这里传入，
+/// 免得 `build_remote_manager` 的形参表越拉越长。
+struct ManagerOptions {
+    /// 初始是否允许被远程控制。
+    enabled: bool,
+    /// 接入确认策略。
+    approval_policy: ApprovalPolicy,
+    /// 平台实现模式（**必须在构造期选定**，见 [`remote::PlatformMode`]）。
+    platform_mode: remote::PlatformMode,
+    /// 被控端共享目录（`None` = 不接受文件请求）。
+    share_dir: Option<PathBuf>,
+    /// 控制器下载文件的落盘目录。
+    download_dir: PathBuf,
+}
+
 /// 构造远程控制引擎（配置就绪后调用一次）。
 ///
 /// `displays` 传 1 只是安装平台实现前的占位——[`remote::install_platform`] 之后
-/// 引擎以 `ScreenSource::displays()` 为准。`approval_policy` 取自持久化偏好，决定被控端
-/// 是直接接受还是每次弹窗确认。
-fn build_remote_manager(config: &ClientConfig, enabled: bool, approval_policy: ApprovalPolicy) -> Arc<RemoteManager> {
+/// 引擎以 `ScreenSource::displays()` 为准。`approval_policy` 取自持久化偏好（GUI）或
+/// `host.toml`（实例），决定被控端是直接接受还是每次弹窗确认。
+///
+/// 返回引擎本身与会话收尾钩子（仅实例模式有；GUI 为 `None`）。
+fn build_remote_manager(
+    config: &ClientConfig,
+    opts: ManagerOptions,
+) -> (Arc<RemoteManager>, Option<Arc<dyn remote::SessionRelease>>) {
     let establisher = Arc::new(remote::LazyTransport::new(config.server.clone()));
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),
         self_client_name: config.name.clone().unwrap_or_default(),
         platform: remote::platform_name().to_owned(),
         displays: 1,
-        enabled,
-        approval_policy,
+        enabled: opts.enabled,
+        approval_policy: opts.approval_policy,
         establisher,
         encode: EncodeOptions::default(),
-        // 被控端共享目录固定为「下载」目录下的 rust-tunnel-share：可见、易找，且与用户的
-        // 个人目录隔离。用户要换目录只需在这里改一处（后续可在设置页做成可配）。
+        share_dir: opts.share_dir,
+        download_dir: opts.download_dir,
+    });
+    // 平台实现在这里**一次性**选定：引擎受理会话时就把 `Arc<dyn ScreenSource>` /
+    // `Arc<dyn InputSink>` 克隆走了，之后 `install_platform` 再覆盖对已建立的会话无效。
+    let release = remote::install_platform(&manager, opts.platform_mode);
+    (manager, release)
+}
+
+/// GUI 路径的引擎选项：共享目录固定为「下载」目录下的 `rust-tunnel-share`——可见、易找，
+/// 且与用户的个人目录隔离（用户要换目录只需在这里改一处）。
+fn gui_manager_options(enabled: bool, approval_policy: ApprovalPolicy) -> ManagerOptions {
+    ManagerOptions {
+        enabled,
+        approval_policy,
+        platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
-    });
-    remote::install_platform(&manager);
-    manager
+    }
 }
 
 #[allow(
@@ -520,88 +588,334 @@ fn spawn_runtime(
             // 远程控制引擎：配置就绪后构造一次，安装平台实现（截屏/注入），注入 AppState
             // 供 GUI 读取，桥接交给控制通道。构造在此（而非 main）是因为 server_host /
             // 客户端名要等磁盘配置加载完；无配置时上面的循环会先等到配置。
-            let remote_manager = build_remote_manager(&config, initial_allow_remote, initial_approval);
+            let (remote_manager, _release) = build_remote_manager(
+                &config,
+                gui_manager_options(initial_allow_remote, initial_approval),
+            );
             app_state.set_remote(Arc::clone(&remote_manager));
 
-            let mut policy = ReconnectPolicy::new();
-            let mut first_success = true;
-
+            // 身份归属监督：Windows 服务在跑时本进程**不注册**（服务端按客户端名唯一，
+            // 同名注册会互相踢，表现为「远程控制每隔几秒掉一次」）。非 Windows 上
+            // `start_watch` 恒返回 `None`，下面的循环退化为今天的「一次 run_client_loop」。
+            let owner_rx = service_watch::start_watch(Arc::clone(&app_state.service_owner_tx));
+            // 「是否已因服务接管而被动」：只在**进入**被动时广播一次状态。UI 的 watch 接收端
+            // 会保留最后一次值，一次就够——每 2 秒 tick 都 send 只会白白刷屏。
+            let mut passive = false;
             loop {
-                let cfg = config.clone();
-                let tx = status_tx.clone();
-                let lb = log_buffer.clone();
-                // 控制通道读循环把远程变体交给引擎，上行经桥接回写同一条通道。
-                let bridge = Some(remote_manager.bridge());
-                let res = rust_tunnel_client::control::run_client_with_status(
-                    cfg,
-                    Some(tx),
-                    Some(lb),
-                    bridge,
-                )
-                .await;
-
-                match res {
-                    Ok(()) => {
-                        policy.reset();
-                        tracing::warn!("控制通道已关闭，准备重连");
+                let owner = owner_rx.as_ref().map_or(IdentityOwner::Gui, |rx| *rx.borrow());
+                if owner.is_service() {
+                    if !passive {
+                        publish_passive_status(&status_tx);
+                        passive = true;
                     }
-                    Err(e) if !ReconnectPolicy::should_reconnect(&e) => {
-                        tracing::error!("注册被拒（不可重连）：{e}");
-                        notify::send("rust-tunnel", &format!("注册被拒：{e}"));
-                        // 标记错误到 status 供面板展示
-                        let mut s = app_state.status_rx.borrow().clone();
-                        s.last_error = Some(e.to_string());
-                        let _ = app_state.status_tx.send(s);
-                        break;
+                    // 被动期间消费并丢弃托盘的「重连」请求：否则服务一停，那个陈旧的请求会
+                    // 立刻触发一次注册，与服务实例再撞一次。
+                    if reconnect_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        tracing::debug!("服务接管身份期间忽略托盘「重连」请求");
                     }
-                    Err(e) => {
-                        tracing::warn!("连接错误：{e}");
-                        let mut s = app_state.status_rx.borrow().clone();
-                        s.connected = false;
-                        s.last_error = Some(e.to_string());
-                        let _ = app_state.status_tx.send(s);
-                        if first_success {
-                            notify::send("rust-tunnel", &format!("已断开：{e}"));
-                        }
-                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
-
-                first_success = false;
-                let backoff = policy.next_backoff();
-                tracing::info!("{backoff}s 后重连…");
-
-                // 可中断的退避等待：托盘“重连”立即打断
-                let mut waited = 0u64;
-                while waited < backoff {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if reconnect_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                        reconnect_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                        if let Some(c) = config_store::load_from_default_path()
-                            .or_else(|| ClientConfig::load().ok())
-                        {
-                            // 钥匙串回填
-                            let mut c2 = c;
-                            if c2.password.is_empty() {
-                                let cn = c2.name.as_deref().unwrap_or("");
-                                if let Some(pw) =
-                                    config_store::read_password_from_keyring(&c2.server, cn)
-                                {
-                                    c2.password = pw;
-                                }
-                            }
-                            config = c2;
-                        }
-                        policy.reset();
-                        break;
+                // 服务已停（或从没装）：本窗口重新接管，下次真被动时要重新广播。
+                passive = false;
+                match run_client_loop(
+                    config.clone(),
+                    Some(Arc::clone(&status_tx)),
+                    Some(Arc::clone(&log_buffer)),
+                    Some(Arc::clone(&reconnect_flag)),
+                    Arc::clone(&remote_manager),
+                    owner_rx.clone(),
+                )
+                .await
+                {
+                    // 注册被拒等不可重连的失败：就此停下，不再进循环（避免热重试）。
+                    LoopExit::Unrecoverable => break,
+                    LoopExit::YieldedToService => {
+                        // 服务接管：通知一次。本函数只被 GUI 路径调用，通知有人看得到。
+                        notify::send(
+                            "rust-tunnel",
+                            "Windows 服务已接管客户端身份，本窗口不再注册",
+                        );
+                        tracing::warn!("服务已接管客户端身份，本窗口转为被动");
                     }
-                    waited += 1;
                 }
             }
         });
     });
 }
 
+/// 控制通道循环的退出原因（见 [`run_client_loop`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopExit {
+    /// 不可重连的失败（注册被拒等）——调用方应停止，不要再进循环。
+    Unrecoverable,
+    /// 服务接管了客户端身份——调用方应转被动，等服务停止后再回来。
+    YieldedToService,
+}
+
+/// 服务接管身份时广播一次「被动」状态：连接置为断开 + 一行解释。
+///
+/// 状态面板与托盘都读这条 `watch`；`last_error` 的文案要能直接读通（托盘首行会把它截断，
+/// 见 `tray::status_menu_text`）。
+fn publish_passive_status(status_tx: &tokio::sync::watch::Sender<ClientStatus>) {
+    let mut s = status_tx.borrow().clone();
+    s.connected = false;
+    s.last_error = Some("Windows 服务已接管客户端身份（本窗口未注册）".to_owned());
+    let _ = status_tx.send(s);
+}
+
+/// 等到身份归属变成 [`IdentityOwner::Service`]（服务接管）。
+///
+/// 供 [`run_client_loop`] 的 `select!` 用：控制通道是一条长命 future，服务起来时必须能
+/// 立刻把它打断，而不是等它自己断线。
+///
+/// **发送端被丢弃时永不 resolve**：那意味着监督方没了，而不是「服务接管」——若让它 resolve，
+/// 一次通道关闭就会被误判成让出，本进程会永远停在被动态。故用 `pending()` 挂住。
+async fn wait_for_service_owner(rx: &mut tokio::sync::watch::Receiver<IdentityOwner>) {
+    loop {
+        // 先 `borrow_and_update` 再 `changed`：watch 的经典用法——否则会立刻被当前值唤醒成
+        // 「已变化」，而其实什么都没变。
+        if rx.borrow_and_update().is_service() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            // 发送端已丢弃：挂住，永不 resolve（见上）。
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// 控制通道重连循环（**GUI 与无头实例共用**）。
+///
+/// GUI 传 `status_tx` / `log_buffer` / `reconnect_flag` 三者；无头实例（`--instance`）三者
+/// 全传 `None`——没有状态面板、没有托盘「重连」按钮，也不需要把日志塞进环形缓冲。
+///
+/// **`status_tx` 是否为 `Some` 同时充当「GUI 模式」判据**：只有 GUI 才弹系统通知
+/// （SYSTEM 会话里的通知没人看得到，且 `notify-rust` 在无桌面上下文下会失败）。
+///
+/// `service_owner` 是服务状态轮询任务的接收端：`Some` 时本循环在**连接期间**与
+/// **退避等待期间**都会盯着它，服务一接管就立刻返回 [`LoopExit::YieldedToService`]，
+/// 把身份让给服务实例。无头实例与非 Windows 传 `None`，行为与从前逐字节一致。
+#[allow(
+    clippy::too_many_lines,
+    reason = "重连状态机（成功 / 不可重连 / 可重连 + 可中断退避 + 服务让出）整体可读性优于拆散"
+)]
+async fn run_client_loop(
+    mut config: ClientConfig,
+    status_tx: Option<Arc<tokio::sync::watch::Sender<ClientStatus>>>,
+    log_buffer: Option<Arc<LogBuffer>>,
+    reconnect_flag: Option<Arc<AtomicBool>>,
+    remote_manager: Arc<RemoteManager>,
+    mut service_owner: Option<tokio::sync::watch::Receiver<IdentityOwner>>,
+) -> LoopExit {
+    let gui = status_tx.is_some();
+    let mut policy = ReconnectPolicy::new();
+    let mut first_success = true;
+
+    loop {
+        let cfg = config.clone();
+        // 控制通道读循环把远程变体交给引擎，上行经桥接回写同一条通道。
+        let bridge = Some(remote_manager.bridge());
+        // 连接期间与「服务接管」竞速：服务一起来就立刻让出，不等控制通道自己断。
+        // 无 `service_owner`（非 Windows / 无头实例）时走原来的纯 await 路径。
+        let mut yielded = false;
+        let res = match &mut service_owner {
+            Some(rx) => {
+                tokio::select! {
+                    r = rust_tunnel_client::control::run_client_with_status(
+                        cfg,
+                        status_tx.clone(),
+                        log_buffer.clone(),
+                        bridge,
+                    ) => r,
+                    () = wait_for_service_owner(rx) => {
+                        yielded = true;
+                        Ok(())
+                    }
+                }
+            }
+            None => {
+                rust_tunnel_client::control::run_client_with_status(
+                    cfg,
+                    status_tx.clone(),
+                    log_buffer.clone(),
+                    bridge,
+                )
+                .await
+            }
+        };
+
+        if yielded {
+            tracing::warn!("服务已接管客户端身份，控制通道让出");
+            return LoopExit::YieldedToService;
+        }
+
+        match res {
+            Ok(()) => {
+                policy.reset();
+                tracing::warn!("控制通道已关闭，准备重连");
+            }
+            Err(e) if !ReconnectPolicy::should_reconnect(&e) => {
+                tracing::error!("注册被拒（不可重连）：{e}");
+                if gui {
+                    notify::send("rust-tunnel", &format!("注册被拒：{e}"));
+                }
+                // 标记错误到 status 供面板展示
+                if let Some(tx) = &status_tx {
+                    let mut s = tx.borrow().clone();
+                    s.last_error = Some(e.to_string());
+                    let _ = tx.send(s);
+                }
+                // 不可重连：就此停下，交由调用方决定（GUI 路径据此不再进循环）。
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("连接错误：{e}");
+                if let Some(tx) = &status_tx {
+                    let mut s = tx.borrow().clone();
+                    s.connected = false;
+                    s.last_error = Some(e.to_string());
+                    let _ = tx.send(s);
+                }
+                if first_success && gui {
+                    notify::send("rust-tunnel", &format!("已断开：{e}"));
+                }
+            }
+        }
+
+        first_success = false;
+        let backoff = policy.next_backoff();
+        tracing::info!("{backoff}s 后重连…");
+
+        // 可中断的退避等待：托盘「重连」立即打断；无头实例没有这个入口，纯退避。
+        let mut waited = 0u64;
+        while waited < backoff {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // 服务在这一秒里起来了就立刻让出——绝不空等完 60 秒退避（那时服务早已接管，
+            // 等完只会多打一次注定被踢的注册）。
+            if service_owner
+                .as_ref()
+                .is_some_and(|rx| rx.borrow().is_service())
+            {
+                tracing::warn!("服务已接管客户端身份，中断退避等待");
+                return LoopExit::YieldedToService;
+            }
+            let Some(flag) = &reconnect_flag else {
+                waited += 1;
+                continue;
+            };
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Some(c) = config_store::load_from_default_path()
+                    .or_else(|| ClientConfig::load().ok())
+                {
+                    // 钥匙串回填
+                    let mut c2 = c;
+                    if c2.password.is_empty() {
+                        let cn = c2.name.as_deref().unwrap_or("");
+                        if let Some(pw) = config_store::read_password_from_keyring(&c2.server, cn) {
+                            c2.password = pw;
+                        }
+                    }
+                    config = c2;
+                }
+                policy.reset();
+                break;
+            }
+            waited += 1;
+        }
+    }
+    LoopExit::Unrecoverable
+}
+
+/// 启动模式（由命令行决定）。
+#[derive(Debug)]
+enum LaunchMode {
+    /// 常规 GUI：托盘 + eframe 主窗口。无参数时。
+    Gui,
+    /// 无头实例：SYSTEM 服务用 `CreateProcessAsUserW` 拉起（见 `--instance`）。
+    Instance(instance::InstanceOptions),
+}
+
+/// 解析命令行。
+///
+/// 手写而不用 `clap`：本 crate 是 **GUI-subsystem** 的，`clap` 的 help/报错走 stdout/stderr，
+/// 在 GUI-subsystem 下**没有输出**；而这里要的就是「参数写错时能看见一条人话」。
+///
+/// **未知参数一律报错，不静默忽略**——静默忽略会让「命令行写错」表现成「装上了但行为不对」
+/// （服务侧拼错一个 `--share`，实例照跑，只是共享目录落到了别处）。
+///
+/// # Errors
+///
+/// 未知参数、缺参数值、或 `--config` 未与 `--instance` 同用时返回错误文本。
+fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMode, String> {
+    const USAGE: &str = "\
+用法：
+  rust-tunnel-client-gui
+      启动桌面托盘客户端（默认）。
+
+  rust-tunnel-client-gui --instance [--config <host.toml>] [--share <dir>] [--download <dir>]
+      无头实例：由 Windows 服务拉进控制台会话运行，无窗口、承载客户端身份、
+      采集与注入跟随输入桌面。仅 Windows 可用。
+
+    --config <path>    host.toml 路径（含服务端地址 + 客户端 token + 审批策略）。
+                       默认 %ProgramData%\\rust-tunnel\\host.toml
+    --share <dir>      被控端对外共享的目录。默认 %ProgramData%\\rust-tunnel\\share
+    --download <dir>   控制端下载文件的落盘目录。默认 %ProgramData%\\rust-tunnel\\download
+                       （三者也可用环境变量 RUST_TUNNEL_HOST_CONFIG / RUST_TUNNEL_SHARE_DIR /
+                       RUST_TUNNEL_DOWNLOAD_DIR 覆盖）";
+
+    let mut instance = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut share_dir: Option<PathBuf> = None;
+    let mut download_dir: Option<PathBuf> = None;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--instance" => instance = true,
+            "--config" | "--share" | "--download" => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{arg} 需要一个路径参数\n\n{USAGE}"));
+                };
+                let slot = match arg.as_str() {
+                    "--config" => &mut config_path,
+                    "--share" => &mut share_dir,
+                    _ => &mut download_dir,
+                };
+                *slot = Some(PathBuf::from(value));
+            }
+            other => return Err(format!("未知参数：{other}\n\n{USAGE}")),
+        }
+    }
+
+    if instance {
+        Ok(LaunchMode::Instance(instance::InstanceOptions::resolve(
+            config_path,
+            share_dir,
+            download_dir,
+        )))
+    } else if config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
+        Err(format!(
+            "--config / --share / --download 只能与 --instance 一起用\n\n{USAGE}"
+        ))
+    } else {
+        Ok(LaunchMode::Gui)
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    // argv 分派放在**最前**：早于 DISPLAY 检查、早于托盘与 eframe——`--instance` 是无头的，
+    // 走到托盘/eframe 就会起窗口（那是它明确不该做的事）。
+    match parse_launch_mode(std::env::args().skip(1)) {
+        Ok(LaunchMode::Instance(opts)) => return instance::run(&opts),
+        Ok(LaunchMode::Gui) => {}
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    }
+
     // 无桌面环境时退化为提示（供容器/CI 体检）
     let has_display = std::env::var("DISPLAY").is_ok()
         || std::env::var("WAYLAND_DISPLAY").is_ok()
@@ -677,4 +991,81 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! argv 分派的纯逻辑单测（无 GUI、无 Windows 依赖，故本机可跑）。
+    //!
+    //! 只测「参数 → 模式」这一层：`--instance` 的**默认路径**由
+    //! [`instance::InstanceOptions::resolve`] 解析，会读环境变量，故这里只对**显式传入**的
+    //! 路径做断言（它们优先于环境变量与默认值）。
+
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn no_arguments_is_the_gui_path() {
+        assert!(matches!(parse_launch_mode(args(&[])), Ok(LaunchMode::Gui)));
+    }
+
+    #[test]
+    fn instance_flag_alone_is_the_instance_path() {
+        let parsed = parse_launch_mode(args(&["--instance"])).unwrap();
+        assert!(matches!(parsed, LaunchMode::Instance(_)));
+    }
+
+    #[test]
+    fn explicit_paths_are_carried_through_in_any_order() {
+        let parsed = parse_launch_mode(args(&[
+            "--config",
+            r"C:\ProgramData\rust-tunnel\host.toml",
+            "--instance",
+            "--share",
+            r"D:\share",
+            "--download",
+            r"D:\dl",
+        ]))
+        .unwrap();
+        let LaunchMode::Instance(opts) = parsed else {
+            panic!("应当是实例模式");
+        };
+        assert_eq!(
+            opts.config_path,
+            PathBuf::from(r"C:\ProgramData\rust-tunnel\host.toml")
+        );
+        assert_eq!(opts.share_dir, PathBuf::from(r"D:\share"));
+        assert_eq!(opts.download_dir, PathBuf::from(r"D:\dl"));
+    }
+
+    /// 未知参数**必须报错**：静默忽略会让「命令行写错」表现成「装上了但行为不对」。
+    #[test]
+    fn unknown_arguments_are_rejected() {
+        let err = parse_launch_mode(args(&["--instanc"])).unwrap_err();
+        assert!(err.contains("未知参数"), "{err}");
+        // 参数值本身也可能是拼错的参数（`--config --share` 这种）——它会被当成路径收下，
+        // 这不是我们能判定的错误（路径长什么样是服务侧的事）。
+        assert!(parse_launch_mode(args(&["--instance", "--oops", "x"])).is_err());
+    }
+
+    /// 缺参数值要报错，而不是把下一个参数当成值或直接忽略。
+    #[test]
+    fn missing_argument_value_is_rejected() {
+        for flag in ["--config", "--share", "--download"] {
+            let err = parse_launch_mode(args(&["--instance", flag])).unwrap_err();
+            assert!(err.contains("需要一个路径参数"), "{flag}: {err}");
+        }
+    }
+
+    /// 实例专用参数不能单独出现（GUI 路径不读它们，静默忽略同样会掩盖拼写错误）。
+    #[test]
+    fn instance_only_flags_without_instance_are_rejected() {
+        for flag in ["--config", "--share", "--download"] {
+            let err = parse_launch_mode(args(&[flag, "x"])).unwrap_err();
+            assert!(err.contains("只能与 --instance 一起用"), "{flag}: {err}");
+        }
+    }
 }
