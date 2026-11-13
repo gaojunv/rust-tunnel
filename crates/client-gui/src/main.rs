@@ -925,12 +925,13 @@ fn install_startup_diagnostics() -> Option<std::path::PathBuf> {
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("gui-startup.log");
     let header = format!(
-        "=== rust-tunnel-client-gui {} starting ===\nexe: {:?}\nargs: {:?}\n",
+        "\n=== rust-tunnel-client-gui {} starting ===\nexe: {:?}\nargs: {:?}",
         env!("CARGO_PKG_VERSION"),
         std::env::current_exe(),
         std::env::args().collect::<Vec<_>>(),
     );
-    std::fs::write(&path, header).ok()?;
+    // 追加而不是截断：Glow 失败后会用 wgpu 重启自身，两次启动的证据都要保留。
+    append_startup_log(&path, &header);
     let hook_path = path.clone();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1016,7 +1017,7 @@ fn main() {
         }
     }
 
-    if let Err(err) = run_app() {
+    if let Err(err) = run_app(log_path.as_deref()) {
         if let Some(path) = log_path.as_deref() {
             log_startup_error(path, &err);
         }
@@ -1025,7 +1026,28 @@ fn main() {
     }
 }
 
-fn run_app() -> anyhow::Result<()> {
+/// 用 wgpu（Windows 上走 DX12）重新拉起自身。
+///
+/// Glow 依赖 OpenGL 驱动；部分 Windows 10 机器（老驱动、虚拟机、远程桌面）没有
+/// 可用的 GL 配置，eframe 会报 `Found no glutin configs`。wgpu 走 DX12，能覆盖这些
+/// 机器。重启而不是进程内重试，是因为 `run_native` 会消费掉 `FnOnce` 的 app 构造器。
+fn relaunch_with_wgpu() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut command = std::process::Command::new(exe);
+    command.args(std::env::args_os().skip(1));
+    command.env("RUST_TUNNEL_RENDERER", "wgpu");
+    match command.spawn() {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(error = %err, "以 wgpu 重新启动失败");
+            false
+        }
+    }
+}
+
+fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // DPI 感知必须在**任何窗口/采集初始化之前**设置：否则 150% 缩放的 4K 屏会被
     // Win32 报成 2560×1440，采集坐标与输入坐标整体错位（见 win_video 模块文档）。
     #[cfg(target_os = "windows")]
@@ -1100,12 +1122,25 @@ fn run_app() -> anyhow::Result<()> {
         vp
     };
 
+    // Windows 上允许用环境变量强制 wgpu；Glow 失败时 [`relaunch_with_wgpu`] 会设置它。
+    let renderer = if cfg!(target_os = "windows")
+        && std::env::var("RUST_TUNNEL_RENDERER").as_deref() == Ok("wgpu")
+    {
+        eframe::Renderer::Wgpu
+    } else {
+        eframe::Renderer::Glow
+    };
+    if let Some(path) = log_path {
+        append_startup_log(path, &format!("renderer: {renderer:?}"));
+    }
+
     let options = eframe::NativeOptions {
         viewport,
+        renderer,
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Rust Tunnel",
         options,
         Box::new(move |cc| {
@@ -1113,8 +1148,28 @@ fn run_app() -> anyhow::Result<()> {
             apply_theme(&cc.egui_ctx, prefs.theme);
             Ok(Box::new(GuiApp::new(app_state, tray, prefs)))
         }),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    );
+
+    if let Err(err) = result {
+        let message = err.to_string();
+        // Glow/OpenGL 配置不可用时自动切 wgpu（只在 Windows；只重试一次，避免循环）。
+        if cfg!(target_os = "windows")
+            && matches!(renderer, eframe::Renderer::Glow)
+            && std::env::var_os("RUST_TUNNEL_RENDERER").is_none()
+            && message.contains("glutin")
+        {
+            if let Some(path) = log_path {
+                append_startup_log(
+                    path,
+                    &format!("eframe(glow) 失败，改用 wgpu 重新启动:\n{message}"),
+                );
+            }
+            if relaunch_with_wgpu() {
+                std::process::exit(0);
+            }
+        }
+        return Err(anyhow::anyhow!("{message}"));
+    }
 
     Ok(())
 }
