@@ -71,7 +71,11 @@ rust-tunnel-win-video = { path = "../win-video" }
 # `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`
 # 与主线程 STA 占位（`OleInitialize`，避免 winit 在 MTA 线程上 panic）。
 # workspace 的 windows-sys 清单不含这两个，这里按需追加 feature（feature 是叠加的）。
-windows-sys = { workspace = true, features = ["Win32_UI_HiDpi", "Win32_System_Ole"] }
+windows-sys = { workspace = true, features = [
+    "Win32_UI_HiDpi",
+    "Win32_System_Ole",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }

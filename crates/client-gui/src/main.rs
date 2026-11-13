@@ -946,38 +946,81 @@ fn install_startup_diagnostics() -> Option<std::path::PathBuf> {
                 std::backtrace::Backtrace::force_capture()
             );
         }
+        show_startup_error_dialog(&format!("panic: {info}"));
         previous(info);
     }));
     Some(path)
 }
 
-/// 把 `run_app` 返回的错误追加到启动日志。
-fn log_startup_error(path: &std::path::Path, err: &anyhow::Error) {
+/// 追加一段文本到启动日志（失败静默，诊断本身不能影响启动）。
+fn append_startup_log(path: &std::path::Path, text: &str) {
     use std::io::Write as _;
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "\n=== startup error ===\n{err:?}");
+        let _ = writeln!(file, "{text}");
     }
 }
 
+/// 把 `run_app` 返回的错误追加到启动日志。
+fn log_startup_error(path: &std::path::Path, err: &anyhow::Error) {
+    append_startup_log(path, &format!("=== startup error ===\n{err:?}"));
+}
+
+/// 在 GUI 无法启动时弹一个系统错误框（现场没有控制台）。
+#[cfg(target_os = "windows")]
+fn show_startup_error_dialog(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let text: Vec<u16> = format!(
+        "{message}\n\n日志: %LOCALAPPDATA%\\rust-tunnel\\gui-startup.log"
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let title: Vec<u16> = "Rust Tunnel 启动失败"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: 两个字符串都以 NUL 结尾；空 HWND 表示无父窗口。
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// 非 Windows 平台没有系统错误框；panic 仍会写日志。
+#[cfg(not(target_os = "windows"))]
+fn show_startup_error_dialog(_message: &str) {}
+
 fn main() {
+    // 诊断必须先于一切：即使下面的 COM/窗口初始化失败，也能留下版本与错误。
+    let log_path = install_startup_diagnostics();
+
     // 主线程先占住 STA：winit 创建窗口时会 `OleInitialize`，若主线程已被任何依赖
     // 初始化成 MTA，winit 会以 `RPC_E_CHANGED_MODE` **直接 panic**。先初始化 STA
-    // 让 winit 那次调用幂等地返回 `S_FALSE`。返回值本身可忽略。
+    // 让 winit 那次调用幂等地返回 `S_FALSE`。
     #[cfg(target_os = "windows")]
     {
         // SAFETY: `OleInitialize` 只影响当前线程，且必须在窗口/COM 使用之前调用。
-        let _ = unsafe { windows_sys::Win32::System::Ole::OleInitialize(std::ptr::null_mut()) };
+        let hr = unsafe { windows_sys::Win32::System::Ole::OleInitialize(std::ptr::null_mut()) };
+        if hr < 0 {
+            if let Some(path) = log_path.as_deref() {
+                append_startup_log(path, &format!("OleInitialize 失败: HRESULT=0x{hr:08X}"));
+            }
+        }
     }
 
-    let log_path = install_startup_diagnostics();
     if let Err(err) = run_app() {
         if let Some(path) = log_path.as_deref() {
             log_startup_error(path, &err);
         }
+        show_startup_error_dialog(&format!("启动失败: {err}"));
         std::process::exit(1);
     }
 }
