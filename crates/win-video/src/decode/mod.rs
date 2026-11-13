@@ -36,6 +36,7 @@ mod color;
 
 use crate::WinVideoError;
 use std::cell::Cell;
+use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::OnceLock;
@@ -43,8 +44,8 @@ use windows::core::{IUnknown, Interface as _};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup,
-    MFVideoArea, MFVideoFormat_H264, MFVideoFormat_IYUV, MFVideoFormat_NV12, MFVideoFormat_YV12,
+    MFMediaType_Video, MFVideoArea, MFVideoFormat_H264, MFVideoFormat_IYUV, MFVideoFormat_NV12,
+    MFVideoFormat_YV12,
     MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MF_E_NOTACCEPTING, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT,
@@ -249,8 +250,8 @@ impl H264Decoder {
             return Ok(None);
         }
         // 解码任务可能在线程池线程上运行：COM 初始化是线程局部的，必须每次确认。
-        ensure_mf_started()?;
         ensure_com_initialized()?;
+        ensure_mf_started()?;
 
         let mut last = None;
         let mut offset = 0usize;
@@ -292,9 +293,7 @@ impl H264Decoder {
         let length = u32::try_from(payload.len())
             .map_err(|_| WinVideoError::Decode("单个包超过 4 GiB".to_owned()))?;
 
-        // SAFETY: `MFCreateMemoryBuffer` 无外部指针参数，返回新的 COM 对象。
-        let buffer = unsafe { MFCreateMemoryBuffer(length) }
-            .map_err(|err| decode_err("MFCreateMemoryBuffer", &err))?;
+        let buffer = create_memory_buffer(length)?;
 
         let mut destination: *mut u8 = ptr::null_mut();
         // SAFETY: `destination` 指向本栈帧；`buffer` 在调用期间有效。
@@ -318,9 +317,7 @@ impl H264Decoder {
         unsafe { buffer.SetCurrentLength(length) }
             .map_err(|err| decode_err("IMFMediaBuffer::SetCurrentLength", &err))?;
 
-        // SAFETY: `MFCreateSample` 无外部指针参数，返回新的 COM 对象。
-        let sample =
-            unsafe { MFCreateSample() }.map_err(|err| decode_err("MFCreateSample", &err))?;
+        let sample = create_sample()?;
         // SAFETY: `sample` 与 `buffer` 都在本函数内有效；AddBuffer 增加引用计数。
         unsafe { sample.AddBuffer(&buffer) }
             .map_err(|err| decode_err("IMFSample::AddBuffer", &err))?;
@@ -395,12 +392,8 @@ impl H264Decoder {
 
     /// 创建一个符合当前输出流要求的样本。
     fn new_output_sample(&self) -> Result<IMFSample, WinVideoError> {
-        // SAFETY: `MFCreateMemoryBuffer` 无外部指针参数。
-        let buffer = unsafe { MFCreateMemoryBuffer(self.output_buffer_size.max(1)) }
-            .map_err(|err| decode_err("MFCreateMemoryBuffer（输出）", &err))?;
-        // SAFETY: `MFCreateSample` 无外部指针参数。
-        let sample = unsafe { MFCreateSample() }
-            .map_err(|err| decode_err("MFCreateSample（输出）", &err))?;
+        let buffer = create_memory_buffer(self.output_buffer_size.max(1))?;
+        let sample = create_sample()?;
         // SAFETY: 两个 COM 对象都在本函数内有效；AddBuffer 增加引用计数。
         unsafe { sample.AddBuffer(&buffer) }
             .map_err(|err| decode_err("IMFSample::AddBuffer（输出）", &err))?;
@@ -612,9 +605,7 @@ fn configure_low_latency(transform: &IMFTransform) {
 
 /// 构造 H.264 输入媒体类型。
 fn build_input_type(width: u32, height: u32, fps: u32) -> Result<IMFMediaType, WinVideoError> {
-    // SAFETY: `MFCreateMediaType` 无外部指针参数。
-    let media_type =
-        unsafe { MFCreateMediaType() }.map_err(|err| decode_err("MFCreateMediaType", &err))?;
+    let media_type = create_media_type()?;
     let progressive = u32::try_from(MFVideoInterlace_Progressive.0).unwrap_or_default();
     // SAFETY: `media_type` 有效；所有 GUID 常数都是 `'static`。
     unsafe {
@@ -710,9 +701,7 @@ fn build_output_type(
     height: u32,
     subtype: &windows::core::GUID,
 ) -> Result<IMFMediaType, WinVideoError> {
-    // SAFETY: `MFCreateMediaType` 无外部指针参数。
-    let media_type = unsafe { MFCreateMediaType() }
-        .map_err(|err| decode_err("MFCreateMediaType（输出）", &err))?;
+    let media_type = create_media_type()?;
     let progressive = u32::try_from(MFVideoInterlace_Progressive.0).unwrap_or_default();
     // SAFETY: `media_type` 有效；GUID 常数都是 `'static`。
     unsafe {
@@ -934,12 +923,130 @@ fn decode_err(context: &str, error: &windows::core::Error) -> WinVideoError {
     WinVideoError::Decode(format!("{context} 失败: {error}"))
 }
 
+/// 运行期加载的 Media Foundation 入口表。
+///
+/// **不在链接期依赖 `mfplat.dll`**：Windows 10 N/LTSC 或精简镜像可能没有它，
+/// 静态导入会让进程在 `main` 之前加载失败（表现为「点开即闪退」）。缺失时这里
+/// 返回错误，`H264DecoderFactory::new` 探测失败 → 控制器不声明 H.264 → 回退 VP9。
+struct MfApi {
+    /// 库必须活到函数表失效之后。
+    _lib: libloading::Library,
+    /// `MFStartup(version, flags)`。
+    startup: unsafe extern "system" fn(u32, u32) -> windows::core::HRESULT,
+    /// `MFCreateMediaType(&mut ptr)`。
+    create_media_type: unsafe extern "system" fn(*mut *mut c_void) -> windows::core::HRESULT,
+    /// `MFCreateMemoryBuffer(len, &mut ptr)`。
+    create_memory_buffer:
+        unsafe extern "system" fn(u32, *mut *mut c_void) -> windows::core::HRESULT,
+    /// `MFCreateSample(&mut ptr)`。
+    create_sample: unsafe extern "system" fn(*mut *mut c_void) -> windows::core::HRESULT,
+}
+
+// SAFETY: 函数表在进程生命周期内只读；`mfplat.dll` 由 `OnceLock` 永久持有，
+// 不会卸载；每次调用创建的 COM 对象仍由调用线程独占。
+unsafe impl Send for MfApi {}
+// SAFETY: 同上——只读函数表可以被多个线程同时读取。
+unsafe impl Sync for MfApi {}
+
+impl MfApi {
+    fn load() -> Result<Self, String> {
+        // SAFETY: 只加载系统目录下的 mfplat.dll。
+        let lib = unsafe { libloading::Library::new("mfplat.dll") }
+            .map_err(|err| format!("加载 mfplat.dll 失败: {err}"))?;
+        // SAFETY: 符号名与下面的函数指针签名必须和 Media Foundation 的 C ABI
+        // 一致；`lib` 在 `MfApi` 存活期间不会卸载。
+        let startup = unsafe {
+            *lib.get::<unsafe extern "system" fn(u32, u32) -> windows::core::HRESULT>(b"MFStartup")
+                .map_err(|err| format!("缺少 MFStartup: {err}"))?
+        };
+        // SAFETY: 同上。
+        let create_media_type = unsafe {
+            *lib.get::<unsafe extern "system" fn(*mut *mut c_void) -> windows::core::HRESULT>(
+                b"MFCreateMediaType",
+            )
+            .map_err(|err| format!("缺少 MFCreateMediaType: {err}"))?
+        };
+        // SAFETY: 同上。
+        let create_memory_buffer = unsafe {
+            *lib.get::<unsafe extern "system" fn(u32, *mut *mut c_void) -> windows::core::HRESULT>(
+                b"MFCreateMemoryBuffer",
+            )
+            .map_err(|err| format!("缺少 MFCreateMemoryBuffer: {err}"))?
+        };
+        // SAFETY: 同上。
+        let create_sample = unsafe {
+            *lib.get::<unsafe extern "system" fn(*mut *mut c_void) -> windows::core::HRESULT>(
+                b"MFCreateSample",
+            )
+            .map_err(|err| format!("缺少 MFCreateSample: {err}"))?
+        };
+        Ok(Self {
+            _lib: lib,
+            startup,
+            create_media_type,
+            create_memory_buffer,
+            create_sample,
+        })
+    }
+}
+
+/// 取（或首次加载）Media Foundation 入口表。
+fn mf_api() -> Result<&'static MfApi, WinVideoError> {
+    static API: OnceLock<Result<MfApi, String>> = OnceLock::new();
+    match API.get_or_init(MfApi::load) {
+        Ok(api) => Ok(api),
+        Err(message) => Err(WinVideoError::Decode(message.clone())),
+    }
+}
+
+/// `MFCreateMediaType` 的运行期版本。
+fn create_media_type() -> Result<IMFMediaType, WinVideoError> {
+    let api = mf_api()?;
+    let mut raw: *mut c_void = ptr::null_mut();
+    // SAFETY: `raw` 指向本栈帧；成功后返回一个由 `from_abi` 接管的接口指针。
+    let hr = unsafe { (api.create_media_type)(&raw mut raw) };
+    hr.ok()
+        .map_err(|err| decode_err("MFCreateMediaType", &err))?;
+    // SAFETY: 成功路径的 `raw` 非空且引用计数为 1，所有权交给返回的接口。
+    unsafe { windows::core::Type::from_abi(raw) }
+        .map_err(|err| decode_err("MFCreateMediaType", &err))
+}
+
+/// `MFCreateMemoryBuffer` 的运行期版本。
+fn create_memory_buffer(length: u32) -> Result<IMFMediaBuffer, WinVideoError> {
+    let api = mf_api()?;
+    let mut raw: *mut c_void = ptr::null_mut();
+    // SAFETY: `raw` 指向本栈帧；成功后返回一个由 `from_abi` 接管的接口指针。
+    let hr = unsafe { (api.create_memory_buffer)(length, &raw mut raw) };
+    hr.ok()
+        .map_err(|err| decode_err("MFCreateMemoryBuffer", &err))?;
+    // SAFETY: 成功路径的 `raw` 非空且引用计数为 1，所有权交给返回的接口。
+    unsafe { windows::core::Type::from_abi(raw) }
+        .map_err(|err| decode_err("MFCreateMemoryBuffer", &err))
+}
+
+/// `MFCreateSample` 的运行期版本。
+fn create_sample() -> Result<IMFSample, WinVideoError> {
+    let api = mf_api()?;
+    let mut raw: *mut c_void = ptr::null_mut();
+    // SAFETY: `raw` 指向本栈帧；成功后返回一个由 `from_abi` 接管的接口指针。
+    let hr = unsafe { (api.create_sample)(&raw mut raw) };
+    hr.ok()
+        .map_err(|err| decode_err("MFCreateSample", &err))?;
+    // SAFETY: 成功路径的 `raw` 非空且引用计数为 1，所有权交给返回的接口。
+    unsafe { windows::core::Type::from_abi(raw) }
+        .map_err(|err| decode_err("MFCreateSample", &err))
+}
+
 /// 进程级 `MFStartup`（只执行一次；失败结果也缓存，避免反复尝试）。
 fn ensure_mf_started() -> Result<(), WinVideoError> {
     static STARTUP: OnceLock<Result<(), String>> = OnceLock::new();
     match STARTUP.get_or_init(|| {
+        let api = mf_api().map_err(|err| err.to_string())?;
         // SAFETY: `MFStartup` 是进程级初始化，`MF_VERSION` 是编译期常数。
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.map_err(|err| err.to_string())
+        unsafe { (api.startup)(MF_VERSION, MFSTARTUP_FULL) }
+            .ok()
+            .map_err(|err| err.to_string())
     }) {
         Ok(()) => Ok(()),
         Err(message) => Err(WinVideoError::Decode(format!("MFStartup 失败: {message}"))),

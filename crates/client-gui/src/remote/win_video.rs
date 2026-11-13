@@ -347,12 +347,28 @@ pub struct H264DecoderFactory;
 
 impl H264DecoderFactory {
     /// 探测 `MSH264DecoderMFT` 是否可用；不可用时返回 `None`（不声明 H.264 能力）。
+    ///
+    /// **探测放在专用线程**：`H264Decoder::new` 会 `CoInitializeEx(MTA)` 并
+    /// `MFStartup`。虽然本函数跑在远程引擎的后台线程、不是 winit 主线程，但把
+    /// COM 套间初始化限制在一条一次性线程上更干净，也不会与后续任何 STA 依赖
+    /// 抢主线程的套间。
     #[must_use]
     pub fn new() -> Option<Self> {
-        match H264Decoder::new(64, 64) {
-            Ok(_) => Some(Self),
-            Err(err) => {
-                info!(error = %err, "Media Foundation H.264 解码器不可用，控制器不声明 H.264 能力");
+        let probe = std::thread::Builder::new()
+            .name("mft-probe".to_owned())
+            .spawn(|| match H264Decoder::new(64, 64) {
+                Ok(_) => true,
+                Err(err) => {
+                    info!(error = %err, "Media Foundation H.264 解码器不可用，控制器不声明 H.264 能力");
+                    false
+                }
+            })
+            .ok()?;
+        match probe.join() {
+            Ok(true) => Some(Self),
+            Ok(false) => None,
+            Err(_) => {
+                info!("MFT 探测线程 panic，控制器不声明 H.264 能力");
                 None
             }
         }

@@ -914,7 +914,75 @@ fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMo
     }
 }
 
-fn main() -> anyhow::Result<()> {
+/// 启动期诊断：把 panic/启动错误写到 `%LOCALAPPDATA%\rust-tunnel\gui-startup.log`。
+///
+/// GUI 是 windows 子系统二进制，没有控制台；现场「点开即闪退」时这是唯一能拿到的
+/// 证据。每次启动截断写一行版本/路径，panic 与启动错误追加。
+fn install_startup_diagnostics() -> Option<std::path::PathBuf> {
+    let dir = directories::BaseDirs::new().map_or_else(std::env::temp_dir, |base| {
+        base.data_local_dir().join("rust-tunnel")
+    });
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("gui-startup.log");
+    let header = format!(
+        "=== rust-tunnel-client-gui {} starting ===\nexe: {:?}\nargs: {:?}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::current_exe(),
+        std::env::args().collect::<Vec<_>>(),
+    );
+    std::fs::write(&path, header).ok()?;
+    let hook_path = path.clone();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&hook_path)
+        {
+            let _ = writeln!(
+                file,
+                "\n=== panic ===\n{info}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        previous(info);
+    }));
+    Some(path)
+}
+
+/// 把 `run_app` 返回的错误追加到启动日志。
+fn log_startup_error(path: &std::path::Path, err: &anyhow::Error) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "\n=== startup error ===\n{err:?}");
+    }
+}
+
+fn main() {
+    // 主线程先占住 STA：winit 创建窗口时会 `OleInitialize`，若主线程已被任何依赖
+    // 初始化成 MTA，winit 会以 `RPC_E_CHANGED_MODE` **直接 panic**。先初始化 STA
+    // 让 winit 那次调用幂等地返回 `S_FALSE`。返回值本身可忽略。
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: `OleInitialize` 只影响当前线程，且必须在窗口/COM 使用之前调用。
+        let _ = unsafe { windows_sys::Win32::System::Ole::OleInitialize(std::ptr::null_mut()) };
+    }
+
+    let log_path = install_startup_diagnostics();
+    if let Err(err) = run_app() {
+        if let Some(path) = log_path.as_deref() {
+            log_startup_error(path, &err);
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run_app() -> anyhow::Result<()> {
     // DPI 感知必须在**任何窗口/采集初始化之前**设置：否则 150% 缩放的 4K 屏会被
     // Win32 报成 2560×1440，采集坐标与输入坐标整体错位（见 win_video 模块文档）。
     #[cfg(target_os = "windows")]
