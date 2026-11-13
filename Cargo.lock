@@ -8453,6 +8453,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "egui-wgpu",
  "enigo",
  "image",
  "keyring",

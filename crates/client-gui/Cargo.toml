@@ -36,6 +36,9 @@ auto-launch = "0.5"
 notify-rust = { version = "4" }
 # wgpu 作为 Windows 上 Glow/OpenGL 不可用时的回退（DX12）；默认仍走 Glow。
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+# 仅用于启动日志里枚举 wgpu adapter（判断是否落到 WARP/软件渲染）；与 eframe
+# 的 wgpu feature 共用同一份依赖图。
+egui-wgpu = "0.31"
 egui = "0.31"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 tray-icon = { version = "0.19" }

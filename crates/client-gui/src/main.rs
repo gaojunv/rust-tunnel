@@ -1026,6 +1026,31 @@ fn main() {
     }
 }
 
+/// 把 wgpu 枚举到的 adapter 写进启动日志。
+///
+/// 现场高 CPU 诊断：如果选中的是 WARP/软件适配器（`device_type: Cpu`），
+/// 高 CPU 是软件光栅化的必然结果，不是 GUI 逻辑在空转。
+#[cfg(target_os = "windows")]
+fn log_wgpu_adapters(path: &std::path::Path) {
+    let instance = egui_wgpu::wgpu::Instance::default();
+    let adapters = instance.enumerate_adapters(egui_wgpu::wgpu::Backends::all());
+    if adapters.is_empty() {
+        append_startup_log(path, "wgpu: 没有枚举到任何 adapter");
+        return;
+    }
+    for adapter in adapters {
+        let info = adapter.get_info();
+        append_startup_log(
+            path,
+            &format!("wgpu adapter: {}", egui_wgpu::adapter_info_summary(&info)),
+        );
+    }
+}
+
+/// 非 Windows 平台没有 wgpu 回退，不需要枚举 adapter。
+#[cfg(not(target_os = "windows"))]
+fn log_wgpu_adapters(_path: &std::path::Path) {}
+
 /// 用 wgpu（Windows 上走 DX12）重新拉起自身。
 ///
 /// Glow 依赖 OpenGL 驱动；部分 Windows 10 机器（老驱动、虚拟机、远程桌面）没有
@@ -1047,6 +1072,10 @@ fn relaunch_with_wgpu() -> bool {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "GUI 启动路径：参数分派、托盘、远程引擎、renderer 选择与回退是一条不可分割的启动链"
+)]
 fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // DPI 感知必须在**任何窗口/采集初始化之前**设置：否则 150% 缩放的 4K 屏会被
     // Win32 报成 2560×1440，采集坐标与输入坐标整体错位（见 win_video 模块文档）。
@@ -1132,6 +1161,9 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     };
     if let Some(path) = log_path {
         append_startup_log(path, &format!("renderer: {renderer:?}"));
+        if matches!(renderer, eframe::Renderer::Wgpu) {
+            log_wgpu_adapters(path);
+        }
     }
 
     let options = eframe::NativeOptions {
