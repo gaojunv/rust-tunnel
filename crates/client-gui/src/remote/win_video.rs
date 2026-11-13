@@ -439,6 +439,12 @@ impl VideoDecoderApi for H264DecoderAdapter {
 /// 任一侧为 `None` 时，协商会回退到 VP9。
 #[must_use]
 pub fn factories() -> super::HardwareFactories {
+    // 现场诊断开关：怀疑 NVENC/Media Foundation 探测导致启动问题时置 1，
+    // 跳过所有硬件探测，数据面完全回退 VP9（GUI 仍应正常启动）。
+    if std::env::var_os("RUST_TUNNEL_DISABLE_HWCODEC").is_some() {
+        info!("RUST_TUNNEL_DISABLE_HWCODEC 已设置，跳过 NVENC/MFT 探测");
+        return (None, None);
+    }
     let encoder = match nvenc_api() {
         Some(api) => match d3d11::create_nvidia() {
             Ok(_) => {
