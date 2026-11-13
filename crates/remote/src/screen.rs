@@ -268,6 +268,11 @@ pub struct EncodeOptions {
     pub target_bitrate_kbps: u32,
     /// 缩放比例**上限**（1.0 = 原始尺寸）。编码尺寸还会被 [`crate::video::MAX_ENCODE_WIDTH`] 封顶；
     /// 闭环可在必要时进一步下调（降编码分辨率）。
+    ///
+    /// **平台采集源可以预先封顶**：Windows 的 WGC/DXGI 采集在交给引擎前就把源缩到
+    /// [`crate::video::MAX_ENCODE_WIDTH`]（避免 4K 的 33 MB 中间缓冲），此时「原始尺寸」
+    /// 指封顶后的尺寸——「流畅」档的 0.5 会在 1920 宽的源上得到 960，而不是 4K 源上
+    /// 先乘 0.5 再被 1920 封顶（后者仍会得到 1920，等于该档降分辨率在 4K 上失效）。
     pub scale: f32,
     /// 目标帧率**上限**（被控端据此定采集间隔，也写进编码器的 `fps`）。
     pub max_fps: u8,

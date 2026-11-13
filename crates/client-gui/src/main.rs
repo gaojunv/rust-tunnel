@@ -464,6 +464,9 @@ fn build_remote_manager(
     opts: ManagerOptions,
 ) -> (Arc<RemoteManager>, Option<Arc<dyn remote::SessionRelease>>) {
     let establisher = Arc::new(remote::LazyTransport::new(config.server.clone()));
+    // Windows 上探测 NVENC 与 Media Foundation H.264 MFT；任一侧不可用则为 `None`，
+    // 协商自动回退 VP9。其他平台恒为 `(None, None)`。
+    let (h264_encoder_factory, h264_decoder_factory) = remote::hardware_factories();
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),
         self_client_name: config.name.clone().unwrap_or_default(),
@@ -475,6 +478,9 @@ fn build_remote_manager(
         encode: EncodeOptions::default(),
         share_dir: opts.share_dir,
         download_dir: opts.download_dir,
+        // Windows 硬件编解码实现由 `remote::win_video` 注入；其他平台保持 VP9。
+        h264_encoder_factory,
+        h264_decoder_factory,
     });
     // 平台实现在这里**一次性**选定：引擎受理会话时就把 `Arc<dyn ScreenSource>` /
     // `Arc<dyn InputSink>` 克隆走了，之后 `install_platform` 再覆盖对已建立的会话无效。
@@ -909,6 +915,11 @@ fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMo
 }
 
 fn main() -> anyhow::Result<()> {
+    // DPI 感知必须在**任何窗口/采集初始化之前**设置：否则 150% 缩放的 4K 屏会被
+    // Win32 报成 2560×1440，采集坐标与输入坐标整体错位（见 win_video 模块文档）。
+    #[cfg(target_os = "windows")]
+    remote::win_video::enable_per_monitor_dpi_awareness();
+
     // argv 分派放在**最前**：早于 DISPLAY 检查、早于托盘与 eframe——`--instance` 是无头的，
     // 走到托盘/eframe 就会起窗口（那是它明确不该做的事）。
     match parse_launch_mode(std::env::args().skip(1)) {

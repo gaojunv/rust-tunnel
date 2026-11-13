@@ -300,6 +300,8 @@ fn manager_with_dirs(
         download_dir,
         // 既有用例都按「直接接受」跑；确认门控的新用例各自 `set_approval_policy(Confirm)`。
         approval_policy: ApprovalPolicy::Auto,
+        h264_encoder_factory: None,
+        h264_decoder_factory: None,
     })
 }
 
@@ -636,6 +638,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         encode: EncodeOptions::default(),
         capture_watchdog: CAPTURE_WATCHDOG,
         stats: SessionStatsReporter::noop(),
+        h264_encoder_factory: None,
     };
     let ctrl_cfg = ControllerConfig {
         session_id: "sess-1".to_owned(),
@@ -643,6 +646,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         local_rd_id: "111111111".to_owned(),
         mode: RemoteMode::Control,
         stats: SessionStatsReporter::noop(),
+        h264_decoder_factory: None,
     };
 
     let (_input_tx, input_rx) = mpsc::channel(4);
@@ -709,6 +713,7 @@ async fn correct_token_completes_handshake_and_streams() {
             encode: EncodeOptions::default(),
             capture_watchdog: CAPTURE_WATCHDOG,
             stats: SessionStatsReporter::noop(),
+            h264_encoder_factory: None,
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),
@@ -725,6 +730,7 @@ async fn correct_token_completes_handshake_and_streams() {
             local_rd_id: "111111111".to_owned(),
             mode: RemoteMode::ViewOnly,
             stats: SessionStatsReporter::noop(),
+            h264_decoder_factory: None,
         },
         plan,
         input_rx,
@@ -839,6 +845,7 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
             local_rd_id: "111111111".to_owned(),
             mode: RemoteMode::Control,
             stats: SessionStatsReporter::noop(),
+            h264_decoder_factory: None,
         },
         plan,
         input_rx,
@@ -1373,6 +1380,7 @@ async fn handshake_against_unregistered_token(
             encode: EncodeOptions::default(),
             capture_watchdog: CAPTURE_WATCHDOG,
             stats: SessionStatsReporter::noop(),
+            h264_encoder_factory: None,
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),

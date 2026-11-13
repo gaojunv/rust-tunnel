@@ -1,0 +1,270 @@
+//! NV12 / YV12 / IYUV → RGBA 转换（BT.709 limited range）。
+//!
+//! # 色彩常数来源
+//!
+//! 编码端（[`crate::nvenc`]）在 VUI 里显式打的是 **BT.709 + limited range**
+//! （`colourMatrix = BT709`、`videoFullRangeFlag = 0`），因此解码端必须用同一套
+//! 矩阵与范围，否则画面会发灰或偏色。本模块的定点常数由 ITU-R BT.709-6 的
+//! 亮度方程与 limited range 缩放（Y: 16–235，Cb/Cr: 16–240）推出：
+//!
+//! - `R' = Y' + 2(1 - Kr)·V`
+//! - `G' = Y' - 2(1 - Kb)·Kb/Kg·U - 2(1 - Kr)·Kr/Kg·V`
+//! - `B' = Y' + 2(1 - Kb)·U`
+//! - 其中 `Kr = 0.2126`、`Kb = 0.0722`、`Kg = 1 - Kr - Kb`；
+//! - `Y' = (Y - 16) / 219`、`U = (Cb - 128) / 224`、`V = (Cr - 128) / 224`。
+//!
+//! 把这些系数乘 255（回到 8-bit）再乘 1024（定点移位），四舍五入后得到下面的
+//! 整数常数。误差在 ±0.5 LSB 内，逐像素只需三次乘加，1080p 单核足够快。
+//!
+//! # 为什么不用 f32
+//!
+//! 控制器解码是软实时路径（1080p 每秒数十帧）；f32 版本每像素要做浮点乘加
+//! 与饱和转换，在低端 CPU 上是可测的开销。定点版本与浮点版本的差异远小于
+//! 4:2:0 本身的色度误差。
+
+use crate::WinVideoError;
+
+/// BT.709 limited range 的亮度黑电平。
+const Y_OFFSET: i32 = 16;
+/// BT.709 limited range 的色度零电平。
+const C_OFFSET: i32 = 128;
+
+/// `255 / 219 * 1024`，四舍五入。
+const Y_SCALE: i32 = 1192;
+/// `1.5748 * 255 / 224 * 1024`（R 的 V 系数）。
+const R_V: i32 = 1836;
+/// `0.1873 * 255 / 224 * 1024`（G 的 U 系数）。
+const G_U: i32 = 218;
+/// `0.4681 * 255 / 224 * 1024`（G 的 V 系数）。
+const G_V: i32 = 546;
+/// `1.8556 * 255 / 224 * 1024`（B 的 U 系数）。
+const B_U: i32 = 2163;
+/// 定点移位的舍入项（`1 << (SHIFT - 1)`）。
+const ROUND: i32 = 512;
+/// 定点小数位数。
+const SHIFT: u32 = 10;
+
+/// 把定点结果裁剪到 8-bit。
+fn clip(value: i32) -> u8 {
+    u8::try_from(value.clamp(0, 255)).unwrap_or(0)
+}
+
+/// 校验 4:2:0 尺寸并转换成 `usize`。
+fn dimensions(width: u32, height: u32) -> Result<(usize, usize), WinVideoError> {
+    if width == 0 || height == 0 {
+        return Err(WinVideoError::Decode(format!(
+            "解码尺寸不能为 0：{width}x{height}"
+        )));
+    }
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(WinVideoError::Decode(format!(
+            "4:2:0 解码要求宽高为偶数，收到 {width}x{height}"
+        )));
+    }
+    let w = usize::try_from(width)
+        .map_err(|_| WinVideoError::Decode("解码宽度无法转为 usize".to_owned()))?;
+    let h = usize::try_from(height)
+        .map_err(|_| WinVideoError::Decode("解码高度无法转为 usize".to_owned()))?;
+    Ok((w, h))
+}
+
+/// 校验一个平面的 stride 与长度（避免后续逐像素索引越界）。
+fn validate_plane(
+    plane: &[u8],
+    pitch: usize,
+    rows: usize,
+    min_row_bytes: usize,
+    name: &str,
+) -> Result<(), WinVideoError> {
+    if pitch < min_row_bytes {
+        return Err(WinVideoError::Decode(format!(
+            "{name} 平面 stride {pitch} 小于行宽 {min_row_bytes}"
+        )));
+    }
+    let needed = pitch
+        .checked_mul(rows)
+        .ok_or_else(|| WinVideoError::Decode(format!("{name} 平面大小溢出")))?;
+    if plane.len() < needed {
+        return Err(WinVideoError::Decode(format!(
+            "{name} 平面过小：需要 {needed} 字节，实际 {}",
+            plane.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 写一个像素；越界时静默跳过（正常情况下不会发生，尺寸已在入口校验）。
+fn store_rgba(out: &mut [u8], index: usize, base: i32, chroma: (i32, i32, i32)) {
+    let (r_chroma, g_chroma, b_chroma) = chroma;
+    let Some(pixel) = out.get_mut(index..index.saturating_add(4)) else {
+        return;
+    };
+    pixel[0] = clip((base.saturating_add(r_chroma)) >> SHIFT);
+    pixel[1] = clip((base.saturating_add(g_chroma)) >> SHIFT);
+    pixel[2] = clip((base.saturating_add(b_chroma)) >> SHIFT);
+    pixel[3] = 255;
+}
+
+/// 由 Cb/Cr 计算每像素共享的色度项（2x2 块内四个像素相同）。
+fn chroma_terms(cb: u8, cr: u8) -> (i32, i32, i32) {
+    let u = i32::from(cb) - C_OFFSET;
+    let v = i32::from(cr) - C_OFFSET;
+    (R_V * v + ROUND, -G_U * u - G_V * v + ROUND, B_U * u + ROUND)
+}
+
+/// 由 Y 计算亮度项。
+fn luma_term(y: u8) -> i32 {
+    Y_SCALE * (i32::from(y) - Y_OFFSET)
+}
+
+/// NV12（Y 平面 + 交织 UV 平面）→ 自顶向下 RGBA。
+///
+/// `y_pitch` / `uv_pitch` 是**字节** stride，可能大于宽度；不能假设等于宽度。
+///
+/// # Errors
+/// 尺寸非偶数、stride 小于行宽或平面长度不足时返回 [`WinVideoError::Decode`]。
+pub(crate) fn nv12_to_rgba(
+    y: &[u8],
+    uv: &[u8],
+    y_pitch: usize,
+    uv_pitch: usize,
+    width: u32,
+    height: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), WinVideoError> {
+    let (w, h) = dimensions(width, height)?;
+    validate_plane(y, y_pitch, h, w, "Y")?;
+    validate_plane(uv, uv_pitch, h / 2, w, "UV")?;
+
+    out.clear();
+    out.resize(w.saturating_mul(h).saturating_mul(4), 255);
+
+    for row in (0..h).step_by(2) {
+        let y0 = row.saturating_mul(y_pitch);
+        let y1 = row.saturating_add(1).saturating_mul(y_pitch);
+        let uv_row = (row / 2).saturating_mul(uv_pitch);
+        for col in (0..w).step_by(2) {
+            let Some((&cb, &cr)) = uv.get(uv_row + col).zip(uv.get(uv_row + col + 1)) else {
+                continue;
+            };
+            let terms = chroma_terms(cb, cr);
+            for (dy, y_row) in [(0usize, y0), (1, y1)] {
+                let Some((&left, &right)) = y.get(y_row + col).zip(y.get(y_row + col + 1)) else {
+                    continue;
+                };
+                let pixel = (row + dy)
+                    .saturating_mul(w)
+                    .saturating_add(col)
+                    .saturating_mul(4);
+                store_rgba(out, pixel, luma_term(left), terms);
+                store_rgba(out, pixel.saturating_add(4), luma_term(right), terms);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 平面 YUV 4:2:0（Y + 独立 U/V 平面）→ 自顶向下 RGBA。
+///
+/// `u` / `v` 由调用方按布局（YV12 为 V 在前，IYUV 为 U 在前）排好。
+///
+/// # Errors
+/// 尺寸非偶数、stride 小于行宽或平面长度不足时返回 [`WinVideoError::Decode`]。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "三个平面 + 两个 stride + 尺寸 + 输出，逐项对应调用点，拆结构体反而更难核对"
+)]
+pub(crate) fn planar_to_rgba(
+    luma: &[u8],
+    u_plane: &[u8],
+    v_plane: &[u8],
+    y_pitch: usize,
+    chroma_pitch: usize,
+    width: u32,
+    height: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), WinVideoError> {
+    let (pixel_width, pixel_height) = dimensions(width, height)?;
+    let chroma_width = pixel_width / 2;
+    let chroma_rows = pixel_height / 2;
+    validate_plane(luma, y_pitch, pixel_height, pixel_width, "Y")?;
+    validate_plane(u_plane, chroma_pitch, chroma_rows, chroma_width, "U")?;
+    validate_plane(v_plane, chroma_pitch, chroma_rows, chroma_width, "V")?;
+
+    out.clear();
+    out.resize(
+        pixel_width.saturating_mul(pixel_height).saturating_mul(4),
+        255,
+    );
+
+    for row in (0..pixel_height).step_by(2) {
+        let y0 = row.saturating_mul(y_pitch);
+        let y1 = row.saturating_add(1).saturating_mul(y_pitch);
+        let chroma_row = (row / 2).saturating_mul(chroma_pitch);
+        for col in (0..pixel_width).step_by(2) {
+            let chroma_col = col / 2;
+            let Some((&cb, &cr)) = u_plane
+                .get(chroma_row + chroma_col)
+                .zip(v_plane.get(chroma_row + chroma_col))
+            else {
+                continue;
+            };
+            let terms = chroma_terms(cb, cr);
+            for (dy, y_row) in [(0usize, y0), (1, y1)] {
+                let Some((&left, &right)) = luma.get(y_row + col).zip(luma.get(y_row + col + 1))
+                else {
+                    continue;
+                };
+                let pixel = (row + dy)
+                    .saturating_mul(pixel_width)
+                    .saturating_add(col)
+                    .saturating_mul(4);
+                store_rgba(out, pixel, luma_term(left), terms);
+                store_rgba(out, pixel.saturating_add(4), luma_term(right), terms);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn black_and_white_are_exact_limited_range_endpoints() {
+        // 2x2 全黑：Y=16、Cb=Cr=128。
+        let mut rgba = Vec::new();
+        nv12_to_rgba(&[16, 16, 16, 16], &[128, 128], 2, 2, 2, 2, &mut rgba).unwrap_or_default();
+        assert_eq!(
+            rgba,
+            vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]
+        );
+        // 2x2 全白：Y=235、Cb=Cr=128。
+        nv12_to_rgba(&[235, 235, 235, 235], &[128, 128], 2, 2, 2, 2, &mut rgba).unwrap_or_default();
+        assert_eq!(
+            rgba,
+            vec![255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn pitch_larger_than_width_is_honoured() {
+        // 4 像素宽但 stride=8：每行后 4 字节是填充，不能读进来。
+        let y = [
+            16, 16, 16, 16, 0, 0, 0, 0, // 第 0 行：黑
+            235, 235, 235, 235, 0, 0, 0, 0, // 第 1 行：白
+        ];
+        let uv = [128u8; 8];
+        let mut rgba = Vec::new();
+        nv12_to_rgba(&y, &uv, 8, 8, 4, 2, &mut rgba).unwrap_or_default();
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&rgba[16..20], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn odd_dimensions_are_rejected() {
+        let mut rgba = Vec::new();
+        assert!(nv12_to_rgba(&[16; 16], &[128; 8], 4, 4, 3, 2, &mut rgba).is_err());
+    }
+}

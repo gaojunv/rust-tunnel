@@ -540,6 +540,8 @@ fn manager(
         // `crates/remote` 的集成测试覆盖）。用 `Auto` 免去弹窗，但控制器仍会等应答，
         // 故下面仍要手工转达 `accepted`——见 `relay_acceptance`。
         approval_policy: ApprovalPolicy::Auto,
+        h264_encoder_factory: None,
+        h264_decoder_factory: None,
     });
     // 双方先拿到能力通告（设置 params / rd_id），与真实控制通道下发等价。
     mgr.handle_control_message(ControlMessage::RemoteCapability {
@@ -578,6 +580,8 @@ fn manager_lazy(
         // `crates/remote` 的集成测试覆盖）。用 `Auto` 免去弹窗，但控制器仍会等应答，
         // 故下面仍要手工转达 `accepted`——见 `relay_acceptance`。
         approval_policy: ApprovalPolicy::Auto,
+        h264_encoder_factory: None,
+        h264_decoder_factory: None,
     });
     mgr.handle_control_message(ControlMessage::RemoteCapability {
         params: Some(params.clone()),
@@ -1403,6 +1407,8 @@ fn control_channel_manager(server_host: &str, name: &str, enabled: bool) -> Arc<
         download_dir: std::env::temp_dir(),
         // 被控端用默认的 `Confirm`（本用例要测拒绝路径）；控制器侧策略无关紧要。
         approval_policy: if enabled { ApprovalPolicy::Confirm } else { ApprovalPolicy::Auto },
+        h264_encoder_factory: None,
+        h264_decoder_factory: None,
     })
 }
 

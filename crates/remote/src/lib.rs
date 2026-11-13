@@ -53,6 +53,7 @@
 
 pub mod approval;
 pub mod auth;
+pub mod codec;
 pub mod controller;
 pub mod controlled;
 pub mod crypto;
@@ -75,6 +76,10 @@ pub mod video;
 mod integration_tests;
 
 pub use approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
+pub use codec::{
+    vp9_decoder_factory, vp9_encoder_factory, VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi,
+    VideoEncoderFactory, Vp9DecoderFactory, Vp9EncoderFactory,
+};
 pub use error::{RemoteError, RemoteResult};
 pub use file::{FileService, TransferMeta};
 pub use controller::ControllerCommand;

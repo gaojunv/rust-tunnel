@@ -73,7 +73,7 @@ jobs:
       # 一致、报价/引号、服务状态映射）。测试失败就该拦住发布。
       - name: Test Windows-only modules
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service
+        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video
 
       - name: Strip binary (non-Windows)
         if: runner.os != 'Windows'

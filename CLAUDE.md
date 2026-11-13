@@ -62,10 +62,11 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `crates/client-gui`（`rust-tunnel-client-gui`）— 桌面托盘客户端（eframe/egui + winit + tray-icon），「状态/映射/设置/日志/远程」五个 Tab
 - `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
 - `crates/rustdesk`（`rust-tunnel-rustdesk`）— 内置 RustDesk 兼容服务（hbbs 会合 + hbbr 中继）的**独立协议库**（`frame`/`proto`/`addr`/`key`/`peer`/`relay`/`rendezvous`）
-- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环/VP9 4:4:4 视频编码/文件传输），**无平台或 UI 依赖**（但含 vendored 的便携 C 编解码器 `vendor/shiguredo_libvpx`）
+- `crates/remote`（`rust-tunnel-remote`）— GUI 客户端互相远程控制的**协议 + 引擎**（会话协议/端到端加密/信令/会话循环/VP9 4:4:4 软件编码/H.264 4:2:0 硬件编解码抽象与协商/文件传输），**无平台或 UI 依赖**（但含 vendored 的便携 C 编解码器 `vendor/shiguredo_libvpx`）
 - `crates/win-platform`（`rust-tunnel-win-platform`）— Windows 无人值守被控端的**平台层**：可移植模块（`error`/`pixels`/`report`/`session`/`desktop`/`monitor`/`inject`/`token`/`sysinfo`，纯 std、macOS 上全量单测）+ 仅在 Windows 编译的裸 FFI 模块（`capture`/`handle`/`service`/`probe`/`process`）。用 `windows-sys`（无 wrapper、无 libvpx），故本机可 `--target x86_64-pc-windows-gnu` 做**类型**检查
 - `crates/win-service`（`rust-tunnel-client-service`）— Windows 无人值守被控端的 **SYSTEM 服务** bin（哑监督者：SCM 注册/安装卸载/启停、把无头实例拉进控制台会话、随会话变化重启）。`--run` 是本体（监督 `rust-tunnel-client-gui.exe --instance`）；`--install` 把两个 exe 复制到 `%ProgramFiles%\rust-tunnel\` 并加固 DACL（**服务以 SYSTEM 运行，exe 放在任何用户可写的目录里 = 替换 exe 即拿到 SYSTEM**）；`--probe`/`--probe-in-service`/`--probe-instance` 是阶段 0 的真机探针，保留
-- 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）；`win-platform ← win-service`，且 `win-platform` **不得**依赖 `remote`（否则 libvpx 会被拖进服务 exe，而服务 exe 走 MSVC、没有预编译库）
+- `crates/win-video`（`rust-tunnel-win-video`）— Windows 远程控制**硬件数据面**：WGC（优先）/ DXGI Desktop Duplication（回退）采集（自顶向下 BGRA）、NVENC H.264 **4:2:0** 硬件编码（运行期 `nvEncodeAPI64.dll`，无链接期驱动依赖）、Media Foundation `MSH264DecoderMFT` 解码（NV12→RGBA，BT.709 limited）。**不依赖 `remote`、不依赖 libvpx**，因此可在 MSVC 上独立编译/单测；真机探针在 `src/bin/`（`win-video-probe`/`capture-probe`/`decode-probe`/`e2e-probe`）
+- 依赖单向：`common ← client`、`common ← server`、`common ← remote ← client-gui`；`rustdesk` **不依赖任何本仓 crate**（只依赖 prost/ed25519-dalek/bytes/tokio）；`win-platform ← win-service`、`win-video ← client-gui`。`win-platform` **不得**依赖 `remote`（否则 libvpx 会被拖进服务 exe），`win-video` **也不得**依赖 `remote`（否则 libvpx/会话协议会拖进硬件层，MSVC 下无法独立测试）
 - **Windows 锁屏/登录界面为什么必须走服务**：`WinSta0\Winlogon` 桌面的 ACL 只放行 LocalSystem（Administrators 不在名单里）+ UIPI（LogonUI 是 System 完整性）+ 会话隔离（服务在会话 0）。**管理员身份运行无效**。详见根目录 `WINDOWS-SECURE-DESKTOP.md`（含架构、部署、真机验收清单与探针闸门）
 - **`rag` 为非默认 feature**（门控 qdrant-edge 与知识容器的向量索引侧）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
@@ -126,7 +127,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - 部署/防火墙/密钥/真机验证清单见根目录 `RUSTDESK.md`（`docs/` 被 gitignore，不放交付文档）
 
 **`crates/remote/src/`** — GUI 客户端互相远程控制的协议 + 引擎（**无平台/UI 依赖**；但含内联的便携 C 编解码器 `vendor/shiguredo_libvpx`，见下）
-- `session.rs` — 会话帧（4 字节大端长度前缀 + bincode，上限 16 MiB——屏幕帧远大于 `common::protocol` 的 1 MiB）+ `Lane{Control,Screen,File}` 多路复用车道（`File` 预留给文件传输）。**`SESSION_PROTO_VERSION` 已到 2**（阶段 2 换成 VP9 数据面），两端靠 `Hello.proto_version` 硬相等实现「混合版本明文干净拒绝」——`Hello`(判别式 0)/`HelloAck`(1) 与内嵌的 `DisplayInfo` **逐字节冻结**（`discriminant_golden` + `hello_and_helloack_wire_bytes_are_frozen` 两条机械锁），新变体一律追加在末尾
+- `session.rs` — 会话帧（4 字节大端长度前缀 + bincode，上限 16 MiB——屏幕帧远大于 `common::protocol` 的 1 MiB）+ `Lane{Control,Screen,File}` 多路复用车道（`File` 预留给文件传输）。**`SESSION_PROTO_VERSION` 已到 3**（阶段 5 引入 `CodecOffer`/`CodecSelect` 协商与 `CodecId::H264`），两端靠 `Hello.proto_version` 硬相等实现「混合版本明文干净拒绝」——`Hello`(判别式 0)/`HelloAck`(1) 与内嵌的 `DisplayInfo` **逐字节冻结**（`discriminant_golden` + `hello_and_helloack_wire_bytes_are_frozen` 两条机械锁），新变体一律追加在末尾
 - `crypto.rs` — X25519 临时密钥交换 + ChaCha20-Poly1305，双向独立密钥与 nonce 计数器。**一次性 token 进 KDF（别去掉）**：裸 ECDH 挡不住中继方——`Hello`/`HelloAck` 都是明文，它可替换两端临时公钥做完整 MITM；token 经加密控制通道下发且从不上数据面，攻击者不知道它就算不出密钥 → 两端密钥必然不一致 → 首帧 AEAD 认证失败。另拒绝低阶点（`was_contributory`）
 - `auth.rs` — 握手 HMAC-SHA256，字段用 **8 字节长度前缀**（`nonce`/公钥是二进制，固定分隔符会有拼接歧义）；`Hello` 的 MAC 覆盖控制器临时公钥，`HelloAck` 的 `hmac_ack` 绑定被控端临时公钥，控制器**真正校验**它；挂起会话 TTL 60s、鉴权成功即消费（重放被拒）、MAC 失败保留以允许重试
 - `signaling.rs` — RustDesk 会合/中继客户端（注册/心跳/打洞/中继请求）；`RustDeskTransport` 是真实数据面建立的唯一实现，`LazyTransport` 把它的构造推迟到 `RemoteParams` 到手（GUI 与 e2e 共用）
@@ -143,7 +144,15 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `transfer.rs` — 会话内文件传输状态机（两端共用）。只有**控制器**能发起（浏览/下载/上传），被控端只应答。同一时刻只允许一次传输；`CHUNK_SIZE=64 KiB` 且每块之间 `CHUNK_PAUSE=4ms` **主动让出调度**，会话循环的 `select!` 才有机会插入画面帧（中继只给一条字节流，画面与文件天然共享带宽）
 - `approval.rs` — 被控端**接入确认**策略与待确认请求（`ApprovalPolicy{Auto,Confirm}`、`PendingApproval`、`APPROVAL_TIMEOUT=45s` / `APPROVAL_WAIT_TIMEOUT=60s`）。`Confirm` 是默认：被控端收到 `RemoteSessionIncoming` 后**不回响应、不登记 token、不派生任务**，只挂起等用户 `approve_pending`/`reject_pending`，到点自动拒绝。**token 绝不进 `PendingApproval`**——那是 UI 状态，凭证只在管理器内部持有。`APPROVAL_TIMEOUT` 必须明显小于服务端 `REMOTE_SESSION_TTL`（60s，见 `crates/server/src/control_plane/remote.rs`）：用户拍板的**整个过程**都要落在那个窗口内，否则响应会被服务端当未知会话丢弃，用户看到的是「卡住」而不是「被拒」
 - `manager.rs` — `RemoteManager` 门面（`RemoteUiState` watch、连接请求、启停、平台注入、剪贴板/共享目录注入、接入确认门控、`RemoteBridge` 实现）
-- 平台实现（xcap 抓屏 / enigo 注入 / arboard 剪贴板）**放在 `crates/client-gui`**，本 crate 保持编译面干净
+- 平台实现（xcap 抓屏 / enigo 注入 / arboard 剪贴板；Windows GUI 采集用 `crates/win-video` 的 WGC/DXGI）**放在 `crates/client-gui`**，本 crate 保持编译面干净
+- `codec.rs` — `VideoEncoderApi`/`VideoDecoderApi`/工厂：会话循环只依赖 trait，具体实现由 `RemoteManagerConfig` 注入；默认仍是 VP9。`VideoDecoderApi::configure(w,h)` 是给 H.264 MFT 的尺寸钩子（`create()` 时还不知道编码尺寸），解码任务在首个包/尺寸变化时调用
+
+**`crates/win-video/src/`** — Windows 硬件数据面（仅 Windows 编译；**不依赖 `remote`/libvpx**）
+- `capture/` — WGC（`GraphicsCaptureItem` + 自由线程 frame pool + `TryGetNextFrame`）优先，DXGI Desktop Duplication 回退；`enumerate_monitors`/`open_best`/`CaptureSource`，输出**自顶向下 BGRA**。无新帧时最多等 10ms 后复用上一帧；HDR 桌面下 DXGI 可能拿到 `R16G16B16A16_FLOAT`，此时明确失败并由上层回退 xcap/GDI
+- `pixels.rs` — `bgra_to_rgba`、`scale_rgba_box`、`scale_bgra_to_rgba`（一步 BGRA→目标尺寸 RGBA；4K→1080p 命中 2×2 快速路径）
+- `nvenc/` — 运行期 dlopen `nvEncodeAPI64.dll`；原生绑定 vendored 自 `moq-nvenc` 0.1.2（MIT，bindgen 自 NVIDIA `nv-codec-headers`）；`NvencEncoder` 用 D3D11 纹理 + `NV_ENC_BUFFER_FORMAT_ARGB/ABGR`，CBR/超低延迟/无限 GOP/显式 IDR；`set_bitrate`/`set_fps` 走 `nvEncReconfigureEncoder` 不插 IDR；**`inputWidth/Height` 只裁剪、不缩放**
+- `decode/` — Media Foundation `MSH264DecoderMFT`，NV12→RGBA（BT.709 limited 定点），按 `MF_MT_MINIMUM_DISPLAY_APERTURE` 裁掉 16 像素宏块填充；`CoInitializeEx` 线程局部、每次 `decode` 确认
+- `d3d11.rs` — 显式选 NVIDIA 适配器建设备（混显下默认适配器可能是核显）；`src/bin/*-probe.rs` — NVENC/采集/解码/全链路真机探针
 
 #### 远程控制的控制面与数据面
 
@@ -151,13 +160,13 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 **向后兼容靠版本门控**：服务端只在客户端版本 ≥ `MIN_REMOTE_CLIENT_VERSION`（`crates/agent/src/runner/version_gate.rs`）时才下发 `RemoteCapability`；客户端只在收到它之后才发新的上行变体。新客户端 + 老服务端 → 老服务端不下发 → 新客户端全程不发新变体；老客户端 + 新服务端 → 门控拦住。两边都不会因 bincode 未知变体而断连。**新增 S→C 推送时必须过 `client_supports_remote`**，否则老客户端反序列化失败会直接断连。
 
-**数据面另有 `SESSION_PROTO_VERSION` 一道门控**（当前 2）：它**不是**控制通道的 `protocol_version`，而是数据面 `Hello` 里的字段，两端**硬相等**校验，不匹配就在握手阶段明文拒绝（`HelloAck{accepted:false}`），因此混合版本不会退化成 bincode 解码失败导致的硬断链——**前提是 `Hello`/`HelloAck`/`DisplayInfo` 的字节形状冻结**（两条机械锁守着，见上）。
+**数据面另有 `SESSION_PROTO_VERSION` 一道门控**（当前 3）：它**不是**控制通道的 `protocol_version`，而是数据面 `Hello` 里的字段，两端**硬相等**校验，不匹配就在握手阶段明文拒绝（`HelloAck{accepted:false}`），因此混合版本不会退化成 bincode 解码失败导致的硬断链——**前提是 `Hello`/`HelloAck`/`DisplayInfo` 的字节形状冻结**（两条机械锁守着，见上）。
 
-**阶段 2 的发布顺序刻意分两步**（`MIN_REMOTE_CLIENT_VERSION` 上的注释写明了）：先把 0.11 客户端铺开（`SESSION_PROTO_VERSION = 2` 生效，0.11↔0.10 在握手阶段干净拒绝），**之后**再部署新服务端并把门控抬到 `(0,11,0)`。抬门控会让 0.10.x **彻底失去**远程控制（功能消失，非降级），所以必须等客户端铺开。**注意客户端上报的是 `CARGO_PKG_VERSION`**，而 `release-client.yml` 的 `VERSION` 只取 git tag、不写回 `Cargo.toml`——所以 `crates/client`/`crates/client-gui` 的版本号要手工抬。
+**阶段 5 的发布顺序仍分两步**：先把 **0.12** 客户端铺开（`SESSION_PROTO_VERSION = 3` 生效，0.12↔0.11 在握手阶段干净拒绝），**之后**再部署新服务端并把门控抬到 `(0,12,0)`。抬门控会让 0.11.x **彻底失去**远程控制（功能消失，非降级），所以必须等客户端铺开。**注意客户端上报的是 `CARGO_PKG_VERSION`**，而 `release-client.yml` 的 `VERSION` 只取 git tag、不写回 `Cargo.toml`——所以 `crates/client`/`crates/client-gui` 的版本号要手工抬（本次已抬到 0.12.0）。
 
 **`crates/remote` 有 vendored 原生依赖**：VP9 4:4:4 需要 profile 1，上游 `shiguredo_libvpx` 表达不了，故 `vendor/shiguredo_libvpx/`（wrapper Apache-2.0 + 内联 libvpx BSD，与项目 MIT/Apache 相容，**无 GPL/AGPL**）打了 7 处补丁（1–3 是 4:4:4 的前提，4 是 CBR 交互级缓冲，5 是显式色彩空间/范围，**6 是运行期在线重配置码率/帧率——QoS 闭环的前提**，**7 是解码侧并行 threads + row-mt——解码原本恒为单线程**），每处带 `PATCH:` 注释写明动机，根 `Cargo.toml` 的 `[patch.crates-io]` 重定向，机械锁在 `crates/remote/tests/vendor_patches.rs`。预编译库覆盖 `aarch64-apple-darwin` / `x86_64-pc-windows-gnu` / `x86_64-unknown-linux-gnu`；**不覆盖** `x86_64-apple-darwin`（build.rs 直接 panic，已放弃该 target）与 MSVC（预编译是 mingw）。**Windows 那份预编译还是 msvcrt 味的 mingw-w64 构建**（它引用 `__imp__setjmp`，而 `_setjmp` 只在 msvcrt 的导入库里），所以那个 leg 的链接器也必须是 msvcrt 味的——runner 镜像自带的 `C:\mingw64` 是 **UCRT** 味，链不了；必须用 MSYS2 的 `mingw64` 环境。别把那条 step 简化回 `C:\mingw64`，理由写在 `release-client.yml` 里。`crates/server` 不依赖 `remote`，musl 静态编译不受影响。
 
-**硬件编解码对这条数据面不适用，别重提**：码流是 VP9 profile 1（8-bit 4:4:4），而**四家厂商全无 VP9 4:4:4 硬件解码**（NVIDIA 支持矩阵的 VP9 列只有 4:2:0/8/10/12-bit，**NVENC 连 VP9 编码器都没有**）；Mac 侧连 H.264/HEVC 的 4:4:4 编码 profile 都不暴露（唯一能出的 4:4:4 是 ProRes 4444，Windows 解不了），NVDEC 也不解 H.264 4:4:4。唯一全硬件的 4:4:4 组合是 Windows+NVIDIA ↔ Windows+NVIDIA（HEVC RExt），不是本项目的部署形态。**2026-10-13 已用一手来源（厂商官方矩阵、SDK 头文件、Intel media-driver 源码、FFmpeg 源码）证否并改道软件解码并行化（补丁 7）**；`hwcodec` 也不可用（只在 RustDesk 的 AGPL 仓库里，crates.io 上 404）——将来若真要走硬件，每个后端都得自己写，**不得引入任何 AGPL/GPL 代码**。
+**硬件编解码的落地范围（阶段 5）**：数据面不再只有 VP9。**Windows GUI 被控端**在 NVENC 可用时用 **H.264 4:2:0 硬件编码**，控制器用 **Media Foundation `MSH264DecoderMFT`** 解码；采集走 **WGC（优先）→ DXGI Desktop Duplication（回退）→ xcap/GDI（最后兜底）**。**有意固定 4:2:0**：消费级 GPU 的 H.264 硬件编码器普遍只支持 4:2:0（本机 RTX 5070 Ti 虽报 `SUPPORT_YUV444_ENCODE=1`，但 H.264 4:4:4 的**解码**侧没有可用硬件/系统解码器，混合部署会断），且 4:2:0 + 高码率对桌面文本已足够；需要 4:4:4 时继续走 VP9 profile 1 软件路径。**这不是给 VP9 加硬件**：四家厂商仍无 VP9 4:4:4 硬件解码，硬件路径是换 codec 到 H.264 4:2:0；VP9 保持软件 4:4:4 作为质量优先的回退。**VP9 软件路径仍是默认回退**：无 NVENC/NVIDIA 适配器、非 Windows、MFT 缺失或对端未声明 H.264 时，`CodecOffer`/`CodecSelect` 协商自动选 VP9。**NVENC 的 `inputWidth/Height` 只做左上角裁剪、不做缩放**（实测码流逐字节相同），故 4K→1920 的下采样由 `crates/win-video` 的 `pixels::scale_bgra_to_rgba` 在采集层一步完成（BGRA→RGBA + 盒式缩放，实测 4K→1080p ~10 ms），避免 33 MB 中间缓冲。**H.264 的显示尺寸 ≠ 编码尺寸**：MFT 会按 16 像素宏块对齐输出（640×360 解出 640×368、1080p 解出 1920×1088），必须按 `MF_MT_MINIMUM_DISPLAY_APERTURE` 裁掉填充，否则坐标/纹理尺寸整体错位。**实例模式（安全桌面）不走 WGC/DXGI**：Winlogon 桌面只能用 GDI `BitBlt`，仍由 `win-platform` 处理；H.264 编码器对实例模式同样可用（BitBlt 出来的是 RGBA）。**编码器的在线重配置**走 `nvEncReconfigureEncoder`（`resetEncoder=0`/`forceIDR=0`），与 VP9 的「码率/帧率变化不重建、不插 IDR」约束一致；只有几何变化才重建 + 强制 IDR。真机实测（RTX 5070 Ti，4K WGC，release）：采集中位 ~31 ms、转换+缩放 ~10 ms、NVENC ~3 ms、MFT 解码 1080p ~21 ms，解码相对源图 MAD ~1.7/255。NVENC 绑定 vendored 自 `moq-nvenc` 0.1.2（MIT，bindgen 自 NVIDIA `nv-codec-headers`），运行期 dlopen，**不引入任何 AGPL/GPL 代码**。
 
 **`rd_id` 由服务端分配并持久化**到 `clients.remote_id`（9 位数字，满足 `MIN_PEER_ID_LEN=6`）。同一 NAT 下多个客户端共用一个公网 IP，所以不能由客户端自选；用户全程看不到也不需要配置 ID。
 
@@ -270,7 +279,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 GitHub Actions 工作流：
 
 - `ci.yml`（push/PR 到 `main` / 手动）— **推送阶段的 Windows 门禁**，两个 job：
-  `windows-tests`（`windows-latest`，跑 `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service`）
+  `windows-tests`（`windows-latest`，跑 `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video`）
   与 `windows-gnu-typecheck`（`ubuntu-latest`，`cargo check`/`clippy -- -D warnings` 交叉到
   `x86_64-pc-windows-gnu`，覆盖 `client-gui`——**出厂 Windows GUI 正是这个 target**）。
   之所以需要它：`release-client.yml` 那条测试命令只在**打 tag 时**跑，回归要到发布那一刻才暴露；
@@ -287,8 +296,8 @@ GitHub Actions 工作流：
   （无人值守服务；**不依赖 libvpx** 故走 MSVC 即可，不需要 GNU leg 那套 MSYS2 曲折；
   资产名必须以 `rust-tunnel-client-` 开头，`finalize-client` 的 glob 与下载页的
   `platform_from_filename` 才认得它），并在同一 leg 跑
-  `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service`
-  ——那批单测是 `#[cfg(windows)]`（`probe`/`service`/`process`/`host`），
+  `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video`
+  ——那批单测是 `#[cfg(windows)]`（`probe`/`service`/`process`/`host`，以及 `win-video` 的像素/颜色/解码纯逻辑），
   **这个 runner 是仓库里唯一能真正跑它们的机器**，本机 macOS 只能做类型检查；
   但这条只在打 tag 时跑，推送阶段的同一批测试由 `ci.yml` 的 `windows-tests` 兜住
 - `release-wiki-client.yml`（tag `wiki-v*` / 手动）— wiki 桌面端（Tauri 2）安装包：macOS
