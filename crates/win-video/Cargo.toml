@@ -1,0 +1,54 @@
+[package]
+name = "rust-tunnel-win-video"
+version = "0.1.0"
+edition = "2021"
+description = "Windows 远程控制数据面：NVENC H.264 4:2:0 硬件编码 + WGC/DXGI 采集"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "win-video-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "win-video-capture-probe"
+path = "src/bin/capture_probe.rs"
+
+[[bin]]
+name = "win-video-decode-probe"
+path = "src/bin/decode_probe.rs"
+
+[[bin]]
+name = "win-video-e2e-probe"
+path = "src/bin/e2e_probe.rs"
+
+[target.'cfg(windows)'.dependencies]
+# WinRT（WGC）+ Win32（D3D11/DXGI/GDI）。与 client-gui 已有的 windows 0.62 共用同一份
+# 依赖图，不额外引入大版本。
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    # Media Foundation：控制器侧 H.264 解码（MSH264DecoderMFT）
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    # WGC 的 interop（IGraphicsCaptureItemInterop::CreateForMonitor）
+    "Win32_System_WinRT_Graphics_Capture",
+    # CreateDirect3D11DeviceFromDXGIDevice / IDirect3DDxgiInterfaceAccess
+    "Win32_System_WinRT_Direct3D11",
+] }
+# NVENC 走运行期 dlopen（nvEncodeAPI64.dll），不能在链接期依赖 NVIDIA 驱动。
+libloading = "0.8"
+thiserror.workspace = true
+tracing.workspace = true

@@ -29,6 +29,7 @@
 
 use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
 use crate::auth::{PendingSession, PendingSessions};
+use crate::codec::{VideoDecoderFactory, VideoEncoderFactory};
 use crate::controller::{run_controller, ControllerCommand, ControllerConfig};
 use crate::controlled::{run_controlled, ControlledConfig, CAPTURE_WATCHDOG};
 use crate::error::{RemoteError, RemoteResult};
@@ -228,6 +229,14 @@ pub struct RemoteManagerConfig {
     pub download_dir: PathBuf,
     /// 被控端接入确认策略（默认 [`ApprovalPolicy::Confirm`]）。
     pub approval_policy: ApprovalPolicy,
+    /// 可选的 H.264 编码器工厂（被控端用）。
+    ///
+    /// `None` = 只编码 VP9。`client-gui` 在 Windows 上注入 `crates/win-video` 的实现。
+    pub h264_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
+    /// 可选的 H.264 解码器工厂（控制器用）。
+    ///
+    /// `None` = 只解 VP9，协商时不会向被控端声明 H.264 能力。
+    pub h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
 }
 
 /// 正在进行的会话句柄。
@@ -1256,6 +1265,7 @@ impl RemoteManager {
             local_rd_id,
             mode,
             stats: self.build_stats_reporter(cancel.clone()),
+            h264_decoder_factory: self.cfg.h264_decoder_factory.clone(),
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
         let transfer = self.build_transfer_hub(None, self.cfg.download_dir.clone(), cancel.clone());
@@ -1449,6 +1459,7 @@ impl RemoteManager {
             encode: self.cfg.encode,
             capture_watchdog: CAPTURE_WATCHDOG,
             stats: self.build_stats_reporter(cancel.clone()),
+            h264_encoder_factory: self.cfg.h264_encoder_factory.clone(),
         };
         let clipboard = self
             .clipboard
@@ -1972,6 +1983,8 @@ mod tests {
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
             approval_policy: ApprovalPolicy::Auto,
+            h264_encoder_factory: None,
+            h264_decoder_factory: None,
         })
     }
 
@@ -2131,6 +2144,8 @@ mod tests {
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
             approval_policy: ApprovalPolicy::Auto,
+            h264_encoder_factory: None,
+            h264_decoder_factory: None,
         })
     }
 

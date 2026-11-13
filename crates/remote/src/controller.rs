@@ -5,17 +5,18 @@
 //! 之后的帧全部加密。
 
 use crate::auth::verify_ack_mac;
+use crate::codec::{vp9_decoder_factory, VideoDecoderApi, VideoDecoderFactory};
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
 use crate::screen::{DecodedFrame, FrameSink, InputEvent, QualityPreset};
 use crate::session::{
-    trusted_rtt, ControllerHandshake, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
+    trusted_rtt, CodecId, ControllerHandshake, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
     HEARTBEAT_INTERVAL, VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
-use crate::video::{VideoDecoder, MAX_FRAME_DIM};
+use crate::video::MAX_FRAME_DIM;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -54,21 +55,25 @@ const QOS_INTERVAL: Duration = Duration::from_secs(1);
 /// 可忽略）。请求本身也按同一窗口限频，避免刷屏。
 const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 一条待解码的画面载荷（尚未 VP9 解码）。
+/// 一条待解码的画面载荷（尚未解码）。
 enum DecodeJob {
-    /// 一个视频包（长度前缀拼接的 VP9 帧）。
+    /// 被控端选定 codec（`CodecSelect`）。解码任务据此换解码器；新 codec 的码流仍从关键帧起步。
+    SelectCodec(CodecId),
+    /// 一个视频包（长度前缀拼接的帧，codec 由 `CodecSelect` 决定）。
     Packet {
         /// 来源显示器编号。
         display: u32,
         /// 帧序号（被控端递增；用于检测「有包被丢弃」的断层）。
         seq: u64,
+        /// 编解码器（应与 `SelectCodec` 一致；缺失时作为兜底）。
+        codec: CodecId,
         /// 标志位（[`VIDEO_FLAG_KEYFRAME`] 等）。
         flags: u8,
         /// 声明的**编码**宽度。
         width: u32,
         /// 声明的**编码**高度。
         height: u32,
-        /// VP9 帧数据。
+        /// 帧数据。
         data: Vec<u8>,
     },
 }
@@ -112,6 +117,10 @@ pub struct ControllerConfig {
     pub mode: RemoteMode,
     /// 统计数据上报句柄（延迟读数）；无管理端时用 [`SessionStatsReporter::noop`]。
     pub stats: SessionStatsReporter,
+    /// 可选的 H.264 解码器工厂（通常由 `crates/win-video` 注入）。
+    ///
+    /// `None` = 本端只能解 VP9，`CodecOffer.h264` 因此为 `false`，被控端不会选 H.264。
+    pub h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
 }
 
 /// 跑一次控制器会话，直到取消、对端关闭或出错。
@@ -196,7 +205,24 @@ pub async fn run_controller(
 
     sink.on_displays(displays.clone());
 
-    // 解码任务：VP9 解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
+    // 2.5) 编解码协商：先声明本端**能解码**的 codec，被控端据此（并与自己的编码能力求交集）
+    // 回一条 `CodecSelect`。必须在任何画面帧之前到达，故紧接握手发出。
+    let offer = SessionMessage::CodecOffer {
+        h264: config.h264_decoder_factory.is_some(),
+        vp9: true,
+    };
+    match send_cancellable(&mut writer, &cancel, SessionFrame::control(offer)).await {
+        Ok(()) => {}
+        Err(RemoteError::Cancelled) => {
+            return Ok(SessionEnd {
+                reason: "用户中断".to_owned(),
+                deliberate: true,
+            });
+        }
+        Err(err) => return Err(err),
+    }
+
+    // 解码任务：解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
     // 被它占住。故把解码挪到独立任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
     //
     // 解码任务会占住运行时的**一个** worker 线程（解码期间不同让）。这是 CPU 密集工作的必然代价，
@@ -214,6 +240,7 @@ pub async fn run_controller(
         std::sync::Arc::clone(&sink),
         cancel.clone(),
         Arc::clone(&decode_ms_shared),
+        config.h264_decoder_factory.clone(),
     ));
 
     // 3) 主循环。
@@ -245,6 +272,8 @@ pub async fn run_controller(
     // 自最近一次收到画面帧以来已发出的关键帧请求数：0 = 这次是首次请求（静止桌面的常规情况，
     // 只记 `debug`），≥1 = 上次请求没换回帧（对端可能真挂住，升到 `warn`）。收到帧即清零。
     let mut stall_requests: u32 = 0;
+    // 被控端通告的 codec（收到 `CodecSelect` 之前为 `None`）。用于校验后续帧的声明。
+    let mut selected_codec: Option<CodecId> = None;
     // 当前观看的显示器：请求关键帧要指名道姓（被控端只认自己正在采集的那台）。
     // 初值与 UI 的选择器一致：优先主显示器，否则第一台。
     let mut selected_display = displays
@@ -430,11 +459,11 @@ pub async fn run_controller(
                         SessionMessage::VideoPacket {
                             display,
                             seq,
+                            codec,
                             flags,
                             width,
                             height,
                             data,
-                            ..
                         } => {
                             // 只投递原始载荷；解码在独立任务里做（见 `decode_loop`）。
                             // 同时记收码率窗口与「最近收帧时刻」（QoS 反馈 / 无帧看门狗用）。
@@ -442,9 +471,13 @@ pub async fn run_controller(
                             last_frame_at = Instant::now();
                             // 帧到了：看门狗若是「首次请求」路径，计数回到 0，下次仍只记 `debug`。
                             stall_requests = 0;
+                            if selected_codec.is_some_and(|selected| selected != codec) {
+                                debug!(?codec, ?selected_codec, "视频包 codec 与已选 codec 不一致");
+                            }
                             if !enqueue_decode(&decode_tx, DecodeJob::Packet {
                                 display,
                                 seq,
+                                codec,
                                 flags,
                                 width,
                                 height,
@@ -457,7 +490,27 @@ pub async fn run_controller(
                         SessionMessage::ScreenConfig { display: monitor, codec, width, height } => {
                             // 编码尺寸/codec 的通告。解码器本身能在关键帧处跟随分辨率变化
                             // （由 `video` 的单测锁定），故这里只记录、不重建。
+                            if selected_codec.is_some_and(|selected| selected != codec) {
+                                debug!(monitor, ?codec, ?selected_codec, "ScreenConfig codec 与已选 codec 不一致");
+                            }
                             debug!(monitor, ?codec, width, height, "收到屏幕配置");
+                        }
+                        SessionMessage::CodecSelect { codec } => {
+                            // 被控端在开始出帧前通告最终 codec。本端必须真的能解它；否则继续
+                            // 解码只会每帧失败并无限请求关键帧，不如明确报协议错误。
+                            if codec == CodecId::H264 && config.h264_decoder_factory.is_none() {
+                                break Err(RemoteError::Codec(
+                                    "被控端选择了本端未提供的 H.264 编解码器".to_owned(),
+                                ));
+                            }
+                            if selected_codec != Some(codec) {
+                                // 换 codec 意味着参考链作废：解码任务会重置解码器并等关键帧。
+                                selected_codec = Some(codec);
+                                if !enqueue_decode(&decode_tx, DecodeJob::SelectCodec(codec)) {
+                                    break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
+                                }
+                            }
+                            debug!(?codec, "被控端选定编解码器");
                         }
                         SessionMessage::RequestKeyframe { .. } => {
                             // 该变体只应由**控制器**发出；收到即说明对端实现异常。
@@ -587,14 +640,34 @@ pub async fn run_controller(
 /// 每次 `decode` 的耗时（含 I444→RGBA 转换）写进 `decode_ms_shared`，由主循环每秒读一次填进
 /// `QosFeedback`。它是被控端「降编码分辨率」的**唯一**依据（4K 解码实测 37–58 ms 是瓶颈，
 /// 编码仅 7.9/7.7 ms 不是）。
+/// 按 codec 取解码器工厂：VP9 用内置实现，H.264 用注入实现（未注入则为 `None`）。
+fn decoder_factory_for(
+    codec: CodecId,
+    h264_decoder_factory: Option<&Arc<dyn VideoDecoderFactory>>,
+) -> Option<Arc<dyn VideoDecoderFactory>> {
+    match codec {
+        CodecId::Vp9 => Some(vp9_decoder_factory()),
+        CodecId::H264 => h264_decoder_factory.cloned(),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "序号断层/关键帧等待/解码器重建/切 codec 是一条不可分割的状态机，拆开反而要来回传状态"
+)]
 async fn decode_loop(
     mut rx: mpsc::Receiver<DecodeJob>,
     keyframe_tx: mpsc::UnboundedSender<u32>,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
     decode_ms_shared: Arc<AtomicU32>,
+    h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
 ) {
-    let mut decoder: Option<VideoDecoder> = None;
+    let mut codec: Option<CodecId> = None;
+    let mut decoder: Option<Box<dyn VideoDecoderApi>> = None;
+    // 当前解码器已经 `configure` 过的编码尺寸；`None` = 新实例，首个包必须先 configure。
+    // 尺寸来自 `VideoPacket`（即编码尺寸），**不是** `ScreenConfig`——后者不经过解码队列。
+    let mut configured_dims: Option<(u32, u32)> = None;
     // 参考链已断，只等 IDR。
     let mut awaiting_keyframe = false;
     // 下一个期望的帧序号（被控端按发送顺序递增；断层 = 中间有包被丢弃）。
@@ -609,14 +682,48 @@ async fn decode_loop(
             },
         };
         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
-        let DecodeJob::Packet {
-            display: monitor,
-            seq,
-            flags,
-            width,
-            height,
-            data,
-        } = job;
+        let (monitor, seq, packet_codec, flags, width, height, data) = match job {
+            DecodeJob::SelectCodec(selected) => {
+                // 换 codec：旧解码器的参考帧不可用，重置并等新 codec 的关键帧。
+                if codec != Some(selected) {
+                    debug!(?selected, "切换解码器 codec");
+                    codec = Some(selected);
+                    decoder = None;
+                    // **只建解码器、不 configure**：尺寸由首个 `VideoPacket` 给出。
+                    configured_dims = None;
+                    awaiting_keyframe = true;
+                    expected_seq = None;
+                    if let Some(factory) =
+                        decoder_factory_for(selected, h264_decoder_factory.as_ref())
+                    {
+                        match factory.create() {
+                            Ok(dec) => decoder = Some(dec),
+                            // 创建失败不必终止：首个关键帧到达时会再试一次（下方 `is_none` 分支）。
+                            Err(err) => warn!(error = %err, "解码器创建失败"),
+                        }
+                    } else {
+                        warn!(?selected, "没有对应 codec 的解码器工厂");
+                    }
+                }
+                continue;
+            }
+            DecodeJob::Packet {
+                display,
+                seq,
+                codec,
+                flags,
+                width,
+                height,
+                data,
+            } => (display, seq, codec, flags, width, height, data),
+        };
+        // 兜底：正常情况下 `SelectCodec` 一定先到；万一对端漏发，用视频包自带的 codec。
+        if codec.is_none() {
+            codec = Some(packet_codec);
+            decoder = None;
+            configured_dims = None;
+            awaiting_keyframe = true;
+        }
 
         // 声明尺寸的纵深防御：真正的解码尺寸由码流决定（下方解码后还会再校验一次），但先挡掉
         // 明显非法的声明，避免把畸形值传下去。
@@ -630,6 +737,7 @@ async fn decode_loop(
         if expected_seq.is_some_and(|expected| seq != expected) {
             debug!(seq, ?expected_seq, "视频序号断层，重置解码器并等待关键帧");
             decoder = None;
+            configured_dims = None;
             awaiting_keyframe = true;
             let _ = keyframe_tx.send(monitor);
         }
@@ -645,10 +753,42 @@ async fn decode_loop(
             continue;
         }
         if decoder.is_none() {
-            match VideoDecoder::new() {
-                Ok(dec) => decoder = Some(dec),
+            let factory = codec
+                .and_then(|codec| decoder_factory_for(codec, h264_decoder_factory.as_ref()));
+            let Some(factory) = factory else {
+                warn!(?codec, "没有对应 codec 的解码器工厂，丢弃本帧并等待关键帧");
+                awaiting_keyframe = true;
+                let _ = keyframe_tx.send(monitor);
+                continue;
+            };
+            match factory.create() {
+                Ok(dec) => {
+                    decoder = Some(dec);
+                    // 新实例尚未 configure：下面立即按本包的编码尺寸配置。
+                    configured_dims = None;
+                }
                 Err(err) => {
                     warn!(error = %err, "解码器创建失败");
+                    continue;
+                }
+            }
+        }
+        // 生命周期钩子：新解码器首次收到包、或编码尺寸变化时先 configure 再 decode。
+        // 尺寸来源是**本包**的 `width`/`height`（编码尺寸）；`ScreenConfig` 不经过解码队列。
+        if configured_dims != Some((width, height)) {
+            let result = match decoder.as_mut() {
+                Some(dec) => dec.configure(width, height),
+                None => Err(RemoteError::Platform("解码器不存在".to_owned())),
+            };
+            match result {
+                Ok(()) => configured_dims = Some((width, height)),
+                Err(err) => {
+                    // 与解码失败同款处理：配置失败的实例不可信，丢弃并等下一个关键帧。
+                    warn!(error = %err, width, height, "解码器配置尺寸失败，重置解码器并请求关键帧");
+                    decoder = None;
+                    configured_dims = None;
+                    awaiting_keyframe = true;
+                    let _ = keyframe_tx.send(monitor);
                     continue;
                 }
             }
@@ -675,6 +815,7 @@ async fn decode_loop(
             Err(err) => {
                 warn!(error = %err, "画面解码失败，重置解码器并请求关键帧");
                 decoder = None;
+                configured_dims = None;
                 awaiting_keyframe = true;
                 let _ = keyframe_tx.send(monitor);
             }
@@ -845,6 +986,7 @@ mod tests {
             local_rd_id: "111111111".to_owned(),
             mode: RemoteMode::Control,
             stats: SessionStatsReporter::noop(),
+            h264_decoder_factory: None,
         }
     }
 
@@ -1117,5 +1259,243 @@ mod tests {
                 "第 {round} 轮：on_closed 的原因也应与之一致"
             );
         }
+    }
+
+    /// 假解码器记录到的生命周期调用（按发生顺序）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum DecoderCall {
+        /// `configure(width, height)`。
+        Configure(u32, u32),
+        /// `decode(..)`。
+        Decode,
+    }
+
+    /// 记录创建次数与生命周期调用的假解码器工厂。
+    #[derive(Debug)]
+    struct RecordingDecoderFactory {
+        codec: CodecId,
+        created: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<Mutex<Vec<DecoderCall>>>,
+    }
+
+    impl VideoDecoderFactory for RecordingDecoderFactory {
+        fn codec(&self) -> CodecId {
+            self.codec
+        }
+
+        fn create(&self) -> RemoteResult<Box<dyn VideoDecoderApi>> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(RecordingDecoder {
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+    }
+
+    /// 假解码器：记录 `configure` / `decode` 顺序，固定返回一帧 2×2。
+    struct RecordingDecoder {
+        calls: Arc<Mutex<Vec<DecoderCall>>>,
+    }
+
+    impl VideoDecoderApi for RecordingDecoder {
+        fn configure(&mut self, width: u32, height: u32) -> RemoteResult<()> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(DecoderCall::Configure(width, height));
+            Ok(())
+        }
+
+        fn decode(&mut self, _data: &[u8]) -> RemoteResult<Option<crate::video::DecodedVideoFrame>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(DecoderCall::Decode);
+            Ok(Some(crate::video::DecodedVideoFrame {
+                width: 2,
+                height: 2,
+                rgba: vec![0u8; 2 * 2 * 4],
+            }))
+        }
+    }
+
+    /// 记录收到帧数的假上报目标。
+    #[derive(Default)]
+    struct CountingSink {
+        frames: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FrameSink for CountingSink {
+        fn on_displays(&self, _displays: Vec<DisplayInfo>) {}
+        fn on_frame(&self, _frame: DecodedFrame) {
+            self.frames.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_closed(&self, _reason: String) {}
+    }
+
+    /// **协商不变量**：`CodecSelect{H264}` 必须让解码任务改用注入的 H.264 工厂建解码器。
+    ///
+    /// 破坏它会怎样：控制器仍然建 VP9 解码器，H.264 字节流每帧解码失败 → 无限请求关键帧，
+    /// 画面永远黑屏。这里用记录创建次数的假工厂做机械断言。
+    #[tokio::test]
+    async fn codec_select_uses_injected_h264_decoder_factory() {
+        let (job_tx, job_rx) = mpsc::channel::<DecodeJob>(4);
+        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<u32>();
+        let sink = Arc::new(CountingSink::default());
+        let cancel = CancellationToken::new();
+        let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory: Arc<dyn VideoDecoderFactory> = Arc::new(RecordingDecoderFactory {
+            codec: CodecId::H264,
+            created: Arc::clone(&created),
+            calls: Arc::clone(&calls),
+        });
+        let task = tokio::spawn(decode_loop(
+            job_rx,
+            keyframe_tx,
+            sink.clone(),
+            cancel.clone(),
+            Arc::new(AtomicU32::new(0)),
+            Some(factory),
+        ));
+
+        job_tx
+            .send(DecodeJob::SelectCodec(CodecId::H264))
+            .await
+            .expect("投递 codec 选择");
+        job_tx
+            .send(DecodeJob::Packet {
+                display: 0,
+                seq: 1,
+                codec: CodecId::H264,
+                flags: VIDEO_FLAG_KEYFRAME,
+                width: 2,
+                height: 2,
+                data: vec![1, 2, 3],
+            })
+            .await
+            .expect("投递关键帧");
+
+        // 等解码任务真的建了解码器并投出一帧。
+        let decoded = tokio::time::timeout(WAIT, async {
+            for _ in 0..200 {
+                if sink.frames.load(Ordering::SeqCst) >= 1 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        })
+        .await
+        .expect("解码任务应及时出帧");
+        assert!(decoded, "应收到解码帧");
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            1,
+            "H.264 选择必须由注入的工厂创建解码器（且只建一次）"
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[
+                DecoderCall::Configure(2, 2),
+                DecoderCall::Decode
+            ],
+            "首个包必须先 configure 编码尺寸再 decode"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, task).await;
+    }
+
+    /// **解码器生命周期**：首个包先 `configure` 再 `decode`；尺寸不变不重复 configure；
+    /// 尺寸变化再次 configure。
+    ///
+    /// 这是 H.264 硬件解码器的硬需求：MFT 必须在建/重建时知道 `MF_MT_FRAME_SIZE`，而尺寸只
+    /// 存在于 `VideoPacket` 里（`ScreenConfig` 不经过解码队列）。VP9 用默认空实现，不受影响。
+    #[tokio::test]
+    async fn decoder_configure_runs_on_first_packet_and_on_size_change_only() {
+        let (job_tx, job_rx) = mpsc::channel::<DecodeJob>(8);
+        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<u32>();
+        let sink = Arc::new(CountingSink::default());
+        let cancel = CancellationToken::new();
+        let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory: Arc<dyn VideoDecoderFactory> = Arc::new(RecordingDecoderFactory {
+            codec: CodecId::H264,
+            created: Arc::clone(&created),
+            calls: Arc::clone(&calls),
+        });
+        let task = tokio::spawn(decode_loop(
+            job_rx,
+            keyframe_tx,
+            sink.clone(),
+            cancel.clone(),
+            Arc::new(AtomicU32::new(0)),
+            Some(factory),
+        ));
+
+        job_tx
+            .send(DecodeJob::SelectCodec(CodecId::H264))
+            .await
+            .expect("投递 codec 选择");
+
+        let packet = |seq: u64, flags: u8, width: u32, height: u32| DecodeJob::Packet {
+            display: 0,
+            seq,
+            codec: CodecId::H264,
+            flags,
+            width,
+            height,
+            data: vec![1, 2, 3],
+        };
+        // 首包（关键帧）→ configure + decode。
+        job_tx
+            .send(packet(1, VIDEO_FLAG_KEYFRAME, 64, 48))
+            .await
+            .expect("投递首包");
+        // 同尺寸 → 只 decode，不重复 configure。
+        job_tx
+            .send(packet(2, 0, 64, 48))
+            .await
+            .expect("投递同尺寸包");
+        // 尺寸变化（关键帧）→ 再次 configure + decode。
+        job_tx
+            .send(packet(3, VIDEO_FLAG_KEYFRAME, 96, 64))
+            .await
+            .expect("投递改尺寸包");
+
+        let decoded = tokio::time::timeout(WAIT, async {
+            for _ in 0..200 {
+                if sink.frames.load(Ordering::SeqCst) >= 3 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        })
+        .await
+        .expect("解码任务应及时出帧");
+        assert!(decoded, "应收到 3 帧");
+
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[
+                DecoderCall::Configure(64, 48),
+                DecoderCall::Decode,
+                DecoderCall::Decode,
+                DecoderCall::Configure(96, 64),
+                DecoderCall::Decode,
+            ],
+            "首个包先 configure；同尺寸不重复；尺寸变化再 configure"
+        );
+        assert_eq!(created.load(Ordering::SeqCst), 1, "尺寸变化不应重建解码器");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, task).await;
     }
 }

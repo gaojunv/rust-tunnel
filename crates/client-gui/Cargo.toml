@@ -2,7 +2,8 @@
 name = "rust-tunnel-client-gui"
 # 与 `crates/client` 同步抬版：客户端上报的是 `CARGO_PKG_VERSION`，服务端门控按它判定。见
 # `crates/agent/src/runner/version_gate.rs` 的 `MIN_REMOTE_CLIENT_VERSION` 注释。
-version = "0.11.0"
+# 数据面 v3（编解码协商）起要求 ≥ 0.12.0。
+version = "0.12.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -64,6 +65,12 @@ keyring = { version = "3", features = ["windows-native"] }
 # 无头实例（`--instance`）的平台层：安全桌面采集/注入、桌面跟随、虚拟桌面几何归一化。
 # 只在 Windows 上编译（macOS/Linux 上本 crate 是零依赖的纯逻辑 crate）。
 rust-tunnel-win-platform = { path = "../win-platform" }
+# GUI 用户会话的硬件采集（WGC/DXGI）+ NVENC H.264 编码 + Media Foundation 解码。
+# 安全桌面的实例模式仍用 win-platform 的 BitBlt，不走这条路径。
+rust-tunnel-win-video = { path = "../win-video" }
+# `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`。
+# workspace 的 windows-sys 清单不含 HiDpi，这里按需追加 feature（feature 是叠加的）。
+windows-sys = { workspace = true, features = ["Win32_UI_HiDpi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }

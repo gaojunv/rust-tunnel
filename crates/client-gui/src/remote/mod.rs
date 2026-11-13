@@ -23,6 +23,9 @@ pub mod view_scale;
 // 私有模块：只有 `windows` 分派会调它的 `screen_and_input`，不对外暴露实现类型。
 #[cfg(target_os = "windows")]
 mod win_desktop;
+// Windows 用户会话的硬件采集 + NVENC/MFT 编解码适配；实例模式不使用它。
+#[cfg(target_os = "windows")]
+pub mod win_video;
 
 pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
@@ -40,7 +43,8 @@ use enigo::{Keyboard as _, Mouse as _};
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
     DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
-    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole,
+    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
+    VideoEncoderFactory,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -112,6 +116,14 @@ pub fn open_permission_settings(kind: PermissionKind) {
     platform::open_settings(kind);
 }
 
+/// 硬件编解码工厂对：`(H.264 编码器工厂, H.264 解码器工厂)`。
+///
+/// 任一侧为 `None` 表示该方向不参与 H.264 协商，数据面回退 VP9。
+pub type HardwareFactories = (
+    Option<Arc<dyn VideoEncoderFactory>>,
+    Option<Arc<dyn VideoDecoderFactory>>,
+);
+
 /// 平台实现的选定模式。
 ///
 /// # 为什么必须在**构造期**定下来
@@ -167,11 +179,32 @@ pub fn install_platform(
 /// 构造 GUI 路径的默认平台三件套（`xcap` + `enigo` + `arboard`，无收尾钩子）。
 #[must_use]
 pub(crate) fn gui_platform_handles() -> PlatformHandles {
+    // Windows 上采集优先走 WGC/DXGI（失败会逐帧回退 xcap）；输入与剪贴板不变——
+    // `EnigoInput` 的编号查询也来自 xcap，换掉采集源才不会让坐标体系分叉。
+    #[cfg(target_os = "windows")]
+    let screen: Arc<dyn ScreenSource> = Arc::new(win_video::screen());
+    #[cfg(not(target_os = "windows"))]
+    let screen: Arc<dyn ScreenSource> = Arc::new(XcapScreen);
     PlatformHandles {
-        screen: Arc::new(XcapScreen),
+        screen,
         input: Arc::new(EnigoInput::new()),
         clipboard: Arc::new(SystemClipboard),
         release: None,
+    }
+}
+
+/// 构造本平台的硬件编解码工厂（Windows 返回 NVENC/MFT；其他平台都返回 `None`）。
+///
+/// `None` 表示该方向不参与 H.264 协商，数据面继续用默认的 VP9。
+#[must_use]
+pub fn hardware_factories() -> HardwareFactories {
+    #[cfg(target_os = "windows")]
+    {
+        win_video::factories()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        (None, None)
     }
 }
 

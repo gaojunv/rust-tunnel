@@ -33,17 +33,19 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 2
+/// # 为什么是 3
 ///
-/// 阶段 2 把数据面从 JPEG 瓦片换成 VP9（[`SessionMessage::VideoPacket`]），并**删掉了**
-/// [`SessionMessage`] 的两个旧变体。数据面没有任何会话内能力协商，两端靠 `Hello.proto_version`
-/// 的**硬相等**校验实现「混合版本干净拒绝」——旧端与新端不会解码对方的画面帧，因为它们在
-/// 版本校验通过之前就被拒了。
+/// 阶段 5 引入硬件编码协商：控制器在握手后立刻发 [`SessionMessage::CodecOffer`]、被控端回
+/// [`SessionMessage::CodecSelect`]，两端再按选定 codec 创建编解码器。这两个新变体追加在
+/// [`SessionMessage`] 末尾，且 [`CodecId`] 追加了 `H264`——老端会在 bincode 解码时因未知
+/// 判别式失败，故必须抬版本。数据面没有会话内向后兼容分支，两端靠 `Hello.proto_version` 的
+/// **硬相等**校验实现「混合版本干净拒绝」：旧端与新端不会解码对方的画面帧，因为它们在版本
+/// 校验通过之前就被拒了。
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
 /// `MIN_REMOTE_CLIENT_VERSION`）。本常量与它必须**分两步发布**（见计划「交付顺序」）：先把
-/// 0.11 客户端铺开，再部署新服务端并抬门控。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 2;
+/// 携带版本 3 的客户端铺开，再部署新服务端并抬门控。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 3;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -115,17 +117,24 @@ impl Lane {
     }
 }
 
-/// 视频编解码器标识（预留扩展位，将来可加 `Jpeg`/`H265`/硬件实现）。
+/// 视频编解码器标识。
 ///
 /// 它是 [`SessionMessage::VideoPacket`] 与 [`SessionMessage::ScreenConfig`] 的**字段**而不是
 /// `SessionMessage` 的新变体，所以给它追加变体不影响 `SessionMessage` 的判别式布局。
 /// 但这**不等于**可以不动版本号：老对端收到不认识的 `CodecId` 判别式一样会在 bincode 解码时失败，
-/// 故阶段 5（硬件编码）仍须抬 `SESSION_PROTO_VERSION` + `MIN_REMOTE_CLIENT_VERSION`，并在握手后
-/// 交换「本端支持的 codec 列表」，只发对端声明支持的 codec。
+/// 故阶段 5（硬件编码）抬了 `SESSION_PROTO_VERSION`，并在握手后交换 `CodecOffer` / `CodecSelect`
+/// 只发对端声明支持、且双方都实际具备的 codec。
+///
+/// **判别式顺序是线上契约**：`Vp9 = 0`、`H264 = 1`，新值一律追加在末尾（由
+/// `codec_id_discriminants_are_stable` 机械锁住）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodecId {
     /// VP9 profile 1（8-bit 4:4:4），软件编码。
     Vp9,
+    /// H.264（固定 4:2:0），通常由平台硬件编码器提供（Windows NVENC）。
+    ///
+    /// 色度格式**不做协商**：本项目的 H.264 路径固定 4:2:0；需要 4:4:4 的调用方继续用 VP9。
+    H264,
 }
 
 /// [`SessionMessage::VideoPacket::flags`]：本包携带编码器配置变更（编码尺寸/色度格式）。
@@ -268,10 +277,12 @@ pub enum SessionMessage {
         reason: String,
     },
     // ── 视频数据面（阶段 2；走 `Screen` lane，判别式追加在末尾）──
-    /// 一帧视频（VP9，时域编码）。关键帧与增量帧都走这里。
+    /// 一帧视频（时域编码，codec 由 [`SessionMessage::CodecSelect`] 决定）。
+    /// 关键帧与增量帧都走这里。
     ///
-    /// `data` 是**一个或多个**长度前缀（u32 大端）拼接的 VP9 帧；解码侧按同一前缀切分后逐帧
-    /// `decode`。正常路径下 `lag_in_frames = 1` 时每次 `encode` 恰好产出一帧，前缀是为健壮性保留。
+    /// `data` 是**一个或多个**长度前缀（u32 大端）拼接的帧；解码侧按同一前缀切分后逐帧
+    /// `decode`。正常路径下 VP9 的 `lag_in_frames = 1` 时每次 `encode` 恰好产出一帧，前缀是为
+    /// 健壮性保留。`codec` 必须与 `CodecSelect` 一致。
     VideoPacket {
         /// 来源显示器编号。
         display: u32,
@@ -285,7 +296,7 @@ pub enum SessionMessage {
         width: u32,
         /// **编码**尺寸的高。
         height: u32,
-        /// VP9 帧数据。
+        /// 帧数据（长度前缀拼接）。
         data: Vec<u8>,
     },
     /// 控制器请求关键帧（解码失败、丢弃了参考帧、或长时间无帧）。
@@ -293,11 +304,12 @@ pub enum SessionMessage {
         /// 目标显示器编号。
         display: u32,
     },
-    /// 被控端下行屏幕配置：编码尺寸 + codec（握手后发一次，变更时重发）。
+    /// 被控端下行屏幕配置：编码尺寸 + codec（首个视频包之前发一次，变更时重发）。
     ///
     /// **显示尺寸不在这里**——它在 `HelloAck.displays` 的 [`DisplayInfo`] 里，而
     /// `HelloAck` 的字节形状一个字都不能动（见 [`SessionMessage`] 的判别式布局说明）。
-    /// `width`/`height` 是**编码**尺寸，即后续 [`SessionMessage::VideoPacket`] 会声明的尺寸。
+    /// `width`/`height` 是**编码**尺寸，即后续 [`SessionMessage::VideoPacket`] 会声明的尺寸；
+    /// `codec` 必须与 [`SessionMessage::CodecSelect`] 一致。
     ScreenConfig {
         /// 目标显示器编号。
         display: u32,
@@ -318,6 +330,24 @@ pub enum SessionMessage {
         decode_ms: u32,
         /// 待解码积压（帧数）。
         backlog: u32,
+    },
+    // ── 编解码器协商（阶段 5；判别式追加在末尾，握手加密后立刻交换）──
+    /// 控制器声明自己**能解码**的 codec（控制器 → 被控端，握手完成后立刻发）。
+    ///
+    /// 这只是能力声明，不是保证：被控端只有在**自己也注入了对应编码器**时才会选它。
+    CodecOffer {
+        /// 本端是否具备 H.264 解码能力。
+        h264: bool,
+        /// 本端是否具备 VP9 解码能力（内置实现始终为 `true`）。
+        vp9: bool,
+    },
+    /// 被控端通告最终选定的 codec（被控端 → 控制器，**开始出帧之前**发）。
+    ///
+    /// 控制器据此创建解码器；后续 [`SessionMessage::ScreenConfig`] 与
+    /// [`SessionMessage::VideoPacket`] 的 `codec` 字段必须与之一致。
+    CodecSelect {
+        /// 选定 codec。
+        codec: CodecId,
     },
 }
 
@@ -564,8 +594,8 @@ mod tests {
         0, 0, 0, 0,
         // session_id "sess-1"
         6, 0, 0, 0, 0, 0, 0, 0, b's', b'e', b's', b's', b'-', b'1',
-        // proto_version = 2
-        2, 0,
+        // proto_version = 3
+        3, 0,
         // controller_rd_id "111111111"
         9, 0, 0, 0, 0, 0, 0, 0, b'1', b'1', b'1', b'1', b'1', b'1', b'1', b'1', b'1',
         // nonce [1, 2, 3, 4]
@@ -702,6 +732,31 @@ mod tests {
             let got = codec_roundtrip(message.clone(), lane);
             assert_eq!(got.lane, lane, "lane 应保持");
             assert_eq!(got.message, message, "消息应往返一致");
+        }
+    }
+
+    /// 协商消息的编解码往返（`CodecOffer` / `CodecSelect` 走 `Control` lane）。
+    #[test]
+    fn codec_offer_and_select_roundtrip() {
+        for message in [
+            SessionMessage::CodecOffer {
+                h264: true,
+                vp9: true,
+            },
+            SessionMessage::CodecOffer {
+                h264: false,
+                vp9: true,
+            },
+        ] {
+            let got = codec_roundtrip(message.clone(), Lane::Control);
+            assert_eq!(got.message, message);
+            assert_eq!(got.lane, Lane::Control);
+        }
+        for codec in [CodecId::Vp9, CodecId::H264] {
+            let message = SessionMessage::CodecSelect { codec };
+            let got = codec_roundtrip(message.clone(), Lane::Control);
+            assert_eq!(got.message, message);
+            assert_eq!(got.lane, Lane::Control);
         }
     }
 
@@ -902,6 +957,11 @@ mod tests {
             (SessionMessage::FileChunk { id: 8, data: vec![] }, Lane::File),
             (SessionMessage::FileDone { id: 9 }, Lane::File),
             (SessionMessage::FileError { id: 10, reason: "用户取消".into() }, Lane::File),
+            // 编解码协商：两种能力组合都覆盖（全支持 / 只有 VP9）。
+            (SessionMessage::CodecOffer { h264: true, vp9: true }, Lane::Control),
+            (SessionMessage::CodecOffer { h264: false, vp9: true }, Lane::Control),
+            (SessionMessage::CodecSelect { codec: CodecId::Vp9 }, Lane::Control),
+            (SessionMessage::CodecSelect { codec: CodecId::H264 }, Lane::Control),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -1047,6 +1107,16 @@ mod tests {
                 },
                 22,
             ),
+            (
+                "CodecOffer",
+                SessionMessage::CodecOffer { h264: true, vp9: true },
+                23,
+            ),
+            (
+                "CodecSelect",
+                SessionMessage::CodecSelect { codec: CodecId::H264 },
+                24,
+            ),
         ];
         for (name, msg, want) in &cases {
             let bytes = bincode::serialize(msg).unwrap();
@@ -1056,6 +1126,20 @@ mod tests {
         // 序号必须连续无洞：任何「删一个变体」的改动都会让这张表与实现脱节。
         for (i, (_, _, want)) in cases.iter().enumerate() {
             assert_eq!(usize::try_from(*want).unwrap(), i, "判别式必须从 0 起连续");
+        }
+    }
+
+    /// **`CodecId` 判别式黄金测试**：`Vp9 = 0`、`H264 = 1`，新值只能追加在末尾。
+    ///
+    /// `CodecId` 是 `VideoPacket` / `ScreenConfig` / `CodecSelect` 的字段，同一个 bincode 枚举
+    /// 编码规则（u32 小端判别式）。把 `H264` 插到 `Vp9` 前面会让老端的 `Vp9` 解码成 `H264`，
+    /// 画面直接花屏且没有任何版本错误可查——故单独锁一条。
+    #[test]
+    fn codec_id_discriminants_are_stable() {
+        for (codec, want) in [(CodecId::Vp9, 0u32), (CodecId::H264, 1)] {
+            let bytes = bincode::serialize(&codec).unwrap();
+            let got = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(got, want, "CodecId::{codec:?} 的判别式错位");
         }
     }
 

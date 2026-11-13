@@ -23,8 +23,17 @@
 //! **生效值**（[`EncodeRates`]）交给下一次编码任务。码率/帧率变化由编码任务**在线重配置**
 //! （vendor 补丁 6），**不重建、不插 IDR**；只有降编码分辨率（几何变化）才重建 + 强制 IDR。
 //! 详见 [`crate::qos`] 的模块文档。
+//!
+//! # 编解码协商（阶段 5）
+//!
+//! 握手加密完成后，控制器先发 `CodecOffer` 声明自己能解码的 codec。被控端**等它到了才开始
+//! 采集**（否则首帧可能用了对端解不了的 codec），按「本端有 H.264 编码工厂 && 对端支持 H.264」
+//! 选 codec，回一条 `CodecSelect`，再用对应工厂创建编码器。等待有 [`CODEC_OFFER_TIMEOUT`]
+//! 上限：超时只记 `warn` 并回退 VP9，绝不永久卡住。版本硬相等已经把老对端挡在握手阶段，
+//! 故这里没有额外的兼容分支。
 
 use crate::auth::{ack_mac, PendingSessions};
+use crate::codec::{vp9_encoder_factory, VideoEncoderApi, VideoEncoderFactory};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, RateController};
@@ -36,7 +45,7 @@ use crate::session::{
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
-use crate::video::{encode_dimensions, VideoEncoder, MAX_ENCODE_WIDTH};
+use crate::video::{encode_dimensions, EncodedVideo, MAX_ENCODE_WIDTH};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::sync::Arc;
@@ -49,6 +58,13 @@ use tracing::{debug, warn};
 
 /// 等待 `Hello` 的超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 等待控制器 `CodecOffer` 的超时。
+///
+/// 控制器在握手完成后**立刻**发 offer，正常路径下这个等待几乎不耗时。超时是防御性的：
+/// 对端实现异常（或将来某个控制器忘了发）时不能永久卡住，回退 VP9 继续会话。版本硬相等已经
+/// 把老对端挡在握手阶段，所以这里不需要兼容分支，只需要「不永久挂起」。
+const CODEC_OFFER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 收尾 `Bye` 的发送上限。对端可能已停读（写缓冲满），不加限时会让 teardown 永久卡住；`Bye`
 /// 只是尽力通知，超时丢弃即可。
@@ -116,6 +132,78 @@ pub struct ControlledConfig {
     pub capture_watchdog: Duration,
     /// 统计数据上报句柄（延迟读数）；无管理端时用 [`SessionStatsReporter::noop`]。
     pub stats: SessionStatsReporter,
+    /// 可选的 H.264 编码器工厂（通常由 `crates/win-video` 注入）。
+    ///
+    /// `None` = 本端只能编码 VP9，协商时一律选 VP9。**与控制器 offer 的交集**才是最终选择：
+    /// 只有本字段为 `Some` **且** `CodecOffer.h264 == true` 时才选 H.264。
+    pub h264_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
+}
+
+/// 被控端读半边类型（协商与主循环共用）。
+type SessionReader = FramedRead<tokio::io::ReadHalf<BoxDuplex>, SessionCodec>;
+
+/// 协商阶段等待 offer 的结果。
+enum CodecOfferOutcome {
+    /// 收到了控制器的能力声明。
+    Offer {
+        /// 控制器是否支持 H.264 解码。
+        h264: bool,
+        /// 控制器是否支持 VP9 解码。
+        vp9: bool,
+    },
+    /// 等待超时，调用方回退 VP9。
+    Timeout,
+    /// 对端在协商完成前关闭连接（按非主动结束处理）。
+    Closed,
+}
+
+/// 纯函数：根据 offer 与本端编码能力选 codec。
+///
+/// 规则（任务约定）：**本端有 H.264 编码工厂且控制器声明支持 H.264** 才选 H.264，否则 VP9。
+/// 超时（`None`）同样回退 VP9。
+#[must_use]
+fn choose_codec(offer: Option<(bool, bool)>, has_h264_encoder: bool) -> CodecId {
+    match offer {
+        Some((true, _)) if has_h264_encoder => CodecId::H264,
+        // 控制器永远声明 `vp9: true`（VP9 解码是内置实现）。即使它声明 false，VP9 仍是唯一
+        // 双方都可能具备的实现，发出去让对端显式报错好过静默卡死。
+        _ => CodecId::Vp9,
+    }
+}
+
+/// 读出控制器的 `CodecOffer`（见 [`CodecOfferOutcome`]）。
+///
+/// 协商发生在加密装上之后、会话主循环之前。窗口内收到的 `Heartbeat` 要正常应答——控制器的
+/// 首个心跳 tick 立即到期，可能在 offer 之后紧跟着到达。其它消息在这个极短窗口里没有意义，
+/// 只记日志忽略（真实控制器在握手后**立刻**发 offer，TCP 保序保证它排在帧与输入之前）。
+async fn read_codec_offer(
+    reader: &mut SessionReader,
+    tx: &mpsc::Sender<WriterMsg>,
+    cancel: &CancellationToken,
+    offer_timeout: Duration,
+) -> RemoteResult<CodecOfferOutcome> {
+    let deadline = sleep(offer_timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(RemoteError::Cancelled),
+            () = &mut deadline => return Ok(CodecOfferOutcome::Timeout),
+            incoming = reader.next() => match incoming {
+                Some(Ok(frame)) => match frame.message {
+                    SessionMessage::CodecOffer { h264, vp9 } => {
+                        return Ok(CodecOfferOutcome::Offer { h264, vp9 });
+                    }
+                    SessionMessage::Heartbeat => {
+                        enqueue(tx, cancel, SessionFrame::control(SessionMessage::HeartbeatAck)).await?;
+                    }
+                    other => debug!(?other, "编解码协商阶段收到未处理消息，忽略"),
+                },
+                Some(Err(err)) => return Err(RemoteError::Codec(err.to_string())),
+                None => return Ok(CodecOfferOutcome::Closed),
+            }
+        }
+    }
 }
 
 /// 跑一次被控端会话，直到取消、对端关闭或出错。
@@ -216,8 +304,55 @@ pub async fn run_controlled(
 
     // 出站写任务：独占写半边。会话 `select!` 循环只把帧投进有界队列，**不再在分支里 await 写**
     // ——否则写侧被背压卡住时（对端停读、中继停走），输入/心跳分支完全得不到轮询，形成队头阻塞。
+    // 协商阶段的 `HeartbeatAck` / `CodecSelect` 也走这条队列，故先把它起来。
     let (tx, rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
     let writer_task = tokio::spawn(writer_loop(writer, rx, cancel.clone()));
+
+    // 2.5) 编解码协商：**必须先拿到 `CodecOffer` 才能开始采集/编码**——否则首帧可能用了控制器
+    // 解不了的 codec，只能靠后来请求关键帧重来。控制器在握手后立刻发它；超时回退 VP9（
+    // 见 [`CODEC_OFFER_TIMEOUT`]），对端在协商前关连接按正常结束处理。
+    let outcome = match read_codec_offer(&mut reader, &tx, &cancel, CODEC_OFFER_TIMEOUT).await {
+        Ok(outcome) => outcome,
+        Err(RemoteError::Cancelled) => {
+            return Ok(SessionEnd {
+                reason: "用户中断".to_owned(),
+                deliberate: true,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    let offer = match outcome {
+        CodecOfferOutcome::Offer { h264, vp9 } => Some((h264, vp9)),
+        CodecOfferOutcome::Timeout => {
+            warn!(
+                timeout = ?CODEC_OFFER_TIMEOUT,
+                "等待 CodecOffer 超时，回退 VP9"
+            );
+            None
+        }
+        CodecOfferOutcome::Closed => {
+            return Ok(SessionEnd {
+                reason: "对端在编解码协商前关闭连接".to_owned(),
+                deliberate: false,
+            });
+        }
+    };
+    let codec = choose_codec(offer, config.h264_encoder_factory.is_some());
+    let encoder_factory: Arc<dyn VideoEncoderFactory> = if codec == CodecId::H264 {
+        // `choose_codec` 只在工厂存在时返回 H264；这里仍是防御性检查，不 panic。
+        config.h264_encoder_factory.clone().ok_or_else(|| {
+            RemoteError::Platform("协商选择了 H.264，但本端没有编码器工厂".to_owned())
+        })?
+    } else {
+        vp9_encoder_factory()
+    };
+    enqueue(
+        &tx,
+        &cancel,
+        SessionFrame::control(SessionMessage::CodecSelect { codec }),
+    )
+    .await?;
+    debug!(?codec, "被控端已选定编解码器");
 
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
@@ -227,6 +362,8 @@ pub async fn run_controlled(
         tx.clone(),
         cancel.clone(),
         config.stats.clone(),
+        codec,
+        encoder_factory,
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -767,8 +904,10 @@ async fn encode_loop(
     out: mpsc::Sender<WriterMsg>,
     cancel: CancellationToken,
     stats: SessionStatsReporter,
+    codec: CodecId,
+    encoder_factory: Arc<dyn VideoEncoderFactory>,
 ) {
-    let mut encoder: Option<VideoEncoder> = None;
+    let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
     let mut encoder_dims: Option<(u32, u32)> = None;
     // 上一帧的原始 RGBA（去重基准）。保留它是去重的定义：memcmp 远快于密码学哈希。
@@ -804,7 +943,7 @@ async fn encode_loop(
             if sent_dims != Some((width, height)) {
                 let config = SessionMessage::ScreenConfig {
                     display,
-                    codec: CodecId::Vp9,
+                    codec,
                     width,
                     height,
                 };
@@ -831,7 +970,7 @@ async fn encode_loop(
             continue;
         }
         if encoder.is_none() {
-            match VideoEncoder::new(width, height, rates.bitrate_kbps, rates.fps) {
+            match encoder_factory.create(width, height, rates.bitrate_kbps, rates.fps) {
                 Ok(enc) => encoder = Some(enc),
                 Err(err) => {
                     warn!(error = %err, "编码器创建失败，跳过本帧");
@@ -850,7 +989,7 @@ async fn encode_loop(
         // 码率/帧率的在线重配置也在这里做（`reconfig_and_encode`），与编码同一次阻塞调用。
         let joined = tokio::task::spawn_blocking(move || {
             let mut enc = enc;
-            let result = reconfig_and_encode(&mut enc, &rates, &rgba, src_width, src_height, force);
+            let result = reconfig_and_encode(enc.as_mut(), &rates, &rgba, src_width, src_height, force);
             (enc, result, rgba)
         })
         .await;
@@ -886,7 +1025,7 @@ async fn encode_loop(
                 let msg = SessionMessage::VideoPacket {
                     display,
                     seq,
-                    codec: CodecId::Vp9,
+                    codec,
                     flags,
                     width,
                     height,
@@ -917,13 +1056,13 @@ async fn encode_loop(
 /// # Errors
 /// libvpx 拒绝重配置或编码失败时返回 [`RemoteError::Encode`]（调用方丢弃编码器、下一帧重建）。
 fn reconfig_and_encode(
-    enc: &mut VideoEncoder,
+    enc: &mut dyn VideoEncoderApi,
     rates: &EncodeRates,
     rgba: &[u8],
     src_width: u32,
     src_height: u32,
     force: bool,
-) -> RemoteResult<crate::video::EncodedVideo> {
+) -> RemoteResult<EncodedVideo> {
     if enc.bitrate_kbps() != rates.bitrate_kbps {
         enc.set_bitrate(rates.bitrate_kbps)?;
     }
@@ -1304,6 +1443,7 @@ mod tests {
             encode: EncodeOptions::default(),
             capture_watchdog,
             stats: SessionStatsReporter::noop(),
+            h264_encoder_factory: None,
         }
     }
 
@@ -1318,12 +1458,142 @@ mod tests {
         pending
     }
 
+    /// 协商规则：只有「本端有 H.264 编码器」且「控制器声明支持 H.264」才选 H.264。
+    #[test]
+    fn choose_codec_requires_both_sides_to_support_h264() {
+        assert_eq!(choose_codec(Some((true, true)), true), CodecId::H264);
+        // 本端没有编码器：即便对端支持也不能选。
+        assert_eq!(choose_codec(Some((true, true)), false), CodecId::Vp9);
+        // 对端不支持：本端有编码器也不选。
+        assert_eq!(choose_codec(Some((false, true)), true), CodecId::Vp9);
+        // 超时回退 VP9。
+        assert_eq!(choose_codec(None, true), CodecId::Vp9);
+        assert_eq!(choose_codec(None, false), CodecId::Vp9);
+    }
+
+    /// 协商读取器应返回控制器声明的能力，并在窗口内正常应答心跳。
+    #[tokio::test]
+    async fn codec_offer_is_read_and_heartbeat_answered_during_negotiation() {
+        let (peer, us) = tokio::io::duplex(4096);
+        let (read_half, _write_half) = tokio::io::split(Box::new(us) as BoxDuplex);
+        let mut reader = FramedRead::new(read_half, SessionCodec::new());
+        let mut peer_writer = FramedWrite::new(Box::new(peer) as BoxDuplex, SessionCodec::new());
+        let (tx, mut rx) = mpsc::channel::<WriterMsg>(4);
+        let cancel = CancellationToken::new();
+
+        // 控制器：先一条心跳（协商窗口内要应答），再发 offer。
+        peer_writer
+            .send(SessionFrame::control(SessionMessage::Heartbeat))
+            .await
+            .expect("发心跳");
+        peer_writer
+            .send(SessionFrame::control(SessionMessage::CodecOffer {
+                h264: true,
+                vp9: true,
+            }))
+            .await
+            .expect("发 offer");
+
+        let outcome = read_codec_offer(&mut reader, &tx, &cancel, WAIT)
+            .await
+            .expect("读 offer 应成功");
+        match outcome {
+            CodecOfferOutcome::Offer { h264, vp9 } => {
+                assert!(h264 && vp9, "应原样带回控制器的能力声明");
+            }
+            _ => panic!("应收到 CodecOffer"),
+        }
+        // 心跳必须在协商阶段就被应答，否则控制器首个 RTT 样本会凭空消失。
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(WriterMsg::Frame(SessionFrame {
+                    message: SessionMessage::HeartbeatAck,
+                    ..
+                }))
+            ),
+            "协商阶段收到 Heartbeat 必须回 HeartbeatAck"
+        );
+    }
+
+    /// 对端不发 offer 时必须超时回退，而不是永久卡住。
+    #[tokio::test]
+    async fn codec_offer_timeout_is_reported() {
+        let (peer, us) = tokio::io::duplex(1024);
+        let (read_half, _write_half) = tokio::io::split(Box::new(us) as BoxDuplex);
+        let mut reader = FramedRead::new(read_half, SessionCodec::new());
+        let (tx, _rx) = mpsc::channel::<WriterMsg>(4);
+        let cancel = CancellationToken::new();
+
+        let started = Instant::now();
+        let outcome = read_codec_offer(&mut reader, &tx, &cancel, Duration::from_millis(30))
+            .await
+            .expect("超时不是错误");
+        assert!(matches!(outcome, CodecOfferOutcome::Timeout), "应为 Timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "超时路径应立即返回，实得 {:?}",
+            started.elapsed()
+        );
+        // 对端保持存活但没有发任何消息。
+        drop(peer);
+    }
+
+    /// 端到端：对端完成握手却**不发** `CodecOffer`，被控端必须超时回退 VP9 并继续会话。
+    ///
+    /// 用 `start_paused` 的虚拟时钟跳过真实的 5s 等待；断言的是「超时之后真的发出
+    /// `CodecSelect{Vp9}`」这一接线，而不只是「一个纯函数返回了 Timeout」。
+    #[tokio::test(start_paused = true)]
+    async fn missing_codec_offer_falls_back_to_vp9_end_to_end() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config(pending_with("TOK"), RemoteMode::Control),
+            Arc::new(EmptyScreenSource),
+            input,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        let (mut peer_reader, _peer_writer) =
+            controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", None).await;
+
+        // 虚拟时钟会推进到 `CODEC_OFFER_TIMEOUT`；外层给一个远大于它的上限以免误判。
+        let frame = tokio::time::timeout(Duration::from_secs(60), peer_reader.next())
+            .await
+            .expect("协商超时后应继续会话并发出 CodecSelect")
+            .expect("流不应关闭")
+            .expect("CodecSelect 应可解码");
+        match frame.message {
+            SessionMessage::CodecSelect { codec } => assert_eq!(codec, CodecId::Vp9),
+            other => panic!("应收到 CodecSelect，实得 {other:?}"),
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, ctld).await;
+    }
+
     /// 作为「控制器」完成握手：写 `Hello`、读 `HelloAck`、装上加密，返回读写半边。
     async fn controller_peer_handshake(
         stream: BoxDuplex,
         plan: &ControllerHandshake,
         token: &str,
         session_id: &str,
+    ) -> (PeerRead, PeerWrite) {
+        controller_peer_handshake_with(stream, plan, token, session_id, Some((false, true))).await
+    }
+
+    /// 同 [`controller_peer_handshake`]，但可控制是否发送 `CodecOffer`
+    /// （`None` 用于验证「对端不发 offer」的超时回退路径）。
+    async fn controller_peer_handshake_with(
+        stream: BoxDuplex,
+        plan: &ControllerHandshake,
+        token: &str,
+        session_id: &str,
+        offer: Option<(bool, bool)>,
     ) -> (PeerRead, PeerWrite) {
         let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = FramedRead::new(read_half, SessionCodec::new());
@@ -1353,6 +1623,14 @@ mod tests {
         writer
             .encoder_mut()
             .set_cipher(Cipher::new(keys.send).expect("密钥长度合法"));
+        // 真实控制器在握手后立刻发 `CodecOffer`；协商窗口有超时，但测试不该为此等满 5s。
+        // 默认声明「只支持 VP9」，需要测 H.264 的用例自行发能力更全的 offer。
+        if let Some((h264, vp9)) = offer {
+            writer
+                .send(SessionFrame::control(SessionMessage::CodecOffer { h264, vp9 }))
+                .await
+                .expect("发送 CodecOffer 应成功");
+        }
         (reader, writer)
     }
 
@@ -1491,6 +1769,8 @@ mod tests {
             out_tx,
             cancel.clone(),
             SessionStatsReporter::noop(),
+            CodecId::Vp9,
+            vp9_encoder_factory(),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -1553,6 +1833,8 @@ mod tests {
             out_tx,
             cancel.clone(),
             SessionStatsReporter::noop(),
+            CodecId::Vp9,
+            vp9_encoder_factory(),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -1592,6 +1874,120 @@ mod tests {
         let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
     }
 
+    /// 假 H.264 编码器工厂：不产出真码流，只用于锁定「按协商 codec 建编码器」的接线。
+    #[derive(Debug, Default)]
+    struct FakeH264EncoderFactory;
+
+    impl VideoEncoderFactory for FakeH264EncoderFactory {
+        fn codec(&self) -> CodecId {
+            CodecId::H264
+        }
+
+        fn create(
+            &self,
+            width: u32,
+            height: u32,
+            target_bitrate_kbps: u32,
+            max_fps: u8,
+        ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+            Ok(Box::new(FakeH264Encoder {
+                width,
+                height,
+                bitrate: target_bitrate_kbps,
+                fps: u32::from(max_fps),
+            }))
+        }
+    }
+
+    /// 假 H.264 编码器：每帧固定吐 4 字节「码流」。
+    struct FakeH264Encoder {
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+    }
+
+    impl VideoEncoderApi for FakeH264Encoder {
+        fn dimensions(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+        fn bitrate_kbps(&self) -> u32 {
+            self.bitrate
+        }
+        fn fps(&self) -> u32 {
+            self.fps
+        }
+        fn set_bitrate(&mut self, kbps: u32) -> RemoteResult<()> {
+            self.bitrate = kbps;
+            Ok(())
+        }
+        fn set_fps(&mut self, fps: u8) -> RemoteResult<()> {
+            self.fps = u32::from(fps);
+            Ok(())
+        }
+        fn encode(
+            &mut self,
+            _rgba: &[u8],
+            _src_width: u32,
+            _src_height: u32,
+            force_keyframe: bool,
+        ) -> RemoteResult<EncodedVideo> {
+            Ok(EncodedVideo {
+                data: vec![0, 0, 0, 1, 0x42],
+                keyframe: force_keyframe,
+            })
+        }
+    }
+
+    /// **协商不变量**：编码任务必须用协商选定的 codec 工厂，并在 `ScreenConfig` /
+    /// `VideoPacket` 里填**实际** codec（不是写死 VP9）。
+    #[tokio::test]
+    async fn encode_loop_uses_selected_codec_in_config_and_packets() {
+        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+            CodecId::H264,
+            Arc::new(FakeH264EncoderFactory),
+        ));
+
+        job_tx
+            .send(EncodeJob {
+                display: 0,
+                rates: EncodeRates::ceiling(EncodeOptions::default()),
+                force_keyframe: true,
+                frame: shaded(0, 64, 48, 10),
+            })
+            .await
+            .expect("投递首帧");
+
+        // 首帧前必须先声明 `ScreenConfig`，且 codec 是协商选定的 H.264。
+        match out_rx.recv().await {
+            Some(WriterMsg::Frame(SessionFrame {
+                message: SessionMessage::ScreenConfig { codec, .. },
+                ..
+            })) => assert_eq!(codec, CodecId::H264, "ScreenConfig 必须填实际 codec"),
+            _ => panic!("首个出站帧应为 ScreenConfig"),
+        }
+        match out_rx.recv().await {
+            Some(WriterMsg::Frame(SessionFrame {
+                message: SessionMessage::VideoPacket { codec, flags, .. },
+                ..
+            })) => {
+                assert_eq!(codec, CodecId::H264, "VideoPacket 必须填实际 codec");
+                assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "首帧应为关键帧");
+            }
+            _ => panic!("第二个出站帧应为关键帧"),
+        }
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
     /// 被背压跳过的那一帧若曾要求关键帧，请求**不能蒸发**：下一帧必须补上 IDR。
     ///
     /// 少了这条，控制器进入 `awaiting_keyframe` 后只请求一次 IDR，若那一帧恰好因出站队列满被跳过，
@@ -1613,6 +2009,8 @@ mod tests {
             out_tx,
             cancel.clone(),
             SessionStatsReporter::noop(),
+            CodecId::Vp9,
+            vp9_encoder_factory(),
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {

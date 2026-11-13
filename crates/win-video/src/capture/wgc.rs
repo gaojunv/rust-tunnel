@@ -1,0 +1,238 @@
+//! WGC（`Windows.Graphics.Capture`）采集后端。
+//!
+//! 用 `IGraphicsCaptureItemInterop::CreateForMonitor` 直接按显示器创建捕获项，
+//! 不弹系统选择器。帧池用 `CreateFreeThreaded`：`capture()` 由调用方在任意线程
+//! 同步轮询，不做事件回调。
+//!
+//! # 前置条件
+//!
+//! - 进程必须已初始化 WinRT（`RoInitialize(RO_INIT_MULTITHREADED)`）。本模块在
+//!   `open` 时初始化；若当前线程已经是别的套间模式（`RPC_E_CHANGED_MODE`），
+//!   只记日志、继续尝试——`CreateFreeThreaded` 不要求调用线程是 MTA。
+//! - 显示器捕获在 Windows 10 1903+ 可用；`GraphicsCaptureSession::IsSupported()`
+//!   为 false 时直接返回错误，让 [`super::open_best`] 回退 DXGI。
+
+use super::{
+    create_device_for, BgraReader, CaptureBackend, CaptureSource, CapturedFrame, MonitorInfo,
+    FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
+};
+use crate::WinVideoError;
+use std::time::Instant;
+use windows::core::Interface as _;
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+
+/// WGC 采集源。
+struct WgcSource {
+    /// 捕获项；捕获会话/帧池内部也会持有引用，这里保留一份便于排障与生命周期
+    /// 明确化。
+    _item: GraphicsCaptureItem,
+    /// 捕获会话（`StartCapture` 之后持续生效）。
+    _session: GraphicsCaptureSession,
+    /// 自由线程帧池。
+    pool: Direct3D11CaptureFramePool,
+    /// D3D11 设备（帧纹理由它创建，读回也要用它）。
+    device: ID3D11Device,
+    /// 立即上下文。
+    context: ID3D11DeviceContext,
+    /// BGRA 读回器（staging 纹理缓存）。
+    reader: BgraReader,
+    /// 最近一次成功采集的帧，用于桌面静止时复用。
+    last: Option<CapturedFrame>,
+}
+
+impl CaptureSource for WgcSource {
+    fn backend(&self) -> CaptureBackend {
+        CaptureBackend::Wgc
+    }
+
+    fn capture(&mut self) -> Result<CapturedFrame, WinVideoError> {
+        let timeout = if self.last.is_some() {
+            NEXT_FRAME_POLL_TIMEOUT
+        } else {
+            FIRST_FRAME_TIMEOUT
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.pool.TryGetNextFrame() {
+                Ok(frame) => {
+                    let captured = self.read_frame(&frame)?;
+                    self.last = Some(captured.clone());
+                    return Ok(captured);
+                }
+                // 帧池没有新帧时 `from_abi` 把空指针折成 `Error::empty()`，
+                // 其 HRESULT 为 0（成功码）。真正的 HRESULT 失败才向上报。
+                Err(err) if err.code().is_ok() => {}
+                Err(err) => {
+                    return Err(WinVideoError::Capture(format!(
+                        "WGC TryGetNextFrame 失败: {err}"
+                    )))
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        match &self.last {
+            Some(frame) => Ok(frame.clone()),
+            None => Err(WinVideoError::Capture(format!(
+                "WGC: {timeout:?} 内没有收到首帧"
+            ))),
+        }
+    }
+}
+
+impl WgcSource {
+    /// 把一帧 WGC 画面读成紧凑 BGRA，并关闭帧对象归还缓冲。
+    fn read_frame(
+        &mut self,
+        frame: &Direct3D11CaptureFrame,
+    ) -> Result<CapturedFrame, WinVideoError> {
+        let result = self.read_surface(frame);
+        // SAFETY 说明：`Close` 是安全方法；失败只影响缓冲归还时机，不影响已读数据。
+        if let Err(err) = frame.Close() {
+            tracing::debug!(error = %err, "WGC 帧对象 Close 失败");
+        }
+        result
+    }
+
+    fn read_surface(
+        &mut self,
+        frame: &Direct3D11CaptureFrame,
+    ) -> Result<CapturedFrame, WinVideoError> {
+        let surface = frame
+            .Surface()
+            .map_err(|err| WinVideoError::Capture(format!("WGC Surface() 失败: {err}")))?;
+        let access: IDirect3DDxgiInterfaceAccess = surface
+            .cast()
+            .map_err(|err| WinVideoError::Capture(format!("表面转 DXGI 接口失败: {err}")))?;
+        // SAFETY: `access` 是帧表面的 DXGI 访问接口；请求的是 D3D11 纹理。
+        let texture: ID3D11Texture2D = unsafe { access.GetInterface() }
+            .map_err(|err| WinVideoError::Capture(format!("帧表面不是 D3D11 纹理: {err}")))?;
+        let (width, height, bgra) = self.reader.read(&self.device, &self.context, &texture)?;
+        Ok(CapturedFrame {
+            width,
+            height,
+            bgra,
+            backend: CaptureBackend::Wgc,
+        })
+    }
+}
+
+/// 打开指定显示器的 WGC 采集源。
+pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinVideoError> {
+    initialize_winrt()?;
+
+    match GraphicsCaptureSession::IsSupported() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(WinVideoError::Capture(
+                "GraphicsCaptureSession::IsSupported() 返回 false".to_owned(),
+            ))
+        }
+        Err(err) => return Err(WinVideoError::Capture(format!("WGC 支持性查询失败: {err}"))),
+    }
+
+    let interop: IGraphicsCaptureItemInterop =
+        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().map_err(
+            |err| WinVideoError::Capture(format!("获取 IGraphicsCaptureItemInterop 失败: {err}")),
+        )?;
+    // SAFETY: `interop` 有效；`hmonitor` 来自 `EnumDisplayMonitors`，在显示器
+    // 存活期间有效。
+    let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor.hmonitor) }
+        .map_err(|err| WinVideoError::Capture(format!("CreateForMonitor 失败: {err}")))?;
+
+    let d3d = create_device_for(monitor.hmonitor)?;
+    let device = winrt_device(&d3d.device)?;
+
+    let size = item
+        .Size()
+        .map_err(|err| WinVideoError::Capture(format!("GraphicsCaptureItem::Size 失败: {err}")))?;
+    if size.Width <= 0 || size.Height <= 0 {
+        return Err(WinVideoError::Capture(format!(
+            "WGC 捕获项尺寸非法: {}x{}",
+            size.Width, size.Height
+        )));
+    }
+
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+        &device,
+        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        2,
+        size,
+    )
+    .map_err(|err| WinVideoError::Capture(format!("CreateFreeThreaded 失败: {err}")))?;
+    let session = pool
+        .CreateCaptureSession(&item)
+        .map_err(|err| WinVideoError::Capture(format!("CreateCaptureSession 失败: {err}")))?;
+
+    // 光标与边框是可选能力：老系统上对应接口不可用，失败不影响采集。
+    if let Err(err) = session.SetIsCursorCaptureEnabled(true) {
+        tracing::debug!(error = %err, "WGC 无法启用光标捕获（继续）");
+    }
+    if let Err(err) = session.SetIsBorderRequired(false) {
+        tracing::debug!(error = %err, "WGC 无法禁用捕获边框（继续）");
+    }
+    session
+        .StartCapture()
+        .map_err(|err| WinVideoError::Capture(format!("StartCapture 失败: {err}")))?;
+
+    tracing::info!(
+        monitor = %monitor.device_name,
+        width = size.Width,
+        height = size.Height,
+        "WGC 采集源已打开"
+    );
+    Ok(Box::new(WgcSource {
+        _item: item,
+        _session: session,
+        pool,
+        device: d3d.device,
+        context: d3d.context,
+        reader: BgraReader::default(),
+        last: None,
+    }))
+}
+
+/// 初始化 WinRT。容忍「当前线程已处于其它套间模式」。
+fn initialize_winrt() -> Result<(), WinVideoError> {
+    // SAFETY: 无参数初始化调用；重复调用是标准 WinRT 用法。
+    match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+        Ok(()) => Ok(()),
+        Err(err) if err.code() == RPC_E_CHANGED_MODE => {
+            tracing::warn!(
+                error = %err,
+                "当前线程已处于非 MTA 套间，WGC 仍按自由线程帧池继续"
+            );
+            Ok(())
+        }
+        Err(err) => Err(WinVideoError::Capture(format!("RoInitialize 失败: {err}"))),
+    }
+}
+
+/// 把 DXGI 设备包成 WinRT 的 `IDirect3DDevice`。
+fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice, WinVideoError> {
+    let dxgi_device: IDXGIDevice = device
+        .cast()
+        .map_err(|err| WinVideoError::Capture(format!("D3D11 设备转 IDXGIDevice 失败: {err}")))?;
+    // SAFETY: `dxgi_device` 是本进程刚创建的有效设备。
+    let inspectable =
+        unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }.map_err(|err| {
+            WinVideoError::Capture(format!("CreateDirect3D11DeviceFromDXGIDevice 失败: {err}"))
+        })?;
+    inspectable
+        .cast()
+        .map_err(|err| WinVideoError::Capture(format!("转 IDirect3DDevice 失败: {err}")))
+}

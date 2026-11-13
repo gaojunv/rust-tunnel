@@ -9,9 +9,10 @@ name: CI
 #
 # 先澄清一个常见误解：`#[cfg(windows)]` 的单测**并非从不运行**——
 # release-client.yml 在 x86_64-pc-windows-msvc 那条 leg 上已经跑了
-# `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service`（约 62 个用例：
-# win-platform 的 service/probe/process/token/capture/handle/desktop 与 win-service 的
-# host），那是仓库里唯一能真正跑它们（本机 macOS 连编译都做不到）的机器。
+# `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video`
+# （约 130 个用例：win-platform 的 service/probe/process/token/capture/handle/desktop、
+# win-service 的 host，以及 win-video 的像素/颜色/解码纯逻辑），那是仓库里唯一能真正
+# 跑它们（本机 macOS 连编译都做不到）的机器。GPU/驱动相关的探针不在 CI 跑。
 # 真正的缺口是**时机**：它们只在打 tag 时跑，回归要到发布那一刻才暴露。
 #
 # 而真正**完全没人覆盖**的是 GNU leg：出厂 Windows GUI 正是用
@@ -70,7 +71,7 @@ jobs:
           cache-on-failure: true
 
       - name: Test Windows-only modules
-        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service
+        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video
 
   # 出厂 Windows GUI 的 GNU leg 的类型检查。
   windows-gnu-typecheck:
@@ -126,5 +127,5 @@ jobs:
       # 把同一条纪律延伸到普通 warning，而这些 crate 在宿主目标上当前是零 warning 的。
       - name: Type-check GNU target
         run: |
-          cargo check  --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-client-gui
-          cargo clippy --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-client-gui -- -D warnings
+          cargo check  --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video -p rust-tunnel-client-gui
+          cargo clippy --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video -p rust-tunnel-client-gui -- -D warnings
