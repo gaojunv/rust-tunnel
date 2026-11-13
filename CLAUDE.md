@@ -294,6 +294,8 @@ GitHub Actions 工作流：
   → SCP 二进制 + systemd 服务 + 配置 → SSH 重启服务
 - `release-client.yml`（tag `v*` / 手动）— 四平台矩阵构建客户端二进制，各 runner 直接 SCP 到
   `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 在服务端生成 `SHA256SUMS` 并更新 `latest` 软链。
+  GUI（`build-gui`）只发布 **Windows（GNU）与 macOS**；**不再构建/发布 Linux GUI**，
+  Linux 只提供 CLI 客户端（musl）。
   Windows/MSVC leg 额外构建并上传 `rust-tunnel-client-service-windows-x86_64.exe`
   （无人值守服务；**不依赖 libvpx** 故走 MSVC 即可，不需要 GNU leg 那套 MSYS2 曲折；
   资产名必须以 `rust-tunnel-client-` 开头，`finalize-client` 的 glob 与下载页的

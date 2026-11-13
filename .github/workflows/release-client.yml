@@ -153,10 +153,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: rust-tunnel-client-gui
-            asset: rust-tunnel-client-gui-linux-x86_64
+          # GUI 只发布 Windows 与 macOS；Linux 只发布 CLI 客户端（build-client），
+          # 不再构建/发布 Linux GUI。
           - os: windows-latest
             # shiguredo_libvpx 的预编译 libvpx 是 GNU/mingw-w64 产物（`Built by MSYS2
             # project`、符号 `___chkstk_ms`），MSVC 链不了，故本 leg 走 GNU 工具链。
@@ -214,18 +212,6 @@ jobs:
           # 再显式钉住链接器：rustc 直接按绝对路径调它，不吃 PATH 先后的亏。
           "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$dir\x86_64-w64-mingw32-gcc.exe" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Install Linux GUI deps
-        if: runner.os == 'Linux'
-        # 远程控制新增的构建依赖（xcap 0.9 / enigo 0.6，二者在 Linux 上无条件编译）：
-        #   libpipewire-0.3-dev —— pipewire-sys 的 build script 走 system-deps 找 pkg-config
-        #   libclang-dev        —— 同一个 build script 用 bindgen 生成绑定
-        #   libxcb1-dev / libxcb-randr0-dev —— xcap 的 xcb(randr) 与 enigo 的 x11rb 后端
-        #   libgbm-dev          —— libwayshot-xcap（xcap 的 Wayland 后端，无条件编译）依赖
-        #                          gbm-sys，**链接期**需要 libgbm.so；缺它会在最后一步链接
-        #                          二进制时报 `mold: fatal: library not found: gbm`。
-        #                          注意 libgtk-3-dev 不会带出它，必须显式安装。
-        # libxkbcommon-dev 是 enigo 的既有依赖，原本已在列表里。
-        run: sudo apt-get update && sudo apt-get install -y mold libgtk-3-dev librsvg2-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libpipewire-0.3-dev libclang-dev libxcb1-dev libxcb-randr0-dev libgbm-dev pkg-config libdbus-1-dev libxdo-dev
       - name: Build GUI
         run: cargo build --release -p rust-tunnel-client-gui --target ${{ matrix.target }}
       # 产物必须自足。本 leg 是交叉编译、链接器是 MSYS2 的 mingw-w64——若 gcc 驱动的默认库把
