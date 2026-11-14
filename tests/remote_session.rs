@@ -409,6 +409,7 @@ impl ScreenSource for FakeScreen {
             height: h,
             rgba,
             gpu: None,
+            changed: true,
         })
     }
 }

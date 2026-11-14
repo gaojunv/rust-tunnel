@@ -236,12 +236,21 @@ fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
     // 被控端编码侧读数（由编码任务每秒经进程内通道上报）：编码耗时 / 实测帧率 / 当前生效码率。
     // 控制器侧恒为 `None`，此处不显示。
     if let Some(ms) = state.encode_ms {
-        let capture = state
-            .encode_capture_ms
-            .map_or(String::new(), |c| format!(" · 采集 {c} ms"));
+        // 采集耗时用微秒上报、按毫秒显示一位小数：GPU 采集常 <1 ms，整数毫秒会恒显示 0。
+        let capture = state.encode_capture_us.map_or(String::new(), |us| {
+            format!(" · 采集 {:.1} ms", f64::from(us) / 1000.0)
+        });
         let fps = state.encode_fps.map_or("—".to_owned(), |f| format!("{f} fps"));
         let kbps = state.encode_kbps.map_or("—".to_owned(), format_kbps);
-        ui.label(RichText::new(format!("编码 {ms} ms{capture} · {fps} · {kbps}")).weak().small());
+        let skipped = match state.encode_skipped {
+            Some(n) if n > 0 => format!(" · 跳过 {n}/s"),
+            _ => String::new(),
+        };
+        ui.label(
+            RichText::new(format!("编码 {ms} ms{capture} · {fps} · {kbps}{skipped}"))
+                .weak()
+                .small(),
+        );
     }
 }
 

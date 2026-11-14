@@ -30,6 +30,15 @@
 //! - 代价是静止画面会被上层重复送进编码器，是否跳过重复帧由调用方按自身节奏
 //!   决定。返回的帧不携带序号，调用方如需去重可自行比较（或改用带事件回调的
 //!   采集循环，本同步契约刻意不做）。
+//! - GPU 路径多一个**廉价的第一道闸门**：
+//!   [`CaptureSource::capture_texture_with_change`] 的 `bool` 直接来自
+//!   「本次是否真的拿到了新帧」。它能过滤掉两种真实情况——WGC 的
+//!   `TryGetNextFrame` 超时（DWM 确实没有新的合成帧）与 DXGI 的
+//!   `AcquireNextFrame` 超时。**不要**把它当成像素级变化检测：实测 WGC 在基本
+//!   静止的桌面上仍会按合成器/刷新节奏持续产帧（120 次采集里 119 次在 0.2 ms
+//!   内返回新帧），所以它**不能**让静止桌面停止编码；像素级去重需要后续的
+//!   GPU 下采样 + 小纹理回读比较。也**不要**用 CPU 读回比较代替这个信号——
+//!   那会把零拷贝的收益全部吃掉。
 //!
 //! `capture()` 是同步阻塞调用（内部用短睡眠轮询），不要直接放在 Tokio 运行时的
 //! 核心线程上；`client-gui` 的应用层采集循环应把它放进 `spawn_blocking`。
@@ -454,6 +463,30 @@ pub trait CaptureSource: Send {
         Err(WinVideoError::Capture(
             "该采集后端不支持 GPU 纹理".to_owned(),
         ))
+    }
+
+    /// 采集一帧 GPU 纹理，并报告**合成器自上次采集以来是否有更新**。
+    ///
+    /// 返回 `Ok((texture, false))` 表示超时内没有新帧、`texture` 是上一次的画面
+    /// （调用方可以据此跳过编码）；`true` 表示这是刚产生的新帧。
+    ///
+    /// 这是**合成器层面**的「有没有新帧」，不是像素比较，因此只是一道**廉价的
+    /// 第一道闸门**：它能过滤掉 WGC `TryGetNextFrame` 超时（DWM 确实没有新的
+    /// 合成帧）与 DXGI `AcquireNextFrame` 超时这两种情况；**不能**据此宣称静止
+    /// 桌面就不再编码——实测 WGC 在基本静止的桌面上仍按合成器/刷新节奏持续
+    /// 产帧（120 次采集里 119 次在 0.2 ms 内拿到新帧）。像素级变化检测是后续
+    /// 工作（GPU 下采样 + 小纹理回读比较）。**不要**用 CPU 读回比较代替它——
+    /// 把纹理拷回内存既慢又破坏零拷贝。
+    ///
+    /// 默认实现保留旧语义（永远认为有更新），因此只实现 [`Self::capture_texture`]
+    /// 的后端行为不变。
+    ///
+    /// # Errors
+    /// 与 [`Self::capture_texture`] 相同。
+    fn capture_texture_with_change(
+        &mut self,
+    ) -> Result<(CapturedTexture, bool), WinVideoError> {
+        self.capture_texture().map(|texture| (texture, true))
     }
 
     /// 采集源使用的 D3D11 设备（编解码需要与采集共用同一设备）。

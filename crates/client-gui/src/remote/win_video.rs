@@ -235,6 +235,8 @@ impl WinVideoScreen {
             height: dst_height,
             rgba,
             gpu: None,
+            // 这是 WGC 的 CPU 读回路径，没有便宜的变化信号，交由引擎按 memcmp 去重。
+            changed: true,
         })
     }
 
@@ -243,10 +245,14 @@ impl WinVideoScreen {
     /// 逻辑尺寸与 CPU 路径一致：先按 [`MAX_ENCODE_WIDTH`] 封顶，`rates.scale` 稍后
     /// 由引擎施加。任何一次失败都会**永久禁用**本进程的 GPU 路径并回退到
     /// [`Self::capture`]（CPU），而不是每帧重试。
+    ///
+    /// 同时把采集层的「是否真的拿到了新帧」信号填进 [`RawFrame::changed`]，引擎据
+    /// 此跳过 WGC/DXGI 超时的那一拍（CPU 路径仍靠 memcmp）。注意这**不是**像素级
+    /// 去重：WGC 在基本静止的桌面上仍按合成器节奏持续产帧。
     fn capture_gpu_frame(&self, display_id: u32) -> RemoteResult<RawFrame> {
-        let captured = match self.with_source(display_id, |source| {
+        let (captured, changed) = match self.with_source(display_id, |source| {
             source
-                .capture_texture()
+                .capture_texture_with_change()
                 .map_err(|err| RemoteError::Platform(format!("GPU 采集失败: {err}")))
         }) {
             Ok(captured) => captured,
@@ -271,6 +277,7 @@ impl WinVideoScreen {
                 source_width,
                 source_height,
             })),
+            changed,
         })
     }
 }

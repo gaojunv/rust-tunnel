@@ -8,6 +8,9 @@
 //! - `AcquireNextFrame` 超时（`DXGI_ERROR_WAIT_TIMEOUT`）不是致命错误：首帧最多
 //!   等 [`FIRST_FRAME_TIMEOUT`]，之后每次最多等 [`NEXT_FRAME_POLL_TIMEOUT`]，超时
 //!   就复用上一帧；只有在**从未采到过帧**时才报错。
+//! - [`CaptureSource::capture_texture_with_change`] 把「超时/只有指针更新」如实报成
+//!   `false`：这些是**合成器层面**没有新帧，不是像素比较。它只是廉价的第一道闸门
+//!   （过滤 `AcquireNextFrame` 超时），**不**等于像素级去重——有帧仍可能像素不变。
 //! - `DXGI_ERROR_ACCESS_LOST`（切换分辨率/HDR/安全桌面、显卡驱动重置等）会触发
 //!   一次重建：重新枚举该 HMONITOR 的输出并 `DuplicateOutput`，然后重试一次；
 //!   重试仍失败才把错误交给调用方。
@@ -82,16 +85,28 @@ impl CaptureSource for DxgiSource {
     }
 
     fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
+        self.capture_texture_with_change().map(|(texture, _)| texture)
+    }
+
+    fn capture_texture_with_change(
+        &mut self,
+    ) -> Result<(CapturedTexture, bool), WinVideoError> {
         match self.acquire()? {
             Acquired::Resource(resource) => self.finish_texture(resource.as_ref()),
-            Acquired::Timeout => self.reuse_texture("超时内没有新帧"),
+            Acquired::Timeout => self
+                .reuse_texture("超时内没有新帧")
+                .map(|texture| (texture, false)),
             Acquired::AccessLost => {
                 tracing::warn!("DXGI 桌面复制会话失效（ACCESS_LOST），尝试重建");
                 self.rebuild()?;
                 match self.acquire()? {
                     Acquired::Resource(resource) => self.finish_texture(resource.as_ref()),
-                    Acquired::Timeout => self.reuse_texture("重建后超时内没有新帧"),
-                    Acquired::AccessLost => self.reuse_texture("重建后再次 ACCESS_LOST"),
+                    Acquired::Timeout => self
+                        .reuse_texture("重建后超时内没有新帧")
+                        .map(|texture| (texture, false)),
+                    Acquired::AccessLost => self
+                        .reuse_texture("重建后再次 ACCESS_LOST")
+                        .map(|texture| (texture, false)),
                 }
             }
         }
@@ -178,7 +193,7 @@ impl DxgiSource {
     fn finish_texture(
         &mut self,
         resource: Option<&IDXGIResource>,
-    ) -> Result<CapturedTexture, WinVideoError> {
+    ) -> Result<(CapturedTexture, bool), WinVideoError> {
         let copied = match resource {
             Some(resource) => self.copy_resource(resource).map(Some),
             None => Ok(None),
@@ -192,9 +207,13 @@ impl DxgiSource {
         match texture {
             Some(texture) => {
                 self.last_texture = Some(texture.clone());
-                Ok(texture)
+                // `AcquireNextFrame` 成功且真的拷了桌面资源 → 这是一帧新内容。
+                Ok((texture, true))
             }
-            None => self.reuse_texture("本次只有指针更新，没有新的桌面图像"),
+            // 只有指针更新、没有新的桌面图像：复用上一张，且告诉上层别编码。
+            None => self
+                .reuse_texture("本次只有指针更新，没有新的桌面图像")
+                .map(|texture| (texture, false)),
         }
     }
 

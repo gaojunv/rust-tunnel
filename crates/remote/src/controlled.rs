@@ -440,12 +440,12 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { generation, .. }) if generation != capture_generation => {
                         debug!(generation, "丢弃过期的采集结果");
                     }
-                    Some(CaptureOutcome { frame, capture_ms, .. }) => {
+                    Some(CaptureOutcome { frame, capture_us, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
                         if let Some(frame) = frame {
-                            debug!(capture_ms, "采集一帧");
-                            let job = EncodeJob { display: display_id, rates: encode, force_keyframe, capture_ms, frame };
+                            debug!(capture_us, "采集一帧");
+                            let job = EncodeJob { display: display_id, rates: encode, force_keyframe, capture_us, frame };
                             // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
                             // 帧（等价降帧率）。关键帧请求保留到真正投递成功的那一次。
                             match encode_tx.try_send(job) {
@@ -810,8 +810,10 @@ struct CaptureOutcome {
     generation: u64,
     /// 采集到的原始帧；采集失败时为 `None`。
     frame: Option<RawFrame>,
-    /// 本次采集耗时（毫秒；采集失败时也记实际耗时）。**测量**用，不参与控制决策。
-    capture_ms: u64,
+    /// 本次采集耗时（微秒；采集失败时也记实际耗时）。**测量**用，不参与控制决策。
+    ///
+    /// 用微秒而不是毫秒：GPU 采集常在 1 ms 以内，毫秒取整会恒为 0（现场看到的就是这个）。
+    capture_us: u64,
 }
 
 /// 交给编码任务的一帧。
@@ -826,8 +828,8 @@ struct EncodeJob {
     rates: EncodeRates,
     /// 本帧是否强制关键帧。
     force_keyframe: bool,
-    /// 本帧的采集耗时（毫秒），只进统计、不参与控制决策。
-    capture_ms: u64,
+    /// 本帧的采集耗时（微秒），只进统计、不参与控制决策。
+    capture_us: u64,
     /// 原始帧。
     frame: RawFrame,
 }
@@ -860,12 +862,12 @@ fn run_capture(
             None
         }
     };
-    let capture_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let capture_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     // 接收端随会话循环存活；会话已结束时发送失败是正常的，忽略。
     let _ = tx.blocking_send(CaptureOutcome {
         generation,
         frame,
-        capture_ms,
+        capture_us,
     });
 }
 
@@ -881,8 +883,10 @@ struct EncodeStatsWindow {
     bytes: u64,
     /// 本窗口编码耗时合计（毫秒）。
     encode_ms: u64,
-    /// 本窗口采集耗时合计（毫秒，与被编码的帧一起计）。
-    capture_ms: u64,
+    /// 本窗口采集耗时合计（微秒，与被编码的帧一起计）。
+    capture_us: u64,
+    /// 本窗口因「无变化」被跳过的帧数（不含背压/去重之外的其它丢弃）。
+    skipped: u32,
 }
 
 impl EncodeStatsWindow {
@@ -892,16 +896,22 @@ impl EncodeStatsWindow {
             frames: 0,
             bytes: 0,
             encode_ms: 0,
-            capture_ms: 0,
+            capture_us: 0,
+            skipped: 0,
         }
     }
 
     /// 记一帧的产出与耗时（采集 + 编码）。
-    fn record(&mut self, bytes: usize, encode_ms: u64, capture_ms: u64) {
+    fn record(&mut self, bytes: usize, encode_ms: u64, capture_us: u64) {
         self.frames = self.frames.saturating_add(1);
         self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         self.encode_ms = self.encode_ms.saturating_add(encode_ms);
-        self.capture_ms = self.capture_ms.saturating_add(capture_ms);
+        self.capture_us = self.capture_us.saturating_add(capture_us);
+    }
+
+    /// 记一帧因「采集层判定无变化」而被跳过。
+    fn record_skip(&mut self) {
+        self.skipped = self.skipped.saturating_add(1);
     }
 
     /// 到点则上报一次并重置窗口。`bitrate_kbps` 是**当前生效的目标码率**（闭环值，非实测出码率）。
@@ -922,22 +932,24 @@ impl EncodeStatsWindow {
         } else {
             u32::try_from(self.encode_ms / u64::from(self.frames)).unwrap_or(u32::MAX)
         };
-        let capture_ms = if self.frames == 0 {
+        let capture_us = if self.frames == 0 {
             0
         } else {
-            u32::try_from(self.capture_ms / u64::from(self.frames)).unwrap_or(u32::MAX)
+            u32::try_from(self.capture_us / u64::from(self.frames)).unwrap_or(u32::MAX)
         };
         stats.report(SessionStats::Encode {
             encode_ms,
-            capture_ms,
+            capture_us,
             fps,
             bitrate_kbps,
+            skipped: self.skipped,
         });
         self.start = Instant::now();
         self.frames = 0;
         self.bytes = 0;
         self.encode_ms = 0;
-        self.capture_ms = 0;
+        self.capture_us = 0;
+        self.skipped = 0;
     }
 }
 
@@ -945,8 +957,11 @@ impl EncodeStatsWindow {
 ///
 /// # 丢弃策略（**改动前先读模块文档**）
 ///
-/// - **静止画面完全不喂编码器**：与上一帧原始 RGBA 逐字节相同（且不强制关键帧）时直接跳过——
-///   不转换、不编码、不发送。这是「带宽趋零」的唯一来源。
+/// - **静止画面完全不喂编码器**：CPU 路径与上一帧原始 RGBA 逐字节相同、GPU 路径由采集层
+///   报告「确实没有新合成帧」（[`RawFrame::changed`] 为 `false`）时直接跳过——不转换、不编码、
+///   不发送。GPU 这条只是**廉价的第一道闸门**：它能挡住 WGC/DXGI 的超时拍，但 WGC 在基本
+///   静止的桌面上仍会按合成器节奏持续产帧，故 GPU 路径**不能**宣称静止桌面带宽趋零；真正的
+///   像素级去重是后续工作（GPU 下采样 + 小纹理回读比较）。
 /// - **输出队列满 → 在编码之前跳过这一帧**（等价降帧率）。**绝不**先编码再丢弃：时域编码的
 ///   参考链是串起来的，丢掉一个已编码的 P 帧会让后续引用它的帧在解码端永远解不出来。
 ///
@@ -992,7 +1007,7 @@ async fn encode_loop(
             display,
             rates,
             force_keyframe,
-            capture_ms,
+            capture_us,
             frame,
         } = job;
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
@@ -1000,6 +1015,15 @@ async fn encode_loop(
 
         // GPU 帧没有 CPU 像素：不能做 memcmp 去重（也绝不能拿空 `rgba` 去比较）。
         let is_gpu = frame.gpu.is_some();
+        // 变化判据分两条路：
+        // - GPU：用采集层的**合成器**「有新帧」信号（`RawFrame::changed`），不做 CPU 读回比较。
+        //   它只能过滤采集超时拍，**不是**像素级去重（WGC 静止桌面仍按刷新节奏出帧）。
+        // - CPU：沿用逐字节 memcmp（与上一帧相同即视为静止）。
+        let unchanged = if is_gpu {
+            !frame.changed
+        } else {
+            prev_rgba.as_deref() == Some(frame.rgba.as_slice())
+        };
         let (width, height) = encode_dimensions(frame.width, frame.height, rates.scale, MAX_ENCODE_WIDTH);
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
@@ -1023,10 +1047,10 @@ async fn encode_loop(
         let force = force_keyframe || geometry_changed || pending_keyframe;
 
         // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
-        // **GPU 帧跳过这条**：像素不在 CPU 上，没有可比较的 `rgba`；留下 `rgba` 为空时
-        // 反而会把「所有 GPU 帧都一样」误判成静止。GPU 路径的静止帧由编码器自身的
-        // 码率控制消化（硬件编码器对静止画面输出极小），不做额外去重。
-        if !force && !is_gpu && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
+        // `force`（首帧/切显示器/切档位/RequestKeyframe/几何变化）为真时必须照常编码，
+        // 否则控制器 `NO_FRAME_TIMEOUT` 要的 IDR 会被这里吞掉。
+        if !force && unchanged {
+            window.record_skip();
             continue;
         }
         // 背压出口在**编码之前**：出站队列满就跳过这一帧。绝不能改成「编码后丢弃」。
@@ -1081,7 +1105,7 @@ async fn encode_loop(
                     continue;
                 }
                 seq = seq.wrapping_add(1);
-                window.record(packet.data.len(), encode_ms, capture_ms);
+                window.record(packet.data.len(), encode_ms, capture_us);
                 let mut flags = 0u8;
                 if geometry_changed {
                     flags |= VIDEO_FLAG_CONFIG;
@@ -1272,8 +1296,8 @@ mod tests {
     use crate::crypto::{derive_session_keys, Cipher};
     use crate::error::RemoteResult;
     use crate::screen::{
-        Clipboard, DisplayInfo, EncodeOptions, EncodeRates, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame,
-        ScreenSource,
+        Clipboard, DisplayInfo, EncodeOptions, EncodeRates, GpuFrame, InputEvent, InputSink,
+        KeyEvent, MouseButton, RawFrame, ScreenSource,
     };
     use crate::session::{plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage};
     use crate::transfer::{TransferEvent, TransferHub};
@@ -1303,6 +1327,7 @@ mod tests {
             height: h,
             rgba: [40u8, 80, 120, 255].repeat((w * h) as usize),
             gpu: None,
+            changed: true,
         }
     }
 
@@ -1362,6 +1387,7 @@ mod tests {
                 height: h,
                 rgba,
                 gpu: None,
+                changed: true,
             })
         }
     }
@@ -1793,6 +1819,7 @@ mod tests {
             height: h,
             rgba,
             gpu: None,
+            changed: true,
         }
     }
 
@@ -1863,7 +1890,7 @@ mod tests {
                 display: 0,
                 rates: hi,
                 force_keyframe: true,
-                capture_ms: 0,
+                capture_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -1877,7 +1904,7 @@ mod tests {
                 display: 0,
                 rates: lo,
                 force_keyframe: false,
-                capture_ms: 0,
+                capture_us: 0,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -1925,7 +1952,7 @@ mod tests {
                 display: 0,
                 rates: hi,
                 force_keyframe: true,
-                capture_ms: 0,
+                capture_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -1938,7 +1965,7 @@ mod tests {
                 display: 0,
                 rates: half,
                 force_keyframe: false,
-                capture_ms: 0,
+                capture_us: 0,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -2041,7 +2068,7 @@ mod tests {
                 display: 0,
                 rates: EncodeRates::ceiling(EncodeOptions::default()),
                 force_keyframe: true,
-                capture_ms: 0,
+                capture_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -2099,7 +2126,7 @@ mod tests {
             display: 0,
             rates: opts,
             force_keyframe: force,
-            capture_ms: 0,
+            capture_us: 0,
             frame,
         };
         let placeholder = || WriterMsg::Frame(SessionFrame::control(SessionMessage::Heartbeat));
@@ -2137,6 +2164,93 @@ mod tests {
         );
 
         // 关掉任务队列让编码任务自然退出（不必等满 `WAIT`）。
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
+    /// GPU 帧的假平台载体（测试只关心「是不是 GPU 帧」，不关心纹理）。
+    struct DummyGpuFrame;
+
+    impl GpuFrame for DummyGpuFrame {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// **变化信号不变量**：GPU 帧在采集层报告「无变化」且不强制关键帧时必须跳过，
+    /// 不能让 GPU 路径退回到「每拍都编码发送」；`force=true` 时仍必须产出 IDR。
+    ///
+    /// 这是现场「静态桌面带宽是两个数量级、帧率却不到 5」的直接回归锁：没有它，
+    /// `frame.changed` 会被静默忽略，GPU 路径又回到每拍空编码。
+    #[tokio::test]
+    async fn unchanged_gpu_frame_is_skipped_unless_forced() {
+        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+            CodecId::H264,
+            Arc::new(FakeH264EncoderFactory),
+        ));
+        let rates = EncodeRates::ceiling(EncodeOptions::default());
+        let gpu_job = |changed: bool, force: bool| EncodeJob {
+            display: 0,
+            rates,
+            force_keyframe: force,
+            capture_us: 0,
+            frame: RawFrame {
+                display: 0,
+                width: 64,
+                height: 48,
+                rgba: Vec::new(),
+                gpu: Some(Arc::new(DummyGpuFrame)),
+                changed,
+            },
+        };
+
+        // 首帧：强制关键帧，先拿到 `ScreenConfig` 再拿到画面包。
+        job_tx.send(gpu_job(true, true)).await.expect("投递首帧");
+        assert!(
+            matches!(
+                out_rx.recv().await,
+                Some(WriterMsg::Frame(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. }))
+            ),
+            "首帧前应先下发 ScreenConfig"
+        );
+        assert!(is_keyframe(&out_rx.recv().await.expect("应收到首帧")));
+
+        // 采集层说「没有新帧」且不强制：不转换、不编码、不发送。
+        job_tx
+            .send(gpu_job(false, false))
+            .await
+            .expect("投递静止 GPU 帧");
+        wait_for(|| job_tx.capacity() == 4).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "无变化的 GPU 帧不应产出视频包（否则 GPU 路径又变成每拍空编码）"
+        );
+
+        // 有新帧：正常产出 P 帧。
+        job_tx
+            .send(gpu_job(true, false))
+            .await
+            .expect("投递变化 GPU 帧");
+        let (flags, ..) = next_video(&mut out_rx).await;
+        assert_eq!(flags & VIDEO_FLAG_KEYFRAME, 0, "有变化但未强制时应是 P 帧");
+
+        // 无变化但强制（首帧/RequestKeyframe）：必须产出 IDR，不能被去重吞掉。
+        job_tx
+            .send(gpu_job(false, true))
+            .await
+            .expect("投递强制 GPU 帧");
+        assert!(
+            is_keyframe(&out_rx.recv().await.expect("应收到强制帧")),
+            "force=true 时即使无变化也必须产出 IDR"
+        );
+
         drop(job_tx);
         let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
     }

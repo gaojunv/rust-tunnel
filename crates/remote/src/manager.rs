@@ -159,8 +159,12 @@ pub struct RemoteUiState {
     /// 被控端最近上报的**编码侧**读数（见 [`SessionStats::Encode`]）：平均单帧编码耗时（毫秒）。
     /// 仅被控端填；控制器侧恒为 `None`。
     pub encode_ms: Option<u32>,
-    /// 被控端最近上报的平均单帧**采集**耗时（毫秒）。仅被控端填。
-    pub encode_capture_ms: Option<u32>,
+    /// 被控端最近上报的平均单帧**采集**耗时（微秒）。仅被控端填。
+    ///
+    /// 微秒而非毫秒：GPU 采集常在 1 ms 以内，毫秒取整会恒为 0。
+    pub encode_capture_us: Option<u32>,
+    /// 被控端最近上报的、每秒因「无变化」跳过的帧数。仅被控端填。
+    pub encode_skipped: Option<u32>,
     /// 被控端最近上报的**实测编码帧率**（帧/秒）。仅被控端填。
     pub encode_fps: Option<u32>,
     /// 被控端最近上报的**当前生效码率**（kbps，闭环在上限之下浮动后的值）。仅被控端填。
@@ -169,6 +173,10 @@ pub struct RemoteUiState {
     pub decode_ms: Option<u32>,
     /// 控制器最近上报的**接收码率**（kbps）。仅控制器填。
     pub recv_kbps: Option<u32>,
+    /// 控制器最近一秒收到的视频包数。仅控制器填。
+    pub decode_packets: Option<u32>,
+    /// 控制器最近一秒因解码队列满/等待 IDR 而丢弃的视频包数。仅控制器填。
+    pub decode_dropped: Option<u32>,
     /// 本次会话的数据面路径（P2P 直连 / 中继）；会话未建立/已结束时为 `None`。
     pub transport: Option<TransportPath>,
     /// 最近一次**由会话循环观测到**的会话结束信息（session_id + 结束原因），供 UI 提示与断线
@@ -207,11 +215,14 @@ impl RemoteUiState {
         self.latency_ms = None;
         self.transport = None;
         self.encode_ms = None;
-        self.encode_capture_ms = None;
+        self.encode_capture_us = None;
+        self.encode_skipped = None;
         self.encode_fps = None;
         self.encode_kbps = None;
         self.decode_ms = None;
         self.recv_kbps = None;
+        self.decode_packets = None;
+        self.decode_dropped = None;
     }
 }
 
@@ -1886,22 +1897,31 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
         }
         SessionStats::Encode {
             encode_ms,
-            capture_ms,
+            capture_us,
             fps,
             bitrate_kbps,
+            skipped,
         } => {
             // 被控端编码侧读数：直接写入，不做平滑（数值本身已是 1s 窗口的平均）。
             mgr.update_ui(|s| {
                 s.encode_ms = Some(encode_ms);
-                s.encode_capture_ms = Some(capture_ms);
+                s.encode_capture_us = Some(capture_us);
+                s.encode_skipped = Some(skipped);
                 s.encode_fps = Some(fps);
                 s.encode_kbps = Some(bitrate_kbps);
             });
         }
-        SessionStats::Decode { decode_ms, recv_kbps } => {
+        SessionStats::Decode {
+            decode_ms,
+            recv_kbps,
+            packets,
+            dropped,
+        } => {
             mgr.update_ui(|s| {
                 s.decode_ms = Some(decode_ms);
                 s.recv_kbps = Some(recv_kbps);
+                s.decode_packets = Some(packets);
+                s.decode_dropped = Some(dropped);
             });
         }
     }
@@ -2810,11 +2830,14 @@ mod tests {
                 s.transport = Some(TransportPath::Relay);
                 // 阶段 3 的编解码读数同样是**会话级**的，必须一起清（曾经漏掉，旧值跨会话残留）。
                 s.encode_ms = Some(8);
-                s.encode_capture_ms = Some(5);
+                s.encode_capture_us = Some(5000);
+                s.encode_skipped = Some(7);
                 s.encode_fps = Some(12);
                 s.encode_kbps = Some(4000);
                 s.decode_ms = Some(11);
                 s.recv_kbps = Some(3800);
+                s.decode_packets = Some(400);
+                s.decode_dropped = Some(3);
             });
 
             mgr.finish_session("s1", input);
@@ -2824,11 +2847,14 @@ mod tests {
             assert_eq!(snap.latency_ms, None, "延迟读数应清零");
             assert_eq!(snap.transport, None, "路径应清零");
             assert_eq!(snap.encode_ms, None, "编码耗时读数应清零");
-            assert_eq!(snap.encode_capture_ms, None, "采集耗时读数应清零");
+            assert_eq!(snap.encode_capture_us, None, "采集耗时读数应清零");
+            assert_eq!(snap.encode_skipped, None, "跳过帧数读数应清零");
             assert_eq!(snap.encode_fps, None, "编码帧率读数应清零");
             assert_eq!(snap.encode_kbps, None, "编码码率读数应清零");
             assert_eq!(snap.decode_ms, None, "解码耗时读数应清零");
             assert_eq!(snap.recv_kbps, None, "收码率读数应清零");
+            assert_eq!(snap.decode_packets, None, "收包数读数应清零");
+            assert_eq!(snap.decode_dropped, None, "丢包数读数应清零");
             let (sid, end) = snap.session_end.expect("应写入 session_end");
             assert_eq!(sid, "s1");
             assert_eq!(
