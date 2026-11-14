@@ -74,6 +74,13 @@ pub struct RawFrame {
     pub rgba: Vec<u8>,
     /// GPU 帧（不落 CPU）；`Some` 时 `rgba` 为空。
     pub gpu: Option<Arc<dyn GpuFrame>>,
+    /// 采集层是否判定画面**可能**有变化（默认 `true`）。
+    ///
+    /// GPU 路径用采集层的「有新帧」信号填这里：`false` = 本拍确实没有新合成帧，
+    /// 编码循环可以跳过它。**注意这不是像素级去重**——WGC 在基本静止的桌面上仍按
+    /// 合成器节奏持续产帧，`true` 只代表「有帧」，不代表「像素变了」。CPU 路径恒为
+    /// `true`，仍靠逐字节 memcmp 去重。
+    pub changed: bool,
 }
 
 impl std::fmt::Debug for RawFrame {
@@ -84,6 +91,7 @@ impl std::fmt::Debug for RawFrame {
             .field("height", &self.height)
             .field("rgba_len", &self.rgba.len())
             .field("gpu", &self.gpu.is_some())
+            .field("changed", &self.changed)
             .finish()
     }
 }
@@ -537,6 +545,7 @@ mod tests {
             height: 1080,
             rgba: Vec::new(),
             gpu: Some(std::sync::Arc::new(DummyGpuFrame)),
+            changed: true,
         };
         assert!(gpu.validate().is_ok(), "GPU 帧不应要求 CPU 像素数据");
         let zero = RawFrame {
@@ -552,6 +561,7 @@ mod tests {
             // 2×2 应为 16 字节。
             rgba: vec![0; 4],
             gpu: None,
+            changed: true,
         };
         assert!(cpu.validate().is_err(), "CPU 帧仍应校验 RGBA 长度");
     }

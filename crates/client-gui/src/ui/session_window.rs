@@ -663,6 +663,14 @@ fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo
                     ui.label(RichText::new("收码率").weak().small());
                     ui.label(state.recv_kbps.map_or("—".to_owned(), format_kbps));
                     ui.end_row();
+                    // 收包/丢包：用来区分「对端没出帧」与「本端解码队列在丢帧」——后者会触发
+                    // 关键帧请求，表现为画面卡顿而码率不低。
+                    ui.label(RichText::new("收包").weak().small());
+                    ui.label(state.decode_packets.map_or("—".to_owned(), |n| format!("{n}/s")));
+                    ui.end_row();
+                    ui.label(RichText::new("丢包").weak().small());
+                    ui.label(state.decode_dropped.map_or("—".to_owned(), |n| format!("{n}/s")));
+                    ui.end_row();
                     // 输入速率：本端**捕获并注入**的事件数（不是远端是否响应）。用来一眼分辨
                     // 「UI 压根没产生事件」与「事件已注入但远端没反应」。
                     ui.label(RichText::new("输入").weak().small());

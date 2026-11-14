@@ -19,7 +19,7 @@ use crate::transport::BoxDuplex;
 use crate::video::MAX_FRAME_DIM;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -37,10 +37,22 @@ const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 待解码载荷队列深度。
 ///
-/// 解码在独立任务里串行进行（1080p 单帧约十几毫秒）。队列太深会在解码跟不上时堆积内存，太浅
-/// 则正常抖动就丢帧；8 兼作**抖动缓冲**，把最坏内存压在「8 × 单帧载荷」量级。队列满即丢帧——
-/// 丢弃会打断 VP9 的参考链，故解码任务用**序号断层**检测到它并请求关键帧（见 [`decode_loop`]）。
-const DECODE_QUEUE: usize = 8;
+/// 解码在独立任务里串行进行（1080p 单帧约十几毫秒）。队列兼作**抖动缓冲**：16 深可以在
+/// 一次 GC/调度抖动或 30–60 fps 的短突发中不丢包，同时把最坏内存压在「16 × 单帧载荷」
+/// 量级——H.264 1080p 单帧载荷通常几十到几百 KiB，最坏（接近无损的 VP9 4:4:4 关键帧）
+/// 约数 MiB，故上限大致在几十 MiB 以内；超过这个深度只是在解码跟不上时多堆积过期画面。
+///
+/// 队列满即丢帧——丢弃会打断 VP9 的参考链，故解码任务用**序号断层**检测到它并请求关键帧
+/// （见 [`decode_loop`]）。队列满时还会推进 `drop_epoch`，让队列里的陈旧 P 帧整体作废，
+/// 解码端直接跳到最新包。
+const DECODE_QUEUE: usize = 16;
+
+/// 关键帧请求的最小间隔。
+///
+/// 序号断层/队列溢出/解码失败都可能每帧触发一次「请补 IDR」。不限频就会形成 IDR 风暴：
+/// 每个 IDR 都是带宽尖峰，反而让解码队列更满、继续丢包。400 ms 内最多一次，既压住风暴，
+/// 又保证等待中的请求会在该窗口内被重试（不会永久卡在等 IDR）。
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
 
 /// QoS 反馈间隔（秒级）。每秒向被控端发一条 `QosFeedback`（含 RTT / 收码率 / 解码耗时 / 积压），
 /// 驱动被控端的 AIMD 闭环（见 [`crate::qos`]）。同时按同一节拍把解码侧读数经进程内
@@ -65,6 +77,8 @@ enum DecodeJob {
         display: u32,
         /// 帧序号（被控端递增；用于检测「有包被丢弃」的断层）。
         seq: u64,
+        /// 入队时的 `drop_epoch`。小于当前 epoch 的包说明队列曾溢出，已被更新的包取代。
+        epoch: u32,
         /// 编解码器（应与 `SelectCodec` 一致；缺失时作为兜底）。
         codec: CodecId,
         /// 标志位（[`VIDEO_FLAG_KEYFRAME`] 等）。
@@ -76,6 +90,29 @@ enum DecodeJob {
         /// 帧数据。
         data: Vec<u8>,
     },
+}
+
+/// 主循环与解码任务共享的原子读数/状态。
+///
+/// 都是 `Relaxed` 足够的观测值：写的是每帧热路径，读的是每秒一次或入队前的一次判断，
+/// 不承担跨线程的同步顺序语义。打包成一个结构是为了避免 [`decode_loop`] 的参数爆炸。
+struct DecodeShared {
+    /// 最近一帧的解码耗时（毫秒）。
+    decode_ms: Arc<AtomicU32>,
+    /// 解码队列溢出代次（主循环 `fetch_add`，解码任务比较）。
+    drop_epoch: Arc<AtomicU32>,
+    /// 解码任务是否正在等 IDR（主循环据此在入队前丢 P 帧）。
+    awaiting_keyframe: Arc<AtomicBool>,
+}
+
+impl DecodeShared {
+    fn new() -> Self {
+        Self {
+            decode_ms: Arc::new(AtomicU32::new(0)),
+            drop_epoch: Arc::new(AtomicU32::new(0)),
+            awaiting_keyframe: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// UI 投递给控制器会话的一条命令。
@@ -233,15 +270,19 @@ pub async fn run_controller(
     // 解码任务 → 循环的关键帧请求通道（无界：只承载「重置后请对端补一个 IDR」这种低频控制）。
     // 循环自己保留 `keyframe_tx`，故 `recv()` 永不返回 `None`（否则会 100% 空转）。
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<u32>();
-    // 最近一帧的解码耗时（毫秒），由解码任务写、主循环读（填进 `QosFeedback`）。原子而非锁：
-    // 写的是热路径（每帧一次），读的是每秒一次，两者几乎不重叠，`Relaxed` 足够。
-    let decode_ms_shared = Arc::new(AtomicU32::new(0));
+    // 主循环与解码任务共享的原子读数/状态（见 [`DecodeShared`]）：
+    // - 解码耗时：由解码任务写、主循环读（填进 `QosFeedback`）；
+    // - `drop_epoch`：队列溢出时推进，解码任务据此整体作废陈旧 P 帧；
+    // - `awaiting_keyframe`：解码任务在等 IDR 时置位，主循环据此**在入队前**直接丢弃
+    //   P 帧——等待期间队列里只留关键帧，IDR 一到就能立刻解码，不会被一堆过期 P 帧
+    //   挤掉（打破「丢弃→请求 IDR→IDR 又被丢」的自锁）。
+    let decode_shared = Arc::new(DecodeShared::new());
     let decode_task = tokio::spawn(decode_loop(
         decode_rx,
         keyframe_tx.clone(),
         std::sync::Arc::clone(&sink),
         cancel.clone(),
-        Arc::clone(&decode_ms_shared),
+        Arc::clone(&decode_shared),
         config.h264_decoder_factory.clone(),
     ));
 
@@ -266,6 +307,9 @@ pub async fn run_controller(
     let mut last_rtt_ms: Option<u32> = None;
     // QoS 窗口内收到的画面字节数（算收码率）。
     let mut recv_bytes: u64 = 0;
+    // 本窗口收到的视频包数 / 丢弃数（含等待 IDR 时主动丢掉的 P 帧与队列满）。
+    let mut window_packets: u32 = 0;
+    let mut window_dropped: u32 = 0;
     let mut qos_window_start = Instant::now();
     // 最近一次收到画面帧的时刻（「长时间无帧」看门狗用）。
     let mut last_frame_at = Instant::now();
@@ -317,7 +361,7 @@ pub async fn run_controller(
                     reason = "收码率为有界非负值，取整后落在 u32 内"
                 )]
                 let recv_kbps = (window_bytes * 8.0 / 1000.0 / elapsed).round() as u32;
-                let decode_ms = decode_ms_shared.load(Ordering::Relaxed);
+                let decode_ms = decode_shared.decode_ms.load(Ordering::Relaxed);
                 let backlog = u32::try_from(DECODE_QUEUE.saturating_sub(decode_tx.capacity())).unwrap_or(u32::MAX);
                 let feedback = SessionMessage::QosFeedback {
                     rtt_ms: last_rtt_ms.unwrap_or(0),
@@ -328,9 +372,17 @@ pub async fn run_controller(
                 if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(feedback)).await {
                     break Err(err);
                 }
-                // 同节拍把解码侧读数经进程内通道送到 UI（不落线）。
-                config.stats.report(SessionStats::Decode { decode_ms, recv_kbps });
+                // 同节拍把解码侧读数经进程内通道送到 UI（不落线）。`QosFeedback` 的字段
+                // **不变**：收包/丢包只是本地观测，不进协议。
+                config.stats.report(SessionStats::Decode {
+                    decode_ms,
+                    recv_kbps,
+                    packets: window_packets,
+                    dropped: window_dropped,
+                });
                 recv_bytes = 0;
+                window_packets = 0;
+                window_dropped = 0;
                 qos_window_start = Instant::now();
 
                 // 「长时间无帧」看门狗（阶段 3）：对端采集/编码挂住、或中继半死时，画面会永久冻结
@@ -477,22 +529,48 @@ pub async fn run_controller(
                             // 只投递原始载荷；解码在独立任务里做（见 `decode_loop`）。
                             // 同时记收码率窗口与「最近收帧时刻」（QoS 反馈 / 无帧看门狗用）。
                             recv_bytes = recv_bytes.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
-                            last_frame_at = Instant::now();
                             // 帧到了：看门狗若是「首次请求」路径，计数回到 0，下次仍只记 `debug`。
+                            // 注意 `last_frame_at` 衡量的是「收到包」，不是「解出帧」，故下面
+                            // 主动丢弃 P 帧时也要更新它。
                             stall_requests = 0;
+                            last_frame_at = Instant::now();
+                            window_packets = window_packets.saturating_add(1);
                             if selected_codec.is_some_and(|selected| selected != codec) {
                                 debug!(?codec, ?selected_codec, "视频包 codec 与已选 codec 不一致");
                             }
-                            if !enqueue_decode(&decode_tx, DecodeJob::Packet {
+                            // 第一道闸门（5.6）：解码任务在等 IDR 时，P 帧一律不入队。
+                            // 否则队列会被过期 P 帧塞满，IDR 反而被挤掉，形成「丢弃→请求 IDR
+                            // →IDR 又被丢」的自锁。关键帧必须放行。
+                            if decode_shared.awaiting_keyframe.load(Ordering::Relaxed)
+                                && flags & VIDEO_FLAG_KEYFRAME == 0
+                            {
+                                window_dropped = window_dropped.saturating_add(1);
+                                debug!("等待关键帧期间丢弃 P 帧（不让它占用解码队列）");
+                                continue;
+                            }
+                            let epoch = decode_shared.drop_epoch.load(Ordering::Relaxed);
+                            match enqueue_decode(&decode_tx, DecodeJob::Packet {
                                 display,
                                 seq,
+                                epoch,
                                 codec,
                                 flags,
                                 width,
                                 height,
                                 data,
                             }) {
-                                break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
+                                DecodeEnqueue::Queued => {}
+                                // 第二道兜底：队列满时推进 epoch，让队列里的陈旧 P 帧
+                                // 出队时被整体作废，解码端直接跳到最新包。
+                                DecodeEnqueue::Dropped => {
+                                    decode_shared.drop_epoch.fetch_add(1, Ordering::Relaxed);
+                                    window_dropped = window_dropped.saturating_add(1);
+                                }
+                                DecodeEnqueue::Closed => {
+                                    break Err(RemoteError::Platform(
+                                        "画面解码任务已结束".to_owned(),
+                                    ));
+                                }
                             }
                         }
                         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
@@ -515,8 +593,12 @@ pub async fn run_controller(
                             if selected_codec != Some(codec) {
                                 // 换 codec 意味着参考链作废：解码任务会重置解码器并等关键帧。
                                 selected_codec = Some(codec);
-                                if !enqueue_decode(&decode_tx, DecodeJob::SelectCodec(codec)) {
-                                    break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
+                                if enqueue_decode(&decode_tx, DecodeJob::SelectCodec(codec))
+                                    == DecodeEnqueue::Closed
+                                {
+                                    break Err(RemoteError::Platform(
+                                        "画面解码任务已结束".to_owned(),
+                                    ));
                                 }
                             }
                             info!("编解码协商完成（控制器） codec={codec:?}");
@@ -640,13 +722,19 @@ pub async fn run_controller(
 /// - **序号断层**（`seq` 不等于预期）说明会话循环因队列满丢弃过包 → 重置解码器、进入
 ///   `awaiting_keyframe`，并请求对端补一个 IDR。
 /// - **解码失败**（数据损坏/缺参考帧）同上。
-/// - `awaiting_keyframe` 期间**丢弃所有非关键帧**，只等 IDR；收到 IDR 后恢复。
+/// - **队列溢出代次**（`epoch < drop_epoch`）说明主循环在 `try_send` 失败时已经推进了代次：
+///   队列里排着的都是过期 P 帧，直接丢弃并等 IDR，避免「先解一堆陈旧帧再重置」。
+/// - `awaiting_keyframe` 期间**丢弃所有非关键帧**，只等 IDR；收到 IDR 后恢复。主循环也通过
+///   共享的 `awaiting_keyframe` 原子做**第一道闸门**：入队前就丢掉 P 帧，保证队列里只留
+///   关键帧，IDR 不会被过期 P 帧挤掉。
 ///
 /// 被控端会周期性发关键帧作兜底，但**不能只靠它**——请求关键帧是丢帧后唯一的快速恢复路径。
+/// 所有请求都走 [`request_keyframe`] 的 400 ms 限频：断层/溢出风暴时最多每 400 ms 一个 IDR；
+/// 同时挂起的请求由 `kf_tick` 重试，不会永久卡在等 IDR。
 ///
 /// # 解码耗时（阶段 3）
 ///
-/// 每次 `decode` 的耗时写进 `decode_ms_shared`，由主循环每秒读一次填进 `QosFeedback`。
+/// 每次 `decode` 的耗时写进 [`DecodeShared::decode_ms`]，由主循环每秒读一次填进 `QosFeedback`。
 /// 它是被控端「降编码分辨率」的**唯一**依据（4K 解码实测 37–58 ms 是瓶颈，编码仅 7.9/7.7 ms
 /// 不是）。
 ///
@@ -665,6 +753,27 @@ fn decoder_factory_for(
     }
 }
 
+/// 发送一个关键帧请求，按 [`KEYFRAME_REQUEST_INTERVAL`] 限频。
+///
+/// 距上次请求已满一个窗口就立即发出并记录时刻；否则只把显示器记进 `pending`，由
+/// [`decode_loop`] 的 400 ms tick 补发。这样断层/溢出风暴里 400 ms 内最多一个 IDR，
+/// 又不会让请求永久丢失（tick 保证 400 ms 内必定重试）。
+fn request_keyframe(
+    tx: &mpsc::UnboundedSender<u32>,
+    last: &mut Option<Instant>,
+    pending: &mut Option<u32>,
+    monitor: u32,
+) {
+    let now = Instant::now();
+    if last.is_none_or(|sent| now.duration_since(sent) >= KEYFRAME_REQUEST_INTERVAL) {
+        let _ = tx.send(monitor);
+        *last = Some(now);
+        *pending = None;
+    } else {
+        *pending = Some(monitor);
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "序号断层/关键帧等待/解码器重建/切 codec 是一条不可分割的状态机，拆开反而要来回传状态"
@@ -674,7 +783,7 @@ async fn decode_loop(
     keyframe_tx: mpsc::UnboundedSender<u32>,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
-    decode_ms_shared: Arc<AtomicU32>,
+    decode_shared: Arc<DecodeShared>,
     h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
 ) {
     let mut codec: Option<CodecId> = None;
@@ -686,17 +795,38 @@ async fn decode_loop(
     let mut awaiting_keyframe = false;
     // 下一个期望的帧序号（被控端按发送顺序递增；断层 = 中间有包被丢弃）。
     let mut expected_seq: Option<u64> = None;
+    // 关键帧请求限频状态：上次真正发出的时刻、被限频挂起的显示器。
+    let mut last_kf_request: Option<Instant> = None;
+    let mut kf_pending: Option<u32> = None;
+    // 定期检查挂起的请求：距上次请求已满一个窗口就发出去，保证不会永久等 IDR。
+    let mut kf_tick = tokio::time::interval_at(
+        Instant::now() + KEYFRAME_REQUEST_INTERVAL,
+        KEYFRAME_REQUEST_INTERVAL,
+    );
+    kf_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         let job = tokio::select! {
             biased;
             () = cancel.cancelled() => break,
+            _ = kf_tick.tick() => {
+                if awaiting_keyframe {
+                    if let Some(monitor) = kf_pending.take() {
+                        let _ = keyframe_tx.send(monitor);
+                        last_kf_request = Some(Instant::now());
+                    }
+                } else {
+                    // 已不在等 IDR（例如收到了关键帧）：挂起的请求作废。
+                    kf_pending = None;
+                }
+                continue;
+            }
             job = rx.recv() => match job {
                 Some(job) => job,
                 None => break,
             },
         };
         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
-        let (monitor, seq, packet_codec, flags, width, height, data) = match job {
+        let (monitor, seq, epoch, packet_codec, flags, width, height, data) = match job {
             DecodeJob::SelectCodec(selected) => {
                 // 换 codec：旧解码器的参考帧不可用，重置并等新 codec 的关键帧。
                 if codec != Some(selected) {
@@ -706,6 +836,7 @@ async fn decode_loop(
                     // **只建解码器、不 configure**：尺寸由首个 `VideoPacket` 给出。
                     configured_dims = None;
                     awaiting_keyframe = true;
+                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
                     expected_seq = None;
                     if let Some(factory) =
                         decoder_factory_for(selected, h264_decoder_factory.as_ref())
@@ -724,19 +855,38 @@ async fn decode_loop(
             DecodeJob::Packet {
                 display,
                 seq,
+                epoch,
                 codec,
                 flags,
                 width,
                 height,
                 data,
-            } => (display, seq, codec, flags, width, height, data),
+            } => (display, seq, epoch, codec, flags, width, height, data),
         };
+        // 队列曾溢出（主循环推进了 epoch）：本包已被更新的包取代。丢掉它并重置参考链，
+        // `expected_seq = None` 避免紧接着的下一个包再触发一次「断层」重置。
+        if epoch < decode_shared.drop_epoch.load(Ordering::Relaxed) {
+            debug!(seq, epoch, "解码队列曾溢出，丢弃陈旧视频包并等待关键帧");
+            decoder = None;
+            configured_dims = None;
+            awaiting_keyframe = true;
+            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            expected_seq = None;
+            request_keyframe(
+                &keyframe_tx,
+                &mut last_kf_request,
+                &mut kf_pending,
+                monitor,
+            );
+            continue;
+        }
         // 兜底：正常情况下 `SelectCodec` 一定先到；万一对端漏发，用视频包自带的 codec。
         if codec.is_none() {
             codec = Some(packet_codec);
             decoder = None;
             configured_dims = None;
             awaiting_keyframe = true;
+            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
         }
 
         // 声明尺寸的纵深防御：真正的解码尺寸由码流决定（下方解码后还会再校验一次），但先挡掉
@@ -753,7 +903,13 @@ async fn decode_loop(
             decoder = None;
             configured_dims = None;
             awaiting_keyframe = true;
-            let _ = keyframe_tx.send(monitor);
+            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            request_keyframe(
+                &keyframe_tx,
+                &mut last_kf_request,
+                &mut kf_pending,
+                monitor,
+            );
         }
         expected_seq = Some(seq.wrapping_add(1));
 
@@ -763,7 +919,13 @@ async fn decode_loop(
         // 尚无解码器时必须从关键帧起步，否则 P 帧无从参考。
         if decoder.is_none() && !keyframe {
             awaiting_keyframe = true;
-            let _ = keyframe_tx.send(monitor);
+            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            request_keyframe(
+                &keyframe_tx,
+                &mut last_kf_request,
+                &mut kf_pending,
+                monitor,
+            );
             continue;
         }
         if decoder.is_none() {
@@ -772,7 +934,13 @@ async fn decode_loop(
             let Some(factory) = factory else {
                 warn!(?codec, "没有对应 codec 的解码器工厂，丢弃本帧并等待关键帧");
                 awaiting_keyframe = true;
-                let _ = keyframe_tx.send(monitor);
+                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                request_keyframe(
+                    &keyframe_tx,
+                    &mut last_kf_request,
+                    &mut kf_pending,
+                    monitor,
+                );
                 continue;
             };
             match factory.create() {
@@ -802,7 +970,13 @@ async fn decode_loop(
                     decoder = None;
                     configured_dims = None;
                     awaiting_keyframe = true;
-                    let _ = keyframe_tx.send(monitor);
+                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                    request_keyframe(
+                        &keyframe_tx,
+                        &mut last_kf_request,
+                        &mut kf_pending,
+                        monitor,
+                    );
                     continue;
                 }
             }
@@ -814,8 +988,11 @@ async fn decode_loop(
         match dec.decode(&data) {
             Ok(Some(frame)) => {
                 let decode_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
-                decode_ms_shared.store(decode_ms, Ordering::Relaxed);
+                decode_shared.decode_ms.store(decode_ms, Ordering::Relaxed);
                 awaiting_keyframe = false;
+                decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
+                // IDR 已解出：被限频挂起的请求没有意义了。
+                kf_pending = None;
                 sink.on_frame(DecodedFrame {
                     display: monitor,
                     width: frame.width,
@@ -826,31 +1003,55 @@ async fn decode_loop(
                 });
             }
             // 本批无输出（理论路径；`lag_in_frames = 1` 下每次都有）。
-            Ok(None) => awaiting_keyframe = false,
+            Ok(None) => {
+                awaiting_keyframe = false;
+                decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
+                kf_pending = None;
+            }
             Err(err) => {
                 warn!(error = %err, "画面解码失败，重置解码器并请求关键帧");
                 decoder = None;
                 configured_dims = None;
                 awaiting_keyframe = true;
-                let _ = keyframe_tx.send(monitor);
+                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                request_keyframe(
+                    &keyframe_tx,
+                    &mut last_kf_request,
+                    &mut kf_pending,
+                    monitor,
+                );
             }
         }
     }
 }
 
-/// 投递一条待解码载荷；返回 `false` 表示解码任务已结束。
+/// [`enqueue_decode`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeEnqueue {
+    /// 已入队。
+    Queued,
+    /// 队列满，该包被丢弃。调用方应推进 `drop_epoch`，让队列里的陈旧包整体作废。
+    Dropped,
+    /// 解码任务已结束。
+    Closed,
+}
+
+/// 投递一条待解码载荷。
 ///
 /// 队列满时**丢弃**该批而不是 `await`：在 `select!` 分支里等解码腾出位置会重新把循环卡住（正是
 /// 本次要修的问题）。丢包会打断 VP9 的参考链，故解码任务用**序号断层**检测到它、重置解码器并
 /// 请求关键帧（见 [`decode_loop`]）——丢帧本身安全，静默花屏才不安全。
-fn enqueue_decode(tx: &mpsc::Sender<DecodeJob>, job: DecodeJob) -> bool {
+///
+/// 主循环还会在 `Dropped` 时推进 `drop_epoch`：队列里排着的 P 帧都是过期画面，解码端应直接
+/// 跳到最新包，而不是先把它们解完再重置。
+fn enqueue_decode(tx: &mpsc::Sender<DecodeJob>, job: DecodeJob) -> DecodeEnqueue {
     match tx.try_send(job) {
-        Ok(()) => true,
+        Ok(()) => DecodeEnqueue::Queued,
         Err(mpsc::error::TrySendError::Full(_)) => {
             debug!("解码队列已满，丢弃一批画面（解码侧将按序号断层请求关键帧）");
-            true
+            DecodeEnqueue::Dropped
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Closed(_)) => DecodeEnqueue::Closed,
     }
 }
 
@@ -1370,7 +1571,7 @@ mod tests {
             keyframe_tx,
             sink.clone(),
             cancel.clone(),
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(DecodeShared::new()),
             Some(factory),
         ));
 
@@ -1382,6 +1583,7 @@ mod tests {
             .send(DecodeJob::Packet {
                 display: 0,
                 seq: 1,
+                epoch: 0,
                 codec: CodecId::H264,
                 flags: VIDEO_FLAG_KEYFRAME,
                 width: 2,
@@ -1448,7 +1650,7 @@ mod tests {
             keyframe_tx,
             sink.clone(),
             cancel.clone(),
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(DecodeShared::new()),
             Some(factory),
         ));
 
@@ -1460,6 +1662,7 @@ mod tests {
         let packet = |seq: u64, flags: u8, width: u32, height: u32| DecodeJob::Packet {
             display: 0,
             seq,
+            epoch: 0,
             codec: CodecId::H264,
             flags,
             width,

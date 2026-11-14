@@ -95,6 +95,12 @@ impl CaptureSource for WgcSource {
     }
 
     fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
+        self.capture_texture_with_change().map(|(texture, _)| texture)
+    }
+
+    fn capture_texture_with_change(
+        &mut self,
+    ) -> Result<(CapturedTexture, bool), WinVideoError> {
         let timeout = self.capture_timeout();
         let deadline = Instant::now() + timeout;
         loop {
@@ -107,7 +113,8 @@ impl CaptureSource for WgcSource {
                     }
                     let captured = result?;
                     self.last_texture = Some(captured.clone());
-                    return Ok(captured);
+                    // 真的拿到了新帧：只有这一条路径需要 `CopyResource`。
+                    return Ok((captured, true));
                 }
                 Err(err) if err.code().is_ok() => {}
                 Err(err) => {
@@ -121,8 +128,10 @@ impl CaptureSource for WgcSource {
             }
             std::thread::sleep(POLL_INTERVAL);
         }
+        // 超时：直接复用上一张纹理，**不做 CopyResource**（画面没变，拷贝纯属浪费）。
+        // 返回 `false` 让上层跳过编码/发送；旧语义（恒为 `true`）由默认实现保留。
         match &self.last_texture {
-            Some(texture) => Ok(texture.clone()),
+            Some(texture) => Ok((texture.clone(), false)),
             None => Err(WinVideoError::Capture(format!(
                 "WGC: {timeout:?} 内没有收到首帧（GPU 纹理）"
             ))),

@@ -758,6 +758,7 @@ impl ScreenSource for XcapScreen {
             height: image.height(),
             rgba: image.into_raw(),
             gpu: None,
+            changed: true,
         })
     }
 }

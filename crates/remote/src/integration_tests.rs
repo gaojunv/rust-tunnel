@@ -43,6 +43,7 @@ fn solid(display: u32, w: u32, h: u32, color: [u8; 4]) -> RawFrame {
         height: h,
         rgba,
         gpu: None,
+        changed: true,
     }
 }
 
