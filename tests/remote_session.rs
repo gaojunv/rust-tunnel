@@ -410,6 +410,7 @@ impl ScreenSource for FakeScreen {
             rgba,
             gpu: None,
             changed: true,
+            changed_permille: 1000,
         })
     }
 }

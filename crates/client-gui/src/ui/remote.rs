@@ -233,8 +233,8 @@ fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
     if let Some(path) = state.transport {
         ui.label(RichText::new(format!("路径 {}", transport_label(path))).weak().small());
     }
-    // 被控端编码侧读数（由编码任务每秒经进程内通道上报）：编码耗时 / 实测帧率 / 当前生效码率。
-    // 控制器侧恒为 `None`，此处不显示。
+    // 被控端编码侧读数（由编码任务每秒经进程内通道上报）：编码耗时 / 实测帧率 / 当前生效码率，
+    // 以及出码拆解（关键帧 vs 普通帧的码率）与平均变化面积。控制器侧恒为 `None`，此处不显示。
     if let Some(ms) = state.encode_ms {
         // 采集耗时用微秒上报、按毫秒显示一位小数：GPU 采集常 <1 ms，整数毫秒会恒显示 0。
         let capture = state.encode_capture_us.map_or(String::new(), |us| {
@@ -242,15 +242,35 @@ fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
         });
         let fps = state.encode_fps.map_or("—".to_owned(), |f| format!("{f} fps"));
         let kbps = state.encode_kbps.map_or("—".to_owned(), format_kbps);
-        let skipped = match state.encode_skipped {
-            Some(n) if n > 0 => format!(" · 跳过 {n}/s"),
-            _ => String::new(),
-        };
-        ui.label(
-            RichText::new(format!("编码 {ms} ms{capture} · {fps} · {kbps}{skipped}"))
-                .weak()
-                .small(),
-        );
+        let mut parts = vec![format!("编码 {ms} ms{capture}"), fps, kbps];
+        if let Some(n) = state.encode_skipped.filter(|n| *n > 0) {
+            parts.push(format!("跳过 {n}/s"));
+        }
+        // 出码拆解：关键帧与普通帧分开显示，才看得出带宽尖峰是不是 IDR 造成的。
+        if let Some(n) = state.encode_keyframes.filter(|n| *n > 0) {
+            parts.push(format!("关键帧 {n}/s"));
+        }
+        if let Some(kbps) = state.encode_idr_kbps.filter(|n| *n > 0) {
+            parts.push(format!("关键帧 {}", format_kbps(kbps)));
+        }
+        if let Some(kbps) = state.encode_p_kbps.filter(|n| *n > 0) {
+            parts.push(format!("普通帧 {}", format_kbps(kbps)));
+        }
+        if let Some(permille) = state.encode_changed_permille.filter(|n| *n > 0) {
+            parts.push(format!("变化 {}", format_permille_percent(permille)));
+        }
+        ui.label(RichText::new(parts.join(" · ")).weak().small());
+    }
+}
+
+/// 把千分比显示成百分比（保留一位小数，整数时省略 `.0`）：`30` → `3%`、`3` → `0.3%`。
+fn format_permille_percent(permille: u32) -> String {
+    let whole = permille / 10;
+    let tenths = permille % 10;
+    if tenths == 0 {
+        format!("{whole}%")
+    } else {
+        format!("{whole}.{tenths}%")
     }
 }
 

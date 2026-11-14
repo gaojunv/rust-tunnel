@@ -83,6 +83,15 @@ pub struct RawFrame {
     /// 检测器不可用时保守给 `true`。CPU 路径恒为 `true`，仍靠逐字节 memcmp 去重。
     /// 任何 `force`（首帧/切显示器/切档位/关键帧请求/几何变化）都会绕过它。
     pub changed: bool,
+    /// 变化面积（千分比，`0..=1000`），采集层与 [`Self::changed`] 一起给出。
+    ///
+    /// `changed == false` 时恒为 0。`changed == true && changed_permille == 0` 表示
+    /// 「变了但面积未知」——编码侧按**满帧**处理，保守地不压制码率/帧率。CPU 路径
+    /// （没有便宜的像素级变化信号）恒填 `1000`。
+    ///
+    /// 它只用于**被控端本地**的码率/帧率自适应（`qos::RateController::observe_activity`），
+    /// 不进线上协议：`QosFeedback` 的字段一个都没变。
+    pub changed_permille: u16,
 }
 
 impl std::fmt::Debug for RawFrame {
@@ -94,6 +103,7 @@ impl std::fmt::Debug for RawFrame {
             .field("rgba_len", &self.rgba.len())
             .field("gpu", &self.gpu.is_some())
             .field("changed", &self.changed)
+            .field("changed_permille", &self.changed_permille)
             .finish()
     }
 }
@@ -548,6 +558,7 @@ mod tests {
             rgba: Vec::new(),
             gpu: Some(std::sync::Arc::new(DummyGpuFrame)),
             changed: true,
+            changed_permille: 1000,
         };
         assert!(gpu.validate().is_ok(), "GPU 帧不应要求 CPU 像素数据");
         let zero = RawFrame {
@@ -564,6 +575,7 @@ mod tests {
             rgba: vec![0; 4],
             gpu: None,
             changed: true,
+            changed_permille: 1000,
         };
         assert!(cpu.validate().is_err(), "CPU 帧仍应校验 RGBA 长度");
     }

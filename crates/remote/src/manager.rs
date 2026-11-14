@@ -171,6 +171,14 @@ pub struct RemoteUiState {
     pub encode_fps: Option<u32>,
     /// 被控端最近上报的**当前生效码率**（kbps，闭环在上限之下浮动后的值）。仅被控端填。
     pub encode_kbps: Option<u32>,
+    /// 被控端最近上报的**窗口内关键帧数**（每秒）。仅被控端填。
+    pub encode_keyframes: Option<u32>,
+    /// 被控端最近上报的**关键帧出码码率**（kbps）。仅被控端填。
+    pub encode_idr_kbps: Option<u32>,
+    /// 被控端最近上报的**普通帧出码码率**（kbps）。仅被控端填。
+    pub encode_p_kbps: Option<u32>,
+    /// 被控端最近上报的**平均变化面积**（千分比，0..=1000）。仅被控端填。
+    pub encode_changed_permille: Option<u32>,
     /// 控制器最近上报的**解码侧**读数：最近一帧解码耗时（毫秒）。仅控制器填。
     pub decode_ms: Option<u32>,
     /// 控制器最近上报的**接收码率**（kbps）。仅控制器填。
@@ -221,6 +229,10 @@ impl RemoteUiState {
         self.encode_skipped = None;
         self.encode_fps = None;
         self.encode_kbps = None;
+        self.encode_keyframes = None;
+        self.encode_idr_kbps = None;
+        self.encode_p_kbps = None;
+        self.encode_changed_permille = None;
         self.decode_ms = None;
         self.recv_kbps = None;
         self.decode_packets = None;
@@ -1904,6 +1916,10 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
             fps,
             bitrate_kbps,
             skipped,
+            keyframes,
+            idr_kbps,
+            p_kbps,
+            changed_permille,
         } => {
             // 被控端编码侧读数：直接写入，不做平滑（数值本身已是 1s 窗口的平均）。
             mgr.update_ui(|s| {
@@ -1912,6 +1928,10 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
                 s.encode_skipped = Some(skipped);
                 s.encode_fps = Some(fps);
                 s.encode_kbps = Some(bitrate_kbps);
+                s.encode_keyframes = Some(keyframes);
+                s.encode_idr_kbps = Some(idr_kbps);
+                s.encode_p_kbps = Some(p_kbps);
+                s.encode_changed_permille = Some(changed_permille);
             });
         }
         SessionStats::Decode {
@@ -2837,6 +2857,10 @@ mod tests {
                 s.encode_skipped = Some(7);
                 s.encode_fps = Some(12);
                 s.encode_kbps = Some(4000);
+                s.encode_keyframes = Some(1);
+                s.encode_idr_kbps = Some(300);
+                s.encode_p_kbps = Some(3700);
+                s.encode_changed_permille = Some(30);
                 s.decode_ms = Some(11);
                 s.recv_kbps = Some(3800);
                 s.decode_packets = Some(400);
@@ -2854,6 +2878,10 @@ mod tests {
             assert_eq!(snap.encode_skipped, None, "跳过帧数读数应清零");
             assert_eq!(snap.encode_fps, None, "编码帧率读数应清零");
             assert_eq!(snap.encode_kbps, None, "编码码率读数应清零");
+            assert_eq!(snap.encode_keyframes, None, "关键帧数读数应清零");
+            assert_eq!(snap.encode_idr_kbps, None, "关键帧码率读数应清零");
+            assert_eq!(snap.encode_p_kbps, None, "普通帧码率读数应清零");
+            assert_eq!(snap.encode_changed_permille, None, "变化面积读数应清零");
             assert_eq!(snap.decode_ms, None, "解码耗时读数应清零");
             assert_eq!(snap.recv_kbps, None, "收码率读数应清零");
             assert_eq!(snap.decode_packets, None, "收包数读数应清零");

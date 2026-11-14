@@ -23,6 +23,31 @@
 //! 重建编码器——重建会强制一个 IDR，AIMD 每秒动一次就变成每秒一个关键帧，正好把阶段 2 要消掉的
 //! 带宽尖峰引回来。只有**降编码分辨率**（几何变化，本模块的 `force_keyframe`）才需要重建 + IDR。
 //!
+//! # 变化面积驱动的生效上限
+//!
+//! AIMD 只看**链路**（RTT/积压），看不见**内容**：整帧编码 + VBR 会把档位预算与「画面变了
+//! 多少」解耦——打字只改几十个像素，编码器照样花完预算。采集层本来就在算像素级变化检测
+//! （`win-video` 的 `ChangeReport.changed_permille`），把它喂给
+//! [`RateController::observe_activity`]，按三档给**生效值**加一个上限：
+//!
+//! | 面积 | 等级 | 码率上限 | 帧率上限 |
+//! |---|---|---|---|
+//! | < 5% | UI | [`QosParams::ui_bitrate_cap_kbps`] 1.2 Mbps | [`QosParams::ui_fps_cap`] 15 |
+//! | 5–20% | Mixed | [`QosParams::mixed_bitrate_cap_kbps`] 2.5 Mbps | [`QosParams::mixed_fps_cap`] 30 |
+//! | > 20% | Active | 不设上限（AIMD） | 不设上限（AIMD） |
+//!
+//! 三条设计约束：
+//!
+//! - **升快降慢**：面积变大立刻放开（视频一开始就要放量），面积变小要连续
+//!   [`QosParams::cap_hold_ticks`]（2 秒）才收紧，防止视频里的单个静止帧把上限压死。
+//! - **只钳制生效值，不改 AIMD 状态**：`bitrate_kbps`/`fps` 的爬升/下降历史保留，面积一变
+//!   大就立刻回到 AIMD 水平，不用重新爬。上限本身也不越过档位上限。
+//! - **不置 `force_keyframe`、不改 `scale`**：上限只改在线重配置的码率/帧率，绝不重建编码器
+//!   或插 IDR；分辨率降级仍只由「解码耗时成为瓶颈」触发。
+//!
+//! 面积**不进** `QosFeedback`：那是控制器的网络反馈，面积是被控端本地的采集读数，两者方向
+//! 与来源都不同；塞进线上结构要改 `SESSION_PROTO_VERSION`，而本特性不需要跨端信息。
+//!
 //! # 阈值依据
 //!
 //! **RTT 判据是相对的**：会话内观测到的最小 RTT（[`RateController::baseline_rtt_ms`]）代表
@@ -107,6 +132,33 @@ pub struct QosParams {
     pub min_scale: f32,
     /// 「持续积压」判定所需的**连续** tick 数（单次抖动不算拥塞）。
     pub backlog_ticks: u32,
+    /// **UI 操作**（变化面积很小）时的生效码率上限（kbps）。
+    ///
+    /// 打字、点菜单、终端光标这类操作每帧只有几个千分点的像素在变，整帧编码 + VBR 却会把
+    /// 档位预算花完。1080p 桌面在这种场景下 1.2 Mbps 已足够清晰（按静态文本每帧几 KB、
+    /// 15 fps 的量级估算），再高只是给码率控制器送填充。
+    pub ui_bitrate_cap_kbps: u32,
+    /// **UI 操作**时的生效帧率上限。
+    ///
+    /// 15 fps 与 [`Self::min_fps`] 同值：UI 操作不需要 30/60 fps 的顺滑度，而降低采集节拍
+    /// 本身就能减少「有新帧但内容没变」的无效采集。想更顺滑的用户可选更高画质档位，但上限
+    /// 仍受本值约束——这是**内容驱动**的，不是档位驱动的。
+    pub ui_fps_cap: u8,
+    /// **混合**内容（介于 UI 与运动之间）时的生效码率上限（kbps）。
+    pub mixed_bitrate_cap_kbps: u32,
+    /// **混合**内容时的生效帧率上限。
+    pub mixed_fps_cap: u8,
+    /// 变化面积低于此千分比（默认 50 = 5%）视为 **UI 操作**。
+    ///
+    /// 320×180 网格里 5% ≈ 2880 个格点；打字/菜单的变化远小于它。
+    pub ui_ratio_permille: u16,
+    /// 变化面积高于此千分比（默认 200 = 20%）视为**运动/视频**（放开到档位上限）。
+    pub active_ratio_permille: u16,
+    /// **收紧**内容上限需要连续这么多次「更安静」的观测（升档立刻生效，降档迟滞）。
+    ///
+    /// 默认 2（QoS 每秒一次反馈 ≈ 2 秒）：视频刚开始就要放量，视频停了两秒才收紧。单次
+    /// 静止帧（例如视频里的黑场）不该把上限压死。
+    pub cap_hold_ticks: u32,
 }
 
 impl Default for QosParams {
@@ -123,6 +175,13 @@ impl Default for QosParams {
             scale_step: 0.75,
             min_scale: 0.25,
             backlog_ticks: 2,
+            ui_bitrate_cap_kbps: 1200,
+            ui_fps_cap: 15,
+            mixed_bitrate_cap_kbps: 2500,
+            mixed_fps_cap: 30,
+            ui_ratio_permille: 50,
+            active_ratio_permille: 200,
+            cap_hold_ticks: 2,
         }
     }
 }
@@ -136,6 +195,31 @@ pub struct QosDecision {
     pub force_keyframe: bool,
     /// 动作分类。
     pub action: QosAction,
+}
+
+/// 由**变化面积**推出的内容活跃等级（`Ord` 用于「升档立刻、降档迟滞」的比较）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Activity {
+    /// UI 操作（打字/菜单/光标）：面积 < [`QosParams::ui_ratio_permille`]。
+    Ui,
+    /// 介于两者之间。
+    Mixed,
+    /// 运动/视频：面积 > [`QosParams::active_ratio_permille`]。
+    Active,
+}
+
+impl QosParams {
+    /// 某一活跃等级对应的 `(码率上限, 帧率上限)`；`Active` = 不设上限（完全交给 AIMD）。
+    fn activity_caps(&self, activity: Activity) -> (Option<u32>, Option<u8>) {
+        match activity {
+            Activity::Ui => (Some(self.ui_bitrate_cap_kbps), Some(self.ui_fps_cap)),
+            Activity::Mixed => (
+                Some(self.mixed_bitrate_cap_kbps),
+                Some(self.mixed_fps_cap),
+            ),
+            Activity::Active => (None, None),
+        }
+    }
 }
 
 /// 被控端侧的码率闭环控制器（AIMD）。
@@ -165,6 +249,17 @@ pub struct RateController {
     /// 只降不升：它代表链路固定开销，不应随后续排队时延抬升。RTT 为 0 是控制器「尚未采到
     /// 样本」的哨兵（见 `controller.rs` 的 `last_rtt_ms`），不参与基线更新。
     baseline_rtt_ms: Option<u32>,
+    /// 当前生效的内容活跃等级（见 [`Self::observe_activity`]）。
+    activity: Activity,
+    /// 连续「比当前等级更安静」的观测次数（收紧上限的迟滞计数）。
+    quiet_streak: u32,
+    /// 内容驱动的码率上限（kbps）；`None` = 不压制（`Activity::Active`）。
+    ///
+    /// **只钳制 [`Self::current`] 的显示/生效值，不改 AIMD 状态**（`bitrate_kbps`）：面积一
+    /// 变大就能立刻回到 AIMD 已经爬到/降到的水平，不必重新爬坡。
+    content_cap_kbps: Option<u32>,
+    /// 内容驱动的帧率上限；语义同 [`Self::content_cap_kbps`]。
+    content_cap_fps: Option<u8>,
 }
 
 impl RateController {
@@ -188,6 +283,10 @@ impl RateController {
             backlog_streak: 0,
             last_action: QosAction::Hold,
             baseline_rtt_ms: None,
+            activity: Activity::Active,
+            quiet_streak: 0,
+            content_cap_kbps: None,
+            content_cap_fps: None,
         }
     }
 
@@ -197,14 +296,76 @@ impl RateController {
         self.ceiling
     }
 
-    /// 当前生效值。
+    /// 当前生效值（AIMD 值再按**内容上限**钳制，且不越过档位上限）。
     #[must_use]
     pub fn current(&self) -> EncodeRates {
         EncodeRates {
-            bitrate_kbps: self.bitrate_kbps,
-            fps: self.fps,
+            bitrate_kbps: self.effective_bitrate_kbps(),
+            fps: self.effective_fps(),
             scale: self.effective_scale(),
         }
+    }
+
+    /// 观测一帧的**变化面积**（千分比），据此收紧/放开内容驱动的码率/帧率上限。
+    ///
+    /// # 为什么面积驱动
+    ///
+    /// 整帧编码 + VBR 码率控制器的预算与「画面变了多少」无关：打字只改几十个像素，编码器
+    /// 照样把档位预算花完（Intel QSV 的 CBR 甚至插填充）。变化面积是**本地免费**的信号
+    /// （GPU 变化检测本来就在算），按它分三档给生效值加一个上限，UI 操作就能显著降字节，
+    /// 拖窗/滚动/视频仍能放开到档位上限。
+    ///
+    /// # 升快降慢
+    ///
+    /// **升档（要求更高码率）立刻生效**：视频/拖窗一开始就要放量，晚一秒用户就看到糊。
+    /// **降档（收紧上限）要连续 [`QosParams::cap_hold_ticks`] 次**「更安静」的观测：视频里的
+    /// 单个静止帧（黑场、暂停画面）不该把上限压死；视频真正停了约两秒后才收紧。
+    ///
+    /// # 为什么不进线上结构
+    ///
+    /// `changed_permille` 是被控端**本地**采集层的读数，`QosFeedback` 是控制器的网络反馈，
+    /// 两者方向与来源都不同。把它塞进 `QosFeedback` 会改动线上结构（`SESSION_PROTO_VERSION`
+    /// 与所有旧客户端），而本特性完全不需要跨端信息。
+    ///
+    /// **不置关键帧、不重建编码器**：上限只改 [`Self::current`] 的码率/帧率生效值，走既有的
+    /// 在线重配置（`set_bitrate` / `set_fps`），`scale` 与 `force_keyframe` 一概不动。
+    pub fn observe_activity(&mut self, changed_permille: u16) {
+        let observed = if changed_permille < self.params.ui_ratio_permille {
+            Activity::Ui
+        } else if changed_permille > self.params.active_ratio_permille {
+            Activity::Active
+        } else {
+            Activity::Mixed
+        };
+
+        if observed >= self.activity {
+            // 升档或持平：立刻生效（视频刚开始就要放量）。
+            self.activity = observed;
+            self.quiet_streak = 0;
+        } else {
+            // 降档（收紧上限）：连续安静够久才生效。
+            self.quiet_streak = self.quiet_streak.saturating_add(1);
+            if self.quiet_streak >= self.params.cap_hold_ticks.max(1) {
+                self.activity = observed;
+                self.quiet_streak = 0;
+            }
+        }
+
+        let (cap_kbps, cap_fps) = self.params.activity_caps(self.activity);
+        self.content_cap_kbps = cap_kbps;
+        self.content_cap_fps = cap_fps;
+    }
+
+    /// 当前**内容驱动**的码率上限（kbps）；`None` = 不压制。仅用于日志/断言。
+    #[must_use]
+    pub fn content_cap_kbps(&self) -> Option<u32> {
+        self.content_cap_kbps
+    }
+
+    /// 当前**内容驱动**的帧率上限；`None` = 不压制。仅用于日志/断言。
+    #[must_use]
+    pub fn content_cap_fps(&self) -> Option<u8> {
+        self.content_cap_fps
     }
 
     /// 上一次动作。
@@ -361,6 +522,32 @@ impl RateController {
     fn effective_scale(&self) -> f32 {
         let scale = self.ceiling.scale * self.params.scale_step.powi(i32::try_from(self.scale_level).unwrap_or(i32::MAX));
         scale.clamp(self.params.min_scale.min(self.ceiling.scale), self.ceiling.scale)
+    }
+
+    /// AIMD 码率再按内容上限钳制；上限本身不越过档位上限，也不低于地板。
+    ///
+    /// 只影响返回值：`self.bitrate_kbps` 是 AIMD 的长期状态，面积变大时直接恢复。
+    fn effective_bitrate_kbps(&self) -> u32 {
+        let ceiling_kbps = self
+            .ceiling
+            .target_bitrate_kbps
+            .max(self.params.min_bitrate_kbps);
+        let cap = self
+            .content_cap_kbps
+            .unwrap_or(ceiling_kbps)
+            .clamp(self.params.min_bitrate_kbps, ceiling_kbps);
+        self.bitrate_kbps.min(cap)
+    }
+
+    /// AIMD 帧率再按内容上限钳制，并夹到 `[min_fps, ceiling.max_fps]`。
+    fn effective_fps(&self) -> u8 {
+        let min_fps = self.params.min_fps.max(1);
+        let ceiling_fps = self.ceiling.max_fps.max(min_fps);
+        let cap = self
+            .content_cap_fps
+            .unwrap_or(ceiling_fps)
+            .clamp(min_fps, ceiling_fps);
+        self.fps.min(cap).clamp(min_fps, ceiling_fps)
     }
 
     /// 组装决策结果。
@@ -751,5 +938,110 @@ mod tests {
         c.on_feedback(fb(50, 10, 1), 0);
         let d = c.on_feedback(fb(50, 10, 1), 0);
         assert_eq!(d.action, QosAction::Decrease);
+    }
+
+    /// 内容上限的「收紧」要连续 `cap_hold_ticks` 次：先配一个可预期的迟滞值。
+    fn activity_controller() -> RateController {
+        RateController::with_params(QualityPreset::Balanced.options(), QosParams::default())
+    }
+
+    #[test]
+    fn ui_activity_caps_effective_bitrate_and_fps() {
+        let mut c = activity_controller();
+        prime(&mut c);
+        // 初始等级是 Active（无上限）；UI 面积是**降档**，需要连续 2 次（默认迟滞）。
+        c.observe_activity(10);
+        assert_eq!(c.current().bitrate_kbps, 6000, "单次安静观测不该收紧上限");
+        c.observe_activity(0);
+        assert_eq!(c.current().bitrate_kbps, 1200, "UI 面积应压到 ui_bitrate_cap_kbps");
+        assert_eq!(c.current().fps, 15, "UI 面积应压到 ui_fps_cap");
+        assert_eq!(c.content_cap_kbps(), Some(1200));
+        assert_eq!(c.content_cap_fps(), Some(15));
+    }
+
+    #[test]
+    fn active_area_releases_cap_immediately() {
+        let mut c = activity_controller();
+        prime(&mut c);
+        c.observe_activity(0);
+        c.observe_activity(0);
+        assert_eq!(c.current().bitrate_kbps, 1200, "先进入 UI 档");
+
+        // 面积变大（视频/拖窗）：**立刻**放开，不等迟滞。
+        c.observe_activity(1000);
+        assert_eq!(c.current().bitrate_kbps, 6000, "面积变大应立刻回到 AIMD 水平");
+        assert_eq!(c.current().fps, 30);
+        assert_eq!(c.content_cap_kbps(), None);
+        let d = c.on_feedback(fb(50, 10, 0), 0);
+        assert!(!d.force_keyframe, "上限变化绝不置关键帧");
+    }
+
+    #[test]
+    fn shrinking_area_needs_consecutive_quiet_ticks() {
+        let mut c = activity_controller();
+        prime(&mut c);
+        let ticks = c.params.cap_hold_ticks;
+        assert!(ticks >= 2, "默认迟滞应至少 2 tick");
+
+        // 视频停下来的第一秒：仍然是满额（避免视频里的静止帧把上限压死）。
+        c.observe_activity(0);
+        assert_eq!(c.current().bitrate_kbps, 6000);
+        // 中途来一帧大变化：连续安静计数被清零。
+        c.observe_activity(1000);
+        c.observe_activity(0);
+        assert_eq!(c.current().bitrate_kbps, 6000, "安静计数被大变化打断后要重新数");
+
+        // 还差一次才到迟滞次数：仍不收紧。
+        for _ in 1..ticks.saturating_sub(1) {
+            c.observe_activity(0);
+            assert_eq!(c.current().bitrate_kbps, 6000, "未达 cap_hold_ticks 时不得收紧");
+        }
+        // 第 ticks 次连续安静：收紧。
+        c.observe_activity(0);
+        assert_eq!(c.current().bitrate_kbps, 1200, "连续安静达到迟滞次数后收紧");
+    }
+
+    #[test]
+    fn content_cap_never_exceeds_quality_ceiling() {
+        // 上限配得比档位上限还大：生效值仍不得越过档位（Smooth：2000 kbps / 20 fps）。
+        let params = QosParams {
+            ui_bitrate_cap_kbps: 8000,
+            ui_fps_cap: 60,
+            cap_hold_ticks: 1,
+            ..QosParams::default()
+        };
+        let mut c = RateController::with_params(QualityPreset::Smooth.options(), params);
+        prime(&mut c);
+        lo_activity_twice(&mut c);
+        assert_eq!(c.current().bitrate_kbps, 2000, "内容上限不得越过档位上限");
+        assert_eq!(c.current().fps, 20, "帧率上限不得越过档位上限");
+    }
+
+    /// 用 UI 面积把上限收紧（默认迟滞下调用两次）。
+    fn lo_activity_twice(c: &mut RateController) {
+        c.observe_activity(0);
+        c.observe_activity(0);
+    }
+
+    #[test]
+    fn content_cap_never_requests_keyframe_or_changes_scale() {
+        let mut c = activity_controller();
+        prime(&mut c);
+        lo_activity_twice(&mut c);
+        assert_eq!(c.current().bitrate_kbps, 1200);
+        assert!(
+            (c.current().scale - 1.0).abs() < f32::EPSILON,
+            "面积自适应只动码率/帧率，不动分辨率"
+        );
+        // 后续一次健康反馈：动作可以是 Increase/Hold，但**绝不**因上限变化置关键帧。
+        for _ in 0..5 {
+            let d = c.on_feedback(fb(50, 10, 0), 0);
+            assert!(!d.force_keyframe, "内容上限绝不带出 IDR");
+            assert!((d.rates.scale - 1.0).abs() < f32::EPSILON);
+        }
+        // AIMD 状态没被上限改写：放开面积后立刻回到上限。
+        c.observe_activity(1000);
+        assert_eq!(c.current().bitrate_kbps, 6000);
+        assert_eq!(c.current().fps, 30);
     }
 }

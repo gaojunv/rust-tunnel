@@ -759,6 +759,8 @@ impl ScreenSource for XcapScreen {
             rgba: image.into_raw(),
             gpu: None,
             changed: true,
+            // CPU 截屏没有像素级变化信号，面积按满帧处理（不压制码率）。
+            changed_permille: 1000,
         })
     }
 }

@@ -14,7 +14,7 @@
 
 use super::{
     create_device_for, texture_dimensions, BgraReader, CaptureBackend, CaptureSource,
-    CapturedFrame, CapturedTexture, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
+    CapturedFrame, CapturedTexture, ChangeReport, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
     NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
 };
 use crate::d3d11;
@@ -103,7 +103,7 @@ impl CaptureSource for WgcSource {
 
     fn capture_texture_with_change(
         &mut self,
-    ) -> Result<(CapturedTexture, bool), WinVideoError> {
+    ) -> Result<(CapturedTexture, ChangeReport), WinVideoError> {
         let timeout = self.capture_timeout();
         let deadline = Instant::now() + timeout;
         loop {
@@ -117,9 +117,9 @@ impl CaptureSource for WgcSource {
                     let captured = result?;
                     // **像素级**变化检测：WGC 在基本静止的桌面上仍按合成器节奏产新帧
                     // （实测 120 次采集 119 次有新帧），所以「有新帧」不等于「有变化」。
-                    let changed = self.change.changed(&self.d3d, &captured);
+                    let report = self.change.changed(&self.d3d, &captured);
                     self.last_texture = Some(captured.clone());
-                    return Ok((captured, changed));
+                    return Ok((captured, report));
                 }
                 Err(err) if err.code().is_ok() => {}
                 Err(err) => {
@@ -134,9 +134,9 @@ impl CaptureSource for WgcSource {
             std::thread::sleep(POLL_INTERVAL);
         }
         // 超时：直接复用上一张纹理，**不做 CopyResource**（画面没变，拷贝纯属浪费）。
-        // 返回 `false` 让上层跳过编码/发送；旧语义（恒为 `true`）由默认实现保留。
+        // 返回「无变化」让上层跳过编码/发送；旧语义（恒为「有变化」）由默认实现保留。
         match &self.last_texture {
-            Some(texture) => Ok((texture.clone(), false)),
+            Some(texture) => Ok((texture.clone(), ChangeReport::unchanged())),
             None => Err(WinVideoError::Capture(format!(
                 "WGC: {timeout:?} 内没有收到首帧（GPU 纹理）"
             ))),

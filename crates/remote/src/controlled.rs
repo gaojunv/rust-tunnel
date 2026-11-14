@@ -434,6 +434,9 @@ pub async fn run_controlled(
     let mut capture_timeouts: u32 = 0;
     // 首帧（或切显示器/切档位/收到 RequestKeyframe 之后）必须先发关键帧：解码侧要有可重建的参考。
     let mut force_keyframe = true;
+    // 最近一帧采集报告的**变化面积**（千分比），供 `QosFeedback` 里的内容自适应使用
+    // （`RateController::observe_activity`）。初值 1000 = 面积未知/满帧，保守地不收紧上限。
+    let mut last_changed_permille: u16 = 1000;
     // 控制器显式选择的帧率上限（30 / 60）。`None` = 尚未下发，沿用画质档位默认。
     // 记住它是为了「换画质档位不覆盖用户选择」：`SetQuality` 换完档位后要重新应用它。
     let mut selected_fps: Option<u8> = None;
@@ -471,6 +474,7 @@ pub async fn run_controlled(
                         capture_timeouts = 0;
                         if let Some(frame) = frame {
                             debug!(capture_us, "采集一帧");
+                            last_changed_permille = frame.changed_permille;
                             let job = EncodeJob { display: display_id, rates: encode, force_keyframe, capture_us, frame };
                             // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
                             // 帧（等价降帧率）。关键帧请求保留到真正投递成功的那一次。
@@ -582,6 +586,10 @@ pub async fn run_controlled(
                             // 控制器的每秒反馈 + 本端出站队列积压 → 一次 AIMD 决策。
                             // **码率/帧率走在线重配置（不重建、不插 IDR）**，只有降分辨率才置
                             // `force_keyframe`（几何变化，见 [`crate::qos`]）。
+                            //
+                            // 先喂**本端**的变化面积：它只收紧/放开生效值上限，不改 AIMD 状态、
+                            // 不置关键帧（见 `RateController::observe_activity`）。
+                            rate.observe_activity(last_changed_permille);
                             let local_backlog =
                                 u32::try_from(WRITER_QUEUE.saturating_sub(tx.capacity())).unwrap_or(u32::MAX);
                             let decision = rate.on_feedback(
@@ -605,7 +613,7 @@ pub async fn run_controlled(
                             if last_qos_log != Some(signature) {
                                 last_qos_log = Some(signature);
                                 info!(
-                                    "QoS 调整 action={:?} rtt={}ms baseline={:?} recv_kbps={} decode_ms={} backlog={} local_backlog={} bitrate_kbps={} fps={} scale={:.3}",
+                                    "QoS 调整 action={:?} rtt={}ms baseline={:?} recv_kbps={} decode_ms={} backlog={} local_backlog={} bitrate_kbps={} fps={} scale={:.3} changed_permille={} cap_kbps={:?} cap_fps={:?}",
                                     decision.action,
                                     rtt_ms,
                                     rate.baseline_rtt_ms(),
@@ -616,6 +624,9 @@ pub async fn run_controlled(
                                     encode.bitrate_kbps,
                                     encode.fps,
                                     encode.scale,
+                                    last_changed_permille,
+                                    rate.content_cap_kbps(),
+                                    rate.content_cap_fps(),
                                 );
                             }
                         }
@@ -913,6 +924,14 @@ struct EncodeStatsWindow {
     capture_us: u64,
     /// 本窗口因「无变化」被跳过的帧数（不含背压/去重之外的其它丢弃）。
     skipped: u32,
+    /// 本窗口内的**关键帧**数（`VideoPacket.keyframe` 为真）。
+    keyframes: u32,
+    /// 本窗口内关键帧的出码字节数（用于把「关键帧码率」与「普通帧码率」拆开）。
+    idr_bytes: u64,
+    /// 本窗口内普通帧的出码字节数。
+    p_bytes: u64,
+    /// 本窗口内各编码帧的 `changed_permille` 累加（用于算窗口平均变化面积）。
+    changed_permille_sum: u64,
 }
 
 impl EncodeStatsWindow {
@@ -924,13 +943,34 @@ impl EncodeStatsWindow {
             encode_ms: 0,
             capture_us: 0,
             skipped: 0,
+            keyframes: 0,
+            idr_bytes: 0,
+            p_bytes: 0,
+            changed_permille_sum: 0,
         }
     }
 
-    /// 记一帧的产出与耗时（采集 + 编码）。
-    fn record(&mut self, bytes: usize, encode_ms: u64, capture_us: u64) {
+    /// 记一帧的产出与耗时（采集 + 编码），并按下「关键帧 / 普通帧」拆解字节。
+    fn record(
+        &mut self,
+        bytes: usize,
+        encode_ms: u64,
+        capture_us: u64,
+        keyframe: bool,
+        changed_permille: u16,
+    ) {
         self.frames = self.frames.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if keyframe {
+            self.keyframes = self.keyframes.saturating_add(1);
+            self.idr_bytes = self.idr_bytes.saturating_add(bytes);
+        } else {
+            self.p_bytes = self.p_bytes.saturating_add(bytes);
+        }
+        self.changed_permille_sum = self
+            .changed_permille_sum
+            .saturating_add(u64::from(changed_permille));
         self.encode_ms = self.encode_ms.saturating_add(encode_ms);
         self.capture_us = self.capture_us.saturating_add(capture_us);
     }
@@ -963,12 +1003,26 @@ impl EncodeStatsWindow {
         } else {
             u32::try_from(self.capture_us / u64::from(self.frames)).unwrap_or(u32::MAX)
         };
+        // 出码拆解：关键帧与普通帧分开算码率。单位换算是整数：kbps = bytes × 8 / 毫秒
+        // （`bytes × 8 / (secs × 1000) × 1000`），避免浮点在 pedantic 下的 cast 告警。
+        let idr_kbps = kbps_from_bytes(self.idr_bytes, elapsed);
+        let p_kbps = kbps_from_bytes(self.p_bytes, elapsed);
+        let changed_permille = if self.frames == 0 {
+            0
+        } else {
+            u32::try_from(self.changed_permille_sum / u64::from(self.frames))
+                .unwrap_or(u32::MAX)
+        };
         stats.report(SessionStats::Encode {
             encode_ms,
             capture_us,
             fps,
             bitrate_kbps,
             skipped: self.skipped,
+            keyframes: self.keyframes,
+            idr_kbps,
+            p_kbps,
+            changed_permille,
         });
         self.start = Instant::now();
         self.frames = 0;
@@ -976,7 +1030,19 @@ impl EncodeStatsWindow {
         self.encode_ms = 0;
         self.capture_us = 0;
         self.skipped = 0;
+        self.keyframes = 0;
+        self.idr_bytes = 0;
+        self.p_bytes = 0;
+        self.changed_permille_sum = 0;
     }
+}
+
+/// 把窗口内的字节数换算成 kbps（整数运算，按窗口实际时长归一）。
+fn kbps_from_bytes(bytes: u64, elapsed: Duration) -> u32 {
+    let millis = u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    u32::try_from(bytes.saturating_mul(8) / millis).unwrap_or(u32::MAX)
 }
 
 /// 编码任务：独占编码器，去重 → （在线重配置）→ 编码 → 投递。
@@ -1043,6 +1109,8 @@ async fn encode_loop(
             capture_us,
             frame,
         } = job;
+        // 本帧的变化面积（千分比）：进统计窗口的平均，并随每帧上报落进日志/UI。
+        let changed_permille = frame.changed_permille;
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
         window.maybe_report(&stats, rates.bitrate_kbps);
 
@@ -1148,12 +1216,19 @@ async fn encode_loop(
                     continue;
                 }
                 seq = seq.wrapping_add(1);
-                window.record(packet.data.len(), encode_ms, capture_us);
+                let keyframe = packet.keyframe;
+                window.record(
+                    packet.data.len(),
+                    encode_ms,
+                    capture_us,
+                    keyframe,
+                    changed_permille,
+                );
                 let mut flags = 0u8;
                 if geometry_changed {
                     flags |= VIDEO_FLAG_CONFIG;
                 }
-                if packet.keyframe {
+                if keyframe {
                     flags |= VIDEO_FLAG_KEYFRAME;
                 }
                 let msg = SessionMessage::VideoPacket {
@@ -1371,6 +1446,7 @@ mod tests {
             rgba: [40u8, 80, 120, 255].repeat((w * h) as usize),
             gpu: None,
             changed: true,
+            changed_permille: 1000,
         }
     }
 
@@ -1431,6 +1507,7 @@ mod tests {
                 rgba,
                 gpu: None,
                 changed: true,
+                changed_permille: 1000,
             })
         }
     }
@@ -1864,6 +1941,7 @@ mod tests {
             rgba,
             gpu: None,
             changed: true,
+            changed_permille: 1000,
         }
     }
 
@@ -2258,6 +2336,7 @@ mod tests {
                 rgba: Vec::new(),
                 gpu: Some(Arc::new(DummyGpuFrame)),
                 changed,
+                changed_permille: if changed { 1000 } else { 0 },
             },
         };
 
@@ -2338,6 +2417,7 @@ mod tests {
                 rgba: Vec::new(),
                 gpu: Some(Arc::new(DummyGpuFrame)),
                 changed,
+                changed_permille: if changed { 1000 } else { 0 },
             },
         };
 
