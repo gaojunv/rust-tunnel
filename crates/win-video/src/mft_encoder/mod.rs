@@ -23,8 +23,10 @@
 //!
 //! # 运行期改码率/帧率
 //!
-//! 优先走 `ICodecAPI`（CBR + mean bitrate / frame rate）。不重建 MFT、不强制
-//! IDR；MFT 不支持时返回明确错误，不假装成功。
+//! 优先走 `ICodecAPI`（峰值受限 VBR + mean/max bitrate / frame rate）。不重建 MFT、
+//! 不强制 IDR；MFT 不支持时返回明确错误，不假装成功。**码率控制默认用峰值受限 VBR
+//! 而不是 CBR**：Intel QSV 的 CBR 会给静止画面插填充把码流灌到目标码率（实测
+//! 1080p@30fps、目标 8 Mbps 时静止帧仍是 ~21.6 KB/帧），远程桌面一静止就白占链路。
 
 mod bitstream;
 mod convert;
@@ -49,7 +51,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
 };
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_CBR, CODECAPI_AVEncCommonLowLatency,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMaxFrameRate,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoOutputFrameRate, ICodecAPI, IMFActivate,
@@ -81,6 +84,12 @@ const EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 但 500 µs 在未生效的机器上仍会按 1 ms 粒度休眠，不会更糟；配合
 /// `METransformHaveOutput` 的到达节奏，比固定 1 ms 少一次多余休眠。
 const EVENT_POLL_INTERVAL: Duration = Duration::from_micros(500);
+
+/// 峰值受限 VBR 的平均码率占目标码率的百分比。
+///
+/// 目标码率（`EncodeRates::bitrate_kbps` / 档位上限）当作**峰值**：复杂画面可以打到
+/// 它，静止/简单画面则明显低于它。远程桌面绝大多数时间属于后者。
+const VBR_MEAN_PERCENT: u32 = 70;
 
 /// 枚举到的一个 H.264 编码器 MFT。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,6 +581,9 @@ impl MftH264Encoder {
 
     /// 运行期修改目标码率，**不重建 MFT、不强制 IDR**。
     ///
+    /// 同时更新峰值与均值（峰值受限 VBR；编码器不支持时退回 CBR，见
+    /// [`apply_rate_control`]）。
+    ///
     /// # Errors
     /// MFT 未暴露 `ICodecAPI`、不支持 `CODECAPI_AVEncCommonMeanBitRate` 或
     /// `SetValue` 失败时返回 [`WinVideoError::Encode`]。
@@ -589,15 +601,7 @@ impl MftH264Encoder {
                 "编码器不支持运行期改码率（CODECAPI_AVEncCommonMeanBitRate）: {err}"
             )));
         }
-        let cbr = u32::try_from(eAVEncCommonRateControlMode_CBR.0).unwrap_or(0);
-        set_codec_u32(codec, &CODECAPI_AVEncCommonRateControlMode, cbr)
-            .map_err(|err| WinVideoError::Encode(format!("设置 CBR 失败: {err}")))?;
-        set_codec_u32(
-            codec,
-            &CODECAPI_AVEncCommonMeanBitRate,
-            kbps.saturating_mul(1000),
-        )
-        .map_err(|err| WinVideoError::Encode(format!("设置目标码率失败: {err}")))?;
+        apply_rate_control(codec, kbps.saturating_mul(1000))?;
         self.bitrate_kbps = kbps;
         Ok(())
     }
@@ -976,12 +980,48 @@ fn is_async_transform(transform: &IMFTransform) -> Result<bool, WinVideoError> {
     Ok(is_async)
 }
 
-/// 设置编码器的默认参数（CBR、码率、低延迟、无 B 帧）；失败只记 debug。
-fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32) {
+/// 设置码率控制：优先**峰值受限 VBR**，编码器不支持时回退 CBR。
+///
+/// # 为什么不是 CBR
+///
+/// 实测 Intel QSV（1080p@30fps、目标 8 Mbps）在**输入完全静止**时仍输出 21666 字节/帧
+/// （≈5.2 Mbps）——CBR 会插入填充数据把码流灌到目标码率。远程桌面一静止，上行就被白占；
+/// 改成峰值受限 VBR（均值 = 目标 × [`VBR_MEAN_PERCENT`]，峰值 = 目标）后，静止画面
+/// 回落到 ~3 KB/帧，复杂画面仍可打到目标峰值。
+///
+/// # Errors
+/// 连 CBR 的均值码率都设不进去时返回 [`WinVideoError::Encode`]（调用方按「编码器不可信、
+/// 重建」处理）。
+fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32) -> Result<(), WinVideoError> {
+    let vbr = u32::try_from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0).unwrap_or(1);
+    let mean = bitrate_bps.saturating_mul(VBR_MEAN_PERCENT) / 100;
+    // 逐项确认：有些 MFT 只认模式、不认峰值属性；任何一步失败都退回 CBR。
+    // SAFETY: `codec` 有效；`IsSupported` 只查询能力。
+    let peak_supported = unsafe { codec.IsSupported(&CODECAPI_AVEncCommonMaxBitRate) }.is_ok();
+    let vbr_applied = peak_supported
+        && set_codec_u32(codec, &CODECAPI_AVEncCommonRateControlMode, vbr).is_ok()
+        && set_codec_u32(codec, &CODECAPI_AVEncCommonMaxBitRate, bitrate_bps).is_ok()
+        && set_codec_u32(codec, &CODECAPI_AVEncCommonMeanBitRate, mean).is_ok();
+    if vbr_applied {
+        tracing::debug!(bitrate_bps, mean, "码率控制：峰值受限 VBR");
+        return Ok(());
+    }
+
+    tracing::debug!("编码器不支持峰值受限 VBR，回退 CBR");
     let cbr = u32::try_from(eAVEncCommonRateControlMode_CBR.0).unwrap_or(0);
+    set_codec_u32(codec, &CODECAPI_AVEncCommonRateControlMode, cbr)
+        .map_err(|err| WinVideoError::Encode(format!("设置 CBR 失败: {err}")))?;
+    set_codec_u32(codec, &CODECAPI_AVEncCommonMeanBitRate, bitrate_bps)
+        .map_err(|err| WinVideoError::Encode(format!("设置目标码率失败: {err}")))?;
+    Ok(())
+}
+
+/// 设置编码器的默认参数（码率控制、低延迟、无 B 帧）；失败只记 debug。
+fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32) {
+    if let Err(err) = apply_rate_control(codec, bitrate_bps) {
+        tracing::debug!(%err, "编码器拒绝码率控制参数，按 MFT 默认值继续");
+    }
     let settings = [
-        (&CODECAPI_AVEncCommonRateControlMode, cbr),
-        (&CODECAPI_AVEncCommonMeanBitRate, bitrate_bps),
         (&CODECAPI_AVEncCommonLowLatency, 1),
         (&CODECAPI_AVEncMPVDefaultBPictureCount, 0),
     ];

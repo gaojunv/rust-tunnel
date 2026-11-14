@@ -26,8 +26,8 @@
 //!
 //! # 关键配置
 //!
-//! - H.264 High profile、CBR、`frameIntervalP = 1`（无 B 帧）、
-//!   `gopLength = NVENC_INFINITE_GOPLENGTH`（无限 GOP）。
+//! - H.264 High profile、**峰值受限 VBR**（均值 = 峰值 × 70%）、`frameIntervalP = 1`
+//!   （无 B 帧）、`gopLength = NVENC_INFINITE_GOPLENGTH`（无限 GOP）。
 //! - `NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY`。
 //! - 只在调用方要求时用 `NV_ENC_PIC_FLAG_FORCEIDR` 产生 IDR（并同时
 //!   `OUTPUT_SPSPPS`，保证任何 IDR 都能独立解码）。
@@ -239,6 +239,11 @@ fn vbv_size(bps: u32) -> u32 {
     (bps / 2).max(1)
 }
 
+/// 峰值受限 VBR 的均值码率（峰值的 70%，与 MFT 路径保持一致）。
+fn vbr_average(peak_bps: u32) -> u32 {
+    (peak_bps.saturating_mul(70) / 100).max(1)
+}
+
 fn create_texture(
     device: &ID3D11Device,
     width: u32,
@@ -430,8 +435,11 @@ fn build_encode_config(
     config.gopLength = sys::NVENC_INFINITE_GOPLENGTH;
     // 1 = 只有 P 帧（无 B 帧）。
     config.frameIntervalP = 1;
-    config.rcParams.rateControlMode = sys::_NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-    config.rcParams.averageBitRate = bitrate_bps;
+    // 峰值受限 VBR：`averageBitRate` 是均值、`maxBitRate` 是峰值。远程桌面大部分时间
+    // 是静止/低变化画面，CBR 会把码率灌满目标值（白白占用上行）；VBR 让简单画面只花
+    // 需要的码率，复杂画面仍可打到峰值。取值与 MFT 路径的 `VBR_MEAN_PERCENT` 一致。
+    config.rcParams.rateControlMode = sys::_NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
+    config.rcParams.averageBitRate = vbr_average(bitrate_bps);
     config.rcParams.maxBitRate = bitrate_bps;
     config.rcParams.vbvBufferSize = vbv_size(bitrate_bps);
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
@@ -877,6 +885,8 @@ impl<'a> NvencEncoder<'a> {
 
     /// 在线修改目标码率，**不重建编码器、不插 IDR**。
     ///
+    /// `kbps` 是**峰值**；均值按 [`vbr_average`] 取峰值的 70%（峰值受限 VBR）。
+    ///
     /// # Errors
     /// `kbps == 0` 或驱动拒绝重配置时返回 [`WinVideoError`]。
     pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), WinVideoError> {
@@ -884,7 +894,7 @@ impl<'a> NvencEncoder<'a> {
             return Err(WinVideoError::Config("码率不能为 0".to_owned()));
         }
         let bps = kbps_to_bps(kbps);
-        self.config.rcParams.averageBitRate = bps;
+        self.config.rcParams.averageBitRate = vbr_average(bps);
         self.config.rcParams.maxBitRate = bps;
         self.config.rcParams.vbvBufferSize = vbv_size(bps);
         self.config.rcParams.vbvInitialDelay = self.config.rcParams.vbvBufferSize;
@@ -949,4 +959,24 @@ impl Drop for NvencEncoder<'_> {
 )]
 fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
     flag as i32 as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vbr_average;
+
+    #[test]
+    fn vbr_average_is_seventy_percent_of_peak() {
+        assert_eq!(vbr_average(10_000_000), 7_000_000);
+        assert_eq!(vbr_average(2_000_000), 1_400_000);
+        // 均值必须严格小于峰值，否则 VBR 退化成 CBR（远程桌面静止时仍灌满上行）。
+        for peak in [2_000_000, 6_000_000, 10_000_000] {
+            assert!(vbr_average(peak) < peak);
+        }
+        // 极小码率也不能算出 0：NVENC 会拒绝 0 码率。
+        assert_eq!(vbr_average(1), 1);
+        assert_eq!(vbr_average(0), 1);
+        // 极大值走饱和乘法，不 panic。
+        assert!(vbr_average(u32::MAX) > 0);
+    }
 }
