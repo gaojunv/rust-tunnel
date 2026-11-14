@@ -16,6 +16,7 @@
 pub mod clipboard_sync;
 pub mod desktop_follow;
 pub mod input_queue;
+pub mod nv12_renderer;
 pub mod reconnect;
 pub mod view_scale;
 // 实例（`--instance`）的采集/注入/剪贴板：win-platform 支撑 + 桌面绑定的专用线程。
@@ -980,6 +981,48 @@ pub struct SessionInputs {
 /// UI 线程读取（非阻塞）；「代」用于丢弃跨会话 / 被后续请求取代的陈旧结果。
 type ClipboardReadSlot = Arc<Mutex<Option<(u64, Result<String, String>)>>>;
 
+/// 本帧要画的画面：egui 纹理（CPU 路径）或 NV12 的 wgpu 回调（GPU 路径）。
+///
+/// `Clone` 是刻意的：没有新帧时 [`RemoteView::upload`] 直接复用上一帧的表述（`Arc` 共享
+/// NV12 数据，不复制像素），画面得以在静止时继续显示。
+#[derive(Clone)]
+pub enum FramePaint {
+    /// 已经上传好的 RGBA 纹理（VP9 路径或 NV12 的 CPU 回退），并带上远端像素尺寸。
+    Texture {
+        /// egui 纹理句柄。
+        id: egui::TextureId,
+        /// 远端画面宽度（像素）。
+        width: u32,
+        /// 远端画面高度（像素）。
+        height: u32,
+    },
+    /// 紧包 NV12：交给 wgpu 着色器直接采样上屏（Windows H.264 硬件路径）。
+    Nv12 {
+        /// 解码后的 NV12 两个平面。
+        frame: Arc<DecodedNv12>,
+        /// 可见画面宽度（像素）。
+        width: u32,
+        /// 可见画面高度（像素）。
+        height: u32,
+        /// 帧序号（GPU 侧据此去重上传）。
+        seq: u64,
+        /// egui 渲染目标格式（决定 shader 的片元入口）。
+        target_format: egui_wgpu::wgpu::TextureFormat,
+    },
+}
+
+impl FramePaint {
+    /// 远端画面的像素尺寸。
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Texture { width, height, .. } | Self::Nv12 { width, height, .. } => {
+                (*width, *height)
+            }
+        }
+    }
+}
+
 /// 远程会话窗口的 GUI 侧状态（纹理、输入边沿状态、独立窗口的展示态）。
 ///
 /// 会被 [`Arc<Mutex<RemoteView>>`] 共享给 deferred viewport 的回调（它可能在别的线程、也可能在
@@ -996,6 +1039,16 @@ pub struct RemoteView {
     texture: Option<egui::TextureHandle>,
     /// 当前纹理尺寸 `(宽, 高)`。
     tex_size: (u32, u32),
+    /// egui 渲染目标格式；仅当运行在 wgpu 上时 `Some`（Glow 下恒 `None`，走 CPU 回退）。
+    wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    /// 上一帧画出来的画面；没有新帧时复用它（避免画面在静止时消失）。
+    last_paint: Option<FramePaint>,
+    /// NV12 GPU 上传的本地帧序号（单调递增，**跨会话不重置**）。
+    ///
+    /// 不能用数据面的 `frame.seq` 去重：被控端每个会话都从 1 开始，而 GPU 资源
+    /// （`Nv12Resources`）活在 egui 的 `CallbackResources` 里、跨会话存活，撞号会让新会话的
+    /// 首帧被当成「同一帧」跳过上传，画面上留着上一场的画面。本地计数器与资源同寿命。
+    paint_seq: u64,
     /// 是否已安装 [`FrameSink`]。
     sink_installed: bool,
     /// 当前观看的显示器编号。
@@ -1097,6 +1150,9 @@ impl RemoteView {
             shared: Arc::new(Mutex::new(FrameState::default())),
             texture: None,
             tex_size: (0, 0),
+            wgpu_target_format: None,
+            last_paint: None,
+            paint_seq: 0,
             sink_installed: false,
             selected_display: None,
             inputs: SessionInputs::default(),
@@ -1144,9 +1200,16 @@ impl RemoteView {
     /// 这些字段在 `RemoteView` 上是**运行时镜像**：工具条改它们，`GuiApp` 每帧比对后回写
     /// `gui.toml`（见其 `sync_display_prefs`）。之所以镜像而非直接读偏好，是因为改动发生在
     /// deferred viewport 的回调里——那个回调与 `GuiApp::update` 不在同一时刻执行，只能靠共享状态传回。
+    ///
+    /// `wgpu_target_format` 来自 `eframe::CreationContext::wgpu_render_state`：`Some` 表示本次
+    /// 运行在 wgpu 上，NV12 帧可以走 GPU 着色器上屏；`None`（Glow）则沿用 CPU 回退。
     #[must_use]
-    pub fn from_prefs(prefs: &crate::prefs::GuiPrefs) -> Self {
+    pub fn from_prefs(
+        prefs: &crate::prefs::GuiPrefs,
+        wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    ) -> Self {
         let mut view = Self::new();
+        view.wgpu_target_format = wgpu_target_format;
         view.scale = prefs.remote_view_scale;
         view.window_size = prefs.remote_window_size;
         view.stats_overlay = prefs.remote_stats_overlay;
@@ -1181,6 +1244,7 @@ impl RemoteView {
     pub fn reset_session(&mut self) {
         self.texture = None;
         self.tex_size = (0, 0);
+        self.last_paint = None;
         self.last_mouse = None;
         self.gate.reset();
         self.capture_this_frame = false;
@@ -1262,6 +1326,7 @@ impl RemoteView {
             self.selected_display = Some(id);
             self.texture = None;
             self.tex_size = (0, 0);
+            self.last_paint = None;
             // 引擎会据此强制下一个关键帧（尺寸变了，差分基准失效）。
             manager.select_display(id);
         }
@@ -1273,35 +1338,69 @@ impl RemoteView {
         guard.closed.take()
     }
 
-    /// 把最新画面落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
+    /// 把最新画面落到纹理/GPU 回调，返回本帧要画的 [`FramePaint`]；无新画面时返回上一帧。
     ///
-    /// 每一帧都是**整帧**：VP9 给 RGBA；Windows H.264 硬件路径给紧包 NV12，这里先用 CPU
-    /// 转成 RGBA（阶段 1b 会换成 GPU 着色器），再走与 VP9 相同的纹理上传路径。
-    pub fn upload(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, u32, u32)> {
+    /// 每一帧都是**整帧**：VP9 给 RGBA；Windows H.264 硬件路径给紧包 NV12。NV12 在 wgpu
+    /// 渲染器下直接交给着色器（Y/UV 两张纹理 + BT.709 转换，GPU 负责缩放）；没有 wgpu
+    /// （Glow / 无 render state）时保留 CPU 回退，转成 RGBA 后走与 VP9 相同的纹理路径。
+    pub fn upload(&mut self, ctx: &egui::Context) -> Option<FramePaint> {
         let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
-                if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
-                    let (width, height) = (frame.width, frame.height);
-                    if self.texture.is_some() && self.tex_size == (width, height) {
-                        if let Some(texture) = self.texture.as_mut() {
-                            texture.set(image, egui::TextureOptions::LINEAR);
-                        }
-                    } else {
-                        self.texture = Some(ctx.load_texture(
-                            "remote-frame",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
+                if let Some(nv12) = frame.nv12 {
+                    if let Some(target_format) = self.wgpu_target_format {
+                        // GPU 路径：不在 UI 线程做任何逐像素转换，只包一层 `Arc`。
+                        let (width, height) = (frame.width, frame.height);
+                        self.tex_size = (width, height);
+                        // 用本地序号（见 `paint_seq` 的文档），不直接用 `frame.seq`。
+                        self.paint_seq = self.paint_seq.wrapping_add(1);
+                        let paint = FramePaint::Nv12 {
+                            frame: Arc::new(nv12),
+                            width,
+                            height,
+                            seq: self.paint_seq,
+                            target_format,
+                        };
+                        self.last_paint = Some(paint.clone());
+                        return Some(paint);
                     }
-                    self.tex_size = (width, height);
+                    // 无 wgpu：CPU 回退（过渡路径）。
+                    if let Some(image) =
+                        nv12_to_color_image(&nv12, frame.width, frame.height, pixel_w, pixel_h)
+                    {
+                        self.upload_texture(ctx, image, frame.width, frame.height);
+                    }
+                } else if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
+                    self.upload_texture(ctx, image, frame.width, frame.height);
                 }
             }
         }
 
-        self.texture
-            .as_ref()
-            .map(|texture| (texture.id(), self.tex_size.0, self.tex_size.1))
+        self.last_paint.clone()
+    }
+
+    /// 把 RGBA 图像落到 egui 纹理，并把 `last_paint` 更新为纹理表述。
+    fn upload_texture(
+        &mut self,
+        ctx: &egui::Context,
+        image: egui::ColorImage,
+        width: u32,
+        height: u32,
+    ) {
+        if self.texture.is_some() && self.tex_size == (width, height) {
+            if let Some(texture) = self.texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            }
+        } else {
+            self.texture =
+                Some(ctx.load_texture("remote-frame", image, egui::TextureOptions::LINEAR));
+        }
+        self.tex_size = (width, height);
+        self.last_paint = self.texture.as_ref().map(|texture| FramePaint::Texture {
+            id: texture.id(),
+            width,
+            height,
+        });
     }
 
     /// 捕获会话窗口内的鼠标/键盘并转成 [`InputEvent`] 投递给引擎。

@@ -27,8 +27,9 @@ use rust_tunnel_remote::{
     ActiveSessionInfo, QualityPreset, RemoteManager, RemoteUiState, SessionRole, TransportPath,
 };
 
+use crate::remote::nv12_renderer::Nv12Callback;
 use crate::remote::{
-    display_size, RemoteView, ViewScale, WindowSize, MIN_INNER, TOOLBAR_FALLBACK_HEIGHT,
+    display_size, FramePaint, RemoteView, ViewScale, WindowSize, MIN_INNER, TOOLBAR_FALLBACK_HEIGHT,
 };
 use crate::ui::remote::state_label;
 
@@ -558,7 +559,7 @@ fn scale_selector(ui: &mut Ui, v: &mut RemoteView) {
 
 /// 画面区域：按缩放档位决定绘制尺寸。`Fit` 等比铺满可用区域；固定档位用滚动区承载溢出。
 fn scene(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, active: &ActiveSessionInfo) {
-    let Some((texture, width, height)) = v.upload(ui.ctx()) else {
+    let Some(paint) = v.upload(ui.ctx()) else {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("等待画面…").weak());
@@ -566,36 +567,56 @@ fn scene(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, active: 
         });
         return;
     };
+    let (width, height) = paint.size();
     let avail = ui.available_size();
     let want = display_size(v.scale, avail, (width, height));
     if v.scale == ViewScale::Fit {
-        paint_image(ui, v, manager, active, (texture, width, height), want);
+        paint_image(ui, v, manager, active, &paint, want);
     } else {
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            paint_image(ui, v, manager, active, (texture, width, height), want);
+            paint_image(ui, v, manager, active, &paint, want);
         });
     }
 }
 
-/// 画一张画面并（完全控制模式时）在其上捕获输入。`image` 为 `(纹理, 远端像素宽, 高)`。
+/// 画一张画面并（完全控制模式时）在其上捕获输入。
+///
+/// 纹理路径直接 `painter().image`；NV12 路径挂一个 `egui_wgpu` 回调（Y/UV 纹理 + 着色器，
+/// GPU 完成 BT.709 转换与缩放）。回调只在 wgpu 渲染器下被调用——`RemoteView::upload` 只在
+/// 拿到 `wgpu_render_state` 时才返回 [`FramePaint::Nv12`]，故 Glow 下不会走到这里。
 fn paint_image(
     ui: &mut Ui,
     v: &mut RemoteView,
     manager: &Arc<RemoteManager>,
     active: &ActiveSessionInfo,
-    image: (egui::TextureId, u32, u32),
+    image: &FramePaint,
     size: egui::Vec2,
 ) {
-    let (texture, _width, _height) = image;
     // 仍然要占位分配这个区域（布局与可交互性不能变），但输入捕获不再依赖 `response`
     // （见 `RemoteView::capture_input`：`hovered()` 会被 egui 的交互簿记影响）。
     let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-    ui.painter().image(
-        texture,
-        rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
+    match image {
+        FramePaint::Texture { id, .. } => {
+            ui.painter().image(
+                *id,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        FramePaint::Nv12 { frame, width, height, seq, target_format } => {
+            ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                rect,
+                Nv12Callback {
+                    frame: Arc::clone(frame),
+                    width: *width,
+                    height: *height,
+                    seq: *seq,
+                    target_format: *target_format,
+                },
+            ));
+        }
+    }
     // 只有「完全控制」模式捕获输入：仅观看 / 仅文件传输不该注入键鼠。
     if active.mode == RemoteMode::Control {
         // 坐标按所选显示器的尺寸映射（由 `capture_input` 内部取），与纹理是否缩放无关。
