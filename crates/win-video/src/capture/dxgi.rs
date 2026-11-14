@@ -9,8 +9,8 @@
 //!   等 [`FIRST_FRAME_TIMEOUT`]，之后每次最多等 [`NEXT_FRAME_POLL_TIMEOUT`]，超时
 //!   就复用上一帧；只有在**从未采到过帧**时才报错。
 //! - [`CaptureSource::capture_texture_with_change`] 把「超时/只有指针更新」如实报成
-//!   `false`：这些是**合成器层面**没有新帧，不是像素比较。它只是廉价的第一道闸门
-//!   （过滤 `AcquireNextFrame` 超时），**不**等于像素级去重——有帧仍可能像素不变。
+//!   `false`；拿到桌面资源后还会过一遍 [`super::change`] 的像素级检测（DXGI 的
+//!   「有新帧」仍可能是内容不变的帧）。两层都通过才返回 `true`。
 //! - `DXGI_ERROR_ACCESS_LOST`（切换分辨率/HDR/安全桌面、显卡驱动重置等）会触发
 //!   一次重建：重新枚举该 HMONITOR 的输出并 `DuplicateOutput`，然后重试一次；
 //!   重试仍失败才把错误交给调用方。
@@ -49,6 +49,9 @@ struct DxgiSource {
     last: Option<CapturedFrame>,
     /// 持久 BGRA 纹理池（GPU 路径）；尺寸/格式变化时重建。
     textures: Option<TexturePool>,
+    /// 像素级变化检测（GPU 路径）。DXGI 的「超时」已是很好的合成器信号，这里再兜一层：
+    /// 只有指针更新、或桌面帧内容其实没变时，仍然值得跳过编码。
+    change: super::change::TextureChangeTracker,
     /// 最近一次 GPU 采集结果（无新帧时返回它的克隆）。
     last_texture: Option<CapturedTexture>,
 }
@@ -206,9 +209,10 @@ impl DxgiSource {
         }
         match texture {
             Some(texture) => {
+                // 真的拷到了桌面图像，再用像素级检测确认**内容**是否变化。
+                let changed = self.change.changed(&self.d3d, &texture);
                 self.last_texture = Some(texture.clone());
-                // `AcquireNextFrame` 成功且真的拷了桌面资源 → 这是一帧新内容。
-                Ok((texture, true))
+                Ok((texture, changed))
             }
             // 只有指针更新、没有新的桌面图像：复用上一张，且告诉上层别编码。
             None => self
@@ -346,6 +350,7 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         reader: BgraReader::default(),
         last: None,
         textures: None,
+        change: super::change::TextureChangeTracker::new(),
         last_texture: None,
     }))
 }
