@@ -334,12 +334,12 @@ impl EncodeOptions {
 /// AIMD 在上限之下浮动（弱网时可能低于档位标称值）。UI 选择器因此显示的是「最高给到多少」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum QualityPreset {
-    /// 流畅：半分辨率 + 低码率 + 8 fps（上限）。窄带/跨地域中继场景。
+    /// 流畅：半分辨率 + 2 Mbps + 20 fps（上限）。窄带/跨地域中继场景。
     Smooth,
-    /// 均衡：原始分辨率（≤ [`crate::video::MAX_ENCODE_WIDTH`]）+ 中码率 + 12 fps（上限）。默认档。
+    /// 均衡：原始分辨率（≤ [`crate::video::MAX_ENCODE_WIDTH`]）+ 6 Mbps + 30 fps（上限）。默认档。
     #[default]
     Balanced,
-    /// 高清：原始分辨率（≤ 封顶宽度）+ 高码率 + 20 fps（上限）。同内网直连场景。
+    /// 高清：原始分辨率（≤ 封顶宽度）+ 10 Mbps + 60 fps（上限）。同内网直连场景。
     Hd,
 }
 
@@ -349,19 +349,19 @@ impl QualityPreset {
     pub fn options(self) -> EncodeOptions {
         match self {
             Self::Smooth => EncodeOptions {
-                target_bitrate_kbps: 1200,
+                target_bitrate_kbps: 2000,
                 scale: 0.5,
-                max_fps: 8,
+                max_fps: 20,
             },
             Self::Balanced => EncodeOptions {
-                target_bitrate_kbps: 4000,
+                target_bitrate_kbps: 6000,
                 scale: 1.0,
-                max_fps: 12,
+                max_fps: 30,
             },
             Self::Hd => EncodeOptions {
-                target_bitrate_kbps: 8000,
+                target_bitrate_kbps: 10_000,
                 scale: 1.0,
-                max_fps: 20,
+                max_fps: 60,
             },
         }
     }
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(opts.capture_interval(), std::time::Duration::from_millis(1000));
         assert_eq!(
             QualityPreset::Hd.options().capture_interval(),
-            std::time::Duration::from_millis(50)
+            std::time::Duration::from_millis(1000 / 60)
         );
     }
 }

@@ -36,7 +36,7 @@ use crate::auth::{ack_mac, PendingSessions};
 use crate::codec::{vp9_encoder_factory, VideoEncoderApi, VideoEncoderFactory};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::qos::{Feedback, RateController};
+use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{Clipboard, EncodeOptions, EncodeRates, InputSink, RawFrame, ScreenSource};
 use crate::session::{
     trusted_rtt, CodecId, SessionCodec, SessionEnd, SessionFrame, SessionMessage, HEARTBEAT_INTERVAL,
@@ -404,6 +404,11 @@ pub async fn run_controlled(
     let mut capture_timeouts: u32 = 0;
     // 首帧（或切显示器/切档位/收到 RequestKeyframe 之后）必须先发关键帧：解码侧要有可重建的参考。
     let mut force_keyframe = true;
+    // 上一次 QoS 日志的签名（动作 + 码率 + 帧率 + 缩放）。稳定的 Hold 不逐秒刷屏；只有动作
+    // 或生效值变化才记一条 info（GUI 日志层会丢 tracing 字段，故全部内联进消息文本）。
+    // **码率必须进签名**：降级阶段通常连续多次 Decrease、只有码率在变，漏掉它就会整段降码率
+    // 过程只剩第一条日志。缩放用 `to_bits()` 比较：判「是否变化」只需逐位相等。
+    let mut last_qos_log: Option<(QosAction, u32, u8, u32)> = None;
     // RTT 样本：发 `Heartbeat` 时记时刻，收到 `HeartbeatAck` 时配对算 RTT。**复用既有心跳往返**，
     // 不新增数据面变体（见 `HEARTBEAT_INTERVAL`）。
     let mut pending_heartbeat: Option<Instant> = None;
@@ -433,7 +438,7 @@ pub async fn run_controlled(
                         capture_timeouts = 0;
                         if let Some(frame) = frame {
                             debug!(capture_ms, "采集一帧");
-                            let job = EncodeJob { display: display_id, rates: encode, force_keyframe, frame };
+                            let job = EncodeJob { display: display_id, rates: encode, force_keyframe, capture_ms, frame };
                             // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
                             // 帧（等价降帧率）。关键帧请求保留到真正投递成功的那一次。
                             match encode_tx.try_send(job) {
@@ -543,18 +548,28 @@ pub async fn run_controlled(
                             if decision.force_keyframe {
                                 force_keyframe = true;
                             }
-                            debug!(
-                                rtt_ms,
-                                recv_kbps,
-                                decode_ms,
-                                backlog,
-                                local_backlog,
-                                action = ?decision.action,
-                                bitrate_kbps = encode.bitrate_kbps,
-                                fps = encode.fps,
-                                scale = encode.scale,
-                                "QoS 决策"
+                            let signature = (
+                                decision.action,
+                                encode.bitrate_kbps,
+                                encode.fps,
+                                encode.scale.to_bits(),
                             );
+                            if last_qos_log != Some(signature) {
+                                last_qos_log = Some(signature);
+                                info!(
+                                    "QoS 调整 action={:?} rtt={}ms baseline={:?} recv_kbps={} decode_ms={} backlog={} local_backlog={} bitrate_kbps={} fps={} scale={:.3}",
+                                    decision.action,
+                                    rtt_ms,
+                                    rate.baseline_rtt_ms(),
+                                    recv_kbps,
+                                    decode_ms,
+                                    backlog,
+                                    local_backlog,
+                                    encode.bitrate_kbps,
+                                    encode.fps,
+                                    encode.scale,
+                                );
+                            }
                         }
                         SessionMessage::RequestKeyframe { display } => {
                             // 控制器解码失败/丢弃了参考帧时的恢复请求。
@@ -789,6 +804,8 @@ struct EncodeJob {
     rates: EncodeRates,
     /// 本帧是否强制关键帧。
     force_keyframe: bool,
+    /// 本帧的采集耗时（毫秒），只进统计、不参与控制决策。
+    capture_ms: u64,
     /// 原始帧。
     frame: RawFrame,
 }
@@ -831,6 +848,8 @@ struct EncodeStatsWindow {
     bytes: u64,
     /// 本窗口编码耗时合计（毫秒）。
     encode_ms: u64,
+    /// 本窗口采集耗时合计（毫秒，与被编码的帧一起计）。
+    capture_ms: u64,
 }
 
 impl EncodeStatsWindow {
@@ -840,14 +859,16 @@ impl EncodeStatsWindow {
             frames: 0,
             bytes: 0,
             encode_ms: 0,
+            capture_ms: 0,
         }
     }
 
-    /// 记一帧的产出与耗时。
-    fn record(&mut self, bytes: usize, encode_ms: u64) {
+    /// 记一帧的产出与耗时（采集 + 编码）。
+    fn record(&mut self, bytes: usize, encode_ms: u64, capture_ms: u64) {
         self.frames = self.frames.saturating_add(1);
         self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         self.encode_ms = self.encode_ms.saturating_add(encode_ms);
+        self.capture_ms = self.capture_ms.saturating_add(capture_ms);
     }
 
     /// 到点则上报一次并重置窗口。`bitrate_kbps` 是**当前生效的目标码率**（闭环值，非实测出码率）。
@@ -868,8 +889,14 @@ impl EncodeStatsWindow {
         } else {
             u32::try_from(self.encode_ms / u64::from(self.frames)).unwrap_or(u32::MAX)
         };
+        let capture_ms = if self.frames == 0 {
+            0
+        } else {
+            u32::try_from(self.capture_ms / u64::from(self.frames)).unwrap_or(u32::MAX)
+        };
         stats.report(SessionStats::Encode {
             encode_ms,
+            capture_ms,
             fps,
             bitrate_kbps,
         });
@@ -877,6 +904,7 @@ impl EncodeStatsWindow {
         self.frames = 0;
         self.bytes = 0;
         self.encode_ms = 0;
+        self.capture_ms = 0;
     }
 }
 
@@ -931,6 +959,7 @@ async fn encode_loop(
             display,
             rates,
             force_keyframe,
+            capture_ms,
             frame,
         } = job;
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
@@ -1014,7 +1043,7 @@ async fn encode_loop(
                     continue;
                 }
                 seq = seq.wrapping_add(1);
-                window.record(packet.data.len(), encode_ms);
+                window.record(packet.data.len(), encode_ms, capture_ms);
                 let mut flags = 0u8;
                 if geometry_changed {
                     flags |= VIDEO_FLAG_CONFIG;
@@ -1786,6 +1815,7 @@ mod tests {
                 display: 0,
                 rates: hi,
                 force_keyframe: true,
+                capture_ms: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -1799,6 +1829,7 @@ mod tests {
                 display: 0,
                 rates: lo,
                 force_keyframe: false,
+                capture_ms: 0,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -1846,6 +1877,7 @@ mod tests {
                 display: 0,
                 rates: hi,
                 force_keyframe: true,
+                capture_ms: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -1858,6 +1890,7 @@ mod tests {
                 display: 0,
                 rates: half,
                 force_keyframe: false,
+                capture_ms: 0,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -1960,6 +1993,7 @@ mod tests {
                 display: 0,
                 rates: EncodeRates::ceiling(EncodeOptions::default()),
                 force_keyframe: true,
+                capture_ms: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -2017,6 +2051,7 @@ mod tests {
             display: 0,
             rates: opts,
             force_keyframe: force,
+            capture_ms: 0,
             frame,
         };
         let placeholder = || WriterMsg::Frame(SessionFrame::control(SessionMessage::Heartbeat));
