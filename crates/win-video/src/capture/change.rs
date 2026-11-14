@@ -84,6 +84,49 @@ const PIXEL_DELTA: u8 = 3;
 /// 输入视图缓存上限（采集纹理池是 4 张，池重建的过渡期再留一倍余量）。
 const MAX_CACHED_INPUT_VIEWS: usize = 8;
 
+/// 一次变化检测的结果。
+///
+/// 除了「有没有变」，还给出**变化面积**：网格里超过 [`PIXEL_DELTA`] 的字节数与总字节数之比
+/// （千分比）。它是引擎侧「按内容活跃度收紧码率/帧率」的输入（见 `crates/remote` 的
+/// `qos::RateController::observe_activity`）：打字/菜单这类 UI 操作只占几个千分点，
+/// 拖窗/滚动/视频会占几十到几百个千分点。
+///
+/// 面积是**字节占比**而不是「格点占比」的近似：NV12 里 Y 平面每格点 1 字节、UV 平面每对
+/// 像素 2 字节，直接数超阈值的字节即可，无需按平面归一化。它用于分档（<5% / >20%），
+/// 不追求精确。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeReport {
+    /// 画面是否有可见变化（与旧 `bool` 返回值同义）。
+    pub changed: bool,
+    /// 变化面积（千分比，`0..=1000`）。`changed == false` 时恒为 0。
+    ///
+    /// `changed == true` 但面积为 0 只可能来自调用方自己构造的「面积未知」，本模块不会产出
+    /// 这种组合：检测失败/首帧一律给 [`Self::changed_all`]（1000，保守 = 不压制码率）。
+    pub changed_permille: u16,
+}
+
+impl ChangeReport {
+    /// 无变化（面积恒为 0）。
+    #[must_use]
+    pub const fn unchanged() -> Self {
+        Self {
+            changed: false,
+            changed_permille: 0,
+        }
+    }
+
+    /// 有变化且面积未知（按满帧处理，保守地不压制码率/帧率）。
+    ///
+    /// 用于首帧、检测器不可用、读网格失败，以及「采集后端没有新帧」之外的保守路径。
+    #[must_use]
+    pub const fn changed_all() -> Self {
+        Self {
+            changed: true,
+            changed_permille: 1000,
+        }
+    }
+}
+
 /// 每个采集源一个的变化检测器（**只尝试构造一次**）。
 ///
 /// 采集源在 `WGC` / `DXGI` 两条路径里各持有一个；构造失败后永久退回「有变化」，
@@ -111,25 +154,25 @@ impl TextureChangeTracker {
         }
     }
 
-    /// 判断这一帧与上一帧是否有可见差异。
+    /// 判断这一帧与上一帧是否有可见差异，并给出变化面积。
     ///
-    /// 首帧、检测器尚未初始化、以及任何内部失败都返回 `true`——宁可多编码一帧，
-    /// 也不能丢画面。
-    pub(crate) fn changed(&mut self, device: &D3d11, frame: &CapturedTexture) -> bool {
+    /// 首帧、检测器尚未初始化、以及任何内部失败都返回 [`ChangeReport::changed_all`]——宁可
+    /// 多编码一帧，也不能丢画面，更不能把「面积未知」当成「没变化」去压制码率。
+    pub(crate) fn changed(&mut self, device: &D3d11, frame: &CapturedTexture) -> ChangeReport {
         match &mut self.state {
             State::Ready(detector) if detector.matches(frame) => detector.changed(frame),
-            State::Unavailable => true,
+            State::Unavailable => ChangeReport::changed_all(),
             // 未初始化或尺寸/格式变了：重建（每个采集源只会走有限次）。
             _ => match ChangeDetector::new(device, frame) {
                 Ok(mut detector) => {
-                    let changed = detector.changed(frame);
+                    let report = detector.changed(frame);
                     self.state = State::Ready(detector);
-                    changed
+                    report
                 }
                 Err(err) => {
                     tracing::debug!(error = %err, "GPU 变化检测不可用，退回逐帧编码");
                     self.state = State::Unavailable;
-                    true
+                    ChangeReport::changed_all()
                 }
             },
         }
@@ -311,27 +354,52 @@ impl ChangeDetector {
         self.input_key == (desc.Width, desc.Height, desc.Format)
     }
 
-    /// 判断这一帧与上一帧是否有可见差异；首帧恒为 `true`。
+    /// 判断这一帧与上一帧是否有可见差异，并统计变化面积；首帧恒为「有变化、满面积」。
     ///
-    /// 比较失败（Blt/Map 出错）时也返回 `true`：宁可多编码一帧，也不能丢画面。
-    fn changed(&mut self, frame: &CapturedTexture) -> bool {
+    /// 比较失败（Blt/Map 出错、网格为空）时也返回 [`ChangeReport::changed_all`]：宁可多编码
+    /// 一帧，也不能丢画面；面积给满则不会让引擎误把失败当成「静止」而收紧码率。
+    fn changed(&mut self, frame: &CapturedTexture) -> ChangeReport {
         let started = Instant::now();
         let Ok(current) = self.read_grid(frame) else {
-            return true;
+            return ChangeReport::changed_all();
         };
-        let changed = self.previous.len() != current.len()
-            || self
+        if current.is_empty() {
+            // 读回成功但没有任何像素（Map 返回空指针/行距为 0）：等价于失败，保守处理。
+            return ChangeReport::changed_all();
+        }
+        let report = if self.previous.len() == current.len() {
+            let differing = self
                 .previous
                 .iter()
                 .zip(current.iter())
-                .any(|(before, now)| before.abs_diff(*now) > PIXEL_DELTA);
+                .filter(|(before, now)| before.abs_diff(**now) > PIXEL_DELTA)
+                .count();
+            if differing == 0 {
+                ChangeReport::unchanged()
+            } else {
+                // 千分比 = 超阈值字节数 / 总字节数；至少记 1（有变化就绝不报 0）。
+                let permille = differing
+                    .saturating_mul(1000)
+                    .checked_div(current.len())
+                    .unwrap_or(1000)
+                    .clamp(1, 1000);
+                ChangeReport {
+                    changed: true,
+                    changed_permille: u16::try_from(permille).unwrap_or(1000),
+                }
+            }
+        } else {
+            // 首帧（或网格尺寸变化）：没有基准，按满面积处理。
+            ChangeReport::changed_all()
+        };
         self.previous = current;
         tracing::trace!(
-            changed,
+            changed = report.changed,
+            changed_permille = report.changed_permille,
             micros = u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX),
             "变化检测"
         );
-        changed
+        report
     }
 
     /// 把采集纹理缩到网格并读回（Y + UV）。
@@ -584,10 +652,14 @@ mod tests {
             eprintln!("跳过变化检测测试：本端不支持 VideoProcessor 变化检测");
             return;
         };
-        assert!(detector.changed(&frame), "首帧没有基准，必须判为有变化");
         assert!(
-            !detector.changed(&frame),
-            "同一张纹理连续两次必须是「无变化」（否则静止闸门失效）"
+            detector.changed(&frame).changed,
+            "首帧没有基准，必须判为有变化"
+        );
+        assert_eq!(
+            detector.changed(&frame),
+            ChangeReport::unchanged(),
+            "同一张纹理连续两次必须是「无变化、零面积」（否则静止闸门失效）"
         );
     }
 
@@ -623,13 +695,46 @@ mod tests {
                 eprintln!("跳过变化检测测试：本端不支持 VideoProcessor 变化检测");
                 return;
             };
-            // 第一帧建立基准（首帧恒为 `true`），第二帧才是真正的比较。
-            assert!(detector.changed(&base));
+            // 第一帧建立基准（首帧恒为「有变化」），第二帧才是真正的比较。
+            assert!(detector.changed(&base).changed);
             assert!(
-                detector.changed(&changed_frame),
+                detector.changed(&changed_frame).changed,
                 "16×16 的变化在 ({left}, {top}) 漏检（检查网格密度与缩放矩形是否覆盖整帧）"
             );
         }
+    }
+
+    /// 变化面积只覆盖真正变化的区域：4K 上一个 16×16 白块远小于满帧，千分比必须落在
+    /// `(0, 1000)` 之间（这正是「UI 操作」档的依据）。
+    #[test]
+    fn change_area_is_small_for_a_tiny_block() {
+        let Some(device) = hardware_device() else {
+            return;
+        };
+        let Some(base_texture) = create_texture(&device.device, &base_pixels()) else {
+            eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+            return;
+        };
+        let base = captured(&device, base_texture);
+        let center = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2);
+        let Some(texture) = create_texture(&device.device, &block_pixels(center.0, center.1)) else {
+            eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+            return;
+        };
+        let changed_frame = captured(&device, texture);
+        let Ok(mut detector) = ChangeDetector::new(&device, &base) else {
+            eprintln!("跳过变化检测测试：本端不支持 VideoProcessor 变化检测");
+            return;
+        };
+        // 首帧建立基准。
+        assert!(detector.changed(&base).changed);
+        let report = detector.changed(&changed_frame);
+        assert!(report.changed, "16×16 白块必须被检出");
+        assert!(
+            report.changed_permille > 0 && report.changed_permille < 1000,
+            "小块面积必须严格小于满帧（实际 {}）",
+            report.changed_permille
+        );
     }
 }
 

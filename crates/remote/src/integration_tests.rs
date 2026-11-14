@@ -46,6 +46,8 @@ fn solid(display: u32, w: u32, h: u32, color: [u8; 4]) -> RawFrame {
         rgba,
         gpu: None,
         changed: true,
+        // CPU 假帧没有像素级变化面积，按满帧处理。
+        changed_permille: 1000,
     }
 }
 

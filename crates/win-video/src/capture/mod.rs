@@ -31,11 +31,12 @@
 //! - 代价是静止画面会被上层重复送进编码器，是否跳过重复帧由调用方按自身节奏
 //!   决定。返回的帧不携带序号，调用方如需去重可自行比较（或改用带事件回调的
 //!   采集循环，本同步契约刻意不做）。
-//! - GPU 路径的 `bool` 是**两层**判断：先看「本次是否真的拿到了新帧」（能过滤
+//! - GPU 路径的 [`ChangeReport`] 是**两层**判断：先看「本次是否真的拿到了新帧」（能过滤
 //!   WGC/DXGI 的超时拍），拿到新帧后再过一遍 [`change`] 的**像素级变化检测**
-//!   （VideoProcessor 缩到 320×180 + staging 回读比较，4K 实测 ~0.36 ms/帧）。
-//!   这是 GPU 路径「静止桌面不编码」的来源：只靠合成器信号做不到，因为 WGC 在
-//!   静止桌面上仍持续产帧。**不要**用 CPU 整帧读回比较代替它——那会把零拷贝的
+//!   （VideoProcessor 缩到 320×180 + staging 回读比较，4K 实测 ~0.36 ms/帧）。报告里的
+//!   `changed` 决定要不要跳过编码，`changed_permille`（变化面积千分比）供引擎按内容活跃度
+//!   收紧码率/帧率。这是 GPU 路径「静止桌面不编码」的来源：只靠合成器信号做不到，因为
+//!   WGC 在静止桌面上仍持续产帧。**不要**用 CPU 整帧读回比较代替它——那会把零拷贝的
 //!   收益全部吃掉。网格取 320×180 而不更稀（例如旧的 128×72）是因为 VideoProcessor
 //!   大比例缩小时是**点采样**：128×72 在 4K 上只抽 1/900 的像素，16×16 的变化只有
 //!   约一半概率被看到；320×180 把密度提到 4 倍而检测耗时不变。
@@ -46,6 +47,8 @@
 mod change;
 mod dxgi;
 mod wgc;
+
+pub use change::ChangeReport;
 
 use crate::d3d11;
 use crate::WinVideoError;
@@ -466,31 +469,31 @@ pub trait CaptureSource: Send {
         ))
     }
 
-    /// 采集一帧 GPU 纹理，并报告**画面内容自上次采集以来是否有可见变化**。
+    /// 采集一帧 GPU 纹理，并报告**画面内容自上次采集以来是否有可见变化**（含变化面积）。
     ///
-    /// 返回 `Ok((texture, false))` 表示这一拍可以跳过编码：要么超时内没有新帧
-    /// （`texture` 是上一次的画面），要么拿到了新帧但**像素完全一致**。`true` 表示
-    /// 内容确实变了。
+    /// 返回 `Ok((texture, ChangeReport::unchanged()))` 表示这一拍可以跳过编码：要么超时内
+    /// 没有新帧（`texture` 是上一次的画面），要么拿到了新帧但**像素完全一致**。
+    /// `report.changed == true` 表示内容确实变了；`report.changed_permille` 是变化面积
+    /// （千分比），供引擎按内容活跃度收紧码率/帧率。
     ///
     /// WGC / DXGI 的实现是**两层判断**：① 本次是否真的拿到了新帧（过滤
     /// `TryGetNextFrame` / `AcquireNextFrame` 超时）；② 拿到后过一遍 [`change`] 的
     /// 像素级检测。第二层不可少——实测 WGC 在基本静止的桌面上仍按合成器节奏持续
     /// 产帧（120 次采集里 119 次在 0.2 ms 内拿到新帧），只看「有新帧」根本省不下
-    /// 带宽。检测器构造失败或内部出错时保守返回 `true`（宁可多编码一帧）。
+    /// 带宽。检测器构造失败或内部出错时保守返回 [`ChangeReport::changed_all`]
+    /// （宁可多编码一帧，面积给满也不会误压码率）。
     ///
-    /// 默认实现保留旧语义（永远认为有变化），因此只实现 [`Self::capture_texture`]
-    /// 的后端行为不变。**不要**用 CPU 整帧读回比较代替它——把纹理拷回内存既慢又
-    /// 会吃掉零拷贝的收益。
-    ///
-    /// 默认实现保留旧语义（永远认为有更新），因此只实现 [`Self::capture_texture`]
-    /// 的后端行为不变。
+    /// 默认实现保留旧语义（永远认为有变化、面积未知），因此只实现
+    /// [`Self::capture_texture`] 的后端行为不变。**不要**用 CPU 整帧读回比较代替它——
+    /// 把纹理拷回内存既慢又会吃掉零拷贝的收益。
     ///
     /// # Errors
     /// 与 [`Self::capture_texture`] 相同。
     fn capture_texture_with_change(
         &mut self,
-    ) -> Result<(CapturedTexture, bool), WinVideoError> {
-        self.capture_texture().map(|texture| (texture, true))
+    ) -> Result<(CapturedTexture, ChangeReport), WinVideoError> {
+        self.capture_texture()
+            .map(|texture| (texture, ChangeReport::changed_all()))
     }
 
     /// 采集源使用的 D3D11 设备（编解码需要与采集共用同一设备）。

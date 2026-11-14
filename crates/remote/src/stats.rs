@@ -29,6 +29,18 @@ pub enum SessionStats {
         bitrate_kbps: u32,
         /// 本上报窗口内因「无变化」而跳过的帧数（不编码、不发送）。
         skipped: u32,
+        /// 本上报窗口内的**关键帧**数（`VideoPacket.keyframe` 为真）。
+        keyframes: u32,
+        /// 本窗口关键帧出码码率（kbps）。与 `p_kbps` 拆开后才看得出「字节到底花在 IDR
+        /// 还是普通帧」，这是定位带宽尖峰的观测面。
+        idr_kbps: u32,
+        /// 本窗口普通帧出码码率（kbps）。
+        p_kbps: u32,
+        /// 本窗口编码帧的**平均变化面积**（千分比，0..=1000）。
+        ///
+        /// 来自采集层的像素级变化检测：<5% 通常是 UI 操作，>20% 是运动/视频。它同时是
+        /// 内容自适应上限的输入（见 `qos::RateController::observe_activity`），这里只做展示。
+        changed_permille: u32,
     },
     /// 控制器**解码侧**读数（每秒一次，与 `QosFeedback` 同一节拍）。
     Decode {

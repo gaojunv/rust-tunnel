@@ -589,6 +589,8 @@ fn serve_capture(monitors: &[Monitor], req: CaptureRequest) {
                 gpu: None,
                 // GDI `BitBlt` 没有合成器变化信号，按旧语义恒为「可能变化」。
                 changed: true,
+                // 也没有便宜的像素级变化面积：按满帧处理（不压制码率）。
+                changed_permille: 1000,
             })
             .map_err(platform_err),
         None => Err(RemoteError::Platform(format!("显示器 {display} 不存在"))),

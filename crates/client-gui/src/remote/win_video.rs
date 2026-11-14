@@ -237,6 +237,8 @@ impl WinVideoScreen {
             gpu: None,
             // 这是 WGC 的 CPU 读回路径，没有便宜的变化信号，交由引擎按 memcmp 去重。
             changed: true,
+            // 面积未知 = 满帧：CPU 路径不参与按面积收紧码率。
+            changed_permille: 1000,
         })
     }
 
@@ -246,12 +248,13 @@ impl WinVideoScreen {
     /// 由引擎施加。任何一次失败都会**永久禁用**本进程的 GPU 路径并回退到
     /// [`Self::capture`]（CPU），而不是每帧重试。
     ///
-    /// 同时把采集层的**像素级**变化判断填进 [`RawFrame::changed`]，引擎据此跳过内容
-    /// 确实没变的那一拍（CPU 路径仍靠 memcmp）。采集后端会先过滤「没有新帧」的超时拍，
-    /// 再做 320×180 下采样 + 回读比较——只看「有没有新合成帧」不够，WGC 在静止桌面上
-    /// 仍按刷新节奏产帧。
+    /// 同时把采集层的**像素级**变化判断填进 [`RawFrame::changed`] 与变化面积
+    /// [`RawFrame::changed_permille`]：前者决定是否跳过这一拍，后者供被控端按内容活跃度
+    /// 收紧码率/帧率（CPU 路径仍靠 memcmp 去重，面积未知按满帧处理）。采集后端会先过滤
+    /// 「没有新帧」的超时拍，再做 320×180 下采样 + 回读比较——只看「有没有新合成帧」不够，
+    /// WGC 在静止桌面上仍按刷新节奏产帧。
     fn capture_gpu_frame(&self, display_id: u32) -> RemoteResult<RawFrame> {
-        let (captured, changed) = match self.with_source(display_id, |source| {
+        let (captured, change) = match self.with_source(display_id, |source| {
             source
                 .capture_texture_with_change()
                 .map_err(|err| RemoteError::Platform(format!("GPU 采集失败: {err}")))
@@ -278,7 +281,8 @@ impl WinVideoScreen {
                 source_width,
                 source_height,
             })),
-            changed,
+            changed: change.changed,
+            changed_permille: change.changed_permille,
         })
     }
 }
