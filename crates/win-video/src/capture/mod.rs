@@ -188,7 +188,66 @@ impl CapturedTexture {
             lease: None,
         }
     }
+
+    /// 把这张 GPU 纹理读回成自顶向下、紧凑排列的 BGRA8（同步阻塞）。
+    ///
+    /// 这是一次「GPU → CPU」拷贝，只给**不能直接吃纹理**的编码器用（例如 NVENC
+    /// 适配器）；QSV/VideoProcessor 的零拷贝路径不应调用它。每次调用会新建一张
+    /// staging 纹理——需要逐帧回读的热路径请改用 [`BgraReadback`] 复用 staging。
+    ///
+    /// # Errors
+    /// 纹理格式不是 BGRA8、`CopyResource`/`Map` 失败时返回 [`WinVideoError::Capture`]。
+    pub fn read_bgra(&self) -> Result<(u32, u32, Vec<u8>), WinVideoError> {
+        BgraReader::default().read(&self.device.device, &self.device.context, &self.texture)
+    }
 }
+
+/// 可复用的 GPU→CPU BGRA 回读器：staging 纹理按 `(宽, 高, 格式)` 缓存。
+///
+/// 用于「逐帧都要回读」的降级路径（NVENC 暂时不能直接吃采集纹理）。QSV 的
+/// VideoProcessor 零拷贝路径不使用它。
+#[derive(Default)]
+pub struct BgraReadback {
+    inner: BgraReader,
+    /// staging 纹理所属的设备；设备变化时整只回读器重置。
+    device: Option<Arc<d3d11::D3d11>>,
+}
+
+impl BgraReadback {
+    /// 构造一个尚未分配 staging 纹理的回读器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 读取 `captured` 的全部像素（自顶向下、紧凑 BGRA8）。
+    ///
+    /// # Errors
+    /// 纹理格式不是 BGRA8、`CopyResource`/`Map` 失败时返回 [`WinVideoError::Capture`]。
+    pub fn read(
+        &mut self,
+        captured: &CapturedTexture,
+    ) -> Result<(u32, u32, Vec<u8>), WinVideoError> {
+        // staging 纹理不能跨设备使用（`CopyResource` 要求同设备）：采集源重建换了
+        // 设备时把旧的丢掉。尺寸/格式变化由 `BgraReader` 自己处理。
+        let same_device = self
+            .device
+            .as_ref()
+            .is_some_and(|device| Arc::ptr_eq(device, &captured.device));
+        if !same_device {
+            self.inner = BgraReader::default();
+            self.device = Some(Arc::clone(&captured.device));
+        }
+        self.inner
+            .read(&captured.device.device, &captured.device.context, &captured.texture)
+    }
+}
+
+// 编译期断言：回读器要能随编码器适配器移进 `spawn_blocking`。
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<BgraReadback>();
+};
 
 impl Clone for CapturedTexture {
     /// 克隆共享池租约（引用计数归零才归还槽位）。

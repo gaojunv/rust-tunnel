@@ -21,6 +21,7 @@
 
 use crate::error::{RemoteError, RemoteResult};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// 每像素字节数（RGBA）。
 pub const BYTES_PER_PIXEL: usize = 4;
@@ -44,8 +45,24 @@ pub struct DisplayInfo {
     pub primary: bool,
 }
 
-/// 一帧原始 RGBA 画面（未编码）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 一帧**不落 CPU** 的平台 GPU 画面。
+///
+/// `remote` 保持平台无关：这里只有类型擦除（[`std::any::Any`]），Windows 的 D3D11
+/// 纹理由 `client-gui` 自己定义并实现本 trait，编码器适配器再用 `downcast_ref`
+/// 取回。**不要**往这个 trait 里加平台类型或像素方法。
+pub trait GpuFrame: Send + Sync {
+    /// 向下转型入口（平台实现直接返回 `self`）。
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// 一帧原始画面（未编码）。
+///
+/// 两种互斥的载体：
+/// - **CPU**：`rgba` 是 `width * height * 4` 的 RGBA8，`gpu` 为 `None`；
+/// - **GPU**：`gpu` 为 `Some`（平台纹理），此时 `rgba` 为空。`width`/`height` 仍是
+///   **逻辑编码尺寸**（已按 [`crate::video::MAX_ENCODE_WIDTH`] 封顶），可能与纹理的
+///   物理像素尺寸不同（4K 采集、1920 逻辑宽）。
+#[derive(Clone)]
 pub struct RawFrame {
     /// 来源显示器编号。
     pub display: u32,
@@ -53,16 +70,42 @@ pub struct RawFrame {
     pub width: u32,
     /// 高度（像素）。
     pub height: u32,
-    /// RGBA8 像素数据，长度必须为 `width * height * 4`。
+    /// RGBA8 像素数据，长度必须为 `width * height * 4`；GPU 帧为空。
     pub rgba: Vec<u8>,
+    /// GPU 帧（不落 CPU）；`Some` 时 `rgba` 为空。
+    pub gpu: Option<Arc<dyn GpuFrame>>,
+}
+
+impl std::fmt::Debug for RawFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawFrame")
+            .field("display", &self.display)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("rgba_len", &self.rgba.len())
+            .field("gpu", &self.gpu.is_some())
+            .finish()
+    }
 }
 
 impl RawFrame {
-    /// 校验像素数据长度是否与宽高一致。
+    /// 校验帧是否自洽。
+    ///
+    /// GPU 帧只要求宽高非零（像素数据不在 CPU 上，无法也不该校验长度）；CPU 帧保持
+    /// 「`rgba.len() == width * height * 4`」这条原有约束。
     ///
     /// # Errors
-    /// 长度不匹配时返回 [`RemoteError::Encode`]。
+    /// 尺寸为零、溢出，或 CPU 帧长度不匹配时返回 [`RemoteError::Encode`]。
     pub fn validate(&self) -> RemoteResult<()> {
+        if self.gpu.is_some() {
+            if self.width == 0 || self.height == 0 {
+                return Err(RemoteError::Encode(format!(
+                    "GPU 帧尺寸非法：{}x{}",
+                    self.width, self.height
+                )));
+            }
+            return Ok(());
+        }
         let expected = (self.width as usize)
             .checked_mul(self.height as usize)
             .and_then(|n| n.checked_mul(BYTES_PER_PIXEL))
@@ -188,6 +231,26 @@ pub trait ScreenSource: Send + Sync + 'static {
     /// # Errors
     /// 采集失败（显示器不存在、平台权限不足等）时返回 [`RemoteError::Platform`]。
     fn capture(&self, display: u32) -> RemoteResult<RawFrame>;
+
+    /// 本采集源是否支持**不落 CPU** 的 GPU 采集（默认 `false`）。
+    ///
+    /// 引擎只在协商到 H.264 且本方法为真时才走 [`ScreenSource::capture_gpu`]；
+    /// 其余情况一律 [`ScreenSource::capture`]（CPU 路径，永远可用）。
+    fn supports_gpu_capture(&self) -> bool {
+        false
+    }
+
+    /// 采集一帧 GPU 画面（默认回退到 CPU 采集）。
+    ///
+    /// 实现返回的 [`RawFrame::gpu`] 必须为 `Some`，且宽高是**逻辑编码尺寸**（平台
+    /// 实现负责先按封顶宽度换算）；失败时可以自行回退 CPU，也可以返回错误让引擎
+    /// 走其它兜底。
+    ///
+    /// # Errors
+    /// GPU 采集失败且实现没有自行回退时返回 [`RemoteError::Platform`]。
+    fn capture_gpu(&self, display: u32) -> RemoteResult<RawFrame> {
+        self.capture(display)
+    }
 }
 
 /// 输入注入目标（被控端实现）。
@@ -454,6 +517,43 @@ mod tests {
         // 默认档即均衡档（避免两处默认值漂移）。
         assert_eq!(EncodeOptions::default(), balanced);
         assert_eq!(QualityPreset::all().len(), 3);
+    }
+
+    /// 一个只用于测试的类型擦除载体。
+    struct DummyGpuFrame;
+
+    impl GpuFrame for DummyGpuFrame {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// GPU 帧只校验宽高非零（像素不在 CPU 上）；CPU 帧仍校验 RGBA 长度。
+    #[test]
+    fn gpu_frame_validate_only_checks_dimensions() {
+        let gpu = RawFrame {
+            display: 0,
+            width: 1920,
+            height: 1080,
+            rgba: Vec::new(),
+            gpu: Some(std::sync::Arc::new(DummyGpuFrame)),
+        };
+        assert!(gpu.validate().is_ok(), "GPU 帧不应要求 CPU 像素数据");
+        let zero = RawFrame {
+            width: 0,
+            ..gpu
+        };
+        assert!(zero.validate().is_err(), "GPU 帧仍要求宽高非零");
+
+        let cpu = RawFrame {
+            display: 0,
+            width: 2,
+            height: 2,
+            // 2×2 应为 16 字节。
+            rgba: vec![0; 4],
+            gpu: None,
+        };
+        assert!(cpu.validate().is_err(), "CPU 帧仍应校验 RGBA 长度");
     }
 
     #[test]

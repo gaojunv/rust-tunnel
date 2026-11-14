@@ -368,6 +368,10 @@ pub async fn run_controlled(
 
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
+    // GPU 采集只在**协商到 H.264** 且平台采集源支持时启用。计算一次即可：codec 在
+    // 会话内不变，平台能力也不会在会话中翻转。H.264 编码器在 GPU 输入不可用时由
+    // 适配器自行回退 CPU（`RawFrame::gpu == None` 走原来的 rgba 路径）。
+    let gpu_capture = codec == CodecId::H264 && screen.supports_gpu_capture();
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
     let mut rate = RateController::new(config.encode);
@@ -483,7 +487,7 @@ pub async fn run_controlled(
                     let tx = capture_tx.clone();
                     // 采集是阻塞调用（xcap 的 portal 路径可能数秒），整体挪出 async worker。
                     tokio::task::spawn_blocking(move || {
-                        run_capture(&*screen, display_now, generation_now, &tx);
+                        run_capture(&*screen, display_now, generation_now, gpu_capture, &tx);
                     });
                 }
             }
@@ -836,9 +840,20 @@ struct EncodeJob {
 ///
 /// 本函数**可能 panic**（平台实现 bug）：`spawn_blocking` 的 `JoinHandle` 被丢弃后 panic 会被
 /// 吞掉、结果永不回传，由调用方的看门狗兜底（见 [`CAPTURE_WATCHDOG`]）。
-fn run_capture(screen: &dyn ScreenSource, display: u32, generation: u64, tx: &mpsc::Sender<CaptureOutcome>) {
+fn run_capture(
+    screen: &dyn ScreenSource,
+    display: u32,
+    generation: u64,
+    gpu: bool,
+    tx: &mpsc::Sender<CaptureOutcome>,
+) {
     let started = Instant::now();
-    let frame = match screen.capture(display) {
+    let captured = if gpu {
+        screen.capture_gpu(display)
+    } else {
+        screen.capture(display)
+    };
+    let frame = match captured {
         Ok(frame) => Some(frame),
         Err(err) => {
             warn!(error = %err, "屏幕采集失败");
@@ -983,6 +998,8 @@ async fn encode_loop(
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
         window.maybe_report(&stats, rates.bitrate_kbps);
 
+        // GPU 帧没有 CPU 像素：不能做 memcmp 去重（也绝不能拿空 `rgba` 去比较）。
+        let is_gpu = frame.gpu.is_some();
         let (width, height) = encode_dimensions(frame.width, frame.height, rates.scale, MAX_ENCODE_WIDTH);
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
@@ -1006,7 +1023,10 @@ async fn encode_loop(
         let force = force_keyframe || geometry_changed || pending_keyframe;
 
         // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
-        if !force && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
+        // **GPU 帧跳过这条**：像素不在 CPU 上，没有可比较的 `rgba`；留下 `rgba` 为空时
+        // 反而会把「所有 GPU 帧都一样」误判成静止。GPU 路径的静止帧由编码器自身的
+        // 码率控制消化（硬件编码器对静止画面输出极小），不做额外去重。
+        if !force && !is_gpu && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
             continue;
         }
         // 背压出口在**编码之前**：出站队列满就跳过这一帧。绝不能改成「编码后丢弃」。
@@ -1029,18 +1049,17 @@ async fn encode_loop(
         let Some(enc) = encoder.take() else {
             continue;
         };
-        let (src_width, src_height) = (frame.width, frame.height);
-        let rgba = frame.rgba;
         let started = Instant::now();
-        // 编码是阻塞调用，移出 async worker；编码器随闭包移入、随结果移出（独占持有）。
-        // 码率/帧率的在线重配置也在这里做（`reconfig_and_encode`），与编码同一次阻塞调用。
+        // 编码是阻塞调用，移出 async worker；编码器与整帧（CPU 的 `rgba` 或 GPU 纹理）
+        // 随闭包移入、随结果移出（独占持有）。码率/帧率的在线重配置也在这里做
+        // （`reconfig_and_encode`），与编码同一次阻塞调用。
         let joined = tokio::task::spawn_blocking(move || {
             let mut enc = enc;
-            let result = reconfig_and_encode(enc.as_mut(), &rates, &rgba, src_width, src_height, force);
-            (enc, result, rgba)
+            let result = reconfig_and_encode(enc.as_mut(), &rates, &frame, force);
+            (enc, result, frame)
         })
         .await;
-        let (enc, result, rgba) = match joined {
+        let (enc, result, frame) = match joined {
             Ok(value) => value,
             Err(err) => {
                 warn!(error = %err, "编码任务失败");
@@ -1054,7 +1073,8 @@ async fn encode_loop(
         match result {
             Ok(packet) => {
                 encoder = Some(enc);
-                prev_rgba = Some(rgba);
+                // GPU 帧没有 CPU 像素可留作去重基准；置 `None` 让下一帧照常编码。
+                prev_rgba = if is_gpu { None } else { Some(frame.rgba) };
                 // `force` 为真时本帧必是 IDR，请求已被满足。
                 pending_keyframe = false;
                 if packet.is_empty() {
@@ -1105,9 +1125,7 @@ async fn encode_loop(
 fn reconfig_and_encode(
     enc: &mut dyn VideoEncoderApi,
     rates: &EncodeRates,
-    rgba: &[u8],
-    src_width: u32,
-    src_height: u32,
+    frame: &RawFrame,
     force: bool,
 ) -> RemoteResult<EncodedVideo> {
     if enc.bitrate_kbps() != rates.bitrate_kbps {
@@ -1116,7 +1134,8 @@ fn reconfig_and_encode(
     if enc.fps() != u32::from(rates.fps) {
         enc.set_fps(rates.fps)?;
     }
-    enc.encode(rgba, src_width, src_height, force)
+    // CPU 帧走 trait 默认实现（= `encode`）；GPU 帧由平台实现覆盖。
+    enc.encode_frame(frame, force)
 }
 
 /// 把一帧画面消息投给出站写任务，**绝不丢弃**。
@@ -1283,6 +1302,7 @@ mod tests {
             width: w,
             height: h,
             rgba: [40u8, 80, 120, 255].repeat((w * h) as usize),
+            gpu: None,
         }
     }
 
@@ -1341,6 +1361,7 @@ mod tests {
                 width: w,
                 height: h,
                 rgba,
+                gpu: None,
             })
         }
     }
@@ -1771,6 +1792,7 @@ mod tests {
             width: w,
             height: h,
             rgba,
+            gpu: None,
         }
     }
 

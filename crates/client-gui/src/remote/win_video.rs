@@ -16,6 +16,7 @@
 //! 采集安全桌面，本模块只服务用户会话里的 GUI 进程。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -23,10 +24,10 @@ use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
 use rust_tunnel_remote::{
-    encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo, RawFrame,
-    RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
+    encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo, GpuFrame,
+    RawFrame, RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
 };
-use rust_tunnel_win_video::capture::{self, CaptureSource};
+use rust_tunnel_win_video::capture::{self, BgraReadback, CaptureSource};
 use rust_tunnel_win_video::d3d11;
 use rust_tunnel_win_video::decode::{H264Decoder, H264HardwarePreference, H264OutputMode};
 use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
@@ -66,6 +67,98 @@ struct Geometry {
     height: u32,
 }
 
+/// 进程级 GPU 采集/编码上下文。
+///
+/// **为什么是进程级**：采集源（`WinVideoScreen`）与编码器工厂（`MftEncoderFactory`）
+/// 由不同的构造路径创建，签名不适合再传一个设备参数。采集成功后把设备记在这里，
+/// MFT 工厂创建编码器时复用同一个 `Arc<D3d11>`——`encode_texture` 的
+/// `Arc::ptr_eq` 校验要求采集纹理与编码器同设备。
+///
+/// `disabled` 是**单向开关**：任何一次 GPU 采集/编码失败都会永久禁用本进程的 GPU
+/// 路径（回退 CPU），避免每帧都重试一次注定失败的操作。`RUST_TUNNEL_DISABLE_GPU_CAPTURE`
+/// 在初始化时就把它置为 `true`。
+struct GpuContext {
+    /// 最近一次成功 GPU 采集所用的设备。
+    device: Mutex<Option<Arc<d3d11::D3d11>>>,
+    /// 是否已禁用 GPU 路径（进程级，单向）。
+    disabled: AtomicBool,
+    /// 是否已经打印过「GPU 路径已启用」日志（只打一次）。
+    logged: AtomicBool,
+}
+
+impl GpuContext {
+    /// 记录（或更新）采集设备。
+    fn set_device(&self, device: Arc<d3d11::D3d11>) {
+        *self.device.lock().unwrap_or_else(PoisonError::into_inner) = Some(device);
+    }
+
+    /// 取当前采集设备（未采过帧时为 `None`）。
+    fn device(&self) -> Option<Arc<d3d11::D3d11>> {
+        self.device
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 禁用 GPU 路径（幂等；只有第一次调用会 `warn!`）。
+    fn disable(&self, reason: &str) {
+        if !self.disabled.swap(true, Ordering::SeqCst) {
+            warn!("GPU 采集/编码已禁用，回退 CPU 路径：{reason}");
+        }
+    }
+
+    /// GPU 路径是否已禁用。
+    fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::SeqCst)
+    }
+
+    /// 首次成功 GPU 采集时打印一条启用日志。
+    fn log_enabled_once(&self, adapter: &str) {
+        if !self.logged.swap(true, Ordering::SeqCst) {
+            // GUI 日志层会丢 tracing 字段，故全部内联进消息文本。
+            info!("GPU 零拷贝采集/编码已启用 adapter={adapter}");
+        }
+    }
+}
+
+/// 进程级 GPU 上下文（见 [`GpuContext`]）。
+static GPU_CONTEXT: OnceLock<Arc<GpuContext>> = OnceLock::new();
+
+/// 取（或首次构造）进程级 GPU 上下文。
+fn gpu_context() -> &'static Arc<GpuContext> {
+    GPU_CONTEXT.get_or_init(|| {
+        // 现场诊断开关：置该环境变量即完全禁用 GPU 采集/编码（回退 CPU）。
+        let env_disabled = std::env::var_os("RUST_TUNNEL_DISABLE_GPU_CAPTURE").is_some();
+        if env_disabled {
+            info!("RUST_TUNNEL_DISABLE_GPU_CAPTURE 已设置，GPU 采集/编码保持禁用");
+        }
+        Arc::new(GpuContext {
+            device: Mutex::new(None),
+            disabled: AtomicBool::new(env_disabled),
+            logged: AtomicBool::new(false),
+        })
+    })
+}
+
+/// 引擎侧 [`RawFrame::gpu`] 的 Windows 载体：一张采集源纹理池里的 BGRA 纹理。
+///
+/// `frame.width/height`（逻辑编码尺寸）可能小于纹理的物理尺寸（4K 采集先封顶到
+/// 1920），故这里同时保留 `source_width/source_height` 供编码器缩放。
+struct WinGpuFrame {
+    /// 采集纹理（持有池槽位租约，直到整帧被丢弃）。
+    texture: capture::CapturedTexture,
+    /// 纹理的物理宽度。
+    source_width: u32,
+    /// 纹理的物理高度。
+    source_height: u32,
+}
+
+impl GpuFrame for WinGpuFrame {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// 硬件优先、xcap 兜底的屏幕采集源。
 ///
 /// `displays()` 刻意继续用 xcap：`DisplayInfo.id` 必须与 [`super::EnigoInput`]
@@ -84,14 +177,16 @@ impl WinVideoScreen {
         }
     }
 
-    /// 尝试用硬件后端采集一帧；失败时由调用方回退 xcap。
+    /// 在缓存/重建好的采集源上执行一次操作。
     ///
-    /// 采集源缓存命中且校验未过期时**不枚举任何显示器**，直接采帧；否则重新
-    /// 枚举、比对几何，必要时重建采集源。
-    ///
-    /// 失败会把缓存项移除，下一次调用重新尝试打开（`open_best` 内部按
-    /// WGC → DXGI 顺序选择）。
-    fn capture_hardware(&self, display_id: u32) -> RemoteResult<RawFrame> {
+    /// 采集源缓存命中且校验未过期时**不枚举任何显示器**，直接调用；否则重新
+    /// 枚举、比对几何，必要时重建采集源。操作失败会把缓存项移除，下一次调用
+    /// 重新尝试打开（`open_best` 内部按 WGC → DXGI 顺序选择）。
+    fn with_source<R>(
+        &self,
+        display_id: u32,
+        action: impl FnOnce(&mut dyn CaptureSource) -> RemoteResult<R>,
+    ) -> RemoteResult<R> {
         let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
         let cache_fresh = sources
             .get(&display_id)
@@ -99,17 +194,23 @@ impl WinVideoScreen {
         if !cache_fresh {
             refresh_cached_source(&mut sources, display_id)?;
         }
-        let captured = match sources.get_mut(&display_id) {
-            Some(cached) => cached.capture_frame(),
+        let result = match sources.get_mut(&display_id) {
+            Some(cached) => action(cached.source.as_mut()),
             None => Err(RemoteError::Platform("硬件采集源缓存丢失".to_owned())),
         };
-        let captured = match captured {
-            Ok(frame) => frame,
-            Err(err) => {
-                sources.remove(&display_id);
-                return Err(err);
-            }
-        };
+        if result.is_err() {
+            sources.remove(&display_id);
+        }
+        result
+    }
+
+    /// 尝试用硬件后端采集一帧 **CPU RGBA**；失败时由调用方回退 xcap。
+    fn capture_hardware(&self, display_id: u32) -> RemoteResult<RawFrame> {
+        let captured = self.with_source(display_id, |source| {
+            source
+                .capture()
+                .map_err(|err| RemoteError::Platform(format!("硬件采集失败: {err}")))
+        })?;
         // **在采集层就封顶到 1920 宽**：4K 源若原样交给引擎，会先生成 33 MB
         // 的 RGBA、再做一次 memcmp 去重与下采样；这里一步 BGRA→目标尺寸 RGBA
         // 把中间缓冲直接压到 1920×1080。`rates.scale` 仍由引擎在这之后生效
@@ -133,6 +234,43 @@ impl WinVideoScreen {
             width: dst_width,
             height: dst_height,
             rgba,
+            gpu: None,
+        })
+    }
+
+    /// 用硬件后端采集一帧 **GPU 纹理**（不落 CPU）。
+    ///
+    /// 逻辑尺寸与 CPU 路径一致：先按 [`MAX_ENCODE_WIDTH`] 封顶，`rates.scale` 稍后
+    /// 由引擎施加。任何一次失败都会**永久禁用**本进程的 GPU 路径并回退到
+    /// [`Self::capture`]（CPU），而不是每帧重试。
+    fn capture_gpu_frame(&self, display_id: u32) -> RemoteResult<RawFrame> {
+        let captured = match self.with_source(display_id, |source| {
+            source
+                .capture_texture()
+                .map_err(|err| RemoteError::Platform(format!("GPU 采集失败: {err}")))
+        }) {
+            Ok(captured) => captured,
+            Err(err) => {
+                gpu_context().disable(&err.to_string());
+                // 回退 CPU 路径：本次会话继续有画面，只是不再尝试 GPU。
+                return self.capture(display_id);
+            }
+        };
+        let (source_width, source_height) = (captured.width, captured.height);
+        gpu_context().set_device(Arc::clone(&captured.device));
+        gpu_context().log_enabled_once(&captured.device.adapter.name);
+        let (width, height) =
+            encode_dimensions(source_width, source_height, 1.0, MAX_ENCODE_WIDTH);
+        Ok(RawFrame {
+            display: display_id,
+            width,
+            height,
+            rgba: Vec::new(),
+            gpu: Some(Arc::new(WinGpuFrame {
+                texture: captured,
+                source_width,
+                source_height,
+            })),
         })
     }
 }
@@ -214,16 +352,6 @@ impl Default for WinVideoScreen {
     }
 }
 
-/// 已缓存采集源的一次采帧（把 `Box<dyn CaptureSource>` 的 `&mut` 封装起来）。
-impl CachedSource {
-    /// 采一帧并把底层错误转成引擎错误。
-    fn capture_frame(&mut self) -> RemoteResult<capture::CapturedFrame> {
-        self.source
-            .capture()
-            .map_err(|err| RemoteError::Platform(format!("硬件采集失败: {err}")))
-    }
-}
-
 impl ScreenSource for WinVideoScreen {
     fn displays(&self) -> Vec<DisplayInfo> {
         // 与输入注入共用 xcap 的编号体系，见类型文档。
@@ -238,6 +366,15 @@ impl ScreenSource for WinVideoScreen {
                 XcapScreen.capture(display_id)
             }
         }
+    }
+
+    fn supports_gpu_capture(&self) -> bool {
+        // 环境变量在 `gpu_context()` 初始化时已折算进 `disabled`。
+        !gpu_context().is_disabled()
+    }
+
+    fn capture_gpu(&self, display_id: u32) -> RemoteResult<RawFrame> {
+        self.capture_gpu_frame(display_id)
     }
 }
 
@@ -317,14 +454,49 @@ impl VideoEncoderFactory for NvencEncoderFactory {
             .with_input_format(InputFormat::Rgba);
         let encoder = NvencEncoder::new(self.api.0, &d3d, config)
             .map_err(|err| RemoteError::Encode(format!("NVENC 编码器创建失败: {err}")))?;
-        Ok(Box::new(NvencAdapter { encoder }))
+        Ok(Box::new(NvencAdapter {
+            encoder,
+            readback: BgraReadback::new(),
+        }))
     }
 }
 
 /// `NvencEncoder` 的 remote 适配器：尺寸不同时先做 CPU 盒式下采样。
+///
+/// NVENC 的输入纹理必须由它自己的设备创建，不能直接吃采集纹理（与 MFT 不同），
+/// 所以收到 GPU 帧时先回读 BGRA 再走原有的 RGBA 上传路径。**这条回读没有 GPU
+/// 收益**，只是为了让「被控端有 NVIDIA 独显」时不至于因 GPU 帧而失败。
 struct NvencAdapter {
     /// 硬件编码器（只借用 `'static` 的函数表）。
     encoder: NvencEncoder<'static>,
+    /// 可复用的 GPU→CPU 回读器（staging 纹理按尺寸缓存）。
+    readback: BgraReadback,
+}
+
+impl NvencAdapter {
+    /// 把采集纹理回读成编码器尺寸的 RGBA。
+    ///
+    /// 4K 采集封顶到 1920 时，`source_width/height` 仍是纹理物理尺寸，故这里用
+    /// [`scale_bgra_to_rgba`] 一步完成下采样 + 通道交换（不是先转 RGBA 再缩）。
+    fn readback_to_rgba(&mut self, gpu: &WinGpuFrame) -> RemoteResult<Vec<u8>> {
+        let (src_width, src_height, bgra) =
+            self.readback.read(&gpu.texture).map_err(|err| {
+                gpu_context().disable(&format!("NVENC GPU 帧回读失败: {err}"));
+                RemoteError::Encode(format!("NVENC GPU 帧回读失败: {err}"))
+            })?;
+        let (dst_width, dst_height) = self.encoder.size();
+        let rgba = if (src_width, src_height) == (dst_width, dst_height) {
+            bgra_to_rgba(&bgra)
+        } else {
+            scale_bgra_to_rgba(&bgra, src_width, src_height, dst_width, dst_height).map_err(
+                |err| {
+                    gpu_context().disable(&format!("NVENC GPU 帧下采样失败: {err}"));
+                    RemoteError::Encode(format!("NVENC GPU 帧下采样失败: {err}"))
+                },
+            )?
+        };
+        Ok(rgba)
+    }
 }
 
 impl VideoEncoderApi for NvencAdapter {
@@ -385,6 +557,25 @@ impl VideoEncoderApi for NvencAdapter {
             keyframe: packet.keyframe,
         })
     }
+
+    fn encode_frame(
+        &mut self,
+        frame: &RawFrame,
+        force_keyframe: bool,
+    ) -> RemoteResult<EncodedVideo> {
+        let Some(gpu) = frame.gpu.as_deref() else {
+            // CPU 帧：与默认实现等价。
+            return self.encode(&frame.rgba, frame.width, frame.height, force_keyframe);
+        };
+        // NVENC 不能直接吃 WGC/DXGI 的采集纹理（跨设备），只能回读。代码路径统一
+        // 走 `WinGpuFrame`，未知载体说明上游接错了，直接报错（不静默编码空帧）。
+        let gpu_frame = gpu.as_any().downcast_ref::<WinGpuFrame>().ok_or_else(|| {
+            RemoteError::Encode("NVENC 收到无法识别的 GPU 帧".to_owned())
+        })?;
+        let rgba = self.readback_to_rgba(gpu_frame)?;
+        let (dst_width, dst_height) = self.encoder.size();
+        self.encode(&rgba, dst_width, dst_height, force_keyframe)
+    }
 }
 
 /// Media Foundation 硬件 H.264 编码器工厂（Intel QSV / AMD VCE 等）。
@@ -433,12 +624,53 @@ impl VideoEncoderFactory for MftEncoderFactory {
         max_fps: u8,
     ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
         let fps = u32::from(max_fps.max(1));
-        let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
-            .map_err(|err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")))?;
+        // GPU 零拷贝只在 **Intel** 采集设备上启用：VideoProcessor + QSV MFT 的同设备
+        // 路径是本机验证过的那一条（见 `MftH264Encoder::encode_texture`）。其它厂商
+        // （AMD 等）继续走 CPU RGBA 输入，避免未验证的组合。
+        let gpu_device = if gpu_context().is_disabled() {
+            None
+        } else {
+            gpu_context()
+                .device()
+                .filter(|device| device.adapter.vendor_id == d3d11::VENDOR_INTEL)
+        };
+        let (encoder, device) = if let Some(device) = gpu_device {
+            let adapter = device.adapter.name.clone();
+            match MftH264Encoder::new_with_device(
+                Arc::clone(&device),
+                width,
+                height,
+                fps,
+                target_bitrate_kbps,
+            ) {
+                Ok(encoder) => {
+                    // GUI 日志层会丢 tracing 字段，全部内联。
+                    info!("MFT 编码器复用采集 D3D11 设备（GPU 零拷贝） adapter={adapter}");
+                    (encoder, Some(device))
+                }
+                Err(err) => {
+                    info!("MFT 复用采集设备失败，回退 CPU RGBA 输入：{err}");
+                    let encoder =
+                        MftH264Encoder::new(width, height, fps, target_bitrate_kbps).map_err(
+                            |err| {
+                                RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}"))
+                            },
+                        )?;
+                    (encoder, None)
+                }
+            }
+        } else {
+            let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps).map_err(
+                |err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")),
+            )?;
+            (encoder, None)
+        };
         Ok(Box::new(MftAdapter {
             encoder,
             fps,
             frames: 0,
+            gpu: device.is_some(),
+            device,
         }))
     }
 }
@@ -451,6 +683,10 @@ struct MftAdapter {
     fps: u32,
     /// 已编码帧数，用于限制细分耗时日志的频率（前 3 帧 + 每 120 帧）。
     frames: u64,
+    /// 编码器是否复用了采集 D3D11 设备（`encode_texture` 可用）。
+    gpu: bool,
+    /// GPU 路径下编码器绑定的采集设备；用于检测采集源重建导致的设备漂移。
+    device: Option<Arc<d3d11::D3d11>>,
 }
 
 impl VideoEncoderApi for MftAdapter {
@@ -524,6 +760,65 @@ impl VideoEncoderApi for MftAdapter {
                 "MFT H.264 编码细分 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={dst_width}x{dst_height} 缩放={scale_ms}ms",
                 self.encoder.last_convert_ms(),
                 self.encoder.last_mft_ms(),
+            );
+        }
+        Ok(EncodedVideo {
+            data: packet.data,
+            keyframe: packet.keyframe,
+        })
+    }
+
+    fn encode_frame(
+        &mut self,
+        frame: &RawFrame,
+        force_keyframe: bool,
+    ) -> RemoteResult<EncodedVideo> {
+        let Some(gpu) = frame.gpu.as_deref() else {
+            // CPU 帧：原路径（RGBA + 盒式下采样）。
+            return self.encode(&frame.rgba, frame.width, frame.height, force_keyframe);
+        };
+        if !self.gpu {
+            // 工厂没能复用采集设备（例如采集源换了适配器）：不能用空 `rgba` 编码，
+            // 禁用 GPU 让下一帧回退 CPU 采集。
+            gpu_context().disable("MFT 编码器未复用采集 D3D11 设备");
+            return Err(RemoteError::Encode(
+                "MFT 编码器未启用 GPU 纹理输入".to_owned(),
+            ));
+        }
+        let Some(gpu_frame) = gpu.as_any().downcast_ref::<WinGpuFrame>() else {
+            gpu_context().disable("收到无法识别的 GPU 帧类型");
+            return Err(RemoteError::Encode("无法识别的 GPU 帧".to_owned()));
+        };
+        // 采集源重建（缓存失效/显示器变更）会换一个新 `Arc<D3d11>`；此时**不永久
+        // 禁用 GPU**——返回错误让引擎重建编码器，工厂会从 GPU 上下文取新设备。
+        if let Some(device) = &self.device {
+            if !Arc::ptr_eq(device, &gpu_frame.texture.device) {
+                return Err(RemoteError::Encode(
+                    "采集设备已变化，重建编码器".to_owned(),
+                ));
+            }
+        }
+        let started = Instant::now();
+        let packet = self
+            .encoder
+            .encode_texture(&gpu_frame.texture, force_keyframe)
+            .map_err(|err| {
+                // 任何真实的 GPU 编码失败都视为该路径不可用：本次调用返回错误，下一帧
+                // `capture_gpu` 看到 disabled 后回退 CPU（会丢一帧，可接受）。
+                gpu_context().disable(&format!("MFT GPU 编码失败: {err}"));
+                RemoteError::Encode(format!("MFT GPU 编码失败: {err}"))
+            })?;
+        let total_ms = elapsed_ms(started);
+        self.frames = self.frames.saturating_add(1);
+        if self.frames <= 3 || self.frames.is_multiple_of(120) {
+            let (width, height) = self.encoder.dimensions();
+            // GUI 日志层会丢弃 tracing 字段，全部内联。
+            info!(
+                "MFT GPU H.264 编码 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={width}x{height} 源={}x{}",
+                self.encoder.last_convert_ms(),
+                self.encoder.last_mft_ms(),
+                gpu_frame.source_width,
+                gpu_frame.source_height,
             );
         }
         Ok(EncodedVideo {
