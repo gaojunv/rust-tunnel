@@ -581,8 +581,10 @@ impl MftH264Encoder {
 
     /// 运行期修改目标码率，**不重建 MFT、不强制 IDR**。
     ///
-    /// 同时更新峰值与均值（峰值受限 VBR；编码器不支持时退回 CBR，见
-    /// [`apply_rate_control`]）。
+    /// **只改均值**（`CODECAPI_AVEncCommonMeanBitRate`），不再重设码率控制模式与峰值：
+    /// 探针实测 Intel QSV 在运行期改模式/峰值会**强制插一个 IDR**，而 QoS 每秒都会动一次
+    /// 码率——那正好变成「每秒一个关键帧」，是阶段 2/3 一直在消灭的带宽尖峰。峰值保持
+    /// 会话创建时按档位设的上限（VBV 仍然约束突发），均值随闭环在它之下浮动。
     ///
     /// # Errors
     /// MFT 未暴露 `ICodecAPI`、不支持 `CODECAPI_AVEncCommonMeanBitRate` 或
@@ -601,7 +603,12 @@ impl MftH264Encoder {
                 "编码器不支持运行期改码率（CODECAPI_AVEncCommonMeanBitRate）: {err}"
             )));
         }
-        apply_rate_control(codec, kbps.saturating_mul(1000))?;
+        set_codec_u32(
+            codec,
+            &CODECAPI_AVEncCommonMeanBitRate,
+            kbps.saturating_mul(1000),
+        )
+        .map_err(|err| WinVideoError::Encode(format!("设置目标码率失败: {err}")))?;
         self.bitrate_kbps = kbps;
         Ok(())
     }
