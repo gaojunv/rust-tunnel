@@ -352,7 +352,7 @@ pub async fn run_controlled(
         SessionFrame::control(SessionMessage::CodecSelect { codec }),
     )
     .await?;
-    info!(?codec, "编解码协商完成（被控端）");
+    info!("编解码协商完成（被控端） codec={codec:?}");
 
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。

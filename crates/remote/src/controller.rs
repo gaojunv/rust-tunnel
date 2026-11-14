@@ -510,7 +510,7 @@ pub async fn run_controller(
                                     break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
                                 }
                             }
-                            info!(?codec, "编解码协商完成（控制器）");
+                            info!("编解码协商完成（控制器） codec={codec:?}");
                         }
                         SessionMessage::RequestKeyframe { .. } => {
                             // 该变体只应由**控制器**发出；收到即说明对端实现异常。

@@ -225,7 +225,7 @@ fn nvenc_api() -> Option<SharedNvencApi> {
             Some(SharedNvencApi(Box::leak(Box::new(api))))
         }
         Err(err) => {
-            info!(error = %err, "NVENC 不可用，H.264 硬件编码不参与协商");
+            info!(error = %err, "NVENC 不可用，尝试 Intel/AMD 硬件 MFT");
             None
         }
     })
