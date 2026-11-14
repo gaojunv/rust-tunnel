@@ -872,7 +872,7 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
     }
 }
 
-/// VP9 数据面：静止画面零输出，局部变化才继续出帧。
+/// VP9 数据面：静止画面只在保活频率上补帧（不是每拍编码），局部变化会额外产生新帧。
 #[tokio::test]
 async fn static_screen_emits_no_frames_and_change_emits_frames() {
     let (a, b) = tokio::io::duplex(256 * 1024);
@@ -892,14 +892,19 @@ async fn static_screen_emits_no_frames_and_change_emits_frames() {
         "应收到首帧关键帧"
     );
 
-    // 静止画面：再等一段，不应有任何**新增**帧（被控端完全不喂编码器）。
+    // 静止画面：**不再每拍编码**，但静止保活补编（`UNCHANGED_RESEND_INTERVAL` = 250 ms）
+    // 会周期性补一帧普通 P 帧——这是「检测盲区/背压丢帧不会让画面永久冻结」的代价。
+    // 断言因此从「零新增帧」改成「新增帧数落在保活频率附近」：
+    // - 上界：900 ms / 250 ms ≈ 4 帧（再多就说明去重闸门失效、退回每拍编码）；
+    // - 下界：至少 1 帧（少了就说明保活没跑）。
     let after_first = ctrl_sink.frames.load(Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        ctrl_sink.frames.load(Ordering::Relaxed),
-        after_first,
-        "静止画面不应有新帧（带宽趋零的来源）"
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let added = ctrl_sink.frames.load(Ordering::Relaxed).saturating_sub(after_first);
+    assert!(
+        added <= 6,
+        "静止画面不应每拍编码（最多只有 250 ms 一次的保活补编），本窗口新增 {added} 帧"
     );
+    assert!(added >= 1, "静止保活补编应在 UNCHANGED_RESEND_INTERVAL 内补至少一帧");
 
     // 改一块区域 → 应产生新的编码帧。
     {
