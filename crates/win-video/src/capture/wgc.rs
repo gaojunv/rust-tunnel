@@ -53,6 +53,9 @@ struct WgcSource {
     last: Option<CapturedFrame>,
     /// 持久 BGRA 纹理池（GPU 路径）；尺寸/格式变化时重建。
     textures: Option<TexturePool>,
+    /// 像素级变化检测（GPU 路径）；WGC 在静止桌面仍按合成器节奏出帧，只能靠它判断
+    /// 「内容确实没变」。
+    change: super::change::TextureChangeTracker,
     /// 最近一次 GPU 采集结果（无新帧时返回它的克隆）。
     last_texture: Option<CapturedTexture>,
 }
@@ -112,9 +115,11 @@ impl CaptureSource for WgcSource {
                         tracing::debug!(error = %err, "WGC 帧对象 Close 失败");
                     }
                     let captured = result?;
+                    // **像素级**变化检测：WGC 在基本静止的桌面上仍按合成器节奏产新帧
+                    // （实测 120 次采集 119 次有新帧），所以「有新帧」不等于「有变化」。
+                    let changed = self.change.changed(&self.d3d, &captured);
                     self.last_texture = Some(captured.clone());
-                    // 真的拿到了新帧：只有这一条路径需要 `CopyResource`。
-                    return Ok((captured, true));
+                    return Ok((captured, changed));
                 }
                 Err(err) if err.code().is_ok() => {}
                 Err(err) => {
@@ -311,6 +316,7 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         reader: BgraReader::default(),
         last: None,
         textures: None,
+        change: super::change::TextureChangeTracker::new(),
         last_texture: None,
     }))
 }
