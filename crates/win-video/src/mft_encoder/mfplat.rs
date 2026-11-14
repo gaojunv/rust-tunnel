@@ -12,7 +12,8 @@ use crate::WinVideoError;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
-use windows::core::{GUID, HRESULT};
+use windows::core::{Interface as _, BOOL, GUID, HRESULT};
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample, MFSTARTUP_FULL,
     MFT_REGISTER_TYPE_INFO, MF_VERSION,
@@ -48,6 +49,13 @@ struct MfPlatformApi {
     /// 初始化失败并回退 VP9。
     create_dxgi_device_manager:
         Option<unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> HRESULT>,
+    /// `MFCreateDXGISurfaceBuffer(riid, surface, subresource, bottom_up, &buffer)`。
+    ///
+    /// GPU 纹理路径用它把 VideoProcessor 输出的 NV12 纹理包成 `IMFMediaBuffer`，
+    /// 不经过 CPU 内存。
+    create_dxgi_surface_buffer: Option<
+        unsafe extern "system" fn(*const GUID, *mut c_void, u32, BOOL, *mut *mut c_void) -> HRESULT,
+    >,
 }
 
 // SAFETY: 函数表在进程生命周期内只读；mfplat.dll 由 `OnceLock` 永久持有，
@@ -99,6 +107,18 @@ impl MfPlatformApi {
             .ok()
             .map(|symbol| *symbol)
         };
+        // SAFETY: 可选符号；缺失时 GPU 纹理路径报错，CPU 路径不受影响。
+        let create_dxgi_surface_buffer = unsafe {
+            lib.get::<unsafe extern "system" fn(
+                *const GUID,
+                *mut c_void,
+                u32,
+                BOOL,
+                *mut *mut c_void,
+            ) -> HRESULT>(b"MFCreateDXGISurfaceBuffer")
+                .ok()
+                .map(|symbol| *symbol)
+        };
 
         Ok(Self {
             _lib: lib,
@@ -108,6 +128,7 @@ impl MfPlatformApi {
             create_memory_buffer,
             create_media_type,
             create_dxgi_device_manager,
+            create_dxgi_surface_buffer,
         })
     }
 }
@@ -235,6 +256,46 @@ pub(super) fn create_dxgi_device_manager() -> Result<(IMFDXGIDeviceManager, u32)
     let manager: IMFDXGIDeviceManager = unsafe { windows::core::Type::from_abi(raw) }
         .map_err(|err| WinVideoError::Encode(format!("设备管理器接口转换失败: {err}")))?;
     Ok((manager, reset_token))
+}
+
+/// `MFCreateDXGISurfaceBuffer` 的运行期版本。
+///
+/// `riid` 用 **`ID3D11Texture2D::IID`**（这是「表面接口」的 IID，不是
+/// `IMFMediaBuffer::IID`）；`bottom_up_when_linear` 只对线性格式有意义，NV12
+/// 传 `false`。
+pub(super) fn create_dxgi_surface_buffer(
+    texture: &ID3D11Texture2D,
+    subresource: u32,
+    bottom_up_when_linear: bool,
+) -> Result<IMFMediaBuffer, WinVideoError> {
+    let api = api()?;
+    let create = api.create_dxgi_surface_buffer.ok_or_else(|| {
+        WinVideoError::Encode(
+            "mfplat.dll 未导出 MFCreateDXGISurfaceBuffer（GPU 纹理输入不可用）".to_owned(),
+        )
+    })?;
+    let mut raw: *mut c_void = ptr::null_mut();
+    // SAFETY: `riid` 是 `'static`；`texture` 借用期间有效，底层对象由 COM 引用
+    // 计数持有；`raw` 指向本栈帧。成功时返回引用计数为 1 的 IMFMediaBuffer。
+    unsafe {
+        create(
+            &ID3D11Texture2D::IID,
+            texture.as_raw(),
+            subresource,
+            BOOL(i32::from(bottom_up_when_linear)),
+            &raw mut raw,
+        )
+    }
+    .ok()
+    .map_err(|err| WinVideoError::Encode(format!("MFCreateDXGISurfaceBuffer 失败: {err}")))?;
+    if raw.is_null() {
+        return Err(WinVideoError::Encode(
+            "MFCreateDXGISurfaceBuffer 返回空缓冲区".to_owned(),
+        ));
+    }
+    // SAFETY: `raw` 非空且引用计数为 1，所有权交给接口。
+    unsafe { windows::core::Type::from_abi(raw) }
+        .map_err(|err| WinVideoError::Encode(format!("DXGI 表面缓冲接口转换失败: {err}")))
 }
 
 /// `MFCreateSample` 的运行期版本。

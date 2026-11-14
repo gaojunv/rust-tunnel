@@ -30,16 +30,24 @@ mod bitstream;
 mod convert;
 mod device;
 mod mfplat;
+mod video_processor;
 
+use crate::capture::CapturedTexture;
+use crate::d3d11;
 use crate::nvenc::EncodedPacket;
 use crate::WinVideoError;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::core::{Interface as _, GUID, PWSTR};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, CODECAPI_AVEncCommonLowLatency,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
@@ -106,8 +114,10 @@ pub struct MftH264Encoder {
     provides_samples: bool,
     /// 调用方需要提供的输出缓冲区大小。
     output_buffer_size: u32,
-    /// 复用的 NV12 输入缓冲。
+    /// 复用的 NV12 输入缓冲（CPU 路径）。
     nv12: Vec<u8>,
+    /// GPU 路径的 BGRA→NV12 转换器；首次 `encode_texture` 时按输入尺寸懒建。
+    video: Option<video_processor::Nv12Converter>,
     /// 输出媒体类型里带的 SPS/PPS（Annex B），必要时前置到关键帧。
     sequence_header: Vec<u8>,
     next_pts: i64,
@@ -226,6 +236,42 @@ impl MftH264Encoder {
     ) -> Result<Self, WinVideoError> {
         validate_config(width, height, fps, bitrate_kbps)?;
         ensure_com_initialized()?;
+        let encode_device = device::create()?;
+        Self::with_device(encode_device, width, height, fps, bitrate_kbps)
+    }
+
+    /// 用调用方提供的 D3D11 设备创建硬件 H.264 编码器。
+    ///
+    /// GPU 纹理路径（[`MftH264Encoder::encode_texture`]）**必须**走这个构造函数：
+    /// 采集纹理与编码器 MFT 的设备管理器必须处在同一个设备上（调用方可用
+    /// 采集源的 [`CaptureSource::device`](crate::capture::CaptureSource::device)）。
+    /// 传入的 `device` 会被 `Arc` 共享，不会重建或替换。
+    ///
+    /// # Errors
+    /// 参数非法、没有硬件 H.264 编码器 MFT、设备管理器创建/绑定失败、媒体类型
+    /// 被拒绝时返回 [`WinVideoError::Encode`]。
+    pub fn new_with_device(
+        device: Arc<d3d11::D3d11>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, WinVideoError> {
+        validate_config(width, height, fps, bitrate_kbps)?;
+        ensure_com_initialized()?;
+        let encode_device = device::create_with_device(device)?;
+        Self::with_device(encode_device, width, height, fps, bitrate_kbps)
+    }
+
+    /// 公共初始化：枚举/激活 MFT、绑定设备管理器、协商媒体类型。
+    fn with_device(
+        encode_device: device::EncodeDevice,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, WinVideoError> {
+        ensure_com_initialized()?;
         let activates = enumerate_activates(true)?;
         if activates.is_empty() {
             return Err(WinVideoError::Encode(
@@ -243,7 +289,6 @@ impl MftH264Encoder {
         let is_async = is_async_transform(&transform)?;
 
         // 硬件 MFT 需要 D3D11 设备管理器；必须在媒体类型之前绑定。
-        let encode_device = device::create()?;
         device::bind(&encode_device, &transform)?;
 
         // Intel QSV 是异步 MFT：必须走 METransformNeedInput/HaveOutput 事件模型。
@@ -300,6 +345,7 @@ impl MftH264Encoder {
             provides_samples,
             output_buffer_size,
             nv12: Vec::new(),
+            video: None,
             sequence_header,
             next_pts: 0,
             frame_duration: HNS_PER_SECOND / i64::from(fps),
@@ -344,9 +390,11 @@ impl MftH264Encoder {
         &self.encode_device.device.adapter.name
     }
 
-    /// 最近一帧 RGBA→NV12（CPU 转换）的耗时，单位毫秒。
+    /// 最近一帧 RGBA→NV12 转换的耗时，单位毫秒。
     ///
-    /// 只用于诊断：在 [`MftH264Encoder::encode_rgba`] 返回后读取，取整到毫秒。
+    /// CPU 路径是 `convert::rgba_to_nv12` 的耗时；GPU 路径
+    /// （[`MftH264Encoder::encode_texture`]）是 `VideoProcessorBlt`（含首次
+    /// 建转换器的开销）的耗时。只用于诊断，取整到毫秒。
     #[must_use]
     pub fn last_convert_ms(&self) -> u32 {
         self.last_convert_ms
@@ -384,12 +432,99 @@ impl MftH264Encoder {
         convert::rgba_to_nv12(rgba, self.width, self.height, &mut self.nv12)?;
         self.last_convert_ms = elapsed_ms(convert_started);
 
+        let sample = self.build_input_sample()?;
+        self.process_sample(sample, force_keyframe)
+    }
+
+    /// 编码一帧**采集纹理**（GPU 路径）。
+    ///
+    /// 输入纹理必须是 BGRA8、且与编码器在**同一个 D3D11 设备**上（`Arc::ptr_eq`）。
+    /// 内部用 D3D11 VideoProcessor 把它转换/缩放成 NV12（BT.709 limited），再用
+    /// `MFCreateDXGISurfaceBuffer` 包成样本喂给 MFT；全程不经过 CPU 内存。
+    ///
+    /// 与 [`MftH264Encoder::encode_rgba`] 共享关键帧请求、异步事件循环、Annex B
+    /// 归一化与空包语义。
+    ///
+    /// # Errors
+    /// 纹理格式/尺寸非法、设备不一致、VideoProcessor 初始化或 Blt 失败、GPU
+    /// 表面缓冲创建失败、MFT 处理失败时返回 [`WinVideoError::Encode`]。任何 GPU
+    /// 环节失败都**不会**静默回退 CPU——回退由上层决定。
+    pub fn encode_texture(
+        &mut self,
+        frame: &CapturedTexture,
+        force_keyframe: bool,
+    ) -> Result<EncodedPacket, WinVideoError> {
+        ensure_com_initialized()?;
+        if !Arc::ptr_eq(&frame.device, &self.encode_device.device) {
+            return Err(WinVideoError::Encode(format!(
+                "采集纹理与编码器不在同一个 D3D11 设备上（采集 {} vs 编码 {}）",
+                frame.device.adapter.name, self.encode_device.device.adapter.name
+            )));
+        }
+        if frame.width == 0 || frame.height == 0 {
+            return Err(WinVideoError::Encode(format!(
+                "采集纹理尺寸不能为 0：{}x{}",
+                frame.width, frame.height
+            )));
+        }
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `frame.texture` 是有效纹理；`desc` 指向本栈帧。
+        unsafe { frame.texture.GetDesc(&raw mut desc) };
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        {
+            return Err(WinVideoError::Encode(format!(
+                "GPU 编码只接受 BGRA8 纹理，收到 {:?}",
+                desc.Format
+            )));
+        }
+        if desc.Width == 0 || desc.Height == 0 {
+            return Err(WinVideoError::Encode(format!(
+                "采集纹理描述尺寸非法：{}x{}",
+                desc.Width, desc.Height
+            )));
+        }
+
+        let key = (desc.Width, desc.Height, desc.Format);
+        let needs_rebuild = self
+            .video
+            .as_ref()
+            .is_none_or(|converter| converter.input_key() != key);
+        let convert_started = Instant::now();
+        if needs_rebuild {
+            self.video = Some(video_processor::Nv12Converter::new(
+                &self.encode_device.device,
+                desc.Width,
+                desc.Height,
+                desc.Format,
+                self.width,
+                self.height,
+                self.fps,
+            )?);
+        }
+        let converter = self
+            .video
+            .as_mut()
+            .ok_or_else(|| WinVideoError::Encode("VideoProcessor 未初始化".to_owned()))?;
+        let nv12 = converter.convert(frame)?;
+        self.last_convert_ms = elapsed_ms(convert_started);
+
+        let sample = self.build_texture_sample(&nv12)?;
+        self.process_sample(sample, force_keyframe)
+    }
+
+    /// 公共的「样本 → 码流」处理：关键帧请求、异步/同步事件循环、Annex B 归一化。
+    fn process_sample(
+        &mut self,
+        sample: IMFSample,
+        force_keyframe: bool,
+    ) -> Result<EncodedPacket, WinVideoError> {
         if force_keyframe {
             self.request_keyframe()?;
         }
 
         let mft_started = Instant::now();
-        let sample = self.build_input_sample()?;
         let raw = if self.events.is_some() {
             self.encode_async(sample)?
         } else {
@@ -671,6 +806,27 @@ impl MftH264Encoder {
         // SAFETY: 两个 COM 对象都在本函数内有效；AddBuffer 增加引用计数。
         unsafe { sample.AddBuffer(&buffer) }
             .map_err(|err| encode_err("IMFSample::AddBuffer", &err))?;
+        self.stamp_sample(&sample)?;
+        Ok(sample)
+    }
+
+    /// 把 GPU 表面缓冲包成带时间戳的输入样本（GPU 路径）。
+    fn build_texture_sample(
+        &mut self,
+        texture: &ID3D11Texture2D,
+    ) -> Result<IMFSample, WinVideoError> {
+        // NV12 是线性可寻址的 2D 子资源，`bottom_up_when_linear = false`。
+        let buffer = mfplat::create_dxgi_surface_buffer(texture, 0, false)?;
+        let sample = mfplat::create_sample()?;
+        // SAFETY: 两个 COM 对象都在本函数内有效；AddBuffer 增加引用计数。
+        unsafe { sample.AddBuffer(&buffer) }
+            .map_err(|err| encode_err("IMFSample::AddBuffer（GPU 输入）", &err))?;
+        self.stamp_sample(&sample)?;
+        Ok(sample)
+    }
+
+    /// 设置样本时间戳并推进时间轴（CPU/GPU 两条路径共用，保证节奏一致）。
+    fn stamp_sample(&mut self, sample: &IMFSample) -> Result<(), WinVideoError> {
         // SAFETY: `sample` 有效；时间戳只影响码流时间轴。
         unsafe {
             sample
@@ -681,7 +837,7 @@ impl MftH264Encoder {
                 .map_err(|err| encode_err("IMFSample::SetSampleDuration", &err))?;
         }
         self.next_pts = self.next_pts.saturating_add(self.frame_duration);
-        Ok(sample)
+        Ok(())
     }
 
     /// 循环取走 MFT 已产生的全部输出样本，返回拼接后的原始码流。

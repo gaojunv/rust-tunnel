@@ -13,10 +13,13 @@
 //!   为 false 时直接返回错误，让 [`super::open_best`] 回退 DXGI。
 
 use super::{
-    create_device_for, BgraReader, CaptureBackend, CaptureSource, CapturedFrame, MonitorInfo,
-    FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
+    create_device_for, texture_dimensions, BgraReader, CaptureBackend, CaptureSource,
+    CapturedFrame, CapturedTexture, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
+    NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
 };
+use crate::d3d11;
 use crate::WinVideoError;
+use std::sync::Arc;
 use std::time::Instant;
 use windows::core::Interface as _;
 use windows::Graphics::Capture::{
@@ -25,7 +28,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -42,14 +45,16 @@ struct WgcSource {
     _session: GraphicsCaptureSession,
     /// 自由线程帧池。
     pool: Direct3D11CaptureFramePool,
-    /// D3D11 设备（帧纹理由它创建，读回也要用它）。
-    device: ID3D11Device,
-    /// 立即上下文。
-    context: ID3D11DeviceContext,
+    /// D3D11 设备（帧纹理由它创建，读回/GPU 拷贝也要用它）。
+    d3d: Arc<d3d11::D3d11>,
     /// BGRA 读回器（staging 纹理缓存）。
     reader: BgraReader,
     /// 最近一次成功采集的帧，用于桌面静止时复用。
     last: Option<CapturedFrame>,
+    /// 持久 BGRA 纹理池（GPU 路径）；尺寸/格式变化时重建。
+    textures: Option<TexturePool>,
+    /// 最近一次 GPU 采集结果（无新帧时返回它的克隆）。
+    last_texture: Option<CapturedTexture>,
 }
 
 impl CaptureSource for WgcSource {
@@ -58,12 +63,7 @@ impl CaptureSource for WgcSource {
     }
 
     fn capture(&mut self) -> Result<CapturedFrame, WinVideoError> {
-        let timeout = if self.last.is_some() {
-            NEXT_FRAME_POLL_TIMEOUT
-        } else {
-            FIRST_FRAME_TIMEOUT
-        };
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + self.capture_timeout();
         loop {
             match self.pool.TryGetNextFrame() {
                 Ok(frame) => {
@@ -88,13 +88,105 @@ impl CaptureSource for WgcSource {
         match &self.last {
             Some(frame) => Ok(frame.clone()),
             None => Err(WinVideoError::Capture(format!(
-                "WGC: {timeout:?} 内没有收到首帧"
+                "WGC: {:?} 内没有收到首帧",
+                self.capture_timeout()
             ))),
         }
+    }
+
+    fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
+        let timeout = self.capture_timeout();
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.pool.TryGetNextFrame() {
+                Ok(frame) => {
+                    let result = self.copy_surface(&frame);
+                    // SAFETY 说明：Close 失败只影响缓冲归还时机，不影响已拷贝的数据。
+                    if let Err(err) = frame.Close() {
+                        tracing::debug!(error = %err, "WGC 帧对象 Close 失败");
+                    }
+                    let captured = result?;
+                    self.last_texture = Some(captured.clone());
+                    return Ok(captured);
+                }
+                Err(err) if err.code().is_ok() => {}
+                Err(err) => {
+                    return Err(WinVideoError::Capture(format!(
+                        "WGC TryGetNextFrame 失败: {err}"
+                    )))
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        match &self.last_texture {
+            Some(texture) => Ok(texture.clone()),
+            None => Err(WinVideoError::Capture(format!(
+                "WGC: {timeout:?} 内没有收到首帧（GPU 纹理）"
+            ))),
+        }
+    }
+
+    fn device(&self) -> Option<Arc<d3d11::D3d11>> {
+        Some(self.d3d.clone())
     }
 }
 
 impl WgcSource {
+    /// 首帧等 2 秒，之后每次最多等 10 毫秒（两种路径共用同一策略）。
+    fn capture_timeout(&self) -> std::time::Duration {
+        if self.last.is_some() || self.last_texture.is_some() {
+            NEXT_FRAME_POLL_TIMEOUT
+        } else {
+            FIRST_FRAME_TIMEOUT
+        }
+    }
+
+    /// 把帧表面拷贝到池纹理（GPU 到 GPU，不落 CPU）。
+    fn copy_surface(
+        &mut self,
+        frame: &Direct3D11CaptureFrame,
+    ) -> Result<CapturedTexture, WinVideoError> {
+        let surface = frame
+            .Surface()
+            .map_err(|err| WinVideoError::Capture(format!("WGC Surface() 失败: {err}")))?;
+        let access: IDirect3DDxgiInterfaceAccess = surface
+            .cast()
+            .map_err(|err| WinVideoError::Capture(format!("表面转 DXGI 接口失败: {err}")))?;
+        // SAFETY: `access` 是帧表面的 DXGI 访问接口；请求的是 D3D11 纹理。
+        let source: ID3D11Texture2D = unsafe { access.GetInterface() }
+            .map_err(|err| WinVideoError::Capture(format!("帧表面不是 D3D11 纹理: {err}")))?;
+        let ((width, height), format) = texture_dimensions(&source)?;
+
+        if self
+            .textures
+            .as_ref()
+            .is_none_or(|pool| !pool.matches(width, height, format))
+        {
+            self.textures = Some(TexturePool::new(&self.d3d.device, width, height, format)?);
+        }
+        let pool = self
+            .textures
+            .as_ref()
+            .ok_or_else(|| WinVideoError::Config("WGC 纹理池缺失".to_owned()))?;
+        let (lease, target) = pool.acquire(&self.d3d.device)?;
+
+        // SAFETY: 两张纹理在同一设备上、尺寸与格式一致（池按源纹理描述创建）；
+        // 拷贝在立即上下文上同步完成。
+        unsafe { self.d3d.context.CopyResource(&target, &source) };
+
+        Ok(CapturedTexture {
+            device: self.d3d.clone(),
+            texture: target,
+            subresource: 0,
+            width,
+            height,
+            lease,
+        })
+    }
+
     /// 把一帧 WGC 画面读成紧凑 BGRA，并关闭帧对象归还缓冲。
     fn read_frame(
         &mut self,
@@ -121,7 +213,9 @@ impl WgcSource {
         // SAFETY: `access` 是帧表面的 DXGI 访问接口；请求的是 D3D11 纹理。
         let texture: ID3D11Texture2D = unsafe { access.GetInterface() }
             .map_err(|err| WinVideoError::Capture(format!("帧表面不是 D3D11 纹理: {err}")))?;
-        let (width, height, bgra) = self.reader.read(&self.device, &self.context, &texture)?;
+        let (width, height, bgra) =
+            self.reader
+                .read(&self.d3d.device, &self.d3d.context, &texture)?;
         Ok(CapturedFrame {
             width,
             height,
@@ -154,7 +248,7 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
     let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor.hmonitor) }
         .map_err(|err| WinVideoError::Capture(format!("CreateForMonitor 失败: {err}")))?;
 
-    let d3d = create_device_for(monitor.hmonitor)?;
+    let d3d = Arc::new(create_device_for(monitor.hmonitor)?);
     let device = winrt_device(&d3d.device)?;
 
     let size = item
@@ -199,10 +293,11 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         _item: item,
         _session: session,
         pool,
-        device: d3d.device,
-        context: d3d.context,
+        d3d,
         reader: BgraReader::default(),
         last: None,
+        textures: None,
+        last_texture: None,
     }))
 }
 

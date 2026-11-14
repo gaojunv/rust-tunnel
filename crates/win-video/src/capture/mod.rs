@@ -5,6 +5,9 @@
 //! - [`enumerate_monitors`]：枚举显示器，返回稳定序号、尺寸、主屏标志与 HMONITOR。
 //! - [`CaptureSource`]：一次打开、反复采帧；[`CaptureSource::capture`] 返回
 //!   **自顶向下 BGRA8**（WGC/DXGI 的原生格式，避免每帧一次通道交换）。
+//! - [`CaptureSource::capture_texture`]：同一画面直接落在采集源的**持久 GPU
+//!   纹理**上（不落 CPU），供 D3D11 VideoProcessor + 硬件编码器直通；
+//!   [`CaptureSource::device`] 暴露采集设备，编码器必须与它共用同一设备。
 //! - [`open_best`]：按 WGC → DXGI 的顺序尝试，返回实际后端；两个后端都失败时
 //!   错误信息里同时带上两侧的原因。
 //!
@@ -33,12 +36,14 @@ mod wgc;
 use crate::d3d11;
 use crate::WinVideoError;
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
@@ -131,6 +136,230 @@ pub struct CapturedFrame {
     pub backend: CaptureBackend,
 }
 
+/// 池里同时存在的 GPU 纹理数量。
+///
+/// 引擎侧最多同时持有 2 帧在途（编码队列 1 + 当前帧 1），留 4 张足够轮转；
+/// 池耗尽时 [`TexturePool::acquire`] 会临时新建一张（只记 debug，不失败）。
+const TEXTURE_POOL_SIZE: usize = 4;
+
+/// 一帧 **GPU 纹理**形式的采集结果（不落 CPU）。
+///
+/// 纹理是采集源内部纹理池里的持久纹理：内容在 `Drop` 之前有效，之后槽位才会
+/// 被下一次采集复用。克隆共享同一份槽位租约（最后一个克隆销毁时才归还），
+/// 因此「静止画面复用上一帧」不会让同一槽位被重复归还。
+///
+/// 纹理格式只保证是 BGRA8（`B8G8R8A8_UNORM` / `_SRGB`），尺寸由 `width`/`height`
+/// 给出。后端不支持的格式（例如 HDR 的 `R16G16B16A16_FLOAT`）在
+/// [`CaptureSource::capture_texture`] 里直接报错，由调用方回退 CPU/GDI。
+pub struct CapturedTexture {
+    /// 纹理所在的 D3D11 设备（与采集源是同一个 `Arc`）。
+    pub device: Arc<d3d11::D3d11>,
+    /// 持久 BGRA 纹理。
+    pub texture: ID3D11Texture2D,
+    /// 纹理子资源序号（2D 纹理恒为 0）。
+    pub subresource: u32,
+    /// 帧宽（像素）。
+    pub width: u32,
+    /// 帧高（像素）。
+    pub height: u32,
+    /// 池槽位租约；外部构造（探针）的纹理没有租约。
+    lease: Option<SlotLease>,
+}
+
+impl CapturedTexture {
+    /// 用外部纹理构造一个不参与采集源纹理池的 [`CapturedTexture`]。
+    ///
+    /// 探针/测试用它把自建纹理喂给编码器；纹理必须与调用方后续使用的编码器
+    /// 处在**同一个** [`d3d11::D3d11`] 设备上。
+    #[must_use]
+    pub fn from_texture(
+        device: Arc<d3d11::D3d11>,
+        texture: ID3D11Texture2D,
+        subresource: u32,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            device,
+            texture,
+            subresource,
+            width,
+            height,
+            lease: None,
+        }
+    }
+}
+
+impl Clone for CapturedTexture {
+    /// 克隆共享池租约（引用计数归零才归还槽位）。
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            texture: self.texture.clone(),
+            subresource: self.subresource,
+            width: self.width,
+            height: self.height,
+            lease: self.lease.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for CapturedTexture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapturedTexture")
+            .field("adapter", &self.device.adapter.name)
+            .field("size", &(self.width, self.height))
+            .field("subresource", &self.subresource)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 池槽位的租约；克隆共享同一租约，最后一个销毁时把序号还给空闲表。
+#[derive(Clone)]
+struct SlotLease(
+    #[expect(
+        dead_code,
+        reason = "字段只用于持有租约；归还槽位发生在 Arc 内的 SlotLeaseInner::drop"
+    )]
+    Arc<SlotLeaseInner>,
+);
+
+struct SlotLeaseInner {
+    free: Arc<Mutex<Vec<usize>>>,
+    index: usize,
+}
+
+impl Drop for SlotLeaseInner {
+    fn drop(&mut self) {
+        lock_free(&self.free).push(self.index);
+    }
+}
+
+/// 取空闲表锁；互斥锁中毒时恢复内部数据（池只是序号表，没有一致性风险）。
+fn lock_free(free: &Mutex<Vec<usize>>) -> MutexGuard<'_, Vec<usize>> {
+    free.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 采集源内部的持久 BGRA 纹理池。
+///
+/// 尺寸或格式变化时整池重建（旧租约仍持有旧池的 `Arc`，归还到旧表里，不会污染
+/// 新池）。**不每帧新建纹理**——`CopyResource` 落到已有槽位。
+struct TexturePool {
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    textures: Vec<ID3D11Texture2D>,
+    free: Arc<Mutex<Vec<usize>>>,
+}
+
+impl TexturePool {
+    fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<Self, WinVideoError> {
+        let mut textures = Vec::with_capacity(TEXTURE_POOL_SIZE);
+        for _ in 0..TEXTURE_POOL_SIZE {
+            textures.push(create_pool_texture(device, width, height, format)?);
+        }
+        // 从尾部弹出，首个被取到的槽位是 0（与插入顺序一致，便于真机排障）。
+        let free = Arc::new(Mutex::new((0..TEXTURE_POOL_SIZE).rev().collect()));
+        Ok(Self {
+            width,
+            height,
+            format,
+            textures,
+            free,
+        })
+    }
+
+    fn matches(&self, width: u32, height: u32, format: DXGI_FORMAT) -> bool {
+        self.width == width && self.height == height && self.format == format
+    }
+
+    /// 借一个槽位；池耗尽时临时新建一张（不归还，随 `CapturedTexture` 释放）。
+    fn acquire(
+        &self,
+        device: &ID3D11Device,
+    ) -> Result<(Option<SlotLease>, ID3D11Texture2D), WinVideoError> {
+        let index = lock_free(&self.free).pop();
+        let Some(index) = index else {
+            tracing::debug!("GPU 纹理池已耗尽，临时新建一张纹理");
+            let texture = create_pool_texture(device, self.width, self.height, self.format)?;
+            return Ok((None, texture));
+        };
+        let texture = self
+            .textures
+            .get(index)
+            .cloned()
+            .ok_or_else(|| WinVideoError::Config(format!("GPU 纹理池槽位 {index} 不存在")))?;
+        let lease = SlotLease(Arc::new(SlotLeaseInner {
+            free: self.free.clone(),
+            index,
+        }));
+        Ok((Some(lease), texture))
+    }
+}
+
+/// 创建一张池纹理：默认用途、可作渲染目标与着色器资源，供 VideoProcessor 输入。
+fn create_pool_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<ID3D11Texture2D, WinVideoError> {
+    let bind = D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0;
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: u32::try_from(bind).unwrap_or(0),
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture: Option<ID3D11Texture2D> = None;
+    // SAFETY: `desc` 合法；输出指针指向栈上 Option。
+    unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture)) }
+        .map_err(|err| WinVideoError::Capture(format!("创建纹理池纹理失败: {err}")))?;
+    texture.ok_or_else(|| WinVideoError::Capture("CreateTexture2D 返回空纹理".to_owned()))
+}
+
+/// 校验采集纹理格式并读出尺寸。
+fn texture_dimensions(
+    texture: &ID3D11Texture2D,
+) -> Result<((u32, u32), DXGI_FORMAT), WinVideoError> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: `texture` 是有效纹理；`desc` 指向本栈帧。
+    unsafe { texture.GetDesc(&raw mut desc) };
+    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB {
+        let hint = if desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            "；这是 HDR 桌面的 DXGI 输出，需要 HDR→SDR 色调映射"
+        } else {
+            ""
+        };
+        return Err(WinVideoError::Capture(format!(
+            "GPU 采集纹理格式不受支持 {:?}（只接受 B8G8R8A8_UNORM / SRGB）{hint}",
+            desc.Format
+        )));
+    }
+    if desc.Width == 0 || desc.Height == 0 {
+        return Err(WinVideoError::Capture(format!(
+            "GPU 采集纹理尺寸非法：{}x{}",
+            desc.Width, desc.Height
+        )));
+    }
+    Ok(((desc.Width, desc.Height), desc.Format))
+}
+
 /// 一次打开、反复采帧的采集源。
 ///
 /// 实现必须是 `Send`：采集通常被放进 `spawn_blocking`（`capture()` 会阻塞）。
@@ -147,7 +376,36 @@ pub trait CaptureSource: Send {
     /// 首帧超时、设备/会话丢失且重建失败、或纹理格式不受支持时返回
     /// [`WinVideoError::Capture`] / [`WinVideoError::Windows`]。
     fn capture(&mut self) -> Result<CapturedFrame, WinVideoError>;
+
+    /// 采集当前屏幕内容到 **GPU 纹理**（不落 CPU）。
+    ///
+    /// 返回的纹理由采集源内部池持有，克隆/释放语义见 [`CapturedTexture`]。
+    /// 无新帧时复用上一次的纹理（同一画面对应的槽位租约被共享）。
+    ///
+    /// 默认实现返回「该后端不支持」；WGC / DXGI 两个后端都实现了它。
+    ///
+    /// # Errors
+    /// 首帧超时、设备/会话丢失且重建失败、或纹理格式不是 BGRA8 时返回
+    /// [`WinVideoError::Capture`]。
+    fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
+        Err(WinVideoError::Capture(
+            "该采集后端不支持 GPU 纹理".to_owned(),
+        ))
+    }
+
+    /// 采集源使用的 D3D11 设备（编解码需要与采集共用同一设备）。
+    ///
+    /// 默认返回 `None`（后端不支持 GPU 纹理）。
+    fn device(&self) -> Option<Arc<d3d11::D3d11>> {
+        None
+    }
 }
+
+// 编译期断言：`CapturedTexture` 必须能随采集源移进 `spawn_blocking`。
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<CapturedTexture>();
+};
 
 /// 枚举所有显示器。
 ///
