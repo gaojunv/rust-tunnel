@@ -46,10 +46,35 @@ SCM ──启动──> rust-tunnel-client-service.exe --run        (SYSTEM / �
               服务端 ──> 控制器
 ```
 
-**装它**（管理员命令行）：
+**装它（推荐：一个 zip + GUI 里点一下）**：
+
+发布页的 `rust-tunnel-client-gui-windows-x86_64.zip` 里同时包含
+`rust-tunnel-client-gui.exe` 与 `rust-tunnel-client-service.exe`。解压后：
+
+1. 双击 `rust-tunnel-client-gui.exe`，先在「设置」里填好服务器地址与客户端 token 并保存；
+2. 打开「设置 → 无人值守被控端」，点 **「安装并启用（推荐）」**；
+3. 在 UAC 上选「是」。
+
+按钮会在**一次提权**里完成：复制两个 exe → 加固目录 DACL → 注册服务 → 用 GUI 当前的
+客户端配置生成 `%ProgramData%\rust-tunnel\host.toml` → 启动服务。不需要手工写配置文件，
+也不需要单独下载服务 exe。
+
+> 无人值守下 `approval` 必须是 `Auto`：实例是无头的，没有人能点确认弹窗，`Confirm`
+> 会让所有接入请求在 45 秒后超时。GUI 在策略为 `Confirm` 时会在安装按钮下方给出警告。
+>
+> **审批策略是安装时的快照**：之后在 GUI 里切换「需要确认 / 自动接受」不会自动改写
+> 服务实例的 `host.toml`。要改服务侧的策略：先在面板上「停止服务」（运行中不允许重装，
+> 否则会掐断正在进行的远程会话），再点「重新安装并启用」；或用管理员命令行执行
+> `--install --host-config <文件> --start`，或手工编辑
+> `%ProgramData%\rust-tunnel\host.toml` 后重启服务。
+
+**命令行等价物**（管理员）：
 
 ```powershell
-rust-tunnel-client-service.exe --install --gui-exe <rust-tunnel-client-gui.exe 的路径>
+rust-tunnel-client-service.exe --install `
+    --gui-exe "<rust-tunnel-client-gui.exe 的路径>" `
+    --host-config "<准备好的 host.toml>" `
+    --start
 ```
 
 `--install` 会：
@@ -62,13 +87,13 @@ rust-tunnel-client-service.exe --install --gui-exe <rust-tunnel-client-gui.exe �
    它的 exe 放在任何用户可写的目录里，替换 exe 就等于拿到 SYSTEM**；
 3. 建 `%ProgramData%\rust-tunnel\`（日志 + `host.toml` + 共享/下载）并同样加固；
 4. 注册服务，`ImagePath` 指向**副本**、参数是编译期常量 `--run`；
-5. 检查 `host.toml`，不存在就把「还差这一步」明确打出来。
+5. 如果给了 `--host-config`，把它复制成 `%ProgramData%\rust-tunnel\host.toml`（先删旧文件，
+   让新文件继承受限 DACL）；否则只检查并提示「还差这一步」；
+6. 如果给了 `--start`，安装成功后立刻启动服务。
 
-**`--install` 不生成 `host.toml`**：它含服务端**全局 token**，那个值只有服务端 Web 界面
-能给。装完请手工写 `%ProgramData%\rust-tunnel\host.toml`（`server` / `password` /
-`name` / 可选的 `approval = "Auto"`）。`--gui-exe` 省略时会在服务 exe 同目录里按
-`rust-tunnel-client-gui.exe` / `rust-tunnel-client-gui-windows-x86_64.exe` 查找
-（CI 把两个产物并排放在同一个目录里）。
+`--install` **不会凭空生成 token**：那个值只有服务端 Web 界面能给。GUI 的一键流程是从
+**当前客户端配置**里取的（用户本来就已经填过），所以不需要再手工找。纯命令行安装时
+`--host-config` 可以省略，按老流程手工写 `%ProgramData%\rust-tunnel\host.toml`。
 
 ### 面板里的四个操作（不用敲命令行）
 
@@ -77,12 +102,11 @@ rust-tunnel-client-service.exe --install --gui-exe <rust-tunnel-client-gui.exe �
 是管理员**（每次会弹一次 UAC；在 UAC 上点「否」会被当作一次合法的取消，静默处理，
 不报「失败」）。命令行等价物是 `--install` / `--uninstall` / `--start` / `--stop`。
 
-**顺序是「安装 → 写 host.toml → 启动」，中间那步不能跳**：
-
-`--install` **有意不启动服务**。而实例读的是 `%ProgramData%\rust-tunnel\host.toml`
-（含服务端**全局 token**，只能由服务端 Web 界面给，必须手工写）。若在 `host.toml`
-不存在时启动服务：GUI 一看到服务在跑就**立刻转为被动**（不再注册），而服务实例又读不到
-配置、注册不了——**这台机器就彻底没有客户端身份了**，从外面完全连不上。
+**「安装并启用」把顺序合并成一次提权**：它先用当前客户端配置生成一份临时
+`host.toml`，再让服务 exe 在**同一个提权进程**里完成「复制 → 加固 → 注册 → 写
+host.toml → 启动」。中间不会出现「服务已启动、配置还没写」的窗口，所以不需要用户
+手工排顺序。**纯命令行安装**仍保留老语义：`--install` **有意不启动服务**，用户要么自己
+写 `host.toml` 再 `--start`，要么用 `--host-config` + `--start` 一次做完。
 
 所以 `host.toml` 不存在时**启动按钮是禁用的**，并写明原因（`service_ui::start_blocked_reason`）。
 这是刻意的联锁，不是保守。

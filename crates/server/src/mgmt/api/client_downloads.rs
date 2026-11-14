@@ -595,6 +595,16 @@ mod tests {
             platform_from_filename("rust-tunnel-client-windows-x86_64.exe"),
             ("windows".into(), "x86_64".into(), Some("exe".into()))
         );
+        // 无人值守服务与 Windows 单包（GUI + 服务）都必须被下载页认成 Windows/x86_64，
+        // 否则它们会从列表里消失或落到 unknown 分组。
+        assert_eq!(
+            platform_from_filename("rust-tunnel-client-service-windows-x86_64.exe"),
+            ("windows".into(), "x86_64".into(), Some("exe".into()))
+        );
+        assert_eq!(
+            platform_from_filename("rust-tunnel-client-gui-windows-x86_64.zip"),
+            ("windows".into(), "x86_64".into(), Some("zip".into()))
+        );
         // 未知命名不丢文件，退化为 unknown
         assert_eq!(
             platform_from_filename("something-else"),

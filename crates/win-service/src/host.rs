@@ -172,9 +172,18 @@ fn execute(command: Command) -> Result<(), String> {
         Command::Run { probe: true } => run_probe_service(),
         Command::Run { probe: false } => run_instance_service(),
         Command::ProbeInService => probe_in_service(),
-        Command::Install { gui_exe } => {
+        Command::Install {
+            gui_exe,
+            host_config,
+            start,
+        } => {
             let gui_exe = gui_exe.map(PathBuf::from);
-            install_service(gui_exe.as_deref())
+            let host_config = host_config.map(PathBuf::from);
+            install_service(gui_exe.as_deref(), host_config.as_deref())?;
+            if start {
+                start_service()?;
+            }
+            Ok(())
         }
         Command::Uninstall => service::uninstall()
             .map(|()| {
@@ -866,12 +875,13 @@ fn stop_service() -> Result<(), String> {
 /// 不可写），`ImagePath` 指向**副本**，并用 [`security::harden_directory`] 把那条限制
 /// 写实、再读回校验。
 ///
-/// # 为什么 `host.toml` 不由本程序生成
+/// # `host.toml`：默认只检查，`--host-config` 时才落盘
 ///
-/// 它含服务端**全局 token**，而那个值只有服务端 Web 界面能给出。凭空写一个空 token 的
-/// 模板只会让服务反复注册失败、日志刷屏，问题却不会因此更快被发现——所以这里只检查、
-/// 并把「还差这一步」明确打出来。
-fn install_service(gui_exe: Option<&Path>) -> Result<(), String> {
+/// 它含服务端**全局 token**。本程序自己不会凭空生成 token，但**调用方可以交一份已经准备好
+/// 的文件**（GUI 的「安装并启用」按钮就把当前客户端配置写进临时文件传进来）。此时安装器
+/// 把它复制到 `%ProgramData%\rust-tunnel\host.toml`，用户不再需要手工找 token、手工写文件。
+/// 没传 `--host-config` 时仍按原流程：只检查并打印「还差这一步」。
+fn install_service(gui_exe: Option<&Path>, host_config: Option<&Path>) -> Result<(), String> {
     let service_exe = std::env::current_exe()
         .map_err(|err| format!("拿不到本程序的路径，没法安装：{err}"))?;
     let gui_exe = locate_gui_exe(gui_exe, &service_exe)?;
@@ -899,8 +909,57 @@ fn install_service(gui_exe: Option<&Path>) -> Result<(), String> {
     // 4) 注册服务（ImagePath 指向**副本**，参数是编译期常量 `--run`）。
     register_service(&paths::installed_service_exe())?;
 
-    // 5) host.toml 是运维/安装器写的：本程序不知道服务端 token，不能凭空生成。
+    // 5) host.toml：调用方给了就**在目录加固之后**落盘（这样新文件继承受限 DACL），
+    //    否则只检查并打印「还差这一步」。
+    if let Some(source) = host_config {
+        seed_host_config(source)?;
+    }
     report_host_config();
+    Ok(())
+}
+
+/// 把调用方准备好的 `host.toml` 复制到 `%ProgramData%\rust-tunnel\host.toml`。
+///
+/// # 为什么先删后写
+///
+/// `%ProgramData%\rust-tunnel` 在调用前已被 [`security::harden_directory`] 加固，**新建**的
+/// 文件会继承「仅 SYSTEM + Administrators」的受限 DACL。但如果是覆盖一个**已存在**的文件，
+/// 它保留自己原来的描述符——那可能比目录宽松。故先删掉旧文件，让新文件重新继承目录 DACL。
+///
+/// 删除失败（权限/占用）会让整个安装失败：宁可让用户看到错误，也不要留下一个 ACL 不明的
+/// token 文件。
+fn seed_host_config(source: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(source).map_err(|err| {
+        format!(
+            "读取 --host-config 指定的配置文件 {} 失败：{err}",
+            source.display()
+        )
+    })?;
+    if bytes.is_empty() {
+        return Err(format!(
+            "--host-config 指定的配置文件 {} 是空的，拒绝把它写成 host.toml",
+            source.display()
+        ));
+    }
+    let destination = paths::host_config_path();
+    match std::fs::remove_file(&destination) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "删除旧 {} 失败（它可能正被占用）：{err}",
+                destination.display()
+            ));
+        }
+    }
+    std::fs::write(&destination, &bytes)
+        .map_err(|err| format!("写入 {} 失败：{err}", destination.display()))?;
+    println!(
+        "已写入实例配置：{}（来源 {}，{} 字节）",
+        destination.display(),
+        source.display(),
+        bytes.len()
+    );
     Ok(())
 }
 
@@ -1349,8 +1408,7 @@ mod tests {
     fn the_gui_exe_candidates_cover_both_archive_and_local_names() {
         // CI 的归档名与本地构建名不同；两个都认，否则用户下载后 --install 会找不到实例。
         assert!(GUI_EXE_CANDIDATES.contains(&"rust-tunnel-client-gui.exe"));
-        assert!(GUI_EXE_CANDIDATES
-            .contains(&"rust-tunnel-client-gui-windows-x86_64.exe"));
+        assert!(GUI_EXE_CANDIDATES.contains(&"rust-tunnel-client-gui-windows-x86_64.exe"));
         for name in GUI_EXE_CANDIDATES {
             assert_eq!(
                 Path::new(name).extension().and_then(|ext| ext.to_str()),

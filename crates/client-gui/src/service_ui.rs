@@ -28,6 +28,14 @@
 //! （见 `crates/win-service/src/args.rs` 的 `USAGE`）：本进程**从不**自己动 SCM，于是 GUI
 //! 不必以管理员身份运行——每次操作弹一次 UAC，四条路完全一致。纯函数 [`op_args`] 给出每个
 //! 操作对应的 argv。
+//!
+//! # 「安装并启用」把三件事合成一次提权
+//!
+//! GUI 本来就持有当前客户端配置（server/password/name/tls）。安装时它把这份配置写成一份
+//! 临时 `host.toml`，连同 `--gui-exe` 一起交给服务 exe 的 `--install`，并带上 `--start`。
+//! 服务 exe 在**同一个提权进程**里完成「复制 → 加固 DACL → 注册 → 写 host.toml → 启动」，
+//! 于是用户只点一次按钮、只弹一次 UAC，也不用再手工找 token、手工排「安装/写配置/启动」
+//! 的顺序。没有配置快照时自动退回老流程（只安装，配置由用户手工写）。
 
 // 非 Windows 上真正用得到这些纯逻辑的只有单测（windows 胶水整段不参与编译，bin crate 的
 // `pub` 也不构成「外部消费者」），故在本机构建里别把它们报成 dead_code——它们是本模块的
@@ -40,6 +48,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
+
+use rust_tunnel_remote::ApprovalPolicy;
 
 use crate::service_watch::{IdentityOwner, ServicePresence};
 
@@ -87,19 +97,166 @@ impl ServiceOp {
     }
 }
 
-/// 一次操作交给服务 exe 的 argv（**纯函数**）。
+/// 一键安装时交给提权安装器的 `host.toml` 内容。
 ///
-/// 四种操作的 argv 都由 runner 经 `elevate::run_elevated` 交给服务 exe（见模块文档）；
-/// `Install` 在有 GUI exe 路径时额外带上 `--gui-exe <路径>`，让服务侧把**正在运行的**这个 GUI
-/// 复制进 `%ProgramFiles%`（而不是去猜归档名）。其余三种操作忽略 `gui_exe`。
+/// # 为什么由 GUI 生成
+///
+/// GUI 本来就持有当前客户端配置（server / password / name / tls）。服务实例要的是**同一份**
+/// 身份，所以安装时直接把这份配置交给服务 exe，由它在自己的提权上下文里写进
+/// `%ProgramData%\rust-tunnel\host.toml`（那个目录只有 SYSTEM 与 Administrators 能写）。
+/// 用户不必再手工去找 token、手工建文件。
+///
+/// # 审批策略
+///
+/// `approval` 取用户当前的偏好。注意 **`Confirm` 在无人值守下无人可点**：实例是无头的，
+/// 接入请求会在 45 秒后超时。UI 必须把这个后果说出来（见 `ui/settings.rs`），不要静默。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSeed {
+    /// 服务端地址（`host:port`）。
+    server: String,
+    /// 客户端 token（与服务端 Web 里该客户端的一致）。
+    password: String,
+    /// 客户端名；`None` = 实例回落到主机名（与服务端身份规则一致）。
+    name: Option<String>,
+    /// 是否启用 TLS。
+    tls: bool,
+    /// TLS SNI。
+    tls_server_name: Option<String>,
+    /// 是否跳过证书校验（自签证书的 TOFU 模式）。
+    tls_insecure: bool,
+    /// 实例日志级别。
+    log: String,
+    /// 接入确认策略。
+    approval: ApprovalPolicy,
+}
+
+impl HostSeed {
+    /// 从当前客户端配置构造（不改配置本身，只做一次快照）。
+    #[must_use]
+    pub fn from_config(
+        config: &rust_tunnel_client::ClientConfig,
+        approval: ApprovalPolicy,
+    ) -> Self {
+        Self {
+            server: config.server.clone(),
+            password: config.password.clone(),
+            name: config.name.clone(),
+            tls: config.tls,
+            tls_server_name: config.tls_server_name.clone(),
+            tls_insecure: config.tls_insecure,
+            log: config.log.clone(),
+            approval,
+        }
+    }
+
+    /// 接入确认策略（UI 用来提示 Confirm 在无人值守下的后果）。
+    #[must_use]
+    pub const fn approval(&self) -> ApprovalPolicy {
+        self.approval
+    }
+
+    /// 序列化成 `host.toml`（**纯函数**，可在任何平台单测）。
+    ///
+    /// 走 `toml` crate 而不是手工拼字符串：token 里可能含引号/反斜杠，手拼会生成
+    /// 一份解析不了的配置，而错误直到服务启动时才会暴露。
+    ///
+    /// # Errors
+    ///
+    /// 序列化失败时返回一句给用户看的说明（正常不会发生）。
+    pub fn to_toml(&self) -> Result<String, String> {
+        #[derive(serde::Serialize)]
+        struct File<'a> {
+            server: &'a str,
+            password: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: Option<&'a str>,
+            tls: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tls_server_name: Option<&'a str>,
+            tls_insecure: bool,
+            log: &'a str,
+            approval: ApprovalPolicy,
+        }
+        let file = File {
+            server: &self.server,
+            password: &self.password,
+            name: self.name.as_deref(),
+            tls: self.tls,
+            tls_server_name: self.tls_server_name.as_deref(),
+            tls_insecure: self.tls_insecure,
+            log: &self.log,
+            approval: self.approval,
+        };
+        toml::to_string(&file).map_err(|err| format!("生成 host.toml 失败：{err}"))
+    }
+}
+
+/// 把 `host.toml` 写到一个**进程私有**的临时文件，返回路径。
+///
+/// 提权后的安装器只接受一个路径（不把 token 放进命令行，避免出现在其它用户可见的进程
+/// 命令行里）。`create_new` 保证不会跟随攻击者预置的符号链接/已存在文件。
+#[cfg(windows)]
+fn write_temp_host_toml(seed: &HostSeed) -> Result<PathBuf, String> {
+    use std::io::Write;
+
+    let content = seed.to_toml()?;
+    let dir = std::env::temp_dir();
+    for attempt in 0..16_u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = dir.join(format!(
+            "rust-tunnel-host-{}-{nanos}-{attempt}.toml",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(content.as_bytes())
+                    .map_err(|err| format!("写临时 host.toml 失败（{}）：{err}", path.display()))?;
+                return Ok(path);
+            }
+            // 撞名：换一个随机名重试（循环体结束后自然进入下一轮）。
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(format!(
+                    "创建临时 host.toml 失败（{}）：{err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(String::from("创建临时 host.toml 失败：连续 16 次撞名"))
+}
+
+/// 一次服务操作的 argv（**纯函数**）。
+///
+/// 四种操作的 argv 都由 runner 经 `elevate::run_elevated` 交给服务 exe（见模块文档）。
+/// 只有 `Install` 会用到 `host_config` / `start`：前者把 GUI 现成的客户端配置交给安装器，
+/// 后者让「装完即可用」只弹**一次** UAC（否则安装、启动各要一次）。
 #[must_use]
-pub fn op_args(op: ServiceOp, gui_exe: Option<&Path>) -> Vec<String> {
+pub fn op_args(
+    op: ServiceOp,
+    gui_exe: Option<&Path>,
+    host_config: Option<&Path>,
+    start: bool,
+) -> Vec<String> {
     match op {
         ServiceOp::Install => {
             let mut args = vec![String::from("--install")];
             if let Some(path) = gui_exe {
                 args.push(String::from("--gui-exe"));
                 args.push(path.to_string_lossy().into_owned());
+            }
+            if let Some(path) = host_config {
+                args.push(String::from("--host-config"));
+                args.push(path.to_string_lossy().into_owned());
+            }
+            if start {
+                args.push(String::from("--start"));
             }
             args
         }
@@ -364,8 +521,20 @@ impl ServiceOps {
     }
 
     /// 起一个后台线程执行操作，结果经通道回灌（见模块文档的线程模型）。
-    #[cfg(windows)]
     pub fn spawn_op(&mut self, op: ServiceOp) {
+        self.spawn_op_with_seed(op, None);
+    }
+
+    /// 「安装并启用」：把当前客户端配置生成的 `host.toml` 一并交给提权安装器，并启动服务。
+    ///
+    /// `seed` 为 `None` 时退化成老流程（只安装，用户自己写 host.toml）。
+    pub fn spawn_install(&mut self, seed: Option<HostSeed>) {
+        self.spawn_op_with_seed(ServiceOp::Install, seed);
+    }
+
+    /// 统一的入队实现：后台线程只跑 [`run_op`]，UI 线程永不阻塞。
+    #[cfg(windows)]
+    fn spawn_op_with_seed(&mut self, op: ServiceOp, seed: Option<HostSeed>) {
         if self.in_flight.is_some() {
             // 已有操作在途：忽略重复点击（按钮本应已禁用，这里是第二道闸）。
             return;
@@ -375,15 +544,15 @@ impl ServiceOps {
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         std::thread::spawn(move || {
-            let outcome = run_op(op);
+            let outcome = run_op(op, seed);
             // 发送失败只可能是 UI 已退出——不是错误。
             let _ = tx.send(outcome);
         });
     }
 
-    /// 非 Windows：无人值守被控端不可用，直接把话说清楚（UI 里那一节本就不出按钮）。
+    /// 非 Windows：没有服务可装，直接把话说清楚（UI 里那一节本就不出按钮）。
     #[cfg(not(windows))]
-    pub fn spawn_op(&mut self, op: ServiceOp) {
+    fn spawn_op_with_seed(&mut self, op: ServiceOp, _seed: Option<HostSeed>) {
         self.last_message = Some(format!("{}：无人值守被控端仅在 Windows 上可用", op.label()));
     }
 }
@@ -438,28 +607,55 @@ fn join_paths(paths: &[PathBuf]) -> String {
 /// 执行一次操作：**唯一**路径——提权重新拉起服务 exe（UAC），等它结束并读它的退出码。
 ///
 /// 四个操作一视同仁（见模块文档）；不再有「本进程已提权就直接调 SCM」那条近路。
+///
+/// `seed` 只在 `Install` 上生效：先写一份临时 `host.toml`，把它作为 `--host-config` 传给
+/// 提权后的安装器，并自动带上 `--start`——于是「安装 + 写配置 + 启动」只弹一次 UAC。
+/// 临时文件在子进程退出后无论成败都删掉。
 #[cfg(windows)]
-fn run_op(op: ServiceOp) -> ServiceOpOutcome {
+fn run_op(op: ServiceOp, seed: Option<HostSeed>) -> ServiceOpOutcome {
     use rust_tunnel_win_platform::{elevate, paths};
+
+    let seed = (op == ServiceOp::Install).then_some(seed).flatten();
+    let temp_host = match seed.as_ref() {
+        Some(seed) => match write_temp_host_toml(seed) {
+            Ok(path) => Some(path),
+            Err(err) => return ServiceOpOutcome::Failed(err),
+        },
+        None => None,
+    };
+
+    let gui_exe = current_gui_exe();
+    let args = op_args(
+        op,
+        gui_exe.as_deref(),
+        temp_host.as_deref(),
+        temp_host.is_some(),
+    );
 
     let gui_exe_dir = current_gui_exe_dir();
     let candidates = service_exe_candidates(&paths::installed_service_exe(), &gui_exe_dir);
-    let Some(exe) = locate_service_exe(&candidates) else {
-        return ServiceOpOutcome::Failed(format!(
-            "找不到服务 exe（找过：{}）",
+    let result = match locate_service_exe(&candidates) {
+        None => ServiceOpOutcome::Failed(format!(
+            "找不到服务 exe（找过：{}）。请把 rust-tunnel-client-service.exe 放在 GUI \
+             同目录，或使用同时包含 GUI 与服务的 zip 包。",
             join_paths(&candidates)
-        ));
+        )),
+        Some(exe) => match elevate::run_elevated(&exe, &args) {
+            Ok(elevate::ElevationOutcome::Completed { exit_code: 0 }) => ServiceOpOutcome::Ok,
+            Ok(elevate::ElevationOutcome::Completed { exit_code }) => {
+                ServiceOpOutcome::Failed(format!("服务 exe 退出码 {exit_code}"))
+            }
+            // 用户点了 UAC 的「否」：合法选择，不是错误。
+            Ok(elevate::ElevationOutcome::Cancelled) => ServiceOpOutcome::Cancelled,
+            Err(err) => ServiceOpOutcome::Failed(err.to_string()),
+        },
     };
-    let args = op_args(op, current_gui_exe().as_deref());
-    match elevate::run_elevated(&exe, &args) {
-        Ok(elevate::ElevationOutcome::Completed { exit_code: 0 }) => ServiceOpOutcome::Ok,
-        Ok(elevate::ElevationOutcome::Completed { exit_code }) => {
-            ServiceOpOutcome::Failed(format!("服务 exe 退出码 {exit_code}"))
-        }
-        // 用户点了 UAC 的「否」：合法选择，不是错误。
-        Ok(elevate::ElevationOutcome::Cancelled) => ServiceOpOutcome::Cancelled,
-        Err(err) => ServiceOpOutcome::Failed(err.to_string()),
+
+    if let Some(path) = temp_host {
+        // 安装器已经读完（提权进程退出后才走到这里）；删不掉也只是留下一个临时文件。
+        let _ = std::fs::remove_file(path);
     }
+    result
 }
 
 #[cfg(test)]
@@ -478,33 +674,66 @@ mod tests {
         dir
     }
 
-    /// 表驱动：四种操作 × 有无 GUI exe。
+    /// 表驱动：四种操作 × 安装选项。
     #[test]
     fn op_args_table() {
-        let cases: &[(ServiceOp, Option<&str>, &[&str])] = &[
-            (ServiceOp::Install, None, &["--install"]),
+        // (op, gui_exe, host_config, start, expected_argv)
+        type Case<'a> = (
+            ServiceOp,
+            Option<&'a Path>,
+            Option<&'a Path>,
+            bool,
+            &'a [&'a str],
+        );
+        let gui = Path::new(r"C:\dl\rust-tunnel-client-gui.exe");
+        let host = Path::new(r"C:\dl\host.toml");
+        let cases: &[Case<'_>] = &[
+            (ServiceOp::Install, None, None, false, &["--install"]),
             (
                 ServiceOp::Install,
-                Some(r"C:\dl\rust-tunnel-client-gui.exe"),
+                Some(gui),
+                None,
+                false,
                 &[
                     "--install",
                     "--gui-exe",
                     r"C:\dl\rust-tunnel-client-gui.exe",
                 ],
             ),
-            (ServiceOp::Uninstall, None, &["--uninstall"]),
-            // 卸载不接受 --gui-exe：即使给了也不该出现在参数里。
-            (ServiceOp::Uninstall, Some(r"C:\x.exe"), &["--uninstall"]),
-            (ServiceOp::Start, None, &["--start"]),
-            (ServiceOp::Stop, None, &["--stop"]),
+            (
+                ServiceOp::Install,
+                Some(gui),
+                Some(host),
+                true,
+                &[
+                    "--install",
+                    "--gui-exe",
+                    r"C:\dl\rust-tunnel-client-gui.exe",
+                    "--host-config",
+                    r"C:\dl\host.toml",
+                    "--start",
+                ],
+            ),
+            (ServiceOp::Uninstall, None, None, false, &["--uninstall"]),
+            // 其余操作不接受安装选项：即使给了也不该出现在参数里。
+            (
+                ServiceOp::Uninstall,
+                Some(gui),
+                Some(host),
+                true,
+                &["--uninstall"],
+            ),
+            (ServiceOp::Start, Some(gui), Some(host), true, &["--start"]),
+            (ServiceOp::Stop, Some(gui), Some(host), true, &["--stop"]),
         ];
-        for (op, gui, expected) in cases {
-            let got = op_args(*op, gui.map(Path::new));
+        for (op, gui_exe, host_config, start, expected) in cases {
+            let got = op_args(*op, *gui_exe, *host_config, *start);
             let want: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
-            assert_eq!(got, want, "{op:?} + {gui:?}");
+            assert_eq!(
+                got, want,
+                "{op:?} + {gui_exe:?} + {host_config:?} + {start}"
+            );
         }
-        // 表必须覆盖「四种操作 × 有无路径」的全部组合。
-        assert_eq!(cases.len(), 6);
     }
 
     /// 四种操作**都**经提权重新拉起服务 exe（模块文档）——本模块只有这一条到达服务 exe 的路径。
@@ -520,7 +749,7 @@ mod tests {
             ServiceOp::Start,
             ServiceOp::Stop,
         ] {
-            let args = op_args(op, None);
+            let args = op_args(op, None, None, false);
             assert_eq!(
                 args.len(),
                 1,
@@ -528,6 +757,55 @@ mod tests {
             );
             assert!(args[0].starts_with("--"), "{op:?}: {args:?}");
         }
+    }
+
+    /// `HostSeed` 必须原样保留身份字段，并生成实例能解析的 TOML。
+    ///
+    /// 这是「一键安装」的机械锁：token 里可能有引号/反斜杠，手拼字符串会生成一份
+    /// 解析不了的 host.toml，而错误直到服务启动时才暴露。
+    #[test]
+    fn host_seed_serialises_the_same_identity_and_approval() {
+        let config = rust_tunnel_client::ClientConfig {
+            server: "example.com:8080".to_owned(),
+            password: "to\"ken\\x".to_owned(),
+            name: Some("home nas".to_owned()),
+            tls: true,
+            tls_insecure: false,
+            log: "debug".to_owned(),
+            ..Default::default()
+        };
+
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto);
+        assert_eq!(seed.approval(), ApprovalPolicy::Auto);
+        let text = seed.to_toml().unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+
+        assert_eq!(parsed["server"].as_str(), Some("example.com:8080"));
+        assert_eq!(parsed["password"].as_str(), Some("to\"ken\\x"));
+        assert_eq!(parsed["name"].as_str(), Some("home nas"));
+        assert_eq!(parsed["tls"].as_bool(), Some(true));
+        assert_eq!(parsed["tls_insecure"].as_bool(), Some(false));
+        assert_eq!(parsed["log"].as_str(), Some("debug"));
+        assert_eq!(parsed["approval"].as_str(), Some("Auto"));
+        // 没有 SNI 时不该写一个空字符串键（实例侧会把它当成真的 SNI）。
+        assert!(parsed.get("tls_server_name").is_none());
+    }
+
+    /// 临时文件必须是**新建**的：`create_new` 防止跟随攻击者预置的文件/符号链接。
+    #[cfg(windows)]
+    #[test]
+    fn temp_host_config_is_created_with_the_expected_contents() {
+        let config = rust_tunnel_client::ClientConfig {
+            server: "127.0.0.1:8080".to_owned(),
+            password: "token".to_owned(),
+            ..Default::default()
+        };
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Confirm);
+        let path = write_temp_host_toml(&seed).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("server = \"127.0.0.1:8080\""), "{text}");
+        assert!(text.contains("approval = \"Confirm\""), "{text}");
+        let _ = std::fs::remove_file(path);
     }
 
     /// `locate_service_exe`：全不存在 → `None`；有存在的 → 返回它；多个存在 → **第一个**胜出。

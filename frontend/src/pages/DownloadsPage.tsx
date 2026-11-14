@@ -28,7 +28,9 @@ import { cn } from '@/lib/utils';
 import type { ClientDownloadFile, ClientDownloadVersion, ClientDownloadsResponse } from '@/types';
 
 function isGuiFile(name: string): boolean {
-  return name.includes("gui") || name.endsWith(".dmg");
+  // 无人值守服务 exe 与 Windows 单包（gui-...-x86_64.zip）都属于桌面端那一组：
+  // 前者是 GUI 的配套服务，后者本身就含 GUI。落到 «CLI» 分组会让用户以为它是命令行工具。
+  return name.includes('gui') || name.includes('service') || name.endsWith('.dmg');
 }
 
 /** 平台图标：Windows 与其他桌面端共用 MonitorSmartphone（lucide 无 Windows 图标）。 */

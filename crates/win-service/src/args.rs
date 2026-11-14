@@ -33,7 +33,7 @@ rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务�
                          再按 Win+L 锁屏，锁上之后它才动手测。
                          服务是自动启动的，故「开机停在登录界面」那一趟的做法是：
                          装一次（本命令）→ 重启机器 → 登录后看报告。
-  --install [--gui-exe <路径>]
+  --install [--gui-exe <路径>] [--host-config <路径>] [--start]
                          安装无人值守被控端：把服务 exe 与实例（GUI）exe 复制到
                          %ProgramFiles%\\rust-tunnel\\（DACL 收敛到 SYSTEM + Administrators）、
                          建好 %ProgramData%\\rust-tunnel\\ 与它的 DACL，再把服务注册成自动启动。
@@ -41,8 +41,12 @@ rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务�
                          --gui-exe 指定实例 exe 的位置；省略时在**本 exe 所在目录**里按
                          rust-tunnel-client-gui.exe / rust-tunnel-client-gui-windows-x86_64.exe
                          查找（CI 把两个产物并排放在同一个目录里）。
-                         **装完还要自己写 host.toml**（含服务端地址与客户端 token）：
-                         本程序不生成它——那个 token 只有服务端 Web 界面能给。
+                         --host-config 指定一份**已准备好的 host.toml**（含服务端地址与客户端
+                         token）；安装时把它复制到 %ProgramData%\\rust-tunnel\\host.toml。
+                         GUI 的「安装并启用」按钮会自动用当前客户端配置生成它。
+                         省略时仍按老流程：装完要自己写 host.toml（token 只有服务端 Web 能给）。
+                         --start 安装成功后立刻启动服务（需要 host.toml 已就位，否则服务会
+                         拒跑并自停——见上面的闸门说明）。
   --uninstall            卸载服务（幂等；服务不在也算成功）。**不删**已复制到
                          %ProgramFiles% / %ProgramData% 的文件。
   --start                启动已安装的服务（StartServiceW），并**确认它真的在跑**：看到
@@ -64,12 +68,11 @@ rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务�
 
 典型流程（在**管理员**命令行里）：
 
-  A) 装无人值守被控端：
-       1) rust-tunnel-client-service --install --gui-exe <rust-tunnel-client-gui.exe>
-       2) 写 %ProgramData%\\rust-tunnel\\host.toml（服务端地址 + 客户端 token + 审批策略）
-       3) 立刻起它（不想重启就先起；重启后服务也会自动起）：
-          rust-tunnel-client-service --start
-       4) 重启机器验证「登录界面上也能被控」
+  A) 装无人值守被控端（GUI 里点一下就行；下面是命令行等价物）：
+       1) rust-tunnel-client-service --install --gui-exe <rust-tunnel-client-gui.exe> \
+              --host-config <准备好的 host.toml> --start
+          （没有 host.toml 时去掉 --host-config --start，手工写好后跑 --start）
+       2) 重启机器验证「登录界面上也能被控」
 
   B) 阶段 0 的真机探针（仍在）：
        1) 登录着、没锁屏：      rust-tunnel-client-service --probe
@@ -102,13 +105,21 @@ pub enum Command {
         /// 是否跑探针（`--run --probe`）。
         probe: bool,
     },
-    /// `--install [--gui-exe <路径>]`：把两个 exe 复制到 `%ProgramFiles%`、建目录、注册服务。
+    /// `--install [--gui-exe <路径>] [--host-config <路径>] [--start]`：把两个 exe 复制到
+    /// `%ProgramFiles%`、建目录、注册服务，可选地写入 host.toml 并立刻启动。
     Install {
         /// 实例（GUI）exe 的显式路径；`None` = 在服务 exe 同目录里按已知文件名找。
         ///
         /// 这个路径**不进服务的命令行**（只用于安装时的文件复制），故不构成
         /// `ImagePath` 注入面——与 [`Command::Run`] 的 `extra_args` 是两回事。
         gui_exe: Option<String>,
+        /// 一份已准备好的 `host.toml`；安装时复制到 `%ProgramData%\rust-tunnel\host.toml`。
+        ///
+        /// GUI 用它把当前客户端配置（server/password/name/approval）交给提权后的安装进程，
+        /// 用户不再需要手工写文件。命令行用户也可以显式传。
+        host_config: Option<String>,
+        /// 安装成功后立刻启动服务（需要 `host_config` 已就位）。
+        start: bool,
     },
     /// `--uninstall`。
     Uninstall,
@@ -116,6 +127,60 @@ pub enum Command {
     Start,
     /// `--stop`：停止已安装的服务并等它真的停下（**幂等**；见 [`USAGE`]）。
     Stop,
+}
+
+/// 解析 `--install` 之后的选项（`rest` 不含 `--install` 本身）。
+///
+/// 只认三个选项：`--gui-exe <路径>`、`--host-config <路径>`、`--start`。**仍然闭合**：
+/// 未知项、重复项、选项后面缺路径都直接报错——静默忽略会让「命令行写错了」表现成
+/// 「服务装上了但行为不对」。
+fn parse_install(rest: &[&str]) -> Result<Command, String> {
+    let mut gui_exe: Option<String> = None;
+    let mut host_config: Option<String> = None;
+    let mut start = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index] {
+            "--start" => {
+                if start {
+                    return Err(String::from("--install 的 --start 重复了"));
+                }
+                start = true;
+                index += 1;
+            }
+            flag @ ("--gui-exe" | "--host-config") => {
+                let Some(value) = rest.get(index + 1) else {
+                    return Err(format!("{flag} 后面缺少路径"));
+                };
+                // 下一个 token 又是个选项：同样按「缺路径」处理，避免把 `--start`
+                // 当成路径写进安装参数。
+                if value.starts_with("--") {
+                    return Err(format!("{flag} 后面缺少路径（收到的是「{value}」）"));
+                }
+                let slot = if flag == "--gui-exe" {
+                    &mut gui_exe
+                } else {
+                    &mut host_config
+                };
+                if slot.is_some() {
+                    return Err(format!("{flag} 重复了"));
+                }
+                *slot = Some((*value).to_owned());
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "--install 不认识参数「{other}」。可用：--gui-exe <路径>、\
+                     --host-config <路径>、--start"
+                ));
+            }
+        }
+    }
+    Ok(Command::Install {
+        gui_exe,
+        host_config,
+        start,
+    })
 }
 
 /// 解析命令行（不含 argv[0]）。
@@ -147,14 +212,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         // 顺序固定成 `--run --probe`：SCM 的 ImagePath 是我们自己写进去的，
         // 不做「任意顺序」这种宽容——宽容只会让写错的地方晚一点被发现。
         ["--run", "--probe"] => Ok(Command::Run { probe: true }),
-        ["--install"] => Ok(Command::Install { gui_exe: None }),
-        // 同样只认一种写法：`--install --gui-exe <路径>`。
-        ["--install", "--gui-exe", path] => Ok(Command::Install {
-            gui_exe: Some((*path).to_owned()),
-        }),
-        // 只给 `--gui-exe` 而没给 `--install` 是错的写法：它只在安装时用得到。
+        // `--install` 的三个选项可以任意顺序组合；解析器自己拒绝未知/重复项。
+        ["--install", rest @ ..] => parse_install(rest),
+        // 只给选项而没给 `--install` 是错的写法：它们只在安装时用得到。
         ["--gui-exe", path] => Err(format!(
             "--gui-exe 只能与 --install 一起用（收到的是「{path}」）"
+        )),
+        ["--host-config", path] => Err(format!(
+            "--host-config 只能与 --install 一起用（收到的是「{path}」）"
         )),
         ["--uninstall"] => Ok(Command::Uninstall),
         ["--start"] => Ok(Command::Start),
@@ -199,13 +264,40 @@ mod tests {
         );
         assert_eq!(
             parse_str("--install").unwrap(),
-            Command::Install { gui_exe: None }
+            Command::Install {
+                gui_exe: None,
+                host_config: None,
+                start: false,
+            }
         );
         assert_eq!(
             parse_str("--install --gui-exe C:\\dl\\rust-tunnel-client-gui.exe").unwrap(),
             Command::Install {
-                gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe"))
+                gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe")),
+                host_config: None,
+                start: false,
             }
+        );
+        assert_eq!(
+            parse_str("--install --host-config C:\\dl\\host.toml --start").unwrap(),
+            Command::Install {
+                gui_exe: None,
+                host_config: Some(String::from("C:\\dl\\host.toml")),
+                start: true,
+            }
+        );
+        assert_eq!(
+            parse_str(
+                "--install --start --host-config C:\\dl\\host.toml \
+                 --gui-exe C:\\dl\\rust-tunnel-client-gui.exe"
+            )
+            .unwrap(),
+            Command::Install {
+                gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe")),
+                host_config: Some(String::from("C:\\dl\\host.toml")),
+                start: true,
+            },
+            "三个选项应当可以任意顺序组合"
         );
         assert_eq!(parse_str("--uninstall").unwrap(), Command::Uninstall);
         assert_eq!(parse_str("--start").unwrap(), Command::Start);
@@ -220,6 +312,23 @@ mod tests {
         // 反过来（`--gui-exe` 在前）也不接受：命令行只认一种写法，宽容只会让写错的
         // 地方晚一点被发现。
         assert!(parse_str("--gui-exe C:\\x.exe --install").is_err());
+        // `--host-config` 同理。
+        let err = parse_str("--host-config C:\\host.toml").unwrap_err();
+        assert!(err.contains("--install"), "{err}");
+    }
+
+    #[test]
+    fn install_flags_reject_missing_or_duplicate_values() {
+        // 选项后面缺路径：不能把 `--start` 当成路径吞掉。
+        assert!(parse_str("--install --gui-exe").is_err());
+        assert!(parse_str("--install --gui-exe --start").is_err());
+        assert!(parse_str("--install --host-config").is_err());
+        // 重复项：装错一个路径就会静默用错的 exe / 配置。
+        assert!(parse_str("--install --start --start").is_err());
+        assert!(parse_str("--install --gui-exe a.exe --gui-exe b.exe").is_err());
+        assert!(parse_str("--install --host-config a.toml --host-config b.toml").is_err());
+        // 未知项仍然报错。
+        assert!(parse_str("--install --force").is_err());
     }
 
     #[test]
@@ -262,6 +371,8 @@ mod tests {
             "--run",
             "--install",
             "--gui-exe",
+            "--host-config",
+            "--start",
             "--uninstall",
             "--start",
             "--stop",

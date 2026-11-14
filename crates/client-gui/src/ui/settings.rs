@@ -3,10 +3,11 @@ use std::sync::Arc;
 use egui::Ui;
 
 use rust_tunnel_client::ClientConfig;
+use rust_tunnel_remote::ApprovalPolicy;
 
 use crate::service_ui::{
     host_config_advisory, host_config_path_display, host_config_presence, owner_label,
-    presence_label, start_blocked_reason, ServiceOp, ServiceOps, SERVICE_SUPPORTED,
+    presence_label, start_blocked_reason, HostSeed, ServiceOp, ServiceOps, SERVICE_SUPPORTED,
 };
 use crate::service_watch::ServicePresence;
 use crate::{app::AppState, config_store};
@@ -268,18 +269,44 @@ pub fn show_service_section(ui: &mut Ui, app_state: &Arc<AppState>, service: &mu
 
             ui.add_space(6.0);
             let busy = service.in_flight();
+            // 「安装并启用」需要的当前客户端配置快照。拿不到时退化成老流程（只安装，
+            // host.toml 由用户手工写）——不要因为配置没读出来就把安装按钮整个藏掉。
+            let seed = app_state
+                .config_snapshot()
+                // 空配置（用户还没填完/没保存）不能生成 host.toml：否则服务起来后
+                // 注册必然失败，而用户看到的是「服务在跑」。
+                .filter(|config| !config.server.trim().is_empty() && !config.password.is_empty())
+                .map(|config| {
+                    let approval = app_state
+                        .remote()
+                        .map_or(ApprovalPolicy::Confirm, |manager| manager.approval_policy());
+                    HostSeed::from_config(&config, approval)
+                });
             // `Absent` = 确定没装；其余（含 `Unknown`）按「已装」处理，多给几个按钮总比
             // 在查询偶发失败时把「卸载」藏起来强。
             let installed = presence != ServicePresence::Absent;
+            // 服务已停止时允许重新安装：它是修「host.toml 写错了 / token 换了 / 审批策略
+            // 要改」的唯一 GUI 路径。**Running 时不放开**——`--install` 会先停服务，等于
+            // 掐断正在进行的远程会话。
+            let can_reinstall = presence == ServicePresence::Stopped;
+            let install_enabled = busy.is_none() && (!installed || can_reinstall);
             // 三态：只有**确定**缺失才拦（`Unknown` 放行——本窗口多半读不到那个目录，
             // 见 `HostConfigPresence`）。
             let config_presence = host_config_presence();
             let blocked = start_blocked_reason(config_presence);
             let advisory = host_config_advisory(config_presence);
             ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(busy.is_none() && !installed, |ui| {
-                    if ui.button("安装服务").clicked() {
-                        service.spawn_op(ServiceOp::Install);
+                ui.add_enabled_ui(install_enabled, |ui| {
+                    // 有配置快照时是「安装 + 写 host.toml + 启动」三合一，只弹一次 UAC。
+                    let label = if installed {
+                        "重新安装并启用"
+                    } else if seed.is_some() {
+                        "安装并启用（推荐）"
+                    } else {
+                        "安装服务"
+                    };
+                    if ui.button(label).clicked() {
+                        service.spawn_install(seed.clone());
                     }
                 });
                 // 「启动」在 host.toml **确定**缺失时禁用：服务一起来本窗口就转被动，
@@ -299,6 +326,42 @@ pub fn show_service_section(ui: &mut Ui, app_state: &Arc<AppState>, service: &mu
                     }
                 });
             });
+            if !installed || can_reinstall {
+                ui.add_space(2.0);
+                match seed.as_ref() {
+                    Some(seed) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "「安装并启用」会用当前客户端配置（服务器 / token / 客户端名）\
+                                 自动生成 host.toml，并在安装成功后立即启动服务。",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        if seed.approval() == ApprovalPolicy::Confirm {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                egui::RichText::new(
+                                    "当前接入确认为「需要确认」：无头实例没有人能点确认弹窗，\
+                                     接入请求会在 45 秒后超时被拒。请先在「远程」Tab 切到\
+                                     「自动接受」再启用。",
+                                )
+                                .small(),
+                            );
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new(
+                                "还没有可用的客户端配置，无法自动生成 host.toml：请先填写服务器\
+                                 与 token，或安装后手工写 host.toml。",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                }
+            }
             if let Some(reason) = blocked {
                 ui.add_space(2.0);
                 ui.colored_label(

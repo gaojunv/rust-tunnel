@@ -310,8 +310,74 @@ jobs:
           scp "${SSH_OPTS[@]}" -P "${PORT}" "$DMG" "${SSH_USER}@${SSH_HOST}:${DEST}/"
           rm -f "${KEY}"
 
+  # ── Windows 单包交付 ───────────────────────────────────────────────
+  #
+  # GUI 走 GNU leg（libvpx 预编译库是 mingw 味），服务走 MSVC leg（不牵 libvpx），
+  # 两个产物天然在两个 job 里。它们各自已 SCP 到服务器；这里把它们**拉回来打成
+  # 一个 zip**，用户只需下载一次、解压后两个 exe 并排放在同一目录——GUI 的
+  # 「安装并启用」按钮就能直接找到服务 exe，不再需要单独下载/手工传 --gui-exe。
+  #
+  # 为什么用 zip 而不是合并成一个 exe：服务进程以 LocalSystem 运行，必须放在
+  # %ProgramFiles% 且 DACL 收敛；GUI 又必须链 libvpx（GNU）。合成一个二进制会把
+  # GUI/编解码栈拖进 SYSTEM 进程，放大攻击面，也绕不开两套工具链。
+  package-windows:
+    needs: [build-client, build-gui]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bundle Windows GUI + service into one zip
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ secrets.SERVER_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.ssh" package
+          KEY="${HOME}/.ssh/rt_deploy_key"
+          printf '%s\n' "${SSH_KEY}" > "${KEY}"
+          chmod 600 "${KEY}"
+          PORT="${SSH_PORT:-22}"
+          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
+          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+
+          # 归档名 → 运行期名：解压后两个 exe 并排，GUI 的 locate_service_exe 默认
+          # 就找得到；服务侧的 --gui-exe 默认值也认得。
+          scp "${SSH_OPTS[@]}" -P "${PORT}" \
+            "${SSH_USER}@${SSH_HOST}:${DEST}/rust-tunnel-client-gui-windows-x86_64.exe" \
+            package/rust-tunnel-client-gui.exe
+          scp "${SSH_OPTS[@]}" -P "${PORT}" \
+            "${SSH_USER}@${SSH_HOST}:${DEST}/rust-tunnel-client-service-windows-x86_64.exe" \
+            package/rust-tunnel-client-service.exe
+
+          cat > package/README.txt <<'EOF'
+          rust-tunnel Windows 客户端（GUI + 无人值守服务）
+          ================================================
+
+          1. 双击 rust-tunnel-client-gui.exe。
+          2. 先在「设置」里填好服务器地址与客户端 token 并保存。
+          3. 打开「设置 → 无人值守被控端」，点「安装并启用（推荐）」。
+          4. UAC 选「是」。服务变为“运行中”后，锁屏/登录界面和任务管理器
+             （UIPI 提权窗口）也能被远程控制。
+
+          安装时两个 exe 必须在同一个目录里；「安装并启用」会把它们复制到
+          %ProgramFiles%\rust-tunnel\ 并注册为 LocalSystem 服务。安装完成后
+          这个解压目录就可以删掉（服务和实例用的是 Program Files 里的副本）。
+          EOF
+
+          (cd package && zip -q -9 rust-tunnel-client-gui-windows-x86_64.zip \
+            rust-tunnel-client-gui.exe \
+            rust-tunnel-client-service.exe \
+            README.txt)
+
+          scp "${SSH_OPTS[@]}" -P "${PORT}" \
+            package/rust-tunnel-client-gui-windows-x86_64.zip \
+            "${SSH_USER}@${SSH_HOST}:${DEST}/"
+          rm -f "${KEY}"
+
   finalize-client:
-    needs: [build-client, build-gui, build-gui-macos]
+    needs: [build-client, build-gui, build-gui-macos, package-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Checksum, permissions and latest symlink
