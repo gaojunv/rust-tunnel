@@ -13,7 +13,8 @@
 //! # 编码
 //!
 //! 数据面自阶段 2 起走 **VP9 4:4:4 时域编码**（见 [`crate::video`]）：编解码都在引擎的运行时
-//! 线程里完成，[`FrameSink`] 拿到的永远是**已解码的整帧 RGBA**（UI 线程只负责上传纹理）。
+//! 线程里完成，[`FrameSink`] 拿到的永远是**已解码的整帧**（VP9 为 RGBA；Windows 的 H.264 硬件
+//! 路径可以给紧包 NV12，见 [`DecodedFrame::nv12`]），UI 线程只负责上传纹理 / 必要的 CPU 转换。
 //! 静止画面由上层 memcmp 去重后**完全不喂编码器**，这是带宽趋零的来源。
 //!
 //! 画质档位见 [`QualityPreset`]，帧率上限见 [`EncodeOptions::max_fps`]。
@@ -79,6 +80,18 @@ impl RawFrame {
     }
 }
 
+/// 解码后的一帧紧包 NV12（4:2:0）。
+///
+/// `y` 长度 `width * height`、`uv` 长度 `width * height / 2`，没有行填充。控制器侧的
+/// H.264 解码器直接产出它，UI 可以选择在 CPU 上转 RGBA 或交给 GPU 上传。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedNv12 {
+    /// Y 平面。
+    pub y: Vec<u8>,
+    /// 交织 UV 平面（`U0 V0 U1 V1 ...`）。
+    pub uv: Vec<u8>,
+}
+
 /// 已解码的一帧画面（交给 UI 上传纹理）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
@@ -90,8 +103,10 @@ pub struct DecodedFrame {
     pub height: u32,
     /// 帧序号（对端递增，用于丢帧判断）。
     pub seq: u64,
-    /// RGBA8 像素数据。
+    /// RGBA8 像素数据；NV12 模式下为空。
     pub rgba: Vec<u8>,
+    /// NV12 模式下的紧包 4:2:0 画面；VP9 / RGBA 模式下为 `None`。
+    pub nv12: Option<DecodedNv12>,
 }
 
 /// 鼠标按键。
@@ -217,7 +232,8 @@ pub trait InputSink: Send + Sync + 'static {
 
 /// 控制器侧的画面上报目标（UI 实现）。
 ///
-/// **调用发生在引擎的运行时线程**：`on_frame` 收到的已是解码后的 RGBA，UI 线程只需上传纹理。
+/// **调用发生在引擎的运行时线程**：`on_frame` 收到的已是解码后的整帧（RGBA，或 H.264 硬件
+/// 路径下的紧包 NV12），UI 线程只需上传纹理或做 CPU 转换。
 pub trait FrameSink: Send + Sync + 'static {
     /// 显示器列表（会话建立时下发一次，变更时再次下发）。
     fn on_displays(&self, displays: Vec<DisplayInfo>);

@@ -23,12 +23,12 @@ use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
 use rust_tunnel_remote::{
-    encode_dimensions, CodecId, DecodedVideoFrame, DisplayInfo, EncodedVideo, RawFrame,
+    encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo, RawFrame,
     RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
 };
 use rust_tunnel_win_video::capture::{self, CaptureSource};
 use rust_tunnel_win_video::d3d11;
-use rust_tunnel_win_video::decode::{H264Decoder, H264HardwarePreference};
+use rust_tunnel_win_video::decode::{H264Decoder, H264HardwarePreference, H264OutputMode};
 use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
@@ -601,10 +601,17 @@ impl VideoDecoderApi for H264DecoderAdapter {
         // 默认行为不变（Auto → DXVA 优先）。
         let software = std::env::var_os("RUST_TUNNEL_DECODE_SOFTWARE")
             .is_some_and(|value| !value.is_empty());
+        // 输出 **紧包 NV12**：CPU 侧的 NV12→RGBA 转换移到 GUI 线程（阶段 1b 会换成
+        // GPU 着色器），解码线程只做 MFT 解码 + 可见区域拷贝。
         let created = if software {
-            H264Decoder::new_with_preference(width, height, H264HardwarePreference::Software)
+            H264Decoder::new_with_preference_and_output(
+                width,
+                height,
+                H264HardwarePreference::Software,
+                H264OutputMode::Nv12,
+            )
         } else {
-            H264Decoder::new(width, height)
+            H264Decoder::new_nv12(width, height)
         };
         match created {
             Ok(decoder) => {
@@ -612,6 +619,7 @@ impl VideoDecoderApi for H264DecoderAdapter {
                     path = ?decoder.path(),
                     adapter = ?decoder.adapter_name(),
                     software,
+                    output = "Nv12",
                     width,
                     height,
                     "H.264 解码器已创建"
@@ -652,14 +660,21 @@ impl VideoDecoderApi for H264DecoderAdapter {
         // 只在前 3 帧与每 120 帧打一条（GUI 日志层会丢弃 tracing 字段，全部内联）。
         if self.frames <= 3 || self.frames.is_multiple_of(120) {
             info!(
-                "H.264 解码细分 总计={total_ms}ms 回读={readback_ms}ms 转换={color_ms}ms 尺寸={}x{} path={path}",
+                "H.264 解码细分 总计={total_ms}ms 回读={readback_ms}ms 打包={color_ms}ms 尺寸={}x{} path={path}",
                 frame.width, frame.height,
             );
         }
+        // 正常路径是 `nv12: Some(..)`、`rgba` 为空；奇数可见区域会被解码器回退成
+        // RGBA（`nv12: None`），两者都原样交给引擎。
+        let nv12 = frame.nv12.map(|nv12| DecodedNv12 {
+            y: nv12.y,
+            uv: nv12.uv,
+        });
         Ok(Some(DecodedVideoFrame {
             width: frame.width,
             height: frame.height,
             rgba: frame.rgba,
+            nv12,
         }))
     }
 }

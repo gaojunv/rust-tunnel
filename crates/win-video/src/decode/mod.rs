@@ -94,15 +94,42 @@ impl H264OutputFormat {
     }
 }
 
-/// 解码后的一帧 RGBA8（自顶向下，alpha 恒为 255）。
+/// 一帧紧凑打包的 NV12（Y 平面 + 交织 UV 平面）。
+///
+/// 两个平面都是**紧包**的：`y.len() == width * height`、`uv.len() == width * height / 2`，
+/// 没有行填充。调用方可以直接把它交给 GPU 上传或 CPU 转码。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nv12Frame {
+    /// Y 平面，长度 `width * height`。
+    pub y: Vec<u8>,
+    /// 交织 UV 平面（`U0 V0 U1 V1 ...`），长度 `width * height / 2`。
+    pub uv: Vec<u8>,
+}
+
+/// 解码器的输出模式。
+///
+/// [`H264OutputMode::Nv12`] 把 MFT 的 4:2:0 输出原样（只做可见区域裁剪）交给调用方，
+/// 省掉解码线程上的 NV12→RGBA 转换；[`H264OutputMode::Rgba`] 保持旧行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H264OutputMode {
+    /// 转换为自顶向下 RGBA8（旧行为）。
+    #[default]
+    Rgba,
+    /// 输出紧包 NV12（可见区域为奇数时自动回退 RGBA，见 [`DecodedH264Frame::nv12`]）。
+    Nv12,
+}
+
+/// 解码后的一帧。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedH264Frame {
     /// 可见宽度（已按 `MF_MT_MINIMUM_DISPLAY_APERTURE` 裁掉宏块填充）。
     pub width: u32,
     /// 可见高度（1080p 的 1088 行编码高度会裁成 1080）。
     pub height: u32,
-    /// 自顶向下 RGBA8，长度恰为 `width * height * 4`。
+    /// 自顶向下 RGBA8，长度恰为 `width * height * 4`；NV12 模式下为空。
     pub rgba: Vec<u8>,
+    /// NV12 模式下的紧包 4:2:0 画面；RGBA 模式（或可见区域为奇数而回退）时为 `None`。
+    pub nv12: Option<Nv12Frame>,
 }
 
 /// 硬件解码偏好。
@@ -178,6 +205,8 @@ pub struct H264Decoder {
     frame_duration: i64,
     /// 创建 / 重建时使用的硬件偏好。
     preference: H264HardwarePreference,
+    /// 输出模式（RGBA 还是紧包 NV12）。
+    output_mode: H264OutputMode,
     /// 当前配置的数据通路（DXVA 是否真正生效另见 [`H264Decoder::hardware_buffers_seen`]）。
     path: H264DecodePath,
     /// DXVA 的 D3D11 设备、设备管理器与 staging 纹理；软件路径为 `None`。
@@ -188,7 +217,7 @@ pub struct H264Decoder {
     warned_no_dxgi: bool,
     /// 最近一帧 DXGI staging 回读（纹理拷贝 + Map）的耗时（毫秒）；软件路径为 0。
     last_readback_ms: u32,
-    /// 最近一帧 NV12/YV12/IYUV→RGBA 颜色转换的耗时（毫秒）。
+    /// 最近一帧像素转换 / NV12 打包的耗时（毫秒）。
     last_color_ms: u32,
 }
 
@@ -206,6 +235,7 @@ impl std::fmt::Debug for H264Decoder {
                 ),
             )
             .field("format", &self.output.layout)
+            .field("output_mode", &self.output_mode)
             .field("path", &self.path)
             .field("dxgi_seen", &self.dxgi_seen)
             .finish_non_exhaustive()
@@ -265,6 +295,33 @@ impl H264Decoder {
         height: u32,
         preference: H264HardwarePreference,
     ) -> Result<Self, WinVideoError> {
+        Self::new_with_preference_and_output(width, height, preference, H264OutputMode::Rgba)
+    }
+
+    /// 创建输出紧包 NV12 的解码器（Auto：DXVA 优先，失败回退系统内存）。
+    ///
+    /// # Errors
+    /// 同 [`H264Decoder::new`]。
+    pub fn new_nv12(width: u32, height: u32) -> Result<Self, WinVideoError> {
+        Self::new_with_preference_and_output(
+            width,
+            height,
+            H264HardwarePreference::Auto,
+            H264OutputMode::Nv12,
+        )
+    }
+
+    /// 按指定硬件偏好与输出模式创建解码器。
+    ///
+    /// # Errors
+    /// 尺寸非法、Media Foundation 初始化失败或（`RequireHardware` 下）DXVA
+    /// 初始化失败时返回 [`WinVideoError`]。
+    pub fn new_with_preference_and_output(
+        width: u32,
+        height: u32,
+        preference: H264HardwarePreference,
+        output_mode: H264OutputMode,
+    ) -> Result<Self, WinVideoError> {
         let pipeline = create_pipeline(width, height, DEFAULT_FPS, preference)?;
         Ok(Self {
             transform: pipeline.transform,
@@ -277,6 +334,7 @@ impl H264Decoder {
             next_pts: 0,
             frame_duration: HNS_PER_SECOND / i64::from(DEFAULT_FPS),
             preference,
+            output_mode,
             path: pipeline.path,
             hardware: pipeline.hardware,
             dxgi_seen: false,
@@ -284,6 +342,12 @@ impl H264Decoder {
             last_readback_ms: 0,
             last_color_ms: 0,
         })
+    }
+
+    /// 当前配置的输出模式。
+    #[must_use]
+    pub fn output_mode(&self) -> H264OutputMode {
+        self.output_mode
     }
 
     /// 当前配置的数据通路。
@@ -334,7 +398,7 @@ impl H264Decoder {
         self.last_readback_ms
     }
 
-    /// 最近一帧 NV12/YV12/IYUV→RGBA 颜色转换的耗时，单位毫秒。
+    /// 最近一帧像素转换（RGBA 模式）或 NV12 打包（NV12 模式）的耗时，单位毫秒。
     ///
     /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。
     #[must_use]
@@ -541,11 +605,12 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// 把一个输出样本转换成 RGBA（DXGI 纹理优先，其次系统内存）。
+    /// 把一个输出样本转成配置的输出模式（DXGI 纹理优先，其次系统内存）。
     fn convert_sample(&mut self, sample: &IMFSample) -> Result<DecodedH264Frame, WinVideoError> {
         // 每帧重新计数：软件路径的回读恒为 0，诊断读数不应沿用上一帧。
         self.last_readback_ms = 0;
         self.last_color_ms = 0;
+        let mode = self.output_mode;
 
         // SAFETY: `sample` 有效；返回的缓冲区在作用域内保持引用计数。
         let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0) }
@@ -563,10 +628,10 @@ impl H264Decoder {
                     output.coded_height,
                     &dxgi_buffer,
                     |scanline, pitch| {
-                        // 闭包只做色彩转换：`with_mapped` 在调用它之前已完成
+                        // 闭包只做像素转换/打包：`with_mapped` 在调用它之前已完成
                         // staging 拷贝与 Map，故“总耗时 - 本段”就是回读耗时。
                         let color_started = Instant::now();
-                        let converted = convert_planes(&output, scanline, pitch);
+                        let converted = convert_frame(&output, mode, scanline, pitch);
                         color_ms = elapsed_ms(color_started);
                         converted
                     },
@@ -600,7 +665,7 @@ impl H264Decoder {
             unsafe { buffer_2d.Lock2D(&raw mut scanline, &raw mut pitch) }
                 .map_err(|err| decode_err("IMF2DBuffer::Lock2D", &err))?;
             let color_started = Instant::now();
-            let converted = convert_system_memory(&self.output, scanline, pitch);
+            let converted = convert_system_memory(&self.output, mode, scanline, pitch);
             self.last_color_ms = elapsed_ms(color_started);
             // SAFETY: 与上面的 Lock2D 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { buffer_2d.Unlock2D() };
@@ -612,7 +677,7 @@ impl H264Decoder {
                 .map_err(|err| decode_err("IMFMediaBuffer::Lock（输出）", &err))?;
             let pitch = i32::try_from(self.output.stride).unwrap_or(0);
             let color_started = Instant::now();
-            let converted = convert_system_memory(&self.output, scanline, pitch);
+            let converted = convert_system_memory(&self.output, mode, scanline, pitch);
             self.last_color_ms = elapsed_ms(color_started);
             // SAFETY: 与上面的 Lock 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { contiguous.Unlock() };
@@ -624,32 +689,62 @@ impl H264Decoder {
 /// 系统内存输出：把 `i32` stride 校验后交给通用转换。
 fn convert_system_memory(
     output: &OutputFormat,
+    mode: H264OutputMode,
     scanline: *mut u8,
     pitch: i32,
 ) -> Result<DecodedH264Frame, WinVideoError> {
     let pitch = usize::try_from(pitch).map_err(|_| {
         WinVideoError::Decode(format!("解码输出 stride 非法（{pitch}，负值不支持）"))
     })?;
-    convert_planes(output, scanline, pitch)
+    convert_frame(output, mode, scanline, pitch)
 }
 
-/// 从锁定的缓冲区转换出一帧。
-#[expect(
-    clippy::too_many_lines,
-    reason = "三种 4:2:0 布局的「融合裁剪 / 整帧回退」分派放在一起对照，拆散反而更难核对"
-)]
-fn convert_planes(
+/// 从锁定的缓冲区切出的平面视图（只读，`Unlock2D` / `Unlock` 前有效）。
+struct PlaneViews<'a> {
+    /// Y 平面。
+    y: &'a [u8],
+    /// 色度平面（布局随协商到的输出格式而定）。
+    chroma: ChromaPlanes<'a>,
+}
+
+/// 4:2:0 色度平面的两种内存布局。
+#[derive(Debug, Clone, Copy)]
+enum ChromaPlanes<'a> {
+    /// NV12：UV 交织（`U0 V0 U1 V1 ...`），`pitch` 是**字节** stride。
+    Interleaved {
+        /// 交织 UV 平面。
+        uv: &'a [u8],
+        /// 字节 stride。
+        pitch: usize,
+    },
+    /// YV12 / IYUV：U/V 各自独立，`pitch` 是**字节** stride。
+    Planar {
+        /// U 平面。
+        u: &'a [u8],
+        /// V 平面。
+        v: &'a [u8],
+        /// 字节 stride。
+        pitch: usize,
+    },
+}
+
+/// 把锁定的 MFT 输出缓冲区解释成平面视图。
+///
+/// # Safety
+/// `scanline` 必须由 MFT 的 `Lock2D` / `Lock` 返回且非空；调用方必须保证从它起
+/// 按编码尺寸解释至少有 `pitch * coded_height` 字节可读（NV12 的 UV 平面与
+/// YV12/IYUV 的两个色度平面紧随 Y 平面），并在 `Unlock2D` / `Unlock` 之前保持
+/// 有效。返回的切片只用于只读转换。
+fn plane_views<'a>(
     output: &OutputFormat,
     scanline: *const u8,
     pitch: usize,
-) -> Result<DecodedH264Frame, WinVideoError> {
+) -> Result<PlaneViews<'a>, WinVideoError> {
     if scanline.is_null() {
         return Err(WinVideoError::Decode("解码输出缓冲区为空指针".to_owned()));
     }
     // 缓冲区按**编码尺寸**（16 像素对齐）解释，最后再裁到可见区域。
-    let width = output.coded_width;
-    let height = output.coded_height;
-    let h = usize::try_from(height)
+    let h = usize::try_from(output.coded_height)
         .map_err(|_| WinVideoError::Decode("解码高度无法转为 usize".to_owned()))?;
     let luma_len = pitch
         .checked_mul(h)
@@ -657,6 +752,245 @@ fn convert_planes(
     let chroma_len = pitch
         .checked_mul(h / 2)
         .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+
+    // SAFETY: 由本函数的契约保证：`scanline` 起至少有 `pitch * coded_height`
+    // 字节可读，各平面按 MFT 的 4:2:0 布局依次排布。
+    let y = unsafe { std::slice::from_raw_parts(scanline, luma_len) };
+    let chroma = match output.layout {
+        H264OutputFormat::Nv12 => {
+            // SAFETY: UV 平面紧跟 Y 平面，长度 `pitch * (coded_height / 2)`。
+            let uv = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), chroma_len) };
+            ChromaPlanes::Interleaved { uv, pitch }
+        }
+        H264OutputFormat::Yv12 => {
+            let plane_stride = pitch / 2;
+            let plane_len = plane_stride
+                .checked_mul(h / 2)
+                .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+            // YV12：V 平面在前，U 平面在后。
+            // SAFETY: 两个色度平面依次跟在 Y 平面之后。
+            let v = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
+            let u = unsafe {
+                std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
+            };
+            ChromaPlanes::Planar {
+                u,
+                v,
+                pitch: plane_stride,
+            }
+        }
+        H264OutputFormat::Iyuv => {
+            let plane_stride = pitch / 2;
+            let plane_len = plane_stride
+                .checked_mul(h / 2)
+                .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+            // IYUV：U 平面在前，V 平面在后。
+            // SAFETY: 同 YV12。
+            let u = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
+            let v = unsafe {
+                std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
+            };
+            ChromaPlanes::Planar {
+                u,
+                v,
+                pitch: plane_stride,
+            }
+        }
+    };
+    Ok(PlaneViews { y, chroma })
+}
+
+/// 判断可见区域能否直接打包成紧包 NV12（4:2:0 要求全偶数且不越界）。
+fn nv12_crop_supported(display: DisplayRect, coded_width: u32, coded_height: u32) -> bool {
+    let even = |value: u32| value.is_multiple_of(2);
+    display.width != 0
+        && display.height != 0
+        && even(display.x)
+        && even(display.y)
+        && even(display.width)
+        && even(display.height)
+        && display
+            .x
+            .checked_add(display.width)
+            .is_some_and(|end| end <= coded_width)
+        && display
+            .y
+            .checked_add(display.height)
+            .is_some_and(|end| end <= coded_height)
+}
+
+/// 按输出模式转换（或打包）一帧。
+fn convert_frame(
+    output: &OutputFormat,
+    mode: H264OutputMode,
+    scanline: *const u8,
+    pitch: usize,
+) -> Result<DecodedH264Frame, WinVideoError> {
+    match mode {
+        H264OutputMode::Rgba => convert_planes(output, scanline, pitch),
+        H264OutputMode::Nv12 => {
+            // 4:2:0 的紧包布局要求可见区域全偶数；奇数光圈（理论上不该出现）
+            // 直接回退 RGBA，而不是把整帧丢掉。
+            if !nv12_crop_supported(output.display, output.coded_width, output.coded_height) {
+                return convert_planes(output, scanline, pitch);
+            }
+            let views = plane_views(output, scanline, pitch)?;
+            let nv12 = pack_nv12(views.y, pitch, views.chroma, output.display)?;
+            Ok(DecodedH264Frame {
+                width: output.display.width,
+                height: output.display.height,
+                rgba: Vec::new(),
+                nv12: Some(nv12),
+            })
+        }
+    }
+}
+
+/// 把三个平面里的可见区域**紧包**成 NV12（纯函数，便于单测）。
+///
+/// `display` 必须是编码帧内的偶数矩形（由 [`nv12_crop_supported`] 预判）；
+/// 不满足时返回 [`WinVideoError::Decode`]，而不是产生半帧数据。
+fn pack_nv12(
+    y: &[u8],
+    y_pitch: usize,
+    chroma: ChromaPlanes<'_>,
+    display: DisplayRect,
+) -> Result<Nv12Frame, WinVideoError> {
+    let even = |value: u32| value.is_multiple_of(2);
+    if display.width == 0
+        || display.height == 0
+        || !even(display.x)
+        || !even(display.y)
+        || !even(display.width)
+        || !even(display.height)
+    {
+        return Err(WinVideoError::Decode(
+            "NV12 打包要求可见区域为非零偶数".to_owned(),
+        ));
+    }
+    let x = usize::try_from(display.x)
+        .map_err(|_| WinVideoError::Decode("可见区域 x 无法转为 usize".to_owned()))?;
+    let top = usize::try_from(display.y)
+        .map_err(|_| WinVideoError::Decode("可见区域 y 无法转为 usize".to_owned()))?;
+    let width = usize::try_from(display.width)
+        .map_err(|_| WinVideoError::Decode("可见宽度无法转为 usize".to_owned()))?;
+    let height = usize::try_from(display.height)
+        .map_err(|_| WinVideoError::Decode("可见高度无法转为 usize".to_owned()))?;
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| WinVideoError::Decode("可见区域大小溢出".to_owned()))?;
+
+    let mut out_y = Vec::with_capacity(pixels);
+    for row in 0..height {
+        let start = top
+            .checked_add(row)
+            .and_then(|absolute| absolute.checked_mul(y_pitch))
+            .and_then(|base| base.checked_add(x))
+            .ok_or_else(|| WinVideoError::Decode("Y 平面偏移溢出".to_owned()))?;
+        let end = start
+            .checked_add(width)
+            .ok_or_else(|| WinVideoError::Decode("Y 平面偏移溢出".to_owned()))?;
+        let Some(line) = y.get(start..end) else {
+            return Err(WinVideoError::Decode("可见区域超出 Y 平面".to_owned()));
+        };
+        out_y.extend_from_slice(line);
+    }
+
+    let chroma_height = height / 2;
+    let mut out_uv = Vec::with_capacity(pixels / 2);
+    match chroma {
+        ChromaPlanes::Interleaved { uv, pitch } => {
+            // NV12 的 UV 交织布局里每个 luma 像素对应 1 字节，故 x 偏移就是
+            // `display.x`（偶数 ⇒ 恰好落在 U 字节上）。
+            for row in 0..chroma_height {
+                let start = (top / 2)
+                    .checked_add(row)
+                    .and_then(|absolute| absolute.checked_mul(pitch))
+                    .and_then(|base| base.checked_add(x))
+                    .ok_or_else(|| WinVideoError::Decode("UV 平面偏移溢出".to_owned()))?;
+                let end = start
+                    .checked_add(width)
+                    .ok_or_else(|| WinVideoError::Decode("UV 平面偏移溢出".to_owned()))?;
+                let Some(line) = uv.get(start..end) else {
+                    return Err(WinVideoError::Decode("可见区域超出 UV 平面".to_owned()));
+                };
+                out_uv.extend_from_slice(line);
+            }
+        }
+        ChromaPlanes::Planar { u, v, pitch } => {
+            let chroma_x = x / 2;
+            let chroma_width = width / 2;
+            for row in 0..chroma_height {
+                let start = (top / 2)
+                    .checked_add(row)
+                    .and_then(|absolute| absolute.checked_mul(pitch))
+                    .and_then(|base| base.checked_add(chroma_x))
+                    .ok_or_else(|| WinVideoError::Decode("色度平面偏移溢出".to_owned()))?;
+                let end = start
+                    .checked_add(chroma_width)
+                    .ok_or_else(|| WinVideoError::Decode("色度平面偏移溢出".to_owned()))?;
+                let (Some(u_row), Some(v_row)) = (u.get(start..end), v.get(start..end)) else {
+                    return Err(WinVideoError::Decode("可见区域超出色度平面".to_owned()));
+                };
+                for (&cb, &cr) in u_row.iter().zip(v_row) {
+                    out_uv.push(cb);
+                    out_uv.push(cr);
+                }
+            }
+        }
+    }
+    Ok(Nv12Frame {
+        y: out_y,
+        uv: out_uv,
+    })
+}
+
+/// 把一帧紧包 NV12 转成自顶向下 RGBA8（CPU 回退路径，供 GUI 使用）。
+///
+/// `pitch` 按 `width` 处理——这是 [`Nv12Frame`] 的紧包约定。
+///
+/// # Errors
+/// 尺寸为 0/奇数、或平面长度与 `width * height`（UV 为一半）不符时返回
+/// [`WinVideoError::Decode`]。
+pub fn nv12_to_rgba(
+    y: &[u8],
+    uv: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, WinVideoError> {
+    let pitch = usize::try_from(width)
+        .map_err(|_| WinVideoError::Decode("解码宽度无法转为 usize".to_owned()))?;
+    let pixels = usize::try_from(height)
+        .ok()
+        .and_then(|h| pitch.checked_mul(h))
+        .ok_or_else(|| WinVideoError::Decode("解码尺寸溢出".to_owned()))?;
+    let expected_uv = pixels / 2;
+    if y.len() != pixels {
+        return Err(WinVideoError::Decode(format!(
+            "NV12 Y 平面长度 {} 与 {width}x{height} 不符（应为 {pixels}）",
+            y.len()
+        )));
+    }
+    if uv.len() != expected_uv {
+        return Err(WinVideoError::Decode(format!(
+            "NV12 UV 平面长度 {} 与 {width}x{height} 不符（应为 {expected_uv}）",
+            uv.len()
+        )));
+    }
+    let mut rgba = Vec::new();
+    color::nv12_to_rgba(y, uv, pitch, pitch, width, height, &mut rgba)?;
+    Ok(rgba)
+}
+
+/// 从锁定的缓冲区转换出一帧 RGBA。
+fn convert_planes(
+    output: &OutputFormat,
+    scanline: *const u8,
+    pitch: usize,
+) -> Result<DecodedH264Frame, WinVideoError> {
+    let PlaneViews { y: y_plane, chroma } = plane_views(output, scanline, pitch)?;
+    let width = output.coded_width;
+    let height = output.coded_height;
 
     let display = output.display;
     let crop = color::CropRect {
@@ -673,40 +1007,29 @@ fn convert_planes(
     // 偶数对齐与边界都满足，就把裁剪融进颜色转换，省掉整帧再拷一次。
     let fuse_crop = !full_frame && color::crop_is_supported(crop, width, height);
 
-    // SAFETY: 对每个平面，MFT 的 `Lock2D` 契约保证从 `scanline` 起至少有
-    // `pitch * rows` 字节可读；NV12 的 UV 平面紧跟在 Y 平面之后，YV12/IYUV
-    // 的两个色度平面依次跟随。切片只用于只读转换，Unlock 前一直有效。
-    let y_plane = unsafe { std::slice::from_raw_parts(scanline, luma_len) };
     let mut rgba = Vec::new();
-    match output.layout {
-        H264OutputFormat::Nv12 => {
-            let uv_plane =
-                unsafe { std::slice::from_raw_parts(scanline.add(luma_len), chroma_len) };
+    match chroma {
+        ChromaPlanes::Interleaved { uv, pitch: uv_pitch } => {
             if fuse_crop {
                 color::nv12_to_rgba_cropped(
-                    y_plane, uv_plane, pitch, pitch, width, height, crop, &mut rgba,
+                    y_plane, uv, pitch, uv_pitch, width, height, crop, &mut rgba,
                 )?;
             } else {
-                color::nv12_to_rgba(y_plane, uv_plane, pitch, pitch, width, height, &mut rgba)?;
+                color::nv12_to_rgba(y_plane, uv, pitch, uv_pitch, width, height, &mut rgba)?;
             }
         }
-        H264OutputFormat::Yv12 => {
-            let plane_stride = pitch / 2;
-            let plane_len = plane_stride
-                .checked_mul(h / 2)
-                .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
-            // YV12：V 平面在前，U 平面在后。
-            let v_plane = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
-            let u_plane = unsafe {
-                std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
-            };
+        ChromaPlanes::Planar {
+            u,
+            v,
+            pitch: chroma_pitch,
+        } => {
             if fuse_crop {
                 color::planar_to_rgba_cropped(
                     y_plane,
-                    u_plane,
-                    v_plane,
+                    u,
+                    v,
                     pitch,
-                    plane_stride,
+                    chroma_pitch,
                     width,
                     height,
                     crop,
@@ -715,45 +1038,10 @@ fn convert_planes(
             } else {
                 color::planar_to_rgba(
                     y_plane,
-                    u_plane,
-                    v_plane,
+                    u,
+                    v,
                     pitch,
-                    plane_stride,
-                    width,
-                    height,
-                    &mut rgba,
-                )?;
-            }
-        }
-        H264OutputFormat::Iyuv => {
-            let plane_stride = pitch / 2;
-            let plane_len = plane_stride
-                .checked_mul(h / 2)
-                .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
-            // IYUV：U 平面在前，V 平面在后。
-            let u_plane = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
-            let v_plane = unsafe {
-                std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
-            };
-            if fuse_crop {
-                color::planar_to_rgba_cropped(
-                    y_plane,
-                    u_plane,
-                    v_plane,
-                    pitch,
-                    plane_stride,
-                    width,
-                    height,
-                    crop,
-                    &mut rgba,
-                )?;
-            } else {
-                color::planar_to_rgba(
-                    y_plane,
-                    u_plane,
-                    v_plane,
-                    pitch,
-                    plane_stride,
+                    chroma_pitch,
                     width,
                     height,
                     &mut rgba,
@@ -767,6 +1055,7 @@ fn convert_planes(
             width: display.width,
             height: display.height,
             rgba,
+            nv12: None,
         });
     }
     crop_to_display(output, rgba)
@@ -1164,6 +1453,7 @@ fn crop_to_display(
             width: display.width,
             height: display.height,
             rgba,
+            nv12: None,
         });
     }
 
@@ -1206,6 +1496,7 @@ fn crop_to_display(
         width: display.width,
         height: display.height,
         rgba: cropped,
+        nv12: None,
     })
 }
 
@@ -1517,5 +1808,190 @@ mod tests {
             expected.extend_from_slice(&full.rgba[start..start + display_row_bytes]);
         }
         assert_eq!(fused.rgba, expected);
+    }
+
+    /// NV12 半平面：紧包必须只拷可见区域，且 UV 的 x 偏移就是 `display.x`。
+    #[test]
+    fn pack_nv12_packs_semipolar_visible_region() {
+        let (w, h) = (8usize, 8usize);
+        let y: Vec<u8> = (0..w * h)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        let uv: Vec<u8> = (0..w * h / 2)
+            .map(|index| u8::try_from((index * 3) % 251).unwrap_or(0))
+            .collect();
+        let chroma = ChromaPlanes::Interleaved {
+            uv: &uv,
+            pitch: w,
+        };
+
+        // 整帧：逐字节相同。
+        let full = pack_nv12(
+            &y,
+            w,
+            chroma,
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+        );
+        assert!(full.is_ok(), "整帧打包应成功");
+        let Ok(full) = full else {
+            return;
+        };
+        assert_eq!(full.y, y);
+        assert_eq!(full.uv, uv);
+
+        // 非零偶数偏移：Y 按行取 x..x+w，UV 按行取 x..x+w。
+        let cropped = pack_nv12(
+            &y,
+            w,
+            chroma,
+            DisplayRect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            },
+        );
+        assert!(cropped.is_ok(), "偶数裁剪打包应成功");
+        let Ok(cropped) = cropped else {
+            return;
+        };
+        let mut expected_y = Vec::new();
+        for row in 2..6usize {
+            expected_y.extend_from_slice(&y[row * w + 2..row * w + 6]);
+        }
+        let mut expected_uv = Vec::new();
+        for row in 1..3usize {
+            expected_uv.extend_from_slice(&uv[row * w + 2..row * w + 6]);
+        }
+        assert_eq!(cropped.y, expected_y);
+        assert_eq!(cropped.uv, expected_uv);
+    }
+
+    /// YV12 / IYUV 的全平面布局必须按 2×2 交织成 NV12 的 UV。
+    #[test]
+    fn pack_nv12_interleaves_planar_layouts() {
+        let (width, height) = (8usize, 8usize);
+        let plane_stride = width / 2;
+        let plane_len = plane_stride * (height / 2);
+        let y_plane: Vec<u8> = (0..width * height)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        let u_plane: Vec<u8> = (0..plane_len)
+            .map(|index| u8::try_from(100 + index).unwrap_or(0))
+            .collect();
+        let v_plane: Vec<u8> = (0..plane_len)
+            .map(|index| u8::try_from(200 + index).unwrap_or(0))
+            .collect();
+        let display = DisplayRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let planar = ChromaPlanes::Planar {
+            u: &u_plane,
+            v: &v_plane,
+            pitch: plane_stride,
+        };
+        let packed = pack_nv12(&y_plane, width, planar, display);
+        assert!(packed.is_ok(), "平面布局打包应成功");
+        let Ok(packed) = packed else {
+            return;
+        };
+        let mut expected_uv = Vec::with_capacity(plane_len * 2);
+        for (&cb, &cr) in u_plane.iter().zip(&v_plane) {
+            expected_uv.push(cb);
+            expected_uv.push(cr);
+        }
+        assert_eq!(packed.y, y_plane);
+        assert_eq!(packed.uv, expected_uv);
+
+        // 走完整入口，锁定 YV12（V 在前）与 IYUV（U 在前）的平面顺序。
+        let output = |layout| OutputFormat {
+            coded_width: 8,
+            coded_height: 8,
+            display,
+            layout,
+            stride: 8,
+        };
+        for layout in [H264OutputFormat::Yv12, H264OutputFormat::Iyuv] {
+            let mut raw = y_plane.clone();
+            if layout == H264OutputFormat::Yv12 {
+                raw.extend_from_slice(&v_plane);
+                raw.extend_from_slice(&u_plane);
+            } else {
+                raw.extend_from_slice(&u_plane);
+                raw.extend_from_slice(&v_plane);
+            }
+            let frame = convert_frame(
+                &output(layout),
+                H264OutputMode::Nv12,
+                raw.as_ptr(),
+                width,
+            );
+            assert!(frame.is_ok(), "{layout:?} 应能打包");
+            if let Ok(frame) = frame {
+                assert!(frame.nv12.is_some(), "{layout:?} 应输出 NV12");
+                if let Some(nv12) = frame.nv12 {
+                    assert_eq!(nv12.uv, expected_uv, "{layout:?} 的 U/V 顺序错误");
+                }
+            }
+        }
+    }
+
+    /// 奇数可见区域必须回退 RGBA（不报错、不丢帧）。
+    #[test]
+    fn odd_visible_region_falls_back_to_rgba() {
+        let output = OutputFormat {
+            coded_width: 8,
+            coded_height: 8,
+            display: DisplayRect {
+                x: 1,
+                y: 0,
+                width: 6,
+                height: 8,
+            },
+            layout: H264OutputFormat::Nv12,
+            stride: 8,
+        };
+        let data: Vec<u8> = (0..8 * 8 * 3 / 2)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        let frame = convert_frame(&output, H264OutputMode::Nv12, data.as_ptr(), 8);
+        assert!(frame.is_ok(), "奇数光圈应回退而不是报错");
+        if let Ok(frame) = frame {
+            assert!(frame.nv12.is_none(), "奇数光圈不得输出 NV12");
+            assert_eq!((frame.width, frame.height), (6, 8));
+            assert_eq!(frame.rgba.len(), 6 * 8 * 4);
+        }
+    }
+
+    /// 公开的 CPU 回退转换必须与内部颜色转换逐字节一致。
+    #[test]
+    fn public_nv12_to_rgba_matches_internal_conversion() {
+        let (w, h) = (8u32, 8u32);
+        let pitch = usize::try_from(w).unwrap_or(0);
+        let pixels = pitch * usize::try_from(h).unwrap_or(0);
+        let y: Vec<u8> = (0..pixels)
+            .map(|index| u8::try_from(index % 220).unwrap_or(0).saturating_add(16))
+            .collect();
+        let uv: Vec<u8> = (0..pixels / 2)
+            .map(|index| u8::try_from((index * 7) % 200).unwrap_or(0).saturating_add(16))
+            .collect();
+
+        let mut expected = Vec::new();
+        let internal = color::nv12_to_rgba(&y, &uv, pitch, pitch, w, h, &mut expected);
+        assert!(internal.is_ok(), "内部转换应成功");
+        let public = nv12_to_rgba(&y, &uv, w, h);
+        assert_eq!(public.ok().as_deref(), Some(expected.as_slice()));
+
+        // 长度不符时给出错误而不是越界。
+        assert!(nv12_to_rgba(&y[..y.len() - 1], &uv, w, h).is_err());
+        assert!(nv12_to_rgba(&y, &uv[..uv.len() - 1], w, h).is_err());
     }
 }

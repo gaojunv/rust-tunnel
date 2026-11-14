@@ -42,8 +42,8 @@ use enigo::{Keyboard as _, Mouse as _};
 // `Clipboard::get` 供后台线程读取本机剪贴板（见 `RemoteView::request_local_clipboard`）。
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
-    DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
-    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
+    DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame,
+    RemoteError, RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
     VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 
@@ -1275,22 +1275,27 @@ impl RemoteView {
 
     /// 把最新画面落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
     ///
-    /// VP9 时域编码下每一帧都是**整帧**（`FrameSink::on_frame` 收到的已是完整 RGBA），故这里
-    /// 只有「重建纹理 / 整幅 `set`」一条路径。
+    /// 每一帧都是**整帧**：VP9 给 RGBA；Windows H.264 硬件路径给紧包 NV12，这里先用 CPU
+    /// 转成 RGBA（阶段 1b 会换成 GPU 着色器），再走与 VP9 相同的纹理上传路径。
     pub fn upload(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, u32, u32)> {
         let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
-                let (width, height) = (frame.width, frame.height);
-                let image = egui::ColorImage::from_rgba_unmultiplied([pixel_w, pixel_h], &frame.rgba);
-                if self.texture.is_some() && self.tex_size == (width, height) {
-                    if let Some(texture) = self.texture.as_mut() {
-                        texture.set(image, egui::TextureOptions::LINEAR);
+                if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
+                    let (width, height) = (frame.width, frame.height);
+                    if self.texture.is_some() && self.tex_size == (width, height) {
+                        if let Some(texture) = self.texture.as_mut() {
+                            texture.set(image, egui::TextureOptions::LINEAR);
+                        }
+                    } else {
+                        self.texture = Some(ctx.load_texture(
+                            "remote-frame",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
                     }
-                } else {
-                    self.texture = Some(ctx.load_texture("remote-frame", image, egui::TextureOptions::LINEAR));
+                    self.tex_size = (width, height);
                 }
-                self.tex_size = (width, height);
             }
         }
 
@@ -1722,13 +1727,72 @@ impl Default for RemoteView {
 }
 
 /// 校验整帧像素数据是否自洽，返回 `(宽像素, 高像素)`；不合法时 `None`。
+///
+/// 两种合法形状：RGBA（`rgba.len() == w*h*4`）或紧包 NV12（`y == w*h` 且 `uv == w*h/2`）。
 fn valid_frame_dims(frame: &DecodedFrame) -> Option<(usize, usize)> {
     let (pixel_w, pixel_h) = (
         usize::try_from(frame.width).ok()?,
         usize::try_from(frame.height).ok()?,
     );
+    if pixel_w == 0 || pixel_h == 0 {
+        return None;
+    }
+    if let Some(nv12) = &frame.nv12 {
+        let pixels = pixel_w.checked_mul(pixel_h)?;
+        return (nv12.y.len() == pixels && nv12.uv.len() == pixels / 2)
+            .then_some((pixel_w, pixel_h));
+    }
     let expected = pixel_w.checked_mul(pixel_h)?.checked_mul(4)?;
-    (pixel_w != 0 && pixel_h != 0 && frame.rgba.len() == expected).then_some((pixel_w, pixel_h))
+    (frame.rgba.len() == expected).then_some((pixel_w, pixel_h))
+}
+
+/// 把一帧解码结果转成 egui 可直接上传的 RGBA 图像；转换失败时返回 `None`。
+fn frame_to_image(
+    frame: &DecodedFrame,
+    pixel_w: usize,
+    pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    if let Some(nv12) = &frame.nv12 {
+        return nv12_to_color_image(nv12, frame.width, frame.height, pixel_w, pixel_h);
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [pixel_w, pixel_h],
+        &frame.rgba,
+    ))
+}
+
+/// Windows：用 `win-video` 的 CPU 回退把 NV12 转成 RGBA（过渡路径，阶段 1b 换 GPU 着色器）。
+#[cfg(target_os = "windows")]
+fn nv12_to_color_image(
+    nv12: &DecodedNv12,
+    width: u32,
+    height: u32,
+    pixel_w: usize,
+    pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    match rust_tunnel_win_video::decode::nv12_to_rgba(&nv12.y, &nv12.uv, width, height) {
+        Ok(rgba) => Some(egui::ColorImage::from_rgba_unmultiplied(
+            [pixel_w, pixel_h],
+            &rgba,
+        )),
+        Err(err) => {
+            tracing::warn!(error = %err, "NV12→RGBA 转换失败，丢弃该帧");
+            None
+        }
+    }
+}
+
+/// 非 Windows 平台不会收到 NV12（VP9 恒为 RGBA），保留一个安全分支让编译通过。
+#[cfg(not(target_os = "windows"))]
+fn nv12_to_color_image(
+    _nv12: &DecodedNv12,
+    _width: u32,
+    _height: u32,
+    _pixel_w: usize,
+    _pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    tracing::warn!("收到 NV12 帧，但当前平台没有 CPU 回退转换；丢弃该帧");
+    None
 }
 
 /// 把窗口内偏移按比例映射到远程像素坐标（有界，非负）。
@@ -2106,7 +2170,14 @@ mod tests {
 
     #[test]
     fn valid_frame_dims_checks_length_and_nonzero_size() {
-        let frame = DecodedFrame { display: 0, width: 2, height: 2, seq: 0, rgba: vec![0; 16] };
+        let frame = DecodedFrame {
+            display: 0,
+            width: 2,
+            height: 2,
+            seq: 0,
+            rgba: vec![0; 16],
+            nv12: None,
+        };
         assert_eq!(valid_frame_dims(&frame), Some((2, 2)));
         // 像素数据长度与尺寸不符 → 拒。
         let short = DecodedFrame { rgba: vec![0; 15], ..frame.clone() };
@@ -2121,6 +2192,31 @@ mod tests {
         // 尺寸乘积溢出 usize → 拒（不 panic）。用 u32::MAX×u32::MAX×4 会溢出。
         let huge = DecodedFrame { width: u32::MAX, height: u32::MAX, rgba: Vec::new(), ..frame };
         assert_eq!(valid_frame_dims(&huge), None);
+    }
+
+    #[test]
+    fn valid_frame_dims_accepts_packed_nv12() {
+        let nv12_frame = |y: Vec<u8>, uv: Vec<u8>| DecodedFrame {
+            display: 0,
+            width: 4,
+            height: 4,
+            seq: 0,
+            rgba: Vec::new(),
+            nv12: Some(DecodedNv12 { y, uv }),
+        };
+        // 4×4 → Y 16 字节、UV 8 字节。
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 8])), Some((4, 4)));
+        // 任一平面长度不符 → 拒。
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 15], vec![0; 8])), None);
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 7])), None);
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 9])), None);
+        // 0 尺寸即便长度看起来自洽也拒（0 长度会匹配 0*0）。
+        let zero = DecodedFrame {
+            width: 0,
+            height: 0,
+            ..nv12_frame(Vec::new(), Vec::new())
+        };
+        assert_eq!(valid_frame_dims(&zero), None);
     }
 
     // ── RemoteView：会话复位时的剪贴板读取槽清理 ─────────────────────
