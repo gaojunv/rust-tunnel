@@ -34,10 +34,11 @@ toml = { workspace = true }
 directories = "5.0"
 auto-launch = "0.5"
 notify-rust = { version = "4" }
-# wgpu 作为 Windows 上 Glow/OpenGL 不可用时的回退（DX12）；默认仍走 Glow。
+# Windows 默认 wgpu（DX12）——NV12 帧的着色器上屏需要它；Glow 保留为
+# `RUST_TUNNEL_RENDERER=glow` 的显式回退。非 Windows 仍默认 Glow。
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
-# 仅用于启动日志里枚举 wgpu adapter（判断是否落到 WARP/软件渲染）；与 eframe
-# 的 wgpu feature 共用同一份依赖图。
+# NV12 帧的 GPU 上屏（`egui_wgpu::Callback` 的管线/纹理资源）与启动日志里的 adapter
+# 枚举（判断是否落到 WARP/软件渲染）；与 eframe 的 wgpu feature 共用同一份依赖图。
 egui-wgpu = "0.31"
 egui = "0.31"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }

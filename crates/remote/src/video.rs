@@ -27,7 +27,7 @@
 //!   唯一来源）。
 
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::scaled_dimension;
+use crate::screen::{scaled_dimension, DecodedNv12};
 use shiguredo_libvpx::{
     CodecConfig, ColorRange, ColorSpace, Decoder, DecoderCodec, DecoderConfig,
     EncodeOptions as VpxEncodeOptions, Encoder, EncoderConfig, EncodingDeadline, ImageData, ImageFormat,
@@ -489,15 +489,17 @@ impl VideoEncoder {
     }
 }
 
-/// 一帧解码出的 RGBA 画面。
+/// 一帧解码出的画面。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedVideoFrame {
     /// 宽（像素）。
     pub width: u32,
     /// 高（像素）。
     pub height: u32,
-    /// RGBA8 像素数据，长度 = `width * height * 4`。
+    /// RGBA8 像素数据，长度 = `width * height * 4`；NV12 输出时为空。
     pub rgba: Vec<u8>,
+    /// 紧包 NV12（H.264 硬件路径）；VP9 解码器恒为 `None`。
+    pub nv12: Option<DecodedNv12>,
 }
 
 /// VP9 解码器。
@@ -591,6 +593,7 @@ impl VideoDecoder {
                     width: u32::try_from(width).unwrap_or(u32::MAX),
                     height: u32::try_from(height).unwrap_or(u32::MAX),
                     rgba,
+                    nv12: None,
                 });
             }
         }

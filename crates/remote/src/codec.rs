@@ -74,6 +74,24 @@ pub trait VideoEncoderApi: Send {
         src_height: u32,
         force_keyframe: bool,
     ) -> RemoteResult<EncodedVideo>;
+
+    /// 编码一帧 [`RawFrame`](crate::screen::RawFrame)。
+    ///
+    /// 默认实现把 CPU 帧的 `rgba` 交给 [`VideoEncoderApi::encode`]；GPU 帧由平台
+    /// 实现覆盖（例如 Windows 的硬件编码器直接吃 D3D11 纹理）。VP9 永远走默认实现
+    /// ——引擎只在 `RawFrame::gpu` 为 `Some` 时才会出现 GPU 帧，而那只会在 H.264
+    /// 硬件路径上发生。
+    ///
+    /// # Errors
+    /// 与 [`VideoEncoderApi::encode`] 相同；GPU 实现还会在纹理无法使用时返回错误
+    /// （调用方据此重建编码器并回退 CPU 采集）。
+    fn encode_frame(
+        &mut self,
+        frame: &crate::screen::RawFrame,
+        force_keyframe: bool,
+    ) -> RemoteResult<EncodedVideo> {
+        self.encode(&frame.rgba, frame.width, frame.height, force_keyframe)
+    }
 }
 
 /// 解码器实例接口。

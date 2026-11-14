@@ -16,6 +16,7 @@
 pub mod clipboard_sync;
 pub mod desktop_follow;
 pub mod input_queue;
+pub mod nv12_renderer;
 pub mod reconnect;
 pub mod view_scale;
 // 实例（`--instance`）的采集/注入/剪贴板：win-platform 支撑 + 桌面绑定的专用线程。
@@ -42,9 +43,9 @@ use enigo::{Keyboard as _, Mouse as _};
 // `Clipboard::get` 供后台线程读取本机剪贴板（见 `RemoteView::request_local_clipboard`）。
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
-    DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
-    RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
-    VideoEncoderFactory,
+    DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame,
+    RemoteError, RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
+    VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -756,6 +757,7 @@ impl ScreenSource for XcapScreen {
             width: image.width(),
             height: image.height(),
             rgba: image.into_raw(),
+            gpu: None,
         })
     }
 }
@@ -980,6 +982,48 @@ pub struct SessionInputs {
 /// UI 线程读取（非阻塞）；「代」用于丢弃跨会话 / 被后续请求取代的陈旧结果。
 type ClipboardReadSlot = Arc<Mutex<Option<(u64, Result<String, String>)>>>;
 
+/// 本帧要画的画面：egui 纹理（CPU 路径）或 NV12 的 wgpu 回调（GPU 路径）。
+///
+/// `Clone` 是刻意的：没有新帧时 [`RemoteView::upload`] 直接复用上一帧的表述（`Arc` 共享
+/// NV12 数据，不复制像素），画面得以在静止时继续显示。
+#[derive(Clone)]
+pub enum FramePaint {
+    /// 已经上传好的 RGBA 纹理（VP9 路径或 NV12 的 CPU 回退），并带上远端像素尺寸。
+    Texture {
+        /// egui 纹理句柄。
+        id: egui::TextureId,
+        /// 远端画面宽度（像素）。
+        width: u32,
+        /// 远端画面高度（像素）。
+        height: u32,
+    },
+    /// 紧包 NV12：交给 wgpu 着色器直接采样上屏（Windows H.264 硬件路径）。
+    Nv12 {
+        /// 解码后的 NV12 两个平面。
+        frame: Arc<DecodedNv12>,
+        /// 可见画面宽度（像素）。
+        width: u32,
+        /// 可见画面高度（像素）。
+        height: u32,
+        /// 帧序号（GPU 侧据此去重上传）。
+        seq: u64,
+        /// egui 渲染目标格式（决定 shader 的片元入口）。
+        target_format: egui_wgpu::wgpu::TextureFormat,
+    },
+}
+
+impl FramePaint {
+    /// 远端画面的像素尺寸。
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Texture { width, height, .. } | Self::Nv12 { width, height, .. } => {
+                (*width, *height)
+            }
+        }
+    }
+}
+
 /// 远程会话窗口的 GUI 侧状态（纹理、输入边沿状态、独立窗口的展示态）。
 ///
 /// 会被 [`Arc<Mutex<RemoteView>>`] 共享给 deferred viewport 的回调（它可能在别的线程、也可能在
@@ -996,6 +1040,16 @@ pub struct RemoteView {
     texture: Option<egui::TextureHandle>,
     /// 当前纹理尺寸 `(宽, 高)`。
     tex_size: (u32, u32),
+    /// egui 渲染目标格式；仅当运行在 wgpu 上时 `Some`（Glow 下恒 `None`，走 CPU 回退）。
+    wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    /// 上一帧画出来的画面；没有新帧时复用它（避免画面在静止时消失）。
+    last_paint: Option<FramePaint>,
+    /// NV12 GPU 上传的本地帧序号（单调递增，**跨会话不重置**）。
+    ///
+    /// 不能用数据面的 `frame.seq` 去重：被控端每个会话都从 1 开始，而 GPU 资源
+    /// （`Nv12Resources`）活在 egui 的 `CallbackResources` 里、跨会话存活，撞号会让新会话的
+    /// 首帧被当成「同一帧」跳过上传，画面上留着上一场的画面。本地计数器与资源同寿命。
+    paint_seq: u64,
     /// 是否已安装 [`FrameSink`]。
     sink_installed: bool,
     /// 当前观看的显示器编号。
@@ -1020,6 +1074,12 @@ pub struct RemoteView {
     pub capture_this_frame: bool,
     /// 画面缩放档位（持久化镜像，见 `GuiPrefs::remote_view_scale`）。
     pub scale: ViewScale,
+    /// 帧率**上限**（持久化镜像，见 `GuiPrefs::remote_frame_rate`）。
+    ///
+    /// 会话开始时自动下发一次（见 [`Self::reconcile`] 的 `frame_rate_sent`）。
+    pub frame_rate: u8,
+    /// 本会话是否已把帧率下发给被控端；会话结束时复位，下一场重新下发。
+    frame_rate_sent: bool,
     /// 窗口尺寸档位（持久化镜像）。
     pub window_size: WindowSize,
     /// 当前应下发给子窗口的内尺寸（builder 里带着它，变化时 `patch` 会自动发 `InnerSize`）。
@@ -1091,6 +1151,9 @@ impl RemoteView {
             shared: Arc::new(Mutex::new(FrameState::default())),
             texture: None,
             tex_size: (0, 0),
+            wgpu_target_format: None,
+            last_paint: None,
+            paint_seq: 0,
             sink_installed: false,
             selected_display: None,
             inputs: SessionInputs::default(),
@@ -1101,6 +1164,8 @@ impl RemoteView {
             window_open: false,
             capture_this_frame: false,
             scale: ViewScale::default(),
+            frame_rate: DEFAULT_FRAME_RATE,
+            frame_rate_sent: false,
             window_size: WindowSize::default(),
             inner_size: egui::vec2(960.0, 600.0),
             toolbar_visible: true,
@@ -1136,14 +1201,22 @@ impl RemoteView {
     /// 这些字段在 `RemoteView` 上是**运行时镜像**：工具条改它们，`GuiApp` 每帧比对后回写
     /// `gui.toml`（见其 `sync_display_prefs`）。之所以镜像而非直接读偏好，是因为改动发生在
     /// deferred viewport 的回调里——那个回调与 `GuiApp::update` 不在同一时刻执行，只能靠共享状态传回。
+    ///
+    /// `wgpu_target_format` 来自 `eframe::CreationContext::wgpu_render_state`：`Some` 表示本次
+    /// 运行在 wgpu 上，NV12 帧可以走 GPU 着色器上屏；`None`（Glow）则沿用 CPU 回退。
     #[must_use]
-    pub fn from_prefs(prefs: &crate::prefs::GuiPrefs) -> Self {
+    pub fn from_prefs(
+        prefs: &crate::prefs::GuiPrefs,
+        wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    ) -> Self {
         let mut view = Self::new();
+        view.wgpu_target_format = wgpu_target_format;
         view.scale = prefs.remote_view_scale;
         view.window_size = prefs.remote_window_size;
         view.stats_overlay = prefs.remote_stats_overlay;
         view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
         view.toolbar_autohide = prefs.remote_toolbar_autohide;
+        view.frame_rate = prefs.remote_frame_rate;
         view
     }
 
@@ -1172,10 +1245,13 @@ impl RemoteView {
     pub fn reset_session(&mut self) {
         self.texture = None;
         self.tex_size = (0, 0);
+        self.last_paint = None;
         self.last_mouse = None;
         self.gate.reset();
         self.capture_this_frame = false;
         self.selected_display = None;
+        // 新会话要重新下发一次帧率偏好（见 `reconcile` 的自动下发）。
+        self.frame_rate_sent = false;
         // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
         self.input_count = 0;
         self.input_base = 0;
@@ -1220,6 +1296,20 @@ impl RemoteView {
         self.selected_display
     }
 
+    /// 当前帧率上限（30 / 60）。
+    #[must_use]
+    pub fn frame_rate(&self) -> u8 {
+        self.frame_rate
+    }
+
+    /// 切换帧率上限：更新本地镜像（由父窗口回写 `gui.toml`）并立刻下发给被控端。
+    ///
+    /// 会话建立时的自动下发走 [`Self::reconcile`]，与本方法共用同一个偏好值。
+    pub fn set_frame_rate(&mut self, fps: u8, manager: &Arc<RemoteManager>) {
+        self.frame_rate = fps;
+        manager.set_frame_rate(fps);
+    }
+
     /// 会话窗口的本地输入态（可编辑）。
     pub fn inputs_mut(&mut self) -> &mut SessionInputs {
         &mut self.inputs
@@ -1237,6 +1327,7 @@ impl RemoteView {
             self.selected_display = Some(id);
             self.texture = None;
             self.tex_size = (0, 0);
+            self.last_paint = None;
             // 引擎会据此强制下一个关键帧（尺寸变了，差分基准失效）。
             manager.select_display(id);
         }
@@ -1248,30 +1339,69 @@ impl RemoteView {
         guard.closed.take()
     }
 
-    /// 把最新画面落到纹理，返回 `(纹理 ID, 宽, 高)`；无新画面时返回既有纹理。
+    /// 把最新画面落到纹理/GPU 回调，返回本帧要画的 [`FramePaint`]；无新画面时返回上一帧。
     ///
-    /// VP9 时域编码下每一帧都是**整帧**（`FrameSink::on_frame` 收到的已是完整 RGBA），故这里
-    /// 只有「重建纹理 / 整幅 `set`」一条路径。
-    pub fn upload(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, u32, u32)> {
+    /// 每一帧都是**整帧**：VP9 给 RGBA；Windows H.264 硬件路径给紧包 NV12。NV12 在 wgpu
+    /// 渲染器下直接交给着色器（Y/UV 两张纹理 + BT.709 转换，GPU 负责缩放）；没有 wgpu
+    /// （Glow / 无 render state）时保留 CPU 回退，转成 RGBA 后走与 VP9 相同的纹理路径。
+    pub fn upload(&mut self, ctx: &egui::Context) -> Option<FramePaint> {
         let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
-                let (width, height) = (frame.width, frame.height);
-                let image = egui::ColorImage::from_rgba_unmultiplied([pixel_w, pixel_h], &frame.rgba);
-                if self.texture.is_some() && self.tex_size == (width, height) {
-                    if let Some(texture) = self.texture.as_mut() {
-                        texture.set(image, egui::TextureOptions::LINEAR);
+                if let Some(nv12) = frame.nv12 {
+                    if let Some(target_format) = self.wgpu_target_format {
+                        // GPU 路径：不在 UI 线程做任何逐像素转换，只包一层 `Arc`。
+                        let (width, height) = (frame.width, frame.height);
+                        self.tex_size = (width, height);
+                        // 用本地序号（见 `paint_seq` 的文档），不直接用 `frame.seq`。
+                        self.paint_seq = self.paint_seq.wrapping_add(1);
+                        let paint = FramePaint::Nv12 {
+                            frame: Arc::new(nv12),
+                            width,
+                            height,
+                            seq: self.paint_seq,
+                            target_format,
+                        };
+                        self.last_paint = Some(paint.clone());
+                        return Some(paint);
                     }
-                } else {
-                    self.texture = Some(ctx.load_texture("remote-frame", image, egui::TextureOptions::LINEAR));
+                    // 无 wgpu：CPU 回退（过渡路径）。
+                    if let Some(image) =
+                        nv12_to_color_image(&nv12, frame.width, frame.height, pixel_w, pixel_h)
+                    {
+                        self.upload_texture(ctx, image, frame.width, frame.height);
+                    }
+                } else if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
+                    self.upload_texture(ctx, image, frame.width, frame.height);
                 }
-                self.tex_size = (width, height);
             }
         }
 
-        self.texture
-            .as_ref()
-            .map(|texture| (texture.id(), self.tex_size.0, self.tex_size.1))
+        self.last_paint.clone()
+    }
+
+    /// 把 RGBA 图像落到 egui 纹理，并把 `last_paint` 更新为纹理表述。
+    fn upload_texture(
+        &mut self,
+        ctx: &egui::Context,
+        image: egui::ColorImage,
+        width: u32,
+        height: u32,
+    ) {
+        if self.texture.is_some() && self.tex_size == (width, height) {
+            if let Some(texture) = self.texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            }
+        } else {
+            self.texture =
+                Some(ctx.load_texture("remote-frame", image, egui::TextureOptions::LINEAR));
+        }
+        self.tex_size = (width, height);
+        self.last_paint = self.texture.as_ref().map(|texture| FramePaint::Texture {
+            id: texture.id(),
+            width,
+            height,
+        });
     }
 
     /// 捕获会话窗口内的鼠标/键盘并转成 [`InputEvent`] 投递给引擎。
@@ -1461,6 +1591,12 @@ impl RemoteView {
             Some(active) => {
                 if self.last_session_id.as_deref() != Some(active.session_id.as_str()) {
                     self.begin_session(&active.session_id);
+                }
+                // 每场会话自动下发一次帧率偏好（`begin_session` 刚把它复位为未发送）。
+                // 被控端不会主动问，漏了这一步用户的 30/60 选择就只在手动点按钮时生效。
+                if !self.frame_rate_sent {
+                    manager.set_frame_rate(self.frame_rate);
+                    self.frame_rate_sent = true;
                 }
                 // 会话已重新建立（可能是重连成功）→ 收起倒计时；目标保留，下次断线仍可自动重连。
                 if self.reconnect.is_active() {
@@ -1691,13 +1827,72 @@ impl Default for RemoteView {
 }
 
 /// 校验整帧像素数据是否自洽，返回 `(宽像素, 高像素)`；不合法时 `None`。
+///
+/// 两种合法形状：RGBA（`rgba.len() == w*h*4`）或紧包 NV12（`y == w*h` 且 `uv == w*h/2`）。
 fn valid_frame_dims(frame: &DecodedFrame) -> Option<(usize, usize)> {
     let (pixel_w, pixel_h) = (
         usize::try_from(frame.width).ok()?,
         usize::try_from(frame.height).ok()?,
     );
+    if pixel_w == 0 || pixel_h == 0 {
+        return None;
+    }
+    if let Some(nv12) = &frame.nv12 {
+        let pixels = pixel_w.checked_mul(pixel_h)?;
+        return (nv12.y.len() == pixels && nv12.uv.len() == pixels / 2)
+            .then_some((pixel_w, pixel_h));
+    }
     let expected = pixel_w.checked_mul(pixel_h)?.checked_mul(4)?;
-    (pixel_w != 0 && pixel_h != 0 && frame.rgba.len() == expected).then_some((pixel_w, pixel_h))
+    (frame.rgba.len() == expected).then_some((pixel_w, pixel_h))
+}
+
+/// 把一帧解码结果转成 egui 可直接上传的 RGBA 图像；转换失败时返回 `None`。
+fn frame_to_image(
+    frame: &DecodedFrame,
+    pixel_w: usize,
+    pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    if let Some(nv12) = &frame.nv12 {
+        return nv12_to_color_image(nv12, frame.width, frame.height, pixel_w, pixel_h);
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [pixel_w, pixel_h],
+        &frame.rgba,
+    ))
+}
+
+/// Windows：用 `win-video` 的 CPU 回退把 NV12 转成 RGBA（过渡路径，阶段 1b 换 GPU 着色器）。
+#[cfg(target_os = "windows")]
+fn nv12_to_color_image(
+    nv12: &DecodedNv12,
+    width: u32,
+    height: u32,
+    pixel_w: usize,
+    pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    match rust_tunnel_win_video::decode::nv12_to_rgba(&nv12.y, &nv12.uv, width, height) {
+        Ok(rgba) => Some(egui::ColorImage::from_rgba_unmultiplied(
+            [pixel_w, pixel_h],
+            &rgba,
+        )),
+        Err(err) => {
+            tracing::warn!(error = %err, "NV12→RGBA 转换失败，丢弃该帧");
+            None
+        }
+    }
+}
+
+/// 非 Windows 平台不会收到 NV12（VP9 恒为 RGBA），保留一个安全分支让编译通过。
+#[cfg(not(target_os = "windows"))]
+fn nv12_to_color_image(
+    _nv12: &DecodedNv12,
+    _width: u32,
+    _height: u32,
+    _pixel_w: usize,
+    _pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    tracing::warn!("收到 NV12 帧，但当前平台没有 CPU 回退转换；丢弃该帧");
+    None
 }
 
 /// 把窗口内偏移按比例映射到远程像素坐标（有界，非负）。
@@ -2075,7 +2270,14 @@ mod tests {
 
     #[test]
     fn valid_frame_dims_checks_length_and_nonzero_size() {
-        let frame = DecodedFrame { display: 0, width: 2, height: 2, seq: 0, rgba: vec![0; 16] };
+        let frame = DecodedFrame {
+            display: 0,
+            width: 2,
+            height: 2,
+            seq: 0,
+            rgba: vec![0; 16],
+            nv12: None,
+        };
         assert_eq!(valid_frame_dims(&frame), Some((2, 2)));
         // 像素数据长度与尺寸不符 → 拒。
         let short = DecodedFrame { rgba: vec![0; 15], ..frame.clone() };
@@ -2090,6 +2292,31 @@ mod tests {
         // 尺寸乘积溢出 usize → 拒（不 panic）。用 u32::MAX×u32::MAX×4 会溢出。
         let huge = DecodedFrame { width: u32::MAX, height: u32::MAX, rgba: Vec::new(), ..frame };
         assert_eq!(valid_frame_dims(&huge), None);
+    }
+
+    #[test]
+    fn valid_frame_dims_accepts_packed_nv12() {
+        let nv12_frame = |y: Vec<u8>, uv: Vec<u8>| DecodedFrame {
+            display: 0,
+            width: 4,
+            height: 4,
+            seq: 0,
+            rgba: Vec::new(),
+            nv12: Some(DecodedNv12 { y, uv }),
+        };
+        // 4×4 → Y 16 字节、UV 8 字节。
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 8])), Some((4, 4)));
+        // 任一平面长度不符 → 拒。
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 15], vec![0; 8])), None);
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 7])), None);
+        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 9])), None);
+        // 0 尺寸即便长度看起来自洽也拒（0 长度会匹配 0*0）。
+        let zero = DecodedFrame {
+            width: 0,
+            height: 0,
+            ..nv12_frame(Vec::new(), Vec::new())
+        };
+        assert_eq!(valid_frame_dims(&zero), None);
     }
 
     // ── RemoteView：会话复位时的剪贴板读取槽清理 ─────────────────────

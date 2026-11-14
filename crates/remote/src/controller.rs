@@ -90,6 +90,8 @@ pub enum ControllerCommand {
     SelectDisplay(u32),
     /// 切换画质档位。
     SetQuality(QualityPreset),
+    /// 切换帧率上限（30 / 60；被控端会钳到 `[min_fps, 120]`）。
+    SetFrameRate(u8),
     /// 把本机剪贴板文本发给被控端。
     Clipboard(String),
     /// 请求被控端把它的剪贴板发过来。
@@ -395,6 +397,13 @@ pub async fn run_controller(
                             break Err(err);
                         }
                     }
+                    ControllerCommand::SetFrameRate(fps) => {
+                        if let Err(err) =
+                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::SetFrameRate { fps })).await
+                        {
+                            break Err(err);
+                        }
+                    }
                     ControllerCommand::Clipboard(text) => {
                         if let Err(err) =
                             send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Clipboard { text })).await
@@ -637,9 +646,14 @@ pub async fn run_controller(
 ///
 /// # 解码耗时（阶段 3）
 ///
-/// 每次 `decode` 的耗时（含 I444→RGBA 转换）写进 `decode_ms_shared`，由主循环每秒读一次填进
-/// `QosFeedback`。它是被控端「降编码分辨率」的**唯一**依据（4K 解码实测 37–58 ms 是瓶颈，
-/// 编码仅 7.9/7.7 ms 不是）。
+/// 每次 `decode` 的耗时写进 `decode_ms_shared`，由主循环每秒读一次填进 `QosFeedback`。
+/// 它是被控端「降编码分辨率」的**唯一**依据（4K 解码实测 37–58 ms 是瓶颈，编码仅 7.9/7.7 ms
+/// 不是）。
+///
+/// **语义随数据面而变化**：VP9 的 `decode()` 含 I444→RGBA 转换；Windows H.264 硬件路径现在
+/// 只解码 + 打包 NV12，NV12→RGBA 的 CPU 转换被移到 GUI 线程（阶段 1b 会换成 GPU 着色器），
+/// 因此 B1 过渡期 H.264 的 `decode_ms` **不含**颜色转换，读数会比旧版本低。QoS 阈值暂不改，
+/// 待着色器落地、转换成本重新可见后再校准。
 /// 按 codec 取解码器工厂：VP9 用内置实现，H.264 用注入实现（未注入则为 `None`）。
 fn decoder_factory_for(
     codec: CodecId,
@@ -808,6 +822,7 @@ async fn decode_loop(
                     height: frame.height,
                     seq,
                     rgba: frame.rgba,
+                    nv12: frame.nv12,
                 });
             }
             // 本批无输出（理论路径；`lag_in_frames = 1` 下每次都有）。
@@ -1314,6 +1329,7 @@ mod tests {
                 width: 2,
                 height: 2,
                 rgba: vec![0u8; 2 * 2 * 4],
+                nv12: None,
             }))
         }
     }

@@ -16,6 +16,19 @@ fn default_true() -> bool {
     true
 }
 
+/// 远程控制帧率上限的缺省值（30 fps）。
+fn default_remote_frame_rate() -> u8 {
+    rust_tunnel_remote::DEFAULT_FRAME_RATE
+}
+
+/// 把读到的帧率钳到合法范围 `15..=60`。
+///
+/// UI 当前只提供 30 / 60（后续可能扩到 15），但手改 `gui.toml` 可能写入任意值；
+/// 0 之类的越界值会让采集间隔退化成 1 fps，故读取时统一收敛。
+fn normalize_remote_frame_rate(fps: u8) -> u8 {
+    fps.clamp(15, 60)
+}
+
 /// 主题偏好（持久化值；egui 的 `ThemePreference` 未启用 serde，自行映射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -72,7 +85,7 @@ impl ThemePref {
 }
 
 /// GUI 偏好根结构（serde(default) 保证前向兼容）。
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "GUI 偏好本就是一组互不相关的独立开关，拆成状态机只会更难读"
@@ -119,6 +132,32 @@ pub struct GuiPrefs {
     /// 会话窗口内的统计角标（延迟 / 路径 / 分辨率 / 帧率 / 时长）是否常显。
     #[serde(default)]
     pub remote_stats_overlay: bool,
+    /// 远程控制帧率**上限**（30 / 60；默认 30）。
+    ///
+    /// 帧率是上限而非固定值：QoS 闭环仍可在其下降级（地板 15）。这里是控制端的偏好，
+    /// 会话建立时自动下发一次。
+    #[serde(default = "default_remote_frame_rate")]
+    pub remote_frame_rate: u8,
+}
+
+impl Default for GuiPrefs {
+    fn default() -> Self {
+        Self {
+            theme: ThemePref::default(),
+            allow_remote: false,
+            remote_approval: ApprovalPolicy::default(),
+            remote_toolbar_autohide: false,
+            remote_toolbar_autohide_migrated: false,
+            remote_view_scale: ViewScale::default(),
+            remote_window_size: WindowSize::default(),
+            remote_clipboard_sync: false,
+            // 与 derive 时代的默认值保持一致（`#[serde(default = "default_true")]` 只在
+            // 配置文件缺键时生效，全新安装的历史行为是 false——不在本次改动里改变它）。
+            remote_auto_reconnect: false,
+            remote_stats_overlay: false,
+            remote_frame_rate: default_remote_frame_rate(),
+        }
+    }
 }
 
 /// GUI 偏好文件路径（与 client 配置同目录的 gui.toml）。
@@ -163,6 +202,8 @@ pub fn load() -> GuiPrefs {
     };
     match toml::from_str::<GuiPrefs>(&content) {
         Ok(mut prefs) => {
+            // 手改配置可能写入越界帧率；读进来就钳到合法范围（UI 只提供 30/60，将来扩到 15）。
+            prefs.remote_frame_rate = normalize_remote_frame_rate(prefs.remote_frame_rate);
             // 迁移必须立刻落盘，否则标志在磁盘上仍是 false，每次启动都会重跑。
             if migrate_toolbar_autohide(&mut prefs) {
                 if let Err(e) = save(&prefs) {
@@ -307,5 +348,29 @@ mod tests {
             "已迁移的文件不得再次迁移"
         );
         assert!(!reparsed.remote_toolbar_autohide);
+    }
+
+    #[test]
+    fn frame_rate_defaults_to_thirty_and_survives_roundtrip() {
+        assert_eq!(GuiPrefs::default().remote_frame_rate, 30, "新配置默认 30");
+        // 缺失该键的旧配置也落到 30（serde default）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert_eq!(prefs.remote_frame_rate, 30);
+        // 往返保留用户选择。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_frame_rate: 60,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert_eq!(reparsed.remote_frame_rate, 60);
+    }
+
+    #[test]
+    fn frame_rate_is_normalized_on_read() {
+        assert_eq!(normalize_remote_frame_rate(0), 15, "0 钳到地板");
+        assert_eq!(normalize_remote_frame_rate(30), 30);
+        assert_eq!(normalize_remote_frame_rate(60), 60);
+        assert_eq!(normalize_remote_frame_rate(200), 60, "超上限钳到 60");
     }
 }

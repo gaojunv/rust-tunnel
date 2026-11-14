@@ -13,6 +13,7 @@
 use super::mfplat;
 use crate::d3d11::{self, D3d11};
 use crate::WinVideoError;
+use std::sync::Arc;
 use windows::core::Interface as _;
 use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Media::MediaFoundation::{
@@ -22,7 +23,10 @@ use windows::Win32::Media::MediaFoundation::{
 /// 编码器绑定的 D3D11 设备与设备管理器。
 pub(super) struct EncodeDevice {
     /// D3D11 设备 / 立即上下文 / 适配器信息。
-    pub device: D3d11,
+    ///
+    /// 用 `Arc` 持有：GPU 纹理路径要求采集源与编码器共用**同一个**设备
+    /// （`Arc::ptr_eq` 校验），而不是各建一个。
+    pub device: Arc<D3d11>,
     /// 交给 MFT 的设备管理器；必须活到 MFT 销毁。
     pub manager: IMFDXGIDeviceManager,
 }
@@ -45,8 +49,15 @@ pub(super) fn create() -> Result<EncodeDevice, WinVideoError> {
         .ok_or_else(|| {
             WinVideoError::Encode("没有可用的硬件适配器（硬件编码需要 D3D11）".to_owned())
         })?;
-    let device = d3d11::create(Some(chosen.index))?;
+    let device = Arc::new(d3d11::create(Some(chosen.index))?);
+    create_with_device(device)
+}
 
+/// 用调用方提供的 D3D11 设备创建编码器设备与设备管理器。
+///
+/// GPU 纹理路径（采集纹理直接喂编码器）必须走这里：VideoProcessor 的输入纹理
+/// 与编码器 MFT 的设备管理器必须处在**同一个**设备上。**不新建设备**。
+pub(super) fn create_with_device(device: Arc<D3d11>) -> Result<EncodeDevice, WinVideoError> {
     // D3D11_CREATE_DEVICE_VIDEO_SUPPORT 要求开启多线程保护；编码器 MFT 可能
     // 在自己的工作线程上访问设备。
     match device.device.cast::<ID3D10Multithread>() {

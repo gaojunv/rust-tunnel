@@ -368,6 +368,10 @@ pub async fn run_controlled(
 
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
+    // GPU 采集只在**协商到 H.264** 且平台采集源支持时启用。计算一次即可：codec 在
+    // 会话内不变，平台能力也不会在会话中翻转。H.264 编码器在 GPU 输入不可用时由
+    // 适配器自行回退 CPU（`RawFrame::gpu == None` 走原来的 rgba 路径）。
+    let gpu_capture = codec == CodecId::H264 && screen.supports_gpu_capture();
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
     let mut rate = RateController::new(config.encode);
@@ -404,6 +408,9 @@ pub async fn run_controlled(
     let mut capture_timeouts: u32 = 0;
     // 首帧（或切显示器/切档位/收到 RequestKeyframe 之后）必须先发关键帧：解码侧要有可重建的参考。
     let mut force_keyframe = true;
+    // 控制器显式选择的帧率上限（30 / 60）。`None` = 尚未下发，沿用画质档位默认。
+    // 记住它是为了「换画质档位不覆盖用户选择」：`SetQuality` 换完档位后要重新应用它。
+    let mut selected_fps: Option<u8> = None;
     // 上一次 QoS 日志的签名（动作 + 码率 + 帧率 + 缩放）。稳定的 Hold 不逐秒刷屏；只有动作
     // 或生效值变化才记一条 info（GUI 日志层会丢 tracing 字段，故全部内联进消息文本）。
     // **码率必须进签名**：降级阶段通常连续多次 Decrease、只有码率在变，漏掉它就会整段降码率
@@ -480,7 +487,7 @@ pub async fn run_controlled(
                     let tx = capture_tx.clone();
                     // 采集是阻塞调用（xcap 的 portal 路径可能数秒），整体挪出 async worker。
                     tokio::task::spawn_blocking(move || {
-                        run_capture(&*screen, display_now, generation_now, &tx);
+                        run_capture(&*screen, display_now, generation_now, gpu_capture, &tx);
                     });
                 }
             }
@@ -526,9 +533,24 @@ pub async fn run_controlled(
                         SessionMessage::SetQuality { preset } => {
                             // 档位是**上限**：换上限并把闭环重置到新上限（用户显式意图，不带降级历史）。
                             rate.set_ceiling(preset.options());
+                            // 用户显式选的帧率优先级高于档位默认值：换画质不应把它覆盖回去。
+                            if let Some(fps) = selected_fps {
+                                rate.set_frame_rate_ceiling(fps);
+                            }
                             encode = rate.current();
                             capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
                             force_keyframe = true;
+                        }
+                        SessionMessage::SetFrameRate { fps } => {
+                            // 帧率是**上限**，且只动采集节拍与编码器的 fps（在线重配置，**不重建**）。
+                            selected_fps = Some(fps);
+                            rate.set_frame_rate_ceiling(fps);
+                            encode = rate.current();
+                            capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
+                            // **不置 `force_keyframe`**：纯帧率变化只动采集节拍与编码器的在线 fps，
+                            // 参考链不变；插 IDR 会多一个带宽尖峰（阶段 2/3 一直在避免的）。
+                            // `SetQuality` 需要关键帧是因为它可能改变编码分辨率（几何变化）。
+                            info!("帧率上限已切换（被控端） fps={}", encode.fps);
                         }
                         SessionMessage::QosFeedback { rtt_ms, recv_kbps, decode_ms, backlog } => {
                             // 控制器的每秒反馈 + 本端出站队列积压 → 一次 AIMD 决策。
@@ -818,9 +840,20 @@ struct EncodeJob {
 ///
 /// 本函数**可能 panic**（平台实现 bug）：`spawn_blocking` 的 `JoinHandle` 被丢弃后 panic 会被
 /// 吞掉、结果永不回传，由调用方的看门狗兜底（见 [`CAPTURE_WATCHDOG`]）。
-fn run_capture(screen: &dyn ScreenSource, display: u32, generation: u64, tx: &mpsc::Sender<CaptureOutcome>) {
+fn run_capture(
+    screen: &dyn ScreenSource,
+    display: u32,
+    generation: u64,
+    gpu: bool,
+    tx: &mpsc::Sender<CaptureOutcome>,
+) {
     let started = Instant::now();
-    let frame = match screen.capture(display) {
+    let captured = if gpu {
+        screen.capture_gpu(display)
+    } else {
+        screen.capture(display)
+    };
+    let frame = match captured {
         Ok(frame) => Some(frame),
         Err(err) => {
             warn!(error = %err, "屏幕采集失败");
@@ -965,6 +998,8 @@ async fn encode_loop(
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
         window.maybe_report(&stats, rates.bitrate_kbps);
 
+        // GPU 帧没有 CPU 像素：不能做 memcmp 去重（也绝不能拿空 `rgba` 去比较）。
+        let is_gpu = frame.gpu.is_some();
         let (width, height) = encode_dimensions(frame.width, frame.height, rates.scale, MAX_ENCODE_WIDTH);
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
@@ -988,7 +1023,10 @@ async fn encode_loop(
         let force = force_keyframe || geometry_changed || pending_keyframe;
 
         // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
-        if !force && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
+        // **GPU 帧跳过这条**：像素不在 CPU 上，没有可比较的 `rgba`；留下 `rgba` 为空时
+        // 反而会把「所有 GPU 帧都一样」误判成静止。GPU 路径的静止帧由编码器自身的
+        // 码率控制消化（硬件编码器对静止画面输出极小），不做额外去重。
+        if !force && !is_gpu && prev_rgba.as_deref() == Some(frame.rgba.as_slice()) {
             continue;
         }
         // 背压出口在**编码之前**：出站队列满就跳过这一帧。绝不能改成「编码后丢弃」。
@@ -1011,18 +1049,17 @@ async fn encode_loop(
         let Some(enc) = encoder.take() else {
             continue;
         };
-        let (src_width, src_height) = (frame.width, frame.height);
-        let rgba = frame.rgba;
         let started = Instant::now();
-        // 编码是阻塞调用，移出 async worker；编码器随闭包移入、随结果移出（独占持有）。
-        // 码率/帧率的在线重配置也在这里做（`reconfig_and_encode`），与编码同一次阻塞调用。
+        // 编码是阻塞调用，移出 async worker；编码器与整帧（CPU 的 `rgba` 或 GPU 纹理）
+        // 随闭包移入、随结果移出（独占持有）。码率/帧率的在线重配置也在这里做
+        // （`reconfig_and_encode`），与编码同一次阻塞调用。
         let joined = tokio::task::spawn_blocking(move || {
             let mut enc = enc;
-            let result = reconfig_and_encode(enc.as_mut(), &rates, &rgba, src_width, src_height, force);
-            (enc, result, rgba)
+            let result = reconfig_and_encode(enc.as_mut(), &rates, &frame, force);
+            (enc, result, frame)
         })
         .await;
-        let (enc, result, rgba) = match joined {
+        let (enc, result, frame) = match joined {
             Ok(value) => value,
             Err(err) => {
                 warn!(error = %err, "编码任务失败");
@@ -1036,7 +1073,8 @@ async fn encode_loop(
         match result {
             Ok(packet) => {
                 encoder = Some(enc);
-                prev_rgba = Some(rgba);
+                // GPU 帧没有 CPU 像素可留作去重基准；置 `None` 让下一帧照常编码。
+                prev_rgba = if is_gpu { None } else { Some(frame.rgba) };
                 // `force` 为真时本帧必是 IDR，请求已被满足。
                 pending_keyframe = false;
                 if packet.is_empty() {
@@ -1087,9 +1125,7 @@ async fn encode_loop(
 fn reconfig_and_encode(
     enc: &mut dyn VideoEncoderApi,
     rates: &EncodeRates,
-    rgba: &[u8],
-    src_width: u32,
-    src_height: u32,
+    frame: &RawFrame,
     force: bool,
 ) -> RemoteResult<EncodedVideo> {
     if enc.bitrate_kbps() != rates.bitrate_kbps {
@@ -1098,7 +1134,8 @@ fn reconfig_and_encode(
     if enc.fps() != u32::from(rates.fps) {
         enc.set_fps(rates.fps)?;
     }
-    enc.encode(rgba, src_width, src_height, force)
+    // CPU 帧走 trait 默认实现（= `encode`）；GPU 帧由平台实现覆盖。
+    enc.encode_frame(frame, force)
 }
 
 /// 把一帧画面消息投给出站写任务，**绝不丢弃**。
@@ -1265,6 +1302,7 @@ mod tests {
             width: w,
             height: h,
             rgba: [40u8, 80, 120, 255].repeat((w * h) as usize),
+            gpu: None,
         }
     }
 
@@ -1323,6 +1361,7 @@ mod tests {
                 width: w,
                 height: h,
                 rgba,
+                gpu: None,
             })
         }
     }
@@ -1674,11 +1713,19 @@ mod tests {
     /// `hmac` 填垃圾也无妨（校验根本走不到那一步）。
     #[tokio::test]
     async fn mismatched_proto_version_is_rejected_cleanly() {
+        // 两个方向都要拒绝：v3（上一版）与 v5（未来版本）。v3↔v4 正是本次抬版本后真实会遇到的
+        // 混合部署场景——两端都必须在握手阶段干净拒绝，而不是等 bincode 解码新变体时炸掉。
+        assert_proto_version_rejected(SESSION_PROTO_VERSION.wrapping_sub(1)).await;
+        assert_proto_version_rejected(SESSION_PROTO_VERSION.wrapping_add(1)).await;
+    }
+
+    /// 用给定的 `proto_version` 造 `Hello`，断言被控端回明文 `HelloAck{accepted:false}` 并以握手错误收场。
+    async fn assert_proto_version_rejected(version: u16) {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
         let bad_hello = SessionMessage::Hello {
             session_id: "sess-1".to_owned(),
-            proto_version: SESSION_PROTO_VERSION.wrapping_add(1),
+            proto_version: version,
             controller_rd_id: "111111111".to_owned(),
             nonce: plan.nonce.clone(),
             hmac: vec![0u8; 32],
@@ -1745,6 +1792,7 @@ mod tests {
             width: w,
             height: h,
             rgba,
+            gpu: None,
         }
     }
 

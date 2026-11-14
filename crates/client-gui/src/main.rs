@@ -79,13 +79,17 @@ impl GuiApp {
         tray: Option<tray::TrayHandle>,
         tray_bridge: Arc<tray_worker::TrayBridge>,
         prefs: prefs::GuiPrefs,
+        wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
     ) -> Self {
         let settings = app_state
             .config_snapshot()
             .as_ref()
             .map(ui::settings::SettingsState::from_config)
             .unwrap_or_default();
-        let remote_view = Arc::new(Mutex::new(remote::RemoteView::from_prefs(&prefs)));
+        let remote_view = Arc::new(Mutex::new(remote::RemoteView::from_prefs(
+            &prefs,
+            wgpu_target_format,
+        )));
         Self {
             app_state,
             settings,
@@ -281,7 +285,7 @@ impl GuiApp {
                 ui.add_space(2.0);
             });
     }
-    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏）回写 `gui.toml`。
+    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏 / 帧率上限）回写 `gui.toml`。
     ///
     /// 这些字段在 [`remote::RemoteView`] 上是运行时镜像——改动发生在 deferred viewport 的回调里
     /// （与 `update` 不在同一时刻），只能靠每帧比对把差异落盘。`save` 只在确有变化时才写。
@@ -309,6 +313,10 @@ impl GuiApp {
         }
         if self.prefs.remote_toolbar_autohide != view.toolbar_autohide {
             self.prefs.remote_toolbar_autohide = view.toolbar_autohide;
+            changed = true;
+        }
+        if self.prefs.remote_frame_rate != view.frame_rate {
+            self.prefs.remote_frame_rate = view.frame_rate;
             changed = true;
         }
         drop(view);
@@ -1054,24 +1062,45 @@ fn log_wgpu_adapters(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 fn log_wgpu_adapters(_path: &std::path::Path) {}
 
-/// 用 wgpu（Windows 上走 DX12）重新拉起自身。
+/// 用指定 renderer 重新拉起自身（`value` 为 `"wgpu"` 或 `"glow"`）。
 ///
-/// Glow 依赖 OpenGL 驱动；部分 Windows 10 机器（老驱动、虚拟机、远程桌面）没有
-/// 可用的 GL 配置，eframe 会报 `Found no glutin configs`。wgpu 走 DX12，能覆盖这些
-/// 机器。重启而不是进程内重试，是因为 `run_native` 会消费掉 `FnOnce` 的 app 构造器。
-fn relaunch_with_wgpu() -> bool {
+/// 两个方向各有用处：Glow 依赖 OpenGL 驱动，部分 Windows 10 机器（老驱动、虚拟机、远程
+/// 桌面）没有可用的 GL 配置（`Found no glutin configs`）；反过来 wgpu 在个别驱动上也会
+/// 失败，此时退回 Glow 至少能让界面起来（NV12 会自动走 CPU 回退）。重启而不是进程内重试，
+/// 是因为 `run_native` 会消费掉 `FnOnce` 的 app 构造器。
+///
+/// 环境变量就是「本次尝试」的标记：子进程读到它后不会再朝同一方向重试，故不会形成循环。
+fn relaunch_with_renderer(value: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
     let mut command = std::process::Command::new(exe);
     command.args(std::env::args_os().skip(1));
-    command.env("RUST_TUNNEL_RENDERER", "wgpu");
+    command.env("RUST_TUNNEL_RENDERER", value);
     match command.spawn() {
         Ok(_) => true,
         Err(err) => {
-            tracing::warn!(error = %err, "以 wgpu 重新启动失败");
+            tracing::warn!(error = %err, renderer = value, "以指定 renderer 重新启动失败");
             false
         }
+    }
+}
+
+/// 选择 eframe 渲染器。
+///
+/// - Windows 上**默认 wgpu**（DX12）：NV12 着色器上屏需要它，且它比 Glow 更能覆盖老驱动 /
+///   虚拟机 / 远程桌面（后者没有可用 GL 配置）。
+/// - 非 Windows 仍默认 Glow（现状不变）。
+/// - `RUST_TUNNEL_RENDERER=glow|wgpu` 显式覆盖；wgpu 只在 Windows 上被采纳。
+fn select_renderer() -> eframe::Renderer {
+    let requested = std::env::var("RUST_TUNNEL_RENDERER").ok();
+    if cfg!(target_os = "windows") {
+        match requested.as_deref() {
+            Some("glow") => eframe::Renderer::Glow,
+            _ => eframe::Renderer::Wgpu,
+        }
+    } else {
+        eframe::Renderer::Glow
     }
 }
 
@@ -1160,14 +1189,9 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         vp
     };
 
-    // Windows 上允许用环境变量强制 wgpu；Glow 失败时 [`relaunch_with_wgpu`] 会设置它。
-    let renderer = if cfg!(target_os = "windows")
-        && std::env::var("RUST_TUNNEL_RENDERER").as_deref() == Ok("wgpu")
-    {
-        eframe::Renderer::Wgpu
-    } else {
-        eframe::Renderer::Glow
-    };
+    // Windows 默认 wgpu（NV12 着色器上屏需要它），可用 RUST_TUNNEL_RENDERER 覆盖。
+    let renderer = select_renderer();
+    let renderer_env = std::env::var("RUST_TUNNEL_RENDERER").ok();
     if let Some(path) = log_path {
         append_startup_log(path, &format!("renderer: {renderer:?}"));
         if matches!(renderer, eframe::Renderer::Wgpu) {
@@ -1181,6 +1205,8 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    // 闭包要 `'static`，故把日志路径拷一份带进去（`log_path` 后面错误分支还要用）。
+    let startup_log = log_path.map(std::path::Path::to_path_buf);
     let result = eframe::run_native(
         "Rust Tunnel",
         options,
@@ -1189,26 +1215,58 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             apply_theme(&cc.egui_ctx, prefs.theme);
             // 把 HWND 与 egui 上下文交给托盘线程：隐藏窗口的还原必须走原生调用。
             tray_bridge.attach(cc);
-            Ok(Box::new(GuiApp::new(app_state, tray, tray_bridge, prefs)))
+            // `wgpu_render_state` 是「本次运行真的在 wgpu 上」的唯一判据：有它才能用 GPU
+            // 着色器上屏，否则 NV12 走 CPU 回退。把目标格式记进启动日志，便于现场确认
+            // sRGB/非 sRGB 选对了片元入口。
+            let wgpu_target_format = cc.wgpu_render_state.as_ref().map(|state| state.target_format);
+            if let Some(path) = startup_log.as_deref() {
+                if let Some(format) = wgpu_target_format {
+                    append_startup_log(path, &format!("wgpu target format: {format:?}"));
+                    append_startup_log(path, "NV12 着色器上屏已启用");
+                } else {
+                    append_startup_log(path, "NV12 走 CPU 回退（无 wgpu render state）");
+                }
+            }
+            Ok(Box::new(GuiApp::new(
+                app_state,
+                tray,
+                tray_bridge,
+                prefs,
+                wgpu_target_format,
+            )))
         }),
     );
 
     if let Err(err) = result {
         let message = err.to_string();
-        // Glow/OpenGL 配置不可用时自动切 wgpu（只在 Windows；只重试一次，避免循环）。
-        if cfg!(target_os = "windows")
-            && matches!(renderer, eframe::Renderer::Glow)
-            && std::env::var_os("RUST_TUNNEL_RENDERER").is_none()
-            && message.contains("glutin")
-        {
-            if let Some(path) = log_path {
-                append_startup_log(
-                    path,
-                    &format!("eframe(glow) 失败，改用 wgpu 重新启动:\n{message}"),
-                );
+        if cfg!(target_os = "windows") {
+            // 默认 wgpu 失败（个别老驱动/虚拟机）→ 用 Glow 重试一次。仅当用户没显式指定
+            // renderer 时这么做，避免覆盖用户的选择。
+            if matches!(renderer, eframe::Renderer::Wgpu) && renderer_env.is_none() {
+                if let Some(path) = log_path {
+                    append_startup_log(
+                        path,
+                        &format!("eframe(wgpu) 失败，改用 glow 重新启动:\n{message}"),
+                    );
+                }
+                if relaunch_with_renderer("glow") {
+                    std::process::exit(0);
+                }
             }
-            if relaunch_with_wgpu() {
-                std::process::exit(0);
+            // Glow/OpenGL 配置不可用时自动切 wgpu（保留旧回退；已显式选 wgpu 时不再回头）。
+            if matches!(renderer, eframe::Renderer::Glow)
+                && renderer_env.as_deref() != Some("wgpu")
+                && message.contains("glutin")
+            {
+                if let Some(path) = log_path {
+                    append_startup_log(
+                        path,
+                        &format!("eframe(glow) 失败，改用 wgpu 重新启动:\n{message}"),
+                    );
+                }
+                if relaunch_with_renderer("wgpu") {
+                    std::process::exit(0);
+                }
             }
         }
         return Err(anyhow::anyhow!("{message}"));

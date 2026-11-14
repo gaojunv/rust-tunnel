@@ -233,6 +233,20 @@ impl RateController {
         self.last_action = QosAction::Hold;
     }
 
+    /// 只改帧率**上限**（控制器显式选择 30 / 60），码率 / 缩放 / 闭环历史一概不动。
+    ///
+    /// 与 [`Self::set_ceiling`] 的区别：换画质档位是「换一整套上限」，而帧率选择只覆盖
+    /// `max_fps`——用户选了 60 之后再把画质切到「流畅」，帧率仍应是 60（调用方在 `SetQuality`
+    /// 之后重新应用本方法，见 `controlled.rs`）。
+    ///
+    /// `fps` 被钳到 `[min_fps, 120]`；当前生效帧率同步到新上限（用户显式意图，重置到上限），
+    /// 下一次 QoS 反馈再按网络状况在它之下调整。**不改编码器**：调用方走在线重配置。
+    pub fn set_frame_rate_ceiling(&mut self, fps: u8) {
+        let fps = fps.clamp(self.params.min_fps.max(1), 120);
+        self.ceiling.max_fps = fps;
+        self.fps = fps;
+    }
+
     /// 处理一次反馈，产出新的生效值。
     ///
     /// `local_backlog` 是被控端**本地**出站队列的积压帧数（编码任务的输出队列）；与反馈里的
@@ -680,6 +694,54 @@ mod tests {
             },
             "换档位应把生效值重置到新上限"
         );
+    }
+
+    #[test]
+    fn frame_rate_ceiling_selects_60_then_30() {
+        let mut c = balanced(); // 档位上限 30
+        prime(&mut c);
+        // 先让闭环降一点码率，验证 `set_frame_rate_ceiling` 不动它。
+        let d = c.on_feedback(fb(300, 10, 0), 0);
+        assert_eq!(d.action, QosAction::Decrease);
+        let bitrate = c.current().bitrate_kbps;
+        let scale = c.current().scale;
+
+        c.set_frame_rate_ceiling(60);
+        assert_eq!(c.ceiling().max_fps, 60, "上限应升到 60");
+        assert_eq!(c.current().fps, 60, "生效帧率同步到新上限");
+        assert_eq!(c.current().bitrate_kbps, bitrate, "码率不受帧率选择影响");
+        assert!((c.current().scale - scale).abs() < f32::EPSILON, "缩放不受影响");
+
+        // 选回 30：上限与生效值都降回去（仍是用户显式选择，不留 60 的闭环历史）。
+        c.set_frame_rate_ceiling(30);
+        assert_eq!(c.ceiling().max_fps, 30);
+        assert_eq!(c.current().fps, 30);
+        assert_eq!(c.current().bitrate_kbps, bitrate, "码率仍不受影响");
+    }
+
+    #[test]
+    fn frame_rate_ceiling_is_clamped_to_min_fps() {
+        let mut c = balanced();
+        c.set_frame_rate_ceiling(5);
+        assert_eq!(c.params.min_fps, 15);
+        assert_eq!(c.ceiling().max_fps, 15, "低于 min_fps 的选择应被钳到 15");
+        assert_eq!(c.current().fps, 15);
+
+        c.set_frame_rate_ceiling(255);
+        assert_eq!(c.ceiling().max_fps, 120, "上限封顶 120");
+        assert_eq!(c.current().fps, 120);
+    }
+
+    #[test]
+    fn frame_rate_ceiling_survives_after_ceiling_reset() {
+        // 模拟 controlled.rs 的 SetQuality 处理顺序：换档位后重新应用用户选的帧率。
+        let mut c = balanced();
+        c.set_frame_rate_ceiling(60);
+        c.set_ceiling(QualityPreset::Smooth.options()); // 档位默认 20
+        assert_eq!(c.current().fps, 20, "换档位本身会回到档位默认");
+        c.set_frame_rate_ceiling(60);
+        assert_eq!(c.current().fps, 60, "重新应用后用户选择仍生效");
+        assert_eq!(c.ceiling().target_bitrate_kbps, 2000, "码率仍是档位默认");
     }
 
     #[test]

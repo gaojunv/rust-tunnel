@@ -13,13 +13,14 @@
 //!   重试仍失败才把错误交给调用方。
 
 use super::{
-    find_output, BgraReader, CaptureBackend, CaptureSource, CapturedFrame, MonitorInfo,
-    FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT,
+    find_output, texture_dimensions, BgraReader, CaptureBackend, CaptureSource, CapturedFrame,
+    CapturedTexture, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT,
 };
 use crate::d3d11;
 use crate::WinVideoError;
+use std::sync::Arc;
 use windows::core::Interface as _;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
@@ -34,9 +35,7 @@ unsafe impl Send for DxgiSource {}
 /// DXGI Desktop Duplication 采集源。
 struct DxgiSource {
     /// 设备建在显示器所属适配器上。
-    device: ID3D11Device,
-    /// 立即上下文。
-    context: ID3D11DeviceContext,
+    d3d: Arc<d3d11::D3d11>,
     /// 当前复制会话。
     duplication: IDXGIOutputDuplication,
     /// 目标显示器，重建时用它重新匹配输出。
@@ -45,6 +44,10 @@ struct DxgiSource {
     reader: BgraReader,
     /// 最近一次成功采集的帧。
     last: Option<CapturedFrame>,
+    /// 持久 BGRA 纹理池（GPU 路径）；尺寸/格式变化时重建。
+    textures: Option<TexturePool>,
+    /// 最近一次 GPU 采集结果（无新帧时返回它的克隆）。
+    last_texture: Option<CapturedTexture>,
 }
 
 /// `AcquireNextFrame` 的一次结果（把「超时/丢失」从错误路径里分出来）。
@@ -77,12 +80,32 @@ impl CaptureSource for DxgiSource {
             }
         }
     }
+
+    fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
+        match self.acquire()? {
+            Acquired::Resource(resource) => self.finish_texture(resource.as_ref()),
+            Acquired::Timeout => self.reuse_texture("超时内没有新帧"),
+            Acquired::AccessLost => {
+                tracing::warn!("DXGI 桌面复制会话失效（ACCESS_LOST），尝试重建");
+                self.rebuild()?;
+                match self.acquire()? {
+                    Acquired::Resource(resource) => self.finish_texture(resource.as_ref()),
+                    Acquired::Timeout => self.reuse_texture("重建后超时内没有新帧"),
+                    Acquired::AccessLost => self.reuse_texture("重建后再次 ACCESS_LOST"),
+                }
+            }
+        }
+    }
+
+    fn device(&self) -> Option<Arc<d3d11::D3d11>> {
+        Some(self.d3d.clone())
+    }
 }
 
 impl DxgiSource {
     /// 等待并取下一帧。
     fn acquire(&mut self) -> Result<Acquired, WinVideoError> {
-        let timeout = if self.last.is_some() {
+        let timeout = if self.last.is_some() || self.last_texture.is_some() {
             NEXT_FRAME_POLL_TIMEOUT
         } else {
             FIRST_FRAME_TIMEOUT
@@ -138,12 +161,77 @@ impl DxgiSource {
         let texture: ID3D11Texture2D = resource
             .cast()
             .map_err(|err| WinVideoError::Capture(format!("桌面资源转 D3D11 纹理失败: {err}")))?;
-        let (width, height, bgra) = self.reader.read(&self.device, &self.context, &texture)?;
+        let (width, height, bgra) =
+            self.reader
+                .read(&self.d3d.device, &self.d3d.context, &texture)?;
         Ok(CapturedFrame {
             width,
             height,
             bgra,
             backend: CaptureBackend::Dxgi,
+        })
+    }
+
+    /// 读取已获取的桌面资源到池纹理，然后无条件 `ReleaseFrame`。
+    ///
+    /// **必须在 `ReleaseFrame` 之前完成拷贝**：DXGI 会在释放后复用那张桌面纹理。
+    fn finish_texture(
+        &mut self,
+        resource: Option<&IDXGIResource>,
+    ) -> Result<CapturedTexture, WinVideoError> {
+        let copied = match resource {
+            Some(resource) => self.copy_resource(resource).map(Some),
+            None => Ok(None),
+        };
+        // SAFETY: `AcquireNextFrame` 成功后必须配对调用 `ReleaseFrame`（即使拷贝失败）。
+        let released = unsafe { self.duplication.ReleaseFrame() };
+        let texture = copied?;
+        if let Err(err) = released {
+            return Err(WinVideoError::Capture(format!("ReleaseFrame 失败: {err}")));
+        }
+        match texture {
+            Some(texture) => {
+                self.last_texture = Some(texture.clone());
+                Ok(texture)
+            }
+            None => self.reuse_texture("本次只有指针更新，没有新的桌面图像"),
+        }
+    }
+
+    /// 把桌面资源拷贝到池纹理（不负责 `ReleaseFrame`）。
+    fn copy_resource(
+        &mut self,
+        resource: &IDXGIResource,
+    ) -> Result<CapturedTexture, WinVideoError> {
+        let source: ID3D11Texture2D = resource
+            .cast()
+            .map_err(|err| WinVideoError::Capture(format!("桌面资源转 D3D11 纹理失败: {err}")))?;
+        let ((width, height), format) = texture_dimensions(&source)?;
+
+        if self
+            .textures
+            .as_ref()
+            .is_none_or(|pool| !pool.matches(width, height, format))
+        {
+            self.textures = Some(TexturePool::new(&self.d3d.device, width, height, format)?);
+        }
+        let pool = self
+            .textures
+            .as_ref()
+            .ok_or_else(|| WinVideoError::Config("DXGI 纹理池缺失".to_owned()))?;
+        let (lease, target) = pool.acquire(&self.d3d.device)?;
+
+        // SAFETY: 两张纹理在同一设备上、尺寸与格式一致；拷贝在立即上下文上
+        // 同步完成，必须在 ReleaseFrame 之前。
+        unsafe { self.d3d.context.CopyResource(&target, &source) };
+
+        Ok(CapturedTexture {
+            device: self.d3d.clone(),
+            texture: target,
+            subresource: 0,
+            width,
+            height,
+            lease,
         })
     }
 
@@ -157,10 +245,20 @@ impl DxgiSource {
         }
     }
 
+    /// 复用上一张 GPU 纹理；从未采到过帧时把原因报给调用方。
+    fn reuse_texture(&self, reason: &str) -> Result<CapturedTexture, WinVideoError> {
+        match &self.last_texture {
+            Some(texture) => Ok(texture.clone()),
+            None => Err(WinVideoError::Capture(format!(
+                "DXGI: {reason}，且还没有任何已采集的 GPU 纹理"
+            ))),
+        }
+    }
+
     /// 会话失效后重建 `DuplicateOutput`。
     fn rebuild(&mut self) -> Result<(), WinVideoError> {
         let matched = find_output(self.hmonitor)?;
-        let dxgi_device: IDXGIDevice = self.device.cast().map_err(|err| {
+        let dxgi_device: IDXGIDevice = self.d3d.device.cast().map_err(|err| {
             WinVideoError::Capture(format!("D3D11 设备转 IDXGIDevice 失败: {err}"))
         })?;
         self.duplication = create_duplication(&matched.output, &dxgi_device)
@@ -210,7 +308,7 @@ fn create_duplication(
 /// 打开指定显示器的 DXGI Desktop Duplication 采集源。
 pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinVideoError> {
     let matched = find_output(monitor.hmonitor)?;
-    let d3d = d3d11::create(Some(matched.adapter_index))?;
+    let d3d = Arc::new(d3d11::create(Some(matched.adapter_index))?);
     let dxgi_device: IDXGIDevice = d3d
         .device
         .cast()
@@ -223,11 +321,12 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         "DXGI 桌面复制采集源已打开"
     );
     Ok(Box::new(DxgiSource {
-        device: d3d.device,
-        context: d3d.context,
+        d3d,
         duplication,
         hmonitor: monitor.hmonitor,
         reader: BgraReader::default(),
         last: None,
+        textures: None,
+        last_texture: None,
     }))
 }

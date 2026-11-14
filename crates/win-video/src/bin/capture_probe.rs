@@ -63,10 +63,46 @@ fn run() -> Result<(), WinVideoError> {
         None => println!("  没有可写的帧"),
     }
 
+    println!("\n== GPU 纹理采集（不落 CPU，阶段 2a）==");
+    probe_gpu_textures(source.as_mut());
+
     // 先释放首个采集源，再做两个后端的独立可用性对比，避免同时占用多个会话。
     drop(source);
     probe_forced_backends(monitor);
     Ok(())
+}
+
+/// 连续取 3 帧 GPU 纹理，打印尺寸、适配器与耗时。
+///
+/// 失败只报告、不让探针退出：静止桌面下 WGC 可能不给新帧，属于预期情况。
+#[cfg(windows)]
+fn probe_gpu_textures(source: &mut dyn CaptureSource) {
+    match source.device() {
+        Some(device) => println!("  采集设备: {}", device.adapter.name),
+        None => println!("  采集设备: 未提供（后端不支持 GPU 纹理）"),
+    }
+    for index in 0..3 {
+        let started = Instant::now();
+        match source.capture_texture() {
+            Ok(texture) => println!(
+                "  #{:02} {:6.2} ms {}x{} subresource={} adapter={}",
+                index + 1,
+                started.elapsed().as_secs_f64() * 1000.0,
+                texture.width,
+                texture.height,
+                texture.subresource,
+                texture.device.adapter.name,
+            ),
+            Err(err) => {
+                println!(
+                    "  #{:02} {:6.2} ms 不可用: {err}",
+                    index + 1,
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                break;
+            }
+        }
+    }
 }
 
 /// 打印显示器列表。
