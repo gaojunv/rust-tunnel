@@ -33,6 +33,7 @@
 //! `decode` 是同步阻塞调用。
 
 mod color;
+mod dxva;
 
 use crate::WinVideoError;
 use std::cell::Cell;
@@ -43,15 +44,15 @@ use std::sync::OnceLock;
 use windows::core::{IUnknown, Interface as _};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform,
-    MFMediaType_Video, MFVideoArea, MFVideoFormat_H264, MFVideoFormat_IYUV, MFVideoFormat_NV12,
-    MFVideoFormat_YV12,
-    MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MF_E_NOTACCEPTING, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_GEOMETRIC_APERTURE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
+    CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFDXGIBuffer, IMFMediaBuffer, IMFMediaType, IMFSample,
+    IMFTransform, MFMediaType_Video, MFVideoArea, MFVideoFormat_H264, MFVideoFormat_IYUV,
+    MFVideoFormat_NV12, MFVideoFormat_YV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_E_NOTACCEPTING, MF_E_NO_MORE_TYPES,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_GEOMETRIC_APERTURE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -103,6 +104,37 @@ pub struct DecodedH264Frame {
     pub rgba: Vec<u8>,
 }
 
+/// 硬件解码偏好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264HardwarePreference {
+    /// 优先 DXVA/D3D11 硬件；初始化任一环节失败时自动回退系统内存软件解码。
+    Auto,
+    /// 强制系统内存软件解码（探针对照组 / 排障用）。
+    Software,
+    /// 强制 DXVA/D3D11；初始化失败返回错误，不静默回退（探针用于确认硬件真的生效）。
+    RequireHardware,
+}
+
+/// 解码器实际采用的数据通路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264DecodePath {
+    /// DXVA/D3D11：MFT 输出 `IMFDXGIBuffer` 纹理，CPU 只做 staging 拷贝与 NV12→RGBA。
+    Dxva,
+    /// 系统内存：MFT 把 NV12 写进调用方提供的缓冲区，CPU 解码 + 转换。
+    Software,
+}
+
+impl H264DecodePath {
+    /// 稳定的短名称，供日志与真机探针输出。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dxva => "DXVA/D3D11",
+            Self::Software => "系统内存（软件）",
+        }
+    }
+}
+
 /// 当前协商到的输出格式。
 ///
 /// `coded_width × coded_height` 是 **MFT 缓冲区**的尺寸（H.264 编码尺寸按 16
@@ -143,6 +175,16 @@ pub struct H264Decoder {
     next_pts: i64,
     /// 单帧时长（100ns）。
     frame_duration: i64,
+    /// 创建 / 重建时使用的硬件偏好。
+    preference: H264HardwarePreference,
+    /// 当前配置的数据通路（DXVA 是否真正生效另见 [`H264Decoder::hardware_buffers_seen`]）。
+    path: H264DecodePath,
+    /// DXVA 的 D3D11 设备、设备管理器与 staging 纹理；软件路径为 `None`。
+    hardware: Option<dxva::HardwareContext>,
+    /// 是否真的收到过 `IMFDXGIBuffer`（配置了硬件但 MFT 仍给系统内存时为 false）。
+    dxgi_seen: bool,
+    /// 「配置了 DXVA 却没有 DXGI 样本」的告警只打一次。
+    warned_no_dxgi: bool,
 }
 
 impl std::fmt::Debug for H264Decoder {
@@ -159,6 +201,8 @@ impl std::fmt::Debug for H264Decoder {
                 ),
             )
             .field("format", &self.output.layout)
+            .field("path", &self.path)
+            .field("dxgi_seen", &self.dxgi_seen)
             .finish_non_exhaustive()
     }
 }
@@ -186,19 +230,76 @@ impl H264Decoder {
     /// 尺寸为 0、Media Foundation 初始化失败、`MSH264DecoderMFT` 不可用
     /// （非 Windows 或系统组件缺失）或媒体类型被拒绝时返回 [`WinVideoError`]。
     pub fn new(width: u32, height: u32) -> Result<Self, WinVideoError> {
-        let (transform, output, provides_samples, output_buffer_size) =
-            create_pipeline(width, height, DEFAULT_FPS)?;
+        Self::new_with_preference(width, height, H264HardwarePreference::Auto)
+    }
+
+    /// 强制系统内存软件解码（探针对照组）。
+    ///
+    /// # Errors
+    /// 尺寸非法或 Media Foundation 初始化失败时返回 [`WinVideoError`]。
+    pub fn new_software(width: u32, height: u32) -> Result<Self, WinVideoError> {
+        Self::new_with_preference(width, height, H264HardwarePreference::Software)
+    }
+
+    /// 强制 DXVA/D3D11 硬件解码；硬件不可用时返回错误而不是静默回退。
+    ///
+    /// # Errors
+    /// 尺寸非法、没有可用硬件适配器、设备管理器创建/绑定失败或 MFT 拒绝
+    /// D3D 设备管理器时返回 [`WinVideoError`]。
+    pub fn new_hardware(width: u32, height: u32) -> Result<Self, WinVideoError> {
+        Self::new_with_preference(width, height, H264HardwarePreference::RequireHardware)
+    }
+
+    /// 按指定硬件偏好创建解码器。
+    ///
+    /// # Errors
+    /// 尺寸非法、Media Foundation 初始化失败或（`RequireHardware` 下）DXVA
+    /// 初始化失败时返回 [`WinVideoError`]。
+    pub fn new_with_preference(
+        width: u32,
+        height: u32,
+        preference: H264HardwarePreference,
+    ) -> Result<Self, WinVideoError> {
+        let pipeline = create_pipeline(width, height, DEFAULT_FPS, preference)?;
         Ok(Self {
-            transform,
-            output,
+            transform: pipeline.transform,
+            output: pipeline.output,
             requested_width: width,
             requested_height: height,
             fps: DEFAULT_FPS,
-            provides_samples,
-            output_buffer_size,
+            provides_samples: pipeline.provides_samples,
+            output_buffer_size: pipeline.output_buffer_size,
             next_pts: 0,
             frame_duration: HNS_PER_SECOND / i64::from(DEFAULT_FPS),
+            preference,
+            path: pipeline.path,
+            hardware: pipeline.hardware,
+            dxgi_seen: false,
+            warned_no_dxgi: false,
         })
+    }
+
+    /// 当前配置的数据通路。
+    ///
+    /// `Dxva` 只说明设备管理器已成功交给 MFT；是否真的输出 DXGI 纹理要看
+    /// [`H264Decoder::hardware_buffers_seen`]。
+    #[must_use]
+    pub fn path(&self) -> H264DecodePath {
+        self.path
+    }
+
+    /// DXVA 路径实际绑定的 D3D11 适配器名；软件路径为 `None`。
+    #[must_use]
+    pub fn adapter_name(&self) -> Option<&str> {
+        self.hardware
+            .as_ref()
+            .map(dxva::HardwareContext::adapter_name)
+    }
+
+    /// 解码过程中是否真的收到过 `IMFDXGIBuffer`（硬件解码生效的证据）。
+    #[must_use]
+    pub fn hardware_buffers_seen(&self) -> bool {
+        self.dxgi_seen
     }
 
     /// 解码器的请求尺寸（`new` / 最近一次 `reconfigure` 的值）。
@@ -225,15 +326,18 @@ impl H264Decoder {
     /// # Errors
     /// 新尺寸非法或 MFT 创建/媒体类型协商失败时返回 [`WinVideoError`]。
     pub fn reconfigure(&mut self, width: u32, height: u32) -> Result<(), WinVideoError> {
-        let (transform, output, provides_samples, output_buffer_size) =
-            create_pipeline(width, height, self.fps)?;
-        self.transform = transform;
-        self.output = output;
+        let pipeline = create_pipeline(width, height, self.fps, self.preference)?;
+        self.transform = pipeline.transform;
+        self.output = pipeline.output;
         self.requested_width = width;
         self.requested_height = height;
-        self.provides_samples = provides_samples;
-        self.output_buffer_size = output_buffer_size;
+        self.provides_samples = pipeline.provides_samples;
+        self.output_buffer_size = pipeline.output_buffer_size;
+        self.path = pipeline.path;
+        self.hardware = pipeline.hardware;
         self.next_pts = 0;
+        self.dxgi_seen = false;
+        self.warned_no_dxgi = false;
         Ok(())
     }
 
@@ -411,121 +515,154 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// 把一个输出样本转换成 RGBA。
-    fn convert_sample(&self, sample: &IMFSample) -> Result<DecodedH264Frame, WinVideoError> {
+    /// 把一个输出样本转换成 RGBA（DXGI 纹理优先，其次系统内存）。
+    fn convert_sample(&mut self, sample: &IMFSample) -> Result<DecodedH264Frame, WinVideoError> {
         // SAFETY: `sample` 有效；返回的缓冲区在作用域内保持引用计数。
-        // `ConvertToContiguousBuffer` 失败时退回第一个缓冲区（部分 MFT 只给 2D 缓冲）。
-        let buffer: IMFMediaBuffer = match unsafe { sample.ConvertToContiguousBuffer() } {
-            Ok(buffer) => buffer,
-            Err(_) => unsafe { sample.GetBufferByIndex(0) }
-                .map_err(|err| decode_err("IMFSample::GetBufferByIndex", &err))?,
+        let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0) }
+            .map_err(|err| decode_err("IMFSample::GetBufferByIndex", &err))?;
+
+        // DXVA 路径：解码器输出 IMFDXGIBuffer（纹理 + subresource），必须拷到
+        // staging 纹理再 Map 读取；不能走 IMF2DBuffer（跨设备纹理没有 CPU 指针）。
+        if let Ok(dxgi_buffer) = buffer.cast::<IMFDXGIBuffer>() {
+            if let Some(hardware) = self.hardware.as_mut() {
+                let output = self.output;
+                let converted = hardware.with_mapped(
+                    output.coded_width,
+                    output.coded_height,
+                    &dxgi_buffer,
+                    |scanline, pitch| convert_planes(&output, scanline, pitch),
+                );
+                self.dxgi_seen = true;
+                return converted;
+            }
+        }
+        if self.hardware.is_some() && !self.warned_no_dxgi {
+            self.warned_no_dxgi = true;
+            tracing::warn!(
+                "已配置 DXVA，但 MFT 输出的是系统内存样本；硬件解码未生效（CPU 解码中）"
+            );
+        }
+
+        // 系统内存路径。
+        // SAFETY: `sample` 有效；`ConvertToContiguousBuffer` 失败时退回第一个缓冲区
+        // （部分 MFT 只给 2D 缓冲）。
+        let contiguous: IMFMediaBuffer = match unsafe { sample.ConvertToContiguousBuffer() } {
+            Ok(contiguous) => contiguous,
+            Err(_) => buffer,
         };
 
-        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+        if let Ok(buffer_2d) = contiguous.cast::<IMF2DBuffer>() {
             let mut scanline: *mut u8 = ptr::null_mut();
             let mut pitch: i32 = 0;
             // SAFETY: 两个输出指针都指向本栈帧；`buffer_2d` 在解锁前一直有效。
             unsafe { buffer_2d.Lock2D(&raw mut scanline, &raw mut pitch) }
                 .map_err(|err| decode_err("IMF2DBuffer::Lock2D", &err))?;
-            let converted = Self::convert_2d(&self.output, scanline, pitch);
+            let converted = convert_system_memory(&self.output, scanline, pitch);
             // SAFETY: 与上面的 Lock2D 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { buffer_2d.Unlock2D() };
             combine_unlock(converted, unlocked, "IMF2DBuffer::Unlock2D")
         } else {
             let mut scanline: *mut u8 = ptr::null_mut();
-            // SAFETY: `scanline` 指向本栈帧；`buffer` 在解锁前一直有效。
-            unsafe { buffer.Lock(&raw mut scanline, None, None) }
+            // SAFETY: `scanline` 指向本栈帧；`contiguous` 在解锁前一直有效。
+            unsafe { contiguous.Lock(&raw mut scanline, None, None) }
                 .map_err(|err| decode_err("IMFMediaBuffer::Lock（输出）", &err))?;
             let pitch = i32::try_from(self.output.stride).unwrap_or(0);
-            let converted = Self::convert_2d(&self.output, scanline, pitch);
+            let converted = convert_system_memory(&self.output, scanline, pitch);
             // SAFETY: 与上面的 Lock 配对；无论转换成败都必须解锁。
-            let unlocked = unsafe { buffer.Unlock() };
+            let unlocked = unsafe { contiguous.Unlock() };
             combine_unlock(converted, unlocked, "IMFMediaBuffer::Unlock（输出）")
         }
     }
+}
 
-    /// 从锁定的 2D 缓冲区转换出一帧。
-    fn convert_2d(
-        output: &OutputFormat,
-        scanline: *mut u8,
-        pitch: i32,
-    ) -> Result<DecodedH264Frame, WinVideoError> {
-        if scanline.is_null() {
-            return Err(WinVideoError::Decode("解码输出缓冲区为空指针".to_owned()));
-        }
-        let pitch = usize::try_from(pitch).map_err(|_| {
-            WinVideoError::Decode(format!("解码输出 stride 非法（{pitch}，负值不支持）"))
-        })?;
-        // 缓冲区按**编码尺寸**（16 像素对齐）解释，最后再裁到可见区域。
-        let width = output.coded_width;
-        let height = output.coded_height;
-        let h = usize::try_from(height)
-            .map_err(|_| WinVideoError::Decode("解码高度无法转为 usize".to_owned()))?;
-        let luma_len = pitch
-            .checked_mul(h)
-            .ok_or_else(|| WinVideoError::Decode("Y 平面大小溢出".to_owned()))?;
-        let chroma_len = pitch
-            .checked_mul(h / 2)
-            .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+/// 系统内存输出：把 `i32` stride 校验后交给通用转换。
+fn convert_system_memory(
+    output: &OutputFormat,
+    scanline: *mut u8,
+    pitch: i32,
+) -> Result<DecodedH264Frame, WinVideoError> {
+    let pitch = usize::try_from(pitch).map_err(|_| {
+        WinVideoError::Decode(format!("解码输出 stride 非法（{pitch}，负值不支持）"))
+    })?;
+    convert_planes(output, scanline, pitch)
+}
 
-        // SAFETY: 对每个平面，MFT 的 `Lock2D` 契约保证从 `scanline` 起至少有
-        // `pitch * rows` 字节可读；NV12 的 UV 平面紧跟在 Y 平面之后，YV12/IYUV
-        // 的两个色度平面依次跟随。切片只用于只读转换，Unlock 前一直有效。
-        let y_plane = unsafe { std::slice::from_raw_parts(scanline, luma_len) };
-        let mut rgba = Vec::new();
-        match output.layout {
-            H264OutputFormat::Nv12 => {
-                let uv_plane =
-                    unsafe { std::slice::from_raw_parts(scanline.add(luma_len), chroma_len) };
-                color::nv12_to_rgba(y_plane, uv_plane, pitch, pitch, width, height, &mut rgba)?;
-            }
-            H264OutputFormat::Yv12 => {
-                let plane_stride = pitch / 2;
-                let plane_len = plane_stride
-                    .checked_mul(h / 2)
-                    .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
-                // YV12：V 平面在前，U 平面在后。
-                let v_plane =
-                    unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
-                let u_plane = unsafe {
-                    std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
-                };
-                color::planar_to_rgba(
-                    y_plane,
-                    u_plane,
-                    v_plane,
-                    pitch,
-                    plane_stride,
-                    width,
-                    height,
-                    &mut rgba,
-                )?;
-            }
-            H264OutputFormat::Iyuv => {
-                let plane_stride = pitch / 2;
-                let plane_len = plane_stride
-                    .checked_mul(h / 2)
-                    .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
-                // IYUV：U 平面在前，V 平面在后。
-                let u_plane =
-                    unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
-                let v_plane = unsafe {
-                    std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
-                };
-                color::planar_to_rgba(
-                    y_plane,
-                    u_plane,
-                    v_plane,
-                    pitch,
-                    plane_stride,
-                    width,
-                    height,
-                    &mut rgba,
-                )?;
-            }
-        }
-        crop_to_display(output, rgba)
+/// 从锁定的缓冲区转换出一帧。
+fn convert_planes(
+    output: &OutputFormat,
+    scanline: *const u8,
+    pitch: usize,
+) -> Result<DecodedH264Frame, WinVideoError> {
+    if scanline.is_null() {
+        return Err(WinVideoError::Decode("解码输出缓冲区为空指针".to_owned()));
     }
+    // 缓冲区按**编码尺寸**（16 像素对齐）解释，最后再裁到可见区域。
+    let width = output.coded_width;
+    let height = output.coded_height;
+    let h = usize::try_from(height)
+        .map_err(|_| WinVideoError::Decode("解码高度无法转为 usize".to_owned()))?;
+    let luma_len = pitch
+        .checked_mul(h)
+        .ok_or_else(|| WinVideoError::Decode("Y 平面大小溢出".to_owned()))?;
+    let chroma_len = pitch
+        .checked_mul(h / 2)
+        .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+
+    // SAFETY: 对每个平面，MFT 的 `Lock2D` 契约保证从 `scanline` 起至少有
+    // `pitch * rows` 字节可读；NV12 的 UV 平面紧跟在 Y 平面之后，YV12/IYUV
+    // 的两个色度平面依次跟随。切片只用于只读转换，Unlock 前一直有效。
+    let y_plane = unsafe { std::slice::from_raw_parts(scanline, luma_len) };
+    let mut rgba = Vec::new();
+    match output.layout {
+        H264OutputFormat::Nv12 => {
+            let uv_plane =
+                unsafe { std::slice::from_raw_parts(scanline.add(luma_len), chroma_len) };
+            color::nv12_to_rgba(y_plane, uv_plane, pitch, pitch, width, height, &mut rgba)?;
+        }
+        H264OutputFormat::Yv12 => {
+            let plane_stride = pitch / 2;
+            let plane_len = plane_stride
+                .checked_mul(h / 2)
+                .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+            // YV12：V 平面在前，U 平面在后。
+            let v_plane = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
+            let u_plane = unsafe {
+                std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
+            };
+            color::planar_to_rgba(
+                y_plane,
+                u_plane,
+                v_plane,
+                pitch,
+                plane_stride,
+                width,
+                height,
+                &mut rgba,
+            )?;
+        }
+        H264OutputFormat::Iyuv => {
+            let plane_stride = pitch / 2;
+            let plane_len = plane_stride
+                .checked_mul(h / 2)
+                .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
+            // IYUV：U 平面在前，V 平面在后。
+            let u_plane = unsafe { std::slice::from_raw_parts(scanline.add(luma_len), plane_len) };
+            let v_plane = unsafe {
+                std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
+            };
+            color::planar_to_rgba(
+                y_plane,
+                u_plane,
+                v_plane,
+                pitch,
+                plane_stride,
+                width,
+                height,
+                &mut rgba,
+            )?;
+        }
+    }
+    crop_to_display(output, rgba)
 }
 
 /// 把转换结果与解锁结果合并：转换失败优先报告转换错误。
@@ -541,12 +678,23 @@ fn combine_unlock(
     }
 }
 
-/// 创建 MFT、配置输入/输出类型并启动流。
+/// 一条已配置好的解码流水线。
+struct Pipeline {
+    transform: IMFTransform,
+    output: OutputFormat,
+    provides_samples: bool,
+    output_buffer_size: u32,
+    path: H264DecodePath,
+    hardware: Option<dxva::HardwareContext>,
+}
+
+/// 按偏好创建流水线；`Auto` 在硬件任一步失败时回退软件。
 fn create_pipeline(
     width: u32,
     height: u32,
     fps: u32,
-) -> Result<(IMFTransform, OutputFormat, bool, u32), WinVideoError> {
+    preference: H264HardwarePreference,
+) -> Result<Pipeline, WinVideoError> {
     if width == 0 || height == 0 {
         return Err(WinVideoError::Config(format!(
             "解码尺寸不能为 0：{width}x{height}"
@@ -558,6 +706,79 @@ fn create_pipeline(
     ensure_mf_started()?;
     ensure_com_initialized()?;
 
+    match preference {
+        H264HardwarePreference::Software => create_software_pipeline(width, height, fps),
+        H264HardwarePreference::Auto => match create_hardware_pipeline(width, height, fps) {
+            Ok(pipeline) => Ok(pipeline),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "H.264 DXVA 初始化失败，回退系统内存软件解码"
+                );
+                create_software_pipeline(width, height, fps)
+            }
+        },
+        H264HardwarePreference::RequireHardware => create_hardware_pipeline(width, height, fps),
+    }
+}
+
+/// 系统内存软件解码流水线。
+fn create_software_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipeline, WinVideoError> {
+    let transform = create_transform()?;
+    let (output, provides_samples, output_buffer_size) =
+        configure_types(&transform, width, height, fps)?;
+    tracing::info!(
+        path = H264DecodePath::Software.as_str(),
+        "H.264 解码流水线已就绪"
+    );
+    Ok(Pipeline {
+        transform,
+        output,
+        provides_samples,
+        output_buffer_size,
+        path: H264DecodePath::Software,
+        hardware: None,
+    })
+}
+
+/// DXVA/D3D11 硬件解码流水线。
+/// 测试用：强制硬件初始化失败，以验证 `Auto` 的回退分支。
+#[cfg(test)]
+static FORCE_HARDWARE_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn create_hardware_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipeline, WinVideoError> {
+    #[cfg(test)]
+    {
+        if FORCE_HARDWARE_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(WinVideoError::Decode(
+                "测试注入的 DXVA 初始化失败".to_owned(),
+            ));
+        }
+    }
+    let device = dxva::create_device()?;
+    let transform = create_transform()?;
+    // 设备管理器必须在 SetInputType / SetOutputType 之前交给 MFT。
+    let hardware = dxva::HardwareContext::new(device, &transform)?;
+    let (output, provides_samples, output_buffer_size) =
+        configure_types(&transform, width, height, fps)?;
+    tracing::info!(
+        path = H264DecodePath::Dxva.as_str(),
+        adapter = hardware.adapter_name(),
+        "H.264 解码流水线已就绪"
+    );
+    Ok(Pipeline {
+        transform,
+        output,
+        provides_samples,
+        output_buffer_size,
+        path: H264DecodePath::Dxva,
+        hardware: Some(hardware),
+    })
+}
+
+/// 创建 `MSH264DecoderMFT` 并设置低延迟属性。
+fn create_transform() -> Result<IMFTransform, WinVideoError> {
     // SAFETY: 进程内 COM 工厂，CLSID 由系统注册；`None` 表示不聚合。
     let transform: IMFTransform = unsafe {
         CoCreateInstance(
@@ -567,15 +788,23 @@ fn create_pipeline(
         )
     }
     .map_err(|err| decode_err("CoCreateInstance(CLSID_MSH264DecoderMFT)", &err))?;
-
     configure_low_latency(&transform);
+    Ok(transform)
+}
 
+/// 设置输入/输出媒体类型并启动流。
+fn configure_types(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<(OutputFormat, bool, u32), WinVideoError> {
     let input = build_input_type(width, height, fps)?;
     // SAFETY: `transform` 与 `input` 都有效；输入流 0 是解码器唯一的输入。
     unsafe { transform.SetInputType(0, &input, 0) }
         .map_err(|err| decode_err("SetInputType(H.264)", &err))?;
 
-    let output = negotiate_output_type(&transform, width, height)?;
+    let output = negotiate_output_type(transform, width, height)?;
 
     // SAFETY: 类型已设置；启动消息只影响 MFT 内部状态。
     unsafe {
@@ -587,8 +816,8 @@ fn create_pipeline(
             .map_err(|err| decode_err("MFT_MESSAGE_NOTIFY_START_OF_STREAM", &err))?;
     }
 
-    let (provides_samples, output_buffer_size) = output_stream_info(&transform, &output)?;
-    Ok((transform, output, provides_samples, output_buffer_size))
+    let (provides_samples, output_buffer_size) = output_stream_info(transform, &output)?;
+    Ok((output, provides_samples, output_buffer_size))
 }
 
 /// 尽力打开低延迟模式；不支持时只记 debug，不影响解码。
@@ -940,6 +1169,12 @@ struct MfApi {
         unsafe extern "system" fn(u32, *mut *mut c_void) -> windows::core::HRESULT,
     /// `MFCreateSample(&mut ptr)`。
     create_sample: unsafe extern "system" fn(*mut *mut c_void) -> windows::core::HRESULT,
+    /// `MFCreateDXGIDeviceManager(&mut token, &mut manager)`。
+    ///
+    /// 设为 `Option`：极旧/精简镜像可能没有这个导出；缺失时只让 DXVA 失败并
+    /// 回退软件，不能把软件解码一起拖下水。
+    create_dxgi_device_manager:
+        Option<unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> windows::core::HRESULT>,
 }
 
 // SAFETY: 函数表在进程生命周期内只读；`mfplat.dll` 由 `OnceLock` 永久持有，
@@ -980,12 +1215,22 @@ impl MfApi {
             )
             .map_err(|err| format!("缺少 MFCreateSample: {err}"))?
         };
+        // MXF/DXVA：可选符号。缺失时硬件路径失败并回退软件，软件解码不受影响。
+        // SAFETY: 与上面的符号相同；失败时保持 `None`。
+        let create_dxgi_device_manager = unsafe {
+            lib.get::<unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> windows::core::HRESULT>(
+                b"MFCreateDXGIDeviceManager",
+            )
+            .ok()
+            .map(|symbol| *symbol)
+        };
         Ok(Self {
             _lib: lib,
             startup,
             create_media_type,
             create_memory_buffer,
             create_sample,
+            create_dxgi_device_manager,
         })
     }
 }
@@ -1031,11 +1276,9 @@ fn create_sample() -> Result<IMFSample, WinVideoError> {
     let mut raw: *mut c_void = ptr::null_mut();
     // SAFETY: `raw` 指向本栈帧；成功后返回一个由 `from_abi` 接管的接口指针。
     let hr = unsafe { (api.create_sample)(&raw mut raw) };
-    hr.ok()
-        .map_err(|err| decode_err("MFCreateSample", &err))?;
+    hr.ok().map_err(|err| decode_err("MFCreateSample", &err))?;
     // SAFETY: 成功路径的 `raw` 非空且引用计数为 1，所有权交给返回的接口。
-    unsafe { windows::core::Type::from_abi(raw) }
-        .map_err(|err| decode_err("MFCreateSample", &err))
+    unsafe { windows::core::Type::from_abi(raw) }.map_err(|err| decode_err("MFCreateSample", &err))
 }
 
 /// 进程级 `MFStartup`（只执行一次；失败结果也缓存，避免反复尝试）。
@@ -1091,5 +1334,19 @@ mod tests {
     #[test]
     fn unpack_size_rejects_zero() {
         assert_eq!(unpack_size(0), (0, 0));
+    }
+
+    /// `Auto` 在 DXVA 初始化失败时必须静默回退到系统内存软件解码。
+    #[test]
+    fn auto_falls_back_to_software_when_dxva_init_fails() {
+        FORCE_HARDWARE_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = H264Decoder::new(640, 360);
+        FORCE_HARDWARE_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(result.is_ok(), "Auto 应在 DXVA 失败后回退软件: {result:?}");
+        if let Ok(decoder) = result {
+            assert_eq!(decoder.path(), H264DecodePath::Software);
+            assert!(decoder.adapter_name().is_none());
+            assert!(!decoder.hardware_buffers_seen());
+        }
     }
 }

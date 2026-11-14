@@ -93,16 +93,22 @@ fn validate_plane(
     Ok(())
 }
 
-/// 写一个像素；越界时静默跳过（正常情况下不会发生，尺寸已在入口校验）。
-fn store_rgba(out: &mut [u8], index: usize, base: i32, chroma: (i32, i32, i32)) {
+/// 把两个相邻像素写进一个 8 字节块（`[RGBA, RGBA]`）。
+///
+/// 目标与源都是定长数组，编译器可以消掉逐像素边界检查；这是 1080p 转换
+/// 能压进个位数毫秒的关键。
+fn write_pair(target: &mut [u8; 8], luma: [u8; 2], chroma: (i32, i32, i32)) {
     let (r_chroma, g_chroma, b_chroma) = chroma;
-    let Some(pixel) = out.get_mut(index..index.saturating_add(4)) else {
-        return;
-    };
-    pixel[0] = clip((base.saturating_add(r_chroma)) >> SHIFT);
-    pixel[1] = clip((base.saturating_add(g_chroma)) >> SHIFT);
-    pixel[2] = clip((base.saturating_add(b_chroma)) >> SHIFT);
-    pixel[3] = 255;
+    let base = luma_term(luma[0]);
+    target[0] = clip((base + r_chroma) >> SHIFT);
+    target[1] = clip((base + g_chroma) >> SHIFT);
+    target[2] = clip((base + b_chroma) >> SHIFT);
+    target[3] = 255;
+    let base = luma_term(luma[1]);
+    target[4] = clip((base + r_chroma) >> SHIFT);
+    target[5] = clip((base + g_chroma) >> SHIFT);
+    target[6] = clip((base + b_chroma) >> SHIFT);
+    target[7] = 255;
 }
 
 /// 由 Cb/Cr 计算每像素共享的色度项（2x2 块内四个像素相同）。
@@ -139,26 +145,33 @@ pub(crate) fn nv12_to_rgba(
     out.clear();
     out.resize(w.saturating_mul(h).saturating_mul(4), 255);
 
+    let row_bytes = w.saturating_mul(4);
     for row in (0..h).step_by(2) {
-        let y0 = row.saturating_mul(y_pitch);
-        let y1 = row.saturating_add(1).saturating_mul(y_pitch);
-        let uv_row = (row / 2).saturating_mul(uv_pitch);
-        for col in (0..w).step_by(2) {
-            let Some((&cb, &cr)) = uv.get(uv_row + col).zip(uv.get(uv_row + col + 1)) else {
-                continue;
-            };
-            let terms = chroma_terms(cb, cr);
-            for (dy, y_row) in [(0usize, y0), (1, y1)] {
-                let Some((&left, &right)) = y.get(y_row + col).zip(y.get(y_row + col + 1)) else {
-                    continue;
-                };
-                let pixel = (row + dy)
-                    .saturating_mul(w)
-                    .saturating_add(col)
-                    .saturating_mul(4);
-                store_rgba(out, pixel, luma_term(left), terms);
-                store_rgba(out, pixel.saturating_add(4), luma_term(right), terms);
-            }
+        let y0_start = row.saturating_mul(y_pitch);
+        let y1_start = row.saturating_add(1).saturating_mul(y_pitch);
+        let uv_start = (row / 2).saturating_mul(uv_pitch);
+        let y0 = &y[y0_start..y0_start + w];
+        let y1 = &y[y1_start..y1_start + w];
+        let uv_row = &uv[uv_start..uv_start + w];
+        let (out0, rest) = out[row.saturating_mul(row_bytes)..].split_at_mut(row_bytes);
+        let out1 = &mut rest[..row_bytes];
+
+        for (((uv, luma0), luma1), (target0, target1)) in uv_row
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(y0.as_chunks::<2>().0)
+            .zip(y1.as_chunks::<2>().0)
+            .zip(
+                out0.as_chunks_mut::<8>()
+                    .0
+                    .iter_mut()
+                    .zip(out1.as_chunks_mut::<8>().0),
+            )
+        {
+            let terms = chroma_terms(uv[0], uv[1]);
+            write_pair(target0, *luma0, terms);
+            write_pair(target1, *luma1, terms);
         }
     }
     Ok(())
@@ -197,31 +210,33 @@ pub(crate) fn planar_to_rgba(
         255,
     );
 
+    let row_bytes = pixel_width.saturating_mul(4);
     for row in (0..pixel_height).step_by(2) {
-        let y0 = row.saturating_mul(y_pitch);
-        let y1 = row.saturating_add(1).saturating_mul(y_pitch);
-        let chroma_row = (row / 2).saturating_mul(chroma_pitch);
-        for col in (0..pixel_width).step_by(2) {
-            let chroma_col = col / 2;
-            let Some((&cb, &cr)) = u_plane
-                .get(chroma_row + chroma_col)
-                .zip(v_plane.get(chroma_row + chroma_col))
-            else {
-                continue;
-            };
+        let y0_start = row.saturating_mul(y_pitch);
+        let y1_start = row.saturating_add(1).saturating_mul(y_pitch);
+        let chroma_start = (row / 2).saturating_mul(chroma_pitch);
+        let y0 = &luma[y0_start..y0_start + pixel_width];
+        let y1 = &luma[y1_start..y1_start + pixel_width];
+        let u_row = &u_plane[chroma_start..chroma_start + chroma_width];
+        let v_row = &v_plane[chroma_start..chroma_start + chroma_width];
+        let (out0, rest) = out[row.saturating_mul(row_bytes)..].split_at_mut(row_bytes);
+        let out1 = &mut rest[..row_bytes];
+
+        for ((((&cb, &cr), luma0), luma1), (target0, target1)) in u_row
+            .iter()
+            .zip(v_row)
+            .zip(y0.as_chunks::<2>().0)
+            .zip(y1.as_chunks::<2>().0)
+            .zip(
+                out0.as_chunks_mut::<8>()
+                    .0
+                    .iter_mut()
+                    .zip(out1.as_chunks_mut::<8>().0),
+            )
+        {
             let terms = chroma_terms(cb, cr);
-            for (dy, y_row) in [(0usize, y0), (1, y1)] {
-                let Some((&left, &right)) = luma.get(y_row + col).zip(luma.get(y_row + col + 1))
-                else {
-                    continue;
-                };
-                let pixel = (row + dy)
-                    .saturating_mul(pixel_width)
-                    .saturating_add(col)
-                    .saturating_mul(4);
-                store_rgba(out, pixel, luma_term(left), terms);
-                store_rgba(out, pixel.saturating_add(4), luma_term(right), terms);
-            }
+            write_pair(target0, *luma0, terms);
+            write_pair(target1, *luma1, terms);
         }
     }
     Ok(())

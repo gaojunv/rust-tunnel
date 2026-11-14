@@ -35,6 +35,8 @@ windows = { version = "0.62", features = [
     "Graphics_DirectX_Direct3D11",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    # ID3D10Multithread：D3D11_CREATE_DEVICE_VIDEO_SUPPORT 要求开启多线程保护
+    "Win32_Graphics_Direct3D10",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -42,6 +44,8 @@ windows = { version = "0.62", features = [
     # Media Foundation：控制器侧 H.264 解码（MSH264DecoderMFT）
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # 探针用 GetProcessTimes 量化软/硬解码的 CPU 时间（wall time 被 CPU 转换掩盖）
+    "Win32_System_Threading",
     "Win32_System_WinRT",
     # WGC 的 interop（IGraphicsCaptureItemInterop::CreateForMonitor）
     "Win32_System_WinRT_Graphics_Capture",
