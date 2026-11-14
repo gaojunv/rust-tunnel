@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// 等待 `HelloAck` 的超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -510,7 +510,7 @@ pub async fn run_controller(
                                     break Err(RemoteError::Platform("画面解码任务已结束".to_owned()));
                                 }
                             }
-                            debug!(?codec, "被控端选定编解码器");
+                            info!(?codec, "编解码协商完成（控制器）");
                         }
                         SessionMessage::RequestKeyframe { .. } => {
                             // 该变体只应由**控制器**发出；收到即说明对端实现异常。

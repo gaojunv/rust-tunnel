@@ -54,7 +54,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, timeout, Instant, MissedTickBehavior};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// 等待 `Hello` 的超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -352,7 +352,7 @@ pub async fn run_controlled(
         SessionFrame::control(SessionMessage::CodecSelect { codec }),
     )
     .await?;
-    debug!(?codec, "被控端已选定编解码器");
+    info!(?codec, "编解码协商完成（被控端）");
 
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
