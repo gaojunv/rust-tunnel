@@ -1,7 +1,7 @@
 //! 托盘图标与菜单（tray-icon + muda）。
 
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::service_watch::IdentityOwner;
 
@@ -165,9 +165,13 @@ pub fn build_tray(allow_remote: bool) -> anyhow::Result<TrayHandle> {
         .with_icon(icon)
         .with_icon_as_template(true)
         .with_menu(Box::new(menu))
+        // 左键直接还原主窗口，右键才弹菜单：托盘常驻应用最自然的操作预期。
+        // 若保持默认 `true`，左键只会弹菜单，用户会觉得「点图标没反应」。
+        .with_menu_on_left_click(false)
         .build()?;
 
-    // 消费未处理的菜单事件（避免堆积）；托盘点击由 muda 统一分发。
+    // 消费未处理的菜单事件（避免堆积）；点击/菜单事件由 tray-icon + muda 的全局
+    // 通道分发，实际抽干者是 `tray_worker` 的独立线程。
     let _ = MenuEvent::receiver();
 
     Ok(TrayHandle {
@@ -306,10 +310,15 @@ pub fn tooltip_text_with_service(
     tooltip_text(status)
 }
 
-/// 轮询 `MenuEvent` 队列，返回待 eframe 侧处理的动作。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 托盘动作（由 [`crate::tray_worker`] 的独立线程消费并执行/转交）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
-    /// 显示主窗口。
+    /// 还原主窗口但**保持当前 Tab**（点托盘图标）。
+    ///
+    /// 与 [`Self::Show`] 分开：用户只是想把窗口叫回来，不该顺手把他正在看的页面
+    /// （比如日志）切走。
+    Restore,
+    /// 显示主窗口并切到状态 Tab（菜单「打开面板…」）。
     Show,
     /// 聚焦设置 Tab。
     Settings,
@@ -337,14 +346,42 @@ impl TrayAction {
             _ => None,
         }
     }
+
+    /// 托盘图标点击 → 动作：左键单击/双击 = 还原主窗口（右键由 muda 弹菜单）。
+    ///
+    /// 只认 `Up`：Windows 会同时发按下与抬起两个事件，认 `Down` 会让一次点击触发两遍。
+    fn from_tray_event(event: &TrayIconEvent) -> Option<Self> {
+        match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => Some(Self::Restore),
+            _ => None,
+        }
+    }
 }
 
-/// 抽干一次 `MenuEvent` 队列。
+/// 抽干一次托盘事件队列（菜单动作 + 图标点击）。
+///
+/// **必须由 [`crate::tray_worker`] 的独立线程调用**，不能在 `eframe::App::update` 里调用：
+/// 关闭窗口后原生窗口被隐藏，而 Windows 只给**可见**窗口投递 `WM_PAINT`，eframe 的
+/// `update` 因此不再运行——在 `update` 里轮询会让整个托盘在窗口隐藏后彻底失灵
+/// （「点托盘没反应、『退出』也点了没用」）。
 #[must_use]
-pub fn poll_menu_actions() -> Vec<TrayAction> {
+pub fn poll_tray_actions() -> Vec<TrayAction> {
     let mut out = Vec::new();
     while let Ok(ev) = MenuEvent::receiver().try_recv() {
         if let Some(a) = TrayAction::from_menu_id(ev.id().0.as_str()) {
+            out.push(a);
+        }
+    }
+    while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+        if let Some(a) = TrayAction::from_tray_event(&ev) {
             out.push(a);
         }
     }
@@ -451,11 +488,7 @@ mod tests {
             (ids::QUIT, TrayAction::Quit),
         ];
         for (id, expected) in cases {
-            assert_eq!(
-                TrayAction::from_menu_id(id),
-                Some(expected.clone()),
-                "菜单项 {id}"
-            );
+            assert_eq!(TrayAction::from_menu_id(id), Some(*expected), "菜单项 {id}");
         }
         // 表必须覆盖 `ids` 的**全部**常量（现在是 6 个）——加常量却漏测时这里先炸。
         assert_eq!(cases.len(), 6);
@@ -467,5 +500,51 @@ mod tests {
         assert_eq!(TrayAction::from_menu_id("server"), None);
         // 真正的未知 id。
         assert_eq!(TrayAction::from_menu_id("nope"), None);
+    }
+
+    fn click(button: MouseButton, state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: tray_icon::TrayIconId::new("test"),
+            position: tray_icon::dpi::PhysicalPosition::new(0.0, 0.0),
+            rect: tray_icon::Rect::default(),
+            button,
+            button_state: state,
+        }
+    }
+
+    /// 左键抬起/双击 = 还原窗口；按下事件必须**忽略**（否则一次点击触发两遍），
+    /// 右键不能抢走菜单。
+    #[test]
+    fn left_click_restores_and_right_click_does_not() {
+        assert_eq!(
+            TrayAction::from_tray_event(&click(MouseButton::Left, MouseButtonState::Up)),
+            Some(TrayAction::Restore)
+        );
+        assert_eq!(
+            TrayAction::from_tray_event(&click(MouseButton::Left, MouseButtonState::Down)),
+            None
+        );
+        assert_eq!(
+            TrayAction::from_tray_event(&click(MouseButton::Right, MouseButtonState::Up)),
+            None
+        );
+        assert_eq!(
+            TrayAction::from_tray_event(&TrayIconEvent::DoubleClick {
+                id: tray_icon::TrayIconId::new("test"),
+                position: tray_icon::dpi::PhysicalPosition::new(0.0, 0.0),
+                rect: tray_icon::Rect::default(),
+                button: MouseButton::Left,
+            }),
+            Some(TrayAction::Restore)
+        );
+        // 鼠标进出/移动不能触发窗口操作。
+        assert_eq!(
+            TrayAction::from_tray_event(&TrayIconEvent::Enter {
+                id: tray_icon::TrayIconId::new("test"),
+                position: tray_icon::dpi::PhysicalPosition::new(0.0, 0.0),
+                rect: tray_icon::Rect::default(),
+            }),
+            None
+        );
     }
 }

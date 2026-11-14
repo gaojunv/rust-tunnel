@@ -1,6 +1,7 @@
 //! GUI 专属偏好持久化（gui.toml，与 client 配置同目录、互不干扰）。
 
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 
 use rust_tunnel_remote::ApprovalPolicy;
 
@@ -181,11 +182,36 @@ pub fn load() -> GuiPrefs {
     }
 }
 
+/// 串行化 `gui.toml` 的写入。
+///
+/// GUI 线程（主题/展示档位）与托盘事件线程（窗口隐藏时的被控开关）都会写同一个文件，
+/// 且 `save` 用的是固定名字的临时文件 + rename——两处并发写会互相截断。
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
 /// 原子写入 GUI 偏好（临时文件 + rename，避免崩溃写半截）。
 ///
 /// # Errors
 /// 当序列化或文件写入失败时返回 `Err`。
 pub fn save(prefs: &GuiPrefs) -> Result<(), config_store::StoreError> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    save_unlocked(prefs)
+}
+
+/// 托盘线程在**窗口隐藏时**直接翻转「允许被远程控制」并落盘。
+///
+/// 此时 `update` 不会运行（见 `tray_worker` 的模块文档），所以不能等 GUI 侧来写。
+/// 先 `load` 再 `save`：`load` 可能触发一次性迁移并自行落盘，那时还不能持有锁，
+/// 故两段式（`save` 内部才加锁）而不是全程持锁。
+///
+/// # Errors
+/// 当偏好文件读取后的序列化或写入失败时返回 `Err`。
+pub fn update_allow_remote(on: bool) -> Result<(), config_store::StoreError> {
+    let mut prefs = load();
+    prefs.allow_remote = on;
+    save(&prefs)
+}
+
+fn save_unlocked(prefs: &GuiPrefs) -> Result<(), config_store::StoreError> {
     let p = path();
     let toml_str =
         toml::to_string(prefs).map_err(|e| config_store::StoreError::Save(e.to_string()))?;

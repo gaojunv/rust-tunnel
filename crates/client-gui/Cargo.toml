@@ -43,6 +43,9 @@ egui = "0.31"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 tray-icon = { version = "0.19" }
 muda = "0.15"
+# 从 eframe 的 `CreationContext` 取出原生窗口句柄（HWND）。托盘线程要靠它把隐藏的
+# 主窗口显示出来——隐藏窗口收不到 WM_PAINT，eframe 不再产生帧（见 `tray_worker`）。
+raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # 远程控制：截屏与输入注入。两者的平台差异都在各自 crate 内部 cfg 处理，
 # 故不需要本文件再按 target 门控（区别于下方的 keyring）。
@@ -76,9 +79,13 @@ rust-tunnel-win-video = { path = "../win-video" }
 # 与主线程 STA 占位（`OleInitialize`，避免 winit 在 MTA 线程上 panic）。
 # workspace 的 windows-sys 清单不含这两个，这里按需追加 feature（feature 是叠加的）。
 windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
     "Win32_UI_HiDpi",
     "Win32_System_Ole",
+    # 托盘线程还原隐藏窗口：ShowWindow / SetForegroundWindow / IsWindowVisible，
+    # 以及前台锁失败时的 AttachThreadInput（System_Threading）。
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
     # `timeBeginPeriod(1)`：把定时器粒度从 15.6 ms 降到 1 ms，避免 MFT/WGC 的
     # 短 sleep 轮询被放大（见 main.rs）。
     "Win32_Media",

@@ -21,6 +21,7 @@ mod remote;
 mod service_ui;
 mod service_watch;
 mod tray;
+mod tray_worker;
 mod ui;
 
 use std::path::PathBuf;
@@ -52,6 +53,9 @@ struct GuiApp {
     selected_tab: usize,
     /// 托盘句柄（保持 `TrayIcon` 生命周期，随窗口同生共死）。
     tray: Option<tray::TrayHandle>,
+    /// 托盘事件线程与 GUI 之间的桥：托盘线程负责窗口级操作，这里每帧取走它留给
+    /// UI 的结果（切 Tab、被控开关镜像）。
+    tray_bridge: Arc<tray_worker::TrayBridge>,
     /// 上次已写入托盘的文案签名（首行/服务器行/tooltip/服务行），逐字段比较避免每帧写托盘。
     last_tray_texts: Option<(String, String, String, String)>,
     /// GUI 偏好（主题等），切换时落盘 gui.toml。
@@ -73,6 +77,7 @@ impl GuiApp {
     fn new(
         app_state: Arc<app::AppState>,
         tray: Option<tray::TrayHandle>,
+        tray_bridge: Arc<tray_worker::TrayBridge>,
         prefs: prefs::GuiPrefs,
     ) -> Self {
         let settings = app_state
@@ -86,6 +91,7 @@ impl GuiApp {
             settings,
             selected_tab: 0,
             tray,
+            tray_bridge,
             last_tray_texts: None,
             prefs,
             remote_view,
@@ -103,6 +109,7 @@ impl GuiApp {
         if let Some(manager) = self.app_state.remote() {
             manager.set_enabled(on);
         }
+        self.tray_bridge.set_allow_remote(on);
         if let Some(handle) = self.tray.as_ref() {
             handle.allow_remote_item.set_checked(on);
         }
@@ -161,50 +168,28 @@ impl GuiApp {
         true
     }
 
-    /// 消费托盘菜单动作队列并执行对应窗口/状态操作。
-    fn drain_tray_actions(&mut self, ctx: &egui::Context) {
-        for action in tray::poll_menu_actions() {
-            match action {
-                tray::TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.selected_tab = 0;
-                }
-                tray::TrayAction::Settings => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    // 「设置」Tab 下标（见 show_tabs 的标签数组：状态/映射/远程/设置/日志）。
-                    self.selected_tab = 3;
-                }
-                tray::TrayAction::Service => {
-                    // 与 `Settings` 同落地（设置就是那个 Tab）；菜单里分成两项只为让语义对上
-                    // 用户意图——「服务设置…」直接把用户带到无人值守被控端那一节。
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.selected_tab = 3;
-                }
-                tray::TrayAction::Reconnect => {
-                    self.app_state
-                        .reconnect_requested
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                tray::TrayAction::ToggleAllowRemote => {
-                    // 从 muda 读翻转后的新状态（不维护镜像，见 TrayHandle 文档）。
-                    let enabled = self
-                        .tray
-                        .as_ref()
-                        .is_some_and(|h| h.allow_remote_item.is_checked());
-                    // 收敛入口：同步引擎（set_enabled）+ 偏好文件。
-                    self.apply_allow_remote(enabled);
-                }
-                tray::TrayAction::Quit => {
-                    self.app_state
-                        .should_exit
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
+    /// 取走托盘线程留给 UI 的 Tab 切换请求。
+    ///
+    /// 托盘事件本身由 [`tray_worker`] 的独立线程消费——**不能**在这里轮询：窗口隐藏后
+    /// 没有帧，这份 `update` 根本不会运行（见该模块文档）。
+    fn apply_pending_tray_tab(&mut self) {
+        if let Some(tab) = self.tray_bridge.take_pending_tab() {
+            // 上限保护：桥里的值只由本 crate 写入，越界说明有人加了 Tab 却漏改这里。
+            self.selected_tab = tab.min(4);
         }
+    }
+
+    /// 把托盘勾选态（**唯一事实来源**，见 [`tray::TrayHandle`]）回写到内存偏好与桥镜像。
+    ///
+    /// 托盘线程在窗口隐藏时会自己翻转镜像并落盘，这里每帧用真实勾选态校正内存副本，
+    /// 否则之后 `sync_display_prefs` 落盘时会拿旧值把 `gui.toml` 覆盖回去。
+    fn sync_allow_remote_from_tray(&mut self) {
+        let Some(handle) = self.tray.as_ref() else {
+            return;
+        };
+        let on = handle.allow_remote_item.is_checked();
+        self.tray_bridge.set_allow_remote(on);
+        self.prefs.allow_remote = on;
     }
 
     /// 托盘状态菜单/Tooltip 随连接态刷新（逐字段比较，仅写入变化字段）。
@@ -340,7 +325,8 @@ impl eframe::App for GuiApp {
         if self.intercept_close(ctx) {
             return;
         }
-        self.drain_tray_actions(ctx);
+        self.apply_pending_tray_tab();
+        self.sync_allow_remote_from_tray();
         // 抽干服务操作的结果通道：一次 --install 要跑约二十秒，结果只能在后续帧里看到。
         self.service_ui.poll();
 
@@ -1157,6 +1143,12 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         }
     };
 
+    // 托盘事件由独立线程消费：关窗后原生窗口被隐藏，Windows 不再投递 WM_PAINT，
+    // eframe 的 `update` 随之停摆——在那之前，托盘完全依赖 `update` 轮询菜单事件，
+    // 于是「点托盘没反应、『退出』也没反应」（见 `tray_worker` 模块文档）。
+    let tray_bridge = Arc::new(tray_worker::TrayBridge::new(prefs.allow_remote));
+    tray_worker::spawn(Arc::clone(&tray_bridge), Arc::clone(&app_state));
+
     let viewport = {
         let mut vp = egui::ViewportBuilder::default()
             .with_inner_size([480.0, 520.0])
@@ -1195,7 +1187,9 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         Box::new(move |cc| {
             fonts::setup_fonts(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx, prefs.theme);
-            Ok(Box::new(GuiApp::new(app_state, tray, prefs)))
+            // 把 HWND 与 egui 上下文交给托盘线程：隐藏窗口的还原必须走原生调用。
+            tray_bridge.attach(cc);
+            Ok(Box::new(GuiApp::new(app_state, tray, tray_bridge, prefs)))
         }),
     );
 

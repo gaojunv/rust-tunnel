@@ -8459,6 +8459,7 @@ dependencies = [
  "keyring",
  "muda 0.15.3",
  "notify-rust",
+ "raw-window-handle",
  "rust-tunnel-client",
  "rust-tunnel-common",
  "rust-tunnel-remote",
