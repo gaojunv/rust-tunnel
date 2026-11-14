@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
-use rust_tunnel_remote::ApprovalPolicy;
+use rust_tunnel_remote::{ApprovalPolicy, QualityPreset};
 
 use crate::config_store;
 use crate::remote::{ViewScale, WindowSize};
@@ -138,6 +138,11 @@ pub struct GuiPrefs {
     /// 会话建立时自动下发一次。
     #[serde(default = "default_remote_frame_rate")]
     pub remote_frame_rate: u8,
+    /// 远程控制画质档位（流畅 / 均衡 / 高清；默认 Balanced）。
+    ///
+    /// 档位是**上限**，实际码率/帧率仍由 QoS 闭环在上限之下浮动。会话建立时自动下发一次。
+    #[serde(default)]
+    pub remote_quality: QualityPreset,
 }
 
 impl Default for GuiPrefs {
@@ -156,6 +161,7 @@ impl Default for GuiPrefs {
             remote_auto_reconnect: false,
             remote_stats_overlay: false,
             remote_frame_rate: default_remote_frame_rate(),
+            remote_quality: QualityPreset::default(),
         }
     }
 }
@@ -364,6 +370,27 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert_eq!(reparsed.remote_frame_rate, 60);
+    }
+
+    /// 画质档位的缺省与往返：与帧率同理，旧配置缺键落到 `Balanced`，用户选择跨重启保留。
+    #[test]
+    fn quality_defaults_to_balanced_and_survives_roundtrip() {
+        assert_eq!(
+            GuiPrefs::default().remote_quality,
+            QualityPreset::Balanced,
+            "新配置默认均衡档"
+        );
+        // 缺失该键的旧配置也落到 Balanced（serde default）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert_eq!(prefs.remote_quality, QualityPreset::Balanced);
+        // 往返保留用户选择。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_quality: QualityPreset::Hd,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert_eq!(reparsed.remote_quality, QualityPreset::Hd);
     }
 
     #[test]

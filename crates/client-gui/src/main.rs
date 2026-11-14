@@ -319,6 +319,10 @@ impl GuiApp {
             self.prefs.remote_frame_rate = view.frame_rate;
             changed = true;
         }
+        if self.prefs.remote_quality != view.quality {
+            self.prefs.remote_quality = view.quality;
+            changed = true;
+        }
         drop(view);
         if changed {
             if let Err(e) = prefs::save(&self.prefs) {
