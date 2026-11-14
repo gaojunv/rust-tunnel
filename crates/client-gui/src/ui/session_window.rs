@@ -27,10 +27,9 @@ use rust_tunnel_remote::{
     ActiveSessionInfo, QualityPreset, RemoteManager, RemoteUiState, SessionRole, TransportPath,
 };
 
+use super::{theme, widgets};
 use crate::remote::nv12_renderer::Nv12Callback;
-use crate::remote::{
-    display_size, FramePaint, RemoteView, ViewScale, WindowSize, MIN_INNER, TOOLBAR_FALLBACK_HEIGHT,
-};
+use crate::remote::{display_size, FramePaint, RemoteView, ViewScale, WindowSize, MIN_INNER};
 use crate::ui::remote::state_label;
 
 /// 会话窗口的 viewport ID（父窗口定位子窗口、子窗口发给自身都用它）。
@@ -45,6 +44,13 @@ const TOOLBAR_IDLE: Duration = Duration::from_secs(3);
 
 /// 指针进入窗口上缘这条带内即视为「想看工具条」（工具条隐藏时的手动召回）。
 const TOOLBAR_HOT: f32 = 6.0;
+
+/// 首帧尚未实测到工具条矩形时的兜底热区高度（逻辑点）。
+///
+/// 工具条现在是**浮层**、不再参与布局，因此这个值只用于「指针是否停在工具条上」的几何判据；
+/// 实测矩形一到（见 [`RemoteView::toolbar_rect`]）就不再使用它。它也不再承担任何占位职责——
+/// 浮层不影响中央面板的可用区域，画面不会因工具条隐现而位移。
+const TOOLBAR_FALLBACK_HEIGHT: f32 = 48.0;
 
 /// 取会话窗口的锁（中毒时取回内部值：一个视图锁中毒不该拖垮整个 UI）。
 fn lock(view: &Arc<Mutex<RemoteView>>) -> MutexGuard<'_, RemoteView> {
@@ -69,7 +75,11 @@ pub fn show(ctx: &egui::Context, view: &Arc<Mutex<RemoteView>>, manager: &Arc<Re
     else {
         return; // 非控制器会话（或无会话）：不注册 viewport
     };
-    let title = format!("远程控制 — {} · {}", active.peer_name, state_label(active.state));
+    let title = format!(
+        "远程控制 — {} · {}",
+        active.peer_name,
+        state_label(active.state)
+    );
 
     // 锁内取值算好 builder 参数，**锁外**再注册（见模块文档：持锁注册会自死锁）。工具条自动隐藏
     // 开关也在这里读——它由工具条上的开关改动（写在回调里），必须在锁内取到最新镜像。
@@ -141,10 +151,27 @@ fn session_viewport_ui(
     handle_shortcuts(ctx, &mut v);
     update_toolbar_visibility(ctx, &mut v, autohide);
 
+    // 首帧前把默认显示器同步给引擎：输入坐标按**所选显示器**的尺寸映射（见
+    // `RemoteView::input_target_size`），而 `reset_session` 会把 `selected_display` 清成 `None`。
+    // 选中前它回退到纹理尺寸——「流畅」档整体缩放过半，鼠标落点会明显偏移。旧工具条靠每帧渲染
+    // `display_selector` 顺手同步单显示器；现在选择器进了设置弹层，必须在这里补上。
+    if v.selected_display().is_none() {
+        let displays = v.displays();
+        if let Some(display) = displays.first() {
+            v.set_selected_display(display.id, manager);
+        }
+    }
+
     // 本帧捕获判据：先清零，`capture_input` 真正运行时再置 true（见 `RemoteView::capture_this_frame`）。
     v.capture_this_frame = false;
     let embedded = matches!(class, egui::ViewportClass::Embedded);
+    // 会话视口的样式覆盖：必须在**本视口的第一次绘制之前**装上，且守卫活到回调结束（析构时恢复
+    // 主窗口样式）。放在 `render` 前而不是回调开头，是因为前面的逻辑只读视图状态、不画任何东西。
+    let _style = theme::scoped_session_style(ctx);
     render(&mut v, ctx, manager, active, &state, embedded);
+    // 设置弹层在画面**之后**画：它要以浮层身份盖在画面与工具条之上，并吃掉本帧的 Esc
+    // （`Modal::should_close` 会消费它，故 `handle_shortcuts` 在弹层打开时不碰 Esc）。
+    settings_modal(ctx, &mut v, manager, &state);
 
     // 本帧没捕获到（模式非完全控制 / 画面还没到 / 独占组合键刚被拦下），或窗口失焦/最小化 →
     // 补发一次输入抬起，避免远端残留按下的键。`release_all` 幂等，多调用无副作用。
@@ -161,11 +188,14 @@ fn session_viewport_ui(
 
 /// 本端快捷键：`F11` 切全屏；全屏时 `Esc` 退出全屏（非全屏的 `Esc` 照常透传给远端，见
 /// [`RemoteView::capture_input`] 对事件流的过滤）。
+///
+/// 设置弹层打开时**不处理** Esc：那是「关掉弹层」的语义，由 `egui::Modal::should_close` 自己
+/// 消费（它 `consume_key` 掉这一帧的 Esc），本端若同时退出全屏，用户按一次 Esc 会连做两件事。
 fn handle_shortcuts(ctx: &egui::Context, v: &mut RemoteView) {
     if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
         v.fullscreen = !v.fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(v.fullscreen));
-    } else if v.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    } else if v.fullscreen && !v.settings_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         // 刻意**不**在这里把 `v.fullscreen` 改成 false：本帧还要靠它让 `capture_input` 吞掉这次
         // Esc（否则它会透传给远端）。下一帧 `vp.fullscreen` 变 false 时自然同步。
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -173,10 +203,10 @@ fn handle_shortcuts(ctx: &egui::Context, v: &mut RemoteView) {
 }
 
 /// 工具条自动隐藏：指针移动、位于工具条**实测矩形**内、或指针按下时显示并重置计时；静止超时后隐藏。
+/// 设置弹层打开期间**恒可见**——否则用户改完设置一抬头，工具条已经消失了。
 ///
-/// 热区判据分两态：**可见时**用工具条面板上一帧的实测矩形（[`RemoteView::toolbar_rect`]，
-/// 覆盖 `horizontal_wrapped` 折行后的第二、三行——否则指针停在第二行按钮上时判据为 false，
-/// 工具条会从指针底下消失）；**隐藏时**只认上缘窄带 [`TOOLBAR_HOT`]（移到窗口上缘召回）。
+/// 热区判据分两态：**可见时**用工具条浮层上一帧的实测矩形（[`RemoteView::toolbar_rect`]）；
+/// **隐藏时**只认上缘窄带 [`TOOLBAR_HOT`]（移到窗口上缘召回）。
 ///
 /// # 为什么用上一帧的矩形
 ///
@@ -200,6 +230,7 @@ fn update_toolbar_visibility(ctx: &egui::Context, v: &mut RemoteView, autohide: 
         moved,
         down,
         idle: now.saturating_duration_since(v.last_pointer_move),
+        modal_open: v.settings_open,
     });
     if decision.reset_activity {
         v.last_pointer_move = now;
@@ -228,6 +259,8 @@ struct ToolbarInputs {
     down: bool,
     /// 距上次指针活动的空闲时长。
     idle: Duration,
+    /// 设置弹层是否打开（打开时工具条恒可见，见 [`decide_toolbar_visibility`]）。
+    modal_open: bool,
 }
 
 /// 决策结果。
@@ -243,6 +276,14 @@ struct ToolbarDecision {
 /// 把输入摊平成 [`ToolbarInputs`] 后，三态（常驻 / 指针在工具条上 / 空闲超时）都能用表格断言
 /// 钉死（见本模块单测）——这正是缺陷「工具条莫名消失」的机械锁。
 fn decide_toolbar_visibility(i: ToolbarInputs) -> ToolbarDecision {
+    if i.modal_open {
+        // 设置弹层打开：工具条必须留在原地（它是弹层的召回入口，也是「当前档位」的读数）。
+        // 同时重置活动计时——用户关掉弹层后，工具条还该完整停留一个 `TOOLBAR_IDLE` 窗口。
+        return ToolbarDecision {
+            visible: true,
+            reset_activity: true,
+        };
+    }
     if !i.autohide {
         // 关闭自动隐藏：恒可见，且无需重置计时。
         return ToolbarDecision {
@@ -286,19 +327,14 @@ fn toolbar_fallback_rect() -> egui::Rect {
     )
 }
 
-/// 工具条面板**隐藏**时要用缓存高度占位（返回 `Some(h)`）；可见时返回 `None`（高度由内容实测）。
-///
-/// # 为什么隐藏时也必须占位（缺陷「隐现挪动/缩放画面」的机械锁）
-///
-/// `TopBottomPanel` 注册时会从中央区域扣除自身高度。过去隐藏时整条面板不注册（占位 = 0），
-/// 中央区域因此变高，`scene()` 用新的 `available_size()` 重算画面——`Fit` 档画面**尺寸改变**、
-/// 固定档画面**原点上移**，隐现瞬间的点击还会落到远端错误坐标。本函数保证隐藏分支**永不**返回
-/// `Some(0.0)`：占位高度恒为缓存高度，于是两种可见性下中央区域完全一致。
-fn toolbar_reserve(cached_height: f32, visible: bool) -> Option<f32> {
-    (!visible).then_some(cached_height)
-}
-
 /// 渲染窗口主体。`embedded` 分支（集成不支持多窗口时的兜底）退化为一个 egui 窗口承载同样内容。
+///
+/// # 浮层，而不是面板（缺陷「隐现挪动/缩放画面」的根除）
+///
+/// 工具条、重连提示、统计角标一律是 `egui::Area`/`egui::Window` 浮层，**不参与布局**：画面矩形
+/// 只由窗口尺寸与缩放档位决定。于是工具条隐现既不改变 `Fit` 档的画面尺寸，也不上移固定档的画面
+/// 原点——过去 `TopBottomPanel` 一注册就从中央区域扣掉自身高度，隐藏时占位为 0，画面会跳动；
+/// 那套「缓存高度常驻占位」的机制随浮层一并删除了。**别再改回面板**。
 fn render(
     v: &mut RemoteView,
     ctx: &egui::Context,
@@ -313,12 +349,17 @@ fn render(
             .default_size([900.0, 620.0])
             .show(ctx, |ui| {
                 if v.toolbar_visible {
-                    toolbar(ui, v, manager, state);
-                } else {
-                    // 与 deferred 路径同理：隐藏也占位，画面不因工具条隐现而上下位移。
-                    ui.add_space(v.toolbar_height);
+                    let bar = theme::toolbar_frame(ui.style()).show(ui, |ui| {
+                        toolbar_contents(ui, v, manager, state, active);
+                    });
+                    // 实测矩形供**下一帧**的热区判据用（见 `update_toolbar_visibility`）。
+                    v.toolbar_rect = Some(bar.response.rect);
                 }
-                reconnect_strip(ui, v, manager);
+                if v.reconnect_note.is_some() {
+                    theme::card_frame(ui.style()).show(ui, |ui| {
+                        reconnect_strip(ui, v, manager);
+                    });
+                }
                 if v.side_panel_open {
                     side_contents(ui, v, manager, state);
                 }
@@ -327,116 +368,144 @@ fn render(
         return;
     }
 
-    // 工具条**常驻注册**（缺陷「隐现挪动/缩放画面」的修复）：无论可见与否都注册这个面板。
-    // `TopBottomPanel` 注册时会从中央区域扣除自身高度；过去隐藏时整条 `.show()` 都不执行，
-    // 中央区域于是变高、上边缘上移，`scene()` 用新的 `available_size()` 重算画面（`Fit` 档尺寸变、
-    // 固定档原点上移），隐现瞬间的点击还会落到远端错误坐标。常驻后隐藏时面板内不画内容、只用
-    // 缓存高度占位，`CentralPanel` 的可用矩形恒定。
-    let reserve = toolbar_reserve(v.toolbar_height, v.toolbar_visible);
-    let mut content_height: Option<f32> = None;
-    let panel = egui::TopBottomPanel::top("session_toolbar").show(ctx, |ui| {
-        if let Some(height) = reserve {
-            // 隐藏：不画内容，但占住缓存高度（`set_min_height` 作用在**内容**上，故缓存的是内容高度）。
-            ui.set_min_height(height);
-        } else {
-            toolbar(ui, v, manager, state);
-            // 记下**内容**高度（不含面板 frame 内边距）：隐藏时以同一个值 `set_min_height`，
-            // 面板总高才与可见时严格一致。
-            content_height = Some(ui.min_rect().height());
-        }
-    });
-    // 实测矩形供**下一帧**的热区判据用（egui 立即模式，见 `update_toolbar_visibility`）。
-    v.toolbar_rect = Some(panel.response.rect);
-    // 只在测得正值时覆盖缓存高度：退化的 0 会让隐藏时占位也为 0，把缺陷放回来。
-    if let Some(height) = content_height.filter(|h| *h > 0.0) {
-        v.toolbar_height = height;
+    // 画面先铺满整块中央区域（浮层不影响它的可用矩形）。
+    egui::CentralPanel::default()
+        .frame(theme::scene_frame(&ctx.style()))
+        .show(ctx, |ui| scene(ui, v, manager, active));
+
+    if v.toolbar_visible {
+        // 浮在画面上缘居中：圆角半透明卡片，只留「状态 + 质量 + 当前档位 + 五个动作」。
+        let bar = egui::Area::new(egui::Id::new("session_toolbar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
+            .show(ctx, |ui| {
+                theme::toolbar_frame(ui.style()).show(ui, |ui| {
+                    toolbar_contents(ui, v, manager, state, active);
+                });
+            });
+        v.toolbar_rect = Some(bar.response.rect);
+    } else {
+        // 隐藏时只在上缘留一条 28×3 的细提示（不可交互）：告诉用户工具条还在、上缘可召回，
+        // 但 3px 的高度不会挡住画面，也不会吃掉点击。
+        let p = theme::palette(&ctx.style());
+        egui::Area::new(egui::Id::new("session_toolbar_hint"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 4.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 3.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, egui::CornerRadius::same(2), p.stroke_strong);
+            });
     }
+
+    // 重连提示浮在工具条下方（同为浮层：它出现/消失也不该挪动画面）。
     if v.reconnect_note.is_some() {
-        egui::TopBottomPanel::top("session_reconnect").show(ctx, |ui| {
-            reconnect_strip(ui, v, manager);
-        });
+        egui::Area::new(egui::Id::new("session_reconnect"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
+            .show(ctx, |ui| {
+                theme::card_frame(ui.style()).show(ui, |ui| {
+                    reconnect_strip(ui, v, manager);
+                });
+            });
     }
+
     if v.side_panel_open {
+        // 侧栏是**面板**（而不是浮层）：它确实要占据右侧一条，画面随之变窄——这是用户主动展开的
+        // 结果，不是工具条那种隐现。标题栏自带关闭按钮，避免用户只能再点一次工具条上的「文件」。
         egui::SidePanel::right("session_side")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(300.0)
+            .frame(theme::card_frame(&ctx.style()))
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("文件与剪贴板").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("关闭").clicked() {
+                            v.side_panel_open = false;
+                        }
+                    });
+                });
+                ui.separator();
                 side_contents(ui, v, manager, state);
             });
     }
-    egui::CentralPanel::default().show(ctx, |ui| {
-        scene(ui, v, manager, active);
-    });
+
     if v.stats_overlay {
         stats_overlay(ctx, v, active, state);
     }
 }
 
-/// 顶部工具条：连接质量常显 + 显示器 / 画质 / 窗口尺寸 / 缩放 / 全屏 / 独占键盘 / 剪贴板同步 /
-/// 测延迟 / 统计角标 / 侧栏 / 最小化窗口 / 中断会话。
-fn toolbar(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, state: &RemoteUiState) {
-    ui.horizontal_wrapped(|ui| {
-        quality_indicator(ui, state);
-        if let Some(active) = state.active.as_ref() {
-            ui.label(RichText::new(format!("· {}", state_label(active.state))).weak().small());
+/// 浮动工具条的内容（`ui` 位于 `theme::toolbar_frame` 之内）。
+///
+/// 只放**一眼要看**的东西与五个动作；所有「进去改一次」的设置都搬到 [`settings_modal`]——
+/// 工具条曾经塞满选择器，窄窗口下折行成三排，把画面压掉一大块。
+fn toolbar_contents(
+    ui: &mut Ui,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+    active: &ActiveSessionInfo,
+) {
+    let p = theme::palette(ui.style());
+    ui.horizontal(|ui| {
+        // 状态点：延迟已知时按延迟上色（一眼看出链路好坏），否则用弱色。
+        let dot = state.latency_ms.map_or(p.text_weak, latency_color);
+        widgets::status_dot(ui, dot, state_label(active.state));
+
+        match state.latency_ms {
+            Some(ms) => widgets::pill(ui, &format!("{ms} ms"), latency_color(ms), p.accent_dim),
+            None => {
+                ui.label(RichText::new("延迟 —").weak().small());
+            }
         }
+        if let Some(path) = state.transport {
+            ui.label(RichText::new(transport_label(path)).weak().small());
+        }
+
         ui.separator();
 
-        display_selector(ui, v, manager);
-        quality_selector(ui, manager, state.quality);
-        frame_rate_selector(ui, v, manager);
-        window_size_selector(ui, v);
-        scale_selector(ui, v);
-        ui.separator();
+        // 当前档位摘要，同时是设置入口（点它和点「设置」等价）。
+        // 用无框按钮：它读起来像一行标签，但整条都可点。
+        let summary = format!("{} · {} fps", v.quality.label(), v.frame_rate());
+        if ui
+            .add(
+                egui::Button::new(RichText::new(summary).color(p.text_weak).size(12.5))
+                    .frame(false),
+            )
+            .on_hover_text("打开会话设置")
+            .clicked()
+        {
+            v.settings_open = true;
+        }
 
+        // 动作区**从左到右**排：`egui::Area` 按内容自适应宽度，`right_to_left` 会把第一个控件
+        // 推到「可用宽度」的右缘（Area 的可用宽度是整个视口），整张卡片会被撑到全屏宽。
+        // 断开放在最后：破坏性操作不该是手指落下的第一站。
+        ui.add_space(4.0);
+        if widgets::toolbar_button(ui, "设置", "画质 / 帧率 / 显示器 / 缩放 / 窗口尺寸 / 交互")
+            .clicked()
+        {
+            v.settings_open = true;
+        }
+        if ui
+            .selectable_label(v.side_panel_open, "文件")
+            .on_hover_text("文件传输与剪贴板")
+            .clicked()
+        {
+            v.side_panel_open = !v.side_panel_open;
+        }
         if ui
             .selectable_label(v.fullscreen, "全屏")
             .on_hover_text("切换全屏（F11；全屏时 Esc 退出）")
             .clicked()
         {
             v.fullscreen = !v.fullscreen;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(v.fullscreen));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(v.fullscreen));
         }
-        if ui
-            .selectable_label(v.exclusive_keyboard, "独占键盘")
-            .on_hover_text("键盘全部发给远端；Ctrl/Cmd+Alt+Shift+K 退出")
-            .clicked()
-        {
-            v.exclusive_keyboard = !v.exclusive_keyboard;
-        }
-        if ui
-            .selectable_label(v.clipboard_sync_enabled, "剪贴板同步")
-            .on_hover_text("自动在本机与远端之间同步剪贴板文本")
-            .clicked()
-        {
-            v.clipboard_sync_enabled = !v.clipboard_sync_enabled;
-            if !v.clipboard_sync_enabled {
-                v.clipboard_sync = None;
-            }
-        }
-        if ui.button("测延迟").on_hover_text("立刻探测一次往返延迟").clicked() {
-            manager.ping();
-        }
-        if ui.selectable_label(v.stats_overlay, "统计角标").clicked() {
-            v.stats_overlay = !v.stats_overlay;
-        }
-        if ui.selectable_label(v.side_panel_open, "侧栏").clicked() {
-            v.side_panel_open = !v.side_panel_open;
-        }
-        // 自动隐藏开关：这是**唯一**能让用户关掉「工具条偶尔消失」的入口（偏好默认值改了也只对
-        // 全新配置生效——老用户的 gui.toml 早已把旧默认钉死）。改动写进运行时镜像，由父窗口的
-        // `sync_display_prefs` 回写 gui.toml。
-        if ui
-            .selectable_label(v.toolbar_autohide, "自动隐藏")
-            .on_hover_text("指针静止 3 秒后隐藏工具条（移到窗口上缘召回）；关闭后工具条常驻")
-            .clicked()
-        {
-            v.toolbar_autohide = !v.toolbar_autohide;
-        }
-        ui.separator();
-        if ui
-            .button("最小化窗口")
-            .on_hover_text("关闭窗口但保留会话；在「远程」Tab 可召回")
+        if widgets::toolbar_button(ui, "最小化", "关闭窗口但保留会话；在「远程」Tab 可召回")
             .clicked()
         {
             // 置 false 后父窗口就不再注册这个 viewport，回调从此不再跑——必须**当场**补发一次
@@ -444,121 +513,226 @@ fn toolbar(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, state:
             v.release_input(manager);
             v.window_open = false;
         }
-        if ui.button("中断会话").clicked() {
+        if widgets::danger_button(ui, "断开", "结束本次远程会话").clicked() {
             manager.abort_active();
         }
     });
 }
 
-/// 连接质量：延迟（按阈值上色）与数据面路径，工具条常显。
-fn quality_indicator(ui: &mut Ui, state: &RemoteUiState) {
-    match state.latency_ms {
-        Some(ms) => {
-            ui.colored_label(latency_color(ms), RichText::new(format!("{ms} ms")).strong());
-        }
-        None => {
-            ui.label(RichText::new("延迟 —").weak());
-        }
+/// 会话设置弹层：旧工具条上所有「进去改一次」的项都在这里。
+///
+/// 用 `egui::Modal`（而非自绘浮窗）是为了让输入天然被隔断：模态层铺满整屏并吃掉背景点击，
+/// [`RemoteView::capture_input`] 又在 `settings_open` 时直接返回——于是弹层里的每一次点击与
+/// 按键都不会被注入远端（把 Ctrl+A 之类的本地操作发给远端是灾难）。关掉弹层的那一次指针活动
+/// 会重置自动隐藏计时，否则用户改完设置、手没动，工具条会在松手 3 秒后立刻消失。
+fn settings_modal(
+    ctx: &egui::Context,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+) {
+    if !v.settings_open {
+        return;
     }
-    if let Some(path) = state.transport {
-        ui.label(RichText::new(transport_label(path)).small());
+    let resp = egui::Modal::new(egui::Id::new("session_settings")).show(ctx, |ui| {
+        ui.set_width(460.0);
+        let mut close = widgets::modal_title(ui, "会话设置");
+        ui.separator();
+        // 限高滚动：小窗口里也不会把底部的「关闭」挤出屏幕。
+        egui::ScrollArea::vertical()
+            .max_height(420.0)
+            .show(ui, |ui| settings_sections(ui, v, manager));
+        ui.separator();
+
+        // 底部摘要：当前链路的几项读数，带单位，省得用户为了看一眼延迟去开统计角标。
+        let mut parts = Vec::new();
+        if let Some(ms) = state.latency_ms {
+            parts.push(format!("延迟 {ms} ms"));
+        }
+        if let Some(path) = state.transport {
+            parts.push(transport_label(path).to_owned());
+        }
+        let (width, height) = v.frame_dims();
+        if width > 0 && height > 0 {
+            parts.push(format!("{width}×{height}"));
+        }
+        if let Some(ms) = state.decode_ms {
+            parts.push(format!("解码 {ms} ms"));
+        }
+        if let Some(kbps) = state.recv_kbps {
+            parts.push(format!("收码率 {}", format_kbps(kbps)));
+        }
+        ui.label(RichText::new(parts.join(" · ")).weak().small());
+        ui.add_space(4.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("关闭").clicked() {
+                close = true;
+            }
+            if ui
+                .button("测延迟")
+                .on_hover_text("立刻探测一次往返延迟")
+                .clicked()
+            {
+                manager.ping();
+            }
+        });
+        close
+    });
+    // `should_close()` 处理 Esc 与「点背景关闭」；它会在 Esc 按下时**消费**该键，故
+    // `handle_shortcuts` 在弹层打开时不再看 Esc（否则按一次会连退出全屏）。
+    if resp.inner || resp.should_close() {
+        v.settings_open = false;
+        v.last_pointer_move = Instant::now();
     }
 }
 
-/// 重连提示条：文案 + 「立即重试 / 停止」。
+/// 设置弹层的三个小节（画面 / 交互 / 界面）。
+///
+/// 从 [`settings_modal`] 拆出来只为控制函数长度；内容与「逐项改一次」的语义完全对应
+/// （各控件在改动时才下发，不做每帧轮询）。
+fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
+    widgets::section(ui, "画面", |ui| {
+        widgets::labeled_row(ui, "画质", |ui| {
+            let picked = widgets::segmented(
+                ui,
+                v.quality,
+                &[
+                    (QualityPreset::Smooth, "流畅"),
+                    (QualityPreset::Balanced, "均衡"),
+                    (QualityPreset::Hd, "高清"),
+                ],
+            );
+            if let Some(preset) = picked {
+                v.set_quality(preset, manager);
+            }
+        });
+        widgets::labeled_row(ui, "帧率上限", |ui| {
+            // 帧率是**上限**：QoS 闭环仍可在拥塞时降到 15。
+            let picked = widgets::segmented(ui, v.frame_rate(), &[(30u8, "30"), (60u8, "60")]);
+            if let Some(fps) = picked {
+                v.set_frame_rate(fps, manager);
+            }
+        });
+        widgets::labeled_row(ui, "显示器", |ui| {
+            display_selector(ui, v, manager);
+        });
+        widgets::labeled_row(ui, "缩放", |ui| {
+            // 固定档忽略可用区域、溢出交给滚动区（见 `ViewScale`）。
+            egui::ComboBox::from_id_salt("session_scale")
+                .selected_text(v.scale.label())
+                .show_ui(ui, |ui| {
+                    for scale in ViewScale::ALL {
+                        ui.selectable_value(&mut v.scale, scale, scale.label());
+                    }
+                });
+        });
+        widgets::labeled_row(ui, "窗口尺寸", |ui| {
+            let mut picked = v.window_size;
+            egui::ComboBox::from_id_salt("session_window_size")
+                .selected_text(picked.label())
+                .show_ui(ui, |ui| {
+                    for size in WindowSize::ALL {
+                        ui.selectable_value(&mut picked, size, size.label());
+                    }
+                });
+            if picked != v.window_size {
+                // 改档即重算内尺寸并锁死（`size_initialized`），下一帧 `patch` 会下发。
+                v.window_size = picked;
+                let monitor = ui.ctx().input(|i| i.viewport().monitor_size);
+                v.inner_size = v.desired_inner(monitor);
+                v.size_initialized = true;
+            }
+        });
+    });
+
+    widgets::section(ui, "交互", |ui| {
+        if ui
+            .checkbox(&mut v.clipboard_sync_enabled, "剪贴板自动同步")
+            .changed()
+            && !v.clipboard_sync_enabled
+        {
+            // 关同步就丢弃去重基线：下次开启会以当时的剪贴板重新开始，而不是补发
+            // 关闭期间积压的变化。
+            v.clipboard_sync = None;
+        }
+        ui.checkbox(
+            &mut v.exclusive_keyboard,
+            "独占键盘（Ctrl/Cmd+Alt+Shift+K 退出）",
+        );
+    });
+
+    widgets::section(ui, "界面", |ui| {
+        // 自动隐藏开关：这是**唯一**能让用户关掉「工具条偶尔消失」的入口。改动写进
+        // 运行时镜像，由父窗口的 `sync_display_prefs` 回写 gui.toml。
+        ui.checkbox(
+            &mut v.toolbar_autohide,
+            "工具条自动隐藏（移到窗口上缘召回）",
+        );
+        ui.checkbox(&mut v.stats_overlay, "显示统计角标");
+    });
+}
+
+/// 显示器选择：多显示器时下拉切换，单显示器时把当前显示器同步给引擎。
+fn display_selector(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
+    let displays = v.displays();
+    if displays.len() > 1 {
+        let current = v
+            .selected_display()
+            .or_else(|| displays.first().map(|d| d.id));
+        let mut picked = current;
+        egui::ComboBox::from_id_salt("session_display")
+            .selected_text(
+                current
+                    .and_then(|id| displays.iter().find(|d| d.id == id))
+                    .map_or("—", |d| d.name.as_str()),
+            )
+            .show_ui(ui, |ui| {
+                for display in &displays {
+                    ui.selectable_value(&mut picked, Some(display.id), display.name.as_str());
+                }
+            });
+        if let Some(id) = picked.filter(|id| Some(*id) != current) {
+            v.set_selected_display(id, manager);
+        }
+    } else if let Some(display) = displays.first() {
+        // 只有一台：没有可选的内容，但仍要把编号同步给引擎（否则输入坐标映射不到显示器）。
+        ui.label(display.name.as_str());
+        v.set_selected_display(display.id, manager);
+    } else {
+        ui.label(RichText::new("—").weak());
+    }
+}
+
+/// 重连提示条：文案 + 「立即重试 / 停止」（外层 frame 由调用方给）。
 fn reconnect_strip(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
     let Some(note) = v.reconnect_note.clone() else {
         return;
     };
-    egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgba_unmultiplied(220, 160, 40, 30))
-        .inner_margin(egui::Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().warn_fg_color, note);
-                if v.reconnect_active {
-                    if ui.button("立即重试").clicked() {
-                        if let Some(target) = v.reconnect.retry_now(Instant::now()) {
-                            manager.request_connect(&target.client_name, target.mode);
-                        }
-                    }
-                    if ui.button("停止").clicked() {
-                        v.reconnect.cancel();
-                        v.reconnect_note = None;
-                        v.reconnect_active = false;
-                    }
+    let warn = theme::palette(ui.style()).warn;
+    ui.horizontal(|ui| {
+        ui.colored_label(warn, note);
+        if v.reconnect_active {
+            if ui.button("立即重试").clicked() {
+                if let Some(target) = v.reconnect.retry_now(Instant::now()) {
+                    manager.request_connect(&target.client_name, target.mode);
                 }
-            });
-        });
-}
-
-/// 显示器选择：多显示器时逐台可点，单显示器时把当前显示器同步给引擎。
-fn display_selector(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
-    let displays = v.displays();
-    if displays.len() > 1 {
-        let current = v.selected_display().or_else(|| displays.first().map(|d| d.id));
-        ui.label(RichText::new("显示器").weak().small());
-        for display in &displays {
-            if ui
-                .selectable_label(current == Some(display.id), display.name.as_str())
-                .clicked()
-            {
-                v.set_selected_display(display.id, manager);
+            }
+            if ui.button("停止").clicked() {
+                v.reconnect.cancel();
+                v.reconnect_note = None;
+                v.reconnect_active = false;
             }
         }
-    } else if let Some(display) = displays.first() {
-        v.set_selected_display(display.id, manager);
-    }
-}
-
-/// 画质档位选择（流畅/均衡/高清）；切换经会话命令下发，由被控端生效。
-fn quality_selector(ui: &mut Ui, manager: &Arc<RemoteManager>, current: QualityPreset) {
-    ui.label(RichText::new("画质").weak().small());
-    for preset in QualityPreset::all() {
-        if ui.selectable_label(current == preset, preset.label()).clicked() {
-            manager.set_quality(preset);
-        }
-    }
-}
-
-/// 帧率上限选择（30 / 60）；切换经会话命令下发，由被控端在线重配置编码器（不重建、不插 IDR）。
-///
-/// 帧率是**上限**：QoS 闭环仍可在网络拥塞时降到 `min_fps`（15）。只在控制端会话窗口出现
-/// （被控端没有这个 viewport）。
-fn frame_rate_selector(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
-    ui.label(RichText::new("帧率").weak().small());
-    for fps in [30u8, 60] {
-        if ui.selectable_label(v.frame_rate() == fps, fps.to_string()).clicked() {
-            v.set_frame_rate(fps, manager);
-        }
-    }
-}
-
-/// 窗口尺寸档位（自适应 / 固定）；切换即重算 `inner_size`，`patch` 会据此下发 `InnerSize`。
-fn window_size_selector(ui: &mut Ui, v: &mut RemoteView) {
-    ui.label(RichText::new("窗口").weak().small());
-    for size in WindowSize::ALL {
-        if ui.selectable_label(v.window_size == size, size.label()).clicked() {
-            v.window_size = size;
-            let monitor = ui.ctx().input(|i| i.viewport().monitor_size);
-            v.inner_size = v.desired_inner(monitor);
-            v.size_initialized = true;
-        }
-    }
-}
-
-/// 画面缩放档位（适应窗口 / 固定百分比）。
-fn scale_selector(ui: &mut Ui, v: &mut RemoteView) {
-    ui.label(RichText::new("缩放").weak().small());
-    for scale in ViewScale::ALL {
-        if ui.selectable_label(v.scale == scale, scale.label()).clicked() {
-            v.scale = scale;
-        }
-    }
+    });
 }
 
 /// 画面区域：按缩放档位决定绘制尺寸。`Fit` 等比铺满可用区域；固定档位用滚动区承载溢出。
-fn scene(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, active: &ActiveSessionInfo) {
+fn scene(
+    ui: &mut Ui,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    active: &ActiveSessionInfo,
+) {
     let Some(paint) = v.upload(ui.ctx()) else {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
@@ -573,9 +747,11 @@ fn scene(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, active: 
     if v.scale == ViewScale::Fit {
         paint_image(ui, v, manager, active, &paint, want);
     } else {
-        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            paint_image(ui, v, manager, active, &paint, want);
-        });
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                paint_image(ui, v, manager, active, &paint, want);
+            });
     }
 }
 
@@ -604,7 +780,13 @@ fn paint_image(
                 Color32::WHITE,
             );
         }
-        FramePaint::Nv12 { frame, width, height, seq, target_format } => {
+        FramePaint::Nv12 {
+            frame,
+            width,
+            height,
+            seq,
+            target_format,
+        } => {
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
                 Nv12Callback {
@@ -625,17 +807,25 @@ fn paint_image(
 }
 
 /// 统计角标（右上角悬浮）：延迟 / 路径 / 分辨率 / 帧率 / 会话时长。
-fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo, state: &RemoteUiState) {
+fn stats_overlay(
+    ctx: &egui::Context,
+    v: &RemoteView,
+    active: &ActiveSessionInfo,
+    state: &RemoteUiState,
+) {
     let (width, height) = v.frame_dims();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(active.started_at_ms, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        .map_or(active.started_at_ms, |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        });
     let secs = now_ms.saturating_sub(active.started_at_ms) / 1000;
     egui::Window::new("会话统计")
         .id(egui::Id::new("session_stats_overlay"))
         .title_bar(false)
         .resizable(false)
         .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
+        .frame(theme::card_frame(&ctx.style()))
         .show(ctx, |ui| {
             egui::Grid::new("session_stats_grid")
                 .num_columns(2)
@@ -658,7 +848,11 @@ fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo
                     ui.end_row();
                     // 解码耗时 / 收码率：控制器侧本地实测（阶段 3 QoS 观测量）。
                     ui.label(RichText::new("解码").weak().small());
-                    ui.label(state.decode_ms.map_or("—".to_owned(), |ms| format!("{ms} ms")));
+                    ui.label(
+                        state
+                            .decode_ms
+                            .map_or("—".to_owned(), |ms| format!("{ms} ms")),
+                    );
                     ui.end_row();
                     ui.label(RichText::new("收码率").weak().small());
                     ui.label(state.recv_kbps.map_or("—".to_owned(), format_kbps));
@@ -666,10 +860,18 @@ fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo
                     // 收包/丢包：用来区分「对端没出帧」与「本端解码队列在丢帧」——后者会触发
                     // 关键帧请求，表现为画面卡顿而码率不低。
                     ui.label(RichText::new("收包").weak().small());
-                    ui.label(state.decode_packets.map_or("—".to_owned(), |n| format!("{n}/s")));
+                    ui.label(
+                        state
+                            .decode_packets
+                            .map_or("—".to_owned(), |n| format!("{n}/s")),
+                    );
                     ui.end_row();
                     ui.label(RichText::new("丢包").weak().small());
-                    ui.label(state.decode_dropped.map_or("—".to_owned(), |n| format!("{n}/s")));
+                    ui.label(
+                        state
+                            .decode_dropped
+                            .map_or("—".to_owned(), |n| format!("{n}/s")),
+                    );
                     ui.end_row();
                     // 输入速率：本端**捕获并注入**的事件数（不是远端是否响应）。用来一眼分辨
                     // 「UI 压根没产生事件」与「事件已注入但远端没反应」。
@@ -684,7 +886,12 @@ fn stats_overlay(ctx: &egui::Context, v: &RemoteView, active: &ActiveSessionInfo
 }
 
 /// 右侧面板内容：剪贴板 + 文件传输（整体从旧「远程」Tab 迁来，逻辑不变）。
-fn side_contents(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, state: &RemoteUiState) {
+fn side_contents(
+    ui: &mut Ui,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+) {
     show_clipboard(ui, v, manager);
     show_files(ui, v, manager, state);
 }
@@ -736,8 +943,16 @@ fn show_clipboard(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>)
 }
 
 /// 文件面板：浏览被控端共享目录、下载、上传、查看传输进度。
-#[expect(clippy::cast_precision_loss, reason = "传输字节数有界，f32 进度条精度足够")]
-fn show_files(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, state: &RemoteUiState) {
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "传输字节数有界，f32 进度条精度足够"
+)]
+fn show_files(
+    ui: &mut Ui,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+) {
     ui.separator();
     egui::CollapsingHeader::new("文件传输")
         .default_open(false)
@@ -748,7 +963,11 @@ fn show_files(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, sta
                 state.remote_dir.clone()
             };
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("当前目录：{shown_dir}")).weak().small());
+                ui.label(
+                    RichText::new(format!("当前目录：{shown_dir}"))
+                        .weak()
+                        .small(),
+                );
                 if ui.button("上级").clicked() {
                     manager.list_remote_dir(&parent_virtual(&state.remote_dir));
                 }
@@ -758,7 +977,11 @@ fn show_files(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, sta
             });
 
             if state.remote_entries.is_empty() {
-                ui.label(RichText::new("（空目录或尚未加载，点「刷新」）").weak().small());
+                ui.label(
+                    RichText::new("（空目录或尚未加载，点「刷新」）")
+                        .weak()
+                        .small(),
+                );
             }
             for entry in &state.remote_entries {
                 ui.horizontal(|ui| {
@@ -809,7 +1032,11 @@ fn show_files(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, sta
             }
             for transfer in &state.transfers {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{}（{}）", transfer.name, transfer.direction.label()));
+                    ui.label(format!(
+                        "{}（{}）",
+                        transfer.name,
+                        transfer.direction.label()
+                    ));
                     let fraction = transfer.done as f32 / transfer.total.max(1) as f32;
                     ui.add(egui::ProgressBar::new(fraction).desired_width(120.0));
                     if ui.button("取消").clicked() {
@@ -819,7 +1046,11 @@ fn show_files(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, sta
             }
 
             if let Some(dir) = manager.share_dir() {
-                ui.label(RichText::new(format!("本机对外共享：{}", dir.display())).weak().small());
+                ui.label(
+                    RichText::new(format!("本机对外共享：{}", dir.display()))
+                        .weak()
+                        .small(),
+                );
             }
         });
 }
@@ -872,9 +1103,8 @@ fn join_virtual(dir: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! 纯逻辑单测：工具条可见性状态机、「隐现不改画面」的几何不变量，以及传输路径标签。
-    //! 真实的 egui 布局（面板注册、实测矩形）与真实链路都无法在无头环境验证，只能由这些单测
-    //! 锁住判定规则。
+    //! 纯逻辑单测：工具条可见性状态机与数据面路径标签。真实的 egui 布局（浮层锚点、弹层模态层）
+    //! 无法在无头环境验证，只能由这些单测锁住判定规则。
 
     use super::*;
 
@@ -904,7 +1134,7 @@ mod tests {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, height))
     }
 
-    /// 造一份决策输入（默认指针未移动、未按下）。
+    /// 造一份决策输入（默认指针未移动、未按下、无设置弹层）。
     fn inputs(
         autohide: bool,
         was_visible: bool,
@@ -920,6 +1150,7 @@ mod tests {
             moved: false,
             down: false,
             idle,
+            modal_open: false,
         }
     }
 
@@ -978,42 +1209,26 @@ mod tests {
     }
 
     #[test]
-    fn hidden_toolbar_still_reserves_its_height() {
-        // 缺陷 2 的机械锁（状态机侧）：隐藏时占位高度是缓存高度，绝不是 0；可见时返回 None
-        // （高度由内容实测）。
-        let hidden = toolbar_reserve(TOOLBAR_FALLBACK_HEIGHT, false);
-        assert!(hidden.is_some_and(|h| (h - TOOLBAR_FALLBACK_HEIGHT).abs() < f32::EPSILON));
-        assert!(toolbar_reserve(TOOLBAR_FALLBACK_HEIGHT, true).is_none());
-    }
-
-    #[test]
-    fn scene_rect_is_independent_of_toolbar_visibility() {
-        // 缺陷 2 的机械锁（几何侧）：工具条常驻占位，可见与隐藏得到**同一**中央可用尺寸，
-        // 从而对同一 `avail`/图像尺寸给出同一 `display_size`——`Fit` 档不再改画面尺寸、固定档
-        // 不再移位。
-        // 中央区域刻意选**高度受限**的比例：这样工具条高度才会改变 Fit 档的缩放比，
-        // 反例才有意义（宽度受限时两个 avail 会算出同一尺寸，断言形同虚设）。
-        let central = egui::vec2(1280.0, 600.0);
-        let image = (1920u32, 1080u32);
-        // 可见时高度由内容决定（模型里取缓存值）；隐藏时用 `toolbar_reserve` 的占位高度。
-        let visible_h = TOOLBAR_FALLBACK_HEIGHT;
-        let hidden_h = toolbar_reserve(TOOLBAR_FALLBACK_HEIGHT, false).unwrap_or(0.0);
-        let avail_visible = egui::vec2(central.x, central.y - visible_h);
-        let avail_hidden = egui::vec2(central.x, central.y - hidden_h);
-        assert_eq!(avail_visible, avail_hidden, "可见性不该改变中央可用尺寸");
-        for scale in ViewScale::ALL {
-            assert_eq!(
-                display_size(scale, avail_visible, image),
-                display_size(scale, avail_hidden, image),
-                "{scale:?} 档下工具条可见性不该改变画面矩形",
-            );
+    fn modal_open_keeps_toolbar_visible() {
+        // 设置弹层打开时工具条恒可见（它是弹层的召回入口与档位读数），并重置空闲计时——
+        // 关掉弹层后工具条还该完整停留一个 `TOOLBAR_IDLE` 窗口，而不是立刻消失。
+        for was_visible in [true, false] {
+            for idle in [Duration::ZERO, Duration::from_secs(60)] {
+                let mut i = inputs(
+                    true,
+                    was_visible,
+                    Some(egui::pos2(500.0, 400.0)),
+                    44.0,
+                    idle,
+                );
+                i.modal_open = true;
+                let d = decide_toolbar_visibility(i);
+                assert!(
+                    d.visible,
+                    "弹层打开时工具条必须可见（was_visible={was_visible}）"
+                );
+                assert!(d.reset_activity, "弹层打开时应重置空闲计时");
+            }
         }
-        // 反例（缺陷 2 的原行为）：隐藏时面板不注册（占位 0）→ 中央区域变高 → Fit 档画面尺寸改变。
-        let avail_buggy_hidden = central;
-        assert_ne!(
-            display_size(ViewScale::Fit, avail_buggy_hidden, image),
-            display_size(ViewScale::Fit, avail_visible, image),
-            "占位为 0 时 Fit 档画面尺寸会变——这正是被修掉的缺陷",
-        );
     }
 }

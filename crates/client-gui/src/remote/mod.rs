@@ -31,7 +31,7 @@ pub mod win_video;
 pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
 pub use view_scale::{
-    display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER, TOOLBAR_FALLBACK_HEIGHT,
+    display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER,
 };
 
 use std::collections::BTreeSet;
@@ -43,9 +43,9 @@ use enigo::{Keyboard as _, Mouse as _};
 // `Clipboard::get` 供后台线程读取本机剪贴板（见 `RemoteView::request_local_clipboard`）。
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
-    DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame,
-    RemoteError, RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
-    VideoEncoderFactory, DEFAULT_FRAME_RATE,
+    DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, QualityPreset,
+    RawFrame, RemoteError, RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole,
+    VideoDecoderFactory, VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -1093,6 +1093,14 @@ pub struct RemoteView {
     pub frame_rate: u8,
     /// 本会话是否已把帧率下发给被控端；会话结束时复位，下一场重新下发。
     frame_rate_sent: bool,
+    /// 设置弹窗开关，不落盘（纯运行时状态：会话结束时关闭）。
+    pub settings_open: bool,
+    /// 画质档位（持久化镜像，见 `GuiPrefs::remote_quality`）。
+    ///
+    /// 会话开始时自动下发一次（见 [`Self::reconcile`] 的 `quality_sent`）。
+    pub quality: QualityPreset,
+    /// 本会话是否已把画质下发给被控端；会话结束时复位，下一场重新下发。
+    quality_sent: bool,
     /// 窗口尺寸档位（持久化镜像）。
     pub window_size: WindowSize,
     /// 当前应下发给子窗口的内尺寸（builder 里带着它，变化时 `patch` 会自动发 `InnerSize`）。
@@ -1105,15 +1113,11 @@ pub struct RemoteView {
     ///
     /// 工具条上的开关改它，`GuiApp::sync_display_prefs` 每帧比对后回写 `gui.toml`。
     pub toolbar_autohide: bool,
-    /// 工具条面板**上一帧**的实测矩形（热区判据：指针是否停在工具条上）。
+    /// 工具条浮层**上一帧**的实测矩形（热区判据：指针是否停在工具条上）。
     ///
-    /// 存实测矩形而非硬编码高度，是因为工具条用 `horizontal_wrapped`——窗口变窄时折行成两三行，
-    /// 硬编码 44px 会让第二行按钮落在热区外，工具条从指针底下消失。首帧尚未测得时为 `None`。
+    /// 工具条是浮在画面之上的 `egui::Area`，隐现不影响布局；但「指针是否停在按钮上」仍要用实测
+    /// 矩形，而不是硬编码高度。首帧尚未测得时为 `None`（用兜底矩形）。
     pub toolbar_rect: Option<egui::Rect>,
-    /// 工具条面板的**缓存内容高度**（隐藏时用它占位，使中央区域不因可见性变化）。
-    ///
-    /// 可见时每帧以实测值覆盖；首帧未知时用 [`TOOLBAR_FALLBACK_HEIGHT`] 兜底。
-    pub toolbar_height: f32,
     /// 统计角标是否常显（持久化镜像）。
     pub stats_overlay: bool,
     /// 剪贴板自动同步开关（持久化镜像）。
@@ -1179,13 +1183,15 @@ impl RemoteView {
             scale: ViewScale::default(),
             frame_rate: DEFAULT_FRAME_RATE,
             frame_rate_sent: false,
+            settings_open: false,
+            quality: QualityPreset::default(),
+            quality_sent: false,
             window_size: WindowSize::default(),
             inner_size: egui::vec2(960.0, 600.0),
             toolbar_visible: true,
             last_pointer_move: Instant::now(),
             toolbar_autohide: false,
             toolbar_rect: None,
-            toolbar_height: TOOLBAR_FALLBACK_HEIGHT,
             stats_overlay: false,
             clipboard_sync_enabled: false,
             clipboard_sync: None,
@@ -1230,6 +1236,7 @@ impl RemoteView {
         view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
         view.toolbar_autohide = prefs.remote_toolbar_autohide;
         view.frame_rate = prefs.remote_frame_rate;
+        view.quality = prefs.remote_quality;
         view
     }
 
@@ -1271,6 +1278,9 @@ impl RemoteView {
         self.selected_display = None;
         // 新会话要重新下发一次帧率偏好（见 `reconcile` 的自动下发）。
         self.frame_rate_sent = false;
+        // 画质同理；设置弹窗属于上一场的 UI 状态，不应带到下一场。
+        self.quality_sent = false;
+        self.settings_open = false;
         // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
         self.input_count = 0;
         self.input_base = 0;
@@ -1327,6 +1337,14 @@ impl RemoteView {
     pub fn set_frame_rate(&mut self, fps: u8, manager: &Arc<RemoteManager>) {
         self.frame_rate = fps;
         manager.set_frame_rate(fps);
+    }
+
+    /// 切换画质档位：更新本地镜像（由父窗口回写 `gui.toml`）并立刻下发给被控端。
+    ///
+    /// 会话建立时的自动下发走 [`Self::reconcile`]，与本方法共用同一个偏好值。
+    pub fn set_quality(&mut self, preset: QualityPreset, manager: &Arc<RemoteManager>) {
+        self.quality = preset;
+        manager.set_quality(preset);
     }
 
     /// 会话窗口的本地输入态（可编辑）。
@@ -1440,6 +1458,11 @@ impl RemoteView {
         // 不置 `capture_this_frame`，让窗口回调在本帧补发一次抬起——刚改了键盘语义，先松开最安全。
         if self.exclusive_keyboard && exit_combo_pressed(ui.ctx()) {
             self.exclusive_keyboard = false;
+            return;
+        }
+        // 设置弹窗打开期间不转发任何输入：弹窗悬浮在画面之上，点击/按键都只属于本地 UI。
+        // 本帧不置 `capture_this_frame`，窗口回调会据此补发一次按键抬起。
+        if self.settings_open {
             return;
         }
         // 记录「本帧已捕获」：窗口回调结尾据它决定是否补发抬起（见 [`RemoteView::capture_this_frame`]）。
@@ -1611,6 +1634,12 @@ impl RemoteView {
                 if self.last_session_id.as_deref() != Some(active.session_id.as_str()) {
                     self.begin_session(&active.session_id);
                 }
+                // 每场会话自动下发一次画质偏好（与帧率同理）：被控端不会主动问，漏了这一步
+                // 弹窗里选的档位就只在手动点选时生效，下一场会显示已选但实际按默认档编码。
+                if !self.quality_sent {
+                    manager.set_quality(self.quality);
+                    self.quality_sent = true;
+                }
                 // 每场会话自动下发一次帧率偏好（`begin_session` 刚把它复位为未发送）。
                 // 被控端不会主动问，漏了这一步用户的 30/60 选择就只在手动点按钮时生效。
                 if !self.frame_rate_sent {
@@ -1662,7 +1691,7 @@ impl RemoteView {
         self.exclusive_keyboard = false;
         self.fullscreen = false;
         // 新会话总是从「工具条可见」开始（首帧不该是空的）。`toolbar_autohide` 是**持久化镜像**，
-        // 与 `scale`/`window_size` 一样跨会话保留——**不在这里复位**；`toolbar_rect`/`toolbar_height`
+        // 与 `scale`/`window_size` 一样跨会话保留——**不在这里复位**；`toolbar_rect`
         // 同理（下一帧渲染时会以实测值覆盖）。
         self.toolbar_visible = true;
         self.fps = 0;

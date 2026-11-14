@@ -501,7 +501,9 @@ fn inject_events(events: &[InputEvent], monitors: &[Monitor], vs: &VirtualScreen
         Ok(outcome) if outcome.fully_accepted() => {}
         // UIPI 拦截的典型形态：事件一个没进去，但 `GetLastError` 常常是 0，
         // **只有计数**能看出来（见 `win-platform::inject` 的模块文档）。
-        Ok(outcome) => tracing::warn!(summary = %outcome.summary(), "部分注入事件未被接受（UIPI / 桌面 ACL？）"),
+        Ok(outcome) => {
+            tracing::warn!(summary = %outcome.summary(), "部分注入事件未被接受（UIPI / 桌面 ACL？）");
+        }
         Err(err) => tracing::warn!(%err, "注入调用失败"),
     }
 }
