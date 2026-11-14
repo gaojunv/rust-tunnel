@@ -28,6 +28,7 @@ use rust_tunnel_remote::{
 use rust_tunnel_win_video::capture::{self, CaptureSource};
 use rust_tunnel_win_video::d3d11;
 use rust_tunnel_win_video::decode::H264Decoder;
+use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
 use tracing::{debug, info, warn};
@@ -341,6 +342,131 @@ impl VideoEncoderApi for NvencAdapter {
     }
 }
 
+/// Media Foundation 硬件 H.264 编码器工厂（Intel QSV / AMD VCE 等）。
+///
+/// 只在 NVENC 不可用时才探测；实际是否可用由 `MftH264Encoder::new` 的硬件
+/// MFT 枚举决定。Intel MFT 不支持运行期改帧率，适配器会保持内部帧率，只让
+/// 采集节奏随 QoS 变化，避免重建编码器/插 IDR。
+#[derive(Debug)]
+pub struct MftEncoderFactory;
+
+impl MftEncoderFactory {
+    /// 探测是否有可用的硬件 H.264 编码 MFT（专用线程，避免 COM 套间污染）。
+    #[must_use]
+    pub fn probe() -> bool {
+        let probe = std::thread::Builder::new()
+            .name("mft-encoder-probe".to_owned())
+            .spawn(|| match MftH264Encoder::new(1280, 720, 30, 2000) {
+                Ok(_) => true,
+                Err(err) => {
+                    info!(error = %err, "没有可用的硬件 H.264 编码 MFT");
+                    false
+                }
+            })
+            .ok();
+        match probe.map(std::thread::JoinHandle::join) {
+            Some(Ok(ok)) => ok,
+            Some(Err(_)) => {
+                info!("MFT 编码器探测线程 panic");
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+impl VideoEncoderFactory for MftEncoderFactory {
+    fn codec(&self) -> CodecId {
+        CodecId::H264
+    }
+
+    fn create(
+        &self,
+        width: u32,
+        height: u32,
+        target_bitrate_kbps: u32,
+        max_fps: u8,
+    ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+        let fps = u32::from(max_fps.max(1));
+        let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
+            .map_err(|err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")))?;
+        Ok(Box::new(MftAdapter { encoder, fps }))
+    }
+}
+
+/// `MftH264Encoder` 的 remote 适配器：尺寸不同时先做 CPU 盒式下采样。
+struct MftAdapter {
+    /// 硬件编码器。
+    encoder: MftH264Encoder,
+    /// 逻辑帧率（Intel MFT 不支持在线改输出帧率，实际节奏由采集控制）。
+    fps: u32,
+}
+
+impl VideoEncoderApi for MftAdapter {
+    fn dimensions(&self) -> (u32, u32) {
+        self.encoder.dimensions()
+    }
+
+    fn bitrate_kbps(&self) -> u32 {
+        self.encoder.bitrate_kbps()
+    }
+
+    fn fps(&self) -> u32 {
+        self.fps
+    }
+
+    fn set_bitrate(&mut self, kbps: u32) -> RemoteResult<()> {
+        self.encoder
+            .set_bitrate(kbps)
+            .map_err(|err| RemoteError::Encode(format!("MFT 在线改码率失败: {err}")))
+    }
+
+    fn set_fps(&mut self, fps: u8) -> RemoteResult<()> {
+        let fps = u32::from(fps.max(1));
+        self.fps = fps;
+        if let Err(err) = self.encoder.set_fps(fps) {
+            debug!(
+                error = %err,
+                fps,
+                "MFT 不支持在线改帧率，保持编码器内部帧率（采集节奏仍按 QoS）"
+            );
+        }
+        Ok(())
+    }
+
+    fn encode(
+        &mut self,
+        rgba: &[u8],
+        src_width: u32,
+        src_height: u32,
+        force_keyframe: bool,
+    ) -> RemoteResult<EncodedVideo> {
+        let expected = (src_width as usize)
+            .checked_mul(src_height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RemoteError::Encode("帧尺寸溢出".to_owned()))?;
+        if rgba.len() != expected {
+            return Err(RemoteError::Encode(format!(
+                "RGBA 长度 {} 与源尺寸 {src_width}x{src_height} 不符（应为 {expected}）",
+                rgba.len()
+            )));
+        }
+        let (dst_width, dst_height) = self.encoder.dimensions();
+        let packet = if (src_width, src_height) == (dst_width, dst_height) {
+            self.encoder.encode_rgba(rgba, force_keyframe)
+        } else {
+            let scaled = scale_rgba_box(rgba, src_width, src_height, dst_width, dst_height)
+                .map_err(|err| RemoteError::Encode(format!("H.264 输入下采样失败: {err}")))?;
+            self.encoder.encode_rgba(&scaled, force_keyframe)
+        }
+        .map_err(|err| RemoteError::Encode(format!("MFT 编码失败: {err}")))?;
+        Ok(EncodedVideo {
+            data: packet.data,
+            keyframe: packet.keyframe,
+        })
+    }
+}
+
 /// Media Foundation H.264 解码器工厂（控制器侧）。
 #[derive(Debug)]
 pub struct H264DecoderFactory;
@@ -403,6 +529,13 @@ impl VideoDecoderApi for H264DecoderAdapter {
         }
         match H264Decoder::new(width, height) {
             Ok(decoder) => {
+                info!(
+                    path = ?decoder.path(),
+                    adapter = ?decoder.adapter_name(),
+                    width,
+                    height,
+                    "H.264 解码器已创建"
+                );
                 self.decoder = Some(decoder);
                 self.configured = Some((width, height));
                 Ok(())
@@ -445,7 +578,7 @@ pub fn factories() -> super::HardwareFactories {
         info!("RUST_TUNNEL_DISABLE_HWCODEC 已设置，跳过 NVENC/MFT 探测");
         return (None, None);
     }
-    let encoder = match nvenc_api() {
+    let nvenc = match nvenc_api() {
         Some(api) => match d3d11::create_nvidia() {
             Ok(_) => {
                 info!("NVENC H.264 硬件编码已注入");
@@ -453,11 +586,25 @@ pub fn factories() -> super::HardwareFactories {
                 Some(factory)
             }
             Err(err) => {
-                info!(error = %err, "没有可用的 NVIDIA 适配器，H.264 编码不参与协商");
+                info!(error = %err, "没有可用的 NVIDIA 适配器，尝试 Intel/AMD 硬件 MFT");
                 None
             }
         },
         None => None,
+    };
+    // NVENC 优先；没有 NVIDIA 时再探测 Intel QSV / AMD VCE 的硬件编码 MFT。
+    let encoder = match nvenc {
+        Some(factory) => Some(factory),
+        None => {
+            if MftEncoderFactory::probe() {
+                info!("Intel/AMD 硬件 MFT H.264 编码已注入");
+                let factory: Arc<dyn VideoEncoderFactory> = Arc::new(MftEncoderFactory);
+                Some(factory)
+            } else {
+                info!("没有可用的硬件 H.264 编码器（NVENC/MFT），回退 VP9");
+                None
+            }
+        }
     };
     let decoder = H264DecoderFactory::new().map(|factory| {
         let factory: Arc<dyn VideoDecoderFactory> = Arc::new(factory);

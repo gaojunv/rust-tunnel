@@ -24,6 +24,10 @@ path = "src/bin/decode_probe.rs"
 name = "win-video-e2e-probe"
 path = "src/bin/e2e_probe.rs"
 
+[[bin]]
+name = "win-video-encode-mft-probe"
+path = "src/bin/encode_mft_probe.rs"
+
 [target.'cfg(windows)'.dependencies]
 # WinRT（WGC）+ Win32（D3D11/DXGI/GDI）。与 client-gui 已有的 windows 0.62 共用同一份
 # 依赖图，不额外引入大版本。
@@ -44,6 +48,9 @@ windows = { version = "0.62", features = [
     # Media Foundation：控制器侧 H.264 解码（MSH264DecoderMFT）
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # ICodecAPI（SetValue 收 VARIANT）：运行期改码率/帧率、强制关键帧
+    "Win32_System_Ole",
+    "Win32_System_Variant",
     # 探针用 GetProcessTimes 量化软/硬解码的 CPU 时间（wall time 被 CPU 转换掩盖）
     "Win32_System_Threading",
     "Win32_System_WinRT",

@@ -36,6 +36,8 @@ pub mod d3d11;
 #[cfg(windows)]
 pub mod decode;
 #[cfg(windows)]
+pub mod mft_encoder;
+#[cfg(windows)]
 pub mod nvenc;
 /// 纯像素工具（BGRA→RGBA、盒式下采样），不依赖 Windows API。
 #[cfg(windows)]
@@ -59,6 +61,9 @@ pub enum WinVideoError {
     /// H.264 解码错误（Media Foundation 的 HRESULT 或码流格式问题）。
     #[error("解码: {0}")]
     Decode(String),
+    /// H.264 编码错误（Media Foundation 的 HRESULT 或码流格式问题）。
+    #[error("编码: {0}")]
+    Encode(String),
     /// Win32/WinRT 错误。
     #[error("Windows API: {0}")]
     Windows(#[from] windows::core::Error),
