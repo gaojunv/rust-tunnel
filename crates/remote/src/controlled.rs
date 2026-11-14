@@ -126,7 +126,7 @@ const MAX_CAPTURE_TIMEOUTS: u32 = 3;
 ///
 /// 所以静止时也要定期补编一帧：**普通 P 帧、不请求 IDR**，把「变化发生 → 控制器看到画面」
 /// 的延迟上界压到 250 ms。代价可忽略：QSV/NVENC 实测静止 P 帧约 3 KB，4 fps ≈ 12 KB/s
-/// ≈ 50 kbps。
+/// ≈ 100 kbps（1080p；这一帧同时会喂给控制端的解码器，不会额外触发关键帧）。
 pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 被控端会话配置。
@@ -1084,7 +1084,9 @@ async fn encode_loop(
         // 不会像 `force` 那样带出 IDR（QoS 每秒动一次就插 IDR 是专门修掉的回归）。
         let resend_due = last_encode.is_none_or(|at| at.elapsed() >= unchanged_resend);
 
-        // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
+        // 静止画面：**默认**不喂编码器（不转换、不编码、不发送），但距上次编码超过
+        // `unchanged_resend` 时必须补编一帧（保活，见 [`UNCHANGED_RESEND_INTERVAL`]）——
+        // 「永久不发」会让检测盲区/背压丢弃变成画面上永久冻结的一帧。
         // `force`（首帧/切显示器/切档位/RequestKeyframe/几何变化）为真时必须照常编码，
         // 否则控制器 `NO_FRAME_TIMEOUT` 要的 IDR 会被这里吞掉。
         if !force && unchanged && !resend_due {
