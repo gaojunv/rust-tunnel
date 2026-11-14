@@ -922,11 +922,19 @@ pub struct FrameState {
 /// [`FrameSink`] 的 egui 实现：把帧塞进共享槽并唤醒 UI 重绘。
 ///
 /// **在引擎的运行时线程被调用**，故只做加锁写入 + `request_repaint`，不做任何解码/缩放。
+///
+/// **重绘必须指定 viewport**：远程会话窗口是 **deferred viewport**，与根窗口分别调度；从后台
+/// 线程调 `Context::request_repaint()` 时 viewport 栈是空的，会落到 `ViewportId::ROOT`，只重绘
+/// 根窗口——这正是「收到的帧率正常、画面却只有个位数帧」的原因。因此帧通道必须
+/// `request_repaint_of(会话 viewport)`；`embed_viewports()`（后端不能开原生多窗口）时内容其实
+/// 嵌在根窗口里，才退回 `ViewportId::ROOT`。不要改回 `request_repaint()`。
 pub struct GuiFrameSink {
     /// 与 [`RemoteView`] 共享的画面槽。
     shared: Arc<Mutex<FrameState>>,
     /// egui 上下文（唤醒重绘）。
     ctx: egui::Context,
+    /// 帧到达要唤醒的 viewport（见上面所有 `request_repaint_of` 的说明）。
+    viewport: egui::ViewportId,
 }
 
 impl FrameSink for GuiFrameSink {
@@ -934,7 +942,7 @@ impl FrameSink for GuiFrameSink {
         if let Ok(mut guard) = self.shared.lock() {
             guard.displays = displays;
         }
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_of(self.viewport);
     }
 
     fn on_frame(&self, frame: DecodedFrame) {
@@ -942,14 +950,14 @@ impl FrameSink for GuiFrameSink {
             guard.latest = Some(frame);
             guard.frame_count = guard.frame_count.wrapping_add(1);
         }
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_of(self.viewport);
     }
 
     fn on_clipboard(&self, text: String) {
         if let Ok(mut guard) = self.shared.lock() {
             guard.clipboard_in = Some(text);
         }
-        self.ctx.request_repaint();
+        self.ctx.request_repaint_of(self.viewport);
     }
 
 
@@ -957,7 +965,9 @@ impl FrameSink for GuiFrameSink {
         if let Ok(mut guard) = self.shared.lock() {
             guard.closed = Some(reason);
         }
-        self.ctx.request_repaint();
+        // 会话窗口要显示「已结束」，根窗口也要更新会话状态（否则它只在 300/600 ms 的定时里刷）。
+        self.ctx.request_repaint_of(self.viewport);
+        self.ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 
@@ -1232,9 +1242,15 @@ impl RemoteView {
         if self.sink_installed {
             return;
         }
+        let viewport = if ctx.embed_viewports() {
+            egui::ViewportId::ROOT
+        } else {
+            crate::ui::session_window::viewport_id()
+        };
         manager.install_frame_sink(Arc::new(GuiFrameSink {
             shared: Arc::clone(&self.shared),
             ctx: ctx.clone(),
+            viewport,
         }));
         self.sink_installed = true;
     }

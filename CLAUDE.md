@@ -181,6 +181,8 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 被控端 UI 面（`crates/client-gui`）：确认弹窗由 `ui/remote.rs::approval_modal` 在 `GuiApp::update` 里每帧渲染、**常驻所有 Tab 之上**（与 `controlled_banner` 同理，安全提示不能只在「远程」Tab 可见），并按模式给出不同的风险说明（「完全控制 / 仅观看 / 仅文件传输」三者的后果不同）；策略选择器与「已信任的对端」列表在「远程」Tab。策略经 `GuiPrefs.remote_approval` 持久化（`#[serde(default)]`，缺省 `Confirm`，旧配置文件也落到「每次询问」）；**信任列表只存内存**，退出应用即清空（`RemoteUiState.trusted_peers`，按客户端名索引——`RemoteSessionIncoming` 不带 `from_rd_id`，改名即失效）。请求首次出现时会强制显示并聚焦窗口（用户可能已把窗口隐藏到托盘），托盘 tooltip 同步改为「有远程接入请求待确认」。
 
+**帧 → UI 通道（`crates/client-gui/src/remote/mod.rs::GuiFrameSink`）**：帧通道必须 `request_repaint_of(<会话 viewport>)`（会话窗口是 deferred viewport，与根窗口独立调度；根 ctx 的 `request_repaint()` 只重绘根窗口，曾导致画面被压在 ~2.5 fps）；`embed_viewports()`（后端不能开原生多窗口）时内容真实嵌在根窗口，才退回 `ViewportId::ROOT`。
+
 **数据面三条路径**：**P2P 打洞**（跨 NAT，经 hbbs 交换公网 UDP 映射后对打）→ **P2P 直连**（同内网，`FetchLocalAddr`/`LocalAddr`）→ **hbbr 中继兜底**（所有 NAT 场景可用，`always_use_relay` 可强制）。规则两侧**对称**，故两端对路径的判断一致；`always_use_relay` **两侧都要遵守**（S3 之前被控端分支忽略它，规则不对称、它也就失去了 kill switch 的意义）。
 
 **打洞为什么现在成立**：早先 `forward_punch_result` 回给请求方的是目标端信令 TCP 连接的**源地址**（临时端口，目标端并未在那里监听），所以「拿到地址就直连」在跨 NAT 下必然失败；现在回的是**目标端已登记的 UDP 映射**（`peers.lookup(&phs.id).socket_addr`，由 `RegisterPeer`/`RegisterPk` 维护），而请求方自报的 UDP 端口经 `PunchHole.udp_port`（tag 4）转给目标端。**UDP 打洞不需要端口复用**——从已注册的套接字向对端发一个数据报就建立了 NAT 映射，这正是它比 TCP 同时打开简单的地方。**hbbs 的三处改动必须保持纯加法**：① `PunchHole.socket_addr` **一个字都不能动**——`forward_punch_result` 靠解码目标端回显的 `PunchHoleSent.socket_addr` 去 `sinks` 里找请求方那条 TCP 连接，而 `sinks` 按**信令 TCP 源地址**索引，改了它上游客户端的应答路由就断了（`push_to_connection` 找不到 sink 会静默丢弃）；② `udp_port == 0` 时逐字节退回旧行为；③ NAT 探测端口的 UDP 半边**只应答 `TestNatRequest`**，**不复用 `handle_datagram`**——否则会把「面向 NAT 端口的映射」写进 `peers`，污染打洞用的映射语义。
