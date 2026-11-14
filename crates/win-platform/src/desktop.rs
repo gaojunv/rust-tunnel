@@ -98,14 +98,41 @@ pub struct InputDesktop {
     attached: bool,
 }
 
+/// 打开输入桌面时申请的访问掩码。
+///
+/// # `DESKTOP_JOURNALPLAYBACK` 为什么不能省（真机实测）
+///
+/// 只申请 `READOBJECTS | WRITEOBJECTS | SWITCHDESKTOP | ENUMERATE` 时，
+/// `OpenInputDesktop` 和 `SetThreadDesktop` **都返回成功**，线程桌面名也确实是
+/// `Default`，但随后的 `SendInput` **每一个事件都返回 0 + `ERROR_ACCESS_DENIED`(5)**。
+/// 在 Windows 11 真机上逐个裁掩码后确认：缺的正是 `DESKTOP_JOURNALPLAYBACK`——
+/// 加上它（或 `GENERIC_WRITE` / `GENERIC_ALL`）后 `SendInput` 立即恢复正常。
+///
+/// 这条路径的失败形态是「挂载成功、注入全被拒」，与 UIPI/桌面 ACL 的错误码一模一样，
+/// 所以必须有这条注释和 `access_includes_journal_playback` 的机械锁，防止有人把
+/// 掩码「精简」回去。
+#[cfg(windows)]
+pub(crate) const INPUT_DESKTOP_ACCESS: u32 = {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        DESKTOP_ENUMERATE, DESKTOP_JOURNALPLAYBACK, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP,
+        DESKTOP_WRITEOBJECTS,
+    };
+    DESKTOP_READOBJECTS
+        | DESKTOP_WRITEOBJECTS
+        | DESKTOP_SWITCHDESKTOP
+        | DESKTOP_ENUMERATE
+        // ↓ 少这个，SetThreadDesktop 成功但 SendInput 恒返回 ERROR_ACCESS_DENIED。
+        | DESKTOP_JOURNALPLAYBACK
+};
+
 #[cfg(windows)]
 impl InputDesktop {
     /// 打开当前输入桌面（`OpenInputDesktop`）。
     ///
-    /// 申请的权限是 `DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP
-    /// | DESKTOP_ENUMERATE`：`SetThreadDesktop` 需要切换权，读取名字需要读对象权。
-    /// **不要**改成 `GENERIC_ALL`——在非 SYSTEM 的调用者上它会失败，而我们希望
-    /// 失败信息尽可能精确。
+    /// 访问掩码见 [`INPUT_DESKTOP_ACCESS`]：除了读取名字/切换线程所需的位，还**必须**
+    /// 包含 `DESKTOP_JOURNALPLAYBACK`，否则 `SetThreadDesktop` 会成功但 `SendInput`
+    /// 全部返回 `ERROR_ACCESS_DENIED`。**不要**改成 `GENERIC_ALL`——在非 SYSTEM 的
+    /// 调用者上它在安全桌面上会失败，而我们希望失败信息尽可能精确。
     ///
     /// # Errors
     ///
@@ -113,16 +140,12 @@ impl InputDesktop {
     /// 返回 `ERROR_ACCESS_DENIED`(5)，那正是「必须有 SYSTEM 服务」的实证，探针要把
     /// 这个码原样记进报告。
     pub fn open() -> crate::WinResult<Self> {
-        use windows_sys::Win32::System::StationsAndDesktops::{
-            OpenInputDesktop, DESKTOP_ENUMERATE, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP,
-            DESKTOP_WRITEOBJECTS,
-        };
+        use windows_sys::Win32::System::StationsAndDesktops::OpenInputDesktop;
 
-        let access =
-            DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP | DESKTOP_ENUMERATE;
         // SAFETY: 三个参数都是标量语义：dwFlags 必须为 0，fInherit = FALSE（不继承），
-        // dwDesiredAccess 是上面那几个位的或。无指针参数。
-        let handle = unsafe { OpenInputDesktop(0, 0, access) };
+        // dwDesiredAccess 见 [`INPUT_DESKTOP_ACCESS`]（含 `DESKTOP_JOURNALPLAYBACK`，
+        // 少了它 `SendInput` 会返回 ACCESS_DENIED）。无指针参数。
+        let handle = unsafe { OpenInputDesktop(0, 0, INPUT_DESKTOP_ACCESS) };
         let handle = crate::handle::require_handle("OpenInputDesktop", handle)?;
         let name = window_object_name(handle).unwrap_or_default();
         let kind = DesktopKind::from_name(&name);
@@ -357,5 +380,22 @@ mod tests {
         ] {
             assert_eq!(DesktopKind::from_name(kind.as_str()), kind, "{kind:?}");
         }
+    }
+
+    /// 机械锁：`SendInput` 需要桌面句柄带 `DESKTOP_JOURNALPLAYBACK`。
+    ///
+    /// 真机实测（Windows 11，普通用户，默认桌面）：`OpenInputDesktop` + `SetThreadDesktop`
+    /// 只要少了这一位就会**成功挂载**，但随后每个 `SendInput` 都返回
+    /// `ERROR_ACCESS_DENIED`(5)。把它「精简」掉会让实例模式的键鼠静默失效。
+    #[cfg(all(test, windows))]
+    #[test]
+    fn access_includes_journal_playback() {
+        use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_JOURNALPLAYBACK;
+        assert_ne!(
+            super::INPUT_DESKTOP_ACCESS & DESKTOP_JOURNALPLAYBACK,
+            0,
+            "少了 DESKTOP_JOURNALPLAYBACK：SetThreadDesktop 会成功，但 SendInput 恒返回 \
+             ERROR_ACCESS_DENIED"
+        );
     }
 }

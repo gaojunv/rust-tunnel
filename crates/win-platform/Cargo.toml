@@ -2,7 +2,7 @@
 name = "rust-tunnel-win-platform"
 # 与 `crates/client-gui` 同一条发布列车：服务端门控比对的是 `CARGO_PKG_VERSION`，
 # 而本 crate 与承载客户端身份的 GUI 实例是同版本一起下发的，抬版必须同步。
-version = "0.11.0"
+version = "0.12.1"
 edition = "2021"
 description = "rust-tunnel Windows platform layer: secure-desktop capture/inject, session/token launch, service control"
 license = "MIT OR Apache-2.0"
