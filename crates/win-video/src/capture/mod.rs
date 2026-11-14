@@ -5,6 +5,9 @@
 //! - [`enumerate_monitors`]：枚举显示器，返回稳定序号、尺寸、主屏标志与 HMONITOR。
 //! - [`CaptureSource`]：一次打开、反复采帧；[`CaptureSource::capture`] 返回
 //!   **自顶向下 BGRA8**（WGC/DXGI 的原生格式，避免每帧一次通道交换）。
+//! - 采集帧**不含鼠标光标**：WGC 的光标捕获已显式关闭，DXGI Desktop Duplication
+//!   与 GDI `BitBlt` 本来就不画光标。控制端窗口用本机系统光标作为唯一指针，
+//!   避免帧内远端光标与本机光标并存造成「双光标」。
 //! - [`open_best`]：按 WGC → DXGI 的顺序尝试，返回实际后端；两个后端都失败时
 //!   错误信息里同时带上两侧的原因。
 //!
@@ -13,8 +16,9 @@
 //!
 //! # 无新帧策略
 //!
-//! WGC 只在画面/光标变化时交付新帧，DXGI 的 `AcquireNextFrame` 在桌面静止时
-//! 返回 `DXGI_ERROR_WAIT_TIMEOUT`。两者都**不把「没有新帧」当错误**：
+//! WGC 只在画面变化时交付新帧（光标不参与采集，它的移动不会再产生新帧），DXGI
+//! 的 `AcquireNextFrame` 在桌面静止时返回 `DXGI_ERROR_WAIT_TIMEOUT`。两者都
+//! **不把「没有新帧」当错误**：
 //!
 //! - 首帧最多等 [`FIRST_FRAME_TIMEOUT`]（2 秒），拿不到才报错；
 //! - 之后每次最多等 [`NEXT_FRAME_POLL_TIMEOUT`]（10 毫秒），超时就返回**上一帧**

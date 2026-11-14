@@ -178,10 +178,15 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         .CreateCaptureSession(&item)
         .map_err(|err| WinVideoError::Capture(format!("CreateCaptureSession 失败: {err}")))?;
 
-    // 光标与边框是可选能力：老系统上对应接口不可用，失败不影响采集。
-    if let Err(err) = session.SetIsCursorCaptureEnabled(true) {
-        tracing::debug!(error = %err, "WGC 无法启用光标捕获（继续）");
+    // 显式关闭帧内光标：控制端窗口只显示本机系统光标，帧内再画一个远端光标就会
+    // 出现两个指针（且远端光标还会因采集与网络延迟拖尾）。本模块没有光标形状
+    // 通道，把光标留在帧内除了「可见」没有任何好处，故不捕获。
+    // 该接口在老系统上可能不可用；失败时维持 WGC 默认的「不捕获」，与目标一致，
+    // 因此只记 debug。
+    if let Err(err) = session.SetIsCursorCaptureEnabled(false) {
+        tracing::debug!(error = %err, "WGC 无法显式关闭光标捕获（维持默认不捕获）");
     }
+    // 边框同属可选能力：老系统上接口不可用时失败不影响采集。
     if let Err(err) = session.SetIsBorderRequired(false) {
         tracing::debug!(error = %err, "WGC 无法禁用捕获边框（继续）");
     }
