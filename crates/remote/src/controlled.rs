@@ -17,6 +17,12 @@
 //! 出口只能放在**编码之前**——输出队列满就跳过这一帧（等价于降帧率，语义合法），绝不在编码之后
 //! 丢弃。**不要把这条改成「编码后丢弃」，那不是优化，是花屏。**
 //!
+//! 但「静止就不发」不能是绝对的。变化检测是**点采样**网格、存在盲区；编码前的背压出口、
+//! 采集看门狗作废结果（此时 `changed` 水位已经推进）也会让「变化确实发生了」却一帧都没
+//! 发出去。故静止时仍按 [`UNCHANGED_RESEND_INTERVAL`]（250 ms）补编一帧**普通 P 帧**作为
+//! 保活——它只绕过「无变化就跳过」这一道闸门，**不会带出 IDR**。少了它，用户看到的是
+//! 「远端静止一段时间后，第一次变化要反复几次才出现」。
+//!
 //! # QoS 闭环（阶段 3）
 //!
 //! 主循环持有 [`RateController`]（AIMD）：每收到一条控制器的 `QosFeedback` 就决策一次，把新的
@@ -109,6 +115,20 @@ pub const CAPTURE_WATCHDOG: Duration = Duration::from_secs(10);
 /// （portal 正忙）只丢一帧并重建基线，连续卡死才终止会话、把原因交给 UI 显示。
 const MAX_CAPTURE_TIMEOUTS: u32 = 3;
 
+/// 静止画面下**保活补编**的最大间隔。
+///
+/// 「无变化就跳过」的闸门有几处真实盲区，任何一处都会让一次已发生的变化**一帧都没发出去**：
+/// - 采集层的像素级检测是**点采样**网格（见 `win-video` 的 `capture::change`），小面积变化
+///   可能整个落在采样点之间；
+/// - 变化确实检测到了，但出站队列当时是满的，编码前的背压出口把这一帧跳过了；
+/// - 采集结果被看门狗判定丢失时，`changed` 的水位已经推进到「已看过」，同一画面不会再被
+///   当成新变化。
+///
+/// 所以静止时也要定期补编一帧：**普通 P 帧、不请求 IDR**，把「变化发生 → 控制器看到画面」
+/// 的延迟上界压到 250 ms。代价可忽略：QSV/NVENC 实测静止 P 帧约 3 KB，4 fps ≈ 12 KB/s
+/// ≈ 50 kbps。
+pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_millis(250);
+
 /// 被控端会话配置。
 #[derive(Debug, Clone)]
 pub struct ControlledConfig {
@@ -130,6 +150,11 @@ pub struct ControlledConfig {
     /// 做成字段而非直接读常量，是为了让测试用极短的值验证「采集 panic/挂死之后仍能恢复」，
     /// 生产路径统一传 [`CAPTURE_WATCHDOG`]。
     pub capture_watchdog: Duration,
+    /// 静止画面下保活补编的最大间隔（见 [`UNCHANGED_RESEND_INTERVAL`]）。
+    ///
+    /// 做成字段而非直接读常量，是为了让测试用 `Duration::ZERO` 锁住「保活补编不会被
+    /// 去重闸门吃掉」；生产路径统一传 [`UNCHANGED_RESEND_INTERVAL`]。
+    pub unchanged_resend: Duration,
     /// 统计数据上报句柄（延迟读数）；无管理端时用 [`SessionStatsReporter::noop`]。
     pub stats: SessionStatsReporter,
     /// 可选的 H.264 编码器工厂（通常由 `crates/win-video` 注入）。
@@ -364,6 +389,7 @@ pub async fn run_controlled(
         config.stats.clone(),
         codec,
         encoder_factory,
+        config.unchanged_resend,
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -957,11 +983,15 @@ impl EncodeStatsWindow {
 ///
 /// # 丢弃策略（**改动前先读模块文档**）
 ///
-/// - **静止画面完全不喂编码器**：CPU 路径与上一帧原始 RGBA 逐字节相同、GPU 路径由采集层
+/// - **静止画面默认不喂编码器**：CPU 路径与上一帧原始 RGBA 逐字节相同、GPU 路径由采集层
 ///   的**像素级**变化检测报告「内容没变」（[`RawFrame::changed`] 为 `false`）时直接跳过——
 ///   不转换、不编码、不发送。这是带宽趋零的唯一来源：GPU 路径只看「有没有新合成帧」是不够的
 ///   （WGC 在静止桌面上仍按刷新节奏产帧），所以平台采集源会在拿到新帧后再做一次
-///   128×72 下采样 + 回读比较（见 `win-video` 的 `capture::change`）。
+///   320×180 下采样 + 回读比较（见 `win-video` 的 `capture::change`）。
+/// - **静止时也不是永远不发**：距上次真正编码超过 `unchanged_resend` 就补编一帧。检测有盲区
+///   （点采样），编码前的背压出口与采集看门狗也会让「已检测到的变化」一帧都没发出去；
+///   没有这条保活，用户看到的是「远端静止一段时间后，第一次变化要反复几次才出现」。
+///   **补编只绕过「无变化就跳过」这一道闸门，`force` 语义不变，因此绝不会带出 IDR。**
 /// - **输出队列满 → 在编码之前跳过这一帧**（等价降帧率）。**绝不**先编码再丢弃：时域编码的
 ///   参考链是串起来的，丢掉一个已编码的 P 帧会让后续引用它的帧在解码端永远解不出来。
 ///
@@ -982,6 +1012,7 @@ async fn encode_loop(
     stats: SessionStatsReporter,
     codec: CodecId,
     encoder_factory: Arc<dyn VideoEncoderFactory>,
+    unchanged_resend: Duration,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -998,6 +1029,8 @@ async fn encode_loop(
     let mut pending_keyframe = false;
     let mut seq: u64 = 0;
     let mut window = EncodeStatsWindow::new();
+    // 上一次**真正编码**（含空包）的时刻：静止保活补编的水位（见 [`UNCHANGED_RESEND_INTERVAL`]）。
+    let mut last_encode: Option<Instant> = None;
 
     while let Some(job) = rx.recv().await {
         if cancel.is_cancelled() {
@@ -1046,10 +1079,15 @@ async fn encode_loop(
         }
         let force = force_keyframe || geometry_changed || pending_keyframe;
 
+        // 静止保活：距上次真正编码超过 `unchanged_resend` 就补一帧。它只绕过下面的
+        // 「无变化就跳过」闸门——**不**参与 `force` 的计算，所以补编永远是普通 P 帧，
+        // 不会像 `force` 那样带出 IDR（QoS 每秒动一次就插 IDR 是专门修掉的回归）。
+        let resend_due = last_encode.is_none_or(|at| at.elapsed() >= unchanged_resend);
+
         // 静止画面：完全不喂编码器（不转换、不编码、不发送）。
         // `force`（首帧/切显示器/切档位/RequestKeyframe/几何变化）为真时必须照常编码，
         // 否则控制器 `NO_FRAME_TIMEOUT` 要的 IDR 会被这里吞掉。
-        if !force && unchanged {
+        if !force && unchanged && !resend_due {
             window.record_skip();
             continue;
         }
@@ -1097,6 +1135,9 @@ async fn encode_loop(
         match result {
             Ok(packet) => {
                 encoder = Some(enc);
+                // 任何一次成功的编码都推进保活水位（**包括空包**）：否则编码器持续吐空包时
+                // 会变成每拍重试，保活间隔形同虚设。
+                last_encode = Some(Instant::now());
                 // GPU 帧没有 CPU 像素可留作去重基准；置 `None` 让下一帧照常编码。
                 prev_rgba = if is_gpu { None } else { Some(frame.rgba) };
                 // `force` 为真时本帧必是 IDR，请求已被满足。
@@ -1536,6 +1577,7 @@ mod tests {
             pending,
             encode: EncodeOptions::default(),
             capture_watchdog,
+            unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
         }
@@ -1875,6 +1917,7 @@ mod tests {
             SessionStatsReporter::noop(),
             CodecId::Vp9,
             vp9_encoder_factory(),
+            UNCHANGED_RESEND_INTERVAL,
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -1941,6 +1984,7 @@ mod tests {
             SessionStatsReporter::noop(),
             CodecId::Vp9,
             vp9_encoder_factory(),
+            UNCHANGED_RESEND_INTERVAL,
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -2061,6 +2105,7 @@ mod tests {
             SessionStatsReporter::noop(),
             CodecId::H264,
             Arc::new(FakeH264EncoderFactory),
+            UNCHANGED_RESEND_INTERVAL,
         ));
 
         job_tx
@@ -2120,6 +2165,7 @@ mod tests {
             SessionStatsReporter::noop(),
             CodecId::Vp9,
             vp9_encoder_factory(),
+            UNCHANGED_RESEND_INTERVAL,
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -2194,6 +2240,8 @@ mod tests {
             SessionStatsReporter::noop(),
             CodecId::H264,
             Arc::new(FakeH264EncoderFactory),
+            // 语义锁：间隔足够大时「无变化就跳过」必须保持原语义（本用例不断言保活）。
+            Duration::from_secs(3600),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -2250,6 +2298,71 @@ mod tests {
             is_keyframe(&out_rx.recv().await.expect("应收到强制帧")),
             "force=true 时即使无变化也必须产出 IDR"
         );
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
+    /// **保活不变量**：`unchanged_resend = 0` 时，连续多帧 `changed == false` 也必须每帧
+    /// 都编码发送，且都是普通 P 帧。
+    ///
+    /// 锁住两件事：① 保活补编不能被「无变化就跳过」的去重闸门吃掉（否则 250 ms 的延迟
+    /// 上界只是纸面数字）；② 补编**不请求 IDR**——`force` 的语义不变，QoS 每秒动一次
+    /// 就插 IDR 是之前专门修掉的回归。
+    #[tokio::test]
+    async fn unchanged_gpu_frames_are_resent_when_interval_is_zero() {
+        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+            CodecId::H264,
+            Arc::new(FakeH264EncoderFactory),
+            Duration::ZERO,
+        ));
+        let rates = EncodeRates::ceiling(EncodeOptions::default());
+        let gpu_job = |changed: bool, force: bool| EncodeJob {
+            display: 0,
+            rates,
+            force_keyframe: force,
+            capture_us: 0,
+            frame: RawFrame {
+                display: 0,
+                width: 64,
+                height: 48,
+                rgba: Vec::new(),
+                gpu: Some(Arc::new(DummyGpuFrame)),
+                changed,
+            },
+        };
+
+        // 首帧建立参考链。
+        job_tx.send(gpu_job(true, true)).await.expect("投递首帧");
+        assert!(
+            matches!(
+                out_rx.recv().await,
+                Some(WriterMsg::Frame(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. }))
+            ),
+            "首帧前应先下发 ScreenConfig"
+        );
+        assert!(is_keyframe(&out_rx.recv().await.expect("应收到首帧")));
+
+        // 连续三帧「无变化、未强制」：每一帧都必须被补编发送，且都不得是 IDR。
+        for index in 0..3 {
+            job_tx
+                .send(gpu_job(false, false))
+                .await
+                .expect("投递静止 GPU 帧");
+            let (flags, ..) = next_video(&mut out_rx).await;
+            assert_eq!(
+                flags & VIDEO_FLAG_KEYFRAME,
+                0,
+                "第 {index} 帧保活补编必须是普通 P 帧（不得带出 IDR）"
+            );
+        }
 
         drop(job_tx);
         let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");

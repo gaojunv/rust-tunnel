@@ -6,7 +6,9 @@
 use crate::approval::ApprovalPolicy;
 use crate::auth::PendingSessions;
 use crate::controller::{run_controller, ControllerConfig};
-use crate::controlled::{run_controlled, ControlledConfig, CAPTURE_WATCHDOG};
+use crate::controlled::{
+    run_controlled, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
+};
 use crate::transfer::{TransferEvent, TransferHub};
 use crate::error::{RemoteError, RemoteResult};
 use crate::manager::{RemoteManager, RemoteManagerConfig, SessionState};
@@ -639,6 +641,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         pending,
         encode: EncodeOptions::default(),
         capture_watchdog: CAPTURE_WATCHDOG,
+        unchanged_resend: UNCHANGED_RESEND_INTERVAL,
         stats: SessionStatsReporter::noop(),
         h264_encoder_factory: None,
     };
@@ -714,6 +717,7 @@ async fn correct_token_completes_handshake_and_streams() {
             pending,
             encode: EncodeOptions::default(),
             capture_watchdog: CAPTURE_WATCHDOG,
+            unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
         },
@@ -1381,6 +1385,7 @@ async fn handshake_against_unregistered_token(
             pending,
             encode: EncodeOptions::default(),
             capture_watchdog: CAPTURE_WATCHDOG,
+            unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
         },

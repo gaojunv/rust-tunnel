@@ -77,7 +77,7 @@ pub struct RawFrame {
     /// 采集层是否判定画面**有可见变化**（默认 `true`）。
     ///
     /// GPU 路径由平台采集源填：Windows 的 WGC/DXGI 后端会在拿到新帧后做一次
-    /// **像素级**检测（VideoProcessor 缩到 128×72 + staging 回读比较，约 0.7–1.0 ms），
+    /// **像素级**检测（VideoProcessor 缩到 320×180 + staging 回读比较，4K 约 0.36 ms），
     /// 内容确实没变时给 `false`，编码循环据此跳过这一拍——这是「静止桌面不编码」的
     /// 来源（只看「有没有新合成帧」不够：WGC 在静止桌面上仍按刷新节奏产帧）。
     /// 检测器不可用时保守给 `true`。CPU 路径恒为 `true`，仍靠逐字节 memcmp 去重。

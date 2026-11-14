@@ -248,7 +248,7 @@ impl WinVideoScreen {
     ///
     /// 同时把采集层的**像素级**变化判断填进 [`RawFrame::changed`]，引擎据此跳过内容
     /// 确实没变的那一拍（CPU 路径仍靠 memcmp）。采集后端会先过滤「没有新帧」的超时拍，
-    /// 再做 128×72 下采样 + 回读比较——只看「有没有新合成帧」不够，WGC 在静止桌面上
+    /// 再做 320×180 下采样 + 回读比较——只看「有没有新合成帧」不够，WGC 在静止桌面上
     /// 仍按刷新节奏产帧。
     fn capture_gpu_frame(&self, display_id: u32) -> RemoteResult<RawFrame> {
         let (captured, changed) = match self.with_source(display_id, |source| {

@@ -10,15 +10,29 @@
 //! # 做法与代价
 //!
 //! 用 `ID3D11VideoProcessor` 把采集到的 BGRA 纹理缩到 [`GRID_WIDTH`]×[`GRID_HEIGHT`]
-//! 的 NV12（VideoProcessor 内部按盒式平均，一帧内容被压进一万多个格点），再拷到
-//! staging 纹理 `Map` 读回，与上一帧逐字节比较。4K 桌面实测 **~1.0 ms/帧**
-//! （Blt + 拷贝 + Map + 比较），编码耗时不受影响。
+//! 的 NV12，再拷到 staging 纹理 `Map` 读回，与上一帧逐字节比较。4K 桌面实测
+//! **0.36 ms/帧**（Blt + 拷贝 + Map + 比较），编码耗时不受影响。
+//!
+//! **网格密度直接决定检出率，因为 VideoProcessor 在大比例缩小时是点采样**：它默认
+//! 不做线性滤波（`D3D11_VIDEO_PROCESSOR_FILTER_*` 里也没有可用的线性项），所以一个
+//! 网格点只对应源帧里的少数几个采样位置，而**不是**一小块区域的平均值。本机在 4K
+//! 帧上用真实 D3D11 VideoProcessor 实测（同一份代码，只改网格尺寸）：
+//!
+//! - 128×72（采样密度 1/900）：16×16 的白块只有 5–6/12 次被看到，1×1 只有 2/12；
+//! - 320×180：密度提高 4 倍，16×16 → 12/12、8×8 → 9/12，而**单次检测耗时不变**
+//!   （0.362 → 0.367 ms）；
+//! - 960×540：4×4 → 12/12，但耗时涨到 0.866 ms——再往上就是拿帧时间换密度。
+//!
+//! 所以取 320×180：显著压低「微小变化漏检」的概率，又不拖慢采集节拍。残余盲区由
+//! 引擎侧的**保活补编**兜底（`crates/remote` 的 `UNCHANGED_RESEND_INTERVAL`，静止时
+//! 每 250 ms 仍补一帧）。
 //!
 //! # 判据
 //!
 //! 任一格点的 |Δ| 超过 [`PIXEL_DELTA`] 即判「有变化」。**刻意不做聚合阈值**：终端
 //! 字符光标的闪烁只影响 1 个格点，但它是真实内容变化，漏掉会让控制器看起来像卡死。
-//! 实测静止画面 124/150 帧完全为 0 差异，光标闪烁类变化是 1–20 个格点，两类分得很开。
+//! 静止画面在相同输入下是**精确的 0 差异**（点采样是确定性的），光标闪烁类变化会落在
+//! 少数格点上，两类分得很开。
 //!
 //! # 失败语义
 //!
@@ -49,16 +63,22 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 
-/// 变化检测使用的网格宽度（像素）。偶数（4:2:0 要求），且足够大以分辨一个字符光标。
-const GRID_WIDTH: u32 = 128;
+/// 变化检测使用的网格宽度（像素）。偶数（4:2:0 要求）。
+///
+/// 320×180 是按实测选的：VideoProcessor 大比例缩小时是**点采样**，网格越稀，
+/// 小面积变化漏检的概率越高。128×72 在 4K 屏上只抽 1/900 的像素，16×16 的变化
+/// 只有约一半概率被看到；320×180 把采样密度提到 4 倍而**检测耗时不变**（4K 实测
+/// 0.36 ms），960×540 才会明显变贵（0.87 ms）。
+const GRID_WIDTH: u32 = 320;
 
-/// 变化检测使用的网格高度（像素）。
-const GRID_HEIGHT: u32 = 72;
+/// 变化检测使用的网格高度（像素）。偶数（4:2:0 要求），与 [`GRID_WIDTH`] 保持 16:9。
+const GRID_HEIGHT: u32 = 180;
 
 /// 判定「有变化」的单像素差阈值（8 位）。
 ///
-/// 取 3 而不是 1：VideoProcessor 的缩放可能带来 ±1–2 的确定性噪声；3 以上只可能是内容
-/// 差异。实测静止画面在这种判据下是**精确的 0 差异**。
+/// 取 3 而不是 1：**静态画面在相同输入下是精确的 0 差异**（点采样是确定性的），
+/// 这点抖动余量只留给缩放器/颜色空间转换在驱动间可能引入的 ±1–2；3 以上只可能是
+/// 内容差异。
 const PIXEL_DELTA: u8 = 3;
 
 /// 输入视图缓存上限（采集纹理池是 4 张，池重建的过渡期再留一倍余量）。
@@ -451,4 +471,165 @@ fn create_texture(
 const _: () = assert!(GRID_WIDTH.is_multiple_of(2));
 const _: () = assert!(GRID_HEIGHT.is_multiple_of(2));
 const _: () = assert!(PIXEL_DELTA > 2);
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use std::sync::Arc;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+    /// 测试帧尺寸：4K 是采样密度最稀的一端，也是现场反馈的来源。
+    const FRAME_WIDTH: u32 = 3840;
+    /// 测试帧高度。
+    const FRAME_HEIGHT: u32 = 2160;
+    /// 现场「看不到」的最小变化量级（微信/QQ 消息闪动、细小选区）。
+    const BLOCK_SIZE: u32 = 16;
+
+    /// 纯色底（BGRA，alpha 恒为 255）。
+    fn base_pixels() -> Vec<u8> {
+        let len = usize::try_from(FRAME_WIDTH * FRAME_HEIGHT * 4)
+            .expect("3840×2160×4 应能放进 usize");
+        let mut pixels = vec![0_u8; len];
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[0x20, 0x40, 0x80, 0xFF]);
+        }
+        pixels
+    }
+
+    /// 在纯色底上画一个 16×16 白块。
+    fn block_pixels(left: u32, top: u32) -> Vec<u8> {
+        let mut pixels = base_pixels();
+        for y in top..top + BLOCK_SIZE {
+            for x in left..left + BLOCK_SIZE {
+                let offset = usize::try_from((y * FRAME_WIDTH + x) * 4)
+                    .expect("像素偏移应能放进 usize");
+                pixels[offset..offset + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+            }
+        }
+        pixels
+    }
+
+    /// 用初始数据创建一张 4K BGRA 纹理。
+    ///
+    /// 必须带 `RENDER_TARGET | SHADER_RESOURCE`：`CreateVideoProcessorInputView`
+    /// 不接受没有任何绑定标志的纹理。
+    fn create_texture(device: &ID3D11Device, pixels: &[u8]) -> Option<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: FRAME_WIDTH,
+            Height: FRAME_HEIGHT,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: u32::try_from(
+                D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0,
+            )
+            .unwrap_or(0),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: FRAME_WIDTH * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: `desc`/`init` 指向本栈帧，`pixels` 在调用期间存活；输出指针有效。
+        unsafe {
+            device.CreateTexture2D(&raw const desc, Some(&raw const init), Some(&raw mut texture))
+        }
+        .ok()?;
+        texture
+    }
+
+    /// 把自建纹理包成采集层的 [`CapturedTexture`]。
+    fn captured(device: &Arc<D3d11>, texture: ID3D11Texture2D) -> CapturedTexture {
+        CapturedTexture::from_texture(Arc::clone(device), texture, 0, FRAME_WIDTH, FRAME_HEIGHT)
+    }
+
+    /// CI 的 Windows runner 可能只有 WARP：设备建不起来就跳过，不 panic。
+    fn hardware_device() -> Option<Arc<D3d11>> {
+        match crate::d3d11::create(None) {
+            Ok(device) => Some(Arc::new(device)),
+            Err(err) => {
+                eprintln!("跳过变化检测测试：没有可用的 D3D11 硬件适配器（{err}）");
+                None
+            }
+        }
+    }
+
+    /// 同一张纹理连续两次：第一次没有基准 → `true`，第二次必须 `false`。
+    ///
+    /// 后半句是「静止闸门」的定义：若这里为 `true`，静止桌面会退回每拍编码。
+    #[test]
+    fn unchanged_frame_is_not_reported_as_changed() {
+        let Some(device) = hardware_device() else {
+            return;
+        };
+        let Some(texture) = create_texture(&device.device, &base_pixels()) else {
+            eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+            return;
+        };
+        let frame = captured(&device, texture);
+        let Ok(mut detector) = ChangeDetector::new(&device, &frame) else {
+            eprintln!("跳过变化检测测试：本端不支持 VideoProcessor 变化检测");
+            return;
+        };
+        assert!(detector.changed(&frame), "首帧没有基准，必须判为有变化");
+        assert!(
+            !detector.changed(&frame),
+            "同一张纹理连续两次必须是「无变化」（否则静止闸门失效）"
+        );
+    }
+
+    /// 4K 帧上贴着边缘的 16×16 变化必须被检出（四角 + 中心）。
+    ///
+    /// 这条同时锁住「缩放的 source/dest rect 必须覆盖整帧」——角上的块最容易被
+    /// 裁剪/采样边界漏掉。128×72 的旧网格在 4K 上只会随机看到其中一部分。
+    #[test]
+    fn tiny_blocks_near_frame_edges_are_detected() {
+        let Some(device) = hardware_device() else {
+            return;
+        };
+        let Some(base_texture) = create_texture(&device.device, &base_pixels()) else {
+            eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+            return;
+        };
+        let base = captured(&device, base_texture);
+
+        let positions = [
+            (0, 0),
+            (FRAME_WIDTH - BLOCK_SIZE, 0),
+            (0, FRAME_HEIGHT - BLOCK_SIZE),
+            (FRAME_WIDTH - BLOCK_SIZE, FRAME_HEIGHT - BLOCK_SIZE),
+            (FRAME_WIDTH / 2, FRAME_HEIGHT / 2),
+        ];
+        for (left, top) in positions {
+            let Some(texture) = create_texture(&device.device, &block_pixels(left, top)) else {
+                eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+                return;
+            };
+            let changed_frame = captured(&device, texture);
+            let Ok(mut detector) = ChangeDetector::new(&device, &base) else {
+                eprintln!("跳过变化检测测试：本端不支持 VideoProcessor 变化检测");
+                return;
+            };
+            // 第一帧建立基准（首帧恒为 `true`），第二帧才是真正的比较。
+            assert!(detector.changed(&base));
+            assert!(
+                detector.changed(&changed_frame),
+                "16×16 的变化在 ({left}, {top}) 漏检（检查网格密度与缩放矩形是否覆盖整帧）"
+            );
+        }
+    }
+}
 
