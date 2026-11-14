@@ -94,8 +94,8 @@ impl ClipboardSync {
 
 /// 是否值得自动同步：非空、含至少一个非控制字符、且不超过 [`MAX_SYNC_BYTES`]。
 ///
-/// 「含非控制字符」这一条与 [`crate::remote::InputGate::text`] 同源：纯控制字符（如从终端
-/// 复制的一串 `\x1b` 转义）同步过去没有意义。
+/// 「含非控制字符」这一条与键盘转发侧同源：纯控制字符（如从终端复制的一串 `\x1b` 转义）
+/// 同步过去没有意义。
 fn is_syncable(text: &str) -> bool {
     !text.is_empty() && text.len() <= MAX_SYNC_BYTES && text.chars().any(|c| !c.is_control())
 }

@@ -139,12 +139,12 @@ fn button_of(index: u8) -> MouseButton {
 /// 按住某个键/鼠标键，远端（以及本机桌面）就会**永久**卡住它。故这里跟踪按下集合，
 /// 在切换/结束时补发一次「全部抬起」。
 ///
-/// 只跟踪**有配对抬起**的事件：`InputEvent::Key` 里 `code != TEXT` 的特殊键与修饰键，
-/// 以及鼠标键。文本键（[`keycode::TEXT`]）是「点按」语义（注入侧展开成按下+抬起），
-/// 没有配对抬起，不进集合。
+/// 只跟踪**有配对抬起**的事件：`InputEvent::Key` 里 `code != TEXT` 的键（特殊键、修饰键与
+/// 可打印键都算——可打印键同样按「按下+抬起」配对转发），以及鼠标键。文本键
+/// （[`keycode::TEXT`]，遗留语义）是「点按」（注入侧展开成按下+抬起）、没有配对抬起，不进集合。
 #[derive(Debug, Default)]
 pub struct HeldInputs {
-    /// 跨平台键码（只含特殊键/修饰键）。
+    /// 跨平台键码（特殊键/修饰键/可打印键；不含遗留的 `TEXT`）。
     keys: BTreeSet<u32>,
     /// 鼠标键下标（见 [`button_index`]）。
     buttons: BTreeSet<u8>,
@@ -395,6 +395,8 @@ mod tests {
     }
 
     /// 文本键（`TEXT`）是「点按」语义、没有配对抬起，不进按下集合。
+    ///
+    /// 这是**遗留**语义：新控制器不再发送 `TEXT`（可打印键改走键码，见下一条测试）。
     #[test]
     fn text_keys_are_not_tracked() {
         let mut held = HeldInputs::default();
@@ -406,6 +408,28 @@ mod tests {
         }));
         assert!(held.is_empty(), "文本键不该进按下集合");
         assert!(held.release_all().is_empty());
+    }
+
+    /// 可打印键（字母/数字/标点）现在是**有配对抬起**的普通键码：按下进集合，会话被硬切断时
+    /// `release_all` 要能补发抬起，否则远端会一直按着那个字母。
+    #[test]
+    fn printable_keys_are_tracked_and_released() {
+        let mut held = HeldInputs::default();
+        let letter = keycode::LETTER_A + 2; // C
+        held.observe(&key_down(letter));
+        held.observe(&key_down(keycode::DIGIT_0));
+        held.observe(&key_down(keycode::SEMICOLON));
+        assert!(!held.is_empty());
+        // 正常抬起其中一个：不会被重复补发。
+        held.observe(&key_up(keycode::DIGIT_0));
+        let releases = held.release_all();
+        assert!(releases.contains(&key_up(letter)), "{releases:?}");
+        assert!(releases.contains(&key_up(keycode::SEMICOLON)), "{releases:?}");
+        assert!(
+            !releases.contains(&key_up(keycode::DIGIT_0)),
+            "已抬起过的键不该被重复补发：{releases:?}"
+        );
+        assert!(held.is_empty());
     }
 
     /// 鼠标三个键各自独立跟踪，且下标映射可往返。

@@ -254,12 +254,19 @@ impl rust_tunnel_remote::Clipboard for SystemClipboard {
 //
 // 控制器侧（egui 捕获）与被控端（enigo 注入）必须共用同一套 `code` 语义，因为
 // `rust_tunnel_remote::KeyEvent.code` 只约定「由上层约定」。此处定义：
-// - `TEXT`：可打印文本，键值由 `KeyEvent.text` 承载；
+// - 可打印键（字母/数字/标点）也发**键码事件**（按下+抬起配对），由被控端映射成
+//   Windows VK / macOS CGKeyCode / Linux keysym 注入——最终字符由**被控端**的键盘布局
+//   与输入法决定，而不是控制器算好的 Unicode 码点；
+// - `TEXT` 是**遗留**语义（`KeyEvent.text` 承载字符），控制器不再发送，被控端保留解码
+//   以兼容旧控制器；
 // - 其余为特殊键/修饰键的稳定编号。
+//
+// 分区（**改动前先看撞号**）：0..=15 特殊键个位段、20..=31 F1..=F12、40..=43 修饰键、
+// 0x100 起字母/数字/标点、0x140 起 F13..=F24。
 
 /// 跨平台键码（控制器编码、被控端解码；见模块注释）。
 pub mod keycode {
-    /// 可打印文本（键值在 `KeyEvent.text` 里）。
+    /// 可打印文本（键值在 `KeyEvent.text` 里）。**遗留**：控制器已不再发送。
     pub const TEXT: u32 = 0;
     /// 回车。
     pub const ENTER: u32 = 1;
@@ -289,7 +296,9 @@ pub mod keycode {
     pub const PAGE_DOWN: u32 = 13;
     /// 空格。
     pub const SPACE: u32 = 14;
-    /// F1（F1..=F12 为连续区间）。
+    /// Insert。
+    pub const INSERT: u32 = 15;
+    /// F1（F1..=F12 为连续区间 20..=31）。
     pub const F1: u32 = 20;
     /// Ctrl。
     pub const CTRL: u32 = 40;
@@ -299,6 +308,41 @@ pub mod keycode {
     pub const ALT: u32 = 42;
     /// Meta / Cmd / Win。
     pub const META: u32 = 43;
+
+    /// 字母 A（`LETTER_A + (b'A'..=b'Z')` 的偏移，0x100..=0x119）。
+    pub const LETTER_A: u32 = 0x100;
+    /// 字母 Z。
+    pub const LETTER_Z: u32 = 0x119;
+    /// 数字 0（`DIGIT_0 + b'0'..=b'9'` 的偏移，0x120..=0x129）。
+    pub const DIGIT_0: u32 = 0x120;
+    /// 数字 9。
+    pub const DIGIT_9: u32 = 0x129;
+    /// `-`。
+    pub const MINUS: u32 = 0x12A;
+    /// `=`。
+    pub const EQUALS: u32 = 0x12B;
+    /// `[`。
+    pub const OPEN_BRACKET: u32 = 0x12C;
+    /// `]`。
+    pub const CLOSE_BRACKET: u32 = 0x12D;
+    /// `\`。
+    pub const BACKSLASH: u32 = 0x12E;
+    /// `;`。
+    pub const SEMICOLON: u32 = 0x12F;
+    /// `'`。
+    pub const QUOTE: u32 = 0x130;
+    /// `` ` ``。
+    pub const BACKTICK: u32 = 0x131;
+    /// `,`。
+    pub const COMMA: u32 = 0x132;
+    /// `.`。
+    pub const PERIOD: u32 = 0x133;
+    /// `/`。
+    pub const SLASH: u32 = 0x134;
+    /// F13（F13..=F24 为连续区间 0x140..=0x14B，与 F1..=F12 分开以免和修饰键撞号）。
+    pub const F13: u32 = 0x140;
+    /// F24。
+    pub const F24: u32 = 0x14B;
 }
 
 /// 修饰键位掩码（与 `KeyEvent.modifiers` 对应）。
@@ -314,6 +358,11 @@ pub mod modifier {
 }
 
 /// 把 egui 修饰键状态编码为位掩码。
+///
+/// **META 只来自 `mac_cmd`，绝不来自 `command`**：egui 的 `command` 在 macOS 上是 ⌘、在
+/// Windows/Linux 上是 Ctrl（`command == ctrl`）。若按 `command` 置 META，Windows 上每敲一次
+/// Ctrl 都会同时给远端按下 Win 键，污染所有 Ctrl 快捷键（且本机键盘根本发不出 Win 键，
+/// 用户无从察觉）。
 #[must_use]
 pub fn egui_modifiers(m: egui::Modifiers) -> u8 {
     let mut bits = 0_u8;
@@ -326,13 +375,23 @@ pub fn egui_modifiers(m: egui::Modifiers) -> u8 {
     if m.shift {
         bits |= modifier::SHIFT;
     }
-    if m.command {
+    if m.mac_cmd {
         bits |= modifier::META;
     }
     bits
 }
 
-/// egui 逻辑键 → 跨平台键码；非特殊键（可打印字符）返回 `None`（走 `TEXT` 路径）。
+/// egui 逻辑键 → 跨平台键码；无法映射的键（egui 的伪键 `Copy`/`Cut`/`Paste`、F25 以上等）
+/// 返回 `None`（静默忽略）。
+///
+/// # 为什么用 `Event::Key.key`（logical-or-physical fallback）而不是 `physical_key`
+///
+/// 远端要的是「按**远端桌面**的布局与输入法输入」。VK / CGKeyCode / keysym 都是**逻辑键**：
+/// 被控端拿它去查**自己**的布局决定字符。用物理位置反而会把控制器的布局强加给远端（同一
+/// 个物理键在两种布局下是不同的字符）——跨布局场景下「按键位」比「按位置」更符合语义。
+///
+/// 上档标点（`:`/`+`/`!` 等）映射到**同一物理键**：Shift 由修饰键事件单独转发，远端按下
+/// Shift + 该键自然得到上档字符。
 #[must_use]
 pub fn egui_key_to_code(key: egui::Key) -> Option<u32> {
     use egui::Key;
@@ -351,6 +410,7 @@ pub fn egui_key_to_code(key: egui::Key) -> Option<u32> {
         Key::PageUp => keycode::PAGE_UP,
         Key::PageDown => keycode::PAGE_DOWN,
         Key::Space => keycode::SPACE,
+        Key::Insert => keycode::INSERT,
         Key::F1 => keycode::F1,
         Key::F2 => keycode::F1 + 1,
         Key::F3 => keycode::F1 + 2,
@@ -363,12 +423,75 @@ pub fn egui_key_to_code(key: egui::Key) -> Option<u32> {
         Key::F10 => keycode::F1 + 9,
         Key::F11 => keycode::F1 + 10,
         Key::F12 => keycode::F1 + 11,
+        // F13..=F24 用独立区间（0x140 起）：否则会与修饰键 40..=43 撞号。
+        Key::F13 => keycode::F13,
+        Key::F14 => keycode::F13 + 1,
+        Key::F15 => keycode::F13 + 2,
+        Key::F16 => keycode::F13 + 3,
+        Key::F17 => keycode::F13 + 4,
+        Key::F18 => keycode::F13 + 5,
+        Key::F19 => keycode::F13 + 6,
+        Key::F20 => keycode::F13 + 7,
+        Key::F21 => keycode::F13 + 8,
+        Key::F22 => keycode::F13 + 9,
+        Key::F23 => keycode::F13 + 10,
+        Key::F24 => keycode::F13 + 11,
+        Key::A => keycode::LETTER_A,
+        Key::B => keycode::LETTER_A + 1,
+        Key::C => keycode::LETTER_A + 2,
+        Key::D => keycode::LETTER_A + 3,
+        Key::E => keycode::LETTER_A + 4,
+        Key::F => keycode::LETTER_A + 5,
+        Key::G => keycode::LETTER_A + 6,
+        Key::H => keycode::LETTER_A + 7,
+        Key::I => keycode::LETTER_A + 8,
+        Key::J => keycode::LETTER_A + 9,
+        Key::K => keycode::LETTER_A + 10,
+        Key::L => keycode::LETTER_A + 11,
+        Key::M => keycode::LETTER_A + 12,
+        Key::N => keycode::LETTER_A + 13,
+        Key::O => keycode::LETTER_A + 14,
+        Key::P => keycode::LETTER_A + 15,
+        Key::Q => keycode::LETTER_A + 16,
+        Key::R => keycode::LETTER_A + 17,
+        Key::S => keycode::LETTER_A + 18,
+        Key::T => keycode::LETTER_A + 19,
+        Key::U => keycode::LETTER_A + 20,
+        Key::V => keycode::LETTER_A + 21,
+        Key::W => keycode::LETTER_A + 22,
+        Key::X => keycode::LETTER_A + 23,
+        Key::Y => keycode::LETTER_A + 24,
+        Key::Z => keycode::LETTER_A + 25,
+        Key::Num0 => keycode::DIGIT_0,
+        Key::Num1 | Key::Exclamationmark => keycode::DIGIT_0 + 1,
+        Key::Num2 => keycode::DIGIT_0 + 2,
+        Key::Num3 => keycode::DIGIT_0 + 3,
+        Key::Num4 => keycode::DIGIT_0 + 4,
+        Key::Num5 => keycode::DIGIT_0 + 5,
+        Key::Num6 => keycode::DIGIT_0 + 6,
+        Key::Num7 => keycode::DIGIT_0 + 7,
+        Key::Num8 => keycode::DIGIT_0 + 8,
+        Key::Num9 => keycode::DIGIT_0 + 9,
+        Key::Minus => keycode::MINUS,
+        Key::Equals | Key::Plus => keycode::EQUALS,
+        Key::OpenBracket | Key::OpenCurlyBracket => keycode::OPEN_BRACKET,
+        Key::CloseBracket | Key::CloseCurlyBracket => keycode::CLOSE_BRACKET,
+        Key::Backslash | Key::Pipe => keycode::BACKSLASH,
+        Key::Semicolon | Key::Colon => keycode::SEMICOLON,
+        Key::Quote => keycode::QUOTE,
+        Key::Backtick => keycode::BACKTICK,
+        Key::Comma => keycode::COMMA,
+        Key::Period => keycode::PERIOD,
+        Key::Slash | Key::Questionmark => keycode::SLASH,
         _ => return None,
     })
 }
 
-/// F1..=F12 对应的 enigo 键（索引 = `code - keycode::F1`）。
-const F_KEYS: [enigo::Key; 12] = [
+/// F1..=F20 对应的 enigo 键（索引 = `code - keycode::F1` 或 `12 + code - keycode::F13`）。
+///
+/// F21..=F24 的 enigo 变体带 `#[cfg(any(windows, unix not macos))]`，不能放进这张全平台表，
+/// 由 [`f_key_extended`] 按平台补。
+const F_KEYS: [enigo::Key; 20] = [
     enigo::Key::F1,
     enigo::Key::F2,
     enigo::Key::F3,
@@ -381,36 +504,93 @@ const F_KEYS: [enigo::Key; 12] = [
     enigo::Key::F10,
     enigo::Key::F11,
     enigo::Key::F12,
+    enigo::Key::F13,
+    enigo::Key::F14,
+    enigo::Key::F15,
+    enigo::Key::F16,
+    enigo::Key::F17,
+    enigo::Key::F18,
+    enigo::Key::F19,
+    enigo::Key::F20,
 ];
 
+/// F1..=F24 的 enigo 键；索引 0..=23 依次对应 F1..=F24。
+fn f_key(index: u32) -> Option<enigo::Key> {
+    F_KEYS
+        .get(usize::try_from(index).ok()?)
+        .copied()
+        .or_else(|| f_key_extended(index))
+}
+
+/// F21..=F24（索引 20..=23）：Windows/Linux 有对应 enigo 变体。
+#[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+fn f_key_extended(index: u32) -> Option<enigo::Key> {
+    Some(match index {
+        20 => enigo::Key::F21,
+        21 => enigo::Key::F22,
+        22 => enigo::Key::F23,
+        23 => enigo::Key::F24,
+        _ => return None,
+    })
+}
+
+/// F21..=F24：macOS 的 enigo 没有这些变体（键盘上也没有这些键），不注入。
+#[cfg(not(any(target_os = "windows", all(unix, not(target_os = "macos")))))]
+fn f_key_extended(_index: u32) -> Option<enigo::Key> {
+    None
+}
+
+/// Insert 的 enigo 键：Windows/Linux 有专门变体，macOS 用 `Other(kVK_Help)`。
+#[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+fn insert_key() -> enigo::Key {
+    enigo::Key::Insert
+}
+
+/// macOS 的 enigo 没有 `Insert` 变体：`kVK_Help`（0x72）就是 Mac 键盘上 Insert 的等价键。
+#[cfg(not(any(target_os = "windows", all(unix, not(target_os = "macos")))))]
+fn insert_key() -> enigo::Key {
+    enigo::Key::Other(0x72)
+}
+
 /// 跨平台键码 → enigo 键；未知码返回 `None`（静默忽略）。
+///
+/// 可打印键（字母/数字/标点）返回 `enigo::Key::Other(raw)`，`raw` 是**目标平台的原生键值**
+/// （见 [`printable_raw`]）。刻意**不用** `enigo::Key::A` 之类的字母变体：它们带
+/// `#[cfg(target_os = "windows")]`，在 macOS 上编译不过。
 #[must_use]
 pub fn code_to_enigo(code: u32) -> Option<enigo::Key> {
     use enigo::Key;
-    Some(match code {
-        keycode::ENTER => Key::Return,
-        keycode::TAB => Key::Tab,
-        keycode::BACKSPACE => Key::Backspace,
-        keycode::ESCAPE => Key::Escape,
-        keycode::DELETE => Key::Delete,
-        keycode::ARROW_LEFT => Key::LeftArrow,
-        keycode::ARROW_RIGHT => Key::RightArrow,
-        keycode::ARROW_UP => Key::UpArrow,
-        keycode::ARROW_DOWN => Key::DownArrow,
-        keycode::HOME => Key::Home,
-        keycode::END => Key::End,
-        keycode::PAGE_UP => Key::PageUp,
-        keycode::PAGE_DOWN => Key::PageDown,
-        keycode::SPACE => Key::Space,
-        keycode::CTRL => Key::Control,
-        keycode::SHIFT => Key::Shift,
-        keycode::ALT => Key::Alt,
-        keycode::META => Key::Meta,
+    match code {
+        keycode::ENTER => Some(Key::Return),
+        keycode::TAB => Some(Key::Tab),
+        keycode::BACKSPACE => Some(Key::Backspace),
+        keycode::ESCAPE => Some(Key::Escape),
+        keycode::DELETE => Some(Key::Delete),
+        keycode::ARROW_LEFT => Some(Key::LeftArrow),
+        keycode::ARROW_RIGHT => Some(Key::RightArrow),
+        keycode::ARROW_UP => Some(Key::UpArrow),
+        keycode::ARROW_DOWN => Some(Key::DownArrow),
+        keycode::HOME => Some(Key::Home),
+        keycode::END => Some(Key::End),
+        keycode::PAGE_UP => Some(Key::PageUp),
+        keycode::PAGE_DOWN => Some(Key::PageDown),
+        keycode::SPACE => Some(Key::Space),
+        keycode::INSERT => Some(insert_key()),
+        keycode::CTRL => Some(Key::Control),
+        keycode::SHIFT => Some(Key::Shift),
+        keycode::ALT => Some(Key::Alt),
+        keycode::META => Some(Key::Meta),
         _ => {
-            let offset = code.checked_sub(keycode::F1)?;
-            *F_KEYS.get(usize::try_from(offset).ok()?)?
+            // F1..=F12（20..=31）与 F13..=F24（0x140..=0x14B）是两段独立的连续区间。
+            if (keycode::F1..=keycode::F1 + 11).contains(&code) {
+                return f_key(code - keycode::F1);
+            }
+            if (keycode::F13..=keycode::F24).contains(&code) {
+                return f_key(12 + (code - keycode::F13));
+            }
+            printable_raw(code).map(Key::Other)
         }
-    })
+    }
 }
 
 /// 跨平台键码 → **Windows 虚拟键码（VK）**；未知码返回 `None`（静默忽略）。
@@ -419,7 +599,8 @@ pub fn code_to_enigo(code: u32) -> Option<enigo::Key> {
 /// 而不是 `enigo` 的键枚举。这张表与 [`code_to_enigo`] 是同一套跨平台键码的两个后端，
 /// 故放在一起、并各有单测（VK 值是手抄的常量，与 `windows-sys` 的常量同名同值）。
 ///
-/// 文本键（[`keycode::TEXT`]）不在表里：它走 `KEYEVENTF_UNICODE`，不受键盘布局影响。
+/// 可打印键也映射成 VK（而不是 `KEYEVENTF_UNICODE`）：VK 是**逻辑键**，由被控端的键盘布局
+/// 与输入法决定最终字符。文本键（[`keycode::TEXT`]）不在表里：那是旧控制器的遗留路径。
 #[cfg_attr(
     not(target_os = "windows"),
     allow(dead_code, reason = "只有 Windows 实例路径（remote::win_desktop）调用它")
@@ -443,39 +624,171 @@ pub fn code_to_vk(code: u32) -> Option<u16> {
     const VK_UP: u16 = 0x26;
     const VK_RIGHT: u16 = 0x27;
     const VK_DOWN: u16 = 0x28;
+    const VK_INSERT: u16 = 0x2D;
     const VK_DELETE: u16 = 0x2E;
     const VK_LWIN: u16 = 0x5B;
     const VK_F1: u16 = 0x70;
+    const VK_F13: u16 = 0x7C;
 
-    match code {
-        keycode::ENTER => Some(VK_RETURN),
-        keycode::TAB => Some(VK_TAB),
-        keycode::BACKSPACE => Some(VK_BACK),
-        keycode::ESCAPE => Some(VK_ESCAPE),
-        keycode::DELETE => Some(VK_DELETE),
-        keycode::ARROW_LEFT => Some(VK_LEFT),
-        keycode::ARROW_RIGHT => Some(VK_RIGHT),
-        keycode::ARROW_UP => Some(VK_UP),
-        keycode::ARROW_DOWN => Some(VK_DOWN),
-        keycode::HOME => Some(VK_HOME),
-        keycode::END => Some(VK_END),
-        keycode::PAGE_UP => Some(VK_PRIOR),
-        keycode::PAGE_DOWN => Some(VK_NEXT),
-        keycode::SPACE => Some(VK_SPACE),
-        keycode::CTRL => Some(VK_CONTROL),
-        keycode::SHIFT => Some(VK_SHIFT),
-        keycode::ALT => Some(VK_MENU),
-        keycode::META => Some(VK_LWIN),
+    let vk = match code {
+        keycode::ENTER => VK_RETURN,
+        keycode::TAB => VK_TAB,
+        keycode::BACKSPACE => VK_BACK,
+        keycode::ESCAPE => VK_ESCAPE,
+        keycode::DELETE => VK_DELETE,
+        keycode::ARROW_LEFT => VK_LEFT,
+        keycode::ARROW_RIGHT => VK_RIGHT,
+        keycode::ARROW_UP => VK_UP,
+        keycode::ARROW_DOWN => VK_DOWN,
+        keycode::HOME => VK_HOME,
+        keycode::END => VK_END,
+        keycode::PAGE_UP => VK_PRIOR,
+        keycode::PAGE_DOWN => VK_NEXT,
+        keycode::SPACE => VK_SPACE,
+        keycode::INSERT => VK_INSERT,
+        keycode::CTRL => VK_CONTROL,
+        keycode::SHIFT => VK_SHIFT,
+        keycode::ALT => VK_MENU,
+        keycode::META => VK_LWIN,
         _ => {
-            // F1..=F12 是连续区间（`VK_F1..=VK_F12`）。
-            let offset = code.checked_sub(keycode::F1)?;
-            if offset < 12 {
-                Some(VK_F1 + u16::try_from(offset).ok()?)
-            } else {
-                None
+            // F1..=F12 是连续区间（`VK_F1..=VK_F12`），F13..=F24 是另一段（`VK_F13..=VK_F24`）。
+            if (keycode::F1..=keycode::F1 + 11).contains(&code) {
+                return Some(VK_F1 + u16::try_from(code - keycode::F1).ok()?);
             }
+            if (keycode::F13..=keycode::F24).contains(&code) {
+                return Some(VK_F13 + u16::try_from(code - keycode::F13).ok()?);
+            }
+            return printable_vk(code);
         }
+    };
+    Some(vk)
+}
+
+/// 可打印键码 → Windows VK（字母 `0x41+idx`、数字 `0x30+idx`，标点用 OEM 键的 VK）。
+fn printable_vk(code: u32) -> Option<u16> {
+    // 字母 A..=Z → VK_A(0x41)..=VK_Z(0x5A)。
+    if (keycode::LETTER_A..=keycode::LETTER_Z).contains(&code) {
+        return Some(0x41 + u16::try_from(code - keycode::LETTER_A).ok()?);
     }
+    // 数字 0..=9 → VK_0(0x30)..=VK_9(0x39)。
+    if (keycode::DIGIT_0..=keycode::DIGIT_9).contains(&code) {
+        return Some(0x30 + u16::try_from(code - keycode::DIGIT_0).ok()?);
+    }
+    Some(match code {
+        keycode::MINUS => 0xBD,          // VK_OEM_MINUS
+        keycode::EQUALS => 0xBB,         // VK_OEM_PLUS
+        keycode::OPEN_BRACKET => 0xDB,   // VK_OEM_4
+        keycode::CLOSE_BRACKET => 0xDD,  // VK_OEM_6
+        keycode::BACKSLASH => 0xDC,      // VK_OEM_5
+        keycode::SEMICOLON => 0xBA,      // VK_OEM_1
+        keycode::QUOTE => 0xDE,          // VK_OEM_7
+        keycode::BACKTICK => 0xC0,       // VK_OEM_3
+        keycode::COMMA => 0xBC,          // VK_OEM_COMMA
+        keycode::PERIOD => 0xBE,         // VK_OEM_PERIOD
+        keycode::SLASH => 0xBF,          // VK_OEM_2
+        _ => return None,
+    })
+}
+
+/// 可打印键码 → **目标平台的原生键值**，供 `enigo::Key::Other` 使用。
+///
+/// `enigo::Key::Other(v)` 的语义按平台不同：Windows 是虚拟键码、macOS 是 `CGKeyCode`、
+/// Linux 是 keysym。故这里按平台分派；不支持的平台返回 `None`（静默忽略）。
+///
+/// Windows 下直接复用 [`code_to_vk`]（实例路径与 enigo 路径共用同一张表）。
+#[cfg(target_os = "windows")]
+fn printable_raw(code: u32) -> Option<u32> {
+    printable_vk(code).map(u32::from)
+}
+
+/// macOS：`CGKeyCode`（Carbon HIToolbox `Events.h` 的 `kVK_*`，手抄常量）。
+#[cfg(target_os = "macos")]
+fn printable_raw(code: u32) -> Option<u32> {
+    // 字母 A..=Z。
+    const LETTERS: [u32; 26] = [
+        0,  // A
+        11, // B
+        8,  // C
+        2,  // D
+        14, // E
+        3,  // F
+        5,  // G
+        4,  // H
+        34, // I
+        38, // J
+        40, // K
+        37, // L
+        46, // M
+        45, // N
+        31, // O
+        35, // P
+        12, // Q
+        15, // R
+        1,  // S
+        17, // T
+        32, // U
+        9,  // V
+        13, // W
+        7,  // X
+        16, // Y
+        6,  // Z
+    ];
+    // 数字 0..=9（主键盘行）。
+    const DIGITS: [u32; 10] = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25];
+
+    if (keycode::LETTER_A..=keycode::LETTER_Z).contains(&code) {
+        let offset = usize::try_from(code - keycode::LETTER_A).ok()?;
+        return LETTERS.get(offset).copied();
+    }
+    if (keycode::DIGIT_0..=keycode::DIGIT_9).contains(&code) {
+        let offset = usize::try_from(code - keycode::DIGIT_0).ok()?;
+        return DIGITS.get(offset).copied();
+    }
+    Some(match code {
+        keycode::MINUS => 27,
+        keycode::EQUALS => 24,
+        keycode::OPEN_BRACKET => 33,
+        keycode::CLOSE_BRACKET => 30,
+        keycode::BACKSLASH => 42,
+        keycode::SEMICOLON => 41,
+        keycode::QUOTE => 39,
+        keycode::BACKTICK => 50,
+        keycode::COMMA => 43,
+        keycode::PERIOD => 47,
+        keycode::SLASH => 44,
+        _ => return None,
+    })
+}
+
+/// Linux：keysym（ASCII 可打印字符的码点即其 keysym）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn printable_raw(code: u32) -> Option<u32> {
+    if (keycode::LETTER_A..=keycode::LETTER_Z).contains(&code) {
+        return Some(u32::from(b'a') + (code - keycode::LETTER_A));
+    }
+    if (keycode::DIGIT_0..=keycode::DIGIT_9).contains(&code) {
+        return Some(u32::from(b'0') + (code - keycode::DIGIT_0));
+    }
+    Some(match code {
+        keycode::MINUS => u32::from(b'-'),
+        keycode::EQUALS => u32::from(b'='),
+        keycode::OPEN_BRACKET => u32::from(b'['),
+        keycode::CLOSE_BRACKET => u32::from(b']'),
+        keycode::BACKSLASH => u32::from(b'\\'),
+        keycode::SEMICOLON => u32::from(b';'),
+        keycode::QUOTE => u32::from(b'\''),
+        keycode::BACKTICK => u32::from(b'`'),
+        keycode::COMMA => u32::from(b','),
+        keycode::PERIOD => u32::from(b'.'),
+        keycode::SLASH => u32::from(b'/'),
+        _ => return None,
+    })
+}
+
+/// 其它平台：没有可用的原生键值映射，静默忽略。
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn printable_raw(_code: u32) -> Option<u32> {
+    None
 }
 
 // ── 输入门控 ─────────────────────────────────────────────────────────
@@ -542,7 +855,7 @@ fn mouse_button_of(button: egui::PointerButton) -> Option<MouseButton> {
 pub struct InputGate {
     /// 已转达按下、尚未转达抬起的鼠标键（下标见 [`MOUSE_BUTTONS`]）。
     mouse_forwarded: [bool; 3],
-    /// 已转达按下、尚未转达抬起的特殊键（跨平台键码；文本键无配对抬起，不进此集合）。
+    /// 已转达按下、尚未转达抬起的键（跨平台键码；`TEXT` 遗留路径没有配对抬起，不进此集合）。
     keys_forwarded: BTreeSet<u32>,
     /// 上一帧观察到的修饰键位掩码（边沿检测基线）。
     modifiers_seen: u8,
@@ -592,14 +905,19 @@ impl InputGate {
         Some(InputEvent::Wheel { dx, dy })
     }
 
-    /// 特殊键门控。`code` 为跨平台键码（非 [`keycode::TEXT`]），`pressed` 由 egui 事件直接给出
-    /// （自带边沿）；`keyboard_enabled` = 本窗口有焦点且无控件在吃键盘输入。
+    /// 键门控。`code` 为跨平台键码（特殊键、修饰键与**可打印键**都走这里），`pressed` 由
+    /// egui 事件直接给出（自带边沿）；`keyboard_enabled` = 本窗口有焦点且无控件在吃键盘输入。
     ///
     /// 与 [`Self::modifiers`] 的补偿路径对称：`keyboard_enabled == false` 时不再转发任何按下，
     /// 而是返回 [`Self::release_keys`] 的结果（回收所有「已转达按下」的键并清空状态）。这条路径
     /// 必不可少——窗口失焦时 egui **不会**合成 key-up（egui 0.31 的 `keys_down` 只由真实的
     /// `Event::Key` 清除，物理抬起交给了获得焦点的另一个应用），若不在此回收，被控端会一直保持
     /// 该键按下，直到用户再按一次并释放。
+    ///
+    /// **自动重复**：egui 把按住不放的键按 `repeat` 反复送来 `Event::Key{pressed:true}`，这里
+    /// 就照原样再发一次「按下」。注入的 keydown 是否在远端触发自动重复取决于被控端前台程序的
+    /// 输入处理（多数窗口程序按 keydown 事件重复，少数看的是按键状态），故不能在控制器侧把它
+    /// 折成一条「按下」——那样两端都会失去自动重复。
     #[must_use]
     pub fn key(&mut self, code: u32, pressed: bool, keyboard_enabled: bool, modifiers: u8) -> Vec<InputEvent> {
         if !keyboard_enabled {
@@ -616,14 +934,40 @@ impl InputGate {
         Vec::new()
     }
 
-    /// 文本输入门控（可打印字符走此路径）。与键盘同一门控；egui 的文本事件没有配对抬起
-    /// （注入侧按「点按」处理），故只做单向转发。纯控制字符不转发。
+    /// 合成一次「修饰键 + 键」的**点按**（Ctrl/Cmd + C/X/V 用）。
+    ///
+    /// egui-winit 把 `Ctrl/Cmd+C/X/V`（Windows 还有 `Ctrl+Insert` / `Shift+Insert` /
+    /// `Shift+Delete`）吞成 [`egui::Event::Copy`] / [`egui::Event::Cut`] / [`egui::Event::Paste`]，
+    /// 不再是普通 `Event::Key`，故这里反过来合成点按发给远端——远端应用看到的是真实快捷键。
+    ///
+    /// 两条路径：修饰键**本帧已转达按下**（`modifiers_forwarded` 含 `mod_mask`）时只发键本身
+    /// 的按下+抬起；否则临时补一对修饰键按下/抬起，把点按包在里面。后者是必需的：egui 的修饰键
+    /// 边沿由 [`Self::modifiers`] 按「帧」推进，而 Copy/Cut/Paste 可能落在修饰键刚按下的那一帧
+    /// （`modifiers()` 在同一帧里先跑，一般会补上，但失焦恢复、`keyboard_enabled` 翻转等边界下
+    /// 未必），少了这一对，远端只会收到一个裸 `C`。
+    ///
+    /// 这些 `InputEvent` 的按下/抬起在本次调用内**配对发完**，故不进 `keys_forwarded` /
+    /// `modifiers_forwarded`（不留下需要回收的状态）。
     #[must_use]
-    pub fn text(text: &str, keyboard_enabled: bool, modifiers: u8) -> Option<InputEvent> {
-        if !keyboard_enabled || !text.chars().any(|c| !c.is_control()) {
-            return None;
+    pub fn shortcut_click(
+        &mut self,
+        code: u32,
+        mod_mask: u8,
+        mod_code: u32,
+        modifiers: u8,
+    ) -> Vec<InputEvent> {
+        if self.modifiers_forwarded & mod_mask != 0 {
+            return vec![
+                key_event(code, true, None, modifiers),
+                key_event(code, false, None, modifiers),
+            ];
         }
-        Some(key_event(keycode::TEXT, true, Some(text.to_owned()), modifiers))
+        vec![
+            key_event(mod_code, true, None, modifiers),
+            key_event(code, true, None, modifiers),
+            key_event(code, false, None, modifiers),
+            key_event(mod_code, false, None, modifiers),
+        ]
     }
 
     /// 修饰键门控。`bits` 为当前位掩码（[`egui_modifiers`] 的结果），`keyboard_enabled` 同键盘。
@@ -654,7 +998,7 @@ impl InputGate {
         out
     }
 
-    /// 释放所有「已转达按下」的鼠标键 / 修饰键 / 特殊键（补发抬起），并清空状态。
+    /// 释放所有「已转达按下」的鼠标键 / 修饰键 / 键（补发抬起），并清空状态。
     ///
     /// 退出捕获（会话结束、切 Tab、切到非「完全控制」模式）时调用；返回的事件应投递给引擎——
     /// 会话已结束时 `send_input` 会静默丢弃，无副作用。
@@ -674,7 +1018,7 @@ impl InputGate {
         out
     }
 
-    /// 回收所有「已转达按下」的特殊键（补发抬起）并清空集合，返回事件列表。
+    /// 回收所有「已转达按下」的键（补发抬起）并清空集合，返回事件列表。
     ///
     /// 与 [`Self::release_all`] 的区别：只动键盘、不动鼠标——键盘门控关闭（失焦 / 有控件在吃
     /// 键盘输入）但鼠标仍可能在使用时只回收键盘。**幂等**：状态清空后再调用返回空，故可每帧安全
@@ -867,7 +1211,9 @@ impl InputSink for EnigoInput {
     }
 
     fn key(&self, event: KeyEvent) -> RemoteResult<()> {
-        // 特殊键/修饰键：按按下/抬起方向注入（有配对事件）。
+        // 键码事件（特殊键、修饰键、可打印键）：按按下/抬起方向注入（有配对事件）。
+        // 可打印键经 `code_to_enigo` 变成目标平台的原生键值（VK/CGKeyCode/keysym），
+        // 由**被控端**的键盘布局与输入法决定最终字符。
         if event.code != keycode::TEXT {
             if let Some(key) = code_to_enigo(event.code) {
                 let direction = if event.pressed {
@@ -878,7 +1224,8 @@ impl InputSink for EnigoInput {
                 return self.with_enigo(|enigo| enigo.key(key, direction).map_err(input_err));
             }
         }
-        // 文本：egui 只发一次文本事件（无配对抬起），故用 Click（按下+抬起）。
+        // 遗留路径：旧控制器把可打印字符放在 `text` 里（`TEXT` 语义）。它没有配对抬起，
+        // 故按「点按」展开（按下+抬起）。新控制器不再发送，保留只为兼容。
         if let Some(text) = event.text.as_deref() {
             for ch in text.chars() {
                 self.with_enigo(|enigo| enigo.key(enigo::Key::Unicode(ch), enigo::Direction::Click).map_err(input_err))?;
@@ -1531,7 +1878,7 @@ impl RemoteView {
         for event in self.gate.modifiers(mods, keyboard_enabled) {
             self.forward_input(manager, event);
         }
-        // 键盘门控关闭（失焦 / 有控件在吃键盘输入）时每帧收敛：把「已转达按下」的特殊键补发抬起。
+        // 键盘门控关闭（失焦 / 有控件在吃键盘输入）时每帧收敛：把「已转达按下」的键补发抬起。
         // 这里不能只依赖下面的事件循环——egui 在窗口失焦时不会合成 key-up，若不在门控关闭的这一帧
         // 回收，被控端会残留一个按住不放的键。与 `modifiers()` 的补偿路径对称；`release_keys` 幂等，
         // 状态清空后重复调用返回空，故不会每帧重发抬起。
@@ -1541,24 +1888,52 @@ impl RemoteView {
             }
         }
 
-        // 3) 键盘事件（特殊键走 code；文本走 TEXT）。控制字符（Enter/Tab 等）已由 Key 事件
-        //    处理，`InputGate::text` 会把纯控制文本滤掉，避免重复。复用上面那份事件列表。
+        // 3) 键盘事件：**一律走键码**（特殊键 + 可打印键），由被控端按自己的布局与输入法解成字符。
+        //
+        //    刻意**不再转发 `Event::Text`**：它是控制器侧 IME/布局算出的结果，注入远端会绕过
+        //    远端的布局与输入法（远端切了中文输入法也只会得到英文），且空格会与 Space 键的
+        //    Key 事件双发。可打印字符已由下面的 Key 分支覆盖。
+        //
+        //    `Ctrl/Cmd+C/X/V` 之类被 egui-winit 吞成 `Copy`/`Cut`/`Paste`，需单独合成点按。
+        let (shortcut_mod_mask, shortcut_mod_code) = if mods & modifier::META != 0 {
+            (modifier::META, keycode::META)
+        } else {
+            (modifier::CTRL, keycode::CTRL)
+        };
         for event in &events {
             match event {
-                egui::Event::Key { key, pressed, .. } => {
+                egui::Event::Key { key, pressed, modifiers, .. } => {
                     // 本窗口的本地快捷键不转发：`F11` 切全屏恒不转发；`Esc` 只在全屏时被本端
                     // 消费（退出全屏），非全屏时照常透传给远端。
                     if *key == egui::Key::F11 || (*key == egui::Key::Escape && self.fullscreen) {
                         continue;
                     }
                     if let Some(code) = egui_key_to_code(*key) {
-                        for out in self.gate.key(code, *pressed, keyboard_enabled, mods) {
+                        // 修饰键位掩码取**该事件自带的**：事件可能产生于修饰键状态变化的那一帧，
+                        // 用帧末的 `i.modifiers` 会让边沿前后的事件带上错误的掩码。
+                        let bits = egui_modifiers(*modifiers);
+                        for out in self.gate.key(code, *pressed, keyboard_enabled, bits) {
                             self.forward_input(manager, out);
                         }
                     }
                 }
-                egui::Event::Text(text) => {
-                    if let Some(out) = InputGate::text(text, keyboard_enabled, mods) {
+                // 剪贴板快捷键：egui-winit 命中 `Ctrl/Cmd+C/X/V`（Windows 还有 `Ctrl+Insert` /
+                // `Shift+Insert` / `Shift+Delete`）时直接产生这三类事件、不再产生对应的 `Key`，
+                // 故必须在这里合成点按，否则远端永远收不到复制/剪切/粘贴。
+                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => {
+                    if !keyboard_enabled {
+                        continue;
+                    }
+                    let code = match event {
+                        egui::Event::Cut => keycode::LETTER_A + 23, // X
+                        egui::Event::Paste(_) => keycode::LETTER_A + 21, // V
+                        // Copy，以及将来可能新增的同类变体：按复制处理。
+                        _ => keycode::LETTER_A + 2, // C
+                    };
+                    for out in self
+                        .gate
+                        .shortcut_click(code, shortcut_mod_mask, shortcut_mod_code, mods)
+                    {
                         self.forward_input(manager, out);
                     }
                 }
@@ -2147,17 +2522,6 @@ mod tests {
     }
 
     #[test]
-    fn text_is_gated_and_ignores_control_only_text() {
-        assert_eq!(InputGate::text("a", false, 0), None);
-        assert_eq!(
-            InputGate::text("a", true, 0),
-            Some(InputEvent::Key(KeyEvent { code: keycode::TEXT, pressed: true, text: Some("a".to_owned()), modifiers: 0 }))
-        );
-        // 纯控制字符（Enter/Tab 等）已由 Key 事件处理，不重复注入。
-        assert_eq!(InputGate::text("\n", true, 0), None);
-    }
-
-    #[test]
     fn modifiers_forward_edge_then_release_when_gate_closes() {
         let mut gate = InputGate::default();
         // Ctrl 按下边沿 → 转达按下。
@@ -2217,16 +2581,68 @@ mod tests {
     // ── 键码 / 修饰键映射 ───────────────────────────────────────────
 
     #[test]
-    fn egui_key_to_code_maps_specials_and_rejects_unknown() {
+    fn egui_key_to_code_maps_specials() {
         assert_eq!(egui_key_to_code(egui::Key::Enter), Some(keycode::ENTER));
         assert_eq!(egui_key_to_code(egui::Key::Escape), Some(keycode::ESCAPE));
         assert_eq!(egui_key_to_code(egui::Key::ArrowUp), Some(keycode::ARROW_UP));
         assert_eq!(egui_key_to_code(egui::Key::ArrowLeft), Some(keycode::ARROW_LEFT));
+        assert_eq!(egui_key_to_code(egui::Key::Insert), Some(keycode::INSERT));
         assert_eq!(egui_key_to_code(egui::Key::F1), Some(keycode::F1));
         assert_eq!(egui_key_to_code(egui::Key::F12), Some(keycode::F1 + 11));
-        // 普通字符键走 TEXT 路径；未知键返回 None 而不是 panic。
-        assert_eq!(egui_key_to_code(egui::Key::A), None);
-        assert_eq!(egui_key_to_code(egui::Key::Num0), None);
+        assert_eq!(egui_key_to_code(egui::Key::F13), Some(keycode::F13));
+        assert_eq!(egui_key_to_code(egui::Key::F24), Some(keycode::F24));
+        // F25 以上没有跨平台键码；egui 的伪键（Copy/Cut/Paste）也不能当普通键发。
+        assert_eq!(egui_key_to_code(egui::Key::F25), None);
+        assert_eq!(egui_key_to_code(egui::Key::Copy), None);
+        assert_eq!(egui_key_to_code(egui::Key::Cut), None);
+        assert_eq!(egui_key_to_code(egui::Key::Paste), None);
+    }
+
+    /// 可打印键也必须映射成键码（`A`/`Num0` 不再是 `None`）——否则 Ctrl+A 之类的组合键
+    /// 根本发不出去。
+    #[test]
+    fn egui_key_to_code_maps_printable_keys() {
+        assert_eq!(egui_key_to_code(egui::Key::A), Some(keycode::LETTER_A));
+        assert_eq!(egui_key_to_code(egui::Key::Z), Some(keycode::LETTER_Z));
+        assert_eq!(egui_key_to_code(egui::Key::C), Some(keycode::LETTER_A + 2));
+        assert_eq!(egui_key_to_code(egui::Key::Num0), Some(keycode::DIGIT_0));
+        assert_eq!(egui_key_to_code(egui::Key::Num9), Some(keycode::DIGIT_9));
+        assert_eq!(egui_key_to_code(egui::Key::Minus), Some(keycode::MINUS));
+        assert_eq!(egui_key_to_code(egui::Key::Equals), Some(keycode::EQUALS));
+        assert_eq!(egui_key_to_code(egui::Key::OpenBracket), Some(keycode::OPEN_BRACKET));
+        assert_eq!(egui_key_to_code(egui::Key::CloseBracket), Some(keycode::CLOSE_BRACKET));
+        assert_eq!(egui_key_to_code(egui::Key::Backslash), Some(keycode::BACKSLASH));
+        assert_eq!(egui_key_to_code(egui::Key::Semicolon), Some(keycode::SEMICOLON));
+        assert_eq!(egui_key_to_code(egui::Key::Quote), Some(keycode::QUOTE));
+        assert_eq!(egui_key_to_code(egui::Key::Backtick), Some(keycode::BACKTICK));
+        assert_eq!(egui_key_to_code(egui::Key::Comma), Some(keycode::COMMA));
+        assert_eq!(egui_key_to_code(egui::Key::Period), Some(keycode::PERIOD));
+        assert_eq!(egui_key_to_code(egui::Key::Slash), Some(keycode::SLASH));
+        assert_eq!(egui_key_to_code(egui::Key::Space), Some(keycode::SPACE));
+        // 上档标点 → 同一物理键（Shift 由修饰键事件单独转发）。
+        assert_eq!(egui_key_to_code(egui::Key::Colon), Some(keycode::SEMICOLON));
+        assert_eq!(egui_key_to_code(egui::Key::Plus), Some(keycode::EQUALS));
+        assert_eq!(egui_key_to_code(egui::Key::Exclamationmark), Some(keycode::DIGIT_0 + 1));
+        assert_eq!(egui_key_to_code(egui::Key::OpenCurlyBracket), Some(keycode::OPEN_BRACKET));
+        assert_eq!(egui_key_to_code(egui::Key::CloseCurlyBracket), Some(keycode::CLOSE_BRACKET));
+        assert_eq!(egui_key_to_code(egui::Key::Pipe), Some(keycode::BACKSLASH));
+        assert_eq!(egui_key_to_code(egui::Key::Questionmark), Some(keycode::SLASH));
+    }
+
+    /// 键码区间不得撞号：若按「F1 + (n-1)」扩展，F21..=F24 会落在 40..=43，正好与
+    /// CTRL/SHIFT/ALT/META 撞在一起（F21 会被注入成 Ctrl）。
+    #[test]
+    fn keycode_ranges_do_not_collide() {
+        assert_eq!(keycode::F13, 0x140);
+        assert_eq!(keycode::F24, 0x14B);
+        assert_eq!(keycode::CTRL, 40);
+        assert_ne!(egui_key_to_code(egui::Key::F21), Some(keycode::CTRL));
+        assert_ne!(egui_key_to_code(egui::Key::F22), Some(keycode::SHIFT));
+        assert_ne!(egui_key_to_code(egui::Key::F23), Some(keycode::ALT));
+        assert_ne!(egui_key_to_code(egui::Key::F24), Some(keycode::META));
+        // 可打印区间与修饰键/功能键也不重叠（编译期断言）。
+        const { assert!(keycode::LETTER_A > keycode::META) };
+        const { assert!(keycode::F13 > keycode::SLASH) };
     }
 
     #[test]
@@ -2234,16 +2650,76 @@ mod tests {
         assert_eq!(code_to_enigo(keycode::ENTER), Some(enigo::Key::Return));
         assert_eq!(code_to_enigo(keycode::ESCAPE), Some(enigo::Key::Escape));
         assert_eq!(code_to_enigo(keycode::CTRL), Some(enigo::Key::Control));
+        assert_eq!(code_to_enigo(keycode::INSERT), Some(insert_key()));
+        assert!(code_to_enigo(keycode::INSERT).is_some());
         assert_eq!(code_to_enigo(keycode::F1), Some(enigo::Key::F1));
         assert_eq!(code_to_enigo(keycode::F1 + 11), Some(enigo::Key::F12));
+        assert_eq!(code_to_enigo(keycode::F13), Some(enigo::Key::F13));
+        // F21..=F24 在 macOS 没有 enigo 变体，故只在 Windows/Linux 断言。
+        #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+        {
+            assert_eq!(code_to_enigo(keycode::F13 + 8), Some(enigo::Key::F21));
+            assert_eq!(code_to_enigo(keycode::F24), Some(enigo::Key::F24));
+        }
         // 未知码静默忽略（不 panic）。
         assert_eq!(code_to_enigo(keycode::TEXT), None);
         assert_eq!(code_to_enigo(keycode::F1 + 12), None);
         assert_eq!(code_to_enigo(u32::MAX), None);
     }
 
+    /// 可打印键一律走 `Key::Other(raw)`（VK / CGKeyCode / keysym），由被控端布局解成字符。
+    #[test]
+    fn code_to_enigo_maps_printables_to_platform_raw_keys() {
+        for code in [
+            keycode::LETTER_A,
+            keycode::LETTER_Z,
+            keycode::DIGIT_0,
+            keycode::DIGIT_9,
+            keycode::MINUS,
+            keycode::EQUALS,
+            keycode::OPEN_BRACKET,
+            keycode::CLOSE_BRACKET,
+            keycode::BACKSLASH,
+            keycode::SEMICOLON,
+            keycode::QUOTE,
+            keycode::BACKTICK,
+            keycode::COMMA,
+            keycode::PERIOD,
+            keycode::SLASH,
+        ] {
+            assert!(
+                matches!(code_to_enigo(code), Some(enigo::Key::Other(_))),
+                "键码 {code:#x} 应映射成 Key::Other"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(code_to_enigo(keycode::LETTER_A), Some(enigo::Key::Other(0x41)));
+            assert_eq!(code_to_enigo(keycode::DIGIT_0), Some(enigo::Key::Other(0x30)));
+            assert_eq!(code_to_enigo(keycode::SEMICOLON), Some(enigo::Key::Other(0xBA)));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(code_to_enigo(keycode::LETTER_A), Some(enigo::Key::Other(0)));
+            assert_eq!(code_to_enigo(keycode::DIGIT_0), Some(enigo::Key::Other(29)));
+            assert_eq!(code_to_enigo(keycode::SEMICOLON), Some(enigo::Key::Other(41)));
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(
+                code_to_enigo(keycode::LETTER_A),
+                Some(enigo::Key::Other(u32::from(b'a')))
+            );
+            assert_eq!(
+                code_to_enigo(keycode::SEMICOLON),
+                Some(enigo::Key::Other(u32::from(b';')))
+            );
+        }
+    }
+
     /// 跨平台键码 → Windows 虚拟键码（实例注入路径）。锁住几个易错项：
-    /// 方向键的 VK 顺序、F1..=F12 的连续区间、以及「文本键/未知码不给 VK」。
+    /// 方向键的 VK 顺序、F1..=F12 / F13..=F24 两段连续区间、可打印键的 OEM VK、
+    /// 以及「文本键/未知码不给 VK」。
     #[test]
     fn code_to_vk_maps_specials_and_f_keys() {
         assert_eq!(code_to_vk(keycode::ENTER), Some(0x0D));
@@ -2251,6 +2727,7 @@ mod tests {
         assert_eq!(code_to_vk(keycode::BACKSPACE), Some(0x08));
         assert_eq!(code_to_vk(keycode::ESCAPE), Some(0x1B));
         assert_eq!(code_to_vk(keycode::DELETE), Some(0x2E));
+        assert_eq!(code_to_vk(keycode::INSERT), Some(0x2D));
         // 方向键不是按上下左右的「直觉顺序」排的：LEFT/UP/RIGHT/DOWN = 25/26/27/28。
         assert_eq!(code_to_vk(keycode::ARROW_LEFT), Some(0x25));
         assert_eq!(code_to_vk(keycode::ARROW_UP), Some(0x26));
@@ -2271,10 +2748,44 @@ mod tests {
         for i in 0..12 {
             assert_eq!(code_to_vk(keycode::F1 + i), Some(0x70 + u16::try_from(i).unwrap()));
         }
-        // 文本键与未知码不给 VK（文本走 KEYEVENTF_UNICODE）。
+        // F13..=F24 是 0x7C..=0x87 的另一段连续区间。
+        assert_eq!(code_to_vk(keycode::F13), Some(0x7C));
+        assert_eq!(code_to_vk(keycode::F24), Some(0x87));
+        for i in 0..12 {
+            assert_eq!(code_to_vk(keycode::F13 + i), Some(0x7C + u16::try_from(i).unwrap()));
+        }
+        // 文本键与未知码不给 VK（文本是旧控制器的遗留路径）。
         assert_eq!(code_to_vk(keycode::TEXT), None);
         assert_eq!(code_to_vk(keycode::F1 + 12), None);
         assert_eq!(code_to_vk(u32::MAX), None);
+    }
+
+    /// 可打印键 → VK。这些常量是所有平台都能编译/运行的（`code_to_vk` 不依赖目标平台）。
+    #[test]
+    fn code_to_vk_maps_printables() {
+        // 字母 A..=Z → 0x41..=0x5A；数字 0..=9 → 0x30..=0x39。
+        assert_eq!(code_to_vk(keycode::LETTER_A), Some(0x41));
+        assert_eq!(code_to_vk(keycode::LETTER_Z), Some(0x5A));
+        assert_eq!(code_to_vk(keycode::DIGIT_0), Some(0x30));
+        assert_eq!(code_to_vk(keycode::DIGIT_9), Some(0x39));
+        for i in 0..26 {
+            assert_eq!(
+                code_to_vk(keycode::LETTER_A + i),
+                Some(0x41 + u16::try_from(i).unwrap())
+            );
+        }
+        // OEM 标点键。
+        assert_eq!(code_to_vk(keycode::MINUS), Some(0xBD));
+        assert_eq!(code_to_vk(keycode::EQUALS), Some(0xBB));
+        assert_eq!(code_to_vk(keycode::OPEN_BRACKET), Some(0xDB));
+        assert_eq!(code_to_vk(keycode::CLOSE_BRACKET), Some(0xDD));
+        assert_eq!(code_to_vk(keycode::BACKSLASH), Some(0xDC));
+        assert_eq!(code_to_vk(keycode::SEMICOLON), Some(0xBA));
+        assert_eq!(code_to_vk(keycode::QUOTE), Some(0xDE));
+        assert_eq!(code_to_vk(keycode::BACKTICK), Some(0xC0));
+        assert_eq!(code_to_vk(keycode::COMMA), Some(0xBC));
+        assert_eq!(code_to_vk(keycode::PERIOD), Some(0xBE));
+        assert_eq!(code_to_vk(keycode::SLASH), Some(0xBF));
     }
 
     #[test]
@@ -2283,11 +2794,65 @@ mod tests {
         assert_eq!(egui_modifiers(egui::Modifiers::ALT), modifier::ALT);
         assert_eq!(egui_modifiers(egui::Modifiers::CTRL), modifier::CTRL);
         assert_eq!(egui_modifiers(egui::Modifiers::SHIFT), modifier::SHIFT);
-        assert_eq!(egui_modifiers(egui::Modifiers::COMMAND), modifier::META);
+        assert_eq!(egui_modifiers(egui::Modifiers::MAC_CMD), modifier::META);
         assert_eq!(
             egui_modifiers(egui::Modifiers::CTRL | egui::Modifiers::ALT | egui::Modifiers::SHIFT),
             modifier::CTRL | modifier::ALT | modifier::SHIFT
         );
+    }
+
+    /// 回归锁：META **只能**来自 `mac_cmd`。
+    ///
+    /// 修之前用的是 `m.command`，而 egui 的 `command` 在 Windows/Linux 上就等于 Ctrl——
+    /// 于是按一次 Ctrl 会同时给远端按下 Win 键，污染所有 Ctrl 快捷键。
+    #[test]
+    fn egui_modifiers_never_derives_meta_from_command() {
+        // Windows/Linux 的 Ctrl（`command = true` 但 `mac_cmd = false`）只有 CTRL 位。
+        assert_eq!(egui_modifiers(egui::Modifiers::COMMAND), 0);
+        let windows_ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(egui_modifiers(windows_ctrl), modifier::CTRL);
+        assert_eq!(egui_modifiers(windows_ctrl) & modifier::META, 0);
+        // 真正的 ⌘（macOS）才给 META。
+        assert_eq!(egui_modifiers(egui::Modifiers::MAC_CMD), modifier::META);
+    }
+
+    // ── InputGate：剪贴板快捷键合成 ─────────────────────────────────
+
+    #[test]
+    fn shortcut_click_uses_already_forwarded_modifier() {
+        let mut gate = InputGate::default();
+        // Ctrl 已由 `modifiers()` 转达按下 → 只发 C 的按下+抬起。
+        assert_eq!(gate.modifiers(modifier::CTRL, true).len(), 1);
+        assert_eq!(
+            gate.shortcut_click(keycode::LETTER_A + 2, modifier::CTRL, keycode::CTRL, modifier::CTRL),
+            vec![
+                key_event(keycode::LETTER_A + 2, true, None, modifier::CTRL),
+                key_event(keycode::LETTER_A + 2, false, None, modifier::CTRL),
+            ]
+        );
+        // 合成点按不进 `keys_forwarded`：会话收尾不会补发一对多余的抬起。
+        assert!(gate.release_keys().is_empty());
+    }
+
+    #[test]
+    fn shortcut_click_synthesises_modifier_when_not_forwarded() {
+        let mut gate = InputGate::default();
+        // 修饰键边沿没赶上：临时补一对，顺序必须是 mod down / key down / key up / mod up。
+        assert_eq!(
+            gate.shortcut_click(keycode::LETTER_A + 23, modifier::CTRL, keycode::CTRL, modifier::CTRL),
+            vec![
+                key_event(keycode::CTRL, true, None, modifier::CTRL),
+                key_event(keycode::LETTER_A + 23, true, None, modifier::CTRL),
+                key_event(keycode::LETTER_A + 23, false, None, modifier::CTRL),
+                key_event(keycode::CTRL, false, None, modifier::CTRL),
+            ]
+        );
+        // 临时补的修饰键抬起后状态归零，不留待回收。
+        assert!(gate.release_all().is_empty());
     }
 
     // ── 坐标 / 尺寸换算的边界 ───────────────────────────────────────
