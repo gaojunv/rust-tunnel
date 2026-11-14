@@ -20,6 +20,16 @@ use rust_tunnel_common::{
 
 use super::ServerState;
 
+/// 客户端控制通道活性超时：连续这么久没有任何入站消息即判定链路静默失效。
+///
+/// 客户端每 30s 发一条 `Ping`，取 3 倍多是为了容忍抖动。**只在收到过至少一条
+/// `Ping` 之后才启用**：万一还有不发心跳的老客户端，不能因此把正常连接误杀。
+const CLIENT_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
+
+/// 单条控制消息写入（含 TLS flush）超时。控制通道同时承载反向代理隧道数据，
+/// 单条 `Data` 最大 1MB；慢上行下取太短会把「慢」误判成「死」，导致反复断线。
+const CONTROL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// 处理单个客户端控制连接（v2 协议，spec §3.2）。
 ///
 /// 替代旧的基于端口的 `handle_control_connection`。
@@ -110,11 +120,27 @@ async fn handle_client_connection(
     resp.write_to_stream(&mut writer).await?;
 
     // Writer task: pump send_rx -> wire
+    // `write_dead` 是写侧的死亡信号。写任务自己知道 socket 已经写不动，读循环
+    // 无法从读事件察觉（黑洞化链路读侧只会永远静默），必须显式通知。
+    let (write_dead_tx, mut write_dead_rx) = watch::channel(false);
     tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
-            if let Err(e) = msg.write_to_stream(&mut writer).await {
-                tracing::debug!("control write ended: {e}");
-                break;
+            match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, msg.write_to_stream(&mut writer)).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("control write failed, ending writer task: {e}");
+                    let _ = write_dead_tx.send(true);
+                    break;
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "control write exceeded {}s, treating link as black-holed",
+                        CONTROL_WRITE_TIMEOUT.as_secs()
+                    );
+                    let _ = write_dead_tx.send(true);
+                    break;
+                }
             }
         }
     });
@@ -137,10 +163,41 @@ async fn handle_client_connection(
     let name_for_cleanup = entry.name.clone();
     let cleanup_registry = registry.clone();
     let result: TunnelResult<()> = async {
+        // 只有见过第一条心跳之后才启用活性超时：不能因为「老客户端不发 Ping」
+        // 就把一条完全正常的连接判死。
+        let mut heartbeat_seen = false;
         loop {
-            let Some(msg) = ControlMessage::read_from_stream(&mut reader).await? else {
+            let read = async {
+                if heartbeat_seen {
+                    match tokio::time::timeout(
+                        CLIENT_LIVENESS_TIMEOUT,
+                        ControlMessage::read_from_stream(&mut reader),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(TunnelError::ControlChannel(format!(
+                            "客户端 {} 秒没有任何入站消息（链路已静默失效）",
+                            CLIENT_LIVENESS_TIMEOUT.as_secs()
+                        ))),
+                    }
+                } else {
+                    ControlMessage::read_from_stream(&mut reader).await
+                }
+            };
+            let selected = tokio::select! {
+                r = read => r?,
+                _ = write_dead_rx.changed() => {
+                    warn!(client = %entry.name, "控制通道写入中断，结束读循环（客户端将重连）");
+                    break;
+                }
+            };
+            let Some(msg) = selected else {
                 break;
             };
+            if matches!(msg, ControlMessage::Ping { .. }) {
+                heartbeat_seen = true;
+            }
             match msg {
                 ControlMessage::Ping {
                     seq,
@@ -318,24 +375,33 @@ async fn handle_client_connection(
     .await;
 
     // 3. Cleanup: remove from registry
-    // 远程会话清理：该客户端参与的会话全部结束，并通知对端（best-effort）。
-    handle_client_disconnected(&state, &name_for_cleanup).await;
-    // 客户端控制连接断开：先清理该客户端的 ACP 会话（flush 回合缓冲 + 移除条目）。
-    // 客户端 agent 进程随连接断开而终止，残留条目只会被 idle reaper 晚回收
-    // （30 分钟）；disconnect 只发断线通知、不 await 任何 agent 工作，此处即时
-    // 清理避免审批等待/缓冲长时间悬挂。
-    if let Some(agent) = &state.agent_state {
-        if let Some(bridge) = &agent.acp_bridge {
-            bridge.drop_client_sessions(&name_for_cleanup).await;
+    // 按 entry 所有权守卫：只有注册表里的条目仍**就是**本连接时才做清理。
+    // 客户端重连成功会立刻注册一条同名新条目，而旧连接的收尾可能晚到；按名字
+    // 无条件清理会把新连接摘掉并踢下线（现场表现就是「每隔几秒掉一次」）。
+    let still_current = cleanup_registry.is_current(&entry).await;
+    if still_current {
+        // 远程会话清理：该客户端参与的会话全部结束，并通知对端（best-effort）。
+        handle_client_disconnected(&state, &name_for_cleanup).await;
+        // 客户端控制连接断开：先清理该客户端的 ACP 会话（flush 回合缓冲 + 移除条目）。
+        // 客户端 agent 进程随连接断开而终止，残留条目只会被 idle reaper 晚回收
+        // （30 分钟）；disconnect 只发断线通知、不 await 任何 agent 工作，此处即时
+        // 清理避免审批等待/缓冲长时间悬挂。
+        if let Some(agent) = &state.agent_state {
+            if let Some(bridge) = &agent.acp_bridge {
+                bridge.drop_client_sessions(&name_for_cleanup).await;
+            }
         }
     }
     cleanup_registry
-        .disconnect(&name_for_cleanup, "connection closed")
+        .disconnect_entry(&entry, "connection closed")
         .await;
     // 该客户端可能正出现在别人的「可远程」列表里：离开后要广播最新集合，否则列表会
     // 一直挂着一个已离线的条目，用户点下去只会得到「目标客户端不在线」。
-    // 必须在 `disconnect` **之后**广播——广播是按当前在线集合构建的。
-    broadcast_remote_peer_list(&state).await;
+    // 必须在 `disconnect_entry` **之后**广播——广播是按当前在线集合构建的。
+    // 只有确实摘掉了本连接才广播：旧连接晚到时不代表集合发生了变化。
+    if still_current {
+        broadcast_remote_peer_list(&state).await;
+    }
     result
 }
 

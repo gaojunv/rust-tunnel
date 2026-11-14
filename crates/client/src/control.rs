@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +20,23 @@ use rust_tunnel_common::{
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// 隧道内命令默认等待超时：2 分钟，覆盖常规文件与 shell 执行。
 const DEFAULT_AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// 控制通道活性超时：连续这么久没有任何**入站**消息就判定链路已静默失效。
+///
+/// 服务端对每条 `Ping`（[`HEARTBEAT_INTERVAL`]，30s 一次）都会回 `Pong`，正常通道
+/// 的入站间隔不会超过 30s；取 3 倍是为了容忍一次网络抖动/短暂拥塞。
+///
+/// 为什么必须有它：写任务一旦写失败就退出、心跳随之停摆，而读循环仍永远等在
+/// `read_from_stream` 上——控制通道再也不会断，客户端就成了「僵尸在线」，既不
+/// 会重连，服务端也看不出异常（Web 仍显示在线，发来的消息全进死通道）。
+const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 单条控制消息写入（含 TLS flush）的超时。
+///
+/// 取 90s 而不是更短：控制通道同时承载反向代理隧道数据，单条 `Data` 最大 1MB，
+/// 慢上行（家宽、4G）下一条消息写几秒是正常的。这里要抓的是「链路已经黑洞化、
+/// 永远写不完」，不是「这次有点慢」——误杀会在慢链路上反复断线重连。
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Stores the global log layer so it can be reused across reconnections.
 /// On reconnect the inner sender is hot-swapped via [`ClientLogLayer::set_sender`].
@@ -470,21 +487,52 @@ async fn start_heartbeat(sender: ControlSender) {
 
 /// 处理控制通道消息分发（心跳、隧道、agent 等）；EOF 时正常结束，Disconnect 时返回错误。
 ///
+/// `write_dead` 是写任务的死亡信号（`None` = 单测路径，永不触发）；一旦写侧中断，
+/// 读循环必须主动退出，否则会永远等在一个再也不会到来的读事件上。
+///
 /// # Errors
 ///
-/// 当收到 `Disconnect` 或底层 `read_from_stream` 出错时返回 `Err`。
-#[allow(
-    clippy::too_many_lines,
-    reason = "对控制通道全部消息变体的扁平派发，共享状态与分支多，拆分无益"
-)]
+/// 当收到 `Disconnect`、底层 `read_from_stream` 出错、写任务已死亡，或
+/// [`LIVENESS_TIMEOUT`] 内没有任何入站消息时返回 `Err`。
 async fn process_control_messages<R: AsyncRead + Unpin>(
     reader: &mut R,
     state: ClientState,
     remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
+    write_dead: Option<watch::Receiver<bool>>,
+) -> TunnelResult<()> {
+    process_control_messages_with(reader, state, remote_bridge, write_dead, LIVENESS_TIMEOUT).await
+}
+
+/// [`process_control_messages`] 的可注入活性超时版本（单测用它验证真超时路径）。
+#[allow(
+    clippy::too_many_lines,
+    reason = "对控制通道全部消息变体的扁平派发，共享状态与分支多，拆分无益"
+)]
+async fn process_control_messages_with<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    state: ClientState,
+    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
+    mut write_dead: Option<watch::Receiver<bool>>,
+    liveness: std::time::Duration,
 ) -> TunnelResult<()> {
     loop {
-        match ControlMessage::read_from_stream(reader).await {
-            Ok(Some(msg)) => {
+        let read = tokio::time::timeout(liveness, ControlMessage::read_from_stream(reader));
+        let read_result = tokio::select! {
+            () = wait_write_dead(&mut write_dead) => {
+                return Err(TunnelError::ControlChannel(
+                    "控制通道写入已中断，主动结束读循环以触发重连".into(),
+                ));
+            }
+            result = read => result,
+        };
+        match read_result {
+            Err(_elapsed) => {
+                return Err(TunnelError::ControlChannel(format!(
+                    "控制通道 {} 秒没有任何入站消息，判定链路已静默失效",
+                    liveness.as_secs()
+                )));
+            }
+            Ok(Ok(Some(msg))) => {
                 match msg {
                     ControlMessage::Pong {
                         seq,
@@ -760,17 +808,29 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     }
                 }
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 info!("Server closed control connection");
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Error reading from control connection: {}", e);
                 break;
             }
         }
     }
     Ok(())
+}
+
+/// 等写任务的死亡信号；`None`（单测路径）时永不 resolve。
+///
+/// `changed()` 返回 `Err` 表示发送端已丢弃（写任务已结束），同样按「写已中断」处理。
+async fn wait_write_dead(rx: &mut Option<watch::Receiver<bool>>) {
+    match rx {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// 客户端主入口：建立控制通道、完成注册与消息循环。
@@ -942,11 +1002,26 @@ async fn run_client_inner(
     let (sender, mut receiver) = mpsc::channel::<ControlMessage>(32);
 
     // Spawn writer task
+    // `write_dead` 把「写侧已死」这件事显式告诉读循环：只有写任务自己知道
+    // socket 已经写不动了，读者不能靠读事件察觉（黑洞化链路读侧只会永远静默）。
+    let (write_dead_tx, write_dead_rx) = watch::channel(false);
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = receiver.recv().await {
-            if let Err(e) = msg.write_to_stream(&mut writer).await {
-                debug!("Failed to write control message: {}", e);
-                break;
+            match tokio::time::timeout(WRITE_TIMEOUT, msg.write_to_stream(&mut writer)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Failed to write control message, ending writer task: {}", e);
+                    let _ = write_dead_tx.send(true);
+                    break;
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "Control message write exceeded {}s, treating link as black-holed",
+                        WRITE_TIMEOUT.as_secs()
+                    );
+                    let _ = write_dead_tx.send(true);
+                    break;
+                }
             }
         }
     });
@@ -986,7 +1061,13 @@ async fn run_client_inner(
     // Start heartbeat task
     let heartbeat_task = tokio::spawn(start_heartbeat(sender));
 
-    let result = process_control_messages(&mut reader, state.clone(), remote_bridge.clone()).await;
+    let result = process_control_messages(
+        &mut reader,
+        state.clone(),
+        remote_bridge.clone(),
+        Some(write_dead_rx),
+    )
+    .await;
     // 确定性清理：立即停掉心跳与写任务（不再等 channel drop 的间接时序），
     // 并中止全部隧道 reader 任务、清空连接表，避免重连后旧任务/旧 socket 累积。
     heartbeat_task.abort();
@@ -1166,7 +1247,7 @@ mod tests {
         assert!(state.activate_connection(42, mock_writer).await);
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state.clone(), None).await;
+        let result = process_control_messages(&mut reader, state.clone(), None, None).await;
         assert!(result.is_ok());
     }
 
@@ -1183,7 +1264,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             TunnelError::Protocol(msg) => assert!(msg.contains("disconnect")),
@@ -1195,7 +1276,7 @@ mod tests {
     async fn test_process_control_messages_eof() {
         let state = create_test_state();
         let mut reader = &[] as &[u8];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_ok());
     }
 
@@ -1214,7 +1295,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_ok());
     }
 
@@ -1244,7 +1325,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -1293,7 +1374,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -1338,7 +1419,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -1373,7 +1454,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state, None).await;
+        let result = process_control_messages(&mut reader, state, None, None).await;
         assert!(result.is_ok());
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -1414,7 +1495,7 @@ mod tests {
         .unwrap();
 
         let mut reader = &buffer[..];
-        let result = process_control_messages(&mut reader, state.clone(), None).await;
+        let result = process_control_messages(&mut reader, state.clone(), None, None).await;
         assert!(result.is_ok());
 
         // 先拿 Ready 里的端口，确认代理确实启动了
@@ -1585,5 +1666,56 @@ mod tests {
         assert!(snap.rtt_ms.is_none());
         assert!(snap.mapping_summary.is_none());
         assert_eq!(snap.active_tunnels, 0);
+    }
+
+    #[tokio::test]
+    async fn a_dead_writer_tears_down_the_control_channel() {
+        let state = create_test_state();
+        // 对端必须保持存活：若它先关闭，读侧会先拿到 EOF 走正常退出，
+        // 就测不到 `write_dead` 这条路径了。
+        let (mut client, _server) = tokio::io::duplex(64);
+        let (write_dead_tx, write_dead_rx) = watch::channel(false);
+
+        let reader = tokio::spawn(async move {
+            process_control_messages(&mut client, state, None, Some(write_dead_rx)).await
+        });
+
+        let _ = write_dead_tx.send(true);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("dead writer signal should end the read loop")
+            .expect("reader task should not panic");
+        assert!(matches!(result, Err(TunnelError::ControlChannel(_))));
+    }
+
+    #[tokio::test]
+    async fn a_silent_channel_times_out() {
+        let state = create_test_state();
+        // 对端持有连接但一个字节都不写：模拟写侧还活着、链路却已静默失效。
+        let (mut client, _server) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        let result = process_control_messages_with(
+            &mut client,
+            state,
+            None,
+            None,
+            std::time::Duration::from_millis(80),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let message = match result {
+            Err(TunnelError::ControlChannel(message)) => message,
+            other => panic!("expected ControlChannel error, got {other:?}"),
+        };
+        assert!(
+            message.contains("没有任何入站消息"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(70),
+            "timed out too early: {elapsed:?}"
+        );
     }
 }

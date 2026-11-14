@@ -280,6 +280,48 @@ impl ClientRegistry {
         }
     }
 
+    /// 注册表里当前的条目是否**就是** `entry`（同一份 `Arc`）。
+    ///
+    /// 用于连接收尾的所有权守卫：同名重连会替换注册表条目，旧连接晚到的清理
+    /// 必须先确认自己仍是当前条目，否则会把新连接误伤。
+    #[must_use]
+    pub async fn is_current(&self, entry: &Arc<ClientEntry>) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(&entry.name)
+            .is_some_and(|cur| Arc::ptr_eq(cur, entry))
+    }
+
+    /// 仅当注册表里仍是 `entry` 时才摘除并下发 `Disconnect { reason }`；已被同名
+    /// 新连接替换时**不动**新条目，返回 `false`。
+    ///
+    /// 写锁与发送分成两段：先摘除、释放写锁，再 `await` 发送，避免持锁等待一个
+    /// 容量未知的控制通道。
+    pub async fn disconnect_entry(&self, entry: &Arc<ClientEntry>, reason: &str) -> bool {
+        let removed = {
+            let mut entries = self.entries.write().await;
+            let is_current = entries
+                .get(&entry.name)
+                .is_some_and(|cur| Arc::ptr_eq(cur, entry));
+            if is_current {
+                entries.remove(&entry.name);
+            }
+            is_current
+        };
+        if !removed {
+            return false;
+        }
+        let _ = entry
+            .control_sender
+            .send(ControlMessage::Disconnect {
+                reason: reason.to_string(),
+            })
+            .await;
+        debug!("client '{}' disconnected", entry.name);
+        true
+    }
+
     /// 返回底层数据库句柄。
     #[must_use]
     pub fn db(&self) -> &Database {
@@ -753,6 +795,51 @@ mod tests {
             _ => panic!("wrong message"),
         }
         assert!(registry.get("home-nas").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_entry_does_not_touch_replaced_connection() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx1, _rx1) = mpsc::channel(32);
+        let old = registry
+            .register("home-nas", None, None, "secret", tx1)
+            .await
+            .unwrap();
+
+        // 同名重连：注册表里换成新条目，旧连接此刻已经过期。
+        let (tx2, mut rx2) = mpsc::channel(32);
+        let new = registry
+            .register("home-nas", None, None, "secret", tx2)
+            .await
+            .unwrap();
+
+        assert!(!registry.is_current(&old).await);
+        assert!(registry.is_current(&new).await);
+
+        // 旧连接晚到的收尾：既不能摘掉新条目，也不能踢掉新连接。
+        assert!(!registry.disconnect_entry(&old, "connection closed").await);
+        assert!(registry.is_current(&new).await);
+        assert_eq!(registry.list_online().await.len(), 1);
+        assert!(matches!(
+            rx2.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        // 新连接自己的收尾照常生效。
+        assert!(registry.disconnect_entry(&new, "connection closed").await);
+        assert!(!registry.is_current(&new).await);
+        assert!(registry.list_online().await.is_empty());
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx2.recv())
+            .await
+            .expect("timed out waiting for Disconnect on new sender")
+            .expect("channel closed");
+        match received {
+            ControlMessage::Disconnect { reason } => assert_eq!(reason, "connection closed"),
+            other => panic!("expected Disconnect, got {other:?}"),
+        }
     }
 
     #[tokio::test]
