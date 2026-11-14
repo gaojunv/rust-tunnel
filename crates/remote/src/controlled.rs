@@ -1860,7 +1860,7 @@ mod tests {
     /// `hmac` 填垃圾也无妨（校验根本走不到那一步）。
     #[tokio::test]
     async fn mismatched_proto_version_is_rejected_cleanly() {
-        // 两个方向都要拒绝：v3（上一版）与 v5（未来版本）。v3↔v4 正是本次抬版本后真实会遇到的
+        // 两个方向都要拒绝：v4（上一版）与 v6（未来版本）。v4↔v5 正是本次抬版本后真实会遇到的
         // 混合部署场景——两端都必须在握手阶段干净拒绝，而不是等 bincode 解码新变体时炸掉。
         assert_proto_version_rejected(SESSION_PROTO_VERSION.wrapping_sub(1)).await;
         assert_proto_version_rejected(SESSION_PROTO_VERSION.wrapping_add(1)).await;

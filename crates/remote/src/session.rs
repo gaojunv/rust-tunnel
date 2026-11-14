@@ -33,20 +33,25 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 4
+/// # 为什么是 5
+///
+/// 版本 5 改了**输入语义**：可打印键不再走 `KeyEvent{code: TEXT, text}`（被控端按 Unicode
+/// 码点注入，绕过被控端的键盘布局与输入法），改为发送完整键位码（`KeyEvent.code` 承载
+/// 字母/数字/标点，由被控端映射成 VK / CGKeyCode / keysym 注入），字符最终由**被控端**的
+/// 键盘布局与输入决定。键码表与旧语义不兼容（同一 `code` 值含义不同），故必须抬版本。
 ///
 /// 版本 4 追加了 [`SessionMessage::SetFrameRate`]（控制端 → 被控端的帧率上限）。它只追加在
 /// [`SessionMessage`] 末尾，但老端（v3）会在 bincode 解码时因未知判别式失败，故必须抬版本。
 /// 数据面没有会话内向后兼容分支，两端靠 `Hello.proto_version` 的 **硬相等** 校验实现
-/// 「混合版本干净拒绝」：v3 ↔ v4 在握手阶段就被明文拒绝，不会解码对方的画面帧。
+/// 「混合版本干净拒绝」：v4 ↔ v5 在握手阶段就被明文拒绝，不会解码对方的画面帧。
 ///
 /// 版本 3 是阶段 5 的硬件编码协商（[`SessionMessage::CodecOffer`] / [`SessionMessage::CodecSelect`]
 /// 与 [`CodecId::H264`]）。
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
-/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v4**——先把携带版本 4 的客户端
-/// 铺开（v4 ↔ v3 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 4;
+/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v5**——先把携带版本 5 的客户端
+/// 铺开（v5 ↔ v4 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 5;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;

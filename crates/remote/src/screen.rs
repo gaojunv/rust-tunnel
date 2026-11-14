@@ -186,11 +186,15 @@ pub enum MouseButton {
 /// 一次键盘事件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {
-    /// 平台扫描码/键码（由上层约定）。
+    /// 完整键位码（由上层约定，见 `crates/client-gui/src/remote/mod.rs` 的 `keycode`）。
+    ///
+    /// v5 起可打印键（字母/数字/标点）也使用它：被控端把键位码映射成 Windows VK /
+    /// macOS CGKeyCode / Linux keysym 注入，最终字符由**被控端**的键盘布局与输入法决定。
     pub code: u32,
     /// 是否按下（`false` 为抬起）。
     pub pressed: bool,
-    /// 可打印文本（可选，供上层按需注入）。
+    /// 可打印文本。**遗留字段**：只有旧控制器会填（`code` 为 `TEXT` 时按 Unicode 码点
+    /// 注入，绕过被控端的布局与输入法）；新控制器不填，被控端保留解码以兼容旧控制器。
     pub text: Option<String>,
     /// 修饰键位掩码（Ctrl/Alt/Shift/Meta，位序由上层约定）。
     pub modifiers: u8,
