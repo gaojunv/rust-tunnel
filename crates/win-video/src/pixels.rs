@@ -6,7 +6,7 @@
 //!
 //! 本模块**不依赖任何 Windows API**，可以单独做单元测试。
 
-use crate::WinVideoError;
+use crate::{worker_count, WinVideoError};
 
 /// 保留一个像素的字节数（RGBA8 / BGRA8 都是 4）。
 const BYTES_PER_PIXEL: usize = 4;
@@ -17,13 +17,20 @@ const BYTES_PER_PIXEL: usize = 4;
 /// 这样这个函数永远不会 panic（调用方本就不该传入这种输入）。
 #[must_use]
 pub fn bgra_to_rgba(src: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len());
+    // 定长预分配后按 4 字节像素直接写入：`extend_from_slice` 每个像素都要做一次
+    // 容量检查与一次小拷贝，1080p 每帧两百万次调用是可测开销。切块后目标也是
+    // 定长数组，边界检查可被编译器消掉。
+    let mut out = vec![0u8; src.len()];
     let (pixels, remainder) = src.as_chunks::<BYTES_PER_PIXEL>();
-    for px in pixels {
+    let (dst_pixels, dst_remainder) = out.as_chunks_mut::<BYTES_PER_PIXEL>();
+    for (src_px, dst_px) in pixels.iter().zip(dst_pixels.iter_mut()) {
         // B、G、R、A → R、G、B、A。
-        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        dst_px[0] = src_px[2];
+        dst_px[1] = src_px[1];
+        dst_px[2] = src_px[0];
+        dst_px[3] = src_px[3];
     }
-    out.extend_from_slice(remainder);
+    dst_remainder.copy_from_slice(remainder);
     out
 }
 
@@ -147,12 +154,39 @@ pub fn scale_bgra_to_rgba(
 /// `src_width / 2` 重建目标宽度，避免再传一个参数。
 fn scale_2x2(src: &[u8], src_width: usize, dst: &mut [u8]) {
     let dst_width = src_width / 2;
-    for (dy, dst_row) in dst
-        .chunks_exact_mut(dst_width * BYTES_PER_PIXEL)
-        .enumerate()
-    {
-        let row0 = dy * 2 * src_width * BYTES_PER_PIXEL;
-        let row1 = row0 + src_width * BYTES_PER_PIXEL;
+    let rows = dst.len() / (dst_width * BYTES_PER_PIXEL).max(1);
+    let workers = worker_count(rows.saturating_mul(dst_width), rows);
+    scale_2x2_with_workers(src, src_width, dst, workers);
+}
+
+/// 指定 worker 数的 2×2 路径（测试用它对比单线程/多线程输出）。
+fn scale_2x2_with_workers(src: &[u8], src_width: usize, dst: &mut [u8], workers: usize) {
+    let dst_width = src_width / 2;
+    let row_bytes = dst_width * BYTES_PER_PIXEL;
+    if workers <= 1 {
+        scale_2x2_rows(src, src_width, 0, dst);
+        return;
+    }
+    let rows = dst.len() / row_bytes.max(1);
+    let rows_per_chunk = rows.div_ceil(workers);
+    let chunk_bytes = rows_per_chunk.saturating_mul(row_bytes);
+    std::thread::scope(|scope| {
+        for (index, chunk) in dst.chunks_mut(chunk_bytes).enumerate() {
+            let start_row = index.saturating_mul(rows_per_chunk);
+            let _ = scope.spawn(move || scale_2x2_rows(src, src_width, start_row, chunk));
+        }
+    });
+}
+
+/// 处理输出行 `[start_row, start_row + dst 行数)` 的 2×2 盒式下采样。
+fn scale_2x2_rows(src: &[u8], src_width: usize, start_row: usize, dst: &mut [u8]) {
+    let dst_width = src_width / 2;
+    let row_bytes = dst_width * BYTES_PER_PIXEL;
+    let src_row_bytes = src_width * BYTES_PER_PIXEL;
+    for (local, dst_row) in dst.chunks_exact_mut(row_bytes).enumerate() {
+        let dy = start_row.saturating_add(local);
+        let row0 = dy.saturating_mul(2).saturating_mul(src_row_bytes);
+        let row1 = row0.saturating_add(src_row_bytes);
         let (dst_pixels, _) = dst_row.as_chunks_mut::<BYTES_PER_PIXEL>();
         for (dx, px) in dst_pixels.iter_mut().enumerate() {
             let col0 = dx * 2 * BYTES_PER_PIXEL;
@@ -170,7 +204,50 @@ fn scale_2x2(src: &[u8], src_width: usize, dst: &mut [u8]) {
 
 /// 通用盒式路径：按比例把源矩形映射到目标像素。
 fn scale_generic(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, dst: &mut [u8]) {
-    for dy in 0..dh {
+    let workers = worker_count(dw.saturating_mul(dh), dh);
+    scale_generic_with_workers(src, sw, sh, dw, dh, dst, workers);
+}
+
+/// 指定 worker 数的通用路径（测试用它对比单线程/多线程输出）。
+fn scale_generic_with_workers(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    dst: &mut [u8],
+    workers: usize,
+) {
+    let row_bytes = dw * BYTES_PER_PIXEL;
+    if workers <= 1 {
+        scale_generic_rows(src, sw, sh, dw, dh, 0, dst);
+        return;
+    }
+    let rows_per_chunk = dh.div_ceil(workers);
+    let chunk_bytes = rows_per_chunk.saturating_mul(row_bytes);
+    std::thread::scope(|scope| {
+        for (index, chunk) in dst.chunks_mut(chunk_bytes).enumerate() {
+            let start_row = index.saturating_mul(rows_per_chunk);
+            let _ = scope.spawn(move || {
+                scale_generic_rows(src, sw, sh, dw, dh, start_row, chunk);
+            });
+        }
+    });
+}
+
+/// 处理输出行 `[start_row, start_row + dst 行数)` 的通用盒式下采样。
+fn scale_generic_rows(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    start_row: usize,
+    dst: &mut [u8],
+) {
+    let row_bytes = dw * BYTES_PER_PIXEL;
+    for (local, dst_row) in dst.chunks_exact_mut(row_bytes).enumerate() {
+        let dy = start_row.saturating_add(local);
         // 与 `rgba_to_i444` 相同：目标行 `dy` 覆盖源行区间 `[sy0, sy1)`。
         let sy0 = dy * sh / dh;
         let sy1 = (((dy + 1) * sh) / dh).max(sy0 + 1);
@@ -189,9 +266,9 @@ fn scale_generic(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, dst: &m
                     count += 1;
                 }
             }
-            let off = (dy * dw + dx) * BYTES_PER_PIXEL;
+            let off = dx * BYTES_PER_PIXEL;
             for (channel, sum) in sums.iter().copied().enumerate() {
-                dst[off + channel] = mean(sum, count);
+                dst_row[off + channel] = mean(sum, count);
             }
         }
     }
@@ -200,12 +277,39 @@ fn scale_generic(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, dst: &m
 /// BGRA 的 2×2 快速路径：源 4 个像素的 B/G/R/A 分别取均值，输出 R/G/B/A。
 fn scale_bgra_2x2(src: &[u8], src_width: usize, dst: &mut [u8]) {
     let dst_width = src_width / 2;
-    for (dy, dst_row) in dst
-        .chunks_exact_mut(dst_width * BYTES_PER_PIXEL)
-        .enumerate()
-    {
-        let row0 = dy * 2 * src_width * BYTES_PER_PIXEL;
-        let row1 = row0 + src_width * BYTES_PER_PIXEL;
+    let rows = dst.len() / (dst_width * BYTES_PER_PIXEL).max(1);
+    let workers = worker_count(rows.saturating_mul(dst_width), rows);
+    scale_bgra_2x2_with_workers(src, src_width, dst, workers);
+}
+
+/// 指定 worker 数的 BGRA 2×2 路径。
+fn scale_bgra_2x2_with_workers(src: &[u8], src_width: usize, dst: &mut [u8], workers: usize) {
+    let dst_width = src_width / 2;
+    let row_bytes = dst_width * BYTES_PER_PIXEL;
+    if workers <= 1 {
+        scale_bgra_2x2_rows(src, src_width, 0, dst);
+        return;
+    }
+    let rows = dst.len() / row_bytes.max(1);
+    let rows_per_chunk = rows.div_ceil(workers);
+    let chunk_bytes = rows_per_chunk.saturating_mul(row_bytes);
+    std::thread::scope(|scope| {
+        for (index, chunk) in dst.chunks_mut(chunk_bytes).enumerate() {
+            let start_row = index.saturating_mul(rows_per_chunk);
+            let _ = scope.spawn(move || scale_bgra_2x2_rows(src, src_width, start_row, chunk));
+        }
+    });
+}
+
+/// 处理输出行 `[start_row, start_row + dst 行数)` 的 BGRA 2×2 下采样。
+fn scale_bgra_2x2_rows(src: &[u8], src_width: usize, start_row: usize, dst: &mut [u8]) {
+    let dst_width = src_width / 2;
+    let row_bytes = dst_width * BYTES_PER_PIXEL;
+    let src_row_bytes = src_width * BYTES_PER_PIXEL;
+    for (local, dst_row) in dst.chunks_exact_mut(row_bytes).enumerate() {
+        let dy = start_row.saturating_add(local);
+        let row0 = dy.saturating_mul(2).saturating_mul(src_row_bytes);
+        let row1 = row0.saturating_add(src_row_bytes);
         let (dst_pixels, _) = dst_row.as_chunks_mut::<BYTES_PER_PIXEL>();
         for (dx, px) in dst_pixels.iter_mut().enumerate() {
             let col0 = dx * 2 * BYTES_PER_PIXEL;
@@ -227,7 +331,50 @@ fn scale_bgra_2x2(src: &[u8], src_width: usize, dst: &mut [u8]) {
 
 /// BGRA 的通用盒式路径：按比例取源矩形均值并在输出时交换 R/B。
 fn scale_bgra_generic(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, dst: &mut [u8]) {
-    for dy in 0..dh {
+    let workers = worker_count(dw.saturating_mul(dh), dh);
+    scale_bgra_generic_with_workers(src, sw, sh, dw, dh, dst, workers);
+}
+
+/// 指定 worker 数的 BGRA 通用路径。
+fn scale_bgra_generic_with_workers(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    dst: &mut [u8],
+    workers: usize,
+) {
+    let row_bytes = dw * BYTES_PER_PIXEL;
+    if workers <= 1 {
+        scale_bgra_generic_rows(src, sw, sh, dw, dh, 0, dst);
+        return;
+    }
+    let rows_per_chunk = dh.div_ceil(workers);
+    let chunk_bytes = rows_per_chunk.saturating_mul(row_bytes);
+    std::thread::scope(|scope| {
+        for (index, chunk) in dst.chunks_mut(chunk_bytes).enumerate() {
+            let start_row = index.saturating_mul(rows_per_chunk);
+            let _ = scope.spawn(move || {
+                scale_bgra_generic_rows(src, sw, sh, dw, dh, start_row, chunk);
+            });
+        }
+    });
+}
+
+/// 处理输出行 `[start_row, start_row + dst 行数)` 的 BGRA 通用下采样。
+fn scale_bgra_generic_rows(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    start_row: usize,
+    dst: &mut [u8],
+) {
+    let row_bytes = dw * BYTES_PER_PIXEL;
+    for (local, dst_row) in dst.chunks_exact_mut(row_bytes).enumerate() {
+        let dy = start_row.saturating_add(local);
         let sy0 = dy * sh / dh;
         let sy1 = (((dy + 1) * sh) / dh).max(sy0 + 1);
         for dx in 0..dw {
@@ -245,12 +392,12 @@ fn scale_bgra_generic(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, ds
                     count += 1;
                 }
             }
-            let off = (dy * dw + dx) * BYTES_PER_PIXEL;
+            let off = dx * BYTES_PER_PIXEL;
             // 源是 B、G、R、A；输出是 R、G、B、A。
-            dst[off] = mean(sums[2], count);
-            dst[off + 1] = mean(sums[1], count);
-            dst[off + 2] = mean(sums[0], count);
-            dst[off + 3] = mean(sums[3], count);
+            dst_row[off] = mean(sums[2], count);
+            dst_row[off + 1] = mean(sums[1], count);
+            dst_row[off + 2] = mean(sums[0], count);
+            dst_row[off + 3] = mean(sums[3], count);
         }
     }
 }
@@ -379,6 +526,43 @@ mod tests {
         assert!(scale_rgba_box(&[], 0, 0, 2, 2).is_err());
     }
 
+    /// 2×2 路径并行与单线程必须逐字节一致。
+    #[test]
+    fn parallel_2x2_matches_single_thread() {
+        let src = gradient(1024, 1024);
+        let dst_len = 512 * 512 * 4;
+        let mut single = vec![0u8; dst_len];
+        scale_2x2_with_workers(&src, 1024, &mut single, 1);
+        let mut multi = vec![0u8; dst_len];
+        scale_2x2_with_workers(&src, 1024, &mut multi, 4);
+        assert_eq!(single, multi);
+
+        let mut bgra_single = vec![0u8; dst_len];
+        scale_bgra_2x2_with_workers(&src, 1024, &mut bgra_single, 1);
+        let mut bgra_multi = vec![0u8; dst_len];
+        scale_bgra_2x2_with_workers(&src, 1024, &mut bgra_multi, 4);
+        assert_eq!(bgra_single, bgra_multi);
+    }
+
+    /// 通用路径并行与单线程必须逐字节一致。
+    #[test]
+    fn parallel_generic_matches_single_thread() {
+        let (sw, sh, dw, dh) = (1000, 1000, 333, 333);
+        let src = gradient(1000, 1000);
+        let dst_len = 333 * 333 * 4;
+        let mut single = vec![0u8; dst_len];
+        scale_generic_with_workers(&src, sw, sh, dw, dh, &mut single, 1);
+        let mut multi = vec![0u8; dst_len];
+        scale_generic_with_workers(&src, sw, sh, dw, dh, &mut multi, 4);
+        assert_eq!(single, multi);
+
+        let mut bgra_single = vec![0u8; dst_len];
+        scale_bgra_generic_with_workers(&src, sw, sh, dw, dh, &mut bgra_single, 1);
+        let mut bgra_multi = vec![0u8; dst_len];
+        scale_bgra_generic_with_workers(&src, sw, sh, dw, dh, &mut bgra_multi, 4);
+        assert_eq!(bgra_single, bgra_multi);
+    }
+
     /// 4K → 1080p 的耗时打印（release 下跑：`cargo test -p rust-tunnel-win-video --lib --release -- --ignored`）。
     #[test]
     #[ignore = "性能观察用，默认不跑"]
@@ -392,5 +576,16 @@ mod tests {
             out.len()
         );
         assert_eq!(out.len(), 1920 * 1080 * 4);
+
+        let dst_len = 1920 * 1080 * 4;
+        let mut single = vec![0u8; dst_len];
+        let started = std::time::Instant::now();
+        scale_2x2_with_workers(&src, 3840, &mut single, 1);
+        println!("4K→1080p 2×2 workers=1: {:?}", started.elapsed());
+        let mut multi = vec![0u8; dst_len];
+        let started = std::time::Instant::now();
+        scale_2x2_with_workers(&src, 3840, &mut multi, 4);
+        println!("4K→1080p 2×2 workers=4: {:?}", started.elapsed());
+        assert_eq!(single, multi);
     }
 }

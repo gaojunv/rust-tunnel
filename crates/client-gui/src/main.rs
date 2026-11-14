@@ -924,11 +924,18 @@ fn install_startup_diagnostics() -> Option<std::path::PathBuf> {
     });
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("gui-startup.log");
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let cpus = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
     let header = format!(
-        "\n=== rust-tunnel-client-gui {} starting ===\nexe: {:?}\nargs: {:?}",
+        "\n=== rust-tunnel-client-gui {} starting ===\nexe: {:?}\nargs: {:?}\nprofile: {profile}, debug_assertions: {}, cpus: {cpus}",
         env!("CARGO_PKG_VERSION"),
         std::env::current_exe(),
         std::env::args().collect::<Vec<_>>(),
+        cfg!(debug_assertions),
     );
     // 追加而不是截断：Glow 失败后会用 wgpu 重启自身，两次启动的证据都要保留。
     append_startup_log(&path, &header);
@@ -1002,6 +1009,16 @@ fn show_startup_error_dialog(_message: &str) {}
 fn main() {
     // 诊断必须先于一切：即使下面的 COM/窗口初始化失败，也能留下版本与错误。
     let log_path = install_startup_diagnostics();
+
+    // 远程数据面的 MFT/WGC 都用短 sleep 轮询；Windows 默认定时器粒度约 15.6 ms，
+    // 会把 0.5–2 ms 的休眠放大一个数量级（表现为每帧凭空多出 15 ms 以上）。
+    // 提到 1 ms 是进程级设置，进程退出后自动失效；失败的返回值不影响正确性。
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: `timeBeginPeriod` 只影响本进程的定时器分辨率，无指针参数、
+        // 无前置条件；与进程生命周期绑定。
+        let _ = unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+    }
 
     // 主线程先占住 STA：winit 创建窗口时会 `OleInitialize`，若主线程已被任何依赖
     // 初始化成 MTA，winit 会以 `RPC_E_CHANGED_MODE` **直接 panic**。先初始化 STA

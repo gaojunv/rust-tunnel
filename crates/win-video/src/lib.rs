@@ -45,6 +45,31 @@ pub mod pixels;
 #[cfg(windows)]
 pub mod probe;
 
+/// 逐像素大循环按行并行时的 worker 数（1 = 单线程）。
+///
+/// 规则：
+/// - 输出像素少于 512×512（约 0.26 M，覆盖 480p 以下）时单线程；
+/// - 否则取 `available_parallelism().min(4)`；
+/// - 再按 `rows` 收敛，保证每个 worker 至少约 64 行（或行对），避免为几行
+///   去 spawn 线程。
+#[cfg(windows)]
+pub(crate) fn worker_count(pixels: usize, rows: usize) -> usize {
+    /// 低于该像素数不值得起线程。
+    const PARALLEL_MIN_PIXELS: usize = 512 * 512;
+    /// 最多 4 个 worker：编码/解码任务本身已在线程池线程上，再多会与主循环抢核。
+    const MAX_WORKERS: usize = 4;
+    /// 每个 worker 至少处理的输出行（行对）数。
+    const MIN_ROWS_PER_WORKER: usize = 64;
+
+    if pixels < PARALLEL_MIN_PIXELS {
+        return 1;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(MAX_WORKERS);
+    cpus.min((rows / MIN_ROWS_PER_WORKER).max(1))
+}
+
 /// 本 crate 的错误类型。
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]

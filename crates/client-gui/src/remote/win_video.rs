@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
@@ -27,7 +28,7 @@ use rust_tunnel_remote::{
 };
 use rust_tunnel_win_video::capture::{self, CaptureSource};
 use rust_tunnel_win_video::d3d11;
-use rust_tunnel_win_video::decode::H264Decoder;
+use rust_tunnel_win_video::decode::{H264Decoder, H264HardwarePreference};
 use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
@@ -35,12 +36,21 @@ use tracing::{debug, info, warn};
 
 use super::XcapScreen;
 
+/// 已缓存采集源的重新校验间隔。
+///
+/// 缓存有效期内不再调 `xcap::Monitor::all()` 与 `capture::enumerate_monitors()`：
+/// 两者每帧各枚举一次显示器，在老 CPU 上是可测开销。2 秒的迟滞对插拔显示器/
+/// 改分辨率来说足够短，又足以让绝大多数帧走零枚举的快路径。
+const SOURCE_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+
 /// 一个已打开的硬件采集源及其对应的显示器几何。
 struct CachedSource {
     /// WGC 或 DXGI 采集源。
     source: Box<dyn CaptureSource>,
     /// 打开时的虚拟桌面几何；几何变化时丢弃重开。
     geometry: Geometry,
+    /// 最近一次完成枚举/几何校验的时刻（缓存有效期从这里算）。
+    checked_at: Instant,
 }
 
 /// 显示器的虚拟桌面几何（物理像素）。
@@ -76,59 +86,18 @@ impl WinVideoScreen {
 
     /// 尝试用硬件后端采集一帧；失败时由调用方回退 xcap。
     ///
+    /// 采集源缓存命中且校验未过期时**不枚举任何显示器**，直接采帧；否则重新
+    /// 枚举、比对几何，必要时重建采集源。
+    ///
     /// 失败会把缓存项移除，下一次调用重新尝试打开（`open_best` 内部按
     /// WGC → DXGI 顺序选择）。
     fn capture_hardware(&self, display_id: u32) -> RemoteResult<RawFrame> {
-        let monitors = xcap::Monitor::all()
-            .map_err(|err| RemoteError::Platform(format!("枚举显示器失败: {err}")))?;
-        let (index, monitor) = monitors
-            .iter()
-            .enumerate()
-            .find(|(_, monitor)| monitor.id().ok() == Some(display_id))
-            .or_else(|| monitors.first().map(|monitor| (0, monitor)))
-            .ok_or_else(|| RemoteError::Platform("无可用显示器".to_owned()))?;
-        let geometry = Geometry {
-            left: monitor
-                .x()
-                .map_err(|err| RemoteError::Platform(format!("读取显示器 X 失败: {err}")))?,
-            top: monitor
-                .y()
-                .map_err(|err| RemoteError::Platform(format!("读取显示器 Y 失败: {err}")))?,
-            width: monitor
-                .width()
-                .map_err(|err| RemoteError::Platform(format!("读取显示器宽度失败: {err}")))?,
-            height: monitor
-                .height()
-                .map_err(|err| RemoteError::Platform(format!("读取显示器高度失败: {err}")))?,
-        };
-
-        let hardware = capture::enumerate_monitors()
-            .map_err(|err| RemoteError::Platform(format!("枚举硬件显示器失败: {err}")))?;
-        // 两个枚举都来自 EnumDisplayMonitors，顺序一致；几何匹配优先，
-        // 顺序索引兜底（DPI 感知模式不同可能让坐标取整略有差异）。
-        let target = hardware
-            .iter()
-            .find(|candidate| {
-                candidate.left == geometry.left
-                    && candidate.top == geometry.top
-                    && candidate.width == geometry.width
-                    && candidate.height == geometry.height
-            })
-            .or_else(|| hardware.get(index))
-            .ok_or_else(|| {
-                RemoteError::Platform(format!("未找到与显示器 {display_id} 匹配的硬件采集目标"))
-            })?;
-
         let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-        let stale = sources
+        let cache_fresh = sources
             .get(&display_id)
-            .is_none_or(|cached| cached.geometry != geometry);
-        if stale {
-            sources.remove(&display_id);
-            let source = capture::open_best(target)
-                .map_err(|err| RemoteError::Platform(format!("打开硬件采集源失败: {err}")))?;
-            debug!(display_id, backend = %source.backend(), "硬件采集源已打开");
-            sources.insert(display_id, CachedSource { source, geometry });
+            .is_some_and(|cached| cached.checked_at.elapsed() < SOURCE_RECHECK_INTERVAL);
+        if !cache_fresh {
+            refresh_cached_source(&mut sources, display_id)?;
         }
         let captured = match sources.get_mut(&display_id) {
             Some(cached) => cached.capture_frame(),
@@ -166,6 +135,77 @@ impl WinVideoScreen {
             rgba,
         })
     }
+}
+
+/// 重新枚举显示器与硬件采集目标；几何未变时只刷新 `checked_at`。
+///
+/// 只有几何真的变化（或缓存缺失）时才枚举硬件目标并重开采集源——枚举本身
+/// 是这次优化的目标，不该在几何未变时白做。
+fn refresh_cached_source(
+    sources: &mut HashMap<u32, CachedSource>,
+    display_id: u32,
+) -> RemoteResult<()> {
+    let monitors = xcap::Monitor::all()
+        .map_err(|err| RemoteError::Platform(format!("枚举显示器失败: {err}")))?;
+    let (index, monitor) = monitors
+        .iter()
+        .enumerate()
+        .find(|(_, monitor)| monitor.id().ok() == Some(display_id))
+        .or_else(|| monitors.first().map(|monitor| (0, monitor)))
+        .ok_or_else(|| RemoteError::Platform("无可用显示器".to_owned()))?;
+    let geometry = Geometry {
+        left: monitor
+            .x()
+            .map_err(|err| RemoteError::Platform(format!("读取显示器 X 失败: {err}")))?,
+        top: monitor
+            .y()
+            .map_err(|err| RemoteError::Platform(format!("读取显示器 Y 失败: {err}")))?,
+        width: monitor
+            .width()
+            .map_err(|err| RemoteError::Platform(format!("读取显示器宽度失败: {err}")))?,
+        height: monitor
+            .height()
+            .map_err(|err| RemoteError::Platform(format!("读取显示器高度失败: {err}")))?,
+    };
+
+    // 缓存几何未变：采集源继续可用，只把有效期往后推。
+    if let Some(cached) = sources.get_mut(&display_id) {
+        if cached.geometry == geometry {
+            cached.checked_at = Instant::now();
+            return Ok(());
+        }
+    }
+
+    let hardware = capture::enumerate_monitors()
+        .map_err(|err| RemoteError::Platform(format!("枚举硬件显示器失败: {err}")))?;
+    // 两个枚举都来自 EnumDisplayMonitors，顺序一致；几何匹配优先，
+    // 顺序索引兜底（DPI 感知模式不同可能让坐标取整略有差异）。
+    let target = hardware
+        .iter()
+        .find(|candidate| {
+            candidate.left == geometry.left
+                && candidate.top == geometry.top
+                && candidate.width == geometry.width
+                && candidate.height == geometry.height
+        })
+        .or_else(|| hardware.get(index))
+        .ok_or_else(|| {
+            RemoteError::Platform(format!("未找到与显示器 {display_id} 匹配的硬件采集目标"))
+        })?;
+
+    sources.remove(&display_id);
+    let source = capture::open_best(target)
+        .map_err(|err| RemoteError::Platform(format!("打开硬件采集源失败: {err}")))?;
+    debug!(display_id, backend = %source.backend(), "硬件采集源已打开");
+    sources.insert(
+        display_id,
+        CachedSource {
+            source,
+            geometry,
+            checked_at: Instant::now(),
+        },
+    );
+    Ok(())
 }
 
 impl Default for WinVideoScreen {
@@ -211,6 +251,11 @@ const _: () = {
 #[must_use]
 pub fn screen() -> WinVideoScreen {
     WinVideoScreen::new()
+}
+
+/// 把从 `started` 到现在的耗时取整为毫秒（饱和到 `u32::MAX`）。
+fn elapsed_ms(started: Instant) -> u32 {
+    u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 /// 进程级 NVENC API 只加载一次；`Box::leak` 让它活到进程结束，从而能给出
@@ -390,7 +435,11 @@ impl VideoEncoderFactory for MftEncoderFactory {
         let fps = u32::from(max_fps.max(1));
         let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
             .map_err(|err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")))?;
-        Ok(Box::new(MftAdapter { encoder, fps }))
+        Ok(Box::new(MftAdapter {
+            encoder,
+            fps,
+            frames: 0,
+        }))
     }
 }
 
@@ -400,6 +449,8 @@ struct MftAdapter {
     encoder: MftH264Encoder,
     /// 逻辑帧率（Intel MFT 不支持在线改输出帧率，实际节奏由采集控制）。
     fps: u32,
+    /// 已编码帧数，用于限制细分耗时日志的频率（前 3 帧 + 每 120 帧）。
+    frames: u64,
 }
 
 impl VideoEncoderApi for MftAdapter {
@@ -452,14 +503,29 @@ impl VideoEncoderApi for MftAdapter {
             )));
         }
         let (dst_width, dst_height) = self.encoder.dimensions();
+        let total_started = Instant::now();
+        let mut scale_ms = 0u32;
         let packet = if (src_width, src_height) == (dst_width, dst_height) {
             self.encoder.encode_rgba(rgba, force_keyframe)
         } else {
+            let scale_started = Instant::now();
             let scaled = scale_rgba_box(rgba, src_width, src_height, dst_width, dst_height)
                 .map_err(|err| RemoteError::Encode(format!("H.264 输入下采样失败: {err}")))?;
+            scale_ms = elapsed_ms(scale_started);
             self.encoder.encode_rgba(&scaled, force_keyframe)
         }
         .map_err(|err| RemoteError::Encode(format!("MFT 编码失败: {err}")))?;
+        let total_ms = elapsed_ms(total_started);
+        self.frames = self.frames.saturating_add(1);
+        // 只在前 3 帧与每 120 帧打一条：GUI 日志层会丢弃 tracing 字段，故全部
+        // 内联进消息文本。字段 = 适配器总耗时（缩放 + 转换 + MFT）。
+        if self.frames <= 3 || self.frames.is_multiple_of(120) {
+            info!(
+                "MFT H.264 编码细分 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={dst_width}x{dst_height} 缩放={scale_ms}ms",
+                self.encoder.last_convert_ms(),
+                self.encoder.last_mft_ms(),
+            );
+        }
         Ok(EncodedVideo {
             data: packet.data,
             keyframe: packet.keyframe,
@@ -510,6 +576,7 @@ impl VideoDecoderFactory for H264DecoderFactory {
         Ok(Box::new(H264DecoderAdapter {
             decoder: None,
             configured: None,
+            frames: 0,
         }))
     }
 }
@@ -520,6 +587,8 @@ struct H264DecoderAdapter {
     decoder: Option<H264Decoder>,
     /// 当前解码器适配的编码尺寸。
     configured: Option<(u32, u32)>,
+    /// 已成功解出的帧数，用于限制细分耗时日志的频率（前 3 帧 + 每 120 帧）。
+    frames: u64,
 }
 
 impl VideoDecoderApi for H264DecoderAdapter {
@@ -527,11 +596,22 @@ impl VideoDecoderApi for H264DecoderAdapter {
         if self.decoder.is_some() && self.configured == Some((width, height)) {
             return Ok(());
         }
-        match H264Decoder::new(width, height) {
+        // 现场 A/B 开关：若解码细分日志显示 DXVA 回读（staging Map）比颜色转换
+        // 还慢，置 `RUST_TUNNEL_DECODE_SOFTWARE=1` 可强制系统内存软件解码对照。
+        // 默认行为不变（Auto → DXVA 优先）。
+        let software = std::env::var_os("RUST_TUNNEL_DECODE_SOFTWARE")
+            .is_some_and(|value| !value.is_empty());
+        let created = if software {
+            H264Decoder::new_with_preference(width, height, H264HardwarePreference::Software)
+        } else {
+            H264Decoder::new(width, height)
+        };
+        match created {
             Ok(decoder) => {
                 info!(
                     path = ?decoder.path(),
                     adapter = ?decoder.adapter_name(),
+                    software,
                     width,
                     height,
                     "H.264 解码器已创建"
@@ -555,10 +635,28 @@ impl VideoDecoderApi for H264DecoderAdapter {
             .decoder
             .as_mut()
             .ok_or_else(|| RemoteError::Encode("H.264 解码器尚未 configure".to_owned()))?;
+        let total_started = Instant::now();
         let frame = decoder
             .decode(data)
             .map_err(|err| RemoteError::Encode(format!("H.264 解码失败: {err}")))?;
-        Ok(frame.map(|frame| DecodedVideoFrame {
+        let total_ms = elapsed_ms(total_started);
+        // 在结束 `decoder` 的可变借用前读出诊断读数与通路名。
+        let readback_ms = decoder.last_readback_ms();
+        let color_ms = decoder.last_color_ms();
+        let path = decoder.path().as_str();
+        let Some(frame) = frame else {
+            // MFT 还在缓冲输入，本帧没有输出；不计数、不打日志。
+            return Ok(None);
+        };
+        self.frames = self.frames.saturating_add(1);
+        // 只在前 3 帧与每 120 帧打一条（GUI 日志层会丢弃 tracing 字段，全部内联）。
+        if self.frames <= 3 || self.frames.is_multiple_of(120) {
+            info!(
+                "H.264 解码细分 总计={total_ms}ms 回读={readback_ms}ms 转换={color_ms}ms 尺寸={}x{} path={path}",
+                frame.width, frame.height,
+            );
+        }
+        Ok(Some(DecodedVideoFrame {
             width: frame.width,
             height: frame.height,
             rgba: frame.rgba,

@@ -68,7 +68,11 @@ const MAX_OUTPUT_TYPES: u32 = 64;
 /// 异步 MFT 等待事件的超时（避免驱动异常时永久阻塞编码线程）。
 const EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 异步事件轮询间隔。
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+///
+/// 有意取亚毫秒值：进程启动时已用 `timeBeginPeriod(1)` 把定时器粒度降到 1 ms，
+/// 但 500 µs 在未生效的机器上仍会按 1 ms 粒度休眠，不会更糟；配合
+/// `METransformHaveOutput` 的到达节奏，比固定 1 ms 少一次多余休眠。
+const EVENT_POLL_INTERVAL: Duration = Duration::from_micros(500);
 
 /// 枚举到的一个 H.264 编码器 MFT。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +112,11 @@ pub struct MftH264Encoder {
     sequence_header: Vec<u8>,
     next_pts: i64,
     frame_duration: i64,
+    /// 最近一帧 `rgba_to_nv12` 的耗时（毫秒），仅供诊断。
+    last_convert_ms: u32,
+    /// 最近一帧 MFT 处理（建样本 + ProcessInput/ProcessOutput + Annex B 归一化）
+    /// 的耗时（毫秒），仅供诊断。
+    last_mft_ms: u32,
 }
 
 impl std::fmt::Debug for MftH264Encoder {
@@ -294,6 +303,8 @@ impl MftH264Encoder {
             sequence_header,
             next_pts: 0,
             frame_duration: HNS_PER_SECOND / i64::from(fps),
+            last_convert_ms: 0,
+            last_mft_ms: 0,
         })
     }
 
@@ -333,6 +344,23 @@ impl MftH264Encoder {
         &self.encode_device.device.adapter.name
     }
 
+    /// 最近一帧 RGBA→NV12（CPU 转换）的耗时，单位毫秒。
+    ///
+    /// 只用于诊断：在 [`MftH264Encoder::encode_rgba`] 返回后读取，取整到毫秒。
+    #[must_use]
+    pub fn last_convert_ms(&self) -> u32 {
+        self.last_convert_ms
+    }
+
+    /// 最近一帧 MFT 处理的耗时，单位毫秒。
+    ///
+    /// 覆盖建输入样本、`ProcessInput`/`ProcessOutput` 与 Annex B 归一化；同为
+    /// 诊断读数，取整到毫秒。
+    #[must_use]
+    pub fn last_mft_ms(&self) -> u32 {
+        self.last_mft_ms
+    }
+
     /// 编码一帧 RGBA8。
     ///
     /// `force_keyframe == true` 时必须产出 IDR + SPS/PPS；若编码器不支持强制
@@ -352,12 +380,15 @@ impl MftH264Encoder {
     ) -> Result<EncodedPacket, WinVideoError> {
         // 编码任务可能在线程池线程上运行：COM 初始化是线程局部的。
         ensure_com_initialized()?;
+        let convert_started = Instant::now();
         convert::rgba_to_nv12(rgba, self.width, self.height, &mut self.nv12)?;
+        self.last_convert_ms = elapsed_ms(convert_started);
 
         if force_keyframe {
             self.request_keyframe()?;
         }
 
+        let mft_started = Instant::now();
         let sample = self.build_input_sample()?;
         let raw = if self.events.is_some() {
             self.encode_async(sample)?
@@ -366,6 +397,7 @@ impl MftH264Encoder {
         };
 
         let annex_b = bitstream::normalize_to_annex_b(&raw)?;
+        self.last_mft_ms = elapsed_ms(mft_started);
         if annex_b.is_empty() {
             // 编码器还在缓冲；调用方跳过本帧。
             return Ok(EncodedPacket {
@@ -1034,6 +1066,11 @@ fn pack_size(width: u32, height: u32) -> u64 {
 /// `MF_MT_FRAME_RATE` / `MF_MT_PIXEL_ASPECT_RATIO` 的打包。
 fn pack_ratio(numerator: u32, denominator: u32) -> u64 {
     (u64::from(numerator) << 32) | u64::from(denominator)
+}
+
+/// 把从 `started` 到现在的耗时取整为毫秒（饱和到 `u32::MAX`）。
+fn elapsed_ms(started: Instant) -> u32 {
+    u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 /// 把 HRESULT 包成带上下文的编码错误。

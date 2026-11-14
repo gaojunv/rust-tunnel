@@ -41,6 +41,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::OnceLock;
+use std::time::Instant;
 use windows::core::{IUnknown, Interface as _};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
@@ -185,6 +186,10 @@ pub struct H264Decoder {
     dxgi_seen: bool,
     /// 「配置了 DXVA 却没有 DXGI 样本」的告警只打一次。
     warned_no_dxgi: bool,
+    /// 最近一帧 DXGI staging 回读（纹理拷贝 + Map）的耗时（毫秒）；软件路径为 0。
+    last_readback_ms: u32,
+    /// 最近一帧 NV12/YV12/IYUV→RGBA 颜色转换的耗时（毫秒）。
+    last_color_ms: u32,
 }
 
 impl std::fmt::Debug for H264Decoder {
@@ -276,6 +281,8 @@ impl H264Decoder {
             hardware: pipeline.hardware,
             dxgi_seen: false,
             warned_no_dxgi: false,
+            last_readback_ms: 0,
+            last_color_ms: 0,
         })
     }
 
@@ -318,6 +325,23 @@ impl H264Decoder {
         )
     }
 
+    /// 最近一帧 DXGI staging 回读的耗时，单位毫秒（软件路径恒为 0）。
+    ///
+    /// 覆盖 `IMFDXGIBuffer`→staging 纹理的 `CopySubresourceRegion` 与 `Map`；
+    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。
+    #[must_use]
+    pub fn last_readback_ms(&self) -> u32 {
+        self.last_readback_ms
+    }
+
+    /// 最近一帧 NV12/YV12/IYUV→RGBA 颜色转换的耗时，单位毫秒。
+    ///
+    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。
+    #[must_use]
+    pub fn last_color_ms(&self) -> u32 {
+        self.last_color_ms
+    }
+
     /// 重建解码器以适配新的编码尺寸（`ScreenConfig` 变化时调用）。
     ///
     /// 重建会丢弃当前参考帧，下一帧必须是 IDR；这与 remote 的分辨率变更规则
@@ -338,6 +362,8 @@ impl H264Decoder {
         self.next_pts = 0;
         self.dxgi_seen = false;
         self.warned_no_dxgi = false;
+        self.last_readback_ms = 0;
+        self.last_color_ms = 0;
         Ok(())
     }
 
@@ -517,6 +543,10 @@ impl H264Decoder {
 
     /// 把一个输出样本转换成 RGBA（DXGI 纹理优先，其次系统内存）。
     fn convert_sample(&mut self, sample: &IMFSample) -> Result<DecodedH264Frame, WinVideoError> {
+        // 每帧重新计数：软件路径的回读恒为 0，诊断读数不应沿用上一帧。
+        self.last_readback_ms = 0;
+        self.last_color_ms = 0;
+
         // SAFETY: `sample` 有效；返回的缓冲区在作用域内保持引用计数。
         let buffer: IMFMediaBuffer = unsafe { sample.GetBufferByIndex(0) }
             .map_err(|err| decode_err("IMFSample::GetBufferByIndex", &err))?;
@@ -526,12 +556,24 @@ impl H264Decoder {
         if let Ok(dxgi_buffer) = buffer.cast::<IMFDXGIBuffer>() {
             if let Some(hardware) = self.hardware.as_mut() {
                 let output = self.output;
+                let mut color_ms = 0u32;
+                let readback_started = Instant::now();
                 let converted = hardware.with_mapped(
                     output.coded_width,
                     output.coded_height,
                     &dxgi_buffer,
-                    |scanline, pitch| convert_planes(&output, scanline, pitch),
+                    |scanline, pitch| {
+                        // 闭包只做色彩转换：`with_mapped` 在调用它之前已完成
+                        // staging 拷贝与 Map，故“总耗时 - 本段”就是回读耗时。
+                        let color_started = Instant::now();
+                        let converted = convert_planes(&output, scanline, pitch);
+                        color_ms = elapsed_ms(color_started);
+                        converted
+                    },
                 );
+                // 两次独立测量的差值即回读（staging 拷贝 + Map）耗时。
+                self.last_readback_ms = elapsed_ms(readback_started).saturating_sub(color_ms);
+                self.last_color_ms = color_ms;
                 self.dxgi_seen = true;
                 return converted;
             }
@@ -557,7 +599,9 @@ impl H264Decoder {
             // SAFETY: 两个输出指针都指向本栈帧；`buffer_2d` 在解锁前一直有效。
             unsafe { buffer_2d.Lock2D(&raw mut scanline, &raw mut pitch) }
                 .map_err(|err| decode_err("IMF2DBuffer::Lock2D", &err))?;
+            let color_started = Instant::now();
             let converted = convert_system_memory(&self.output, scanline, pitch);
+            self.last_color_ms = elapsed_ms(color_started);
             // SAFETY: 与上面的 Lock2D 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { buffer_2d.Unlock2D() };
             combine_unlock(converted, unlocked, "IMF2DBuffer::Unlock2D")
@@ -567,7 +611,9 @@ impl H264Decoder {
             unsafe { contiguous.Lock(&raw mut scanline, None, None) }
                 .map_err(|err| decode_err("IMFMediaBuffer::Lock（输出）", &err))?;
             let pitch = i32::try_from(self.output.stride).unwrap_or(0);
+            let color_started = Instant::now();
             let converted = convert_system_memory(&self.output, scanline, pitch);
+            self.last_color_ms = elapsed_ms(color_started);
             // SAFETY: 与上面的 Lock 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { contiguous.Unlock() };
             combine_unlock(converted, unlocked, "IMFMediaBuffer::Unlock（输出）")
@@ -588,6 +634,10 @@ fn convert_system_memory(
 }
 
 /// 从锁定的缓冲区转换出一帧。
+#[expect(
+    clippy::too_many_lines,
+    reason = "三种 4:2:0 布局的「融合裁剪 / 整帧回退」分派放在一起对照，拆散反而更难核对"
+)]
 fn convert_planes(
     output: &OutputFormat,
     scanline: *const u8,
@@ -608,6 +658,21 @@ fn convert_planes(
         .checked_mul(h / 2)
         .ok_or_else(|| WinVideoError::Decode("色度平面大小溢出".to_owned()))?;
 
+    let display = output.display;
+    let crop = color::CropRect {
+        x: display.x,
+        y: display.y,
+        width: display.width,
+        height: display.height,
+    };
+    let full_frame = display.x == 0
+        && display.y == 0
+        && display.width == width
+        && display.height == height;
+    // 编码帧与可见区域一致时走整帧路径（零额外开销）；否则只要 4:2:0 的
+    // 偶数对齐与边界都满足，就把裁剪融进颜色转换，省掉整帧再拷一次。
+    let fuse_crop = !full_frame && color::crop_is_supported(crop, width, height);
+
     // SAFETY: 对每个平面，MFT 的 `Lock2D` 契约保证从 `scanline` 起至少有
     // `pitch * rows` 字节可读；NV12 的 UV 平面紧跟在 Y 平面之后，YV12/IYUV
     // 的两个色度平面依次跟随。切片只用于只读转换，Unlock 前一直有效。
@@ -617,7 +682,13 @@ fn convert_planes(
         H264OutputFormat::Nv12 => {
             let uv_plane =
                 unsafe { std::slice::from_raw_parts(scanline.add(luma_len), chroma_len) };
-            color::nv12_to_rgba(y_plane, uv_plane, pitch, pitch, width, height, &mut rgba)?;
+            if fuse_crop {
+                color::nv12_to_rgba_cropped(
+                    y_plane, uv_plane, pitch, pitch, width, height, crop, &mut rgba,
+                )?;
+            } else {
+                color::nv12_to_rgba(y_plane, uv_plane, pitch, pitch, width, height, &mut rgba)?;
+            }
         }
         H264OutputFormat::Yv12 => {
             let plane_stride = pitch / 2;
@@ -629,16 +700,30 @@ fn convert_planes(
             let u_plane = unsafe {
                 std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
             };
-            color::planar_to_rgba(
-                y_plane,
-                u_plane,
-                v_plane,
-                pitch,
-                plane_stride,
-                width,
-                height,
-                &mut rgba,
-            )?;
+            if fuse_crop {
+                color::planar_to_rgba_cropped(
+                    y_plane,
+                    u_plane,
+                    v_plane,
+                    pitch,
+                    plane_stride,
+                    width,
+                    height,
+                    crop,
+                    &mut rgba,
+                )?;
+            } else {
+                color::planar_to_rgba(
+                    y_plane,
+                    u_plane,
+                    v_plane,
+                    pitch,
+                    plane_stride,
+                    width,
+                    height,
+                    &mut rgba,
+                )?;
+            }
         }
         H264OutputFormat::Iyuv => {
             let plane_stride = pitch / 2;
@@ -650,17 +735,39 @@ fn convert_planes(
             let v_plane = unsafe {
                 std::slice::from_raw_parts(scanline.add(luma_len + plane_len), plane_len)
             };
-            color::planar_to_rgba(
-                y_plane,
-                u_plane,
-                v_plane,
-                pitch,
-                plane_stride,
-                width,
-                height,
-                &mut rgba,
-            )?;
+            if fuse_crop {
+                color::planar_to_rgba_cropped(
+                    y_plane,
+                    u_plane,
+                    v_plane,
+                    pitch,
+                    plane_stride,
+                    width,
+                    height,
+                    crop,
+                    &mut rgba,
+                )?;
+            } else {
+                color::planar_to_rgba(
+                    y_plane,
+                    u_plane,
+                    v_plane,
+                    pitch,
+                    plane_stride,
+                    width,
+                    height,
+                    &mut rgba,
+                )?;
+            }
         }
+    }
+    if fuse_crop {
+        // 融合路径的输出已经是可见尺寸，不再走 crop_to_display。
+        return Ok(DecodedH264Frame {
+            width: display.width,
+            height: display.height,
+            rgba,
+        });
     }
     crop_to_display(output, rgba)
 }
@@ -1152,6 +1259,11 @@ fn decode_err(context: &str, error: &windows::core::Error) -> WinVideoError {
     WinVideoError::Decode(format!("{context} 失败: {error}"))
 }
 
+/// 把从 `started` 到现在的耗时取整为毫秒（饱和到 `u32::MAX`）。
+fn elapsed_ms(started: Instant) -> u32 {
+    u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
 /// 运行期加载的 Media Foundation 入口表。
 ///
 /// **不在链接期依赖 `mfplat.dll`**：Windows 10 N/LTSC 或精简镜像可能没有它，
@@ -1348,5 +1460,62 @@ mod tests {
             assert!(decoder.adapter_name().is_none());
             assert!(!decoder.hardware_buffers_seen());
         }
+    }
+
+    /// 1080p（coded 1920×1088、display 1920×1080）的融合裁剪必须与
+    /// 「整帧转换后再裁」逐字节一致。
+    #[test]
+    fn fused_crop_decode_matches_full_then_crop() {
+        let (width, height) = (1920_u32, 1088_u32);
+        let w = usize::try_from(width).unwrap_or(0);
+        let h = usize::try_from(height).unwrap_or(0);
+        let pixels = w * h;
+        let mut data = vec![0u8; pixels + pixels / 2];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = u8::try_from(index % 256).unwrap_or(0);
+        }
+
+        let coded = DisplayRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let display = DisplayRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let full_output = OutputFormat {
+            coded_width: width,
+            coded_height: height,
+            display: coded,
+            layout: H264OutputFormat::Nv12,
+            stride: width,
+        };
+        let fused_output = OutputFormat {
+            display,
+            ..full_output
+        };
+
+        let full_result = convert_planes(&full_output, data.as_ptr(), w);
+        let fused_result = convert_planes(&fused_output, data.as_ptr(), w);
+        assert!(full_result.is_ok());
+        assert!(fused_result.is_ok());
+        let (Ok(full), Ok(fused)) = (full_result, fused_result) else {
+            return;
+        };
+        assert_eq!(fused.width, 1920);
+        assert_eq!(fused.height, 1080);
+
+        let row_bytes = w * 4;
+        let display_row_bytes = 1920 * 4;
+        let mut expected = Vec::with_capacity(fused.rgba.len());
+        for row in 0..1080 {
+            let start = row * row_bytes;
+            expected.extend_from_slice(&full.rgba[start..start + display_row_bytes]);
+        }
+        assert_eq!(fused.rgba, expected);
     }
 }
