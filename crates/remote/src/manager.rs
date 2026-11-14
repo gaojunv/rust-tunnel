@@ -31,7 +31,9 @@ use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVA
 use crate::auth::{PendingSession, PendingSessions};
 use crate::codec::{VideoDecoderFactory, VideoEncoderFactory};
 use crate::controller::{run_controller, ControllerCommand, ControllerConfig};
-use crate::controlled::{run_controlled, ControlledConfig, CAPTURE_WATCHDOG};
+use crate::controlled::{
+    run_controlled, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
+};
 use crate::error::{RemoteError, RemoteResult};
 use crate::file::FileService;
 use crate::screen::{
@@ -1487,6 +1489,7 @@ impl RemoteManager {
             pending,
             encode: self.cfg.encode,
             capture_watchdog: CAPTURE_WATCHDOG,
+            unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: self.build_stats_reporter(cancel.clone()),
             h264_encoder_factory: self.cfg.h264_encoder_factory.clone(),
         };
