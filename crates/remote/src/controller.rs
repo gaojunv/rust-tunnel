@@ -90,6 +90,8 @@ pub enum ControllerCommand {
     SelectDisplay(u32),
     /// 切换画质档位。
     SetQuality(QualityPreset),
+    /// 切换帧率上限（30 / 60；被控端会钳到 `[min_fps, 120]`）。
+    SetFrameRate(u8),
     /// 把本机剪贴板文本发给被控端。
     Clipboard(String),
     /// 请求被控端把它的剪贴板发过来。
@@ -391,6 +393,13 @@ pub async fn run_controller(
                     ControllerCommand::SetQuality(preset) => {
                         if let Err(err) =
                             send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::SetQuality { preset })).await
+                        {
+                            break Err(err);
+                        }
+                    }
+                    ControllerCommand::SetFrameRate(fps) => {
+                        if let Err(err) =
+                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::SetFrameRate { fps })).await
                         {
                             break Err(err);
                         }

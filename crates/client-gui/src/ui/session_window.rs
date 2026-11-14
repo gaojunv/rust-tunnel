@@ -383,6 +383,7 @@ fn toolbar(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>, state:
 
         display_selector(ui, v, manager);
         quality_selector(ui, manager, state.quality);
+        frame_rate_selector(ui, v, manager);
         window_size_selector(ui, v);
         scale_selector(ui, v);
         ui.separator();
@@ -515,6 +516,19 @@ fn quality_selector(ui: &mut Ui, manager: &Arc<RemoteManager>, current: QualityP
     for preset in QualityPreset::all() {
         if ui.selectable_label(current == preset, preset.label()).clicked() {
             manager.set_quality(preset);
+        }
+    }
+}
+
+/// 帧率上限选择（30 / 60）；切换经会话命令下发，由被控端在线重配置编码器（不重建、不插 IDR）。
+///
+/// 帧率是**上限**：QoS 闭环仍可在网络拥塞时降到 `min_fps`（15）。只在控制端会话窗口出现
+/// （被控端没有这个 viewport）。
+fn frame_rate_selector(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
+    ui.label(RichText::new("帧率").weak().small());
+    for fps in [30u8, 60] {
+        if ui.selectable_label(v.frame_rate() == fps, fps.to_string()).clicked() {
+            v.set_frame_rate(fps, manager);
         }
     }
 }

@@ -33,19 +33,20 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 3
+/// # 为什么是 4
 ///
-/// 阶段 5 引入硬件编码协商：控制器在握手后立刻发 [`SessionMessage::CodecOffer`]、被控端回
-/// [`SessionMessage::CodecSelect`]，两端再按选定 codec 创建编解码器。这两个新变体追加在
-/// [`SessionMessage`] 末尾，且 [`CodecId`] 追加了 `H264`——老端会在 bincode 解码时因未知
-/// 判别式失败，故必须抬版本。数据面没有会话内向后兼容分支，两端靠 `Hello.proto_version` 的
-/// **硬相等**校验实现「混合版本干净拒绝」：旧端与新端不会解码对方的画面帧，因为它们在版本
-/// 校验通过之前就被拒了。
+/// 版本 4 追加了 [`SessionMessage::SetFrameRate`]（控制端 → 被控端的帧率上限）。它只追加在
+/// [`SessionMessage`] 末尾，但老端（v3）会在 bincode 解码时因未知判别式失败，故必须抬版本。
+/// 数据面没有会话内向后兼容分支，两端靠 `Hello.proto_version` 的 **硬相等** 校验实现
+/// 「混合版本干净拒绝」：v3 ↔ v4 在握手阶段就被明文拒绝，不会解码对方的画面帧。
+///
+/// 版本 3 是阶段 5 的硬件编码协商（[`SessionMessage::CodecOffer`] / [`SessionMessage::CodecSelect`]
+/// 与 [`CodecId::H264`]）。
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
-/// `MIN_REMOTE_CLIENT_VERSION`）。本常量与它必须**分两步发布**（见计划「交付顺序」）：先把
-/// 携带版本 3 的客户端铺开，再部署新服务端并抬门控。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 3;
+/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v4**——先把携带版本 4 的客户端
+/// 铺开（v4 ↔ v3 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 4;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -348,6 +349,14 @@ pub enum SessionMessage {
     CodecSelect {
         /// 选定 codec。
         codec: CodecId,
+    },
+    /// 控制器下发帧率**上限**（控制端 → 被控端）。
+    ///
+    /// 帧率是上限而非固定值：QoS 闭环仍可在其上降级（地板见 [`crate::qos::QosParams::min_fps`]）。
+    /// 被控端只改采集节拍与编码器的 `fps`（在线重配置，**不重建编码器、不插 IDR**）。
+    SetFrameRate {
+        /// 目标帧率上限（被控端钳到 `[min_fps, 120]`）。
+        fps: u8,
     },
 }
 
@@ -962,6 +971,10 @@ mod tests {
             (SessionMessage::CodecOffer { h264: false, vp9: true }, Lane::Control),
             (SessionMessage::CodecSelect { codec: CodecId::Vp9 }, Lane::Control),
             (SessionMessage::CodecSelect { codec: CodecId::H264 }, Lane::Control),
+            (SessionMessage::SetFrameRate { fps: 30 }, Lane::Control),
+            (SessionMessage::SetFrameRate { fps: 60 }, Lane::Control),
+            // 边界：被控端会把它钳到 [min_fps, 120]。
+            (SessionMessage::SetFrameRate { fps: 0 }, Lane::Control),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -990,9 +1003,14 @@ mod tests {
     }
 
     /// 固定的 `Hello`（判别式/字节恒等机械锁用；字段值覆盖二进制与字符串两类）。
-    fn frozen_hello() -> SessionMessage {        SessionMessage::Hello {
+    ///
+    /// `proto_version` 刻意写成**字面量 3**、而不是 [`SESSION_PROTO_VERSION`]：这条测试锁的是
+    /// `Hello` 的**字节形状**（字段顺序、长度前缀位置），不是当前协议版本。每次抬版本都去改
+    /// `FROZEN_HELLO_BYTES` 会让「形状没变」这一断言失去意义。
+    fn frozen_hello() -> SessionMessage {
+        SessionMessage::Hello {
             session_id: "sess-1".into(),
-            proto_version: SESSION_PROTO_VERSION,
+            proto_version: 3,
             controller_rd_id: "111111111".into(),
             nonce: vec![1, 2, 3, 4],
             hmac: vec![7u8; 32],
@@ -1025,6 +1043,10 @@ mod tests {
     /// 中间）都会让判别式错位，使 `Hello`/`HelloAck` 不再是 0/1，整个方案立刻退化成 bincode
     /// 解码失败导致的硬断链。bincode 1.3 默认 fixint：判别式是 u32 小端，故直接读前 4 字节。
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "逐个变体平铺成一张判别式表，拆开反而看不出「只追加、不插入」的契约"
+    )]
     fn discriminant_golden() {
         let cases: Vec<(&str, SessionMessage, u32)> = vec![
             ("Hello", frozen_hello(), 0),
@@ -1116,6 +1138,11 @@ mod tests {
                 "CodecSelect",
                 SessionMessage::CodecSelect { codec: CodecId::H264 },
                 24,
+            ),
+            (
+                "SetFrameRate",
+                SessionMessage::SetFrameRate { fps: 60 },
+                25,
             ),
         ];
         for (name, msg, want) in &cases {

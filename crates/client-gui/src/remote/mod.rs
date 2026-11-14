@@ -44,7 +44,7 @@ use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
     DecodedFrame, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
     RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
-    VideoEncoderFactory,
+    VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
@@ -1020,6 +1020,12 @@ pub struct RemoteView {
     pub capture_this_frame: bool,
     /// 画面缩放档位（持久化镜像，见 `GuiPrefs::remote_view_scale`）。
     pub scale: ViewScale,
+    /// 帧率**上限**（持久化镜像，见 `GuiPrefs::remote_frame_rate`）。
+    ///
+    /// 会话开始时自动下发一次（见 [`Self::reconcile`] 的 `frame_rate_sent`）。
+    pub frame_rate: u8,
+    /// 本会话是否已把帧率下发给被控端；会话结束时复位，下一场重新下发。
+    frame_rate_sent: bool,
     /// 窗口尺寸档位（持久化镜像）。
     pub window_size: WindowSize,
     /// 当前应下发给子窗口的内尺寸（builder 里带着它，变化时 `patch` 会自动发 `InnerSize`）。
@@ -1101,6 +1107,8 @@ impl RemoteView {
             window_open: false,
             capture_this_frame: false,
             scale: ViewScale::default(),
+            frame_rate: DEFAULT_FRAME_RATE,
+            frame_rate_sent: false,
             window_size: WindowSize::default(),
             inner_size: egui::vec2(960.0, 600.0),
             toolbar_visible: true,
@@ -1144,6 +1152,7 @@ impl RemoteView {
         view.stats_overlay = prefs.remote_stats_overlay;
         view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
         view.toolbar_autohide = prefs.remote_toolbar_autohide;
+        view.frame_rate = prefs.remote_frame_rate;
         view
     }
 
@@ -1176,6 +1185,8 @@ impl RemoteView {
         self.gate.reset();
         self.capture_this_frame = false;
         self.selected_display = None;
+        // 新会话要重新下发一次帧率偏好（见 `reconcile` 的自动下发）。
+        self.frame_rate_sent = false;
         // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
         self.input_count = 0;
         self.input_base = 0;
@@ -1218,6 +1229,20 @@ impl RemoteView {
     #[must_use]
     pub fn selected_display(&self) -> Option<u32> {
         self.selected_display
+    }
+
+    /// 当前帧率上限（30 / 60）。
+    #[must_use]
+    pub fn frame_rate(&self) -> u8 {
+        self.frame_rate
+    }
+
+    /// 切换帧率上限：更新本地镜像（由父窗口回写 `gui.toml`）并立刻下发给被控端。
+    ///
+    /// 会话建立时的自动下发走 [`Self::reconcile`]，与本方法共用同一个偏好值。
+    pub fn set_frame_rate(&mut self, fps: u8, manager: &Arc<RemoteManager>) {
+        self.frame_rate = fps;
+        manager.set_frame_rate(fps);
     }
 
     /// 会话窗口的本地输入态（可编辑）。
@@ -1461,6 +1486,12 @@ impl RemoteView {
             Some(active) => {
                 if self.last_session_id.as_deref() != Some(active.session_id.as_str()) {
                     self.begin_session(&active.session_id);
+                }
+                // 每场会话自动下发一次帧率偏好（`begin_session` 刚把它复位为未发送）。
+                // 被控端不会主动问，漏了这一步用户的 30/60 选择就只在手动点按钮时生效。
+                if !self.frame_rate_sent {
+                    manager.set_frame_rate(self.frame_rate);
+                    self.frame_rate_sent = true;
                 }
                 // 会话已重新建立（可能是重连成功）→ 收起倒计时；目标保留，下次断线仍可自动重连。
                 if self.reconnect.is_active() {

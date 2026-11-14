@@ -85,6 +85,7 @@ pub use file::{FileService, TransferMeta};
 pub use controller::ControllerCommand;
 pub use manager::{
     ActiveSessionInfo, RemoteManager, RemoteManagerConfig, RemoteUiState, SessionRole, SessionState,
+    DEFAULT_FRAME_RATE,
 };
 pub use qos::{Feedback, QosAction, QosDecision, QosParams, RateController};
 pub use screen::{

@@ -106,6 +106,9 @@ pub struct ActiveSessionInfo {
     pub started_at_ms: u64,
 }
 
+/// 控制端帧率上限的默认值（30 fps）。
+pub const DEFAULT_FRAME_RATE: u8 = 30;
+
 /// UI 可见的远程控制状态。`Clone` + 适合 `watch`（只含小对象）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteUiState {
@@ -127,6 +130,8 @@ pub struct RemoteUiState {
     pub last_error: Option<String>,
     /// 控制器当前选中的画质档位（下发后由被控端生效）。
     pub quality: QualityPreset,
+    /// 控制器当前选中的帧率**上限**（30 / 60；下发后由被控端生效，QoS 仍可在其下降级）。
+    pub frame_rate: u8,
     /// 控制器当前观看的显示器编号。
     pub selected_display: u32,
     /// 最近一次收到的对端剪贴板文本（UI 提供「粘贴到本机」按钮）。
@@ -388,6 +393,7 @@ impl RemoteManager {
             enabled: cfg.enabled,
             self_platform: cfg.platform.clone(),
             quality: QualityPreset::default(),
+            frame_rate: DEFAULT_FRAME_RATE,
             approval_policy: cfg.approval_policy,
             ..RemoteUiState::default()
         };
@@ -571,6 +577,15 @@ impl RemoteManager {
     pub fn set_quality(&self, preset: QualityPreset) {
         self.update_ui(|s| s.quality = preset);
         self.send_command(ControllerCommand::SetQuality(preset));
+    }
+
+    /// 下发帧率上限（30 / 60；由被控端生效）。
+    ///
+    /// 无活动会话时只更新 UI 偏好，不报错——与 [`Self::set_quality`] 一致：命令经
+    /// [`Self::send_command`] 静默丢弃，界面上的选择仍应保留到下一次会话。
+    pub fn set_frame_rate(&self, fps: u8) {
+        self.update_ui(|s| s.frame_rate = fps);
+        self.send_command(ControllerCommand::SetFrameRate(fps));
     }
 
     /// 把本机剪贴板文本发给被控端。
