@@ -148,7 +148,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - `codec.rs` — `VideoEncoderApi`/`VideoDecoderApi`/工厂：会话循环只依赖 trait，具体实现由 `RemoteManagerConfig` 注入；默认仍是 VP9。`VideoDecoderApi::configure(w,h)` 是给 H.264 MFT 的尺寸钩子（`create()` 时还不知道编码尺寸），解码任务在首个包/尺寸变化时调用
 
 **`crates/win-video/src/`** — Windows 硬件数据面（仅 Windows 编译；**不依赖 `remote`/libvpx**）
-- `capture/` — WGC（`GraphicsCaptureItem` + 自由线程 frame pool + `TryGetNextFrame`）优先，DXGI Desktop Duplication 回退；`enumerate_monitors`/`open_best`/`CaptureSource`，输出**自顶向下 BGRA**。无新帧时最多等 10ms 后复用上一帧；HDR 桌面下 DXGI 可能拿到 `R16G16B16A16_FLOAT`，此时明确失败并由上层回退 xcap/GDI
+- `capture/` — WGC（`GraphicsCaptureItem` + 自由线程 frame pool + `TryGetNextFrame`）优先，DXGI Desktop Duplication 回退；`enumerate_monitors`/`open_best`/`CaptureSource`，输出**自顶向下 BGRA**。无新帧时最多等 10ms 后复用上一帧；HDR 桌面下 DXGI 可能拿到 `R16G16B16A16_FLOAT`，此时明确失败并由上层回退 xcap/GDI。采集帧**不含鼠标光标**（WGC 光标捕获已显式关闭），控制器只显示本机光标以避免双光标；代价是看不到远端光标的形状变化
 - `pixels.rs` — `bgra_to_rgba`、`scale_rgba_box`、`scale_bgra_to_rgba`（一步 BGRA→目标尺寸 RGBA；4K→1080p 命中 2×2 快速路径）
 - `nvenc/` — 运行期 dlopen `nvEncodeAPI64.dll`；原生绑定 vendored 自 `moq-nvenc` 0.1.2（MIT，bindgen 自 NVIDIA `nv-codec-headers`）；`NvencEncoder` 用 D3D11 纹理 + `NV_ENC_BUFFER_FORMAT_ARGB/ABGR`，CBR/超低延迟/无限 GOP/显式 IDR；`set_bitrate`/`set_fps` 走 `nvEncReconfigureEncoder` 不插 IDR；**`inputWidth/Height` 只裁剪、不缩放**
 - `mft_encoder/` — Media Foundation **硬件 H.264 编码**（Intel QSV 优先，也覆盖 AMD VCE 等硬件 MFT）：`MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)` + 异步 MFT 事件模型 + D3D11 设备管理器；RGBA→NV12（BT.709 limited）+ Annex B；`set_bitrate` 走 `ICodecAPI` 不插 IDR；**Intel MFT 不支持运行期改帧率**（适配器保持内部帧率，只让采集节奏随 QoS）；1080p 实测 ~13 ms/帧
