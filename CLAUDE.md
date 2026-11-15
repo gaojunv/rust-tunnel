@@ -163,11 +163,11 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 **数据面另有 `SESSION_PROTO_VERSION` 一道门控**（当前 5）：它**不是**控制通道的 `protocol_version`，而是数据面 `Hello` 里的字段，两端**硬相等**校验，不匹配就在握手阶段明文拒绝（`HelloAck{accepted:false}`），因此混合版本不会退化成 bincode 解码失败导致的硬断链——**前提是 `Hello`/`HelloAck`/`DisplayInfo` 的字节形状冻结**（两条机械锁守着，见上）。
 
-**v5（输入键位码）的发布顺序：两端必须同为 v5**（v4 的 `SetFrameRate` 也要求两端同为 v4+）。`SetFrameRate` 只用于「控制端在会话窗口里选 30/60」，被控端据此在线重配置采集节拍与编码器 fps（**不重建、不插 IDR**），QoS 仍可在上限之下降到 `min_fps`（15）；v5 则改了键盘输入的编码语义（可打印键从 Unicode 文本改成完整键位码，见下面「远程控制的输入语义」）。v4 ↔ v5 在握手阶段被 `Hello.proto_version` 硬相等校验干净拒绝（`HelloAck{accepted:false}`），不会退化成 bincode 硬断链；但这意味着**新旧 GUI 客户端之间不能互相远程控制**，所以必须等全部客户端升到 v5 再部署依赖它的版本。`Hello`/`HelloAck`/`DisplayInfo` 的字节形状仍冻结（`FROZEN_HELLO_BYTES` 里的 `proto_version = 3` 是**形状锁**、不是当前版本，别去改它）。阶段 5 的服务端门控 `MIN_REMOTE_CLIENT_VERSION` 抬升仍按原计划走两步：先铺客户端、再部署新服务端并把门控抬到 `(0,12,0)`。**注意客户端上报的是 `CARGO_PKG_VERSION`**，而 `release-client.yml` 的 `VERSION` 只取 git tag、不写回 `Cargo.toml`——所以 `crates/client`/`crates/client-gui` 的版本号要手工抬（本次已抬到 0.12.0）。
+**v5（输入键位码）的发布顺序：两端必须同为 v5**（v4 的 `SetFrameRate` 也要求两端同为 v4+）。`SetFrameRate` 只用于「控制端在会话窗口里选 30/60」，被控端据此在线重配置采集节拍与编码器 fps（**不重建、不插 IDR**），QoS 仍可在上限之下降到 `min_fps`（15）；v5 则改了键盘输入的编码语义（可打印键从 Unicode 文本改成完整键位码，见下面「远程控制的输入语义」）。v4 ↔ v5 在握手阶段被 `Hello.proto_version` 硬相等校验干净拒绝（`HelloAck{accepted:false}`），不会退化成 bincode 硬断链；但这意味着**新旧 GUI 客户端之间不能互相远程控制**，所以必须等全部客户端升到 v5 再部署依赖它的版本。`Hello`/`HelloAck`/`DisplayInfo` 的字节形状仍冻结（`FROZEN_HELLO_BYTES` 里的 `proto_version = 3` 是**形状锁**、不是当前版本，别去改它）。阶段 5 的服务端门控 `MIN_REMOTE_CLIENT_VERSION` 抬升仍按原计划走两步：先铺客户端、再部署新服务端并把门控抬到 `(0,12,0)`。**注意客户端上报的是 `CARGO_PKG_VERSION`**，而客户端发布 workflow（`release-client.yml` / `release-client-gui.yml`）的 `VERSION` 只取 git tag、不写回 `Cargo.toml`——所以 `crates/client`/`crates/client-gui` 的版本号要手工抬（本次已抬到 0.12.0）。
 
 **远程控制的输入语义（v5）**：控制端**不再转发 `egui::Event::Text`**——可打印键（字母/数字/标点）改为发送完整键位码（按下+抬起配对），由被控端映射成 Windows VK / macOS CGKeyCode / Linux keysym 注入，最终字符由**被控端**的键盘布局与输入法决定（这正是远端切中文输入法能出中文、且不再被控制端布局带偏的原因）。`egui_key_to_code` 用逻辑键（`Event::Key.key` 的 logical-or-physical fallback）而不是 `physical_key`；上档标点（`:`/`+`/`!` 等）映射到同一物理键、Shift 由修饰键事件单独转发。`Ctrl/Cmd+C/X/V` 被 egui-winit 吞成 `Event::Copy/Cut/Paste`，`InputGate::shortcut_click` 负责把它们合成点按（修饰键已转达就只发键本身，否则临时补一对修饰键按下/抬起）。`egui_modifiers` 的 META **只来自 `m.mac_cmd`**、绝不来自 `m.command`（Windows 上 `command == ctrl`，按 `command` 置位会让每次 Ctrl 都额外按下 Win 键）。键码表分区：0..=15 特殊键、20..=31 F1..=F12、40..=43 修饰键、0x100 起字母/数字/标点、0x140 起 F13..=F24（旧表按「F1 + (n-1)」排会与修饰键撞号）。**已知限制**：winit/egui 不产生 `Win`（Windows 键）/`CapsLock`/`PrintScreen` 事件，故这些键无法透传。
 
-**`crates/remote` 有 vendored 原生依赖**：VP9 4:4:4 需要 profile 1，上游 `shiguredo_libvpx` 表达不了，故 `vendor/shiguredo_libvpx/`（wrapper Apache-2.0 + 内联 libvpx BSD，与项目 MIT/Apache 相容，**无 GPL/AGPL**）打了 7 处补丁（1–3 是 4:4:4 的前提，4 是 CBR 交互级缓冲，5 是显式色彩空间/范围，**6 是运行期在线重配置码率/帧率——QoS 闭环的前提**，**7 是解码侧并行 threads + row-mt——解码原本恒为单线程**），每处带 `PATCH:` 注释写明动机，根 `Cargo.toml` 的 `[patch.crates-io]` 重定向，机械锁在 `crates/remote/tests/vendor_patches.rs`。预编译库覆盖 `aarch64-apple-darwin` / `x86_64-pc-windows-gnu` / `x86_64-unknown-linux-gnu`；**不覆盖** `x86_64-apple-darwin`（build.rs 直接 panic，已放弃该 target）与 MSVC（预编译是 mingw）。**Windows 那份预编译还是 msvcrt 味的 mingw-w64 构建**（它引用 `__imp__setjmp`，而 `_setjmp` 只在 msvcrt 的导入库里），所以那个 leg 的链接器也必须是 msvcrt 味的——runner 镜像自带的 `C:\mingw64` 是 **UCRT** 味，链不了；必须用 MSYS2 的 `mingw64` 环境。别把那条 step 简化回 `C:\mingw64`，理由写在 `release-client.yml` 里。`crates/server` 不依赖 `remote`，musl 静态编译不受影响。
+**`crates/remote` 有 vendored 原生依赖**：VP9 4:4:4 需要 profile 1，上游 `shiguredo_libvpx` 表达不了，故 `vendor/shiguredo_libvpx/`（wrapper Apache-2.0 + 内联 libvpx BSD，与项目 MIT/Apache 相容，**无 GPL/AGPL**）打了 7 处补丁（1–3 是 4:4:4 的前提，4 是 CBR 交互级缓冲，5 是显式色彩空间/范围，**6 是运行期在线重配置码率/帧率——QoS 闭环的前提**，**7 是解码侧并行 threads + row-mt——解码原本恒为单线程**），每处带 `PATCH:` 注释写明动机，根 `Cargo.toml` 的 `[patch.crates-io]` 重定向，机械锁在 `crates/remote/tests/vendor_patches.rs`。预编译库覆盖 `aarch64-apple-darwin` / `x86_64-pc-windows-gnu` / `x86_64-unknown-linux-gnu`；**不覆盖** `x86_64-apple-darwin`（build.rs 直接 panic，已放弃该 target）与 MSVC（预编译是 mingw）。**Windows 那份预编译还是 msvcrt 味的 mingw-w64 构建**（它引用 `__imp__setjmp`，而 `_setjmp` 只在 msvcrt 的导入库里），所以那个 leg 的链接器也必须是 msvcrt 味的——runner 镜像自带的 `C:\mingw64` 是 **UCRT** 味，链不了；必须用 MSYS2 的 `mingw64` 环境。别把那条 step 简化回 `C:\mingw64`，理由写在 `release-client-gui.yml` 里。`crates/server` 不依赖 `remote`，musl 静态编译不受影响。
 
 **硬件编解码的落地范围（阶段 5）**：数据面不再只有 VP9。**Windows GUI 被控端**在 NVENC 或 Intel/AMD 硬件编码 MFT 可用时用 **H.264 4:2:0 硬件编码**（NVENC 优先；无 NVIDIA 时用 Media Foundation 硬件编码 MFT，Intel QSV 优先），控制器用 **Media Foundation `MSH264DecoderMFT`** 解码（DXVA 优先）；采集走 **WGC（优先）→ DXGI Desktop Duplication（回退）→ xcap/GDI（最后兜底）**。**有意固定 4:2:0**：消费级 GPU 的 H.264 硬件编码器普遍只支持 4:2:0（本机 RTX 5070 Ti 虽报 `SUPPORT_YUV444_ENCODE=1`，但 H.264 4:4:4 的**解码**侧没有可用硬件/系统解码器，混合部署会断），且 4:2:0 + 高码率对桌面文本已足够；需要 4:4:4 时继续走 VP9 profile 1 软件路径。**这不是给 VP9 加硬件**：四家厂商仍无 VP9 4:4:4 硬件解码，硬件路径是换 codec 到 H.264 4:2:0；VP9 保持软件 4:4:4 作为质量优先的回退。**VP9 软件路径仍是默认回退**：无 NVENC、无硬件编码 MFT、非 Windows、MFT 缺失或对端未声明 H.264 时，`CodecOffer`/`CodecSelect` 协商自动选 VP9。**NVENC 的 `inputWidth/Height` 只做左上角裁剪、不做缩放**（实测码流逐字节相同），故 4K→1920 的下采样由 `crates/win-video` 的 `pixels::scale_bgra_to_rgba` 在采集层一步完成（BGRA→RGBA + 盒式缩放，实测 4K→1080p ~10 ms），避免 33 MB 中间缓冲。**H.264 的显示尺寸 ≠ 编码尺寸**：MFT 会按 16 像素宏块对齐输出（640×360 解出 640×368、1080p 解出 1920×1088），必须按 `MF_MT_MINIMUM_DISPLAY_APERTURE` 裁掉填充，否则坐标/纹理尺寸整体错位。**实例模式（安全桌面）不走 WGC/DXGI**：Winlogon 桌面只能用 GDI `BitBlt`，仍由 `win-platform` 处理；H.264 编码器对实例模式同样可用（BitBlt 出来的是 RGBA）。**编码器的在线重配置**：NVENC 走 `nvEncReconfigureEncoder`（`resetEncoder=0`/`forceIDR=0`）；Intel/AMD MFT 走 `ICodecAPI`（码率支持、帧率 Intel MFT 不支持，适配器保持内部帧率而不重建）。两者都遵守「码率变化不重建、不插 IDR」，只有几何变化才重建 + 强制 IDR。真机实测：RTX 5070 Ti（4K WGC，release）采集 ~31 ms、转换+缩放 ~10 ms、NVENC ~3 ms；Intel UHD 770 **QSV 1080p 编码 ~13 ms**（现场 HD 630 的 VP9 软件编码是 **113 ms**）；控制器 **DXVA 解码 1080p CPU 时间 13.4→9.1 ms/帧**（输出与软件逐像素一致，QSV→DXVA 端到端 MAD ~1.0/255）。像素转换（RGBA↔NV12、NV12→RGBA、4K 盒式缩放）按行并行（`crates/win-video/src/lib.rs::worker_count`，最多 4 个 worker；1080p 转换 release 本机实测 4.5→1.1 ms，去掉复用缓冲的多余 memset 后 ~0.5/0.7 ms）；解码把 `MF_MT_MINIMUM_DISPLAY_APERTURE` 裁剪融进颜色转换，省掉 1080p 整帧 8.3 MB 的二次拷贝；GUI 启动时 `timeBeginPeriod(1)`，避免 MFT/WGC 的 1–2 ms 轮询被 Windows 默认 15.6 ms 定时器粒度放大；采集源几何每 2 s 复查一次，不再每帧枚举显示器。NVENC 绑定 vendored 自 `moq-nvenc` 0.1.2（MIT，bindgen 自 NVIDIA `nv-codec-headers`），运行期 dlopen，**不引入任何 AGPL/GPL 代码**。
 
@@ -240,7 +240,7 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 - 公开：`POST /api/login`、`GET /api/health`、`GET /api/knowledge/events`（SSE，`?token=` 认证）
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
 - RustDesk（新）：`GET /api/rustdesk`（配置 + 运行状态；密钥只回 `key_set` 布尔，明文永不回传）、`POST /api/rustdesk`（更新并应用；`generate_key: true` 时一次性回传新公钥）
-- 产物归档下载：`GET /api/client-downloads`、`GET /api/wiki-downloads`（列表，需 JWT）；`GET /api/client-downloads/:version/:file`、`GET /api/wiki-downloads/:version/:file`（下载，公开路由自带 `?token=` 校验，因 `<a download>` 不能带 Header）。分别只读 `client_dist_dir` / `wiki_dist_dir`，由 `release-client.yml` / `release-wiki-client.yml` 落盘
+- 产物归档下载：`GET /api/client-downloads`、`GET /api/wiki-downloads`（列表，需 JWT）；`GET /api/client-downloads/:version/:file`、`GET /api/wiki-downloads/:version/:file`（下载，公开路由自带 `?token=` 校验，因 `<a download>` 不能带 Header）。分别只读 `client_dist_dir` / `wiki_dist_dir`，由 `release-client.yml` + `release-client-gui.yml` / `release-wiki-client.yml` 落盘
 - LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`、`POST /v1/responses`（Responses API 入口，与 `/v1/chat/completions` 同域）
 - 统一知识容器（新）：`/api/knowledge`（CRUD）、`/api/knowledge/:id`、`/api/knowledge/:id/docs`、`/api/knowledge/:id/docs/:doc_id`（含 `/reindex`）、`/api/knowledge/test-embedding`、`/api/knowledge/:id/query`（向量检索预览）、`/api/knowledge/:id/pages`、`/api/knowledge/:id/graph`、`/api/knowledge/:id/search`、`/api/knowledge/search`
 - AI agent（新）：`GET /api/agent/ws`（WebSocket 回合/事件流）、`/api/agent/workspaces`（CRUD，含 `/files`、`/sessions`）、`/api/agent/sessions/:id`（含 `/model`、`/archive`、`/messages`、`/role`）、`/api/agent/default-model`、`/api/agent/roles`（多角色子代理 CRUD，含 `:id/toggle`）
@@ -295,7 +295,7 @@ GitHub Actions 工作流：
   `windows-tests`（`windows-latest`，跑 `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video`）
   与 `windows-gnu-typecheck`（`ubuntu-latest`，`cargo check`/`clippy -- -D warnings` 交叉到
   `x86_64-pc-windows-gnu`，覆盖 `client-gui`——**出厂 Windows GUI 正是这个 target**）。
-  之所以需要它：`release-client.yml` 那条测试命令只在**打 tag 时**跑，回归要到发布那一刻才暴露；
+  之所以需要它：`release-client-gui.yml` 的 `build-service` 那条测试命令只在**打 tag 时**跑，回归要到发布那一刻才暴露；
   而 GNU leg 在打 tag 之前**没有任何东西**做过类型检查。用 `-p` 指定 crate，**绝不用 `--workspace`**
   （会拖进第三方 qdrant-edge）。**不覆盖**：`client-gui` 的宿主目标单测（Linux 上链接 eframe 需要
   一整套 X11/Wayland/GL 开发库，未经验证的红色 job 比如实记录缺口更糟），以及**全部运行时行为**
@@ -303,26 +303,35 @@ GitHub Actions 工作流：
 - `release-server.yml`（手动触发）— 单 job：Node 构建前端 → `x86_64-unknown-linux-musl` 静态编译
   （`--features rag,embed-frontend`）→ 从 `contrib/config.toml.template` 渲染配置（占位符替换后校验）
   → SCP 二进制 + systemd 服务 + 配置 → SSH 重启服务
-- `release-client.yml`（tag `v*` / 手动）— 四平台矩阵构建客户端二进制，各 runner 直接 SCP 到
-  `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 在服务端生成 `SHA256SUMS` 并更新 `latest` 软链。
-  GUI（`build-gui`）只发布 **Windows（GNU）与 macOS**；**不再构建/发布 Linux GUI**，
-  Linux 只提供 CLI 客户端（musl）。
-  Windows/MSVC leg 额外构建并上传 `rust-tunnel-client-service-windows-x86_64.exe`
-  （无人值守服务；**不依赖 libvpx** 故走 MSVC 即可，不需要 GNU leg 那套 MSYS2 曲折；
-  资产名必须以 `rust-tunnel-client-` 开头，`finalize-client` 的 glob 与下载页的
-  `platform_from_filename` 才认得它），并在同一 leg 跑
+- `release-client.yml`（tag `v*` / 手动）— **只负责 CLI 客户端**：四平台矩阵（Linux musl、
+  macOS x86_64/aarch64、Windows MSVC），各 runner 直接 SCP 到 `${DEPLOY_PATH}/client/<tag>/`，
+  `finalize-client` 在服务端**合并** `SHA256SUMS`（只负责 CLI 那几个文件名，保留 GUI 流程写下的
+  其余行）并更新 `latest` 软链。`latest` 由本流程独占维护，代表「包含完整 CLI 产物的最新版本」
+- `release-client-gui.yml`（tag `gui-v*` / 手动）— **只负责 GUI 客户端**：Windows（GNU）GUI exe +
+  macOS arm64 `.dmg` + Windows（MSVC）无人值守服务 exe + Windows 单包 zip。产物落到与 CLI
+  **同一个** `${DEPLOY_PATH}/client/<version>/`（版本 = tag 去掉 `gui-` 前缀，使下载页按版本聚合
+  两类产物；保留前缀会让 `semver_key` 解析失败、版本排到列表末尾）。
+  **不再构建/发布 Linux GUI**，Linux 只提供 CLI 客户端（musl）。
+  `build-service` 额外构建并上传 `rust-tunnel-client-service-windows-x86_64.exe`
+  （无人值守服务；**不依赖 libvpx** 故走 MSVC 即可，不需要 `build-gui` 那套 MSYS2 曲折；
+  资产名必须以 `rust-tunnel-client-` 开头，`finalize-gui` 的 glob 与下载页的
+  `platform_from_filename` 才认得它），并在同一 job 跑
   `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video`
   ——那批单测是 `#[cfg(windows)]`（`probe`/`service`/`process`/`host`，以及 `win-video` 的像素/颜色/解码纯逻辑），
   **这个 runner 是仓库里唯一能真正跑它们的机器**，本机 macOS 只能做类型检查；
   但这条只在打 tag 时跑，推送阶段的同一批测试由 `ci.yml` 的 `windows-tests` 兜住。
-  `package-windows` 在 `build-client` + `build-gui` 完成后把服务与 GUI 从服务器拉回、
+  `package-windows` 在 GUI 与服务上传完成后把两个 exe 从服务器拉回、
   打成 `rust-tunnel-client-gui-windows-x86_64.zip`（内含两个 exe + README），用户只下载一次；
-  GUI 的「安装并启用」会自动找同目录的服务 exe，并把当前客户端配置写成 `host.toml`
+  GUI 的「安装并启用」会自动找同目录的服务 exe，并把当前客户端配置写成 `host.toml`。
+  `finalize-gui` 用同一套合并规则写 `SHA256SUMS`（只负责 gui/service/dmg 那几个文件名），
+  且**不碰 `latest`**——GUI-only 版本仍是独立版本目录，会出现在下载页的版本列表里，但不会成为 `latest`。
+  协议不兼容的版本必须让 `v*` 与 `gui-v*` 两个 tag 指向同一版本一起发；
+  `crates/client`/`crates/client-gui` 的 `CARGO_PKG_VERSION` 仍要手工同步抬版（workflow 不写回 `Cargo.toml`）
 - `release-wiki-client.yml`（tag `wiki-v*` / 手动）— wiki 桌面端（Tauri 2）安装包：macOS
   aarch64/x86_64 `.dmg` + Windows `.msi`/NSIS `.exe`，产物重命名为
   `wiki-desktop-<os>-<arch>[-setup].<ext>` 后 SCP 到 `${DEPLOY_PATH}/wiki/<version>/`（版本目录名 =
   tag 去掉 `wiki-` 前缀），`finalize-wiki` 生成校验和与 `latest` 软链。触发用独立 tag 前缀与
-  `release-client.yml` 解耦（Tauri 打包耗时远高于单文件二进制）
+  客户端发布（`release-client.yml` / `release-client-gui.yml`）解耦（Tauri 打包耗时远高于单文件二进制）
 
 部署使用 systemd（`contrib/rust-tunnel-server.service`），配置模板 `contrib/config.toml.template`。
 两个归档目录经 `client_dist_dir` / `wiki_dist_dir` 交给服务端只读，Web「下载」页分两个分区展示。

@@ -126,8 +126,9 @@ pub fn client_supports_mapping_summary(version: Option<&str>) -> bool {
 ///
 /// **所以这里的 `(0, 10, 0)` 不是漏改**，是刻意的第一步状态。第 2 步是 `(0, 11, 0)`。
 /// 抬它之前请确认：`crates/client/Cargo.toml` 与 `crates/client-gui/Cargo.toml` 的版本已经是
-/// 0.11.0（客户端上报的是 `CARGO_PKG_VERSION`，而 `release-client.yml` 的 `VERSION` 只取 git
-/// tag、不写回 Cargo.toml——漏了那一步会把**所有**客户端一起挡掉）。
+/// 0.11.0（客户端上报的是 `CARGO_PKG_VERSION`，而 `release-client.yml` /
+/// `release-client-gui.yml` 的 `VERSION` 只取 git tag、不写回 Cargo.toml——漏了那一步会把
+/// **所有**客户端一起挡掉）。
 pub const MIN_REMOTE_CLIENT_VERSION: (u64, u64, u64) = (0, 10, 0);
 
 /// 客户端版本是否支持远程控制；缺失/非法视为不支持（保守，避免老客户端收到

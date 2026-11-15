@@ -165,9 +165,10 @@ LogonUI 先起来，而那时用户根本没打开过面板，GUI 那层检查�
 
 它**不在**常规客户端下载里，要单独构建。两条路：
 
-1. **CI**：触发 `release-client.yml`（打一个 `v*` tag，或手动 `workflow_dispatch`）。
-   Windows/MSVC leg 会额外产出 `rust-tunnel-client-service-windows-x86_64.exe`，
-   落到 `${DEPLOY_PATH}/client/<tag>/`。
+1. **CI**：触发 `release-client-gui.yml`（打一个 `gui-v*` tag，或手动 `workflow_dispatch`
+   并填 `version`）。
+   Windows/MSVC 的 `build-service` job 会额外产出 `rust-tunnel-client-service-windows-x86_64.exe`，
+   落到 `${DEPLOY_PATH}/client/<version>/`（版本 = tag 去 `gui-` 前缀）。
    服务的构建*不*牵入 libvpx，所以走 MSVC 即可，不需要 GNU leg 那套 MSYS2 曲折。
 2. **在 Windows 机器上自己编**（需要 Rust 的 MSVC 工具链）：
 

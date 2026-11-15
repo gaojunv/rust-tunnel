@@ -284,7 +284,8 @@ GitHub Actions（`.github/workflows/`）：
 
 - `ci.yml` — 每次 push / PR：`cargo fmt --check` → `cargo clippy --tests -D warnings`（含豁免）→ `cargo build --tests` → `cargo test --tests -- --test-threads=4`。
 - `release-server.yml` — 打 `v*` tag 或手动触发：Node 20 构建前端 → 下载产物到 `frontend-dist/` → `x86_64-unknown-linux-musl` 静态编译服务器（`-p rust-tunnel-server`，`--features rag,embed-frontend`）→ strip → SCP 二进制 + systemd 单元 + 配置到远程服务器 → SSH 重启。
-- `release-client.yml` — 打 tag 时交叉编译客户端：Linux musl、macOS x86_64/aarch64、Windows MSVC，上传为 Release 构件。
+- `release-client.yml` — 打 `v*` tag 或手动触发：**仅 CLI**，交叉编译 Linux musl、macOS x86_64/aarch64、Windows MSVC 客户端，SCP 到 `${DEPLOY_PATH}/client/<tag>/` 并更新 `latest` 软链。
+- `release-client-gui.yml` — 打 `gui-v*` tag 或手动触发：**仅 GUI**，Windows（GNU）GUI + macOS arm64 dmg + Windows（MSVC）无人值守服务 exe + 单包 zip，落到与 CLI 相同的 `${DEPLOY_PATH}/client/<version>/`（版本 = tag 去 `gui-`）；校验和合并写入，且不改 `latest`。
 
 部署使用 systemd，单元文件 `contrib/rust-tunnel-server.service`（工作目录 `/opt/rust-tunnel`，配置 `/etc/rust-tunnel/config.toml`，模板见 `contrib/config.toml.template`）。
 
