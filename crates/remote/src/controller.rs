@@ -161,6 +161,8 @@ pub enum ControllerCommand {
     ClipboardRequest,
     /// 文件传输操作。
     File(TransferCommand),
+    /// 请求被控端**锁定屏幕**（纯 UI 动作；被控端只在完全控制模式下执行）。
+    LockScreen,
     /// 立即探测一次延迟（**纯进程内命令，不上线**）。
     ///
     /// **仅当当前无在途心跳样本时**才真正发一次 `Heartbeat`：否则会覆盖既有样本，让那次往返
@@ -503,6 +505,13 @@ pub async fn run_controller(
                     ControllerCommand::ClipboardRequest => {
                         if let Err(err) =
                             send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::ClipboardRequest)).await
+                        {
+                            break Err(err);
+                        }
+                    }
+                    ControllerCommand::LockScreen => {
+                        if let Err(err) =
+                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::LockScreen)).await
                         {
                             break Err(err);
                         }

@@ -113,6 +113,12 @@ pub const DEFAULT_FRAME_RATE: u8 = 30;
 
 /// UI 可见的远程控制状态。`Clone` + 适合 `watch`（只含小对象）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+// 四个以上的独立开关会被 clippy 判为「该拆状态机」；但这里每个 bool 都是互不相关的用户
+// 偏好/能力位，拆成枚举只会让 UI 读取更绕。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "UI 状态是一组互不相关的独立开关，拆成状态机反而更难读"
+)]
 pub struct RemoteUiState {
     /// 控制通道是否已连接（`attach` / `on_disconnected` 维护）。
     pub connected: bool,
@@ -148,6 +154,11 @@ pub struct RemoteUiState {
     pub transfer_note: Option<String>,
     /// 被控端接入确认策略。
     pub approval_policy: ApprovalPolicy,
+    /// 被控端会话结束后**自动锁定本机屏幕**（用户偏好；UI 显示与设置用）。
+    ///
+    /// 会话进行中改它也立即生效（[`RemoteManager::set_auto_lock_on_disconnect`] 写的是原子位，
+    /// 被控端会话收尾守卫实时读取）。
+    pub auto_lock_on_disconnect: bool,
     /// 待本机确认的接入请求（UI 弹窗数据；无则为 `None`）。
     pub pending_approval: Option<PendingApproval>,
     /// 已信任的对端客户端名：命中后不再弹窗、直接接受。
@@ -417,6 +428,12 @@ pub struct RemoteManager {
     /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
     /// `tokio::spawn` 会 panic；预登记必须走这个句柄。构造发生在 `block_on` 内，故句柄可用。
     rt: Option<tokio::runtime::Handle>,
+    /// 被控端会话结束后是否自动锁定屏幕。
+    ///
+    /// 独立于 `ui_tx` 的原子位：被控端会话的收尾守卫（`controlled.rs` 的 `AutoLockOnExit`）
+    /// 在 `Drop` 里**实时读取**，用户在会话进行中打开设置也必须生效。UI 侧另有
+    /// [`RemoteUiState::auto_lock_on_disconnect`] 供显示。
+    auto_lock_on_disconnect: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RemoteManager {
@@ -471,6 +488,7 @@ impl RemoteManager {
             share,
             self_weak: weak.clone(),
             rt: rt_field,
+            auto_lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -689,6 +707,26 @@ impl RemoteManager {
     #[must_use]
     pub fn approval_policy(&self) -> ApprovalPolicy {
         self.ui_tx.borrow().approval_policy
+    }
+
+    /// 设置「被控端会话结束后自动锁定屏幕」。
+    ///
+    /// 原子位供被控端会话收尾守卫实时读取（会话进行中打开也立即生效），同时写进 UI 状态
+    /// 供「远程」Tab 与「无人值守安装」读取。
+    pub fn set_auto_lock_on_disconnect(&self, on: bool) {
+        self.auto_lock_on_disconnect.store(on, Ordering::Relaxed);
+        self.update_ui(|s| s.auto_lock_on_disconnect = on);
+    }
+
+    /// 当前「会话结束后自动锁定屏幕」偏好。
+    #[must_use]
+    pub fn auto_lock_on_disconnect(&self) -> bool {
+        self.auto_lock_on_disconnect.load(Ordering::Relaxed)
+    }
+
+    /// 请求被控端锁定屏幕（控制器动作；被控端只在完全控制模式下执行）。
+    pub fn lock_screen(&self) {
+        self.send_command(ControllerCommand::LockScreen);
     }
 
     /// 批准当前待确认的接入请求；`remember` 为真时把该对端加入信任列表（此后免弹窗）。
@@ -1522,6 +1560,7 @@ impl RemoteManager {
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: self.build_stats_reporter(cancel.clone()),
             h264_encoder_factory: self.cfg.h264_encoder_factory.clone(),
+            lock_on_disconnect: Arc::clone(&self.auto_lock_on_disconnect),
         };
         let clipboard = self
             .clipboard

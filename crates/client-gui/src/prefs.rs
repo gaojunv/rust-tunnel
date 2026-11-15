@@ -102,6 +102,13 @@ pub struct GuiPrefs {
     /// 这是安全侧默认，不要改成 `Auto`。
     #[serde(default)]
     pub remote_approval: ApprovalPolicy,
+    /// 被控端**会话结束后自动锁定本机屏幕**。
+    ///
+    /// **默认关闭**：它会在无人值守时把本机锁在登录界面；而且 GUI 模式被控端通常无法采集
+    /// Windows 安全桌面，锁屏后远程画面即中断（要远程解锁需无人值守服务实例）。必须是用户
+    /// 的显式选择。旧配置文件缺此字段时落到 `false`。
+    #[serde(default)]
+    pub remote_auto_lock_on_disconnect: bool,
     /// 远程会话窗口：工具条是否自动隐藏（指针静止后淡出，移到上缘或移动指针再现）。
     ///
     /// **默认关闭**：工具条是会话里唯一的操作入口，默认常驻最省心；要淡出的人可开。
@@ -157,6 +164,7 @@ impl Default for GuiPrefs {
             theme: ThemePref::default(),
             allow_remote: false,
             remote_approval: ApprovalPolicy::default(),
+            remote_auto_lock_on_disconnect: false,
             remote_toolbar_autohide: false,
             remote_toolbar_collapsed: false,
             remote_toolbar_autohide_migrated: false,
@@ -415,6 +423,30 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert!(reparsed.remote_toolbar_collapsed);
+    }
+
+    /// 自动锁屏的缺省与往返：默认关闭，旧配置缺键也是关闭，用户打开后跨重启保留。
+    #[test]
+    fn auto_lock_defaults_off_and_survives_roundtrip() {
+        assert!(
+            !GuiPrefs::default().remote_auto_lock_on_disconnect,
+            "新配置默认关闭"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(
+            !prefs.remote_auto_lock_on_disconnect,
+            "缺键的旧配置也必须落到关闭"
+        );
+        let saved = toml::to_string(&GuiPrefs {
+            remote_auto_lock_on_disconnect: true,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(
+            reparsed.remote_auto_lock_on_disconnect,
+            "往返必须保留用户选择"
+        );
     }
 
     #[test]

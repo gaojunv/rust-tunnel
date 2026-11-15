@@ -1111,6 +1111,65 @@ impl ScreenSource for XcapScreen {
     }
 }
 
+// ── 锁屏（三平台，与 enigo 无关）────────────────────────────────────
+
+/// 锁定本机屏幕（被控端 [`rust_tunnel_remote::InputSink::lock_screen`] 的平台实现）。
+///
+/// **不依赖 `enigo`**：锁屏与输入注入无关，macOS 上即便没授予「辅助功能」权限、注入器
+/// 初始化失败，锁屏仍应可用。
+fn lock_platform_screen() -> RemoteResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: `LockWorkStation` 无参数、不读写调用方的内存；失败信息经 `GetLastError`
+        // 反映，这里用 `last_os_error` 取回。它作用于**进程所在的交互式会话**，不要求
+        // 调用方切换/挂载桌面（实例模式在 SYSTEM 下同样可用）。
+        if unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } == 0 {
+            return Err(RemoteError::Platform(format!(
+                "调用 LockWorkStation 失败: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 优先用系统自带的 `CGSession -suspend`（同步、无额外依赖）；失败时如实报错让 UI
+        // 显示，不做静默降级。
+        let status = std::process::Command::new(
+            "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession",
+        )
+        .arg("-suspend")
+        .status()
+        .map_err(|err| RemoteError::Platform(format!("执行 CGSession 失败: {err}")))?;
+        if !status.success() {
+            return Err(RemoteError::Platform(format!(
+                "CGSession -suspend 退出码非零: {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 依次尝试 systemd（loginctl）与 X11 时代的 xdg-screensaver；成功即返回。
+        let mut last_error = String::from("没有可用的锁屏命令（已尝试 loginctl 与 xdg-screensaver）");
+        for (program, args) in [
+            ("loginctl", &["lock-session"][..]),
+            ("xdg-screensaver", &["lock"][..]),
+        ] {
+            match std::process::Command::new(program).args(args).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(status) => last_error = format!("{program} 退出码非零: {status}"),
+                Err(err) => last_error = format!("执行 {program} 失败: {err}"),
+            }
+        }
+        Err(RemoteError::Platform(format!("锁定屏幕失败：{last_error}")))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err(RemoteError::Platform("本平台不支持锁定屏幕".to_owned()))
+    }
+}
+
 // ── 输入注入（enigo，三平台通用）────────────────────────────────────
 
 /// 把 enigo 注入错误转成引擎错误（作为 `map_err` 的函数指针按值接收）。
@@ -1234,6 +1293,11 @@ impl InputSink for EnigoInput {
             }
         }
         Ok(())
+    }
+
+    fn lock_screen(&self) -> RemoteResult<()> {
+        // 与输入注入无关，故刻意**不**走 `with_enigo`（注入器初始化失败时锁屏仍应可用）。
+        lock_platform_screen()
     }
 }
 

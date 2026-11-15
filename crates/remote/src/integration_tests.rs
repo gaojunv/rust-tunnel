@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
 use rust_tunnel_common::remote_bridge::RemoteBridge as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
@@ -646,6 +646,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         unchanged_resend: UNCHANGED_RESEND_INTERVAL,
         stats: SessionStatsReporter::noop(),
         h264_encoder_factory: None,
+        lock_on_disconnect: Arc::new(AtomicBool::new(false)),
     };
     let ctrl_cfg = ControllerConfig {
         session_id: "sess-1".to_owned(),
@@ -722,6 +723,7 @@ async fn correct_token_completes_handshake_and_streams() {
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),
@@ -1395,6 +1397,7 @@ async fn handshake_against_unregistered_token(
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
         Arc::new(RecordingInput::default()),

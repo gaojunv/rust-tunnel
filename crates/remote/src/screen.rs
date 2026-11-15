@@ -493,6 +493,18 @@ pub trait InputSink: Send + Sync + 'static {
     /// 注入失败时返回 [`RemoteError::Platform`]。
     fn key(&self, event: KeyEvent) -> RemoteResult<()>;
 
+    /// 锁定本机屏幕（被控端）。默认实现返回「平台不支持」。
+    ///
+    /// 引擎在**完全控制**模式下收到控制器的 [`crate::session::SessionMessage::LockScreen`]
+    /// 时调用它，也在会话收尾（用户偏好开启时）自动调用一次。平台实现见
+    /// `crates/client-gui/src/remote/mod.rs` 的 `lock_platform_screen`。
+    ///
+    /// # Errors
+    /// 平台不支持或系统调用失败时返回 [`RemoteError::Platform`]。
+    fn lock_screen(&self) -> RemoteResult<()> {
+        Err(RemoteError::Platform("本平台不支持锁定屏幕".to_owned()))
+    }
+
     /// 按 [`InputEvent`] 分发到上述四个方法（默认实现，平台实现可覆写）。
     ///
     /// # Errors
