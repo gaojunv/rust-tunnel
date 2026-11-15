@@ -3,12 +3,12 @@ name: CI
 # 推送/PR 阶段的 Windows 目标编译与测试门禁。
 #
 # 现状：codeql.yml 是**唯一**的 push/PR 工作流，而它用 build-mode: none（只抽取源码、
-# 在宿主目标上做静态分析，不编译）；与 Windows 相关的 release-client.yml /
+# 在宿主目标上做静态分析，不编译）；与 Windows 相关的 release-client-gui.yml /
 # release-server.yml 只在打 tag 或手动触发时跑。也就是说，push/PR 阶段**没有任何
 # 东西编译或测试 Windows 目标的代码**。
 #
 # 先澄清一个常见误解：`#[cfg(windows)]` 的单测**并非从不运行**——
-# release-client.yml 在 x86_64-pc-windows-msvc 那条 leg 上已经跑了
+# release-client-gui.yml 的 build-service job 在 x86_64-pc-windows-msvc 上已经跑了
 # `cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video`
 # （约 130 个用例：win-platform 的 service/probe/process/token/capture/handle/desktop、
 # win-service 的 host，以及 win-video 的像素/颜色/解码纯逻辑），那是仓库里唯一能真正
@@ -16,7 +16,7 @@ name: CI
 # 真正的缺口是**时机**：它们只在打 tag 时跑，回归要到发布那一刻才暴露。
 #
 # 而真正**完全没人覆盖**的是 GNU leg：出厂 Windows GUI 正是用
-# x86_64-pc-windows-gnu 构建的（release-client.yml 的 build-client-gui job），
+# x86_64-pc-windows-gnu 构建的（release-client-gui.yml 的 build-gui job），
 # 打 tag 之前没有任何东西对它做类型检查。
 #
 # 本工作流**不覆盖**的部分（别把它读成「Windows 已全面覆盖」）：
@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 jobs:
-  # 把 release-client.yml 已经在 msvc leg 上跑的那两条测试命令也接进 push/PR，
+  # 把 release-client-gui.yml 的 build-service 已经在 msvc leg 上跑的那条测试命令也接进 push/PR，
   # 让 Windows 专属单测成为提交门禁，而不只是 tag 门禁。
   windows-tests:
     name: Windows tests (MSVC)
@@ -56,8 +56,8 @@ jobs:
 
       # windows-latest 默认就是 MSVC 工具链，无需任何额外工具链配置：这两个 crate
       # 在 windows-sys 之上是纯 Rust，且都不牵入 libvpx（libvpx 只经
-      # rust-tunnel-remote 进来），所以 MSVC 链接它们没有问题——release-client.yml:76
-      # 已经证明了这一点。
+      # rust-tunnel-remote 进来），所以 MSVC 链接它们没有问题——release-client-gui.yml
+      # 的 build-service job 已经证明了这一点。
       - name: Install Rust with target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -114,7 +114,7 @@ jobs:
           packages: gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
           version: 1.0
 
-      # 别把 release-client.yml 里那套 MSYS2 mingw64 的曲折照搬到这里。那份文件详细
+      # 别把 release-client-gui.yml 里那套 MSYS2 mingw64 的曲折照搬到这里。那份文件详细
       # 论证了它的 Windows runner 必须用 **msvcrt 味**的 mingw-w64（MSYS2 的 mingw64
       # 环境）而非 UCRT 味，因为 vendored 的预编译 libvpx 是 msvcrt 味的构建、引用了
       # `__imp__setjmp`。**那条约束是关于链接的，而 cargo check / cargo clippy 根本

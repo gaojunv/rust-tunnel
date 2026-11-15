@@ -244,7 +244,8 @@ Lint 基线：`clippy::pedantic = deny`（`doc_markdown = allow`），`unwrap_us
 GitHub Actions（见 [`.github/workflows/`](.github/workflows/)）：
 
 - `release-server.yml`（手动）：前端构建 → `x86_64-unknown-linux-musl` 静态编译（`--features rag,embed-frontend`）→ 从 `contrib/config.toml.template` 渲染配置并校验 → SCP 二进制 + systemd 服务 + 配置 → SSH 重启
-- `release-client.yml`（tag `v*` / 手动）：四平台矩阵构建客户端二进制，SCP 到 `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 生成 `SHA256SUMS` 并更新 `latest` 软链
+- `release-client.yml`（tag `v*` / 手动）：**仅 CLI**，四平台矩阵（Linux musl、macOS x86_64/aarch64、Windows MSVC）构建客户端二进制，SCP 到 `${DEPLOY_PATH}/client/<tag>/`，`finalize-client` 合并 `SHA256SUMS`（只负责 CLI 文件）并更新 `latest` 软链
+- `release-client-gui.yml`（tag `gui-v*` / 手动）：**仅 GUI**，Windows（GNU）GUI exe + macOS arm64 `.dmg` + Windows（MSVC）无人值守服务 exe + Windows 单包 zip，落到与 CLI 相同的 `${DEPLOY_PATH}/client/<version>/`（版本 = tag 去 `gui-` 前缀），`finalize-gui` 合并校验和且不更新 `latest`（`latest` 由 CLI 流程维护）
 - `release-wiki-client.yml`（tag `wiki-v*` / 手动）：Tauri 2 安装包（macOS aarch64/x86_64 `.dmg` + Windows `.msi`/NSIS `.exe`），重命名为 `wiki-desktop-<os>-<arch>[-setup].<ext>` 后 SCP 到 `${DEPLOY_PATH}/wiki/<version>/`（目录名 = tag 去 `wiki-` 前缀），`finalize-wiki` 生成校验和与 `latest` 软链
 
 部署为 systemd（[`contrib/rust-tunnel-server.service`](contrib/rust-tunnel-server.service)），两类归档经 `client_dist_dir` / `wiki_dist_dir` 以绝对路径只读暴露给 Web 下载页。

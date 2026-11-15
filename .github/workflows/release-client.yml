@@ -1,9 +1,14 @@
-name: Release Client
+name: Release Client (CLI)
 
-# 当推送 tag 时触发，也可以手动触发
-# 构建矩阵在多 runner 上产出二进制后，各 runner 直接 SCP 上传到服务器的
-# ${DEPLOY_PATH}/client/<tag>/ 目录（版本隔离），不使用 Artifact 中转，避免存储配额问题
-# 全部平台上传完成后由 finalize-client 在服务端生成校验和并更新 latest 软链接
+# 客户端 **CLI** 二进制发布（Linux musl / macOS x86_64 / macOS aarch64 / Windows MSVC）。
+# GUI 客户端（Windows GNU + macOS arm64 dmg + 无人值守服务 exe + Windows 单包 zip）
+# 在独立的 release-client-gui.yml（tag `gui-v*`）里构建，两个 workflow 各自独立触发。
+#
+# 当推送 `v*` tag 时触发，也可以手动触发：各 runner 直接 SCP 到服务器的
+# ${DEPLOY_PATH}/client/<version>/ 目录（版本隔离），不使用 Artifact 中转，避免存储配额问题。
+# 全部平台上传完成后由 finalize-client 在服务端**合并**校验和并更新 latest 软链接。
+# `latest` 只由本 workflow 维护（它代表「包含完整 CLI 产物的最新版本」），
+# GUI 流程刻意不碰它——见 release-client-gui.yml。
 # 行为对齐 release-server.yml（SCP 直传，不依赖 Releases/Artifacts 分发）
 on:
   push:
@@ -66,15 +71,6 @@ jobs:
           RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release -p rust-tunnel-client --target ${{ matrix.target }}
 
-      # 无人值守被控端的平台层与服务，有一大批单测**只在 Windows 上编译**
-      # （`probe`/`service`/`process`/`host` 全是 `#[cfg(windows)]`），本机 macOS
-      # 只能对它们做类型检查。这个 runner 是仓库里唯一能真正跑它们的机器，所以在这里跑：
-      # 它们是阶段 0 探针的机械锁（三态判据与报告结论行的逐字匹配、父子进程报告文件名
-      # 一致、报价/引号、服务状态映射）。测试失败就该拦住发布。
-      - name: Test Windows-only modules
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video
-
       - name: Strip binary (non-Windows)
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
@@ -105,279 +101,8 @@ jobs:
             "${SSH_USER}@${SSH_HOST}:${DEST}/${{ matrix.asset }}"
           rm -f "${KEY}"
 
-      # 无人值守被控端服务（仅 Windows）：`rust-tunnel-client-service.exe`，
-      # 一个把客户端实例拉进控制台会话的 SYSTEM 服务。
-      # 它**不依赖 rust-tunnel-remote**（不牵入 libvpx），所以走 MSVC 即可，
-      # 不需要 build-gui 那条 leg 的 MSYS2 mingw-w64 曲折；RUSTFLAGS 与上面的
-      # `Build client` 一致（静态 CRT，用户机器上不需要额外运行库）。
-      # 资产名必须以 `rust-tunnel-client-` 开头：`finalize-client` 的
-      # `rust-tunnel-client-*` glob（chmod + sha256sum）与下载页的
-      # `platform_from_filename` 都靠它解析平台/架构/扩展名——
-      # `rust-tunnel-client-service-windows-x86_64.exe` 会被解析成
-      # (windows, x86_64, exe)，与客户端本体同一套规则。
-      - name: Build and upload Windows unattended service
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SSH_HOST: ${{ secrets.SERVER_HOST }}
-          SSH_USER: ${{ secrets.SERVER_USER }}
-          SSH_PORT: ${{ secrets.SERVER_PORT }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-        run: |
-          set -euo pipefail
-          cargo build --release -p rust-tunnel-win-service --target ${{ matrix.target }}
-          # 产物名取自 `crates/win-service/Cargo.toml` 的 `[[bin]] name`；
-          # 上传时改名成带平台/架构的资产名（下载页要靠它认平台）。
-          SRC="target/${{ matrix.target }}/release/rust-tunnel-client-service.exe"
-          ASSET="rust-tunnel-client-service-windows-x86_64.exe"
-          # 上传方式与上面 `Upload binary to remote server` 逐字对齐（原生 ssh/scp，
-          # 因为 appleboy/scp-action 是 Docker action，只能在 Linux runner 上跑）。
-          mkdir -p "${HOME}/.ssh"
-          KEY="${HOME}/.ssh/rt_deploy_key"
-          printf '%s\n' "${SSH_KEY}" > "${KEY}"
-          chmod 600 "${KEY}"
-          PORT="${SSH_PORT:-22}"
-          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
-          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-          echo "Uploading ${ASSET} -> ${DEST}/"
-          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
-          scp "${SSH_OPTS[@]}" -P "${PORT}" \
-            "${SRC}" \
-            "${SSH_USER}@${SSH_HOST}:${DEST}/${ASSET}"
-          rm -f "${KEY}"
-
-  build-gui:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # GUI 只发布 Windows 与 macOS；Linux 只发布 CLI 客户端（build-client），
-          # 不再构建/发布 Linux GUI。
-          - os: windows-latest
-            # shiguredo_libvpx 的预编译 libvpx 是 GNU/mingw-w64 产物（`Built by MSYS2
-            # project`、符号 `___chkstk_ms`），MSVC 链不了，故本 leg 走 GNU 工具链。
-            # 而且它具体是 **msvcrt 味**的 mingw-w64 构建（依据：它引用 `__imp__setjmp`，
-            # 而 `_setjmp` 只存在于 msvcrt 的导入库）——链接器也必须用 msvcrt 味的，
-            # 见下面那条 "Use MSVCRT-flavored MinGW" step。
-            # 只改 GUI：CLI 客户端（build-client）不依赖 rust-tunnel-remote，保持 msvc。
-            target: x86_64-pc-windows-gnu
-            binary: rust-tunnel-client-gui.exe
-            asset: rust-tunnel-client-gui-windows-x86_64.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-          cache-on-failure: true
-      # 本 leg 的 GNU 链接器必须是 **MSVCRT 味**的 mingw-w64，不能用镜像自带的 `C:\mingw64`。
-      #
-      # 镜像里的 `C:\mingw64` 是 niXman/mingw-builds 的 **UCRT** 构建（一手来源：runner-images
-      # 的 `images/windows/toolsets/toolset-2025.json` 写着 `"mingw": {"version": "15.*",
-      # "runtime": "ucrt"}`），而镜像用 `Add-MachinePathItem "C:\mingw64\bin"` 把它放上了
-      # PATH——**它本来就排在前面**，所以往 GITHUB_PATH 追加 `C:\msys64\mingw64\bin` 是空操作
-      # （原实现正是这么写的，白写了）。
-      #
-      # 为什么 UCRT 链不了：vendored 的预编译 libvpx 是 **msvcrt 味**的构建，它引用
-      # `__imp__setjmp`（mingw-w64 的 `setjmp.h` 把 `setjmp` 宏成 `_setjmp`，声明带 `_CRTIMP`）。
-      # 这个导入槽**只有 msvcrt 的导入库提供**：mingw-w64 的 `msvcrt.def.in` 里有
-      # `F_NON_ARM64(_setjmp)`，而 `ucrtbase-common.def.in` 里没有（UCRT 只导出 `setjmp` 与
-      # `__intrinsic_setjmp`）。于是 UCRT 链接器报 `undefined reference to '__imp__setjmp'`，
-      # 且**只**报这一个——libvpx 的其余导入（`__acrt_iob_func`、`_errno`、`longjmp`、
-      # `Sleep`/`QueryPerformanceCounter`）两边的导入库都有。
-      #
-      # MSYS2 的 `mingw64` 环境（包名 `mingw-w64-x86_64-*`）就是 msvcrt 味；UCRT 味是**另一个**
-      # 环境 `ucrt64`（`mingw-w64-ucrt-x86_64-*`）。镜像虽预装 MSYS2，但**不装任何 mingw 包**
-      # （toolset 里 `MsysPackages.mingw` 是空的），故这里先装上，再前置到 PATH 头部。
-      - name: Use MSVCRT-flavored MinGW (MSYS2 mingw64)
-        if: matrix.target == 'x86_64-pc-windows-gnu'
-        shell: pwsh
-        run: |
-          & C:\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm --needed mingw-w64-x86_64-gcc"
-          if ($LASTEXITCODE -ne 0) { throw "pacman 装 mingw-w64-x86_64-gcc 失败（exit $LASTEXITCODE）" }
-          $dir = 'C:\msys64\mingw64\bin'
-          if (-not (Test-Path "$dir\x86_64-w64-mingw32-gcc.exe")) {
-            throw "MSYS2 的 mingw64 工具链没装上：$dir 下没有 x86_64-w64-mingw32-gcc.exe"
-          }
-          # 前置而非追加：镜像的 C:\mingw64\bin 已在 PATH 上且排在前，只有前置才赢得过它。
-          $lines = @($dir)
-          if (Test-Path $env:GITHUB_PATH) { $lines += @(Get-Content $env:GITHUB_PATH) }
-          [System.IO.File]::WriteAllLines($env:GITHUB_PATH, [string[]]$lines)
-          # 再显式钉住链接器：rustc 直接按绝对路径调它，不吃 PATH 先后的亏。
-          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$dir\x86_64-w64-mingw32-gcc.exe" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build GUI
-        run: cargo build --release -p rust-tunnel-client-gui --target ${{ matrix.target }}
-      # 产物必须自足。本 leg 是交叉编译、链接器是 MSYS2 的 mingw-w64——若 gcc 驱动的默认库把
-      # `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` 动态带了进来，产物在**用户机器上**起不来
-      # （那些 DLL 只存在于 CI 的 `C:\msys64\mingw64\bin`）。本仓此前的 Windows 客户端走 msvc，
-      # 是自足的，所以这个风险是换 leg 才引入的，而且**只有这条流水线能验**——本地无 mingw
-      # 工具链，交叉编译产物拿不到。
-      #
-      # 判据：导入表里不得出现任何 `lib*.dll`。mingw 运行时 DLL 全以 `lib` 开头
-      # （libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libssp-0），而 Windows 系统 DLL
-      # 一个都不是（KERNEL32 / USER32 / GDI32 / D3D11 / DXGI / OPENGL32 / msvcrt …）。
-      # 解析不出导入表也算失败——否则判据会被「空列表」静默满足。
-      - name: Assert the .exe carries no MinGW runtime DLL imports
-        if: matrix.target == 'x86_64-pc-windows-gnu'
-        shell: pwsh
-        run: |
-          $exe = 'target/x86_64-pc-windows-gnu/release/rust-tunnel-client-gui.exe'
-          $objdump = 'C:\msys64\mingw64\bin\objdump.exe'
-          if (-not (Test-Path $objdump)) { throw "objdump not found at $objdump (binutils should come with gcc)" }
-          $dlls = @(& $objdump -p $exe |
-                     Where-Object { $_ -match 'DLL Name:' } |
-                     ForEach-Object { ($_ -split 'DLL Name:')[1].Trim() } |
-                     Sort-Object -Unique)
-          if ($dlls.Count -eq 0) { throw "could not parse the import table of $exe (objdump -p output changed?)" }
-          Write-Host 'Imported DLLs:'
-          $dlls | ForEach-Object { Write-Host "  $_" }
-          $bad = @($dlls | Where-Object { $_ -match '^lib' })
-          if ($bad.Count -gt 0) {
-            throw "binary depends on MinGW runtime DLLs that users do not have: $($bad -join ', ')"
-          }
-      - name: Upload GUI to remote
-        shell: bash
-        env:
-          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SSH_HOST: ${{ secrets.SERVER_HOST }}
-          SSH_USER: ${{ secrets.SERVER_USER }}
-          SSH_PORT: ${{ secrets.SERVER_PORT }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${HOME}/.ssh"
-          KEY="${HOME}/.ssh/rt_deploy_key"
-          printf '%s\n' "${SSH_KEY}" > "${KEY}"
-          chmod 600 "${KEY}"
-          PORT="${SSH_PORT:-22}"
-          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
-          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
-          scp "${SSH_OPTS[@]}" -P "${PORT}" "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${SSH_USER}@${SSH_HOST}:${DEST}/${{ matrix.asset }}"
-          rm -f "${KEY}"
-
-  build-gui-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          # 只发 arm64：shiguredo_libvpx 没有 macos_x86_64 预编译，其 build.rs 对该
-          # target 直接 panic（`unsupported target: os=macos, arch=x86_64`），
-          # 用户已决定放弃 macOS x86_64（不再 lipo 出 universal2）。
-          targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-          cache-on-failure: true
-      - name: Build arm64 binary
-        run: |
-          cargo build --release -p rust-tunnel-client-gui --target aarch64-apple-darwin
-      - name: Bundle .app and dmg
-        env:
-          VERSION: ${{ github.ref_name }}
-          GUI_BIN: target/aarch64-apple-darwin/release/rust-tunnel-client-gui
-        run: |
-          bash scripts/bundle-macos.sh
-          ls -lh dist/
-      - name: Upload dmg
-        shell: bash
-        env:
-          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SSH_HOST: ${{ secrets.SERVER_HOST }}
-          SSH_USER: ${{ secrets.SERVER_USER }}
-          SSH_PORT: ${{ secrets.SERVER_PORT }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${HOME}/.ssh"
-          KEY="${HOME}/.ssh/rt_deploy_key"
-          printf '%s\n' "${SSH_KEY}" > "${KEY}"
-          chmod 600 "${KEY}"
-          PORT="${SSH_PORT:-22}"
-          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
-          DMG="dist/RustTunnel-${GITHUB_REF_NAME}-macos-aarch64.dmg"
-          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-          ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
-          scp "${SSH_OPTS[@]}" -P "${PORT}" "$DMG" "${SSH_USER}@${SSH_HOST}:${DEST}/"
-          rm -f "${KEY}"
-
-  # ── Windows 单包交付 ───────────────────────────────────────────────
-  #
-  # GUI 走 GNU leg（libvpx 预编译库是 mingw 味），服务走 MSVC leg（不牵 libvpx），
-  # 两个产物天然在两个 job 里。它们各自已 SCP 到服务器；这里把它们**拉回来打成
-  # 一个 zip**，用户只需下载一次、解压后两个 exe 并排放在同一目录——GUI 的
-  # 「安装并启用」按钮就能直接找到服务 exe，不再需要单独下载/手工传 --gui-exe。
-  #
-  # 为什么用 zip 而不是合并成一个 exe：服务进程以 LocalSystem 运行，必须放在
-  # %ProgramFiles% 且 DACL 收敛；GUI 又必须链 libvpx（GNU）。合成一个二进制会把
-  # GUI/编解码栈拖进 SYSTEM 进程，放大攻击面，也绕不开两套工具链。
-  package-windows:
-    needs: [build-client, build-gui]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Bundle Windows GUI + service into one zip
-        shell: bash
-        env:
-          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
-          SSH_HOST: ${{ secrets.SERVER_HOST }}
-          SSH_USER: ${{ secrets.SERVER_USER }}
-          SSH_PORT: ${{ secrets.SERVER_PORT }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${HOME}/.ssh" package
-          KEY="${HOME}/.ssh/rt_deploy_key"
-          printf '%s\n' "${SSH_KEY}" > "${KEY}"
-          chmod 600 "${KEY}"
-          PORT="${SSH_PORT:-22}"
-          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
-          SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-
-          # 归档名 → 运行期名：解压后两个 exe 并排，GUI 的 locate_service_exe 默认
-          # 就找得到；服务侧的 --gui-exe 默认值也认得。
-          scp "${SSH_OPTS[@]}" -P "${PORT}" \
-            "${SSH_USER}@${SSH_HOST}:${DEST}/rust-tunnel-client-gui-windows-x86_64.exe" \
-            package/rust-tunnel-client-gui.exe
-          scp "${SSH_OPTS[@]}" -P "${PORT}" \
-            "${SSH_USER}@${SSH_HOST}:${DEST}/rust-tunnel-client-service-windows-x86_64.exe" \
-            package/rust-tunnel-client-service.exe
-
-          cat > package/README.txt <<'EOF'
-          rust-tunnel Windows 客户端（GUI + 无人值守服务）
-          ================================================
-
-          1. 双击 rust-tunnel-client-gui.exe。
-          2. 先在「设置」里填好服务器地址与客户端 token 并保存。
-          3. 打开「设置 → 无人值守被控端」，点「安装并启用（推荐）」。
-          4. UAC 选「是」。服务变为“运行中”后，锁屏/登录界面和任务管理器
-             （UIPI 提权窗口）也能被远程控制。
-
-          安装时两个 exe 必须在同一个目录里；「安装并启用」会把它们复制到
-          %ProgramFiles%\rust-tunnel\ 并注册为 LocalSystem 服务。安装完成后
-          这个解压目录就可以删掉（服务和实例用的是 Program Files 里的副本）。
-          EOF
-
-          (cd package && zip -q -9 rust-tunnel-client-gui-windows-x86_64.zip \
-            rust-tunnel-client-gui.exe \
-            rust-tunnel-client-service.exe \
-            README.txt)
-
-          scp "${SSH_OPTS[@]}" -P "${PORT}" \
-            package/rust-tunnel-client-gui-windows-x86_64.zip \
-            "${SSH_USER}@${SSH_HOST}:${DEST}/"
-          rm -f "${KEY}"
-
   finalize-client:
-    needs: [build-client, build-gui, build-gui-macos, package-windows]
+    needs: [build-client]
     runs-on: ubuntu-latest
     steps:
       - name: Checksum, permissions and latest symlink
@@ -392,12 +117,35 @@ jobs:
             BASE="${{ secrets.DEPLOY_PATH }}/client"
             TAG="${{ github.ref_name }}"
             cd "${BASE}/${TAG}"
-            chmod +x rust-tunnel-client-* RustTunnel-*.dmg 2>/dev/null || true
-            sha256sum rust-tunnel-client-* RustTunnel-*.dmg 2>/dev/null > SHA256SUMS || sha256sum rust-tunnel-client-* > SHA256SUMS
+
+            # 合并式清单：CLI 与 GUI 是两个独立 workflow，可能同时发布同一个版本目录
+            # （协议不兼容版本要求两个 tag 指向同一版本，例如 v0.13.2 + gui-v0.13.2）。
+            # 每次都整份重写会抹掉对方刚写进去的条目，所以先保留「不归本流程管」的旧行，
+            # 再追加本次产物的新行，最后按文件名（第二列）排序。
+            # 本流程负责：rust-tunnel-client-linux-* / -macos-* / -windows-x86_64.exe；
+            # GUI 流程负责：rust-tunnel-client-gui-* / -service-* / RustTunnel-*.dmg。
+            #
+            # 注意：未匹配的 glob 在 set -e 下会让 sha256sum 报错，故逐个判断文件存在性；
+            # 同一个循环顺带补上 CLI 二进制的执行位。
+            TMP="$(mktemp)"
+            if [ -f SHA256SUMS ]; then
+              grep -Ev '[ *](rust-tunnel-client-linux-[^ ]*|rust-tunnel-client-macos-[^ ]*|rust-tunnel-client-windows-x86_64\.exe)$' \
+                SHA256SUMS > "${TMP}" || true
+            else
+              : > "${TMP}"
+            fi
+            for f in rust-tunnel-client-linux-* rust-tunnel-client-macos-* rust-tunnel-client-windows-x86_64.exe; do
+              [ -f "$f" ] || continue
+              chmod +x "$f"
+              sha256sum "$f" >> "${TMP}"
+            done
+            sort -k2 "${TMP}" > SHA256SUMS
+            rm -f "${TMP}"
+
             echo "--- ${BASE}/${TAG} ---"
             ls -lh
             echo "--- SHA256SUMS ---"
             cat SHA256SUMS
             ln -sfn "${TAG}" "${BASE}/latest"
             ls -ld "${BASE}/latest"
-            echo "Client ${TAG} deployed successfully to ${BASE}/${TAG}/ (latest -> ${TAG})"
+            echo "Client CLI ${TAG} deployed successfully to ${BASE}/${TAG}/ (latest -> ${TAG})"

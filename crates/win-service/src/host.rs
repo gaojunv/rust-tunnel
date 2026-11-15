@@ -965,7 +965,7 @@ fn seed_host_config(source: &Path) -> Result<(), String> {
 
 /// 实例（GUI）exe 的候选文件名。
 ///
-/// CI 的归档名与本地构建名不同（见 `release-client.yml`），两个都认——用户下载后
+/// CI 的归档名与本地构建名不同（见 `release-client-gui.yml`），两个都认——用户下载后
 /// 两个产物是**并排**放在同一个目录里的。
 const GUI_EXE_CANDIDATES: [&str; 2] = [
     "rust-tunnel-client-gui.exe",

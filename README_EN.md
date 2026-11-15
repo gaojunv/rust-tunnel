@@ -244,7 +244,8 @@ See [`crates/server/src/mgmt/api/mod.rs`](crates/server/src/mgmt/api/mod.rs) for
 GitHub Actions (see [`.github/workflows/`](.github/workflows/)):
 
 - `release-server.yml` (manual): frontend build → `x86_64-unknown-linux-musl` static compilation (`--features rag,embed-frontend`) → config rendered from `contrib/config.toml.template` and validated → SCP binary + systemd unit + config → SSH restart
-- `release-client.yml` (tag `v*` / manual): four-platform matrix build of client binaries, SCP'd to `${DEPLOY_PATH}/client/<tag>/`; `finalize-client` generates `SHA256SUMS` and updates the `latest` symlink
+- `release-client.yml` (tag `v*` / manual): **CLI only**, four-platform matrix (Linux musl, macOS x86_64/aarch64, Windows MSVC) build of client binaries, SCP'd to `${DEPLOY_PATH}/client/<tag>/`; `finalize-client` merges `SHA256SUMS` (CLI files only) and updates the `latest` symlink
+- `release-client-gui.yml` (tag `gui-v*` / manual): **GUI only**, Windows (GNU) GUI exe + macOS arm64 `.dmg` + Windows (MSVC) unattended-service exe + Windows single zip, written to the same `${DEPLOY_PATH}/client/<version>/` as the CLI (version = tag without the `gui-` prefix); `finalize-gui` merges checksums and does not update `latest` (maintained by the CLI workflow)
 - `release-wiki-client.yml` (tag `wiki-v*` / manual): Tauri 2 installers (macOS aarch64/x86_64 `.dmg` + Windows `.msi` / NSIS `.exe`), renamed to `wiki-desktop-<os>-<arch>[-setup].<ext>` and SCP'd to `${DEPLOY_PATH}/wiki/<version>/` (directory name = tag without the `wiki-` prefix); `finalize-wiki` generates checksums and the `latest` symlink
 
 Deployment uses systemd ([`contrib/rust-tunnel-server.service`](contrib/rust-tunnel-server.service)); both archive directories are exposed read-only to the Web downloads page via `client_dist_dir` / `wiki_dist_dir` as absolute paths.

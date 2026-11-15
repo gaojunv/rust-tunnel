@@ -136,7 +136,8 @@ log = "info"
 db_path = "./data/rust-tunnel.db"
 
 # 客户端二进制归档目录
-# CI（.github/workflows/release-client.yml）按 tag 落盘为 <dir>/<tag>/，并维护 <dir>/latest 软链
+# CI（.github/workflows/release-client.yml 与 release-client-gui.yml）按版本落盘为
+# <dir>/<version>/（CLI 用 v* tag，GUI 用 gui-v* tag 并去掉前缀），并维护 <dir>/latest 软链
 # Web 管理界面「客户端下载」页只读该目录
 # 默认值：./client（相对于服务进程工作目录）
 client_dist_dir = "./client"

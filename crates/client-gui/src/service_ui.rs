@@ -59,8 +59,8 @@ use crate::service_watch::{IdentityOwner, ServicePresence};
 /// 「服务：未知」，让 macOS 用户去找一个根本不存在的服务。
 pub const SERVICE_SUPPORTED: bool = cfg!(target_os = "windows");
 
-/// 服务 exe 的候选文件名（**必须与 `paths::SERVICE_EXE_NAME` 和 `release-client.yml` 的
-/// 归档名一致**）。
+/// 服务 exe 的候选文件名（**必须与 `paths::SERVICE_EXE_NAME` 和 `release-client-gui.yml`
+/// 的归档名一致**）。
 ///
 /// 与 `crates/win-service/src/host.rs` 的 `GUI_EXE_CANDIDATES` 是镜像关系：CI 把两个产物
 /// **并排**放在同一个目录里，本地构建时 `target/<triple>/release/` 里同样两个都在。故在
