@@ -46,7 +46,7 @@ fn chroma(red: u32, green: u32, blue: u32) -> (u8, u8) {
 ///
 /// # Errors
 /// 尺寸为 0/奇数、或 `rgba` 长度不足时返回 [`WinVideoError::Encode`]。
-pub(super) fn rgba_to_nv12(
+pub(crate) fn rgba_to_nv12(
     rgba: &[u8],
     width: u32,
     height: u32,

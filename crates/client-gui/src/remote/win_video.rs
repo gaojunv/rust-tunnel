@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
+use rust_tunnel_remote::screen::{CapturedPatches, ScreenPatch};
 use rust_tunnel_remote::{
     encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo, GpuFrame,
     RawFrame, RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
@@ -387,6 +388,101 @@ impl ScreenSource for WinVideoScreen {
 
     fn capture_gpu(&self, display_id: u32) -> RemoteResult<RawFrame> {
         self.capture_gpu_frame(display_id)
+    }
+
+    fn supports_patches(&self) -> bool {
+        // 补丁模式建立在 WGC/DXGI 的 GPU 纹理与变化网格上；GPU 路径被禁用（环境变量或
+        // 一次真实的采集/编码失败）时它也不可用。
+        !gpu_context().is_disabled()
+    }
+
+    /// 采集一帧并产出**脏矩形补丁**（编码尺寸坐标系，紧包 NV12）。
+    ///
+    /// 只有 H.264 且画面活跃度低时引擎才会调用。返回 `Ok(None)` 表示「本拍不适合补丁」：
+    /// 采集失败、变化网格缺失（首帧/检测器不可用/超时复用了上一帧）、或矩形数/面积超限。
+    /// **不在这里禁用 GPU 路径**——补丁提取只是优化，失败应当退回全帧视频，而不是把整个
+    /// 硬件链路永久关掉。
+    fn capture_patches(
+        &self,
+        display_id: u32,
+        scale: f32,
+        max_width: u32,
+    ) -> RemoteResult<Option<CapturedPatches>> {
+        let collected = self.with_source(display_id, |source| {
+            source
+                .capture_texture_with_dirty()
+                .map_err(|err| RemoteError::Platform(format!("GPU 补丁采集失败: {err}")))
+        });
+        let (captured, report, grid) = match collected {
+            Ok(result) => result,
+            Err(err) => {
+                // GUI 日志层会丢 tracing 字段，原因全部内联。
+                debug!("脏矩形补丁采集失败，回退全帧：{err}");
+                return Ok(None);
+            }
+        };
+        // 用**实际纹理尺寸**算目标编码尺寸：会话中途改分辨率也不会沿用陈旧尺寸。
+        //
+        // **必须与视频路径同一套双重换算**：`capture_gpu_frame` 先按 `max_width` 把源封顶
+        // （`encode_dimensions(.., 1.0, ..)`），引擎随后再施加 `rates.scale`。若这里直接用
+        // 原始纹理 × scale，4K + 非 1.0 缩放会得到 1920×1080，而视频路径得到 960×540 ——
+        // 补丁尺寸就与控制端合成帧对不上（见 `controlled.rs` 的同名换算）。
+        let (cap_width, cap_height) = encode_dimensions(captured.width, captured.height, 1.0, max_width);
+        let (width, height) = encode_dimensions(cap_width, cap_height, scale, max_width);
+        let Some(grid) = grid else {
+            // 两种「没有网格」必须分开：
+            // - `changed == false`：采集后端超时后复用了上一帧（DXGI 静止桌面很常见）。
+            //   这不是检测器不可用，只是本拍没有新帧——给一个空补丁当保活，别把引擎
+            //   踢回全帧模式。
+            // - `changed == true`：首帧或检测器不可用，无法判断脏区，只能回退全帧。
+            if !report.changed {
+                return Ok(Some(CapturedPatches {
+                    display: display_id,
+                    width,
+                    height,
+                    changed_permille: 0,
+                    rects: Vec::new(),
+                }));
+            }
+            debug!("脏矩形补丁不可用（变化网格缺失），回退全帧");
+            return Ok(None);
+        };
+        gpu_context().set_device(Arc::clone(&captured.device));
+        gpu_context().log_enabled_once(&captured.device.adapter.name);
+        let patches = match capture::extract_patches(
+            &captured,
+            &grid,
+            width,
+            height,
+            &capture::PatchParams::default(),
+        ) {
+            Ok(Some(patches)) => patches,
+            Ok(None) => {
+                debug!("脏矩形补丁不适用（矩形数/面积超限或图集过高），回退全帧");
+                return Ok(None);
+            }
+            Err(err) => {
+                debug!("脏矩形补丁提取失败，回退全帧：{err}");
+                return Ok(None);
+            }
+        };
+        let rects = patches
+            .into_iter()
+            .map(|patch| ScreenPatch {
+                x: patch.x,
+                y: patch.y,
+                width: patch.width,
+                height: patch.height,
+                nv12: patch.nv12,
+            })
+            .collect();
+        Ok(Some(CapturedPatches {
+            display: display_id,
+            width,
+            height,
+            changed_permille: report.changed_permille,
+            rects,
+        }))
     }
 }
 

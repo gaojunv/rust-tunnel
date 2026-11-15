@@ -432,6 +432,17 @@ fn render(
             });
     }
 
+    // 关键帧请求速率：管理面只累计计数，这里按累计值差分每秒结算一次（与帧率同款）。
+    // 只有控制器会发关键帧请求；被控端保持 0，角标里不显示。
+    if active.role == SessionRole::Controller {
+        let total = state
+            .keyframe_requests
+            .iter()
+            .copied()
+            .fold(0_u32, u32::saturating_add);
+        v.poll_keyframe_rate(total, Instant::now());
+    }
+
     if v.stats_overlay {
         stats_overlay(ctx, v, active, state);
     }
@@ -873,6 +884,21 @@ fn stats_overlay(
                             .map_or("—".to_owned(), |n| format!("{n}/s")),
                     );
                     ui.end_row();
+                    // 补丁批数：协议 v6 的脏矩形增量通道。补丁模式下全帧几乎消失，这一项
+                    // 代替「收包」说明画面仍在更新（被控端/VP9 会话恒为 —）。
+                    ui.label(RichText::new("补丁").weak().small());
+                    ui.label(
+                        state
+                            .decode_patches
+                            .map_or("—".to_owned(), |n| format!("{n}/s")),
+                    );
+                    ui.end_row();
+                    // 关键帧请求速率：持续 >0 说明解码链在反复断裂（丢包/队列溢出/解码失败）。
+                    if v.keyframe_rate > 0 {
+                        ui.label(RichText::new("关键帧请求").weak().small());
+                        ui.label(format!("{}/s", v.keyframe_rate));
+                        ui.end_row();
+                    }
                     // 输入速率：本端**捕获并注入**的事件数（不是远端是否响应）。用来一眼分辨
                     // 「UI 压根没产生事件」与「事件已注入但远端没反应」。
                     ui.label(RichText::new("输入").weak().small());

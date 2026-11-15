@@ -18,7 +18,7 @@
 
 use super::{
     find_output, texture_dimensions, BgraReader, CaptureBackend, CaptureSource, CapturedFrame,
-    CapturedTexture, ChangeReport, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
+    CapturedTexture, ChangeReport, DirtyGrid, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
     NEXT_FRAME_POLL_TIMEOUT,
 };
 use crate::d3d11;
@@ -90,17 +90,26 @@ impl CaptureSource for DxgiSource {
     }
 
     fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
-        self.capture_texture_with_change().map(|(texture, _)| texture)
+        self.capture_texture_with_dirty()
+            .map(|(texture, _, _)| texture)
     }
 
     fn capture_texture_with_change(
         &mut self,
     ) -> Result<(CapturedTexture, ChangeReport), WinVideoError> {
+        self.capture_texture_with_dirty()
+            .map(|(texture, report, _)| (texture, report))
+    }
+
+    fn capture_texture_with_dirty(
+        &mut self,
+    ) -> Result<(CapturedTexture, ChangeReport, Option<DirtyGrid>), WinVideoError> {
         match self.acquire()? {
             Acquired::Resource(resource) => self.finish_texture(resource.as_ref()),
+            // 超时复用上一帧时**不给网格**：陈旧的格点会让补丁模式覆盖错画面。
             Acquired::Timeout => self
                 .reuse_texture("超时内没有新帧")
-                .map(|texture| (texture, ChangeReport::unchanged())),
+                .map(|texture| (texture, ChangeReport::unchanged(), None)),
             Acquired::AccessLost => {
                 tracing::warn!("DXGI 桌面复制会话失效（ACCESS_LOST），尝试重建");
                 self.rebuild()?;
@@ -108,10 +117,10 @@ impl CaptureSource for DxgiSource {
                     Acquired::Resource(resource) => self.finish_texture(resource.as_ref()),
                     Acquired::Timeout => self
                         .reuse_texture("重建后超时内没有新帧")
-                        .map(|texture| (texture, ChangeReport::unchanged())),
+                        .map(|texture| (texture, ChangeReport::unchanged(), None)),
                     Acquired::AccessLost => self
                         .reuse_texture("重建后再次 ACCESS_LOST")
-                        .map(|texture| (texture, ChangeReport::unchanged())),
+                        .map(|texture| (texture, ChangeReport::unchanged(), None)),
                 }
             }
         }
@@ -198,7 +207,7 @@ impl DxgiSource {
     fn finish_texture(
         &mut self,
         resource: Option<&IDXGIResource>,
-    ) -> Result<(CapturedTexture, ChangeReport), WinVideoError> {
+    ) -> Result<(CapturedTexture, ChangeReport, Option<DirtyGrid>), WinVideoError> {
         let copied = match resource {
             Some(resource) => self.copy_resource(resource).map(Some),
             None => Ok(None),
@@ -211,15 +220,16 @@ impl DxgiSource {
         }
         match texture {
             Some(texture) => {
-                // 真的拷到了桌面图像，再用像素级检测确认**内容**是否变化。
-                let report = self.change.changed(&self.d3d, &texture);
+                // 真的拷到了桌面图像，再用像素级检测确认**内容**是否变化，并拿到脏格点
+                // 网格供补丁模式使用。
+                let (report, grid) = self.change.changed_with_grid(&self.d3d, &texture);
                 self.last_texture = Some(texture.clone());
-                Ok((texture, report))
+                Ok((texture, report, grid))
             }
-            // 只有指针更新、没有新的桌面图像：复用上一张，且告诉上层别编码。
+            // 只有指针更新、没有新的桌面图像：复用上一张，且告诉上层别编码（也没有网格）。
             None => self
                 .reuse_texture("本次只有指针更新，没有新的桌面图像")
-                .map(|texture| (texture, ChangeReport::unchanged())),
+                .map(|texture| (texture, ChangeReport::unchanged(), None)),
         }
     }
 

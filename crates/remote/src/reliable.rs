@@ -15,6 +15,9 @@
 //! → 协议任务写不动 → 停止确认 → 对端接收窗口填满 → 对端停发。**内存上界因此与对端行为
 //! 无关**（乱序缓冲硬上界 [`MAX_RECV_WINDOW`] 段、发送缓冲硬上界 [`SEND_BUFFER_LIMIT`] 字节）。
 //!
+//! 窗口取 256 段（≈307 KB 在途）：100 ms RTT 下的吞吐上限从「64 段/RTT ≈ 6 Mbps」抬到
+//! 「256 段/RTT ≈ 24 Mbps」，不再成为应用层码率闭环（[`crate::qos`]）的天花板。
+//!
 //! # 不与 `qos.rs` 抢方向盘（**重要**）
 //!
 //! 应用层码率闭环（[`crate::qos`]）已经是这条数据面的**主拥塞控制**。本模块的 `cwnd` / RTO
@@ -55,7 +58,12 @@ pub(crate) const MAX_PAYLOAD: usize = 1200;
 pub(crate) const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 接收窗口上限（段）：乱序缓冲 + 待交付缓冲的硬上界。
-const MAX_RECV_WINDOW: usize = 64;
+///
+/// 256 段 × 1200 B ≈ **307 KB** 在途上限。旧值 64 段在 100 ms RTT 下只能提供约 6 Mbps
+/// （`64 × 1200 × 8 / 0.1`），会把 QoS 闭环的更高档位硬卡在窗口上；256 段把同一 RTT 下的
+/// 上限抬到约 24 Mbps。窗口只是**允许**的在途量，实际发送节奏仍由 `cwnd`（保守地板）与
+/// 应用层 QoS 决定。
+const MAX_RECV_WINDOW: usize = 256;
 
 /// 拥塞窗口初值（段）。
 const INITIAL_CWND_SEGMENTS: usize = 10;
@@ -1499,6 +1507,44 @@ mod tests {
         // 应用读走一段 → 窗口重新打开。
         conn.consume_delivered(1);
         assert!(conn.window() > 0, "应用消费后窗口应恢复");
+    }
+
+    /// 接收窗口上限从 64 段抬到 256 段：握手/常规 ACK 里通告的就是这个值。
+    ///
+    /// 锁的是「窗口不再是 100 ms RTT 下 ~6 Mbps 的天花板」这一改动本身——把常量改回 64 会
+    /// 让这条断言失败。
+    #[tokio::test(start_paused = true)]
+    async fn advertised_receive_window_is_256_segments() {
+        assert_eq!(MAX_RECV_WINDOW, 256);
+        let net = Net::new(22);
+        let conn = bare_conn(&net, 23);
+        assert_eq!(conn.window(), 256, "空闲连接的窗口应通告满额 256 段");
+        assert_eq!(recv_window_max(), 256, "握手段通告的窗口同样应是 256");
+    }
+
+    /// 对端窗口允许时，单次 `pump` 可以发出**超过 64 段**在途——旧上限不参与发送侧判定。
+    ///
+    /// 发送侧只看 `min(cwnd, peer_window_bytes)`；把两者都放到 256 段后灌满数据，未确认队列
+    /// 应超过 64 段。这证明簇射能力确实随窗口抬升，而不是仅在段头里写了个更大的数字。
+    #[tokio::test(start_paused = true)]
+    async fn sender_may_have_more_than_64_segments_in_flight() {
+        let net = Net::new(24);
+        let mut conn = bare_conn(&net, 25);
+        // 直接摆上「窗口与拥塞窗口都是 256 段」的条件（`pump` 的判定只读这两个字段）。
+        conn.peer_window = 256;
+        conn.cwnd = 256 * MAX_PAYLOAD;
+        conn.push_app_data(&vec![0x5Au8; 200 * MAX_PAYLOAD]);
+        conn.pump(Instant::now());
+        assert!(
+            conn.unacked.len() > 64,
+            "对端窗口允许时应能发出超过 64 段在途，实为 {}",
+            conn.unacked.len()
+        );
+        assert!(
+            conn.unacked.len() <= 256,
+            "仍未确认段数不得超过接收窗口上限 256，实为 {}",
+            conn.unacked.len()
+        );
     }
 
     // ───────────────────────── 端到端（内存链路） ─────────────────────────

@@ -15,10 +15,14 @@
 //! 上限 [`MAX_SESSION_FRAME`]（16 MiB）：**不复用**控制通道的 1 MiB 上限。VP9 的关键帧远小于
 //! 此值，但文件块（`File` lane）与将来可能的更大分辨率仍需要它。
 //!
-//! # 保活
+//! # 保活与延迟探测
 //!
-//! [`HEARTBEAT_INTERVAL`] = 10s，硬性小于 hbbr 中继的 `idle_timeout`（30s，见
+//! [`HEARTBEAT_INTERVAL`] = 1s，硬性小于 hbbr 中继的 `idle_timeout`（30s，见
 //! `crates/rustdesk/src/relay.rs`）。**静止画面也必须发心跳**，否则中继按空闲断开。
+//!
+//! 心跳同时充当**延迟探测**：1s 一次往返，RTT 读数最快也就 1s 一个样本，足够 QoS 闭环按秒
+//! 决策。可信上限是 [`TRUSTED_RTT_MAX`]（10s）——超过它的读数只可能是迟到 ack 与新的心跳
+//! 配错了对，或对端卡了整整几个周期，一律丢弃（见 [`trusted_rtt`]）。
 
 use crate::auth::handshake_mac;
 use crate::crypto::{random_nonce, Cipher, EphemeralKeyPair};
@@ -33,47 +37,58 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 5
+/// # 为什么是 6
 ///
-/// 版本 5 改了**输入语义**：可打印键不再走 `KeyEvent{code: TEXT, text}`（被控端按 Unicode
-/// 码点注入，绕过被控端的键盘布局与输入法），改为发送完整键位码（`KeyEvent.code` 承载
-/// 字母/数字/标点，由被控端映射成 VK / CGKeyCode / keysym 注入），字符最终由**被控端**的
-/// 键盘布局与输入决定。键码表与旧语义不兼容（同一 `code` 值含义不同），故必须抬版本。
+/// 版本 6 在我们这条分支上把两件事合到了一起：
 ///
-/// 版本 4 追加了 [`SessionMessage::SetFrameRate`]（控制端 → 被控端的帧率上限）。它只追加在
-/// [`SessionMessage`] 末尾，但老端（v3）会在 bincode 解码时因未知判别式失败，故必须抬版本。
-/// 数据面没有会话内向后兼容分支，两端靠 `Hello.proto_version` 的 **硬相等** 校验实现
-/// 「混合版本干净拒绝」：v4 ↔ v5 在握手阶段就被明文拒绝，不会解码对方的画面帧。
+/// - **脏矩形增量补丁**：追加 [`SessionMessage::RegionUpdate`]（被控端 → 控制端）。它只追加在
+///   [`SessionMessage`] 末尾，但老端会在 bincode 解码时因未知判别式失败，故必须抬版本。
+/// - **输入语义变更**（main 的 v5）：可打印键不再走 `KeyEvent{code: TEXT, text}`（被控端按
+///   Unicode 码点注入，绕过被控端的键盘布局与输入法），改为发送完整键位码，由被控端映射成
+///   VK / CGKeyCode / keysym 注入，字符最终由**被控端**的键盘布局与输入决定。键码表与旧语义
+///   不兼容（同一 `code` 值含义不同），所以那次也必须抬版本。
 ///
-/// 版本 3 是阶段 5 的硬件编码协商（[`SessionMessage::CodecOffer`] / [`SessionMessage::CodecSelect`]
-/// 与 [`CodecId::H264`]）。
+/// 两笔改动各自都把版本抬到了 5，但含义不同；合并后统一为 **6**，任一旧端（v4 或 v5）都会
+/// 被硬相等校验干净拒绝。数据面没有会话内向后兼容分支，两端靠 `Hello.proto_version` 的
+/// **硬相等** 校验实现「混合版本干净拒绝」，不会解码对方的画面帧。
+///
+/// 版本 4 是控制端可选的 [`SessionMessage::SetFrameRate`]（帧率上限）；版本 3 是阶段 5 的
+/// 硬件编码协商（[`SessionMessage::CodecOffer`] / [`SessionMessage::CodecSelect`] 与
+/// [`CodecId::H264`]）。
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
-/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v5**——先把携带版本 5 的客户端
-/// 铺开（v5 ↔ v4 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 5;
+/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v6**——先把携带版本 6 的客户端
+/// 铺开（v6 ↔ v5/v4 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 6;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
 
 /// 心跳间隔。**必须小于 hbbr 的 30s idle_timeout**（由单测断言）。
 ///
-/// # 为什么延迟读数最快也要 10s 一次
+/// 心跳同时是延迟探测：1s 一次的零载荷往返让 QoS 闭环每秒都能拿到一个 RTT 样本。**复用既有
+/// 心搏变体、不新增数据面变体**——`SessionMessage` 的硬相等版本校验会让混合版本的一端 bincode
+/// 解码失败而直接断链。高 RTT 链路上，迟到的 ack 可能与更新的心跳配错对，故两端都用
+/// 「发出时刻队列」而不是单个 `Option<Instant>`（见 `controller.rs` / `controlled.rs`）。
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// RTT 样本的可信上限。
 ///
-/// 会话循环用这条心跳的**往返**（`Heartbeat` → `HeartbeatAck`）测延迟，因此最快每
-/// [`HEARTBEAT_INTERVAL`] 才有一个样本。更快的探测需要新增数据面变体（`SessionMessage`
-/// 的硬相等版本校验会让混合版本的一端 bincode 解码失败而直接断链），代价远大于收益，故有意不加快。
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// 心跳是**零载荷**的固定往返，正常 RTT 远小于它；一旦读数达到 10s，只可能是把一个迟到的
+/// `HeartbeatAck` 与另一次（或已作废的）`Heartbeat` 配了对，或对端/链路卡了整整几个周期。
+/// 两者都不可信，报给 UI 只会误导。**它只是可信上限，不是探测间隔**——探测间隔是
+/// [`HEARTBEAT_INTERVAL`]（1s）。
+pub const TRUSTED_RTT_MAX: Duration = Duration::from_secs(10);
 
 /// 由「发出时刻」与「收到应答时刻」算一次可信的 RTT 样本。
 ///
-/// 丢弃 `>= HEARTBEAT_INTERVAL` 的样本：心跳是**零载荷**的固定往返，正常 RTT 必然远小于间隔；
-/// 一旦读数达到间隔量级，只可能是把一个迟到的 `HeartbeatAck` 与另一次（或已作废的）`Heartbeat`
-/// 配了对，或对端/链路卡了整整一个周期——两者都不可信，报给 UI 只会误导。抽成纯函数以便单测。
+/// 只丢弃 `>= TRUSTED_RTT_MAX` 的样本（见该常量的说明）；1–10s 的读数仍然采信——跨洲中继/
+/// 卫星链路完全可能在这个区间，早先按「一个心跳间隔」丢弃会把它们全部误判成错配。
+/// 抽成纯函数以便单测。
 #[must_use]
 pub fn trusted_rtt(sent: Instant, now: Instant) -> Option<Duration> {
     let rtt = now.saturating_duration_since(sent);
-    (rtt < HEARTBEAT_INTERVAL).then_some(rtt)
+    (rtt < TRUSTED_RTT_MAX).then_some(rtt)
 }
 
 /// 一次会话的结束信息：会话循环的返回值，也是管理器判定的唯一依据。
@@ -150,6 +165,38 @@ pub const VIDEO_FLAG_CONFIG: u8 = 0b0000_0001;
 
 /// [`SessionMessage::VideoPacket::flags`]：本包含 IDR（解码器可由此重建参考帧）。
 pub const VIDEO_FLAG_KEYFRAME: u8 = 0b0000_0010;
+
+/// [`RegionRect::flags`]：`data` 是用 zstd（level 1）压缩过的紧包 NV12。
+///
+/// 未置位时 `data` 就是原始 NV12（压缩没有收益时用，避免为极小块付 zstd 帧头开销）。
+pub const REGION_FLAG_ZSTD: u8 = 0b0000_0001;
+
+/// 一条 [`SessionMessage::RegionUpdate`] 里允许的最大矩形数。
+///
+/// 上限的作用是**限制控制端的解码/合成工作量**：矩形越多，解压与逐块覆写的固定开销越大。
+/// 被控端在矩形超过这个数时会退回全帧视频（见 `crates/remote/src/controlled.rs`）。
+pub const MAX_REGION_RECTS: usize = 32;
+
+/// 脏矩形增量补丁里的一个矩形。
+///
+/// 坐标与尺寸都在**目标帧缓冲（编码尺寸）坐标系**里，且**全部为偶数**：补丁像素是 NV12
+/// （UV 半分辨率），奇数边界会让色度块错位。`data` 的布局是紧包 NV12：
+/// `Y(width*height) ‖ UV(width*height/2)`，无行填充。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionRect {
+    /// 左上角 X（偶数）。
+    pub x: u32,
+    /// 左上角 Y（偶数）。
+    pub y: u32,
+    /// 宽度（偶数）。
+    pub width: u32,
+    /// 高度（偶数）。
+    pub height: u32,
+    /// 压缩标志；目前只有 [`REGION_FLAG_ZSTD`]。
+    pub flags: u8,
+    /// 压缩（或原始）的紧包 NV12。
+    pub data: Vec<u8>,
+}
 
 /// 会话消息。
 ///
@@ -362,6 +409,34 @@ pub enum SessionMessage {
     SetFrameRate {
         /// 目标帧率上限（被控端钳到 `[min_fps, 120]`）。
         fps: u8,
+    },
+    /// 脏矩形增量补丁（被控端 → 控制端；仅 Windows H.264 路径）。
+    ///
+    /// # 语义
+    ///
+    /// 应用在上一次 [`SessionMessage::VideoPacket`]（或补丁）之上：控制端维护一块**持久**
+    /// NV12 帧缓冲，全帧到达时整块替换，补丁到达时只覆写给出的矩形。`rects` 为空表示
+    /// **保活**（画面没变，不要重绘），用于让控制端的「长时间无帧」看门狗保持安静。
+    ///
+    /// # 顺序与可靠性
+    ///
+    /// 补丁与全帧走**同一条**解码队列，因此严格同序；补丁**不允许被丢弃**（丢一个会让画面
+    /// 永久缺一块）。控制端队列满时会请求关键帧，被控端据此退出补丁模式并发一个全帧 IDR。
+    ///
+    /// # 与视频序号的关系
+    ///
+    /// 补丁**不占用** [`SessionMessage::VideoPacket::seq`]：补丁模式下编码器不出帧，视频
+    /// 序号保持不变；退出补丁模式后的第一个全帧序号仍与解码端的 `expected_seq` 连续，
+    /// 不会误触发「序号断层」。
+    RegionUpdate {
+        /// 目标显示器编号。
+        display: u32,
+        /// 目标帧缓冲宽度（编码尺寸，偶数）。
+        width: u32,
+        /// 目标帧缓冲高度（编码尺寸，偶数）。
+        height: u32,
+        /// 本批矩形；空 = 保活。
+        rects: Vec<RegionRect>,
     },
 }
 
@@ -669,19 +744,33 @@ mod tests {
     #[test]
     fn trusted_rtt_keeps_fast_samples_and_drops_slow_ones() {
         let base = Instant::now();
-        // 正常往返：远小于间隔，应采信。
+        // 正常往返：远小于上限，应采信。
         assert_eq!(
             trusted_rtt(base, base + Duration::from_millis(5)),
             Some(Duration::from_millis(5))
         );
-        // 恰好等于间隔、以及超过间隔：样本不可信，丢弃（只可能是丢包/错配）。
-        assert_eq!(trusted_rtt(base, base + HEARTBEAT_INTERVAL), None);
+        // 1.5s 仍必须采信：高 RTT 链路（卫星/跨洲中继）完全可能在这个量级，它不是错配信号。
         assert_eq!(
-            trusted_rtt(base, base + HEARTBEAT_INTERVAL + Duration::from_millis(1)),
+            trusted_rtt(base, base + Duration::from_millis(1500)),
+            Some(Duration::from_millis(1500))
+        );
+        // 恰好等于上限、以及超过上限：样本不可信，丢弃（只可能是迟到 ack 配错对）。
+        assert_eq!(trusted_rtt(base, base + TRUSTED_RTT_MAX), None);
+        assert_eq!(
+            trusted_rtt(base, base + TRUSTED_RTT_MAX + Duration::from_millis(1)),
             None
         );
         // 时钟回拨/负差不应 panic，按 0 处理（仍是可信样本）。
         assert_eq!(trusted_rtt(base, base), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn heartbeat_probes_every_second_and_trusts_up_to_ten() {
+        // 探测间隔与可信上限是两件事：1s 探测、10s 上限。把它们绑在一起会让所有高 RTT 链路
+        // 的读数被永久丢弃。
+        assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(1));
+        assert_eq!(TRUSTED_RTT_MAX, Duration::from_secs(10));
+        assert!(HEARTBEAT_INTERVAL < TRUSTED_RTT_MAX);
     }
 
     #[test]
@@ -980,6 +1069,43 @@ mod tests {
             (SessionMessage::SetFrameRate { fps: 60 }, Lane::Control),
             // 边界：被控端会把它钳到 [min_fps, 120]。
             (SessionMessage::SetFrameRate { fps: 0 }, Lane::Control),
+            // 补丁：带一个 zstd 矩形与一个原始矩形（两种 flags 都覆盖）。
+            (
+                SessionMessage::RegionUpdate {
+                    display: 0,
+                    width: 1920,
+                    height: 1080,
+                    rects: vec![
+                        RegionRect {
+                            x: 2,
+                            y: 4,
+                            width: 64,
+                            height: 32,
+                            flags: REGION_FLAG_ZSTD,
+                            data: vec![0x11; 96],
+                        },
+                        RegionRect {
+                            x: 100,
+                            y: 200,
+                            width: 16,
+                            height: 16,
+                            flags: 0,
+                            data: vec![0x22; 384],
+                        },
+                    ],
+                },
+                Lane::Screen,
+            ),
+            // 边界：空补丁 = 保活。
+            (
+                SessionMessage::RegionUpdate {
+                    display: 1,
+                    width: 2,
+                    height: 2,
+                    rects: vec![],
+                },
+                Lane::Screen,
+            ),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -1148,6 +1274,16 @@ mod tests {
                 "SetFrameRate",
                 SessionMessage::SetFrameRate { fps: 60 },
                 25,
+            ),
+            (
+                "RegionUpdate",
+                SessionMessage::RegionUpdate {
+                    display: 0,
+                    width: 0,
+                    height: 0,
+                    rects: vec![],
+                },
+                26,
             ),
         ];
         for (name, msg, want) in &cases {

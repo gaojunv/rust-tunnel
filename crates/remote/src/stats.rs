@@ -10,6 +10,66 @@
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// 控制器请求关键帧的原因（**进程内观测值，不上线**）。
+///
+/// 关键帧请求本身走既有 [`crate::session::SessionMessage::RequestKeyframe`]（线上只有
+/// `display` 一个字段）；这里只是把「为什么请」拆开送进管理面，用于判断画面卡顿的真因：
+/// - [`Self::SeqGap`] / [`Self::QueueOverflow`] → 本端解码队列在丢帧（链路/解码跟不上）；
+/// - [`Self::DecodeError`] / [`Self::ConfigureFailed`] → 解码器/码流本身有问题；
+/// - [`Self::NoDecoder`] → 工厂或 codec 协商缺失；
+/// - [`Self::StalledNoFrame`] → 对端长时间不出帧（静止桌面的正常情况也会命中）；
+/// - [`Self::Manual`] → 由人/上层显式发起（目前没有调用点，保留语义位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeReason {
+    /// 帧序号断层：会话循环丢过包，参考链已断。
+    SeqGap,
+    /// 解码队列溢出：主循环推进了 `drop_epoch`，队列里的帧整体作废。
+    QueueOverflow,
+    /// 解码器返回错误（码流损坏/缺参考帧）。
+    DecodeError,
+    /// 没有可用的解码器（工厂缺失、codec 未知，或尚未创建成功）。
+    NoDecoder,
+    /// 解码器 `configure(width, height)` 失败。
+    ConfigureFailed,
+    /// 长时间未收到画面帧（[`crate::controller`] 的 `NO_FRAME_TIMEOUT` 看门狗）。
+    StalledNoFrame,
+    /// 人工/上层显式请求。
+    Manual,
+}
+
+impl KeyframeReason {
+    /// 变体总数（供定长计数器数组使用）。
+    pub const COUNT: usize = 7;
+
+    /// 稳定的数组下标（**只追加、不改顺序**，否则历史计数会错位）。
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::SeqGap => 0,
+            Self::QueueOverflow => 1,
+            Self::DecodeError => 2,
+            Self::NoDecoder => 3,
+            Self::ConfigureFailed => 4,
+            Self::StalledNoFrame => 5,
+            Self::Manual => 6,
+        }
+    }
+
+    /// 面向 UI/日志的中文标签。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SeqGap => "序号断层",
+            Self::QueueOverflow => "队列溢出",
+            Self::DecodeError => "解码失败",
+            Self::NoDecoder => "无解码器",
+            Self::ConfigureFailed => "配置失败",
+            Self::StalledNoFrame => "长时间无帧",
+            Self::Manual => "手动",
+        }
+    }
+}
+
 /// 会话循环 → 管理器的统计数据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStats {
@@ -34,6 +94,11 @@ pub enum SessionStats {
         /// 本窗口关键帧出码码率（kbps）。与 `p_kbps` 拆开后才看得出「字节到底花在 IDR
         /// 还是普通帧」，这是定位带宽尖峰的观测面。
         idr_kbps: u32,
+        /// 本窗口关键帧的**累计出码字节数**（与 `idr_kbps` 同一窗口）。
+        ///
+        /// `idr_kbps` 是速率，单独看无法判断「一个关键帧到底多大」——同样的 kbps 可能来自
+        /// 很多小 IDR，也可能来自少量巨大 IDR。UI 据此显示「关键帧平均 x KB」。
+        idr_bytes: u64,
         /// 本窗口普通帧出码码率（kbps）。
         p_kbps: u32,
         /// 本窗口编码帧的**平均变化面积**（千分比，0..=1000）。
@@ -52,6 +117,16 @@ pub enum SessionStats {
         packets: u32,
         /// 本窗口因解码队列满而丢弃的包数（含等待 IDR 期间主动丢弃的 P 帧）。
         dropped: u32,
+        /// 本窗口**已应用**到合成帧的补丁批数（协议 v5 脏矩形增量）。
+        ///
+        /// 统计的是解码侧真正交给 `FrameSink::on_patch` 的批次：因等待关键帧/几何不符被
+        /// 丢弃的补丁不计入。补丁模式下全帧几乎为零，这一项是「增量通道在工作」的唯一读数。
+        patches: u32,
+    },
+    /// 控制器发出的一次关键帧请求及原因（每秒可能多次；管理面按原因累计计数）。
+    KeyframeRequest {
+        /// 请求原因。
+        reason: KeyframeReason,
     },
 }
 

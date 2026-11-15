@@ -40,15 +40,21 @@
 //!   收益全部吃掉。网格取 320×180 而不更稀（例如旧的 128×72）是因为 VideoProcessor
 //!   大比例缩小时是**点采样**：128×72 在 4K 上只抽 1/900 的像素，16×16 的变化只有
 //!   约一半概率被看到；320×180 把密度提到 4 倍而检测耗时不变。
+//! - [`CaptureSource::capture_texture_with_dirty`] 在上面这层之上再返回一块**脏格点网格**
+//!   （[`DirtyGrid`]，320×180 × 1 字节/格点）。它只在补丁模式（H.264 脏矩形）里被用到：
+//!   首帧、检测器不可用、读网格失败时第三项为 `None`，调用方据此退回全帧；超时复用上一帧
+//!   时同样为 `None`（复用帧没有新网格，补丁模式不能拿陈旧网格去覆盖控制器画面）。
 //!
 //! `capture()` 是同步阻塞调用（内部用短睡眠轮询），不要直接放在 Tokio 运行时的
 //! 核心线程上；`client-gui` 的应用层采集循环应把它放进 `spawn_blocking`。
 
 mod change;
 mod dxgi;
+mod patches;
 mod wgc;
 
-pub use change::ChangeReport;
+pub use change::{ChangeReport, DirtyGrid};
+pub use patches::{extract_patches, extract_rects, PatchParams, PatchRect, Rect};
 
 use crate::d3d11;
 use crate::WinVideoError;
@@ -494,6 +500,25 @@ pub trait CaptureSource: Send {
     ) -> Result<(CapturedTexture, ChangeReport), WinVideoError> {
         self.capture_texture()
             .map(|texture| (texture, ChangeReport::changed_all()))
+    }
+
+    /// 采集一帧 GPU 纹理，并同时报告**画面变化**与**脏格点网格**。
+    ///
+    /// 第三个返回值是补丁模式（H.264 脏矩形）的输入：`Some(grid)` 表示这一拍拿到了新帧
+    /// 且变化检测可用，网格里的 `1` 标出变化的格点；`None` 表示**不能**进入补丁模式
+    /// （首帧没有基准、检测器不可用、读网格失败、或超时复用了上一帧），调用方应走全帧
+    /// 视频。**不要**在 `None` 时拿陈旧的网格去猜——那会让控制器画面与真实桌面错位。
+    ///
+    /// 默认实现保留旧语义（永远认为有变化、面积未知、没有网格）。WGC / DXGI 覆写本方法
+    /// 并把 [`Self::capture_texture_with_change`] 写成它的薄包装，两条入口因此不会分叉。
+    ///
+    /// # Errors
+    /// 与 [`Self::capture_texture`] 相同。
+    fn capture_texture_with_dirty(
+        &mut self,
+    ) -> Result<(CapturedTexture, ChangeReport, Option<DirtyGrid>), WinVideoError> {
+        self.capture_texture_with_change()
+            .map(|(texture, report)| (texture, report, None))
     }
 
     /// 采集源使用的 D3D11 设备（编解码需要与采集共用同一设备）。

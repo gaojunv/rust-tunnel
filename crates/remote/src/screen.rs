@@ -155,6 +155,109 @@ pub struct DecodedNv12 {
     pub uv: Vec<u8>,
 }
 
+impl DecodedNv12 {
+    /// 把一个脏矩形补丁**原地拼进**整帧缓冲。
+    ///
+    /// `frame_width` 是整帧宽度（偶数）；整帧高度由 `y.len() / frame_width` 推出。
+    ///
+    /// 坐标系与 [`ScreenPatch`] 一致：`x`/`y`/`width`/`height` 全部偶数，`rect.nv12` 是
+    /// 紧包 NV12（`Y(w*h) ‖ UV(w*h/2)`）。UV 平面在整帧里的行宽等于 `frame_width`
+    /// 字节（每个 luma 像素对占 2 字节），因此补丁的 UV 行偏移就是 `x`（`x` 为偶数，
+    /// 恰好是色度对的字节偏移）。
+    ///
+    /// 返回 `false`（且不修改任何字节）表示参数非法：越界、奇数坐标、长度不符……调用方
+    /// 应当丢弃这一帧并等下一个关键帧，而不是把错位的内容拼进去。
+    #[must_use]
+    pub fn apply_patch(&mut self, frame_width: u32, rect: &ScreenPatch) -> bool {
+        let Ok(frame_width) = usize::try_from(frame_width) else {
+            return false;
+        };
+        if frame_width == 0 {
+            return false;
+        }
+        let Ok(rect_width) = usize::try_from(rect.width) else {
+            return false;
+        };
+        let Ok(rect_height) = usize::try_from(rect.height) else {
+            return false;
+        };
+        let Ok(x) = usize::try_from(rect.x) else {
+            return false;
+        };
+        let Ok(y) = usize::try_from(rect.y) else {
+            return false;
+        };
+        // 偶数与整数长度校验：奇数宽高会让 UV 半分辨率错位。
+        if rect_width == 0
+            || rect_height == 0
+            || !rect_width.is_multiple_of(2)
+            || !rect_height.is_multiple_of(2)
+            || !x.is_multiple_of(2)
+            || !y.is_multiple_of(2)
+        {
+            return false;
+        }
+        let Some(frame_height) = self.y.len().checked_div(frame_width) else {
+            return false;
+        };
+        if frame_height == 0 || !frame_height.is_multiple_of(2) {
+            return false;
+        }
+        if self.y.len() != frame_width.saturating_mul(frame_height) {
+            return false;
+        }
+        if self.uv.len() != frame_width.saturating_mul(frame_height / 2) {
+            return false;
+        }
+        let Some(right) = x.checked_add(rect_width) else {
+            return false;
+        };
+        let Some(bottom) = y.checked_add(rect_height) else {
+            return false;
+        };
+        if right > frame_width || bottom > frame_height {
+            return false;
+        }
+        let Some(expected) = rect_width
+            .checked_mul(rect_height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .and_then(|bytes| bytes.checked_div(2))
+        else {
+            return false;
+        };
+        if rect.nv12.len() != expected {
+            return false;
+        }
+
+        // Y 平面：`rect_height` 行，每行 `rect_width` 字节。
+        for row in 0..rect_height {
+            let src = row * rect_width;
+            let dst = (y + row) * frame_width + x;
+            let (Some(src_slice), Some(dst_slice)) = (
+                rect.nv12.get(src..src + rect_width),
+                self.y.get_mut(dst..dst + rect_width),
+            ) else {
+                return false;
+            };
+            dst_slice.copy_from_slice(src_slice);
+        }
+        // UV 平面：半高度，每行仍是 `rect_width` 字节（交错的 U/V 对）。
+        let uv_base = rect_width * rect_height;
+        for row in 0..(rect_height / 2) {
+            let src = uv_base + row * rect_width;
+            let dst = (y / 2 + row) * frame_width + x;
+            let (Some(src_slice), Some(dst_slice)) = (
+                rect.nv12.get(src..src + rect_width),
+                self.uv.get_mut(dst..dst + rect_width),
+            ) else {
+                return false;
+            };
+            dst_slice.copy_from_slice(src_slice);
+        }
+        true
+    }
+}
+
 /// 已解码的一帧画面（交给 UI 上传纹理）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
@@ -213,6 +316,63 @@ pub struct FileEntry {
     pub size: u64,
     /// 修改时间（毫秒，自 epoch）；取不到为 0。
     pub modified_ms: u64,
+}
+
+/// 一个脏矩形补丁（**编码尺寸坐标系**的紧包 NV12）。
+///
+/// 布局与 [`DecodedNv12`] 相同：`nv12` = `Y(width*height) ‖ UV(width*height/2)`，无行填充。
+/// `x`/`y`/`width`/`height` **全部为偶数**：NV12 的 UV 平面是半分辨率，奇数边界会让
+/// 色度块错位。
+///
+/// 同一份类型在两段链路上复用：
+/// - 被控端采集层产出的**原始**补丁（未经压缩）；
+/// - 控制端解码任务解压后的补丁（交给 [`FrameSink::on_patch`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenPatch {
+    /// 目标帧缓冲内的左上角 X（偶数）。
+    pub x: u32,
+    /// 目标帧缓冲内的左上角 Y（偶数）。
+    pub y: u32,
+    /// 宽度（偶数）。
+    pub width: u32,
+    /// 高度（偶数）。
+    pub height: u32,
+    /// 紧包 NV12（长度 = `width*height*3/2`）。
+    pub nv12: Vec<u8>,
+}
+
+/// 被控端一次补丁采集的结果。
+///
+/// `width`/`height` 是**目标编码尺寸**（控制端持久帧缓冲的尺寸），不是采集源的物理尺寸；
+/// 采集源负责把脏矩形缩放/转换到该坐标系。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedPatches {
+    /// 来源显示器编号。
+    pub display: u32,
+    /// 目标帧缓冲宽度（编码尺寸）。
+    pub width: u32,
+    /// 目标帧缓冲高度（编码尺寸）。
+    pub height: u32,
+    /// 本拍的变化面积（千分比，`0..=1000`）；空补丁（保活）时为 0。
+    pub changed_permille: u16,
+    /// 脏矩形；空表示「本拍没有变化」，仅用于保活。
+    pub rects: Vec<ScreenPatch>,
+}
+
+/// 控制端收到的一帧补丁（已从线上格式解压为 NV12）。
+///
+/// 与 [`CapturedPatches`] 分开是因为控制端不需要 `changed_permille`，且两者的生命周期与
+/// 来源不同（一个来自平台采集，一个来自解码任务）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPatch {
+    /// 来源显示器编号。
+    pub display: u32,
+    /// 目标帧缓冲宽度（编码尺寸）。
+    pub width: u32,
+    /// 目标帧缓冲高度（编码尺寸）。
+    pub height: u32,
+    /// 脏矩形（已解压）。
+    pub rects: Vec<ScreenPatch>,
 }
 
 /// 一条输入事件（控制器 → 被控端）。
@@ -275,6 +435,36 @@ pub trait ScreenSource: Send + Sync + 'static {
     fn capture_gpu(&self, display: u32) -> RemoteResult<RawFrame> {
         self.capture(display)
     }
+
+    /// 本采集源是否支持**脏矩形补丁**（默认 `false`）。
+    ///
+    /// 引擎只在协商到 H.264、且本方法为真、且画面活跃度足够低时才进入补丁模式。VP9 路径
+    /// 不启用：它的解码输出是 RGBA，控制端需要另一套持久帧缓冲。
+    fn supports_patches(&self) -> bool {
+        false
+    }
+
+    /// 采集一帧并产出**脏矩形补丁**（编码尺寸坐标系，紧包 NV12）。
+    ///
+    /// 返回 `Ok(None)` 表示「本拍不适合补丁」（活跃度过高、脏矩形过多/过大、变化检测不可用、
+    /// 首帧……）：引擎随后回到全帧视频路径。**不要在实现里自行降级成全帧**——引擎需要知道
+    /// 模式已经切换，才能强制关键帧。
+    ///
+    /// `scale` / `max_width` 与 [`crate::video::encode_dimensions`] 的语义一致：实现先按采集
+    /// 纹理的**实际**物理尺寸算出目标编码尺寸，再把脏矩形缩放/转换到该坐标系。这样显示器
+    /// 分辨率在会话中途变化时也不会用陈旧尺寸。
+    ///
+    /// # Errors
+    /// 采集/回读/转换失败时返回 [`RemoteError::Platform`]；引擎会记日志并退回全帧。
+    fn capture_patches(
+        &self,
+        display: u32,
+        scale: f32,
+        max_width: u32,
+    ) -> RemoteResult<Option<CapturedPatches>> {
+        let _ = (display, scale, max_width);
+        Ok(None)
+    }
 }
 
 /// 输入注入目标（被控端实现）。
@@ -327,6 +517,15 @@ pub trait FrameSink: Send + Sync + 'static {
 
     /// 一帧已解码画面（VP9 时域编码下**一律是整帧**）。
     fn on_frame(&self, frame: DecodedFrame);
+
+    /// 一批脏矩形补丁（H.264 补丁模式；已解压为 NV12）。
+    ///
+    /// **必须应用在上一次 [`FrameSink::on_frame`] 的全帧之上**：引擎保证两者严格同序
+    /// （都走同一条解码队列），且补丁不可丢（队列满时会请求关键帧、由被控端退出补丁模式）。
+    /// 默认实现为空操作——不实现它只意味着不做补丁上屏，会话本身仍然正常。
+    fn on_patch(&self, patch: DecodedPatch) {
+        let _ = patch;
+    }
 
     /// 对端（被控端）发来的剪贴板文本。
     ///
@@ -595,6 +794,81 @@ mod tests {
             QualityPreset::Hd.options().capture_interval(),
             std::time::Duration::from_millis(1000 / 60)
         );
+    }
+
+    /// 补丁必须**只覆写矩形内的 Y/UV**，矩形外一个字节都不动。
+    #[test]
+    fn apply_patch_overwrites_only_the_rect() {
+        // 8×6 的整帧：Y = 48 字节，UV = 8×3 = 24 字节。
+        let mut frame = DecodedNv12 {
+            y: vec![0xAA; 48],
+            uv: vec![0xBB; 24],
+        };
+        let patch = ScreenPatch {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+            // Y 8 字节（2 行 × 4），UV 4 字节（1 行 × 4）。
+            nv12: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        };
+        assert!(frame.apply_patch(8, &patch));
+
+        // Y：第 2 行从 x=2 开始 4 字节，第 3 行同理。
+        assert_eq!(&frame.y[2 * 8 + 2..2 * 8 + 6], &[1, 2, 3, 4]);
+        assert_eq!(&frame.y[3 * 8 + 2..3 * 8 + 6], &[5, 6, 7, 8]);
+        // UV：y=2 → UV 行 1，字节偏移 = x = 2。
+        assert_eq!(&frame.uv[8 + 2..8 + 6], &[9, 10, 11, 12]);
+
+        // 矩形外的字节保持原值（抽查四角与相邻行）。
+        assert_eq!(frame.y[0], 0xAA);
+        assert_eq!(frame.y[2 * 8], 0xAA, "矩形左侧不应被写");
+        assert_eq!(frame.y[2 * 8 + 1], 0xAA, "矩形左侧不应被写");
+        assert_eq!(frame.y[2 * 8 + 6], 0xAA, "矩形右侧不应被写");
+        assert_eq!(frame.y[4 * 8 + 2], 0xAA, "矩形下方不应被写");
+        assert_eq!(frame.uv[0], 0xBB);
+        assert_eq!(frame.uv[8], 0xBB);
+        assert_eq!(frame.uv[8 + 6], 0xBB);
+    }
+
+    /// 非法补丁必须被拒绝，且**不修改**帧缓冲（宁可少拼一帧，也不能拼错位）。
+    #[test]
+    fn apply_patch_rejects_invalid_rects_without_touching_the_frame() {
+        let original = DecodedNv12 {
+            y: vec![0xAA; 48],
+            uv: vec![0xBB; 24],
+        };
+        let valid = ScreenPatch {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+            nv12: vec![0; 12],
+        };
+        let cases = [
+            // 奇数宽度。
+            ScreenPatch { width: 3, ..valid.clone() },
+            // 奇数坐标。
+            ScreenPatch { x: 3, ..valid.clone() },
+            // 越界（x + w > 8）。
+            ScreenPatch { x: 6, ..valid.clone() },
+            // 越界（y + h > 6）。
+            ScreenPatch { y: 6, ..valid.clone() },
+            // NV12 长度不符。
+            ScreenPatch { nv12: vec![0; 11], ..valid.clone() },
+            // 尺寸为零。
+            ScreenPatch { width: 0, ..valid.clone() },
+        ];
+        for (index, patch) in cases.into_iter().enumerate() {
+            let mut frame = original.clone();
+            assert!(!frame.apply_patch(8, &patch), "第 {index} 个非法补丁应被拒绝");
+            assert_eq!(frame, original, "第 {index} 个非法补丁不应修改帧");
+        }
+        // 宽度为奇数/零的整帧同样拒绝。
+        let mut frame = original.clone();
+        assert!(!frame.apply_patch(0, &valid));
+        assert!(!frame.apply_patch(7, &valid));
+        assert_eq!(frame, original);
     }
 }
 

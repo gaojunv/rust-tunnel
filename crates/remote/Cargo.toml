@@ -32,6 +32,10 @@ uuid = { version = "1.0", features = ["v4"] }
 # 数据面加密：X25519 临时密钥交换 + ChaCha20-Poly1305 AEAD。
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# 增量补丁（协议 v6 的 `RegionUpdate`）的无损压缩。只压脏矩形的 NV12，单块通常几 KB；
+# level 1 的编码速度远快于采集/编码节拍。`zstd` 在工作区里已由其它 crate 间接引入，
+# 此处只是显式依赖，不额外增加 C 构建面。
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 futures-util = "0.3"
