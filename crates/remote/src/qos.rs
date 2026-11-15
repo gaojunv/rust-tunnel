@@ -27,8 +27,9 @@
 //!
 //! AIMD 只看**链路**（RTT/积压），看不见**内容**：整帧编码 + VBR 会把档位预算与「画面变了
 //! 多少」解耦——打字只改几十个像素，编码器照样花完预算。采集层本来就在算像素级变化检测
-//! （`win-video` 的 `ChangeReport.changed_permille`），把它喂给
-//! [`RateController::observe_activity`]，按三档给**生效值**加一个上限：
+//! （`win-video` 的 `ChangeReport.changed_permille`）：**逐帧**交给
+//! [`RateController::promote_activity`] 负责升档，每秒的 `QosFeedback` 再交给
+//! [`RateController::observe_activity`] 负责带迟滞的降档，按三档给**生效值**加一个上限：
 //!
 //! | 面积 | 等级 | 码率上限 | 帧率上限 |
 //! |---|---|---|---|
@@ -38,8 +39,12 @@
 //!
 //! 三条设计约束：
 //!
-//! - **升快降慢**：面积变大立刻放开（视频一开始就要放量），面积变小要连续
-//!   [`QosParams::cap_hold_ticks`]（2 秒）才收紧，防止视频里的单个静止帧把上限压死。
+//! - **升快降慢**：面积变大要立刻放开（视频一开始就要放量）。升档由**逐帧**的
+//!   [`RateController::promote_activity`] 驱动——变化面积是本地、逐帧可得的信号；若只在
+//!   1 Hz 的 `QosFeedback` 里升档，「安静两秒后开始拖窗/切窗口」的第一秒仍卡在 UI 档
+//!   （15 fps / 1.2 Mbps），用户看到的就是每次开始操作都先顿一下。面积变小则由每秒一次的
+//!   [`RateController::observe_activity`] 连续 [`QosParams::cap_hold_ticks`]（2 秒）才收紧，
+//!   防止视频里的单个静止帧把上限压死。
 //! - **只钳制生效值，不改 AIMD 状态**：`bitrate_kbps`/`fps` 的爬升/下降历史保留，面积一变
 //!   大就立刻回到 AIMD 水平，不用重新爬。上限本身也不越过档位上限。
 //! - **不置 `force_keyframe`、不改 `scale`**：上限只改在线重配置的码率/帧率，绝不重建编码器
@@ -434,13 +439,7 @@ impl RateController {
     /// **不置关键帧、不重建编码器**：上限只改 [`Self::current`] 的码率/帧率生效值，走既有的
     /// 在线重配置（`set_bitrate` / `set_fps`），`scale` 与 `force_keyframe` 一概不动。
     pub fn observe_activity(&mut self, changed_permille: u16) {
-        let observed = if changed_permille < self.params.ui_ratio_permille {
-            Activity::Ui
-        } else if changed_permille > self.params.active_ratio_permille {
-            Activity::Active
-        } else {
-            Activity::Mixed
-        };
+        let observed = self.activity_of(changed_permille);
 
         if observed >= self.activity {
             // 升档或持平：立刻生效（视频刚开始就要放量）。
@@ -458,6 +457,37 @@ impl RateController {
         let (cap_kbps, cap_fps) = self.params.activity_caps(self.activity);
         self.content_cap_kbps = cap_kbps;
         self.content_cap_fps = cap_fps;
+    }
+
+    /// 变化面积 → 活跃等级。三档边界见 [`QosParams::ui_ratio_permille`] /
+    /// [`QosParams::active_ratio_permille`]。
+    fn activity_of(&self, changed_permille: u16) -> Activity {
+        if changed_permille < self.params.ui_ratio_permille {
+            Activity::Ui
+        } else if changed_permille > self.params.active_ratio_permille {
+            Activity::Active
+        } else {
+            Activity::Mixed
+        }
+    }
+
+    /// 逐帧观测变化面积，**只晋升**活跃等级（不参与降档迟滞）。
+    ///
+    /// `observe_activity` 由 1 Hz 的 `QosFeedback` 驱动；只用它做升档会让「安静 2 秒 →
+    /// 开始拖窗/切窗口」的第一秒仍卡在 UI 档（15 fps / 1.2 Mbps），用户看到的就是每次开始
+    /// 操作都先顿一下。变化面积是本地、逐帧可得的信号，升档必须立刻生效。
+    ///
+    /// **只升不降**：降档仍由 `observe_activity` 按 [`QosParams::cap_hold_ticks`] 迟滞处理，
+    /// 所以单个 Active 帧不会被立刻收回，单个静止帧也不会把上限压死。
+    pub fn promote_activity(&mut self, changed_permille: u16) {
+        let observed = self.activity_of(changed_permille);
+        if observed > self.activity {
+            self.activity = observed;
+            self.quiet_streak = 0;
+            let (cap_kbps, cap_fps) = self.params.activity_caps(observed);
+            self.content_cap_kbps = cap_kbps;
+            self.content_cap_fps = cap_fps;
+        }
     }
 
     /// 当前**内容驱动**的码率上限（kbps）；`None` = 不压制。仅用于日志/断言。
@@ -1234,6 +1264,46 @@ mod tests {
         assert_eq!(c.content_cap_kbps(), None);
         let d = c.on_feedback(fb(50, 10, 0), 0, 0);
         assert!(!d.force_keyframe, "上限变化绝不置关键帧");
+    }
+
+    /// 逐帧升档：一帧跑满面积就立刻放开，不必等下一次 1 Hz 的 `QosFeedback`。
+    ///
+    /// 锁的是「安静两秒后开始拖窗」的第一秒：那条路径只有逐帧信号可用。
+    #[test]
+    fn promote_activity_lifts_ui_cap_immediately() {
+        let mut c = RateController::new(QualityPreset::Hd.options()); // 10000 kbps / 60 fps
+        prime(&mut c);
+        lo_activity_twice(&mut c);
+        assert_eq!(c.current().fps, 15, "先进入 UI 档");
+        assert_eq!(c.current().bitrate_kbps, 1200);
+
+        c.promote_activity(1000);
+        let ceiling = QualityPreset::Hd.options();
+        assert_eq!(
+            c.current().fps, ceiling.max_fps,
+            "逐帧升档必须立刻回到档位帧率"
+        );
+        assert_eq!(
+            c.current().bitrate_kbps,
+            ceiling.target_bitrate_kbps,
+            "逐帧升档必须立刻回到 AIMD 码率"
+        );
+        assert_eq!(c.content_cap_fps(), None, "Active 档不设内容上限");
+    }
+
+    /// `promote_activity` **只升不降**：降档迟滞仍归 1 Hz 的 `observe_activity`。
+    #[test]
+    fn promote_activity_never_lowers() {
+        let mut c = RateController::new(QualityPreset::Hd.options());
+        prime(&mut c);
+        lo_activity_twice(&mut c);
+        c.promote_activity(1000);
+        assert_eq!(c.content_cap_fps(), None);
+
+        // 随后的静止帧不能把刚升上去的档位收回（否则单帧抖动会反复压上限）。
+        c.promote_activity(0);
+        assert_eq!(c.content_cap_fps(), None, "promote_activity 不得降档");
+        assert_eq!(c.current().fps, QualityPreset::Hd.options().max_fps);
     }
 
     #[test]
