@@ -264,14 +264,20 @@ impl Shared {
 
 // ── 监管线程：桌面跟随 ──────────────────────────────────────────────
 
-/// 探测**当前输入桌面**并分类。
+/// 探测**当前输入桌面**并分类（分类 + 原始桌面名）。
 ///
 /// 走 `InputDesktop::open()` → 读名字 → **立即丢弃**：`Drop` 会在未挂载时关闭句柄，
 /// 故这次探测不泄漏句柄（这正是「不要每次操作前 `OpenInputDesktop`」那条约束的落点——
 /// 每事件一次会泄漏，每 300ms 一次不会）。
-fn probe_input_desktop() -> Option<FollowDesktop> {
+///
+/// 原始名字一并回传，只为**诊断**：`Unsupported` 有好几种（`Disconnect` / 未知名），
+/// 没有名字时日志只能说「不支持」，现场根本分不清是哪种桌面把跟随卡住了。
+fn probe_input_desktop() -> Option<(FollowDesktop, String)> {
     match InputDesktop::open() {
-        Ok(desktop) => Some(desktop_follow::follow_of_name(desktop.name())),
+        Ok(desktop) => {
+            let name = desktop.name().to_owned();
+            Some((desktop_follow::follow_of_name(&name), name))
+        }
         Err(err) => {
             tracing::debug!(%err, "探测输入桌面失败（非 SYSTEM 进程锁屏时会这样）");
             None
@@ -282,12 +288,28 @@ fn probe_input_desktop() -> Option<FollowDesktop> {
 /// 监管线程主体：按 ≤4Hz 探测输入桌面，桌面变化（或 worker 意外退出）就重建 worker。
 ///
 /// 它**自己从不挂桌面**（不调 `SetThreadDesktop`），所以可以在整个进程生命周期内长驻，
-/// 不必随桌面变化重建。
+/// 不必随桌面变化重建。跟随目标（`Default` / `Winlogon` / `Screen-saver`）由
+/// [`super::desktop_follow`] 决定；这里只负责按决策重建 worker。
 fn supervisor_loop(shared: &Arc<Shared>) {
     let mut worker: Option<JoinHandle<()>> = None;
     let mut current: Option<FollowDesktop> = None;
+    // 上一次「输入桌面不在跟随目标里」时见到的桌面名，**只用于日志去重**：探测是
+    // 300ms 一次，而 `Disconnect`/未知名可能长时间保持，不去重就是每秒三行刷屏。
+    let mut last_unsupported: Option<String> = None;
     loop {
-        let action = desktop_follow::decide(current, probe_input_desktop());
+        let observed = probe_input_desktop();
+        if let Some((kind, name)) = observed.as_ref() {
+            if matches!(kind, FollowDesktop::Unsupported) {
+                if last_unsupported.as_deref() != Some(name.as_str()) {
+                    tracing::info!(desktop = %name, "输入桌面不是跟随目标，保持当前挂载");
+                    last_unsupported = Some(name.clone());
+                }
+            } else {
+                // 回到可跟随目标（含 Screen-saver）：下一种 Unsupported 要重新记一次。
+                last_unsupported = None;
+            }
+        }
+        let action = desktop_follow::decide(current, observed.as_ref().map(|(kind, _)| *kind));
         // worker 意外退出（panic）也必须重建：否则实例会**静默**失去采集/注入能力——
         // 服务端看到的是一个在线但怎么都控不了的本机。
         let worker_died = worker.as_ref().is_some_and(JoinHandle::is_finished);
