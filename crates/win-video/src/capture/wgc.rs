@@ -11,6 +11,23 @@
 //!   只记日志、继续尝试——`CreateFreeThreaded` 不要求调用线程是 MTA。
 //! - 显示器捕获在 Windows 10 1903+ 可用；`GraphicsCaptureSession::IsSupported()`
 //!   为 false 时直接返回错误，让 [`super::open_best`] 回退 DXGI。
+//!
+//! # 排空到最新帧
+//!
+//! 帧池只有 2 张缓冲（见 `open` 里的 `CreateFreeThreaded(..., 2, ...)`）。合成器
+//! 按显示器刷新率产帧，而采集按引擎节拍来取（20/30 fps），所以两拍之间帧池里往往
+//! 已经排了不止一帧。`TryGetNextFrame` 返回的是**队首那张最旧的帧**——只取一张就
+//! 走，等于把队列里更新的帧留到下一拍，每多排一帧就多一个合成器周期的**纯排队
+//! 延迟**（60 Hz 下约 16.7 ms），对画质没有任何贡献。
+//!
+//! 因此每次采集调用都先把帧池**排空**：反复 `TryGetNextFrame`，只保留最新的一帧
+//! 去 `Surface()`/`CopyResource`，前面更旧的帧立即 `Close` 归还缓冲（缓冲早归还，
+//! 合成器才不用为等槽位而丢帧）。排空是**有界**的（最多 `MAX_DRAIN_FRAMES` 张，
+//! 正常最多 2 张），循环里不睡眠、不延长首帧/新帧的等待上限，所以「没有新帧」
+//! 的语义与轮询节奏完全不变。
+//!
+//! 同步轮询没有更省事的「取最新」原语：帧池按产帧顺序交付，**排到空为止**取到的
+//! 那张就是最新的一帧，无需逐帧比较时间戳。
 
 use super::{
     create_device_for, texture_dimensions, BgraReader, CaptureBackend, CaptureSource,
@@ -35,6 +52,17 @@ use windows::Win32::System::WinRT::Direct3D11::{
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+
+/// 一次采集调用里最多从帧池排空的帧数。
+///
+/// 帧池只有 2 张缓冲（`CreateFreeThreaded(..., 2, ...)`），正常情况排 2 张就取空了。
+/// 8 是留给异常状态（帧池内部补发、调用方长时间没采集）的余量，同时保证排空循环
+/// **绝不会**在帧池持续产帧时变成不设上限的忙循环。
+const MAX_DRAIN_FRAMES: usize = 8;
+
+// 编译期断言：排空上限必须覆盖帧池的 2 张缓冲，否则一次「池被填满」的采集仍会
+// 留下旧帧，排空就失去了意义。
+const _: () = assert!(MAX_DRAIN_FRAMES >= 2);
 
 /// WGC 采集源。
 struct WgcSource {
@@ -68,20 +96,12 @@ impl CaptureSource for WgcSource {
     fn capture(&mut self) -> Result<CapturedFrame, WinVideoError> {
         let deadline = Instant::now() + self.capture_timeout();
         loop {
-            match self.pool.TryGetNextFrame() {
-                Ok(frame) => {
-                    let captured = self.read_frame(&frame)?;
-                    self.last = Some(captured.clone());
-                    return Ok(captured);
-                }
-                // 帧池没有新帧时 `from_abi` 把空指针折成 `Error::empty()`，
-                // 其 HRESULT 为 0（成功码）。真正的 HRESULT 失败才向上报。
-                Err(err) if err.code().is_ok() => {}
-                Err(err) => {
-                    return Err(WinVideoError::Capture(format!(
-                        "WGC TryGetNextFrame 失败: {err}"
-                    )))
-                }
+            // 排空到最新帧：帧池里排着的更旧帧已经过时，读回它们只会把
+            // 端到端延迟拖后 1–2 个合成器周期（模块文档「排空到最新帧」）。
+            if let Some(frame) = self.drain_latest_frame()? {
+                let captured = self.read_frame(&frame)?;
+                self.last = Some(captured.clone());
+                return Ok(captured);
             }
             if Instant::now() >= deadline {
                 break;
@@ -115,27 +135,19 @@ impl CaptureSource for WgcSource {
         let timeout = self.capture_timeout();
         let deadline = Instant::now() + timeout;
         loop {
-            match self.pool.TryGetNextFrame() {
-                Ok(frame) => {
-                    let result = self.copy_surface(&frame);
-                    // SAFETY 说明：Close 失败只影响缓冲归还时机，不影响已拷贝的数据。
-                    if let Err(err) = frame.Close() {
-                        tracing::debug!(error = %err, "WGC 帧对象 Close 失败");
-                    }
-                    let captured = result?;
-                    // **像素级**变化检测：WGC 在基本静止的桌面上仍按合成器节奏产新帧
-                    // （实测 120 次采集 119 次有新帧），所以「有新帧」不等于「有变化」。
-                    // 同时拿到脏格点网格，供上层决定是否走补丁模式。
-                    let (report, grid) = self.change.changed_with_grid(&self.d3d, &captured);
-                    self.last_texture = Some(captured.clone());
-                    return Ok((captured, report, grid));
-                }
-                Err(err) if err.code().is_ok() => {}
-                Err(err) => {
-                    return Err(WinVideoError::Capture(format!(
-                        "WGC TryGetNextFrame 失败: {err}"
-                    )))
-                }
+            // 与 CPU 路径同一策略：先排空，只拷最新一帧（更旧的帧已在
+            // `drain_latest_frame` 里 Close 归还缓冲）。
+            if let Some(frame) = self.drain_latest_frame()? {
+                let result = self.copy_surface(&frame);
+                // 最新帧处理完也要归还缓冲（失败只影响归还时机，不影响已拷贝数据）。
+                close_frame(&frame);
+                let captured = result?;
+                // **像素级**变化检测：WGC 在基本静止的桌面上仍按合成器节奏产新帧
+                // （实测 120 次采集 119 次有新帧），所以「有新帧」不等于「有变化」。
+                // 同时拿到脏格点网格，供上层决定是否走补丁模式。
+                let (report, grid) = self.change.changed_with_grid(&self.d3d, &captured);
+                self.last_texture = Some(captured.clone());
+                return Ok((captured, report, grid));
             }
             if Instant::now() >= deadline {
                 break;
@@ -167,6 +179,34 @@ impl WgcSource {
         } else {
             FIRST_FRAME_TIMEOUT
         }
+    }
+
+    /// 把帧池里**已就绪**的帧全部取走，只返回最新的一帧（没有就绪帧时返回 `None`）。
+    ///
+    /// 为什么要排空：`TryGetNextFrame` 交付的是队首（最旧）那张帧。合成器产帧快于
+    /// 采集节拍时，池里常排着 1–2 张更新的帧，只取一张就处理等于主动多背 1–2 个
+    /// 合成器周期的排队延迟（60 Hz 下 ~16.7 ms/帧），而这段延迟对画面质量毫无贡献。
+    ///
+    /// 排空过程中更旧的帧**立即 `Close`**：`Direct3D11CaptureFrame` 的 `Drop` 只释放
+    /// COM 引用、不会调用 `IClosable::Close`，不显式关闭的话缓冲要等垃圾回收才归还，
+    /// 帧池可用的槽位会被无谓占用。保留最新帧期间关闭前面的帧是安全的——每张帧对象
+    /// 各自持有自己的缓冲。
+    ///
+    /// 循环有界（`MAX_DRAIN_FRAMES`），不睡眠、不推进 deadline；真正的 HRESULT 失败
+    /// 向上报（并顺手关闭已收集的帧），与原先「第一次失败即报错」的语义一致。
+    fn drain_latest_frame(&self) -> Result<Option<Direct3D11CaptureFrame>, WinVideoError> {
+        drain_newest(
+            || match self.pool.TryGetNextFrame() {
+                Ok(frame) => Ok(Some(frame)),
+                // 帧池没有新帧时 `from_abi` 把空指针折成 `Error::empty()`，
+                // 其 HRESULT 为 0（成功码）。真正的 HRESULT 失败才向上报。
+                Err(err) if err.code().is_ok() => Ok(None),
+                Err(err) => Err(WinVideoError::Capture(format!(
+                    "WGC TryGetNextFrame 失败: {err}"
+                ))),
+            },
+            |frame| close_frame(&frame),
+        )
     }
 
     /// 把帧表面拷贝到池纹理（GPU 到 GPU，不落 CPU）。
@@ -218,10 +258,7 @@ impl WgcSource {
         frame: &Direct3D11CaptureFrame,
     ) -> Result<CapturedFrame, WinVideoError> {
         let result = self.read_surface(frame);
-        // SAFETY 说明：`Close` 是安全方法；失败只影响缓冲归还时机，不影响已读数据。
-        if let Err(err) = frame.Close() {
-            tracing::debug!(error = %err, "WGC 帧对象 Close 失败");
-        }
+        close_frame(frame);
         result
     }
 
@@ -248,6 +285,47 @@ impl WgcSource {
             backend: CaptureBackend::Wgc,
         })
     }
+}
+
+/// 关闭 WGC 帧对象、把缓冲立即还给帧池。
+///
+/// 帧对象的 `Drop` 只释放 COM 引用，**不会**调用 `IClosable::Close`；不显式关闭的话
+/// 缓冲要等引用计数归零后由池内部回收，期间新帧可能因没有空槽而被丢弃。失败只记
+/// debug——它只影响归还时机，不影响任何已经拷贝出来的数据。
+fn close_frame(frame: &Direct3D11CaptureFrame) {
+    if let Err(err) = frame.Close() {
+        tracing::debug!(error = %err, "WGC 帧对象 Close 失败");
+    }
+}
+
+/// 「排空到最新」的通用循环：反复调用 `next` 直到取空或出错，只返回**最新**一项；
+/// 被替换掉的旧项立即交给 `recycle`。
+///
+/// 抽成泛型是为了让四条不变量（保留最新、回收旧项、循环有界、出错时也回收）能被
+/// 不依赖 Windows 的单测钉住——真实的 `Direct3D11CaptureFrame` 无法在单测里构造。
+fn drain_newest<T, E>(
+    mut next: impl FnMut() -> Result<Option<T>, E>,
+    mut recycle: impl FnMut(T),
+) -> Result<Option<T>, E> {
+    let mut latest: Option<T> = None;
+    for _ in 0..MAX_DRAIN_FRAMES {
+        match next() {
+            Ok(Some(item)) => {
+                if let Some(previous) = latest.replace(item) {
+                    recycle(previous);
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                // 已经收集到的帧也要归还，否则帧池会把槽位算作仍被占用。
+                if let Some(previous) = latest.take() {
+                    recycle(previous);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(latest)
 }
 
 /// 打开指定显示器的 WGC 采集源。
@@ -286,6 +364,8 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         )));
     }
 
+    // 2 张缓冲：采集端每拍都会排空到最新帧（见 `drain_latest_frame`），缓冲越少，
+    // 池里能累积的排队帧就越少；再多给缓冲只是把延迟换成「不会丢帧」，不划算。
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -361,4 +441,71 @@ fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice, WinVideoError>
     inspectable
         .cast()
         .map_err(|err| WinVideoError::Capture(format!("转 IDirect3DDevice 失败: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drain_newest, MAX_DRAIN_FRAMES};
+    use std::collections::VecDeque;
+
+    /// 池里有 3 张就绪帧：只保留最新那张，前两张按取出的顺序立即回收。
+    #[test]
+    fn drain_keeps_newest_and_recycles_older_items() {
+        let mut ready = VecDeque::from([1_u32, 2, 3]);
+        let mut recycled = Vec::new();
+        let result = drain_newest(
+            || Ok::<_, ()>(ready.pop_front()),
+            |item| recycled.push(item),
+        );
+        assert!(result.is_ok(), "测试闭包不会返回错误");
+        assert_eq!(result.ok().flatten(), Some(3));
+        assert_eq!(recycled, vec![1, 2]);
+    }
+
+    /// 帧池一直有帧时也不能无限排空：循环必须停在 `MAX_DRAIN_FRAMES`。
+    #[test]
+    fn drain_is_bounded_when_frames_never_stop() {
+        let mut produced = 0_usize;
+        let mut recycled = Vec::new();
+        let result = drain_newest(
+            || {
+                produced += 1;
+                Ok::<_, ()>(Some(produced))
+            },
+            |item| recycled.push(item),
+        );
+        assert!(result.is_ok(), "测试闭包不会返回错误");
+        assert_eq!(result.ok().flatten(), Some(MAX_DRAIN_FRAMES));
+        assert_eq!(produced, MAX_DRAIN_FRAMES);
+        assert_eq!(recycled.len(), MAX_DRAIN_FRAMES - 1);
+    }
+
+    /// 帧池取空时返回 `None`，且不回收任何东西。
+    #[test]
+    fn drain_returns_none_when_pool_is_empty() {
+        let mut recycled = Vec::new();
+        let result = drain_newest(|| Ok::<_, ()>(None::<u32>), |item| recycled.push(item));
+        assert!(result.is_ok(), "测试闭包不会返回错误");
+        assert!(result.ok().flatten().is_none());
+        assert!(recycled.is_empty());
+    }
+
+    /// 真正出错时既要向上报错，也要把已经收集到的帧回收掉（否则缓冲永远不归还）。
+    #[test]
+    fn drain_error_recycles_collected_items_and_propagates() {
+        let mut calls = 0_u32;
+        let mut recycled = Vec::new();
+        let result = drain_newest(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Ok::<Option<u32>, &'static str>(Some(7)),
+                    _ => Err("boom"),
+                }
+            },
+            |item| recycled.push(item),
+        );
+        assert_eq!(result, Err("boom"));
+        assert_eq!(recycled, vec![7]);
+    }
 }

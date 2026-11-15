@@ -19,10 +19,23 @@
 //! 目标格式与当前回调不一致时，`prepare` 跳过上传、`paint` 直接返回——画面上保留上一帧
 //! （或什么都不画），**绝不 panic**。Glow/无 wgpu 的路径根本不会创建这个回调，仍走
 //! [`super::RemoteView::upload`] 的 CPU 回退。
+//!
+//! # 增量上传（脏矩形）
+//!
+//! 全帧与补丁共用同一个 [`CompositeFrame`]（`Arc` 跨线程共享的持久 NV12 缓冲）：
+//! - **解码线程**（`FrameSink::on_frame` / `on_patch`）写入并登记脏矩形；
+//! - **渲染线程**（[`Nv12Callback::prepare`]）通过 [`CompositeFrame::take_upload`] 取走脏矩形，
+//!   只把**这些矩形**按行拷进 staging 后 `write_texture`——补丁路径不再上传整帧，也不再整帧
+//!   clone 缓冲。整帧到达（或脏面积过大被合并）时才走整帧上传。
+//!
+//! 锁的边界：`take_upload` 在锁内完成「判定 + 拷贝 staging」，**锁外**才真正上传；临界区只与
+//! 脏面积成正比（整帧上传时才与整帧成正比）。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use egui_wgpu::wgpu;
+use rust_tunnel_remote::screen::ScreenPatch;
 use rust_tunnel_remote::DecodedNv12;
 
 /// NV12 上屏的内联 WGSL。
@@ -96,19 +109,303 @@ fn fs_gamma_target(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 ";
 
+/// 一个脏矩形（编码尺寸坐标系）。
+///
+/// `x`/`y`/`width`/`height` 全部为偶数：NV12 的 UV 平面是半分辨率，奇数边界会让色度块错位。
+/// 合法性在写入时已由 [`rust_tunnel_remote::screen::DecodedNv12::validate_patch`] 保证。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRect {
+    /// 左上角 X（偶数）。
+    pub x: u32,
+    /// 左上角 Y（偶数）。
+    pub y: u32,
+    /// 宽度（偶数）。
+    pub width: u32,
+    /// 高度（偶数）。
+    pub height: u32,
+}
+
+impl DirtyRect {
+    /// 从线上补丁矩形转过来（字段一一对应；校验在写入时完成）。
+    #[must_use]
+    pub fn of(patch: &ScreenPatch) -> Self {
+        Self {
+            x: patch.x,
+            y: patch.y,
+            width: patch.width,
+            height: patch.height,
+        }
+    }
+
+    /// UV 纹理上的原点（半分辨率）。
+    #[must_use]
+    pub fn uv_origin(&self) -> wgpu::Origin3d {
+        wgpu::Origin3d {
+            x: self.x / 2,
+            y: self.y / 2,
+            z: 0,
+        }
+    }
+
+    /// UV 纹理上的尺寸（半分辨率，单位是 texel；`Rg8Unorm` 每 texel 2 字节）。
+    #[must_use]
+    pub fn uv_extent(&self) -> wgpu::Extent3d {
+        wgpu::Extent3d {
+            width: self.width / 2,
+            height: self.height / 2,
+            depth_or_array_layers: 1,
+        }
+    }
+
+    /// 矩形面积（luma 像素数）。
+    #[must_use]
+    pub fn area(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+}
+
+/// 脏矩形合并阈值：矩形块数超过它就直接整帧上传（小块 `write_texture` 的固定开销开始占主导）。
+const MAX_DIRTY_RECTS: usize = 32;
+/// 脏面积占整帧的千分比超过它就直接整帧上传：此时按矩形上传省下的字节抵不过多次
+/// `write_texture`（每次都有内部 staging/命令开销）与零散访问。
+const FULL_UPLOAD_PERMILLE: u64 = 500;
+
+/// 与渲染线程共享的持久 NV12 合成帧。
+///
+/// **尺寸在实例生命周期内固定**：尺寸变了就整体换一个新实例（渲染侧据此重建纹理并整帧上传）。
+/// 每个实例的 `generation` 唯一（跨会话也不复用），用于让渲染侧区分「还是同一块缓冲」与
+/// 「换了一帧」。
+pub struct CompositeFrame {
+    /// 实例唯一编号（渲染侧据此判断是否需要无条件整帧上传）。
+    generation: u64,
+    /// 编码宽度（偶数 luma 像素数）。
+    width: u32,
+    /// 编码高度（偶数 luma 像素数）。
+    height: u32,
+    /// 数据 + 待上传脏区；两个字段必须**同一把锁**：写入数据与登记脏矩形要原子，
+    /// 否则渲染线程可能取走脏区却漏掉刚写进去的数据。
+    inner: Mutex<CompositeInner>,
+}
+
+/// [`CompositeFrame`] 的锁内状态。
+struct CompositeInner {
+    /// 当前整帧（Y + UV）。
+    data: DecodedNv12,
+    /// 内容版本（同实例内单调递增；CPU 回退路径据此决定是否需要重新转换）。
+    version: u64,
+    /// 自上次被渲染线程取走以来的变化区域。
+    pending: PendingUpload,
+}
+
+/// 待上传内容。
+enum PendingUpload {
+    /// 整帧（新全帧到达 / 脏区太多被合并）。
+    Full,
+    /// 只上传这些矩形（可能为空 = 没有变化）。
+    Rects(Vec<DirtyRect>),
+}
+
+/// 渲染线程一次上传所需的全部数据（已在锁内拷贝，锁外直接交给 wgpu）。
+pub enum UploadChunk {
+    /// 整帧（Y 紧包、UV 紧包）。
+    Full {
+        /// Y 平面（`width * height`）。
+        y: Vec<u8>,
+        /// 交织 UV 平面（`width * height / 2`）。
+        uv: Vec<u8>,
+    },
+    /// 一批脏矩形（各自紧包）。
+    Rects(Vec<StagedRect>),
+}
+
+/// 单个脏矩形的紧包 staging（Y 行宽 = `rect.width`，UV 行宽也是 `rect.width`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedRect {
+    /// 目标矩形。
+    pub rect: DirtyRect,
+    /// Y 平面（`rect.width * rect.height`）。
+    pub y: Vec<u8>,
+    /// 交织 UV 平面（`rect.width * rect.height / 2`）。
+    pub uv: Vec<u8>,
+}
+
+impl CompositeFrame {
+    /// 用一帧整帧数据构造；尺寸/长度不自洽（含奇数边长）时返回 `None`。
+    ///
+    /// 新实例的 `pending` 是 [`PendingUpload::Full`]：渲染侧第一次见到它必须整帧上传。
+    #[must_use]
+    pub fn new(width: u32, height: u32, data: DecodedNv12) -> Option<Self> {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return None;
+        }
+        let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
+        let pixels = w.checked_mul(h)?;
+        if data.y.len() != pixels || data.uv.len() != pixels / 2 {
+            return None;
+        }
+        Some(Self {
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            width,
+            height,
+            inner: Mutex::new(CompositeInner {
+                data,
+                version: 1,
+                pending: PendingUpload::Full,
+            }),
+        })
+    }
+
+    /// 编码尺寸 `(宽, 高)`。
+    #[must_use]
+    pub fn dims(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// 实例唯一编号（渲染侧据此判断「换了一帧缓冲」）。
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 内容版本（同实例内单调递增；无变化时不推进）。
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.inner.lock().map_or(0, |inner| inner.version)
+    }
+
+    /// 在锁内只读访问整帧数据（CPU 回退路径做 NV12→RGBA 用）。
+    pub fn with_data<R>(&self, f: impl FnOnce(&DecodedNv12) -> R) -> R {
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&inner.data)
+    }
+
+    /// 把一批补丁**原子地**拼进缓冲：先逐块校验，全部合法才写；任一非法则一字节都不改。
+    ///
+    /// 与旧的「克隆整帧做回滚副本」不同，这里靠 `validate_patch`（与 `apply_patch` 同一套
+    /// 前置条件）实现全有或全无，**没有任何整帧拷贝**。
+    #[must_use]
+    pub fn apply_patches(&self, rects: &[ScreenPatch]) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rects.is_empty() {
+            // 保活批：不改缓冲、不推进版本（渲染侧无需任何动作）。
+            return true;
+        }
+        if !inner.data.apply_patches(self.width, rects) {
+            return false;
+        }
+        inner.version = inner.version.wrapping_add(1);
+        if let PendingUpload::Rects(list) = &mut inner.pending {
+            list.extend(rects.iter().map(DirtyRect::of));
+            if should_upload_full(list, self.width, self.height) {
+                inner.pending = PendingUpload::Full;
+            }
+        }
+        true
+    }
+
+    /// 渲染线程取一次待上传内容（锁内拷贝 staging）；没有变化时 `None`。
+    ///
+    /// 取走即清空待上传标记：内容已经拷进返回的 `Vec`，之后新到的补丁会重新登记。若 `force_full`
+    /// （纹理刚重建 / 首次上传），无论待上传标记是什么都按整帧处理。
+    #[must_use]
+    pub fn take_upload(&self, force_full: bool) -> Option<UploadChunk> {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if force_full {
+            inner.pending = PendingUpload::Full;
+        }
+        let pending = std::mem::replace(&mut inner.pending, PendingUpload::Rects(Vec::new()));
+        match pending {
+            // 整帧上传要在锁内拷出整块（代价 ∝ 整帧），锁外再交给 wgpu。
+            PendingUpload::Full => Some(UploadChunk::Full {
+                y: inner.data.y.clone(),
+                uv: inner.data.uv.clone(),
+            }),
+            PendingUpload::Rects(list) if !list.is_empty() => {
+                let mut staged = Vec::with_capacity(list.len());
+                for rect in list {
+                    let Some(rect) = stage_rect(&inner.data, self.width, rect) else {
+                        continue;
+                    };
+                    staged.push(rect);
+                }
+                (!staged.is_empty()).then_some(UploadChunk::Rects(staged))
+            }
+            PendingUpload::Rects(_) => None,
+        }
+    }
+}
+
+/// 脏区是否该合并成整帧上传（矩形过多或面积过大）。
+fn should_upload_full(rects: &[DirtyRect], width: u32, height: u32) -> bool {
+    if rects.len() > MAX_DIRTY_RECTS {
+        return true;
+    }
+    let area: u64 = rects.iter().map(DirtyRect::area).sum();
+    let total = u64::from(width) * u64::from(height);
+    total > 0 && area.saturating_mul(1000) >= total.saturating_mul(FULL_UPLOAD_PERMILLE)
+}
+
+/// 从紧包整帧里抽出一个矩形，按行拷进紧包 staging。
+///
+/// 与 [`rust_tunnel_remote::screen::DecodedNv12::apply_patch`] 的坐标约定一致：
+/// - Y 行宽 = `frame_width`，取 `(x + col, y + row)`；
+/// - UV 行宽也是 `frame_width` **字节**（每个色度对 2 字节覆盖 2 个 luma 像素），
+///   取 `(x + col, y/2 + row)`，行数 `height/2`。
+///
+/// 返回 `None` 表示矩形越界/与缓冲尺寸不自洽（调用方跳过这一块，绝不越界读）。
+#[must_use]
+pub fn stage_rect(data: &DecodedNv12, frame_width: u32, rect: DirtyRect) -> Option<StagedRect> {
+    let frame_width = usize::try_from(frame_width).ok()?;
+    if frame_width == 0 {
+        return None;
+    }
+    let frame_height = data.y.len().checked_div(frame_width)?;
+    if frame_height == 0 || data.y.len() != frame_width.checked_mul(frame_height)? {
+        return None;
+    }
+    if data.uv.len() != frame_width.checked_mul(frame_height / 2)? {
+        return None;
+    }
+    let (x, y) = (usize::try_from(rect.x).ok()?, usize::try_from(rect.y).ok()?);
+    let (w, h) = (
+        usize::try_from(rect.width).ok()?,
+        usize::try_from(rect.height).ok()?,
+    );
+    if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+        return None;
+    }
+    if !x.is_multiple_of(2) || !y.is_multiple_of(2) {
+        return None;
+    }
+    if x.checked_add(w)? > frame_width || y.checked_add(h)? > frame_height {
+        return None;
+    }
+
+    let mut y_bytes = Vec::with_capacity(w.checked_mul(h)?);
+    for row in 0..h {
+        let start = (y + row).checked_mul(frame_width)?.checked_add(x)?;
+        y_bytes.extend_from_slice(data.y.get(start..start.checked_add(w)?)?);
+    }
+    let mut uv_bytes = Vec::with_capacity(w.checked_mul(h / 2)?);
+    for row in 0..(h / 2) {
+        let start = (y / 2 + row).checked_mul(frame_width)?.checked_add(x)?;
+        uv_bytes.extend_from_slice(data.uv.get(start..start.checked_add(w)?)?);
+    }
+    Some(StagedRect {
+        rect,
+        y: y_bytes,
+        uv: uv_bytes,
+    })
+}
+
 /// 一帧 NV12 的绘制回调（`egui_wgpu::Callback` 的数据载体）。
 ///
-/// `seq` 用于去重：同一帧会被每帧的 egui pass 反复 `prepare`，但只有 `seq` 变化时才真正
-/// 上传纹理；没有新帧时 GPU 继续采样上一帧的内容，画面不会闪。
+/// `frame` 是**共享**的合成缓冲：解码线程原地打补丁，渲染侧每次 `prepare` 取走自上次以来累积的
+/// 脏矩形（见 [`CompositeFrame::take_upload`]）。因此同一份 `Arc` 可以被反复绘制而不重复上传。
 pub struct Nv12Callback {
-    /// 解码后的 NV12 平面（`Arc` 让 `FramePaint` 能跨帧复用同一份数据）。
-    pub frame: Arc<DecodedNv12>,
-    /// 可见画面宽度（像素，等于 Y 平面宽）。
-    pub width: u32,
-    /// 可见画面高度（像素，等于 Y 平面高）。
-    pub height: u32,
-    /// 帧序号（去重）。
-    pub seq: u64,
+    /// 与解码线程共享的持久合成缓冲（含全帧 + 已应用的补丁）。
+    pub frame: Arc<CompositeFrame>,
     /// 当前 egui 渲染目标格式（决定片元入口与管线格式）。
     pub target_format: wgpu::TextureFormat,
 }
@@ -133,8 +430,6 @@ struct Nv12Resources {
     bind_group: Option<wgpu::BindGroup>,
     /// 当前纹理尺寸；变化时重建纹理与绑定组。
     size: Option<(u32, u32)>,
-    /// 已上传帧的序号（同一 `seq` 不重复上传）。
-    last_seq: Option<u64>,
 }
 
 impl Nv12Resources {
@@ -239,119 +534,179 @@ impl Nv12Resources {
             texture_uv: None,
             bind_group: None,
             size: None,
-            last_seq: None,
         }
     }
 
-    /// 把一帧 NV12 上传到 GPU；尺寸变化时先重建纹理与绑定组。
+    /// 把共享合成帧的**增量**上传到 GPU。
     ///
-    /// 任何前置条件不满足（奇偶/长度/零尺寸）都直接跳过——保留上一帧比画错或崩溃好。
-    fn upload(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        frame: &DecodedNv12,
-        width: u32,
-        height: u32,
-        seq: u64,
-    ) {
+    /// 上传内容由 [`CompositeFrame::take_upload`] 决定：全帧到达（或脏区被合并）时整帧上传，
+    /// 否则只上传自上次以来累积的脏矩形。任何前置条件不满足（零尺寸/奇数尺寸）都直接跳过——
+    /// 保留上一帧比画错或崩溃好。
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &CompositeFrame) {
+        let (width, height) = frame.dims();
         // 4:2:0 要求偶数尺寸；零尺寸无法建纹理。
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return;
         }
-        // 同一帧只上传一次（egui 每个 pass 都会调 prepare）。
-        if self.last_seq == Some(seq) && self.size == Some((width, height)) {
-            return;
-        }
-        let (Ok(pixel_w), Ok(pixel_h)) = (usize::try_from(width), usize::try_from(height)) else {
-            return;
-        };
-        let Some(pixels) = pixel_w.checked_mul(pixel_h) else {
-            return;
-        };
-        if frame.y.len() != pixels || frame.uv.len() != pixels / 2 {
-            return;
-        }
-
-        if self.size != Some((width, height)) {
-            let (uv_w, uv_h) = (width / 2, height / 2);
-            let texture_y = create_texture(device, "nv12_y", width, height, wgpu::TextureFormat::R8Unorm);
-            let texture_uv =
-                create_texture(device, "nv12_uv", uv_w, uv_h, wgpu::TextureFormat::Rg8Unorm);
-            let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
-            let view_uv = texture_uv.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("nv12_bind_group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view_y),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view_uv),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            self.texture_y = Some(texture_y);
-            self.texture_uv = Some(texture_uv);
-            self.bind_group = Some(bind_group);
-            self.size = Some((width, height));
-        }
-
+        // 纹理重建（尺寸变化 / 首次）后必须整帧上传：新纹理里什么都没有。
+        let force_full = self.ensure_textures(device, width, height);
         let (Some(texture_y), Some(texture_uv)) = (self.texture_y.as_ref(), self.texture_uv.as_ref())
         else {
             return;
         };
+        // 取脏矩形（锁内只拷贝 staging，锁外上传）。
+        let Some(chunk) = frame.take_upload(force_full) else {
+            return;
+        };
+        match chunk {
+            UploadChunk::Full { y, uv } => {
+                write_full(queue, texture_y, texture_uv, width, height, &y, &uv);
+            }
+            UploadChunk::Rects(rects) => write_rects(queue, texture_y, texture_uv, &rects),
+        }
+    }
 
-        // Y：每行 `width` 字节，共 `height` 行。
+    /// 尺寸变化时重建纹理与绑定组；返回是否重建过（重建过 = 必须整帧上传）。
+    fn ensure_textures(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
+        if self.size == Some((width, height)) {
+            return false;
+        }
+        let (uv_w, uv_h) = (width / 2, height / 2);
+        let texture_y = create_texture(device, "nv12_y", width, height, wgpu::TextureFormat::R8Unorm);
+        let texture_uv = create_texture(device, "nv12_uv", uv_w, uv_h, wgpu::TextureFormat::Rg8Unorm);
+        let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_uv = texture_uv.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view_y),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_uv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.texture_y = Some(texture_y);
+        self.texture_uv = Some(texture_uv);
+        self.bind_group = Some(bind_group);
+        self.size = Some((width, height));
+        true
+    }
+}
+
+/// 整帧上传（Y/UV 两张纹理各自 `width` 字节行宽）。
+fn write_full(
+    queue: &wgpu::Queue,
+    texture_y: &wgpu::Texture,
+    texture_uv: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    y: &[u8],
+    uv: &[u8],
+) {
+    // Y：每行 `width` 字节，共 `height` 行。
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: texture_y,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        y,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    // UV：每行 `uv_w * 2 == width` 字节。
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: texture_uv,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        uv,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width),
+            rows_per_image: Some(height / 2),
+        },
+        wgpu::Extent3d {
+            width: width / 2,
+            height: height / 2,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+/// 只上传脏矩形（Y 与 UV 各一块）。
+///
+/// `write_texture` 的行距不要求 256 字节对齐（它内部会 staging 到对齐布局），故紧包行宽
+/// `rect.width` 直接可用；整帧路径的 `bytes_per_row = width` 也一直是这么做的。
+fn write_rects(
+    queue: &wgpu::Queue,
+    texture_y: &wgpu::Texture,
+    texture_uv: &wgpu::Texture,
+    rects: &[StagedRect],
+) {
+    for staged in rects {
+        let rect = staged.rect;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: texture_y,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            &frame.y,
+            &staged.y,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(rect.width),
+                rows_per_image: Some(rect.height),
             },
             wgpu::Extent3d {
-                width,
-                height,
+                width: rect.width,
+                height: rect.height,
                 depth_or_array_layers: 1,
             },
         );
-
-        // UV：每像素 2 字节，每行 `uv_w` 像素 → `uv_w * 2 == width` 字节。
+        // UV 平面是半分辨率：原点是 `(x/2, y/2)`、尺寸 `w/2 × h/2`；
+        // 行距仍是 `rect.width` 字节（与 Y 相同，见 `stage_rect`）。
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: texture_uv,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: rect.uv_origin(),
                 aspect: wgpu::TextureAspect::All,
             },
-            &frame.uv,
+            &staged.uv,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width),
-                rows_per_image: Some(height / 2),
+                bytes_per_row: Some(rect.width),
+                rows_per_image: Some(rect.height / 2),
             },
-            wgpu::Extent3d {
-                width: width / 2,
-                height: height / 2,
-                depth_or_array_layers: 1,
-            },
+            rect.uv_extent(),
         );
-
-        self.last_seq = Some(seq);
     }
 }
 
@@ -396,7 +751,8 @@ impl egui_wgpu::CallbackTrait for Nv12Callback {
             callback_resources.insert(Nv12Resources::new(device, self.target_format));
         }
         if let Some(resources) = callback_resources.get_mut::<Nv12Resources>() {
-            resources.upload(device, queue, &self.frame, self.width, self.height, self.seq);
+            // 资源刚重建时纹理是空的，必须整帧上传（`upload` 内部按 `size` 判断）。
+            resources.upload(device, queue, &self.frame);
         }
         Vec::new()
     }
@@ -421,5 +777,210 @@ impl egui_wgpu::CallbackTrait for Nv12Callback {
         render_pass.set_pipeline(&resources.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 只覆盖**纯逻辑**：脏矩形几何、按行 staging 拷贝、合成缓冲的原子应用与脏区合并。
+    //! 不需要 GPU（`take_upload` 只做 CPU 侧拷贝）。
+
+    use super::*;
+
+    /// 8×8 的紧包 NV12：Y = `0..64`、UV = `100..132`（取值便于手算期望字节）。
+    fn frame_8x8() -> DecodedNv12 {
+        DecodedNv12 {
+            y: (0..64).collect(),
+            uv: (100..132).collect(),
+        }
+    }
+
+    fn frame_16x16() -> DecodedNv12 {
+        DecodedNv12 {
+            y: vec![0; 16 * 16],
+            uv: vec![0; 16 * 8],
+        }
+    }
+
+    fn patch(x: u32, y: u32, width: u32, height: u32) -> ScreenPatch {
+        let len = usize::try_from(width * height * 3 / 2).unwrap();
+        ScreenPatch {
+            x,
+            y,
+            width,
+            height,
+            nv12: vec![0x5A; len],
+        }
+    }
+
+    #[test]
+    fn dirty_rect_uv_geometry_is_half_resolution() {
+        let rect = DirtyRect {
+            x: 100,
+            y: 40,
+            width: 20,
+            height: 10,
+        };
+        assert_eq!(
+            rect.uv_origin(),
+            wgpu::Origin3d {
+                x: 50,
+                y: 20,
+                z: 0
+            }
+        );
+        assert_eq!(
+            rect.uv_extent(),
+            wgpu::Extent3d {
+                width: 10,
+                height: 5,
+                depth_or_array_layers: 1
+            }
+        );
+        assert_eq!(rect.area(), 200);
+    }
+
+    /// staging 必须只拷矩形内的行：Y 行宽 = `rect.width`，UV 行偏移用 `(y/2)*width + x`。
+    #[test]
+    fn stage_rect_copies_only_the_rect_rows() {
+        let data = frame_8x8();
+        let rect = DirtyRect {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+        };
+        let staged = stage_rect(&data, 8, rect).expect("合法矩形应能取出");
+        // Y：第 2/3 行从 x=2 起各 4 字节。
+        assert_eq!(staged.y, vec![18, 19, 20, 21, 26, 27, 28, 29]);
+        // UV：y=2 → UV 行 1，起始字节偏移 = 1*8 + 2 = 10（每行 8 字节 = 整帧宽度）。
+        assert_eq!(staged.uv, vec![110, 111, 112, 113]);
+        assert_eq!(staged.rect, rect);
+    }
+
+    #[test]
+    fn stage_rect_rejects_illegal_rects() {
+        let data = frame_8x8();
+        // 越界（x+w > 8）、越界（y+h > 8）、奇数坐标、奇数尺寸、零尺寸。
+        for rect in [
+            DirtyRect { x: 6, y: 0, width: 4, height: 2 },
+            DirtyRect { x: 0, y: 6, width: 2, height: 4 },
+            DirtyRect { x: 1, y: 0, width: 2, height: 2 },
+            DirtyRect { x: 0, y: 1, width: 2, height: 2 },
+            DirtyRect { x: 0, y: 0, width: 3, height: 2 },
+            DirtyRect { x: 0, y: 0, width: 2, height: 3 },
+            DirtyRect { x: 0, y: 0, width: 0, height: 2 },
+        ] {
+            assert!(stage_rect(&data, 8, rect).is_none(), "{rect:?} 应被拒");
+        }
+        // 帧宽与缓冲不自洽时也不越界读。
+        assert!(stage_rect(&data, 7, DirtyRect { x: 0, y: 0, width: 2, height: 2 }).is_none());
+    }
+
+    /// 全帧构造时 `pending = Full`；应用补丁后只登记脏矩形，**不替换/不拷贝**整帧。
+    #[test]
+    fn apply_patches_marks_dirty_rects_instead_of_full_frame() {
+        let composite = CompositeFrame::new(8, 8, frame_8x8()).expect("8×8 合法");
+        assert!(matches!(composite.take_upload(false), Some(UploadChunk::Full { .. })));
+
+        assert!(composite.apply_patches(&[patch(2, 2, 4, 2)]));
+        match composite.take_upload(false) {
+            Some(UploadChunk::Rects(rects)) => {
+                assert_eq!(rects.len(), 1);
+                assert_eq!(
+                    rects[0].rect,
+                    DirtyRect {
+                        x: 2,
+                        y: 2,
+                        width: 4,
+                        height: 2
+                    }
+                );
+            }
+            _ => panic!("补丁应只登记脏矩形"),
+        }
+        // 数据确实原地写进共享缓冲，矩形外不动。
+        composite.with_data(|data| {
+            assert_eq!(data.y[2 * 8 + 2], 0x5A);
+            assert_eq!(data.y[3 * 8 + 5], 0x5A);
+            assert_eq!(data.y[0], 0, "矩形外不应被写");
+            assert_eq!(data.uv[0], 100, "矩形外不应被写");
+        });
+        // 取走即清：没有新变化就不再上传。
+        assert!(composite.take_upload(false).is_none());
+    }
+
+    /// 一批补丁要么全应用、要么一字节不改；非法批次不得推进版本（否则渲染侧会白跑）。
+    #[test]
+    fn apply_patches_is_all_or_nothing() {
+        let original_y = frame_8x8().y;
+        let composite = CompositeFrame::new(8, 8, frame_8x8()).expect("8×8 合法");
+        let before = composite.version();
+        assert!(composite.take_upload(false).is_some());
+
+        // 第二块越界：第一块也不能留下。
+        assert!(!composite.apply_patches(&[patch(2, 2, 4, 2), patch(6, 0, 4, 2)]));
+        assert_eq!(composite.version(), before, "失败批次不应推进版本");
+        composite.with_data(|data| assert_eq!(data.y, original_y, "整批失败时不得留半截"));
+        assert!(composite.take_upload(false).is_none(), "失败批次不应登记脏区");
+    }
+
+    #[test]
+    fn empty_patch_batch_is_a_noop() {
+        let composite = CompositeFrame::new(8, 8, frame_8x8()).expect("8×8 合法");
+        assert!(composite.take_upload(false).is_some());
+        let before = composite.version();
+        assert!(composite.apply_patches(&[]));
+        assert_eq!(composite.version(), before, "保活空批不应推进版本");
+        assert!(composite.take_upload(false).is_none());
+    }
+
+    /// 累积脏面积达到整帧 50% 时直接整帧上传（小块 `write_texture` 的固定开销不划算）。
+    ///
+    /// 脏区在 `take_upload` 时清空，所以「累积」必须发生在两次上屏之间。
+    #[test]
+    fn dirty_area_over_half_the_frame_coalesces_to_full() {
+        let composite = CompositeFrame::new(16, 16, frame_16x16()).expect("16×16 合法");
+        assert!(composite.take_upload(false).is_some());
+        // 每块 8×4 = 32 像素，整帧 256；阈值是 128（50%）。
+        assert!(composite.apply_patches(&[patch(0, 0, 8, 4)]));
+        assert!(composite.apply_patches(&[patch(8, 0, 8, 4)]));
+        assert!(composite.apply_patches(&[patch(0, 4, 8, 4)]));
+        assert!(composite.apply_patches(&[patch(8, 4, 8, 4)]));
+        assert!(
+            matches!(composite.take_upload(false), Some(UploadChunk::Full { .. })),
+            "128/256 = 50% 应合并成整帧上传"
+        );
+        // 清空后单块小补丁仍按矩形上传。
+        assert!(composite.apply_patches(&[patch(0, 0, 8, 4)]));
+        assert!(matches!(
+            composite.take_upload(false),
+            Some(UploadChunk::Rects(_))
+        ));
+    }
+
+    #[test]
+    fn should_upload_full_caps_rect_count_and_area() {
+        let tiny = [DirtyRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        }; MAX_DIRTY_RECTS + 1];
+        assert!(should_upload_full(&tiny, 1920, 1080), "块数超限应整帧");
+        let one = [DirtyRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        }];
+        assert!(!should_upload_full(&one, 1920, 1080));
+        let half = [DirtyRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 540,
+        }];
+        assert!(should_upload_full(&half, 1920, 1080), "面积达到 50% 应整帧");
     }
 }

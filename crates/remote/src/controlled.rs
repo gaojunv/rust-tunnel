@@ -9,8 +9,23 @@
 //! `select!` 循环只保留 cancel / heartbeat / 输入 / 文件 / 控制消息。画面走一条三阶段流水线：
 //!
 //! ```text
-//! 采集(spawn_blocking) --有界(1)--> 编码任务(spawn_blocking) --有界(WRITER_QUEUE)--> 发送(独占 writer)
+//! 采集(spawn_blocking) --有界(1)--> 编码任务(spawn_blocking) --有界(SCREEN_QUEUE)--> 发送(独占 writer)
 //! ```
+//!
+//! # 出站三档队列（阶段 10）
+//!
+//! 写半边由**独立写任务**独占（[`writer_loop`]），主循环只投递帧。队列按优先级分成四档，
+//! 写任务用 `select! { biased; ... }` 固定按 **close → ctrl → screen → file** 取帧：
+//!
+//! - **close**：收尾 `Bye`，无界通道，最高优先，不理会取消令牌；
+//! - **ctrl**（深度 [`CTRL_QUEUE`]）：心跳/输入/QoS/剪贴板/文件协议小消息，可取消地等、绝不丢；
+//! - **screen**（深度 [`SCREEN_QUEUE`]）：`VideoPacket`/`RegionUpdate`/`ScreenConfig`，可取消地等、
+//!   绝不丢（时域参考链不能断）；
+//! - **file**（深度 [`FILE_QUEUE`]）：只有 `FileChunk` 及其收尾（`FileDone`/`FileError`）。主循环
+//!   **只在有容量时**用 `try_send` 投递，满了就留在 `file_staging` 下一拍重试——文件分块的生产
+//!   因此**永不阻塞主循环**（否则采集会停拍、输入/心跳会停摆）。
+//!
+//! 分类由纯函数 [`outbound_class`] 决定，新增 `SessionMessage` 变体时编译器会强制在这里归类。
 //!
 //! **丢弃策略是这个管线里最关键的正确性决定**：时域编码的参考链是串起来的，丢掉一个**已编码**
 //! 的 P 帧，后续引用它的帧在解码端永远解不出来（花屏且不自愈，只能等下一个 IDR）。所以背压的
@@ -48,8 +63,9 @@
 //!
 //! 三条硬约束：
 //! - **顺序**：补丁必须排在那块全帧基准**之后**。进入模式前先强制一个基准 IDR，且只在该 IDR
-//!   **真正投进出站队列**（编码任务回报 `base_frame_sent`）之后才切模式；两者走同一条 FIFO
-//!   出站队列，故顺序天然成立。发送补丁本身也走 [`enqueue`]（可取消地等、绝不丢弃）。
+//!   **真正投进出站队列**（编码任务回报 `base_frame_sent`）之后才切模式；两者走**同一条画面
+//!   队列**（`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::enqueue_screen`]
+//!   （可取消地等、绝不丢弃）。
 //! - **退出即全帧**：任何让参考/几何失效的事件（`RequestKeyframe` / `SelectDisplay` /
 //!   `SetQuality`、补丁采集失败、活跃度过高、矩形过多/过大）都立刻回到全帧并强制 IDR。
 //! - **QoS 闭环在补丁模式下暂停**：控制器此时不解码视频，`decode_ms`/`recv_kbps` 是陈旧值，
@@ -61,17 +77,18 @@ use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
-    CapturedPatches, Clipboard, EncodeOptions, EncodeRates, InputSink, RawFrame, ScreenSource,
+    native_bitrate_ceiling, CapturedPatches, Clipboard, DisplayInfo, EncodeOptions, EncodeRates,
+    InputSink, RawFrame, ScreenSource,
 };
 use crate::session::{
     trusted_rtt, CodecId, RegionRect, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
-    HEARTBEAT_INTERVAL, MAX_REGION_RECTS, REGION_FLAG_ZSTD, SESSION_PROTO_VERSION, VIDEO_FLAG_CONFIG,
-    VIDEO_FLAG_KEYFRAME,
+    HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS, REGION_FLAG_ZSTD, SESSION_PROTO_VERSION,
+    VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
-use crate::video::{encode_dimensions, EncodedVideo, MAX_ENCODE_WIDTH};
+use crate::video::{encode_dimensions, EncodedVideo, MAX_ENCODE_WIDTH, NATIVE_MAX_ENCODE_WIDTH};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
@@ -99,27 +116,252 @@ const CODEC_OFFER_TIMEOUT: Duration = Duration::from_secs(5);
 /// 只是尽力通知，超时丢弃即可。
 const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 出站帧队列深度。
+/// 控制队列深度。
+///
+/// 控制帧只有几十字节，32 深足以吸收突发，同时把写侧被卡住时的等待时间压在很小量级。
+pub(crate) const CTRL_QUEUE: usize = 32;
+
+/// 画面队列深度。
 ///
 /// 画面帧是大头（可达 MiB 级），队列过深会在写侧卡住时把内存顶上去；过浅则正常突发下容易丢帧。
 /// 4 足以吸收一次采集与心跳的抖动，同时把最坏内存压在「4 × 单帧」量级。
-const WRITER_QUEUE: usize = 4;
+pub(crate) const SCREEN_QUEUE: usize = 4;
+
+/// 文件队列深度。
+///
+/// 只放 `FileChunk`（[`crate::transfer::CHUNK_SIZE`] = 16 KiB）及其收尾，2 块 ≈ 32 KiB 在途。
+/// 主循环只在有空位时取下一块，队列容量就是这个方向唯一的背压。
+pub(crate) const FILE_QUEUE: usize = 2;
 
 /// 编码侧读数的上报间隔（见 [`EncodeStatsWindow`]）。
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 显示器枚举的复查间隔。
+///
+/// 窗口枚举在 Windows 上是 `EnumDisplayMonitors`，有可测开销（要进内核问桌面拓扑），所以
+/// 不复用采集节拍、也不做每帧检查。热插拔/改分辨率在 5 秒内可见，对用户是可接受的延迟；
+/// 当前采集的显示器消失时也不会长期冻结画面（见主循环的 `display_tick` 分支）。
+const DISPLAY_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// 在途心跳时刻队列的上限（1s 探测、10s 可信上限 ⇒ 8 个足够覆盖任何可信延迟）。
 const HEARTBEAT_SENT_CAP: usize = 8;
 
-/// 投给出站写任务的一条消息。
-enum WriterMsg {
-    /// 普通出站帧：写侧被取消或出错即停止后续发送。
-    Frame(SessionFrame),
-    /// 收尾帧（`Bye`）：**不再理会取消令牌**，限时尽力写出后结束写任务。
+/// 出站写队列的优先级分类（**控制器与被控端共用**）。
+///
+/// 分类是纯函数 [`outbound_class`] 的唯一职责：新增 [`SessionMessage`] 变体时，那个 `match`
+/// 会因未覆盖而编译失败——避免新消息悄悄落进错误的队列。丢/不丢、能不能 `.await`、会不会
+/// 打断参考链，全由类别决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboundClass {
+    /// 收尾 `Bye`：最高优先级，走独立无界通道，不理会取消令牌。
+    Close,
+    /// 小而敏感的控制帧：可取消地等空位，**绝不丢**。
+    Control,
+    /// 画面数据（`VideoPacket` / `RegionUpdate` / `ScreenConfig`）：可取消地等空位，**绝不丢**。
+    Screen,
+    /// 文件数据块与收尾（`FileChunk` / `FileDone` / `FileError`）：只用 `try_send`，满则暂存。
+    File,
+}
+
+/// 把一条会话消息归入出站队列类别（纯函数，机械锁见单测）。
+///
+/// 两个容易归错的点：
+/// - `ScreenConfig` 必须与 `VideoPacket` 同队列（它要排在第一个画面包之前）；
+/// - `FileDone`/`FileError` 必须排在所有 `FileChunk` 之后，故与数据块同走 file 队列；
+///   其余文件协议小消息（列目录/请求/受理）没有数据面顺序约束，走控制队列。
+#[must_use]
+pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
+    match msg {
+        SessionMessage::Bye { .. } => OutboundClass::Close,
+        SessionMessage::VideoPacket { .. }
+        | SessionMessage::RegionUpdate { .. }
+        | SessionMessage::ScreenConfig { .. } => OutboundClass::Screen,
+        SessionMessage::FileChunk { .. }
+        | SessionMessage::FileDone { .. }
+        | SessionMessage::FileError { .. } => OutboundClass::File,
+        SessionMessage::Hello { .. }
+        | SessionMessage::HelloAck { .. }
+        | SessionMessage::Input(_)
+        | SessionMessage::SelectDisplay { .. }
+        | SessionMessage::SetQuality { .. }
+        | SessionMessage::Clipboard { .. }
+        | SessionMessage::ClipboardRequest
+        | SessionMessage::DisplayList(_)
+        | SessionMessage::Heartbeat
+        | SessionMessage::HeartbeatAck
+        | SessionMessage::FileListRequest { .. }
+        | SessionMessage::FileList { .. }
+        | SessionMessage::FileDownloadRequest { .. }
+        | SessionMessage::FileUploadRequest { .. }
+        | SessionMessage::FileAccept { .. }
+        | SessionMessage::RequestKeyframe { .. }
+        | SessionMessage::QosFeedback { .. }
+        | SessionMessage::CodecOffer { .. }
+        | SessionMessage::CodecSelect { .. }
+        | SessionMessage::SetFrameRate { .. }
+        | SessionMessage::LockScreen => OutboundClass::Control,
+    }
+}
+
+/// 出站写侧的四个发送端（会话主循环持有）。
+///
+/// `file_staging` 是文件类消息的**暂存区**：file 队列满时消息留在这里、下一拍重试，主循环
+/// 因此永远不必为文件数据 `.await`。它保持 FIFO，所以 `FileDone`/`FileError` 不会越过尚未
+/// 投递的 `FileChunk`。
+pub(crate) struct OutboundQueues {
+    ctrl: mpsc::Sender<SessionFrame>,
+    screen: mpsc::Sender<SessionFrame>,
+    file: mpsc::Sender<SessionFrame>,
+    close: mpsc::UnboundedSender<SessionFrame>,
+    file_staging: VecDeque<SessionMessage>,
+}
+
+/// [`OutboundQueues`] 的另一半：四个接收端，整体移交给 [`writer_loop`]。
+pub(crate) struct OutboundReceivers {
+    ctrl: mpsc::Receiver<SessionFrame>,
+    screen: mpsc::Receiver<SessionFrame>,
+    file: mpsc::Receiver<SessionFrame>,
+    close: mpsc::UnboundedReceiver<SessionFrame>,
+}
+
+impl OutboundQueues {
+    /// 建立四个通道。返回的接收端必须移交给 [`writer_loop`]。
+    #[must_use]
+    pub(crate) fn new() -> (Self, OutboundReceivers) {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(CTRL_QUEUE);
+        let (screen_tx, screen_rx) = mpsc::channel(SCREEN_QUEUE);
+        let (file_tx, file_rx) = mpsc::channel(FILE_QUEUE);
+        let (close_tx, close_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                ctrl: ctrl_tx,
+                screen: screen_tx,
+                file: file_tx,
+                close: close_tx,
+                file_staging: VecDeque::new(),
+            },
+            OutboundReceivers {
+                ctrl: ctrl_rx,
+                screen: screen_rx,
+                file: file_rx,
+                close: close_rx,
+            },
+        )
+    }
+
+    /// 画面发送端的克隆（编码任务需要独立持有）。
+    pub(crate) fn screen_sender(&self) -> mpsc::Sender<SessionFrame> {
+        self.screen.clone()
+    }
+
+    /// 当前画面队列里的在途帧数（QoS 的 `local_backlog` 读数）。
+    #[must_use]
+    pub(crate) fn screen_backlog(&self) -> usize {
+        SCREEN_QUEUE.saturating_sub(self.screen.capacity())
+    }
+
+    /// 文件队列是否还有空位（主循环据此决定要不要再读一块）。
+    #[must_use]
+    pub(crate) fn file_has_room(&self) -> bool {
+        self.file.capacity() > 0
+    }
+
+    /// 是否有文件类消息在暂存区等重试。
+    #[must_use]
+    pub(crate) fn has_staged_file(&self) -> bool {
+        !self.file_staging.is_empty()
+    }
+
+    /// 收尾帧走最高优先级的无界通道（不阻塞、不理会取消）。
+    pub(crate) fn close(&self, frame: SessionFrame) {
+        // 写任务已退出时丢弃即可：会话已在收尾，没有别的接收者。
+        let _ = self.close.send(frame);
+    }
+
+    /// 按 [`outbound_class`] 的分类投递一条出站帧。
     ///
-    /// 取消正是最常见的结束原因，若让取消令牌把它一并掐掉，对端就只能看到「连接被断开」，
-    /// 把一次用户主动中断记成 `deliberate: false`（进而触发自动重连）。
-    Close(SessionFrame),
+    /// # Errors
+    /// 取消令牌触发（ctrl/screen 等待空位时）或写任务已结束（通道关闭）时返回错误。
+    pub(crate) async fn dispatch_frame(
+        &mut self,
+        cancel: &CancellationToken,
+        frame: SessionFrame,
+    ) -> RemoteResult<()> {
+        match outbound_class(&frame.message) {
+            OutboundClass::Close => {
+                self.close(frame);
+                Ok(())
+            }
+            OutboundClass::Control => self.enqueue_ctrl(cancel, frame).await,
+            OutboundClass::Screen => self.enqueue_screen(cancel, frame).await,
+            OutboundClass::File => self.try_enqueue_file(frame.message),
+        }
+    }
+
+    /// 投进控制队列（可取消地等空位，**绝不丢**）。
+    ///
+    /// 帧的 `lane` 由调用方决定：`QosFeedback`/`RequestKeyframe` 在线上仍是 `Screen` lane，
+    /// 但内容小、时延敏感，所以走控制队列。
+    ///
+    /// # Errors
+    /// 取消令牌触发或写任务已结束时返回错误。
+    pub(crate) async fn enqueue_ctrl(
+        &self,
+        cancel: &CancellationToken,
+        frame: SessionFrame,
+    ) -> RemoteResult<()> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(RemoteError::Cancelled),
+            res = self.ctrl.send(frame) => res.map_err(|_| link_closed()),
+        }
+    }
+
+    /// 投进画面队列（可取消地等空位，**绝不丢**；时域参考链不能断）。
+    ///
+    /// # Errors
+    /// 取消令牌触发或写任务已结束时返回错误。
+    pub(crate) async fn enqueue_screen(
+        &self,
+        cancel: &CancellationToken,
+        frame: SessionFrame,
+    ) -> RemoteResult<()> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(RemoteError::Cancelled),
+            res = self.screen.send(frame) => res.map_err(|_| link_closed()),
+        }
+    }
+
+    /// **非阻塞**地把一条文件类消息投进文件队列（满了就暂存，绝不 `.await`）。
+    ///
+    /// # Errors
+    /// 写任务已结束（通道关闭）时返回错误。
+    pub(crate) fn try_enqueue_file(&mut self, msg: SessionMessage) -> RemoteResult<()> {
+        self.file_staging.push_back(msg);
+        self.drain_file()
+    }
+
+    /// 把暂存区里的文件消息按序补投（队满即停，保持 FIFO）。
+    ///
+    /// # Errors
+    /// 写任务已结束（通道关闭）时返回错误，暂存区一并清空。
+    pub(crate) fn drain_file(&mut self) -> RemoteResult<()> {
+        while let Some(msg) = self.file_staging.pop_front() {
+            match self.file.try_send(SessionFrame::file(msg)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(frame)) => {
+                    self.file_staging.push_front(frame.message);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.file_staging.clear();
+                    return Err(link_closed());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 在途采集的看门狗时限。
@@ -357,16 +599,63 @@ fn capture_tick_period(mode: ScreenMode, encode: &EncodeRates) -> Duration {
     }
 }
 
+/// 显示列表的**比较签名**：按 `id` 排序后的 `(id, width, height)`。
+///
+/// 只取这三个字段：`name`/`primary` 变化不影响采集（GUI 列表刷新本身需要整份 `DisplayList`，
+/// 但那由调用方在签名变化时另行处理）；`id` 排序让枚举顺序波动不算变化——平台返回顺序
+/// 不保证稳定，按原顺序比较会每拍都误判。
+#[must_use]
+fn display_signature(displays: &[DisplayInfo]) -> Vec<(u32, u32, u32)> {
+    let mut signature: Vec<(u32, u32, u32)> =
+        displays.iter().map(|d| (d.id, d.width, d.height)).collect();
+    signature.sort_unstable_by_key(|entry| entry.0);
+    signature
+}
+
 /// 显示尺寸 → **最终编码尺寸**，与视频路径的计算顺序完全一致。
 ///
-/// 平台采集源会先按 [`MAX_ENCODE_WIDTH`] 封顶（Windows 的 `capture_gpu_frame` /
+/// 平台采集源会先按 `max_width` 封顶（Windows 的 `capture_gpu_frame` /
 /// `capture_hardware` 用 `encode_dimensions(.., 1.0, ..)`），编码循环随后再施加 `rates.scale`。
 /// 补丁模式的目标帧缓冲必须落在**同一套**结果上，否则 4K + 非 1.0 缩放时两边会差一档
 /// （视频 960×540、补丁 1920×1080），控制端就会因尺寸不符拒绝所有补丁。
-fn encode_target_dims(display_width: u32, display_height: u32, scale: f32) -> (u32, u32) {
+///
+/// `max_width` 必须是**本会话协商后的**有效上限（见 [`effective_max_encode_width`]）：
+/// 默认 1920，硬件 H.264 + 原生分辨率时 3840。
+fn encode_target_dims(
+    display_width: u32,
+    display_height: u32,
+    scale: f32,
+    max_width: u32,
+) -> (u32, u32) {
     let (capped_width, capped_height) =
-        encode_dimensions(display_width, display_height, 1.0, MAX_ENCODE_WIDTH);
-    encode_dimensions(capped_width, capped_height, scale, MAX_ENCODE_WIDTH)
+        encode_dimensions(display_width, display_height, 1.0, max_width);
+    encode_dimensions(capped_width, capped_height, scale, max_width)
+}
+
+/// 本会话的有效编码宽度上限（像素）。
+///
+/// **只有硬件 H.264 + 用户显式开启原生分辨率**才放宽到
+/// [`NATIVE_MAX_ENCODE_WIDTH`]（3840）；其余一律 [`MAX_ENCODE_WIDTH`]（1920）——
+/// 包括「开了选项但对端只有 VP9」：VP9 软件解码 4K 在控制器侧仍是 37–58 ms 一帧。
+#[must_use]
+fn effective_max_encode_width(codec: CodecId, native_resolution: bool) -> u32 {
+    if native_resolution && codec == CodecId::H264 {
+        NATIVE_MAX_ENCODE_WIDTH
+    } else {
+        MAX_ENCODE_WIDTH
+    }
+}
+
+/// 原生分辨率会话把档位码率上限翻倍（帧率、缩放不动），见 [`native_bitrate_ceiling`]。
+fn session_encode_options(options: EncodeOptions, native_active: bool) -> EncodeOptions {
+    if native_active {
+        EncodeOptions {
+            target_bitrate_kbps: native_bitrate_ceiling(options.target_bitrate_kbps),
+            ..options
+        }
+    } else {
+        options
+    }
 }
 
 /// 退出补丁模式：回到全帧视频、强制关键帧，并让采集节拍重新对齐到视频档位。
@@ -452,6 +741,13 @@ pub struct ControlledConfig {
     /// 自阶段 3 起它是档位**上限**，不是实际生效值——实际值由 QoS 闭环
     /// （[`crate::qos::RateController`]）在上限之下浮动，见 [`crate::screen::EncodeRates`]。
     pub encode: EncodeOptions,
+    /// 是否允许**原生分辨率**（4K）编码（默认 `false`）。
+    ///
+    /// 仅在协商到**硬件 H.264** 时生效：编码宽度上限从 [`MAX_ENCODE_WIDTH`]（1920）
+    /// 放宽到 [`NATIVE_MAX_ENCODE_WIDTH`]（3840），档位码率经
+    /// [`crate::screen::native_bitrate_ceiling`] 翻倍（封顶 30 Mbps）；VP9 路径不受影响。
+    /// 这一项只在**会话开始**时读取，运行中改它只影响下一次会话。
+    pub native_resolution: bool,
     /// 在途采集的看门狗时限（见 [`CAPTURE_WATCHDOG`]）。
     ///
     /// 做成字段而非直接读常量，是为了让测试用极短的值验证「采集 panic/挂死之后仍能恢复」，
@@ -538,7 +834,7 @@ fn choose_codec(offer: Option<(bool, bool)>, has_h264_encoder: bool) -> CodecId 
 /// 只记日志忽略（真实控制器在握手后**立刻**发 offer，TCP 保序保证它排在帧与输入之前）。
 async fn read_codec_offer(
     reader: &mut SessionReader,
-    tx: &mpsc::Sender<WriterMsg>,
+    queues: &OutboundQueues,
     cancel: &CancellationToken,
     offer_timeout: Duration,
 ) -> RemoteResult<CodecOfferOutcome> {
@@ -555,7 +851,9 @@ async fn read_codec_offer(
                         return Ok(CodecOfferOutcome::Offer { h264, vp9 });
                     }
                     SessionMessage::Heartbeat => {
-                        enqueue(tx, cancel, SessionFrame::control(SessionMessage::HeartbeatAck)).await?;
+                        queues
+                            .enqueue_ctrl(cancel, SessionFrame::control(SessionMessage::HeartbeatAck))
+                            .await?;
                     }
                     other => debug!(?other, "编解码协商阶段收到未处理消息，忽略"),
                 },
@@ -588,7 +886,8 @@ pub async fn run_controlled(
     let mut reader = FramedRead::new(read_half, SessionCodec::new());
     let mut writer = FramedWrite::new(write_half, SessionCodec::new());
 
-    let displays = screen.displays();
+    // 会持续更新（显示器热插拔/分辨率变化），故必须是 `mut`。
+    let mut displays = screen.displays();
 
     // 1) 读 Hello 并鉴权（明文）。
     let hello = match timeout(HANDSHAKE_TIMEOUT, reader.next()).await {
@@ -662,16 +961,16 @@ pub async fn run_controlled(
     writer.encoder_mut().set_cipher(Cipher::new(keys.send)?);
     debug!(session = %config.session_id, "被控端会话已加密");
 
-    // 出站写任务：独占写半边。会话 `select!` 循环只把帧投进有界队列，**不再在分支里 await 写**
+    // 出站写任务：独占写半边。会话 `select!` 循环只把帧投进分档队列，**不再在分支里 await 写**
     // ——否则写侧被背压卡住时（对端停读、中继停走），输入/心跳分支完全得不到轮询，形成队头阻塞。
-    // 协商阶段的 `HeartbeatAck` / `CodecSelect` 也走这条队列，故先把它起来。
-    let (tx, rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
-    let writer_task = tokio::spawn(writer_loop(writer, rx, cancel.clone()));
+    // 协商阶段的 `HeartbeatAck` / `CodecSelect` 也走这些队列，故先把它起来。
+    let (mut queues, receivers) = OutboundQueues::new();
+    let writer_task = tokio::spawn(writer_loop(writer, receivers, cancel.clone()));
 
     // 2.5) 编解码协商：**必须先拿到 `CodecOffer` 才能开始采集/编码**——否则首帧可能用了控制器
     // 解不了的 codec，只能靠后来请求关键帧重来。控制器在握手后立刻发它；超时回退 VP9（
     // 见 [`CODEC_OFFER_TIMEOUT`]），对端在协商前关连接按正常结束处理。
-    let outcome = match read_codec_offer(&mut reader, &tx, &cancel, CODEC_OFFER_TIMEOUT).await {
+    let outcome = match read_codec_offer(&mut reader, &queues, &cancel, CODEC_OFFER_TIMEOUT).await {
         Ok(outcome) => outcome,
         Err(RemoteError::Cancelled) => {
             return Ok(SessionEnd {
@@ -706,13 +1005,18 @@ pub async fn run_controlled(
     } else {
         vp9_encoder_factory()
     };
-    enqueue(
-        &tx,
-        &cancel,
-        SessionFrame::control(SessionMessage::CodecSelect { codec }),
-    )
-    .await?;
+    queues
+        .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::CodecSelect { codec }))
+        .await?;
     info!("编解码协商完成（被控端） codec={codec:?}");
+
+    // 本会话的**有效编码宽度上限**：只有硬件 H.264 + 用户显式开启原生分辨率才放宽到 3840
+    // （见 [`effective_max_encode_width`]）。采集侧也按它预缩放——采集实现必须与编码循环用
+    // 同一个值，否则补丁/全帧两条路径的尺寸会差一档。
+    let max_encode_width = effective_max_encode_width(codec, config.native_resolution);
+    let native_active = max_encode_width > MAX_ENCODE_WIDTH;
+    screen.set_max_encode_width(max_encode_width);
+    info!("编码宽度上限（被控端） max_width={max_encode_width} native={native_active}");
 
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
@@ -726,7 +1030,7 @@ pub async fn run_controlled(
     let (encode_tx, encode_rx) = mpsc::channel::<EncodeJob>(1);
     let encode_task = tokio::spawn(encode_loop(
         encode_rx,
-        tx.clone(),
+        queues.screen_sender(),
         cancel.clone(),
         config.stats.clone(),
         codec,
@@ -734,6 +1038,7 @@ pub async fn run_controlled(
         config.unchanged_resend,
         Arc::clone(&sent_kbps),
         Arc::clone(&base_frame_sent),
+        max_encode_width,
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -765,7 +1070,10 @@ pub async fn run_controlled(
     let patch_capable = patch_compressor.is_some();
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
-    let mut rate = RateController::new(config.encode);
+    //
+    // 原生分辨率会话把上限**翻倍**（封顶 30 Mbps）：4K 桌面文字在 10 Mbps 下明显不够。
+    // 只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
+    let mut rate = RateController::new(session_encode_options(config.encode, native_active));
     let mut encode = rate.current();
     let mut display_id = displays
         .iter()
@@ -781,6 +1089,12 @@ pub async fn run_controlled(
     // 出站文件块：只在有在途传输时启用。
     let mut file_tick = interval_at(Instant::now(), CHUNK_PAUSE);
     file_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 显示器热插拔/分辨率变化复查。首拍延后一个周期：会话开始时刚刚枚举过一次。
+    let mut display_tick = interval_at(
+        Instant::now() + DISPLAY_RECHECK_INTERVAL,
+        DISPLAY_RECHECK_INTERVAL,
+    );
+    display_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     // 采集节拍用「可重置的 sleep」而不是固定 interval：画质档位会改 `max_fps`，档位一变
     // 节拍要立刻跟着变（`interval_at` 的周期改不了，只能重建）。
@@ -819,6 +1133,8 @@ pub async fn run_controlled(
     // 迟到的 ack 与更新的心跳配错对，算出一个假的低 RTT。队列按 FIFO 配对，最坏只是样本旧
     // 一个周期；上限 8 防止对端完全不应答时无限增长。
     let mut heartbeat_sent: VecDeque<Instant> = VecDeque::new();
+    // 最近一次收到 `HeartbeatAck` 的时刻：仅用于超时告警（不上线、不进协议）。
+    let mut last_ack_at: Option<Instant> = None;
     let mut reason = String::from("会话结束");
     let result: RemoteResult<SessionEnd> = loop {
         tokio::select! {
@@ -827,12 +1143,26 @@ pub async fn run_controlled(
                 break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
             }
             _ = heartbeat.tick() => {
+                // 存活检测：队首是最老的未应答心跳。超过 `LIVENESS_TIMEOUT` 仍没配对，说明链路
+                // 已经断了（中继停转发但 TCP 未断时对端不会给我们任何错误，会话会「永久冻结」
+                // 而 UI 仍显示在线）。必须在容量上限的 `pop_front` 之前判（理由同控制器侧）。
+                // 队列空（还没发过心跳）时不判。
+                if heartbeat_sent.front().is_some_and(|sent| sent.elapsed() >= LIVENESS_TIMEOUT) {
+                    let last_ack_ms = last_ack_at
+                        .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    warn!(?last_ack_ms, "对端心跳超时（链路可能已中断），结束会话");
+                    "对端心跳超时（链路可能已中断）".clone_into(&mut reason);
+                    break Ok(SessionEnd { reason: reason.clone(), deliberate: false });
+                }
                 // FIFO 配对：迟到的 ack 认领最老的未应答心跳，而不是最新那个。
                 if heartbeat_sent.len() >= HEARTBEAT_SENT_CAP {
                     heartbeat_sent.pop_front();
                 }
                 heartbeat_sent.push_back(Instant::now());
-                if let Err(err) = enqueue(&tx, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
+                if let Err(err) = queues
+                    .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat))
+                    .await
+                {
                     break Err(err);
                 }
             }
@@ -891,7 +1221,12 @@ pub async fn run_controlled(
                                         .iter()
                                         .find(|d| d.id == display_id)
                                         .map_or((0, 0), |d| {
-                                            encode_target_dims(d.width, d.height, encode.scale)
+                                            encode_target_dims(
+                                                d.width,
+                                                d.height,
+                                                encode.scale,
+                                                max_encode_width,
+                                            )
                                         });
                                     if patches.width != want_w || patches.height != want_h {
                                         warn!(
@@ -962,9 +1297,10 @@ pub async fn run_controlled(
                                                         "发送脏矩形补丁"
                                                     );
                                                     // 补丁很小，但**绝不丢弃**（丢一个会让画面永久缺
-                                                    // 一块），故走 `enqueue` 的可取消等待。
-                                                    if let Err(err) =
-                                                        enqueue(&tx, &cancel, SessionFrame::screen(msg)).await
+                                                    // 一块），故走画面队列的可取消等待。
+                                                    if let Err(err) = queues
+                                                        .enqueue_screen(&cancel, SessionFrame::screen(msg))
+                                                        .await
                                                     {
                                                         break Err(err);
                                                     }
@@ -1053,7 +1389,7 @@ pub async fn run_controlled(
                     let request = match screen_mode.mode {
                         ScreenMode::Patches => CaptureRequest::Patches {
                             scale: encode.scale,
-                            max_width: MAX_ENCODE_WIDTH,
+                            max_width: max_encode_width,
                         },
                         ScreenMode::Video => CaptureRequest::Frame { gpu: gpu_capture },
                     };
@@ -1064,19 +1400,97 @@ pub async fn run_controlled(
                     });
                 }
             }
-            _ = file_tick.tick(), if transfer.has_outgoing() => {
-                match transfer.next_outbound().await {
-                    Ok(Some(msg)) => {
-                        if let Err(err) = enqueue(&tx, &cancel, SessionFrame::file(msg)).await {
-                            break Err(err);
+            // 显示器热插拔 / 分辨率变化复查。
+            //
+            // 会话开始时只枚举了一次，之后不复查会有两个后果：控制器的显示器列表永远陈旧；
+            // 当前采集的显示器被拔掉后 `capture` 只 `warn!` 后继续，画面永久冻结而会话
+            // 看起来还活着。5 秒的延迟对热插拔是可接受的。
+            //
+            // 枚举直接内联：Windows 的 `EnumDisplayMonitors` 是毫秒级，远小于一次采集（视
+            // 平台可能几十毫秒到数秒），不值得为它再引一条 `spawn_blocking` 通道与在途标志
+            // ——那反而让分支状态机多一个可出错点。
+            _ = display_tick.tick() => {
+                let fresh = screen.displays();
+                if fresh.is_empty() {
+                    // 空列表一律视为**一次枚举失败**（拔掉唯一显示器、锁屏/切桌面瞬间等）：
+                    // 不应用。否则会把控制器列表清空、并把采集目标改成一块不存在的屏。
+                    debug!("显示器枚举返回空列表，保留旧列表");
+                } else if display_signature(&fresh) != display_signature(&displays) {
+                    let old_current = displays.iter().find(|d| d.id == display_id).cloned();
+                    let count = fresh.len();
+                    displays = fresh;
+                    // 控制队列（可取消地等空位、绝不丢）：GUI 据此刷新显示器下拉框。
+                    if let Err(err) = queues
+                        .enqueue_ctrl(
+                            &cancel,
+                            SessionFrame::control(SessionMessage::DisplayList(displays.clone())),
+                        )
+                        .await
+                    {
+                        break Err(err);
+                    }
+                    let new_current = displays.iter().find(|d| d.id == display_id);
+                    match (old_current, new_current) {
+                        // 当前采集的显示器被拔掉：改选 primary（没有则第一个），并立刻出帧。
+                        (_, None) => {
+                            if let Some(target) = displays
+                                .iter()
+                                .find(|d| d.primary)
+                                .or_else(|| displays.first())
+                            {
+                                let new_id = target.id;
+                                info!(
+                                    "当前显示器 {display_id} 已消失，切换到显示器 {new_id}（共 {count} 台）"
+                                );
+                                display_id = new_id;
+                            }
+                            // 几何/来源都变了：补丁模式的持久缓冲与编码器尺寸都要重建。
+                            screen_mode.exit();
+                            force_keyframe = true;
+                            capture_tick.as_mut().reset(Instant::now());
+                        }
+                        // 当前显示器还在但分辨率变了：同上（控制器那块合成帧已作废）。
+                        (Some(old), Some(new))
+                            if (old.width, old.height) != (new.width, new.height) =>
+                        {
+                            info!(
+                                "显示器 {display_id} 分辨率变化 {}x{} -> {}x{}，重建编码器并强制关键帧",
+                                old.width, old.height, new.width, new.height
+                            );
+                            screen_mode.exit();
+                            force_keyframe = true;
+                            capture_tick.as_mut().reset(Instant::now());
+                        }
+                        // 其它变化（拔插了别的显示器、primary 变了）：列表已刷新，当前采集目标
+                        // 不受影响，参考链与几何都没变，**不**插 IDR。
+                        (_, Some(_)) => {
+                            info!("显示器列表变化（当前显示器 {display_id} 未变，共 {count} 台）");
                         }
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, "文件读取失败，中断该次传输");
-                        // 回发 `FileError`：发送方不再有 chunk 流动，对端的 `Incoming` 会一直挂着。
-                        if let Err(send_err) = send_file_errors(&tx, &cancel, transfer.abort_all(&err.to_string())).await {
-                            break Err(send_err);
+                }
+            }
+            // 文件块生产**永不阻塞主循环**：先补投暂存区，再在 file 队列确实有空位时才读下一块。
+            // `try_enqueue_file` 只做 `try_send`，满了就留在暂存区等下一拍；绝不 `.await` 空位。
+            _ = file_tick.tick(), if transfer.has_outgoing() || queues.has_staged_file() => {
+                if let Err(err) = queues.drain_file() {
+                    break Err(err);
+                }
+                if queues.file_has_room() && transfer.has_outgoing() {
+                    match transfer.next_outbound().await {
+                        Ok(Some(msg)) => {
+                            if let Err(err) = queues.dispatch_frame(&cancel, SessionFrame::file(msg)).await {
+                                break Err(err);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(error = %err, "文件读取失败，中断该次传输");
+                            // 回发 `FileError`：发送方不再有 chunk 流动，对端的 `Incoming` 会一直挂着。
+                            if let Err(send_err) =
+                                send_file_errors(&mut queues, &cancel, transfer.abort_all(&err.to_string())).await
+                            {
+                                break Err(send_err);
+                            }
                         }
                     }
                 }
@@ -1120,7 +1534,11 @@ pub async fn run_controlled(
                         }
                         SessionMessage::SetQuality { preset } => {
                             // 档位是**上限**：换上限并把闭环重置到新上限（用户显式意图，不带降级历史）。
-                            rate.set_ceiling(preset.options());
+                            // 原生分辨率会话同样翻倍（见 `session_encode_options`）。
+                            rate.set_ceiling(session_encode_options(
+                                preset.options(),
+                                native_active,
+                            ));
                             // 用户显式选的帧率优先级高于档位默认值：换画质不应把它覆盖回去。
                             if let Some(fps) = selected_fps {
                                 rate.set_frame_rate_ceiling(fps);
@@ -1169,7 +1587,7 @@ pub async fn run_controlled(
                             // 不置关键帧（见 `RateController::observe_activity`）。
                             rate.observe_activity(last_changed_permille);
                             let local_backlog =
-                                u32::try_from(WRITER_QUEUE.saturating_sub(tx.capacity())).unwrap_or(u32::MAX);
+                                u32::try_from(queues.screen_backlog()).unwrap_or(u32::MAX);
                             // 本窗口**实际发出**的码率（编码任务每秒写入）。与控制器回报的
                             // `recv_kbps` 一起算投递率，识别「RTT 还没抬升但链路已在丢包」。
                             let sent_kbps_now = sent_kbps.load(Ordering::Relaxed);
@@ -1269,18 +1687,26 @@ pub async fn run_controlled(
                                 },
                                 None => String::new(),
                             };
-                            if let Err(err) = enqueue(&tx, &cancel, SessionFrame::control(SessionMessage::Clipboard { text })).await {
+                            if let Err(err) = queues
+                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Clipboard { text }))
+                                .await
+                            {
                                 break Err(err);
                             }
                         }
                         SessionMessage::Heartbeat => {
-                            if let Err(err) = enqueue(&tx, &cancel, SessionFrame::control(SessionMessage::HeartbeatAck)).await {
+                            if let Err(err) = queues
+                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::HeartbeatAck))
+                                .await
+                            {
                                 break Err(err);
                             }
                         }
                         SessionMessage::HeartbeatAck => {
+                            let now = Instant::now();
+                            last_ack_at = Some(now);
                             if let Some(sent) = heartbeat_sent.pop_front() {
-                                if let Some(rtt) = trusted_rtt(sent, Instant::now()) {
+                                if let Some(rtt) = trusted_rtt(sent, now) {
                                     config.stats.report(SessionStats::Rtt(rtt));
                                 }
                             }
@@ -1299,9 +1725,13 @@ pub async fn run_controlled(
                         | SessionMessage::FileError { .. }) => {
                             match transfer.on_message(file).await {
                                 Ok(replies) => {
+                                    // 按分类投递：`FileError` 与数据块同队列（顺序在已有 chunk 之后），
+                                    // 其余文件协议小消息走控制队列。
                                     let mut write_err = None;
                                     for reply in replies {
-                                        if let Err(err) = enqueue(&tx, &cancel, SessionFrame::file(reply)).await {
+                                        if let Err(err) =
+                                            queues.dispatch_frame(&cancel, SessionFrame::file(reply)).await
+                                        {
                                             write_err = Some(err);
                                             break;
                                         }
@@ -1312,7 +1742,9 @@ pub async fn run_controlled(
                                 }
                                 Err(err) => {
                                     warn!(error = %err, "文件落盘失败，中断该次传输");
-                                    if let Err(send_err) = send_file_errors(&tx, &cancel, transfer.abort_all(&err.to_string())).await {
+                                    if let Err(send_err) =
+                                        send_file_errors(&mut queues, &cancel, transfer.abort_all(&err.to_string())).await
+                                    {
                                         break Err(send_err);
                                     }
                                 }
@@ -1346,22 +1778,19 @@ pub async fn run_controlled(
     // 会话正在收尾：在途传输一并作废。这里**不必**回发 `abort_all` 的 `FileError`——`Bye` 马上
     // 就到，对端收尾时同样会清掉自己的在途传输，不会挂在半途。
     let _ = transfer.abort_all(&reason);
-    // 收尾帧经同一队列交给写任务：即便取消已触发，写任务仍会限时尽力写出 `Bye`（见 `writer_loop`），
-    // 使对端把它记成「主动结束」而不是「连接断开」。队列满时 `send` 会等写侧腾出位置，故同样限时。
-    let _ = timeout(
-        BYE_TIMEOUT,
-        tx.send(WriterMsg::Close(SessionFrame::control(SessionMessage::Bye {
-            reason: reason.clone(),
-        }))),
-    )
-    .await;
-    // 编码任务先停：它可能正阻塞在出站队列的 `send` 上（对端停读）。关掉它的输入队列并限时等待，
+    // 收尾帧走独立的无界 close 通道：即便取消已触发、普通队列全满，写任务仍会限时尽力写出
+    // `Bye`（见 `writer_loop`），使对端把它记成「主动结束」而不是「连接断开」。
+    queues.close(SessionFrame::control(SessionMessage::Bye {
+        reason: reason.clone(),
+    }));
+    // 编码任务先停：它可能正阻塞在画面队列的 `send` 上（对端停读）。关掉它的输入队列并限时等待，
     // 超时则中止——它的 `send` 在写任务退出后会拿到 `Closed`，正常收场。
     drop(encode_tx);
     let mut encode_task = encode_task;
     let _ = timeout(BYE_TIMEOUT, &mut encode_task).await;
     encode_task.abort();
-    drop(tx);
+    // 丢弃三个普通队列的发送端：写任务在取消后只等 close，这些队列是否还有残留帧都不再重要。
+    drop(queues);
     // 写任务自己的 `Bye` 发送也限时（`BYE_TIMEOUT`），这里再给一个上界；超时则中止它——写任务
     // 仍卡在停读的对端上时，只有丢弃写半边（= 关闭 socket）才能避免把连接泄漏到 TCP 超时。
     let mut writer_task = writer_task;
@@ -1370,71 +1799,74 @@ pub async fn run_controlled(
     result
 }
 
-/// 出站写任务：独占写半边，从有界队列取帧写线。
+/// 出站写任务：独占写半边，按**四档优先级**从队列取帧写线。
+///
+/// 优先级固定为 close → ctrl → screen → file（`select!` 的 `biased`）。close 是收尾 `Bye`
+/// 专用通道，**不理会取消令牌**、限时尽力写出；其余三档在取消后不再发送。
 ///
 /// 取消语义：普通帧的发送同时等取消令牌（[`send_cancellable`]），取消一旦触发就丢弃后续普通帧、
 /// 只等收尾帧——这样「取消能立刻打断被背压卡住的发送」与「收尾 `Bye` 仍能尽力发出」两件事同时成立。
-async fn writer_loop(
+pub(crate) async fn writer_loop(
     mut writer: FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
-    mut rx: mpsc::Receiver<WriterMsg>,
+    mut rx: OutboundReceivers,
     cancel: CancellationToken,
 ) {
     // 取消后不再写普通帧，只等收尾帧。
     let mut cancelled = false;
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            WriterMsg::Frame(frame) => {
-                if cancelled {
-                    continue;
-                }
-                match send_cancellable(&mut writer, &cancel, frame).await {
-                    Ok(()) => {}
-                    Err(RemoteError::Cancelled) => cancelled = true,
-                    Err(err) => {
-                        debug!(error = %err, "出站写失败，写任务结束");
-                        break;
-                    }
-                }
-            }
-            WriterMsg::Close(frame) => {
+    loop {
+        tokio::select! {
+            // biased：顺序即优先级。close 永远先于任何普通帧。
+            biased;
+            Some(frame) = rx.close.recv() => {
                 // 收尾帧不理会取消令牌（取消正是最常见的结束原因），限时尽力写出。
                 let _ = timeout(BYE_TIMEOUT, writer.send(frame)).await;
                 break;
             }
+            Some(frame) = rx.ctrl.recv(), if !cancelled => {
+                if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
+                    break;
+                }
+            }
+            Some(frame) = rx.screen.recv(), if !cancelled => {
+                if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
+                    break;
+                }
+            }
+            Some(frame) = rx.file.recv(), if !cancelled => {
+                if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
+                    break;
+                }
+            }
+            // 所有通道都已关闭（或普通通道在取消后被禁用）：任务收场。
+            else => break,
         }
     }
 }
 
-/// 投递一帧给出站写任务（**控制帧与文件帧**专用）。
+/// 写一条普通帧；返回 `false` 表示写侧出错、写任务应结束。
 ///
-/// # 为什么这里可以等、画面帧却不能走这条路
-///
-/// 队头阻塞的成因是**画面帧**：它曾是大块（MiB 级 JPEG），写侧被背压卡住时会把有界队列塞满。
-/// 而**控制帧**只有几十字节、**文件帧**本身已由 [`CHUNK_PAUSE`] 节流，故它们**绝不可丢**：
-/// 丢一条 `FileChunk` 会让接收侧静默少收一截字节（`TransferHub::on_done` 的字节数校验会把这种
-/// 损坏变成显式错误，但正确做法是根本不丢），丢一条控制帧会让心跳/剪贴板应答凭空消失。队列被
-/// 暂时塞满时**可取消地等**它腾空；取消令牌保证「用户点中断能立刻脱身」这一既有语义不受影响。
-///
-/// **画面帧不走这里**：它在编码任务里经 [`send_video`] 投递——那条路径**绝不丢弃**（见模块文档），
-/// 背压出口在编码之前。
-///
-/// # Errors
-/// 等待队列腾空时被取消返回 [`RemoteError::Cancelled`]；写任务已结束（链路断开）返回
-/// [`RemoteError::Io`]。
-async fn enqueue(
-    tx: &mpsc::Sender<WriterMsg>,
+/// 取消触发时把 `cancelled` 置位并返回 `true`（继续循环只为等 close 通道里的 `Bye`）。
+async fn write_ordinary(
+    writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
     cancel: &CancellationToken,
     frame: SessionFrame,
-) -> RemoteResult<()> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(RemoteError::Cancelled),
-        res = tx.send(WriterMsg::Frame(frame)) => res.map_err(|_| link_closed()),
+    cancelled: &mut bool,
+) -> bool {
+    match send_cancellable(writer, cancel, frame).await {
+        Ok(()) => true,
+        Err(RemoteError::Cancelled) => {
+            *cancelled = true;
+            true
+        }
+        Err(err) => {
+            debug!(error = %err, "出站写失败，写任务结束");
+            false
+        }
     }
 }
 
 /// 出站写任务已结束（链路断开）时的会话级错误。
-fn link_closed() -> RemoteError {
+pub(crate) fn link_closed() -> RemoteError {
     RemoteError::Io(std::io::Error::new(
         std::io::ErrorKind::BrokenPipe,
         "出站写任务已结束",
@@ -1719,7 +2151,7 @@ fn kbps_from_bytes(bytes: u64, elapsed: Duration) -> u32 {
 )]
 async fn encode_loop(
     mut rx: mpsc::Receiver<EncodeJob>,
-    out: mpsc::Sender<WriterMsg>,
+    out: mpsc::Sender<SessionFrame>,
     cancel: CancellationToken,
     stats: SessionStatsReporter,
     codec: CodecId,
@@ -1727,6 +2159,9 @@ async fn encode_loop(
     unchanged_resend: Duration,
     sent_kbps: Arc<AtomicU32>,
     base_frame_sent: Arc<AtomicBool>,
+    // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
+    // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。
+    max_encode_width: u32,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -1773,7 +2208,8 @@ async fn encode_loop(
         } else {
             prev_rgba.as_deref() == Some(frame.rgba.as_slice())
         };
-        let (width, height) = encode_dimensions(frame.width, frame.height, rates.scale, MAX_ENCODE_WIDTH);
+        let (width, height) =
+            encode_dimensions(frame.width, frame.height, rates.scale, max_encode_width);
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
         if geometry_changed {
@@ -1935,14 +2371,14 @@ fn reconfig_and_encode(
 
 /// 把一帧画面消息投给出站写任务，**绝不丢弃**。
 ///
-/// 与 [`enqueue`] 的区别只在语义：画面帧一旦编码就不能丢（参考链），故这里 `send().await`
-/// 直到队列腾空；背压由编码任务之前的「跳过采集」出口消化（见 [`encode_loop`]）。
-/// 返回 `false` 表示会话正在收尾（取消触发或写任务已结束），编码任务据此退出。
-async fn send_video(out: &mpsc::Sender<WriterMsg>, cancel: &CancellationToken, msg: SessionMessage) -> bool {
+/// 画面帧一旦编码就不能丢（参考链），故这里 `send().await` 直到画面队列腾空；背压由编码任务
+/// 之前的「跳过采集」出口消化（见 [`encode_loop`]）。返回 `false` 表示会话正在收尾
+/// （取消触发或写任务已结束），编码任务据此退出。
+async fn send_video(out: &mpsc::Sender<SessionFrame>, cancel: &CancellationToken, msg: SessionMessage) -> bool {
     tokio::select! {
         biased;
         () = cancel.cancelled() => false,
-        res = out.send(WriterMsg::Frame(SessionFrame::screen(msg))) => res.is_ok(),
+        res = out.send(SessionFrame::screen(msg)) => res.is_ok(),
     }
 }
 
@@ -1957,7 +2393,7 @@ async fn send_video(out: &mpsc::Sender<WriterMsg>, cancel: &CancellationToken, m
 ///
 /// # Errors
 /// 取消令牌触发时返回 [`RemoteError::Cancelled`]；发送失败时透传底层 IO 错误。
-async fn send_cancellable(
+pub(crate) async fn send_cancellable(
     writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
     cancel: &CancellationToken,
     frame: SessionFrame,
@@ -1969,17 +2405,19 @@ async fn send_cancellable(
     }
 }
 
-/// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次投给出站写任务。
+/// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次投进出站队列。
 ///
 /// **必须回发**：发送方读文件失败后不会再有任何 chunk 流动，对端既等不到 `FileDone` 也等不到
-/// 错误，会一直挂在半途（UI 停在 99%）。走 [`enqueue`] 的文件帧路径（满队列时可取消地等，不丢）。
+/// 错误，会一直挂在半途（UI 停在 99%）。`FileError` 属 file 类，按分类只会暂存、不阻塞主循环。
 async fn send_file_errors(
-    tx: &mpsc::Sender<WriterMsg>,
+    queues: &mut OutboundQueues,
     cancel: &CancellationToken,
     msgs: Vec<SessionMessage>,
 ) -> RemoteResult<()> {
     for msg in msgs {
-        enqueue(tx, cancel, SessionFrame::file(msg)).await?;
+        queues
+            .dispatch_frame(cancel, SessionFrame::file(msg))
+            .await?;
     }
     Ok(())
 }
@@ -2070,7 +2508,10 @@ mod tests {
         CapturedPatches, Clipboard, DisplayInfo, EncodeOptions, EncodeRates, GpuFrame, InputEvent,
         InputSink, KeyEvent, MouseButton, RawFrame, ScreenPatch, ScreenSource,
     };
-    use crate::session::{plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage};
+    use crate::session::{
+        plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage,
+        LIVENESS_TIMEOUT,
+    };
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
     use rust_tunnel_common::protocol::RemoteMode;
@@ -2226,6 +2667,29 @@ mod tests {
         }
     }
 
+    /// 显示器列表会变的假采集源：前 `stable_calls` 次返回旧列表，之后返回新列表。
+    struct ShiftingScreen {
+        calls: AtomicUsize,
+        old: Vec<DisplayInfo>,
+        new: Vec<DisplayInfo>,
+        stable_calls: usize,
+    }
+
+    impl ScreenSource for ShiftingScreen {
+        fn displays(&self) -> Vec<DisplayInfo> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.stable_calls {
+                self.old.clone()
+            } else {
+                self.new.clone()
+            }
+        }
+
+        fn capture(&self, _display: u32) -> RemoteResult<RawFrame> {
+            Err(RemoteError::Platform("测试不采集".to_owned()))
+        }
+    }
+
     /// 读取剪贴板会长时间阻塞的假实现（X11 下别的进程持有 selection 的真实情形）。
     struct SlowClipboard {
         delay: Duration,
@@ -2320,6 +2784,7 @@ mod tests {
             mode,
             pending,
             encode: EncodeOptions::default(),
+            native_resolution: false,
             capture_watchdog,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
@@ -2352,6 +2817,48 @@ mod tests {
         assert_eq!(choose_codec(None, false), CodecId::Vp9);
     }
 
+    /// 显示器签名：与枚举顺序无关、空列表为空签名、尺寸/编号变化看得出来。
+    #[test]
+    fn display_signature_is_order_independent_and_tracks_geometry() {
+        fn display(id: u32, width: u32, height: u32, name: &str, primary: bool) -> DisplayInfo {
+            DisplayInfo {
+                id,
+                width,
+                height,
+                name: name.to_owned(),
+                primary,
+            }
+        }
+        let a = display(0, 1920, 1080, "内置", true);
+        let b = display(1, 2560, 1440, "外接", false);
+
+        // 枚举顺序不保证稳定：顺序不同但内容相同必须视为同一个签名。
+        assert_eq!(
+            display_signature(&[a.clone(), b.clone()]),
+            display_signature(&[b.clone(), a.clone()])
+        );
+        // 空列表：空签名（调用方据此判定「枚举失败/没有显示器」）。
+        assert!(display_signature(&[]).is_empty());
+        // 尺寸变化必须改变签名（分辨率变化要重建编码器）。
+        let resized = display(1, 1920, 1080, "外接", false);
+        assert_ne!(
+            display_signature(&[a.clone(), b.clone()]),
+            display_signature(&[a.clone(), resized])
+        );
+        // 编号变化也必须改变签名（换了一块屏）。
+        let renumbered = display(2, 2560, 1440, "外接", false);
+        assert_ne!(
+            display_signature(&[a.clone(), b.clone()]),
+            display_signature(&[a.clone(), renumbered])
+        );
+        // name/primary 不参与签名：它们不影响采集几何，不该触发重建/IDR。
+        let renamed = display(1, 2560, 1440, "改了个名", true);
+        assert_eq!(
+            display_signature(&[a, b]),
+            display_signature(&[renamed, display(0, 1920, 1080, "x", false)])
+        );
+    }
+
     /// 协商读取器应返回控制器声明的能力，并在窗口内正常应答心跳。
     #[tokio::test]
     async fn codec_offer_is_read_and_heartbeat_answered_during_negotiation() {
@@ -2359,7 +2866,7 @@ mod tests {
         let (read_half, _write_half) = tokio::io::split(Box::new(us) as BoxDuplex);
         let mut reader = FramedRead::new(read_half, SessionCodec::new());
         let mut peer_writer = FramedWrite::new(Box::new(peer) as BoxDuplex, SessionCodec::new());
-        let (tx, mut rx) = mpsc::channel::<WriterMsg>(4);
+        let (queues, mut rx) = OutboundQueues::new();
         let cancel = CancellationToken::new();
 
         // 控制器：先一条心跳（协商窗口内要应答），再发 offer。
@@ -2375,7 +2882,7 @@ mod tests {
             .await
             .expect("发 offer");
 
-        let outcome = read_codec_offer(&mut reader, &tx, &cancel, WAIT)
+        let outcome = read_codec_offer(&mut reader, &queues, &cancel, WAIT)
             .await
             .expect("读 offer 应成功");
         match outcome {
@@ -2387,11 +2894,11 @@ mod tests {
         // 心跳必须在协商阶段就被应答，否则控制器首个 RTT 样本会凭空消失。
         assert!(
             matches!(
-                rx.recv().await,
-                Some(WriterMsg::Frame(SessionFrame {
+                rx.ctrl.recv().await,
+                Some(SessionFrame {
                     message: SessionMessage::HeartbeatAck,
                     ..
-                }))
+                })
             ),
             "协商阶段收到 Heartbeat 必须回 HeartbeatAck"
         );
@@ -2403,11 +2910,11 @@ mod tests {
         let (peer, us) = tokio::io::duplex(1024);
         let (read_half, _write_half) = tokio::io::split(Box::new(us) as BoxDuplex);
         let mut reader = FramedRead::new(read_half, SessionCodec::new());
-        let (tx, _rx) = mpsc::channel::<WriterMsg>(4);
+        let (queues, _rx) = OutboundQueues::new();
         let cancel = CancellationToken::new();
 
         let started = Instant::now();
-        let outcome = read_codec_offer(&mut reader, &tx, &cancel, Duration::from_millis(30))
+        let outcome = read_codec_offer(&mut reader, &queues, &cancel, Duration::from_millis(30))
             .await
             .expect("超时不是错误");
         assert!(matches!(outcome, CodecOfferOutcome::Timeout), "应为 Timeout");
@@ -2455,6 +2962,131 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, ctld).await;
+    }
+
+    /// 显示器热插拔：会话中途列表变化时，被控端必须主动推 `DisplayList`（此前从未发送过）。
+    ///
+    /// 用 `start_paused` 跳过真实的 5s 复查间隔；控制器对端在循环里应答心跳，避免
+    /// [`LIVENESS_TIMEOUT`] 先把会话结束掉。`FileTransfer` 模式不采集，排除画面路径的干扰。
+    #[tokio::test(start_paused = true)]
+    async fn display_hotplug_pushes_display_list_to_controller() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let screen = Arc::new(ShiftingScreen {
+            calls: AtomicUsize::new(0),
+            old: vec![DisplayInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                name: "内置".into(),
+                primary: true,
+            }],
+            new: vec![
+                DisplayInfo {
+                    id: 0,
+                    width: 1920,
+                    height: 1080,
+                    name: "内置".into(),
+                    primary: false,
+                },
+                DisplayInfo {
+                    id: 1,
+                    width: 2560,
+                    height: 1440,
+                    name: "外接".into(),
+                    primary: true,
+                },
+            ],
+            stable_calls: 1,
+        });
+        let cancel = CancellationToken::new();
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config(pending_with("TOK"), RemoteMode::FileTransfer),
+            screen,
+            Arc::new(NullInputSink),
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        let (mut peer_reader, mut peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+
+        // 会话开始时的 `HelloAck` 已带旧列表；这里等中途那条 `DisplayList`。
+        let displays = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match peer_reader.next().await {
+                    Some(Ok(frame)) => match frame.message {
+                        SessionMessage::Heartbeat => {
+                            peer_writer
+                                .send(SessionFrame::control(SessionMessage::HeartbeatAck))
+                                .await
+                                .expect("回应心跳");
+                        }
+                        SessionMessage::DisplayList(list) => return list,
+                        _ => {}
+                    },
+                    other => panic!("会话意外结束: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("5s 复查后应主动推送 DisplayList");
+
+        assert_eq!(
+            displays
+                .iter()
+                .map(|d| (d.id, d.width, d.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 1920, 1080), (1, 2560, 1440)],
+            "DisplayList 必须是新列表（含新插入的显示器）"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, ctld).await;
+    }
+
+    /// 被控端侧心跳存活检测：控制器只读帧、**从不回 `HeartbeatAck`** 时，被控端必须在
+    /// [`LIVENESS_TIMEOUT`] 附近以 `deliberate: false` 结束（与控制器侧对称）。
+    ///
+    /// 中继停转发但 TCP 不断时，被控端同样收不到任何错误；没有这道判据，采集/编码会继续
+    /// 空转、UI 仍显示在线。用 `start_paused` 跳过真实的 4s 等待。
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_timeout_ends_controlled_session_as_link_failure() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config(pending_with("TOK"), RemoteMode::Control),
+            Arc::new(EmptyScreenSource),
+            input,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        let (mut peer_reader, peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+
+        // 控制器只排空、**从不回 HeartbeatAck**。writer 必须攥在手里：drop 掉会让被控端读到
+        // EOF，会话将以「对端已关闭连接」提前结束，测到的就不是超时判据了。
+        let peer = tokio::spawn(async move {
+            let _keep_writer = peer_writer;
+            while let Some(Ok(_frame)) = peer_reader.next().await {}
+        });
+
+        let end = tokio::time::timeout(LIVENESS_TIMEOUT + Duration::from_secs(3), ctld)
+            .await
+            .expect("心跳超时后应结束会话，而不是永久冻结")
+            .expect("任务不应 panic")
+            .expect("心跳超时属于正常收尾（不是 IO 错误）");
+        assert_eq!(end.reason, "对端心跳超时（链路可能已中断）");
+        assert!(
+            !end.deliberate,
+            "心跳超时是链路故障，deliberate 必须为 false"
+        );
+        peer.abort();
     }
 
     /// 作为「控制器」完成握手：写 `Hello`、读 `HelloAck`、装上加密，返回读写半边。
@@ -2612,13 +3244,13 @@ mod tests {
     }
 
     /// 一条出站消息是否为关键帧视频包。
-    fn is_keyframe(msg: &WriterMsg) -> bool {
+    fn is_keyframe(frame: &SessionFrame) -> bool {
         matches!(
-            msg,
-            WriterMsg::Frame(SessionFrame {
+            frame,
+            SessionFrame {
                 message: SessionMessage::VideoPacket { flags, .. },
                 ..
-            }) if flags & VIDEO_FLAG_KEYFRAME != 0
+            } if flags & VIDEO_FLAG_KEYFRAME != 0
         )
     }
 
@@ -2634,13 +3266,13 @@ mod tests {
     }
 
     /// 取出下一个视频包（跳过 `ScreenConfig` 等非画面帧），返回 `(flags, width, height)`。
-    async fn next_video(out_rx: &mut mpsc::Receiver<WriterMsg>) -> (u8, u32, u32) {
+    async fn next_video(out_rx: &mut mpsc::Receiver<SessionFrame>) -> (u8, u32, u32) {
         loop {
             match out_rx.recv().await {
-                Some(WriterMsg::Frame(SessionFrame {
+                Some(SessionFrame {
                     message: SessionMessage::VideoPacket { flags, width, height, .. },
                     ..
-                })) => return (flags, width, height),
+                }) => return (flags, width, height),
                 Some(_) => {}
                 None => panic!("出站队列已关闭"),
             }
@@ -2653,7 +3285,7 @@ mod tests {
     /// 消掉的带宽尖峰引回来。几何不变时 `encode_loop` 只能走 `set_bitrate` / `set_fps`（补丁 6）。
     #[tokio::test]
     async fn rate_change_reconfigures_online_without_idr() {
-        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(encode_loop(
@@ -2666,6 +3298,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -2722,7 +3355,7 @@ mod tests {
     /// 与上一条相对：这是唯一允许插 IDR 的路径（AIMD 的「大幅下调」）。
     #[tokio::test]
     async fn resolution_change_rebuilds_and_forces_keyframe() {
-        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(encode_loop(
@@ -2735,6 +3368,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -2845,7 +3479,7 @@ mod tests {
     /// `VideoPacket` 里填**实际** codec（不是写死 VP9）。
     #[tokio::test]
     async fn encode_loop_uses_selected_codec_in_config_and_packets() {
-        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(encode_loop(
@@ -2858,6 +3492,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
 
         job_tx
@@ -2873,17 +3508,17 @@ mod tests {
 
         // 首帧前必须先声明 `ScreenConfig`，且 codec 是协商选定的 H.264。
         match out_rx.recv().await {
-            Some(WriterMsg::Frame(SessionFrame {
+            Some(SessionFrame {
                 message: SessionMessage::ScreenConfig { codec, .. },
                 ..
-            })) => assert_eq!(codec, CodecId::H264, "ScreenConfig 必须填实际 codec"),
+            }) => assert_eq!(codec, CodecId::H264, "ScreenConfig 必须填实际 codec"),
             _ => panic!("首个出站帧应为 ScreenConfig"),
         }
         match out_rx.recv().await {
-            Some(WriterMsg::Frame(SessionFrame {
+            Some(SessionFrame {
                 message: SessionMessage::VideoPacket { codec, flags, .. },
                 ..
-            })) => {
+            }) => {
                 assert_eq!(codec, CodecId::H264, "VideoPacket 必须填实际 codec");
                 assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "首帧应为关键帧");
             }
@@ -2905,7 +3540,7 @@ mod tests {
     #[tokio::test]
     async fn skipped_forced_keyframe_is_retried_on_next_frame() {
         const JOB_CAP: usize = 4;
-        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(2);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(2);
         // 供测试自己往出站队列里塞占位帧（模拟背压），故先克隆一份。
         let filler = out_tx.clone();
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(JOB_CAP);
@@ -2920,6 +3555,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -2929,14 +3565,14 @@ mod tests {
             capture_us: 0,
             frame,
         };
-        let placeholder = || WriterMsg::Frame(SessionFrame::control(SessionMessage::Heartbeat));
+        let placeholder = || SessionFrame::control(SessionMessage::Heartbeat);
 
         // 首帧：先下发 `ScreenConfig`，随后是关键帧。
         job_tx.send(job(shaded(0, 64, 48, 10), true)).await.expect("投递首帧");
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(WriterMsg::Frame(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. }))
+                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -2984,7 +3620,7 @@ mod tests {
     /// `frame.changed` 会被静默忽略，GPU 路径又回到每拍空编码。
     #[tokio::test]
     async fn unchanged_gpu_frame_is_skipped_unless_forced() {
-        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(encode_loop(
@@ -2998,6 +3634,7 @@ mod tests {
             Duration::from_secs(3600),
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -3021,7 +3658,7 @@ mod tests {
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(WriterMsg::Frame(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. }))
+                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -3068,7 +3705,7 @@ mod tests {
     /// 就插 IDR 是之前专门修掉的回归。
     #[tokio::test]
     async fn unchanged_gpu_frames_are_resent_when_interval_is_zero() {
-        let (out_tx, mut out_rx) = mpsc::channel::<WriterMsg>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
         let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(encode_loop(
@@ -3081,6 +3718,7 @@ mod tests {
             Duration::ZERO,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -3104,7 +3742,7 @@ mod tests {
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(WriterMsg::Frame(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. }))
+                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -3773,20 +4411,74 @@ mod tests {
         );
     }
 
-    /// 补丁目标尺寸必须与视频路径的**双重换算**一致（先按 1920 封顶，再乘 scale）。
+    /// 补丁目标尺寸必须与视频路径的**双重换算**一致（先按 `max_width` 封顶，再乘 scale）。
     ///
     /// 这条锁住的是 4K + 非 1.0 缩放的错位：直接用「原始宽 × scale 再封顶」会得到
     /// 1920×1080，而视频路径得到 960×540，控制端会因尺寸不符拒绝所有补丁。
     #[test]
     fn encode_target_dims_matches_the_video_path_double_step() {
-        assert_eq!(encode_target_dims(1920, 1080, 1.0), (1920, 1080));
-        assert_eq!(encode_target_dims(1920, 1080, 0.5), (960, 540));
+        assert_eq!(encode_target_dims(1920, 1080, 1.0, MAX_ENCODE_WIDTH), (1920, 1080));
+        assert_eq!(encode_target_dims(1920, 1080, 0.5, MAX_ENCODE_WIDTH), (960, 540));
         // 4K：先封顶到 1920×1080，再乘 scale。
-        assert_eq!(encode_target_dims(3840, 2160, 1.0), (1920, 1080));
-        assert_eq!(encode_target_dims(3840, 2160, 0.5), (960, 540));
-        assert_eq!(encode_target_dims(3840, 2160, 0.75), (1440, 810));
+        assert_eq!(
+            encode_target_dims(3840, 2160, 1.0, MAX_ENCODE_WIDTH),
+            (1920, 1080)
+        );
+        assert_eq!(
+            encode_target_dims(3840, 2160, 0.5, MAX_ENCODE_WIDTH),
+            (960, 540)
+        );
+        assert_eq!(
+            encode_target_dims(3840, 2160, 0.75, MAX_ENCODE_WIDTH),
+            (1440, 810)
+        );
         // 超宽屏（5120）：同样先封顶。
-        assert_eq!(encode_target_dims(5120, 2880, 0.5), (960, 540));
+        assert_eq!(
+            encode_target_dims(5120, 2880, 0.5, MAX_ENCODE_WIDTH),
+            (960, 540)
+        );
+        // 原生分辨率：4K 原生保真；0.5 缩放仍得到 1920（与视频路径一致）。
+        assert_eq!(
+            encode_target_dims(3840, 2160, 1.0, NATIVE_MAX_ENCODE_WIDTH),
+            (3840, 2160)
+        );
+        assert_eq!(
+            encode_target_dims(3840, 2160, 0.5, NATIVE_MAX_ENCODE_WIDTH),
+            (1920, 1080)
+        );
+    }
+
+    /// 有效上限只对**硬件 H.264 + 显式开启**放宽；开了选项但只有 VP9 仍是 1920。
+    ///
+    /// 这是「原生分辨率」的完整真值表：VP9 软件解 4K 的成本不允许被这个开关带进来。
+    #[test]
+    fn effective_max_encode_width_table() {
+        assert_eq!(effective_max_encode_width(CodecId::H264, true), 3840);
+        assert_eq!(effective_max_encode_width(CodecId::Vp9, true), MAX_ENCODE_WIDTH);
+        assert_eq!(effective_max_encode_width(CodecId::H264, false), MAX_ENCODE_WIDTH);
+        assert_eq!(effective_max_encode_width(CodecId::Vp9, false), MAX_ENCODE_WIDTH);
+        assert_eq!(NATIVE_MAX_ENCODE_WIDTH, 3840);
+    }
+
+    /// 原生分辨率只翻**码率上限**：帧率/缩放原样，封顶 30 Mbps。
+    #[test]
+    fn native_resolution_doubles_only_the_bitrate_ceiling() {
+        let hd = EncodeOptions::default();
+        let native = session_encode_options(hd, true);
+        assert_eq!(native.target_bitrate_kbps, hd.target_bitrate_kbps * 2);
+        assert_eq!(native.max_fps, hd.max_fps, "帧率不动");
+        assert!((native.scale - hd.scale).abs() < f32::EPSILON, "缩放不动");
+        // 非原生：逐字段原样（不悄悄改上限）。
+        assert_eq!(session_encode_options(hd, false), hd);
+        // 各档位都翻倍且不越过封顶。
+        for preset in crate::screen::QualityPreset::all() {
+            let doubled = session_encode_options(preset.options(), true);
+            assert_eq!(
+                doubled.target_bitrate_kbps,
+                preset.options().target_bitrate_kbps * 2
+            );
+            assert!(doubled.target_bitrate_kbps <= crate::screen::NATIVE_MAX_BITRATE_KBPS);
+        }
     }
 
     /// 顺序不变量：基准关键帧**真正写出**后才进入补丁模式；等不到就放弃并清零计数。
@@ -3962,5 +4654,194 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, ctld).await.expect("被控端应结束");
+    }
+
+    // ───────────────── 出站分档队列（阶段 10） ─────────────────
+
+    /// 分类机械锁：每一类代表消息都必须落在正确的队列上。
+    ///
+    /// 三处最容易归错的点（改 `outbound_class` 前先看这里）：
+    /// - `ScreenConfig` 必须与 `VideoPacket` 同队列，否则首帧可能先于尺寸声明到达；
+    /// - `FileDone`/`FileError` 必须与 `FileChunk` 同队列，否则收尾会越过尚未投递的块；
+    /// - `QosFeedback`/`RequestKeyframe` 在线上是 `Screen` lane，但内容小、时延敏感，走控制队列。
+    #[test]
+    fn outbound_class_covers_sensitive_messages() {
+        assert_eq!(
+            outbound_class(&SessionMessage::Bye {
+                reason: "结束".to_owned(),
+            }),
+            OutboundClass::Close
+        );
+        for msg in [
+            SessionMessage::VideoPacket {
+                display: 0,
+                seq: 1,
+                codec: CodecId::Vp9,
+                flags: VIDEO_FLAG_KEYFRAME,
+                width: 2,
+                height: 2,
+                data: vec![0],
+            },
+            SessionMessage::RegionUpdate {
+                display: 0,
+                width: 2,
+                height: 2,
+                rects: Vec::new(),
+            },
+            SessionMessage::ScreenConfig {
+                display: 0,
+                codec: CodecId::Vp9,
+                width: 2,
+                height: 2,
+            },
+        ] {
+            assert_eq!(outbound_class(&msg), OutboundClass::Screen, "{msg:?}");
+        }
+        for msg in [
+            SessionMessage::FileChunk {
+                id: 1,
+                data: vec![0],
+            },
+            SessionMessage::FileDone { id: 1 },
+            SessionMessage::FileError {
+                id: 1,
+                reason: "失败".to_owned(),
+            },
+        ] {
+            assert_eq!(outbound_class(&msg), OutboundClass::File, "{msg:?}");
+        }
+        for msg in [
+            SessionMessage::Heartbeat,
+            SessionMessage::HeartbeatAck,
+            SessionMessage::Input(InputEvent::MouseMove {
+                x: 1,
+                y: 2,
+                display: 0,
+            }),
+            SessionMessage::RequestKeyframe { display: 0 },
+            SessionMessage::QosFeedback {
+                rtt_ms: 1,
+                recv_kbps: 2,
+                decode_ms: 3,
+                backlog: 4,
+            },
+            SessionMessage::FileAccept {
+                id: 1,
+                accepted: true,
+                reason: None,
+                size: 0,
+            },
+            SessionMessage::CodecSelect {
+                codec: CodecId::Vp9,
+            },
+            SessionMessage::LockScreen,
+        ] {
+            assert_eq!(outbound_class(&msg), OutboundClass::Control, "{msg:?}");
+        }
+    }
+
+    /// file 队列满时，文件消息只暂存、不阻塞；控制帧必须立刻投得进去。
+    ///
+    /// 这是「文件传输永不阻塞主循环」的核心断言：`try_enqueue_file` 若在满队列上 `.await`，
+    /// 采集会停拍、输入与心跳会停摆（中继停走时对端还会把会话判成超时）。
+    #[tokio::test]
+    async fn full_file_queue_does_not_block_control() {
+        let (mut queues, mut rx) = OutboundQueues::new();
+        // 填满 file 队列。
+        for byte in [1_u8, 2] {
+            queues
+                .try_enqueue_file(SessionMessage::FileChunk {
+                    id: 1,
+                    data: vec![byte; 16],
+                })
+                .expect("初始队列有空位");
+        }
+        assert!(!queues.file_has_room(), "file 队列应已填满");
+        // 再压一条：只能进暂存区，且不得阻塞。
+        queues
+            .try_enqueue_file(SessionMessage::FileChunk {
+                id: 1,
+                data: vec![3; 16],
+            })
+            .expect("满队列也只是暂存");
+        assert!(queues.has_staged_file(), "满队列的块应留在暂存区");
+        assert!(!queues.file_has_room(), "暂存不会偷偷扩容队列");
+
+        // 关键断言：控制帧投递立即成功（timeout 只是防挂死的守卫，不是预期等待）。
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            queues.enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat)),
+        )
+        .await
+        .expect("控制帧投递不得被文件队列阻塞")
+        .expect("控制队列有空位");
+
+        // 已入队的块保持原序，暂存的那条不在其中。
+        for byte in [1_u8, 2] {
+            let frame = rx.file.recv().await.expect("file 队列应有帧");
+            match frame.message {
+                SessionMessage::FileChunk { data, .. } => assert_eq!(data[0], byte),
+                other => panic!("期望 FileChunk，实得 {other:?}"),
+            }
+        }
+    }
+
+    /// 暂存区保持 FIFO：`FileDone` 绝不能越过尚未投递的 `FileChunk`。
+    ///
+    /// 越序意味着接收方在收到最后一块之前就收到「传输完成」，落盘的文件会被截断。
+    #[tokio::test]
+    async fn staged_file_messages_keep_fifo_order() {
+        let (mut queues, mut rx) = OutboundQueues::new();
+        let cancel = CancellationToken::new();
+        // 先填满队列，让后面三条全部落进暂存区。
+        for _ in 0..FILE_QUEUE {
+            queues
+                .try_enqueue_file(SessionMessage::FileChunk {
+                    id: 7,
+                    data: vec![0; 16],
+                })
+                .expect("填队列");
+        }
+        for msg in [
+            SessionMessage::FileChunk {
+                id: 7,
+                data: vec![1; 16],
+            },
+            SessionMessage::FileChunk {
+                id: 7,
+                data: vec![2; 16],
+            },
+            SessionMessage::FileDone { id: 7 },
+        ] {
+            queues
+                .dispatch_frame(&cancel, SessionFrame::file(msg))
+                .await
+                .expect("file 类只暂存、不阻塞");
+        }
+        assert!(queues.has_staged_file(), "三条都应暂存");
+
+        // 收一块、补投一次：每读出一块就腾出一个空位，暂存区按 FIFO 补进去。
+        let mut seen = Vec::new();
+        for _ in 0..FILE_QUEUE + 3 {
+            let frame = rx.file.recv().await.expect("file 队列应始终有帧");
+            seen.push(frame.message);
+            queues.drain_file().expect("写任务仍在，补投应成功");
+        }
+
+        // 前 FILE_QUEUE 条是填充块（首字节 0），随后必须依次是块 1、块 2、完成（0xFF 代表）。
+        let order: Vec<u8> = seen
+            .into_iter()
+            .map(|msg| match msg {
+                SessionMessage::FileChunk { data, .. } => data[0],
+                SessionMessage::FileDone { .. } => u8::MAX,
+                other => panic!("意外的文件消息 {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            &order[FILE_QUEUE..],
+            &[1, 2, u8::MAX],
+            "暂存区必须保持 FIFO：FileDone 不能越过尚未投递的块（实际顺序 {order:?}）"
+        );
     }
 }

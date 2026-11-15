@@ -297,6 +297,7 @@ fn manager_with_dirs(
         displays: 1,
         enabled,
         establisher,
+        native_resolution: false,
         encode: EncodeOptions {
             target_bitrate_kbps: 2000,
             scale: 1.0,
@@ -642,6 +643,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         mode: RemoteMode::Control,
         pending,
         encode: EncodeOptions::default(),
+        native_resolution: false,
         capture_watchdog: CAPTURE_WATCHDOG,
         unchanged_resend: UNCHANGED_RESEND_INTERVAL,
         stats: SessionStatsReporter::noop(),
@@ -719,6 +721,7 @@ async fn correct_token_completes_handshake_and_streams() {
             mode: RemoteMode::ViewOnly,
             pending,
             encode: EncodeOptions::default(),
+            native_resolution: false,
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
@@ -968,7 +971,7 @@ async fn file_transfer_download_and_upload() {
     std::fs::create_dir_all(&share).unwrap();
     std::fs::create_dir_all(&dl).unwrap();
 
-    // 源文件大于单块（CHUNK_SIZE = 64 KiB），保证多块流动。
+    // 源文件大于单块（CHUNK_SIZE = 16 KiB），保证多块流动。
     let payload = pseudo_bytes(200 * 1024);
     std::fs::write(share.join("source.bin"), &payload).unwrap();
 
@@ -1393,6 +1396,7 @@ async fn handshake_against_unregistered_token(
             // 而不是「一张新造的空表里查不到」。
             pending,
             encode: EncodeOptions::default(),
+            native_resolution: false,
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),

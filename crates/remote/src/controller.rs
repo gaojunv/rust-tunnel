@@ -6,18 +6,21 @@
 
 use crate::auth::verify_ack_mac;
 use crate::codec::{vp9_decoder_factory, VideoDecoderApi, VideoDecoderFactory};
+use crate::controlled::{send_cancellable, writer_loop, OutboundQueues};
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
+use crate::input_buffer::InputBuffer;
 use crate::screen::{DecodedFrame, DecodedPatch, FrameSink, InputEvent, QualityPreset, ScreenPatch};
 use crate::session::{
     trusted_rtt, CodecId, ControllerHandshake, RegionRect, SessionCodec, SessionEnd, SessionFrame,
-    SessionMessage, HEARTBEAT_INTERVAL, MAX_REGION_RECTS, REGION_FLAG_ZSTD, VIDEO_FLAG_KEYFRAME,
+    SessionMessage, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS, REGION_FLAG_ZSTD,
+    VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{KeyframeReason, SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
 use crate::video::MAX_FRAME_DIM;
-use futures_util::{SinkExt as _, StreamExt as _};
+use futures_util::StreamExt as _;
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -190,23 +193,60 @@ pub struct ControllerConfig {
     pub h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
 }
 
-/// 跑一次控制器会话，直到取消、对端关闭或出错。
+/// 跑一次控制器会话，直到取消、对端关闭或出错（**不注入外部输入来源**）。
 ///
-/// `cmd_rx` 是 UI 经 [`crate::manager::RemoteManager`] 投递的命令流；`sink` 接收已解码画面
-/// （[`FrameSink::on_frame`] 拿到的是 RGBA，不在 UI 线程解码）。
+/// 这是 [`run_controller_with_input`] 的兼容入口：生产路径（[`crate::manager::RemoteManager`]）
+/// 走带 [`InputBuffer`] 的那条，UI 输入因此合并鼠标移动、且抬起永不丢。这里保留旧签名给单测
+/// 与无 UI 的调用方——输入仍可经 [`ControllerCommand::Input`] 投递。
 ///
 /// # Errors
-/// 握手被拒、编解码失败、IO 失败时返回 [`RemoteError`]；正常结束（收到 `Bye` / 对端关闭 /
-/// 取消）返回 `Ok(`[`SessionEnd`]`)`，由调用方据此判定是否需要自动重连。
-#[expect(
-    clippy::too_many_lines,
-    reason = "握手校验 + 画面/输入/剪贴板/文件/心跳的单会话循环，拆开反而丢失控制流全貌"
-)]
+/// 同 [`run_controller_with_input`]。
 pub async fn run_controller(
     duplex: BoxDuplex,
     config: ControllerConfig,
     handshake: ControllerHandshake,
+    cmd_rx: mpsc::Receiver<ControllerCommand>,
+    transfer: TransferHub,
+    sink: std::sync::Arc<dyn FrameSink>,
+    cancel: CancellationToken,
+) -> RemoteResult<SessionEnd> {
+    run_controller_with_input(
+        duplex,
+        config,
+        handshake,
+        cmd_rx,
+        Arc::new(InputBuffer::new()),
+        transfer,
+        sink,
+        cancel,
+    )
+    .await
+}
+
+/// 跑一次控制器会话，直到取消、对端关闭或出错（**带外部输入来源**）。
+///
+/// `input` 是 UI 经 [`crate::manager::RemoteManager::send_input`] 投递的输入缓冲：主循环用
+/// **biased 优先**分支每轮先把它 drain 干净，因此按键按下/抬起不会被背压丢掉（鼠标移动则合并、
+/// 满时只挤掉最旧的移动，见 [`InputBuffer`]）。`cmd_rx` 仍承载显示器/画质/剪贴板/文件等命令；
+/// `sink` 接收已解码画面（[`FrameSink::on_frame`] 拿到的是 RGBA，不在 UI 线程解码）。
+///
+/// # Errors
+/// 握手被拒、编解码失败、IO 失败时返回 [`RemoteError`]；正常结束（收到 `Bye` / 对端关闭 /
+/// 取消 / 心跳超时）返回 `Ok(`[`SessionEnd`]`)`，由调用方据此判定是否需要自动重连。
+#[expect(
+    clippy::too_many_lines,
+    reason = "握手校验 + 画面/输入/剪贴板/文件/心跳的单会话循环，拆开反而丢失控制流全貌"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "会话循环需要完整上下文；输入缓冲与命令通道必须分开（见 `InputBuffer`）"
+)]
+pub(crate) async fn run_controller_with_input(
+    duplex: BoxDuplex,
+    config: ControllerConfig,
+    handshake: ControllerHandshake,
     mut cmd_rx: mpsc::Receiver<ControllerCommand>,
+    input: Arc<InputBuffer>,
     mut transfer: TransferHub,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
@@ -289,6 +329,14 @@ pub async fn run_controller(
         Err(err) => return Err(err),
     }
 
+    // 2.6) 出站写任务：独占写半边，按 close → ctrl → screen → file 的优先级取帧。
+    //
+    // 握手阶段的 `CodecOffer` 仍直接写 writer（上面那一步），此后所有帧都只投队列。这样主循环
+    // 不会在任何一次网络写上阻塞——对端停读/中继停走时，读画面、心跳、输入仍能继续轮询。
+    // `queues` 与写任务共享同一组通道；`file_staging` 保证文件块在队列满时不丢字节。
+    let (mut queues, receivers) = OutboundQueues::new();
+    let writer_task = tokio::spawn(writer_loop(writer, receivers, cancel.clone()));
+
     // 解码任务：解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
     // 被它占住。故把解码挪到独立任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
     //
@@ -320,7 +368,7 @@ pub async fn run_controller(
     // 会话一建立就发一次心跳，用户开窗即有读数，不必空等一个 [`HEARTBEAT_INTERVAL`]。
     let mut heartbeat = interval_at(Instant::now(), HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // 出站文件块：只在有在途传输时启用（`has_outgoing` 为假时该分支不被轮询，不产生空转）。
+    // 出站文件块：只在「有在途传输或有暂存块」时启用（否则该分支不被轮询，不产生空转）。
     let mut file_tick = interval_at(Instant::now(), CHUNK_PAUSE);
     file_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // QoS 反馈节拍：每秒一条 `QosFeedback`（驱动被控端 AIMD）+ 一次解码侧读数上报。
@@ -334,6 +382,9 @@ pub async fn run_controller(
     // 用队列而不是单个 `Option`：1s 探测在高 RTT 链路上会有多个心跳同时在途，单槽位会把迟到的
     // ack 与更新的心跳配错对。FIFO 配对最坏只让样本旧一个周期；上限 8 防止对端不应答时无限增长。
     let mut heartbeat_sent: VecDeque<Instant> = VecDeque::new();
+    // 最近一次收到 `HeartbeatAck` 的时刻：仅用于超时告警里区分「从未通过」与「刚刚断掉」，
+    // 便于现场判断（不上线、不进协议）。
+    let mut last_ack_at: Option<Instant> = None;
     // 最近一次可信 RTT（毫秒）：填进 `QosFeedback`。无样本时为 0（闭环此时按「未知」处理，
     // 不会误判为健康——`0 < fast_threshold` 但队列非空时仍可能判拥塞）。
     let mut last_rtt_ms: Option<u32> = None;
@@ -361,7 +412,7 @@ pub async fn run_controller(
         .map_or(0, |d| d.id);
     let mut reason = String::from("会话结束");
 
-    let result: RemoteResult<SessionEnd> = loop {
+    let result: RemoteResult<SessionEnd> = 'session: loop {
         tokio::select! {
             // 取消优先（`biased`）：收尾时 `cancel.cancel()` 与 `lock_cmd().take()` 是背靠背的两条
             // 语句，本循环下一次轮询时两个分支**同时就绪**，而默认的随机轮询会任选其一——于是同一次
@@ -375,13 +426,41 @@ pub async fn run_controller(
                 "用户中断".clone_into(&mut reason);
                 break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
             }
+            // 输入**优先于**定时器与读分支：UI 产生的按键抬起不能被心跳/QoS 的投递挡在后面。
+            // `drain` 一次性取走整批并按入队顺序写出，因此「先移动、再按下」的先后关系不变；
+            // 输入走控制队列（写任务里优先级最高的一档），可取消地等空位、绝不丢弃。
+            () = input.notified(), if input.has_pending() => {
+                for event in input.drain() {
+                    if let Err(err) = queues
+                        .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Input(event)))
+                        .await
+                    {
+                        break 'session Err(err);
+                    }
+                }
+            }
             _ = heartbeat.tick() => {
+                // 存活检测：队首是最老的未应答心跳。超过 `LIVENESS_TIMEOUT` 还没配对，说明链路
+                // 已经断了（中继停转发但 TCP 未断、接收方零窗口时对端不会给我们任何错误）。
+                // **必须在下面容量上限的 `pop_front` 之前判**——上限（8）大于超时对应的 4 个周期，
+                // 正常配置挤不到队首，但把判据放在前面才不会在将来调参后悄悄把超时掩盖掉。
+                // 队列空（还没发过心跳）时 `front()` 为 `None`，不判。
+                if heartbeat_sent.front().is_some_and(|sent| sent.elapsed() >= LIVENESS_TIMEOUT) {
+                    let last_ack_ms = last_ack_at
+                        .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    warn!(?last_ack_ms, "对端心跳超时（链路可能已中断），结束会话");
+                    "对端心跳超时（链路可能已中断）".clone_into(&mut reason);
+                    break Ok(SessionEnd { reason: reason.clone(), deliberate: false });
+                }
                 // FIFO 配对：迟到的 ack 认领最老的未应答心跳，而不是最新那个。
                 if heartbeat_sent.len() >= HEARTBEAT_SENT_CAP {
                     heartbeat_sent.pop_front();
                 }
                 heartbeat_sent.push_back(Instant::now());
-                if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
+                if let Err(err) = queues
+                    .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat))
+                    .await
+                {
                     break Err(err);
                 }
             }
@@ -404,7 +483,12 @@ pub async fn run_controller(
                     decode_ms,
                     backlog,
                 };
-                if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(feedback)).await {
+                // `QosFeedback` 在线上仍是 `Screen` lane，但内容只有几十字节且时延敏感，
+                // 按 `outbound_class` 走控制队列（见 `OutboundClass`）。
+                if let Err(err) = queues
+                    .enqueue_ctrl(&cancel, SessionFrame::screen(feedback))
+                    .await
+                {
                     break Err(err);
                 }
                 // 同节拍把解码侧读数经进程内通道送到 UI（不落线）。`QosFeedback` 的字段
@@ -448,7 +532,10 @@ pub async fn run_controller(
                         let request = SessionMessage::RequestKeyframe {
                             display: selected_display,
                         };
-                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(request)).await {
+                        if let Err(err) = queues
+                            .enqueue_ctrl(&cancel, SessionFrame::screen(request))
+                            .await
+                        {
                             break Err(err);
                         }
                         config.stats.report(SessionStats::KeyframeRequest {
@@ -467,13 +554,22 @@ pub async fn run_controller(
                 };
                 match cmd {
                     ControllerCommand::Input(event) => {
-                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Input(event))).await {
+                        // 兼容入口（无 UI 的调用方仍可经命令通道投递输入）。生产路径走
+                        // `InputBuffer`，两者最终都进控制队列。
+                        if let Err(err) = queues
+                            .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Input(event)))
+                            .await
+                        {
                             break Err(err);
                         }
                     }
                     ControllerCommand::SelectDisplay(display) => {
-                        if let Err(err) =
-                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::SelectDisplay { display })).await
+                        if let Err(err) = queues
+                            .enqueue_ctrl(
+                                &cancel,
+                                SessionFrame::control(SessionMessage::SelectDisplay { display }),
+                            )
+                            .await
                         {
                             break Err(err);
                         }
@@ -482,43 +578,59 @@ pub async fn run_controller(
                         selected_display = display;
                     }
                     ControllerCommand::SetQuality(preset) => {
-                        if let Err(err) =
-                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::SetQuality { preset })).await
+                        if let Err(err) = queues
+                            .enqueue_ctrl(
+                                &cancel,
+                                SessionFrame::control(SessionMessage::SetQuality { preset }),
+                            )
+                            .await
                         {
                             break Err(err);
                         }
                     }
                     ControllerCommand::SetFrameRate(fps) => {
-                        if let Err(err) =
-                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::SetFrameRate { fps })).await
+                        if let Err(err) = queues
+                            .enqueue_ctrl(
+                                &cancel,
+                                SessionFrame::control(SessionMessage::SetFrameRate { fps }),
+                            )
+                            .await
                         {
                             break Err(err);
                         }
                     }
                     ControllerCommand::Clipboard(text) => {
-                        if let Err(err) =
-                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Clipboard { text })).await
+                        if let Err(err) = queues
+                            .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Clipboard { text }))
+                            .await
                         {
                             break Err(err);
                         }
                     }
                     ControllerCommand::ClipboardRequest => {
-                        if let Err(err) =
-                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::ClipboardRequest)).await
+                        if let Err(err) = queues
+                            .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::ClipboardRequest))
+                            .await
                         {
                             break Err(err);
                         }
                     }
                     ControllerCommand::LockScreen => {
-                        if let Err(err) =
-                            send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::LockScreen)).await
+                        // v7 的锁屏是控制帧，走控制队列（与其它小控制消息同一优先级）。
+                        if let Err(err) = queues
+                            .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::LockScreen))
+                            .await
                         {
                             break Err(err);
                         }
                     }
                     ControllerCommand::File(cmd) => match transfer.on_command(cmd).await {
+                        // 按 `outbound_class` 分流：Chunk/Done/Error 走 file（可暂存），其余走控制队列。
                         Ok(Some(msg)) => {
-                            if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::file(msg)).await {
+                            if let Err(err) = queues
+                                .dispatch_frame(&cancel, SessionFrame::file(msg))
+                                .await
+                            {
                                 break Err(err);
                             }
                         }
@@ -529,7 +641,10 @@ pub async fn run_controller(
                         // 已有在途样本时不打扰：否则会多一条在途心跳，让用户此刻想要的读数被推迟。
                         if heartbeat_sent.is_empty() {
                             heartbeat_sent.push_back(Instant::now());
-                            if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
+                            if let Err(err) = queues
+                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat))
+                                .await
+                            {
                                 break Err(err);
                             }
                         }
@@ -540,24 +655,43 @@ pub async fn run_controller(
             // `keyframe_tx` 常驻于本函数 → `recv()` 不会返回 `None`，本分支只在真的有请求时触发。
             // 原因只进管理面（进程内上报），线上 `RequestKeyframe` 仍只有 `display` 一个字段。
             Some((display, reason)) = keyframe_rx.recv() => {
-                if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(SessionMessage::RequestKeyframe { display })).await {
+                if let Err(err) = queues
+                    .enqueue_ctrl(
+                        &cancel,
+                        SessionFrame::screen(SessionMessage::RequestKeyframe { display }),
+                    )
+                    .await
+                {
                     break Err(err);
                 }
                 config.stats.report(SessionStats::KeyframeRequest { reason });
             }
-            _ = file_tick.tick(), if transfer.has_outgoing() => {
-                match transfer.next_outbound().await {
-                    Ok(Some(msg)) => {
-                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::file(msg)).await {
-                            break Err(err);
+            // 文件块生产**永不阻塞主循环**：先补投暂存区，再在 file 队列确实有空位时才读下一块。
+            // `dispatch_frame` 对 File 类只做 `try_send`（满了留暂存区），绝不 `.await` 空位，
+            // 因此上传/下载期间画面读取、输入与心跳都不会被文件传输堵住。
+            _ = file_tick.tick(), if transfer.has_outgoing() || queues.has_staged_file() => {
+                if let Err(err) = queues.drain_file() {
+                    break Err(err);
+                }
+                if queues.file_has_room() && transfer.has_outgoing() {
+                    match transfer.next_outbound().await {
+                        Ok(Some(msg)) => {
+                            if let Err(err) = queues
+                                .dispatch_frame(&cancel, SessionFrame::file(msg))
+                                .await
+                            {
+                                break Err(err);
+                            }
                         }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, "文件读取失败，中断该次传输");
-                        // 回发 `FileError`：发送方不再有 chunk 流动，对端的 `Incoming` 会一直挂着。
-                        if let Err(send_err) = send_file_errors(&mut writer, &cancel, transfer.abort_all(&err.to_string())).await {
-                            break Err(send_err);
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(error = %err, "文件读取失败，中断该次传输");
+                            // 回发 `FileError`：发送方不再有 chunk 流动，对端的 `Incoming` 会一直挂着。
+                            if let Err(send_err) =
+                                send_file_errors(&mut queues, &cancel, transfer.abort_all(&err.to_string())).await
+                            {
+                                break Err(send_err);
+                            }
                         }
                     }
                 }
@@ -736,13 +870,18 @@ pub async fn run_controller(
                             debug!("控制器收到 ClipboardRequest，但控制器不实现剪贴板应答，忽略");
                         }
                         SessionMessage::Heartbeat => {
-                            if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::HeartbeatAck)).await {
+                            if let Err(err) = queues
+                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::HeartbeatAck))
+                                .await
+                            {
                                 break Err(err);
                             }
                         }
                         SessionMessage::HeartbeatAck => {
+                            let now = Instant::now();
+                            last_ack_at = Some(now);
                             if let Some(sent) = heartbeat_sent.pop_front() {
-                                if let Some(rtt) = trusted_rtt(sent, Instant::now()) {
+                                if let Some(rtt) = trusted_rtt(sent, now) {
                                     // 存一份毫秒读数：`QosFeedback` 要用它填 `rtt_ms`。
                                     last_rtt_ms = Some(u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
                                     config.stats.report(SessionStats::Rtt(rtt));
@@ -765,7 +904,12 @@ pub async fn run_controller(
                                 Ok(replies) => {
                                     let mut write_err = None;
                                     for reply in replies {
-                                        if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::file(reply)).await {
+                                        // `FileDone`/`FileError`/数据块按分类走 file 队列（可暂存），
+                                        // 其余小消息走控制队列；两条队列各自保序。
+                                        if let Err(err) = queues
+                                            .dispatch_frame(&cancel, SessionFrame::file(reply))
+                                            .await
+                                        {
                                             write_err = Some(err);
                                             break;
                                         }
@@ -777,7 +921,9 @@ pub async fn run_controller(
                                 Err(err) => {
                                     // 本地落盘失败：这次传输已不可信，报错并中断它，会话本身继续。
                                     warn!(error = %err, "文件接收失败，中断该次传输");
-                                    if let Err(send_err) = send_file_errors(&mut writer, &cancel, transfer.abort_all(&err.to_string())).await {
+                                    if let Err(send_err) =
+                                        send_file_errors(&mut queues, &cancel, transfer.abort_all(&err.to_string())).await
+                                    {
                                         break Err(send_err);
                                     }
                                 }
@@ -811,12 +957,18 @@ pub async fn run_controller(
     // 4) 收尾：尽力通知对端（限时，见 `BYE_TIMEOUT`），并把在途传输标记为失败（UI 不能停在 99%）。
     //    这里**不必**回发 `abort_all` 的 `FileError`——`Bye` 马上就到，对端收尾时同样会清掉自己
     //    的在途传输。
+    //
+    //    `Bye` 走 close 通道（写任务里最高优先级、不理会取消）；随后丢弃普通队列的发送端，
+    //    写任务在写出 `Bye` 后自然退出。给它一个上界：写任务可能正卡在停读的对端上，超时即
+    //    abort（丢弃写半边 = 关闭 socket）。
     let _ = transfer.abort_all(&reason);
-    let _ = timeout(
-        BYE_TIMEOUT,
-        writer.send(SessionFrame::control(SessionMessage::Bye { reason: reason.clone() })),
-    )
-    .await;
+    queues.close(SessionFrame::control(SessionMessage::Bye {
+        reason: reason.clone(),
+    }));
+    drop(queues);
+    let mut writer_task = writer_task;
+    let _ = timeout(BYE_TIMEOUT, &mut writer_task).await;
+    writer_task.abort();
     // 解码任务持有 `sink`：必须先让它停下，`on_closed` 之后才不会有画面再投进来。
     drop(decode_tx);
     let mut decode_task = decode_task;
@@ -1196,13 +1348,29 @@ async fn decode_loop(
                 }
             }
         }
-        let Some(dec) = decoder.as_mut() else {
+        // 解码是同步的重活（1080p 单帧十几毫秒，4K 更久）：直接跑在 async worker 上会与
+        // 网络读循环/心跳抢线程。只把**这一次** `decode` 调用移进 `spawn_blocking`；
+        // 上面的状态机（序号断层/等 IDR/重建解码器）仍然原样跑在 runtime 上。
+        //
+        // 安全性：`VideoDecoderApi: Send`，且解码器是**独占**的（`Box<dyn ...>` 只有这里
+        // 持有），所以 `take()` 进闭包、拿回来再放回 `decoder` 是安全的。MFT 的 COM 初始化
+        // 是线程局部的（每次 `decode` 自己 `CoInitializeEx`），VP9 没有线程亲和——两者都能
+        // 在任何阻塞线程上跑。
+        //
+        // `decoder == None` 的分支保持原样（本包之前已决定丢弃/等关键帧）。
+        let Some(mut dec) = decoder.take() else {
             continue;
         };
-        let started = Instant::now();
-        match dec.decode(&data) {
-            Ok(Some(frame)) => {
-                let decode_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let blocking_result = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = dec.decode(&data);
+            (dec, result, started.elapsed())
+        })
+        .await;
+        match blocking_result {
+            Ok((dec, Ok(Some(frame)), elapsed)) => {
+                decoder = Some(dec);
+                let decode_ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
                 decode_shared.decode_ms.store(decode_ms, Ordering::Relaxed);
                 awaiting_keyframe = false;
                 decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
@@ -1218,12 +1386,36 @@ async fn decode_loop(
                 });
             }
             // 本批无输出（理论路径；`lag_in_frames = 1` 下每次都有）。
-            Ok(None) => {
+            Ok((dec, Ok(None), _elapsed)) => {
+                decoder = Some(dec);
                 awaiting_keyframe = false;
                 decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
                 kf_pending = None;
             }
-            Err(err) => {
+            Ok((dec, Err(err), _elapsed)) => {
+                // 解码失败：这个实例不可信，丢弃并等下一个关键帧（`dec` 在分支结束时 drop）。
+                drop(dec);
+                warn!(error = %err, "画面解码失败，重置解码器并请求关键帧");
+                decoder = None;
+                configured_dims = None;
+                awaiting_keyframe = true;
+                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                request_keyframe(
+                    &keyframe_tx,
+                    &mut last_kf_request,
+                    &mut kf_pending,
+                    monitor,
+                    KeyframeReason::DecodeError,
+                );
+            }
+            Err(join_err) => {
+                // `spawn_blocking` 里 panic：解码器已随闭包一起 drop，只能重建实例并等
+                // 下一个关键帧。与解码失败同款恢复路径，但错误类型明确写进日志。
+                let err = if join_err.is_panic() {
+                    RemoteError::Codec("解码阻塞任务 panic".to_owned())
+                } else {
+                    RemoteError::Platform("解码阻塞任务被取消".to_owned())
+                };
                 warn!(error = %err, "画面解码失败，重置解码器并请求关键帧");
                 decoder = None;
                 configured_dims = None;
@@ -1321,41 +1513,20 @@ fn enqueue_decode(tx: &mpsc::Sender<DecodeJob>, job: DecodeJob) -> DecodeEnqueue
     }
 }
 
-/// 可取消的发送：`select!` 的 handler 里直接 `.await` 会让循环看不见取消信号。
-///
-/// tokio 的 `select!` 在 handler 求值期间**不再轮询其它分支**，所以对端停读（中继停走、TCP
-/// 零窗口）把写缓冲填满后，`writer.send` 会永久挂起，`cancel.cancelled()` 分支再也得不到轮询
-/// ——会话不结束、不回 `RemoteSessionEnd`、socket 与任务一起泄漏到 TCP 超时。故每次发送都同时
-/// 等取消令牌，取消优先（`biased`）。
-///
-/// 发送被中途取消是安全的：会话正要结束，半截帧不会被对端当成完整帧（长度前缀 + bincode
-/// 自校验），且此后不会再发新帧。
-///
-/// # Errors
-/// 取消令牌触发时返回 [`RemoteError::Cancelled`]；发送失败时透传底层 IO 错误。
-async fn send_cancellable(
-    writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
-    cancel: &CancellationToken,
-    frame: SessionFrame,
-) -> RemoteResult<()> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(RemoteError::Cancelled),
-        res = writer.send(frame) => res.map_err(RemoteError::Io),
-    }
-}
-
-/// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次写出。
+/// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次投进出站队列。
 ///
 /// **必须回发**：发送方读文件失败后不会再有任何 chunk 流动，对端既等不到 `FileDone` 也等不到
-/// 错误，会一直挂在半途（UI 停在 99%）。写失败按会话级错误处理，与其它发送一致。
+/// 错误，会一直挂在半途（UI 停在 99%）。`FileError` 属 file 类：队列满时进暂存区、下一拍重试，
+/// 绝不阻塞主循环。
 async fn send_file_errors(
-    writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
+    queues: &mut OutboundQueues,
     cancel: &CancellationToken,
     msgs: Vec<SessionMessage>,
 ) -> RemoteResult<()> {
     for msg in msgs {
-        send_cancellable(writer, cancel, SessionFrame::file(msg)).await?;
+        queues
+            .dispatch_frame(cancel, SessionFrame::file(msg))
+            .await?;
     }
     Ok(())
 }
@@ -1366,10 +1537,17 @@ mod tests {
     use crate::auth::ack_mac;
     use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
     use crate::error::RemoteResult;
-    use crate::screen::{DecodedFrame, DisplayInfo, FrameSink};
-    use crate::session::{plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage};
+    use crate::input_buffer::InputBuffer;
+    use crate::screen::{DecodedFrame, DisplayInfo, FrameSink, InputEvent, KeyEvent};
+    use crate::session::{
+        plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage,
+        LIVENESS_TIMEOUT,
+    };
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
+    // `.send(..)` 只有测试里的 peer writer 用得到（lib 层所有出站都走队列，不再直接写 writer），
+    // 故 `SinkExt` 只在测试模块引入。
+    use futures_util::SinkExt as _;
     use rust_tunnel_common::protocol::RemoteMode;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1684,6 +1862,142 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, task).await;
+    }
+
+    /// 7. 对端不再回 `HeartbeatAck` 时，必须在 `LIVENESS_TIMEOUT` 附近以**非主动**方式结束。
+    ///
+    /// 中继停转发但 TCP 不断（半开/零窗口）时，对端不会给我们任何错误——没有这个判据，会话会
+    /// 永久冻结而 UI 仍显示在线。用 `start_paused` 的虚拟时钟跳过真实的 4s 等待。
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_timeout_ends_session_as_link_failure() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (mut peer_reader, peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+
+        // 对端只排空、**从不回 HeartbeatAck**。writer 必须攥在手里：drop 掉会让控制器读到
+        // EOF，会话将以「对端已关闭连接」提前结束，测到的就不是超时判据了。
+        let peer = tokio::spawn(async move {
+            let _keep_writer = peer_writer;
+            while let Some(Ok(_frame)) = peer_reader.next().await {}
+        });
+
+        let sink = Arc::new(FakeSink::default());
+        let (_cmd_tx, cmd_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let task = controller_task(Box::new(a), plan, cmd_rx, sink.clone(), cancel);
+
+        // 首个心跳立即发出，此后每 `HEARTBEAT_INTERVAL` 一拍；队首变老到 `LIVENESS_TIMEOUT`
+        // 的那一拍判定超时。外层上限留足收尾余量，绝不能退化成「等 WAIT 超时」。
+        let end = tokio::time::timeout(LIVENESS_TIMEOUT + Duration::from_secs(3), task)
+            .await
+            .expect("心跳超时后应结束会话，而不是永久冻结")
+            .expect("任务不应 panic")
+            .expect("心跳超时属于正常收尾（不是 IO 错误）");
+        assert_eq!(end.reason, "对端心跳超时（链路可能已中断）");
+        assert!(
+            !end.deliberate,
+            "心跳超时是链路故障，deliberate 必须为 false，否则不会触发自动重连"
+        );
+        assert_eq!(
+            sink.closed.lock().unwrap().as_deref(),
+            Some("对端心跳超时（链路可能已中断）"),
+            "on_closed 也应收到同一原因"
+        );
+        peer.abort();
+    }
+
+    /// 8. 外部输入缓冲的整批事件按入队顺序写出，且连续鼠标移动只发最后一条。
+    ///
+    /// 这是「输入不丢 + 合并」的接线锁：只测 `InputBuffer` 的纯逻辑不够，还要证明会话循环
+    /// 真的用 `drain()` 的返回值、按顺序写进 `SessionMessage::Input`。
+    #[tokio::test]
+    async fn buffered_input_is_written_in_order_and_merged() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (mut peer_reader, mut peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+
+        // 被控端：应答心跳，并把收到的输入事件按线上顺序转发出来。
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<InputEvent>();
+        let peer = tokio::spawn(async move {
+            while let Some(Ok(frame)) = peer_reader.next().await {
+                match frame.message {
+                    SessionMessage::Heartbeat => {
+                        if peer_writer
+                            .send(SessionFrame::control(SessionMessage::HeartbeatAck))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    SessionMessage::Input(event) => {
+                        if seen_tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let input = Arc::new(InputBuffer::new());
+        // 连续两条移动合并成最后一条；抬起事件必须原样排队。
+        input.push(InputEvent::MouseMove {
+            x: 1,
+            y: 0,
+            display: 0,
+        });
+        input.push(InputEvent::MouseMove {
+            x: 2,
+            y: 0,
+            display: 0,
+        });
+        let key_up = InputEvent::Key(KeyEvent {
+            code: 13,
+            pressed: false,
+            text: None,
+            modifiers: 0,
+        });
+        input.push(key_up.clone());
+
+        let sink = Arc::new(FakeSink::default());
+        let (_cmd_tx, cmd_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_controller_with_input(
+            Box::new(a),
+            config("sess-1", "TOK"),
+            plan,
+            cmd_rx,
+            Arc::clone(&input),
+            transfer_hub().0,
+            sink,
+            cancel.clone(),
+        ));
+
+        let first = tokio::time::timeout(WAIT, seen_rx.recv())
+            .await
+            .expect("首个输入事件应及时写出")
+            .expect("输入转发通道不应关闭");
+        let second = tokio::time::timeout(WAIT, seen_rx.recv())
+            .await
+            .expect("抬起事件应及时写出")
+            .expect("输入转发通道不应关闭");
+        assert_eq!(
+            first,
+            InputEvent::MouseMove {
+                x: 2,
+                y: 0,
+                display: 0
+            },
+            "连续移动应只发最后一条"
+        );
+        assert_eq!(second, key_up, "抬起事件必须原样送达且排在移动之后");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, task).await;
+        peer.abort();
     }
 
     /// 5. 取消与命令发送端**同时**失效时，必须判定为「用户中断」，而不是「命令通道已关闭」。

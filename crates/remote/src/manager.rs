@@ -30,12 +30,13 @@
 use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
 use crate::auth::{PendingSession, PendingSessions};
 use crate::codec::{VideoDecoderFactory, VideoEncoderFactory};
-use crate::controller::{run_controller, ControllerCommand, ControllerConfig};
+use crate::controller::{run_controller_with_input, ControllerCommand, ControllerConfig};
 use crate::controlled::{
     run_controlled, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
 };
 use crate::error::{RemoteError, RemoteResult};
 use crate::file::FileService;
+use crate::input_buffer::InputBuffer;
 use crate::screen::{
     Clipboard, EncodeOptions, FileEntry, FrameSink, InputEvent, InputSink, NullFrameSink, QualityPreset, ScreenSource,
 };
@@ -283,6 +284,12 @@ pub struct RemoteManagerConfig {
     pub enabled: bool,
     /// 数据面建立器。
     pub establisher: Arc<dyn TransportEstablisher>,
+    /// 是否允许**原生分辨率**（4K）编码（默认 `false`）。
+    ///
+    /// 仅在被控端协商到**硬件 H.264** 时生效：编码宽度上限从 1920 放宽到 3840，档位码率
+    /// 翻倍（封顶 30 Mbps）。VP9 路径不受影响。运行中修改经
+    /// [`RemoteManager::set_native_resolution`]，只对**下一次会话**生效。
+    pub native_resolution: bool,
     /// 屏幕编码参数。
     pub encode: EncodeOptions,
     /// 被控端对外共享的目录；`None` = 本端不接受任何文件请求。
@@ -417,12 +424,22 @@ pub struct RemoteManager {
     frame_sink: RwLock<Option<Arc<dyn FrameSink>>>,
     /// 当前控制器会话的命令投递端（输入 / 切档位 / 剪贴板 / 文件）。
     cmd_tx: Mutex<Option<mpsc::Sender<ControllerCommand>>>,
+    /// 控制器侧输入缓冲（**跨会话复用同一个实例**，会话收尾时清空）。
+    ///
+    /// 输入不走 [`Self::cmd_tx`]：那条通道满即静默丢，而按键抬起丢了会让远端永久卡键。
+    /// 见 [`InputBuffer`]。
+    input: Arc<InputBuffer>,
     /// 被控端剪贴板实现。
     clipboard: RwLock<Option<Arc<dyn Clipboard>>>,
     /// 被控端共享目录（`share_dir` 为 `None` 时此处也是 `None`）。
     share: Option<ShareDir>,
     /// 自引用弱指针（供同步方法 `spawn` 使用）。
     self_weak: Weak<RemoteManager>,
+    /// 被控端是否允许原生分辨率（4K）编码。
+    ///
+    /// 用原子而不是 `Inner` 锁：由 GUI 的 UI 线程在会话进行中随时调用，会话任务只在**开始**
+    /// 时读一次；没必要为一次读抢内部锁。改动只影响下一次会话（编码宽度在协商后固定）。
+    native_resolution: AtomicBool,
     /// 构造时所在的 Tokio 运行时句柄。
     ///
     /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
@@ -467,6 +484,7 @@ impl RemoteManager {
         let rt = tokio::runtime::Handle::try_current().ok();
         let out_pump = rt.as_ref().map(|_| Arc::new(Notify::new()));
         let rt_field = rt.clone();
+        let native_resolution = cfg.native_resolution;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -484,11 +502,13 @@ impl RemoteManager {
             platform: RwLock::new(None),
             frame_sink: RwLock::new(None),
             cmd_tx: Mutex::new(None),
+            input: Arc::new(InputBuffer::new()),
             clipboard: RwLock::new(None),
             share,
             self_weak: weak.clone(),
             rt: rt_field,
             auto_lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            native_resolution: AtomicBool::new(native_resolution),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -623,9 +643,16 @@ impl RemoteManager {
         }
     }
 
-    /// 投递一条输入事件到当前控制器会话（无会话或队列满时静默丢弃）。
+    /// 投递一条输入事件到当前控制器会话（无会话时静默丢弃）。
+    ///
+    /// 走 [`InputBuffer`] 而不是命令通道：鼠标移动会合并（last-wins）、队列满时只挤掉最旧的
+    /// 移动，**按键/鼠标键的按下与抬起永不丢弃**——抬起丢了会让远端永久卡键。
     pub fn send_input(&self, event: InputEvent) {
-        self.send_command(ControllerCommand::Input(event));
+        // 无活动控制器会话时直接丢弃（与旧 `send_command` 的静默丢弃语义一致）。会话一建立
+        // `cmd_tx` 就已存在（`Connecting` 期间的输入也会被缓冲，和旧行为一致）。
+        if self.lock_cmd().is_some() {
+            self.input.push(event);
+        }
     }
 
     /// 请求被控端切换到某台显示器。
@@ -647,6 +674,14 @@ impl RemoteManager {
     pub fn set_frame_rate(&self, fps: u8) {
         self.update_ui(|s| s.frame_rate = fps);
         self.send_command(ControllerCommand::SetFrameRate(fps));
+    }
+
+    /// 设置被控端是否允许**原生分辨率（4K）**编码（默认关闭）。
+    ///
+    /// 只对**下一次**会话生效：编码宽度上限在会话开始、codec 协商完成后确定，运行中的会话
+    /// 不重建编码器（重建会强制 IDR）。对端只支持 VP9 时该开关被忽略（仍按 1920 编码）。
+    pub fn set_native_resolution(&self, on: bool) {
+        self.native_resolution.store(on, Ordering::Relaxed);
     }
 
     /// 把本机剪贴板文本发给被控端。
@@ -1065,6 +1100,8 @@ impl RemoteManager {
         }
         self.take_active();
         self.lock_cmd().take();
+        // 清掉残留输入：上一场没来得及发出的按键/移动不能带到下一场对端。
+        self.input.clear();
         // `Err` 一律视为「连接是断的/失败的」（`deliberate: false`），这是断线自动重连的唯一判据；
         // `Ok(SessionEnd)` 的 `deliberate` 由会话循环按结束原因给出。
         let (reason, failed, deliberate) = match result {
@@ -1132,6 +1169,8 @@ impl RemoteManager {
             active.cancel.cancel();
         }
         self.lock_cmd().take();
+        // 清掉残留输入：上一场没来得及发出的按键/移动不能带到下一场对端。
+        self.input.clear();
         self.update_ui(move |s| {
             s.active = None;
             // 会话已收尾：会话级读数失效，清掉免得 UI 显示残留。
@@ -1368,11 +1407,15 @@ impl RemoteManager {
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
         let transfer = self.build_transfer_hub(None, self.cfg.download_dir.clone(), cancel.clone());
-        run_controller(
+        // 输入走独立的缓冲（合并移动、抬起不丢）；`cmd_rx` 仍承载其它命令。管理器与会话循环
+        // 共享同一个 `Arc`，`send_input` 直接 `push` + 唤醒，不再经过容量 256 的 `try_send`。
+        let input = Arc::clone(&self.input);
+        run_controller_with_input(
             duplex,
             config,
             handshake,
             cmd_rx,
+            input,
             transfer,
             self.frame_sink_arc(),
             cancel,
@@ -1556,6 +1599,7 @@ impl RemoteManager {
             mode,
             pending,
             encode: self.cfg.encode,
+            native_resolution: self.native_resolution.load(Ordering::Relaxed),
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: self.build_stats_reporter(cancel.clone()),
@@ -1812,6 +1856,8 @@ impl RemoteBridge for RemoteManager {
             active.cancel.cancel();
         }
         self.lock_cmd().take();
+        // 清掉残留输入：上一场没来得及发出的按键/移动不能带到下一场对端。
+        self.input.clear();
         // 控制通道已断，服务端会把这侧的会话判死：任何挂起请求/授权都不可能再走通。
         // 待确认的接入请求**只本地清掉、不发拒绝**（没有通道可发；即便发出去，服务端也已
         // 回收该会话，只会记一条「未知 session」），否则用户点「接受」会给一个永远起不来的
@@ -2112,6 +2158,7 @@ mod tests {
             displays: 1,
             enabled,
             establisher,
+            native_resolution: false,
             encode: EncodeOptions::default(),
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
@@ -2273,6 +2320,7 @@ mod tests {
             displays: 1,
             enabled,
             establisher: Arc::new(NeverEstablisher),
+            native_resolution: false,
             encode: EncodeOptions::default(),
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),

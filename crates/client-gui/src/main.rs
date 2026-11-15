@@ -418,6 +418,15 @@ impl eframe::App for GuiApp {
                 }
                 3 => {
                     ui::settings::show(ui, settings, app_state);
+                    if ui::settings::show_remote_section(
+                        ui,
+                        &mut self.prefs,
+                        remote_manager.as_ref(),
+                    ) {
+                        if let Err(e) = prefs::save(&self.prefs) {
+                            tracing::warn!("GUI 偏好保存失败：{e}");
+                        }
+                    }
                     // 「无人值守被控端」一节独立于 `show`（那已背着 too_many_lines 豁免）。
                     ui::settings::show_service_section(ui, app_state, service_ui);
                 }
@@ -466,6 +475,8 @@ struct ManagerOptions {
     approval_policy: ApprovalPolicy,
     /// 被控端会话结束后是否自动锁定屏幕（GUI 取自 `GuiPrefs`，实例取自 `host.toml`）。
     auto_lock_on_disconnect: bool,
+    /// 被控端是否允许原生分辨率（4K）编码（仅硬件 H.264 生效）。
+    native_resolution: bool,
     /// 平台实现模式（**必须在构造期选定**，见 [`remote::PlatformMode`]）。
     platform_mode: remote::PlatformMode,
     /// 被控端共享目录（`None` = 不接受文件请求）。
@@ -497,6 +508,7 @@ fn build_remote_manager(
         enabled: opts.enabled,
         approval_policy: opts.approval_policy,
         establisher,
+        native_resolution: opts.native_resolution,
         encode: EncodeOptions::default(),
         share_dir: opts.share_dir,
         download_dir: opts.download_dir,
@@ -518,11 +530,13 @@ fn gui_manager_options(
     enabled: bool,
     approval_policy: ApprovalPolicy,
     auto_lock_on_disconnect: bool,
+    native_resolution: bool,
 ) -> ManagerOptions {
     ManagerOptions {
         enabled,
         approval_policy,
         auto_lock_on_disconnect,
+        native_resolution,
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
@@ -531,9 +545,10 @@ fn gui_manager_options(
 
 #[allow(
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     clippy::items_after_statements,
     clippy::map_unwrap_or,
-    reason = "GUI 托盘启动编排，一次性初始化链路拆分无益"
+    reason = "GUI 托盘启动编排，一次性初始化链路拆分无益；开关参数与 prefs 一一对应"
 )]
 fn spawn_runtime(
     app_state: Arc<app::AppState>,
@@ -543,6 +558,7 @@ fn spawn_runtime(
     initial_allow_remote: bool,
     initial_approval: ApprovalPolicy,
     initial_auto_lock: bool,
+    initial_native_resolution: bool,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -630,7 +646,12 @@ fn spawn_runtime(
             // 客户端名要等磁盘配置加载完；无配置时上面的循环会先等到配置。
             let (remote_manager, _release) = build_remote_manager(
                 &config,
-                gui_manager_options(initial_allow_remote, initial_approval, initial_auto_lock),
+                gui_manager_options(
+                    initial_allow_remote,
+                    initial_approval,
+                    initial_auto_lock,
+                    initial_native_resolution,
+                ),
             );
             app_state.set_remote(Arc::clone(&remote_manager));
 
@@ -1193,6 +1214,7 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         prefs.allow_remote,
         prefs.remote_approval,
         prefs.remote_auto_lock_on_disconnect,
+        prefs.remote_native_resolution,
     );
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，

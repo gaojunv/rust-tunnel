@@ -24,6 +24,23 @@
 //! `OnceLock` + `Box::leak` 拿到 `&'static NvencApi` 即可构造
 //! `NvencEncoder<'static>`。
 //!
+//! **设备由编码器拥有**（`Arc<D3d11>`）：调用方可以把**采集源的同一块设备**
+//! 传进来，而不是每次新建一块 NVIDIA 设备；持有 `Arc` 同时保证设备在编码器
+//! 存活期间不会被释放。
+//!
+//! # 两条输入通路
+//!
+//! - **CPU 上传**（[`NvencEncoder::encode_bgra`] / [`NvencEncoder::encode_rgba`]）：
+//!   `UpdateSubresource` 写进本编码器自有的输入纹理。跨设备采集（Intel 核显采集
+//!   + NVIDIA 独显编码）或需要 CPU 缩放时走这条。
+//! - **GPU 纹理直通**（[`NvencEncoder::encode_texture`]）：调用方的采集纹理经
+//!   `nvEncRegisterResource` 注册、逐帧 `nvEncMapInputResource` 后直接交给 NVENC，
+//!   **不落 CPU**。前提是纹理与编码器同一设备且尺寸相等（NVENC 只裁剪不缩放）。
+//!
+//! 直通路径的注册按**纹理对象地址**缓存（采集纹理池反复复用同一批纹理），
+//! 因此只有首帧付注册成本。任何注册/映射失败都返回错误，由调用方回退到 CPU
+//! 上传——一次失败**不该**关掉整条 GPU 采集路径。
+//!
 //! # 关键配置
 //!
 //! - H.264 High profile、**峰值受限 VBR**（均值 = 峰值 × 70%）、`frameIntervalP = 1`
@@ -45,17 +62,23 @@ use crate::WinVideoError;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr;
+use std::sync::Arc;
 use windows::core::Interface as _;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 
-/// 允许的最大编码宽度（与现有远程控制业务的上限一致）。
-pub const MAX_ENCODE_WIDTH: u32 = 1920;
+/// 允许的最大编码宽度（像素）。
+///
+/// 3840 = **原生分辨率**（硬件 H.264 4K）的上限。默认会话仍由引擎按 1920 编码，
+/// 这条只是**校验边界**、不是默认值；NVENC 的真实上限另由创建会话时的
+/// `NV_ENC_CAPS_WIDTH_MAX` 核对。H.264 4:2:0 在消费级 NVENC 上编 4K 是常规能力。
+pub const MAX_ENCODE_WIDTH: u32 = 3840;
 /// 允许的最大编码高度（NVENC H.264 能力上限）。
 pub const MAX_ENCODE_HEIGHT: u32 = 4096;
 /// 允许的最大输入（源）边长；4K 采集源为 3840x2160。
@@ -386,6 +409,123 @@ fn unregister_input(session: &NvencSession<'_>, registered: sys::NV_ENC_REGISTER
     }
 }
 
+/// 有界 LRU 表：容量满时淘汰最久未使用项。
+///
+/// 专给直通输入注册缓存用。抽成泛型是为了让「命中后变最近使用」「容量淘汰时
+/// 返回旧值」这两条顺序不变量能**脱离 GPU 单测**——真机路径无法在本机跑，
+/// 而淘汰顺序错了会导致注销一个仍在被映射的注册，或者泄漏注册。
+struct LruCache<T> {
+    /// 最近使用的在前，最久未使用的在尾。
+    entries: Vec<(usize, T)>,
+    /// 容量上限（至少 1）。
+    capacity: usize,
+}
+
+impl<T> LruCache<T> {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// 取值并把它标记为最近使用。
+    fn get_mut(&mut self, key: usize) -> Option<&mut T> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)?;
+        let entry = self.entries.remove(index);
+        self.entries.insert(0, entry);
+        self.entries.first_mut().map(|(_, value)| value)
+    }
+
+    /// 插入并标记为最近使用；返回被替换或淘汰的旧值（调用方负责注销）。
+    fn insert(&mut self, key: usize, value: T) -> Option<T> {
+        let existing = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key);
+        let replaced = existing.map(|index| self.entries.remove(index).1);
+        self.entries.insert(0, (key, value));
+        if replaced.is_some() {
+            return replaced;
+        }
+        if self.entries.len() > self.capacity {
+            return self.entries.pop().map(|(_, value)| value);
+        }
+        None
+    }
+
+    /// 删除 `key` 并返回其值。
+    fn remove(&mut self, key: usize) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)?;
+        Some(self.entries.remove(index).1)
+    }
+
+    /// 取走全部值（用于 `Drop` 里统一注销）。
+    fn drain(&mut self) -> Vec<T> {
+        self.entries.drain(..).map(|(_, value)| value).collect()
+    }
+}
+
+/// 直通缓存的容量：采集纹理池为 4 张，留一倍余量给池重建（改分辨率时新旧池会
+/// 短暂并存）与探针自建的临时纹理。
+const DIRECT_INPUT_CAPACITY: usize = 8;
+
+/// 直通输入纹理的注册缓存：纹理对象地址 → 注册句柄。
+///
+/// **必须同时持有纹理引用**：注册期间驱动保存的是裸资源指针，若纹理先被释放、
+/// 之后的新对象恰好拿到同一地址，缓存就会把过期句柄发给一张完全不同的纹理。
+/// 持引用既稳定了地址，也保证资源在注销前不会被释放。
+struct DirectInputCache {
+    entries: LruCache<(ID3D11Texture2D, sys::NV_ENC_REGISTERED_PTR)>,
+}
+
+impl DirectInputCache {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::new(DIRECT_INPUT_CAPACITY),
+        }
+    }
+
+    /// 缓存键：纹理对象地址（同一 `ID3D11Texture2D` 在生命周期内不变）。
+    fn key(texture: &ID3D11Texture2D) -> usize {
+        texture.as_raw() as usize
+    }
+
+    /// 取已注册句柄（命中会刷新最近使用顺序）。
+    fn get(&mut self, key: usize) -> Option<sys::NV_ENC_REGISTERED_PTR> {
+        self.entries.get_mut(key).map(|(_, registered)| *registered)
+    }
+
+    /// 登记一条新注册；返回需要由调用方**先注销**的旧句柄（同键替换或淘汰）。
+    fn insert(
+        &mut self,
+        key: usize,
+        texture: ID3D11Texture2D,
+        registered: sys::NV_ENC_REGISTERED_PTR,
+    ) -> Option<sys::NV_ENC_REGISTERED_PTR> {
+        self.entries
+            .insert(key, (texture, registered))
+            .map(|(_, old)| old)
+    }
+
+    /// 移除并返回 `key` 的注册句柄（映射失败时用它清掉坏项）。
+    fn remove(&mut self, key: usize) -> Option<sys::NV_ENC_REGISTERED_PTR> {
+        self.entries.remove(key).map(|(_, registered)| registered)
+    }
+
+    /// 取走全部（纹理引用, 注册句柄），供 `Drop` 统一注销。
+    fn drain(&mut self) -> Vec<(ID3D11Texture2D, sys::NV_ENC_REGISTERED_PTR)> {
+        self.entries.drain()
+    }
+}
+
 /// 从驱动取 H.264 的 preset 默认配置，再覆盖成本模块要求的固定参数。
 fn build_encode_config(
     session: &NvencSession<'_>,
@@ -486,10 +626,15 @@ pub struct NvencEncoder<'a> {
     registered: sys::NV_ENC_REGISTERED_PTR,
     mapped: sys::NV_ENC_INPUT_PTR,
     mapped_format: sys::NV_ENC_BUFFER_FORMAT,
-    /// 只为保持设备存活（纹理与上下文都源自它）；本模块不直接读它。
-    _device: ID3D11Device,
+    /// 设备所有权（纹理与上下文都源自它）。
+    ///
+    /// 复用采集设备时这里与采集源共享同一个 `Arc<D3d11>`；独立设备（探针路径）
+    /// 则独占一块新建的设备。直通路径要求调用方的纹理来自**同一块**设备。
+    d3d: Arc<D3d11>,
     context: ID3D11DeviceContext,
     texture: ID3D11Texture2D,
+    /// 外部 GPU 纹理的注册缓存（[`Self::encode_texture`] 用）。
+    direct: DirectInputCache,
     input_format: InputFormat,
     width: u32,
     height: u32,
@@ -524,26 +669,28 @@ impl std::fmt::Debug for NvencEncoder<'_> {
 }
 
 impl<'a> NvencEncoder<'a> {
-    /// 在 NVIDIA D3D11 设备上打开一个 H.264 4:2:0 编码会话并准备好输入纹理。
+    /// 在 `d3d` 指定的 D3D11 设备上打开一个 H.264 4:2:0 编码会话并准备好输入纹理。
+    ///
+    /// `d3d` 按值传入（`Arc`）：调用方可以复用采集源的设备，避免多建一块
+    /// NVIDIA 设备。
     ///
     /// # Errors
     /// 参数越界、驱动拒绝会话/初始化、D3D11 纹理创建或资源注册失败时返回
     /// [`WinVideoError`]。
     pub fn new(
         api: &'a NvencApi,
-        d3d: &D3d11,
+        d3d: Arc<D3d11>,
         config: EncoderConfig,
     ) -> Result<Self, WinVideoError> {
         config.validate()?;
 
-        let session = api.open_session(d3d)?;
+        let session = api.open_session(&d3d)?;
         let bitrate_bps = kbps_to_bps(config.bitrate_kbps);
         let encode_config = build_encode_config(&session, bitrate_bps)?;
 
-        let device = d3d.device.clone();
         let context = d3d.context.clone();
         let texture = create_texture(
-            &device,
+            &d3d.device,
             config.source_width,
             config.source_height,
             config.input_format,
@@ -615,9 +762,10 @@ impl<'a> NvencEncoder<'a> {
             registered,
             mapped,
             mapped_format,
-            _device: device,
+            d3d,
             context,
             texture,
+            direct: DirectInputCache::new(),
             input_format: config.input_format,
             width: config.width,
             height: config.height,
@@ -639,6 +787,21 @@ impl<'a> NvencEncoder<'a> {
     #[must_use]
     pub fn source_size(&self) -> (u32, u32) {
         (self.source_width, self.source_height)
+    }
+
+    /// 编码器所在的 D3D11 设备。
+    ///
+    /// 直通路径（[`Self::encode_texture`]）要求纹理与它**是同一块设备**，
+    /// 调用方用 `Arc::ptr_eq` 校验即可。
+    #[must_use]
+    pub fn device(&self) -> &Arc<D3d11> {
+        &self.d3d
+    }
+
+    /// `device` 是否就是本编码器所在的那块 D3D11 设备。
+    #[must_use]
+    pub fn is_same_device(&self, device: &Arc<D3d11>) -> bool {
+        Arc::ptr_eq(&self.d3d, device)
     }
 
     /// 输入像素的通道顺序。
@@ -736,6 +899,103 @@ impl<'a> NvencEncoder<'a> {
     /// # Errors
     /// NVENC 编码/锁码流失败时返回 [`WinVideoError`]。
     pub fn encode(&mut self, force_idr: bool) -> Result<EncodedPacket, WinVideoError> {
+        self.encode_mapped(self.mapped, self.mapped_format, force_idr)
+    }
+
+    /// 编码一帧**调用方的 GPU 纹理**（零拷贝直通，`nvEncRegisterResource`）。
+    ///
+    /// 与 [`Self::encode`] 相比只换了输入来源：把纹理注册给 NVENC 后逐帧
+    /// 映射 → 编码 → 解映射，**不经过本编码器自有的输入纹理、不做任何 CPU 拷贝**。
+    ///
+    /// 调用方必须保证：
+    /// - 纹理与编码器在同一块 D3D11 设备上（跨设备注册会被驱动拒绝）；
+    /// - 纹理尺寸 == [`Self::source_size`]（NVENC 只按 `inputWidth/Height` 裁剪、
+    ///   不缩放），格式与 [`Self::input_format`] 一致。
+    ///
+    /// 注册按纹理对象地址缓存（采集纹理池会反复复用同一批纹理），首帧之后每帧
+    /// 只多一次 `nvEncMapInputResource`。
+    ///
+    /// **失败不是致命的**：约束不满足、驱动拒绝注册/映射时返回错误，调用方应回退
+    /// 到 CPU 上传路径（[`Self::encode_bgra`] / [`Self::encode_rgba`]），而**不要**
+    /// 因此关掉整条 GPU 采集路径。
+    ///
+    /// # Errors
+    /// 纹理格式/尺寸不符（[`WinVideoError::Config`]）、驱动未导出注册/映射入口、
+    /// 注册或映射失败、编码/锁码流失败（[`WinVideoError::Nvenc`]）。
+    pub fn encode_texture(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        force_idr: bool,
+    ) -> Result<EncodedPacket, WinVideoError> {
+        let key = DirectInputCache::key(texture);
+        let registered = self.direct_input(key, texture)?;
+        let (mapped, mapped_format) = match map_input(&self.session, registered) {
+            Ok(mapped) => mapped,
+            Err(err) => {
+                // 映射失败说明这条注册不可用，别把坏句柄留在缓存里（否则每帧都会
+                // 在同一处失败，且 Drop 时还会去注销一个可能已失效的句柄）。
+                if let Some(dead) = self.direct.remove(key) {
+                    unregister_input(&self.session, dead);
+                }
+                return Err(err);
+            }
+        };
+        let result = self.encode_mapped(mapped, mapped_format, force_idr);
+        // 无论编码成功与否都必须解映射，否则下一帧无法再映射这张纹理。
+        unmap_input(&self.session, mapped);
+        result
+    }
+
+    /// 取（必要时注册）外部纹理对应的 NVENC 注册句柄。
+    fn direct_input(
+        &mut self,
+        key: usize,
+        texture: &ID3D11Texture2D,
+    ) -> Result<sys::NV_ENC_REGISTERED_PTR, WinVideoError> {
+        if let Some(registered) = self.direct.get(key) {
+            return Ok(registered);
+        }
+        // 首次见到这张纹理才校验：同一对象的描述不会变，缓存命中时无需重复查询。
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `texture` 是调用方保证有效的纹理；`desc` 指向本栈帧。
+        unsafe { texture.GetDesc(&raw mut desc) };
+        // 采集纹理可能是 `_SRGB` 变体（WGC/DXGI 的帧格式），字节布局与 `_UNORM`
+        // 完全相同；NVENC 注册只看排列不看传输曲线，故一并接受。
+        let srgb_bgra = self.input_format == InputFormat::Bgra
+            && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if desc.Format != self.input_format.dxgi_format() && !srgb_bgra {
+            return Err(WinVideoError::Config(format!(
+                "直通纹理格式 {:?} 与编码器输入格式 {:?} 不一致",
+                desc.Format, self.input_format
+            )));
+        }
+        if (desc.Width, desc.Height) != (self.source_width, self.source_height) {
+            return Err(WinVideoError::Config(format!(
+                "直通纹理尺寸 {}x{} 与编码器输入尺寸 {}x{} 不一致（缩放必须先回读）",
+                desc.Width, desc.Height, self.source_width, self.source_height
+            )));
+        }
+        let registered = register_input(
+            &self.session,
+            texture,
+            self.source_width,
+            self.source_height,
+            self.input_format,
+        )?;
+        if let Some(old) = self.direct.insert(key, texture.clone(), registered) {
+            // 同键替换（不该发生：命中时不会走到这里）或容量淘汰。
+            unregister_input(&self.session, old);
+        }
+        Ok(registered)
+    }
+
+    /// 用**已映射**的输入资源编码一帧；CPU 上传与纹理直通两条路径共用。
+    fn encode_mapped(
+        &mut self,
+        mapped: sys::NV_ENC_INPUT_PTR,
+        mapped_format: sys::NV_ENC_BUFFER_FORMAT,
+        force_idr: bool,
+    ) -> Result<EncodedPacket, WinVideoError> {
         let encode_picture = self
             .session
             .api()
@@ -766,13 +1026,13 @@ impl<'a> NvencEncoder<'a> {
             (*pic_ptr).frameIdx = self.frame_idx;
             (*pic_ptr).inputTimeStamp = u64::from(self.frame_idx);
             (*pic_ptr).inputDuration = 1;
-            (*pic_ptr).inputBuffer = self.mapped;
+            (*pic_ptr).inputBuffer = mapped;
             (*pic_ptr).outputBitstream = self.bitstream;
-            (*pic_ptr).bufferFmt = self.mapped_format;
+            (*pic_ptr).bufferFmt = mapped_format;
             (*pic_ptr).pictureStruct = sys::_NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
         }
 
-        // SAFETY: 会话句柄有效；输入缓冲来自本编码器的映射资源，输出缓冲由本
+        // SAFETY: 会话句柄有效；输入缓冲来自本编码器映射的资源，输出缓冲由本
         // 编码器创建；参数指向本栈帧且字段已完整初始化。
         let status = unsafe { encode_picture(self.session.handle(), pic_ptr) };
         check(status, "nvEncEncodePicture")?;
@@ -946,6 +1206,12 @@ impl Drop for NvencEncoder<'_> {
         self.mapped = ptr::null_mut();
         unregister_input(&self.session, self.registered);
         self.registered = ptr::null_mut();
+        // 直通缓存：**先注销再放掉纹理引用**。顺序不能反——纹理一旦先释放，
+        // 注销的就不再是一块有效资源。每帧的映射都在编码后立即解除，这里不会
+        // 有仍处于映射状态的注册。
+        for (_, registered) in self.direct.drain() {
+            unregister_input(&self.session, registered);
+        }
         destroy_bitstream(&self.session, self.bitstream);
         self.bitstream = ptr::null_mut();
         // 纹理 / 设备 / 上下文随字段析构；编码器句柄由 `NvencSession::drop` 销毁。
@@ -963,7 +1229,7 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::vbr_average;
+    use super::{vbr_average, LruCache};
 
     #[test]
     fn vbr_average_is_seventy_percent_of_peak() {
@@ -978,5 +1244,56 @@ mod tests {
         assert_eq!(vbr_average(0), 1);
         // 极大值走饱和乘法，不 panic。
         assert!(vbr_average(u32::MAX) > 0);
+    }
+
+    /// 直通注册缓存的**淘汰顺序**：命中刷新最近使用、满容量淘汰最久未使用。
+    ///
+    /// 顺序错了会注销一张仍在使用中的注册（画面直接坏掉）或泄漏注册，
+    /// 而这条路径在本机无法真机验证，只能靠这里的机械锁。
+    #[test]
+    fn lru_cache_evicts_least_recently_used() {
+        let mut cache = LruCache::new(2);
+        assert_eq!(cache.insert(1, "a"), None);
+        assert_eq!(cache.insert(2, "b"), None);
+        // 命中 1：顺序变成 1（最近）→ 2（最久）。
+        assert_eq!(cache.get_mut(1), Some(&mut "a"));
+        // 插入 3 必须淘汰 2，而不是 1。
+        assert_eq!(cache.insert(3, "c"), Some("b"));
+        assert!(cache.get_mut(2).is_none(), "被淘汰的键不能再命中");
+        assert_eq!(cache.get_mut(1), Some(&mut "a"));
+        assert_eq!(cache.get_mut(3), Some(&mut "c"));
+    }
+
+    /// 同键重复插入必须把旧值交回调用方注销（不能静默丢弃句柄）。
+    #[test]
+    fn lru_cache_same_key_returns_old_value() {
+        let mut cache = LruCache::new(4);
+        assert_eq!(cache.insert(7, 10_u32), None);
+        assert_eq!(cache.insert(7, 20_u32), Some(10));
+        assert_eq!(cache.get_mut(7), Some(&mut 20));
+    }
+
+    /// 容量为 0 会被抬到 1（一个键都不缓存等于每帧重新注册）。
+    #[test]
+    fn lru_cache_capacity_is_at_least_one() {
+        let mut cache = LruCache::new(0);
+        assert_eq!(cache.insert(1, "a"), None);
+        assert_eq!(cache.insert(2, "b"), Some("a"));
+        assert_eq!(cache.get_mut(2), Some(&mut "b"));
+    }
+
+    /// `remove` / `drain` 必须真的把值交出来（`Drop` 靠 `drain` 逐个注销）。
+    #[test]
+    fn lru_cache_remove_and_drain_return_values() {
+        let mut cache = LruCache::new(4);
+        cache.insert(1, "a");
+        cache.insert(2, "b");
+        cache.insert(3, "c");
+        assert_eq!(cache.remove(2), Some("b"));
+        assert_eq!(cache.remove(2), None);
+        let mut drained = cache.drain();
+        drained.sort_unstable();
+        assert_eq!(drained, vec!["a", "c"]);
+        assert!(cache.get_mut(1).is_none(), "drain 之后表必须为空");
     }
 }

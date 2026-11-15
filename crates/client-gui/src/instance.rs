@@ -358,6 +358,8 @@ pub(crate) fn spawn_instance_runtime(
                     enabled: true,
                     approval_policy: approval,
                     auto_lock_on_disconnect: auto_lock,
+                    // 实例模式（安全桌面）走 GDI/BitBlt 采集，不做 4K：编码宽度保持 1920。
+                    native_resolution: false,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

@@ -16,6 +16,8 @@ use rust_tunnel_win_video::nvenc::{EncoderConfig, NvencApi, NvencEncoder};
 #[cfg(windows)]
 use rust_tunnel_win_video::WinVideoError;
 #[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows::Win32::Foundation::FILETIME;
@@ -326,7 +328,7 @@ fn print_run(
 #[cfg(windows)]
 fn run_comparison(
     api: &NvencApi,
-    encode_d3d: &d3d11::D3d11,
+    encode_d3d: &Arc<d3d11::D3d11>,
     width: u32,
     height: u32,
 ) -> Result<(), WinVideoError> {
@@ -334,7 +336,7 @@ fn run_comparison(
     println!("\n== 对照：{width}x{height} ==");
 
     let config = EncoderConfig::new(width, height, FPS, bitrate_kbps)?;
-    let mut encoder = NvencEncoder::new(api, encode_d3d, config)?;
+    let mut encoder = NvencEncoder::new(api, Arc::clone(encode_d3d), config)?;
     let mut packets: Vec<Vec<u8>> = Vec::with_capacity(usize::try_from(FRAME_COUNT).unwrap_or(0));
     for index in 0..FRAME_COUNT {
         let bgra = synthetic_bgra(width, height, index);
@@ -381,11 +383,14 @@ fn run_comparison(
 
 /// 多包拼接输入回归（与路径无关）。
 #[cfg(windows)]
-fn run_concatenated_probe(api: &NvencApi, encode_d3d: &d3d11::D3d11) -> Result<(), WinVideoError> {
+fn run_concatenated_probe(
+    api: &NvencApi,
+    encode_d3d: &Arc<d3d11::D3d11>,
+) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
     let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, 4000)?;
-    let mut encoder = NvencEncoder::new(api, encode_d3d, config)?;
+    let mut encoder = NvencEncoder::new(api, Arc::clone(encode_d3d), config)?;
     let mut combined = Vec::new();
     for index in 0..3u32 {
         let bgra = synthetic_bgra(WIDTH, HEIGHT, index);
@@ -421,11 +426,11 @@ fn run_concatenated_probe(api: &NvencApi, encode_d3d: &d3d11::D3d11) -> Result<(
 
 /// `reconfigure` 尺寸变化回归（与路径无关）。
 #[cfg(windows)]
-fn run_resize_probe(api: &NvencApi, encode_d3d: &d3d11::D3d11) -> Result<(), WinVideoError> {
+fn run_resize_probe(api: &NvencApi, encode_d3d: &Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 360;
     let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, 2000)?;
-    let mut encoder = NvencEncoder::new(api, encode_d3d, config)?;
+    let mut encoder = NvencEncoder::new(api, Arc::clone(encode_d3d), config)?;
     let bgra = synthetic_bgra(WIDTH, HEIGHT, 0);
     encoder.upload_bgra(&bgra)?;
     let packet = encoder.encode(true)?;
@@ -478,7 +483,7 @@ fn run() -> Result<(), WinVideoError> {
     }
 
     let api = NvencApi::load()?;
-    let encode_d3d = d3d11::create_nvidia()?;
+    let encode_d3d = Arc::new(d3d11::create_nvidia()?);
     println!("\n  NVENC 编码设备: {}", encode_d3d.adapter.name);
 
     for (width, height) in RESOLUTIONS {

@@ -868,18 +868,13 @@ fn paint_image(
         }
         FramePaint::Nv12 {
             frame,
-            width,
-            height,
-            seq,
             target_format,
+            ..
         } => {
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
                 Nv12Callback {
                     frame: Arc::clone(frame),
-                    width: *width,
-                    height: *height,
-                    seq: *seq,
                     target_format: *target_format,
                 },
             ));

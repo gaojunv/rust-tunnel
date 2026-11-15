@@ -22,7 +22,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows_probe {
-    use rust_tunnel_win_video::capture;
+    use rust_tunnel_win_video::capture::{self, BgraReadback, CaptureSource};
     use rust_tunnel_win_video::d3d11;
     use rust_tunnel_win_video::decode::H264Decoder;
     use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
@@ -31,6 +31,7 @@ mod windows_probe {
     use std::fs::File;
     use std::io::{BufWriter, Write};
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::Instant;
 
     /// 最多采集/编解码的帧数。
@@ -156,6 +157,105 @@ mod windows_probe {
         Ok(())
     }
 
+    /// 零拷贝对照：同一帧分别走「纹理直通」与「回读上传」编码，再各自解码比对。
+    ///
+    /// 只在**采集设备本身是 NVIDIA** 时才跑：否则 NVENC 会话开在另一块设备上，
+    /// `nvEncRegisterResource` 根本不适用（适配器会回读）。输出
+    /// `zero-copy used = true/false` 与失败原因，并打印两条路径的码流字节数、
+    /// 各自耗时，以及解码画面相对源帧的 MAD。
+    ///
+    /// 判据（真机）：直通与回读的 MAD ≤ 2/255 —— 同一帧、同一编码器参数，两者
+    /// 只该有码率控制量化带来的细微差异；有结构性差异说明直通的颜色通道或
+    /// 步长（pitch）拿错了。
+    fn zero_copy_ab(source: &mut dyn CaptureSource) -> Result<(), WinVideoError> {
+        let Some(device) = source.device() else {
+            println!(
+                "零拷贝对照: 采集后端没有 D3D11 设备，zero-copy used = false 原因=后端不支持 GPU 纹理"
+            );
+            return Ok(());
+        };
+        if !device.adapter.is_nvidia() {
+            println!(
+                "零拷贝对照: 采集设备不是 NVIDIA（{}），zero-copy used = false 原因=采集设备与 NVENC 不同设备",
+                device.adapter.name
+            );
+            return Ok(());
+        }
+        let captured = match source.capture_texture() {
+            Ok(captured) => captured,
+            Err(err) => {
+                println!("零拷贝对照: GPU 采集失败，zero-copy used = false 原因={err}");
+                return Ok(());
+            }
+        };
+        let (width, height) = (captured.width, captured.height);
+        println!(
+            "零拷贝对照: 采集设备 NVIDIA（{}），纹理 {width}x{height}",
+            device.adapter.name
+        );
+        if width > MAX_WIDTH {
+            println!(
+                "零拷贝对照: 纹理宽 {width} 超过编码上限 {MAX_WIDTH}（4K→1920 需要 CPU 缩放），zero-copy used = false 原因=尺寸超限"
+            );
+            return Ok(());
+        }
+
+        let api = NvencApi::load()?;
+        let config = EncoderConfig::new(width, height, FPS, BITRATE_KBPS)?
+            .with_input_format(InputFormat::Bgra);
+        let mut encoder = NvencEncoder::new(&api, Arc::clone(&device), config)?;
+
+        // ① 纹理直通：采集纹理直接注册给 NVENC，不落 CPU。
+        let direct_started = Instant::now();
+        let direct = match encoder.encode_texture(&captured.texture, true) {
+            Ok(packet) => packet,
+            Err(err) => {
+                println!("零拷贝对照: 纹理直通失败，zero-copy used = false 原因={err}");
+                return Ok(());
+            }
+        };
+        let direct_ms = direct_started.elapsed().as_secs_f64() * 1000.0;
+
+        // ② 回读上传：既有路径（staging CopyResource + Map + UpdateSubresource）。
+        let mut readback = BgraReadback::new();
+        let readback_started = Instant::now();
+        let (_, _, bgra) = readback.read(&captured)?;
+        let readback_ms = readback_started.elapsed().as_secs_f64() * 1000.0;
+        let encode_started = Instant::now();
+        let uploaded = encoder.encode_bgra(&bgra, true)?;
+        let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "零拷贝对照: 直通 {} 字节（{direct_ms:.2} ms）| 回读 {} 字节（回读 {readback_ms:.2} ms + 编码 {encode_ms:.2} ms），zero-copy used = true",
+            direct.payload_len(),
+            uploaded.payload_len(),
+        );
+
+        // 解码比对放在最后：即使解码器建不起来（例如 4K 输入超出 MFT 能力），
+        // 上面的「直通确实编出了码流」仍然是有效结论。
+        let mut decoder = match H264Decoder::new(width, height) {
+            Ok(decoder) => decoder,
+            Err(err) => {
+                println!("零拷贝对照: 解码器不可用，跳过像素比较（{err}）");
+                return Ok(());
+            }
+        };
+        let reference = bgra_to_rgba(&bgra);
+        let direct_frame = decoder.decode(&direct.data)?;
+        let uploaded_frame = decoder.decode(&uploaded.data)?;
+        let (Some(direct_frame), Some(uploaded_frame)) = (direct_frame, uploaded_frame) else {
+            println!("零拷贝对照: 解码器没有输出（MFT 输入缓冲），本次无法比较像素；重跑通常就有");
+            return Ok(());
+        };
+        println!(
+            "零拷贝对照: 直通 vs 回读 MAD={:.2}，直通 vs 源 MAD={:.2}，回读 vs 源 MAD={:.2}",
+            mean_abs_diff(&direct_frame.rgba, &uploaded_frame.rgba),
+            mean_abs_diff(&direct_frame.rgba, &reference),
+            mean_abs_diff(&uploaded_frame.rgba, &reference),
+        );
+        Ok(())
+    }
+
     /// 跑一次全链路探针。
     ///
     /// # Errors
@@ -191,10 +291,10 @@ mod windows_probe {
         println!("源 {src_w}x{src_h} → 编码 {dst_w}x{dst_h}");
 
         let api = NvencApi::load()?;
-        let d3d = d3d11::create_nvidia()?;
+        let d3d = Arc::new(d3d11::create_nvidia()?);
         let config = EncoderConfig::new(dst_w, dst_h, FPS, BITRATE_KBPS)?
             .with_input_format(InputFormat::Rgba);
-        let mut encoder = NvencEncoder::new(&api, &d3d, config)?;
+        let mut encoder = NvencEncoder::new(&api, d3d, config)?;
         let mut decoder = H264Decoder::new(dst_w, dst_h)?;
         println!(
             "NVENC 会话已打开（驱动 {:?}），MFT 已初始化",
@@ -280,6 +380,12 @@ mod windows_probe {
             println!("第一帧解码结果已写入 {}", path.display());
         } else {
             println!("警告：没有任何解码输出，BMP 未写入");
+        }
+
+        // 零拷贝对照：直通 vs 回读（需采集设备就是 NVIDIA）。
+        println!();
+        if let Err(err) = zero_copy_ab(source.as_mut()) {
+            println!("零拷贝对照失败（不影响上面的全链路结论）：{err}");
         }
 
         Ok(())

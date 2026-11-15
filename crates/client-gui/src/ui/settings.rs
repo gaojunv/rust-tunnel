@@ -3,8 +3,9 @@ use std::sync::Arc;
 use egui::Ui;
 
 use rust_tunnel_client::ClientConfig;
-use rust_tunnel_remote::ApprovalPolicy;
+use rust_tunnel_remote::{ApprovalPolicy, RemoteManager};
 
+use crate::prefs::GuiPrefs;
 use crate::service_ui::{
     host_config_advisory, host_config_path_display, host_config_presence, owner_label,
     presence_label, start_blocked_reason, HostSeed, ServiceOp, ServiceOps, SERVICE_SUPPORTED,
@@ -76,6 +77,48 @@ impl SettingsState {
         cfg.enable_agent = self.enable_agent;
         cfg
     }
+}
+
+/// 「原生分辨率（4K）」开关（被控端编码选项）。
+///
+/// 返回 `true` 表示用户改动了它——调用方负责落盘并把新值同步到引擎
+/// （本函数内部已调用 [`RemoteManager::set_native_resolution`]）。
+///
+/// 语义有意保守：**只对硬件 H.264 生效**（VP9 软件解码 4K 在控制器侧 37–58 ms/帧），
+/// 且只影响**下一次**会话（运行中的会话不重建编码器、不插 IDR）。
+pub fn show_remote_section(
+    ui: &mut Ui,
+    prefs: &mut GuiPrefs,
+    manager: Option<&Arc<RemoteManager>>,
+) -> bool {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.heading("远程控制 · 编码");
+            ui.add_space(4.0);
+            let mut on = prefs.remote_native_resolution;
+            let changed = ui
+                .checkbox(&mut on, "原生分辨率（4K，仅硬件 H.264）")
+                .changed();
+            ui.label(
+                egui::RichText::new(
+                    "仅 4K 屏 + 硬件 H.264 生效：码率上限翻倍（封顶 30 Mbps）；\
+                     控制器解码/上屏压力更大。对端只支持 VP9 时仍按 1080p 编码。\
+                     运行中修改在下次会话生效。",
+                )
+                .small()
+                .weak(),
+            );
+            if changed {
+                prefs.remote_native_resolution = on;
+                if let Some(manager) = manager {
+                    manager.set_native_resolution(on);
+                }
+                tracing::info!("原生分辨率（4K）：{}", if on { "开" } else { "关" });
+            }
+            changed
+        })
+        .inner
 }
 
 #[allow(

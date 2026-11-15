@@ -169,65 +169,17 @@ impl DecodedNv12 {
     /// 应当丢弃这一帧并等下一个关键帧，而不是把错位的内容拼进去。
     #[must_use]
     pub fn apply_patch(&mut self, frame_width: u32, rect: &ScreenPatch) -> bool {
-        let Ok(frame_width) = usize::try_from(frame_width) else {
+        let Some(geometry) = self.patch_geometry(frame_width, rect) else {
             return false;
         };
-        if frame_width == 0 {
-            return false;
-        }
-        let Ok(rect_width) = usize::try_from(rect.width) else {
-            return false;
-        };
-        let Ok(rect_height) = usize::try_from(rect.height) else {
-            return false;
-        };
-        let Ok(x) = usize::try_from(rect.x) else {
-            return false;
-        };
-        let Ok(y) = usize::try_from(rect.y) else {
-            return false;
-        };
-        // 偶数与整数长度校验：奇数宽高会让 UV 半分辨率错位。
-        if rect_width == 0
-            || rect_height == 0
-            || !rect_width.is_multiple_of(2)
-            || !rect_height.is_multiple_of(2)
-            || !x.is_multiple_of(2)
-            || !y.is_multiple_of(2)
-        {
-            return false;
-        }
-        let Some(frame_height) = self.y.len().checked_div(frame_width) else {
-            return false;
-        };
-        if frame_height == 0 || !frame_height.is_multiple_of(2) {
-            return false;
-        }
-        if self.y.len() != frame_width.saturating_mul(frame_height) {
-            return false;
-        }
-        if self.uv.len() != frame_width.saturating_mul(frame_height / 2) {
-            return false;
-        }
-        let Some(right) = x.checked_add(rect_width) else {
-            return false;
-        };
-        let Some(bottom) = y.checked_add(rect_height) else {
-            return false;
-        };
-        if right > frame_width || bottom > frame_height {
-            return false;
-        }
-        let Some(expected) = rect_width
-            .checked_mul(rect_height)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .and_then(|bytes| bytes.checked_div(2))
-        else {
-            return false;
-        };
-        if rect.nv12.len() != expected {
-            return false;
-        }
+        let PatchGeometry {
+            frame_width,
+            rect_width,
+            rect_height,
+            x,
+            y,
+            uv_base,
+        } = geometry;
 
         // Y 平面：`rect_height` 行，每行 `rect_width` 字节。
         for row in 0..rect_height {
@@ -242,7 +194,6 @@ impl DecodedNv12 {
             dst_slice.copy_from_slice(src_slice);
         }
         // UV 平面：半高度，每行仍是 `rect_width` 字节（交错的 U/V 对）。
-        let uv_base = rect_width * rect_height;
         for row in 0..(rect_height / 2) {
             let src = uv_base + row * rect_width;
             let dst = (y / 2 + row) * frame_width + x;
@@ -256,6 +207,104 @@ impl DecodedNv12 {
         }
         true
     }
+
+    /// 只**校验**、不写任何字节：该补丁能否安全拼进本帧。
+    ///
+    /// 判据与 [`Self::apply_patch`] 的前置条件**一字不差**（两者共用 [`Self::patch_geometry`]），
+    /// 供补丁批次层实现「先逐块全验、再原地全写」——这样不需要克隆整帧做回滚副本。
+    #[must_use]
+    pub fn validate_patch(&self, frame_width: u32, rect: &ScreenPatch) -> bool {
+        self.patch_geometry(frame_width, rect).is_some()
+    }
+
+    /// 把一批补丁**原子地**拼进整帧：先逐块校验，全部合法才原地写；任一非法则一字节都不改。
+    ///
+    /// [`Self::apply_patch`] 只保证**单个**矩形原子（第二个失败时第一个已经写进去了），批次层
+    /// 若直接逐个调用就会留下「半截应用」——画面缺一块且无法回滚。这里先用
+    /// [`Self::validate_patch`]（与 `apply_patch` 同一套前置条件、不写字节）全验，再原地写。
+    #[must_use]
+    pub fn apply_patches(&mut self, frame_width: u32, rects: &[ScreenPatch]) -> bool {
+        if !rects.iter().all(|rect| self.validate_patch(frame_width, rect)) {
+            return false;
+        }
+        for rect in rects {
+            // 校验与 `apply_patch` 共用 `patch_geometry`，故这里不可能失败。
+            let applied = self.apply_patch(frame_width, rect);
+            debug_assert!(applied, "validate_patch 通过后 apply_patch 不应失败");
+            if !applied {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 校验并解出拼写所需的几何量（全部已转成 `usize`，且已验证不越界）；非法时 `None`。
+    fn patch_geometry(&self, frame_width: u32, rect: &ScreenPatch) -> Option<PatchGeometry> {
+        let frame_width = usize::try_from(frame_width).ok()?;
+        if frame_width == 0 {
+            return None;
+        }
+        let rect_width = usize::try_from(rect.width).ok()?;
+        let rect_height = usize::try_from(rect.height).ok()?;
+        let x = usize::try_from(rect.x).ok()?;
+        let y = usize::try_from(rect.y).ok()?;
+        // 偶数与整数长度校验：奇数宽高会让 UV 半分辨率错位。
+        if rect_width == 0
+            || rect_height == 0
+            || !rect_width.is_multiple_of(2)
+            || !rect_height.is_multiple_of(2)
+            || !x.is_multiple_of(2)
+            || !y.is_multiple_of(2)
+        {
+            return None;
+        }
+        let frame_height = self.y.len().checked_div(frame_width)?;
+        if frame_height == 0 || !frame_height.is_multiple_of(2) {
+            return None;
+        }
+        if self.y.len() != frame_width.saturating_mul(frame_height) {
+            return None;
+        }
+        if self.uv.len() != frame_width.saturating_mul(frame_height / 2) {
+            return None;
+        }
+        let right = x.checked_add(rect_width)?;
+        let bottom = y.checked_add(rect_height)?;
+        if right > frame_width || bottom > frame_height {
+            return None;
+        }
+        let expected = rect_width
+            .checked_mul(rect_height)?
+            .checked_mul(3)?
+            .checked_div(2)?;
+        if rect.nv12.len() != expected {
+            return None;
+        }
+        Some(PatchGeometry {
+            frame_width,
+            rect_width,
+            rect_height,
+            x,
+            y,
+            uv_base: rect_width * rect_height,
+        })
+    }
+}
+
+/// [`DecodedNv12::patch_geometry`] 解出的拼写几何量（全部已完成校验）。
+struct PatchGeometry {
+    /// 整帧宽度（字节，等于 luma 像素数）。
+    frame_width: usize,
+    /// 矩形宽度（luma 像素数 = Y 平面每行字节数）。
+    rect_width: usize,
+    /// 矩形高度（luma 像素行数）。
+    rect_height: usize,
+    /// 矩形左上角 X（偶数）。
+    x: usize,
+    /// 矩形左上角 Y（偶数）。
+    y: usize,
+    /// 补丁数据里 UV 平面相对 Y 平面的字节偏移（`rect_width * rect_height`）。
+    uv_base: usize,
 }
 
 /// 已解码的一帧画面（交给 UI 上传纹理）。
@@ -416,6 +465,17 @@ pub trait ScreenSource: Send + Sync + 'static {
     /// 采集失败（显示器不存在、平台权限不足等）时返回 [`RemoteError::Platform`]。
     fn capture(&self, display: u32) -> RemoteResult<RawFrame>;
 
+    /// 设置本会话的**编码宽度上限**（引擎在每次会话开始、codec 协商完成后调用一次）。
+    ///
+    /// 平台实现据此决定采集侧预缩放的上限：Windows 硬件路径会把 4K 采集一步缩到该
+    /// 宽度（见 `WinVideoScreen`），避免整帧 33 MB 的中间缓冲。默认实现**忽略**它，
+    /// 即始终使用 [`crate::video::MAX_ENCODE_WIDTH`]（1920）——实例/安全桌面那条
+    /// GDI/BitBlt 路径就属于这种情况，不做 4K。
+    ///
+    /// 引擎传入的值只会是 [`crate::video::MAX_ENCODE_WIDTH`] 或
+    /// [`crate::video::NATIVE_MAX_ENCODE_WIDTH`]（后者仅硬件 H.264 的显式选项）。
+    fn set_max_encode_width(&self, _width: u32) {}
+
     /// 本采集源是否支持**不落 CPU** 的 GPU 采集（默认 `false`）。
     ///
     /// 引擎只在协商到 H.264 且本方法为真时才走 [`ScreenSource::capture_gpu`]；
@@ -566,6 +626,26 @@ pub trait Clipboard: Send + Sync + 'static {
     fn set(&self, text: &str) -> RemoteResult<()>;
 }
 
+/// 原生分辨率（硬件 H.264 4K）会话的绝对码率上限（kbps）。
+///
+/// 档位码率翻倍后再封顶到这里：10 Mbps 对 4K 桌面文字明显偏低，翻倍后均衡/高清档
+/// 分别是 12 / 20 Mbps。**只约束被控端的编码上限**，QoS 闭环仍可在其下下调。
+pub const NATIVE_MAX_BITRATE_KBPS: u32 = 30_000;
+
+/// 原生分辨率会话把档位码率上限**翻倍**（封顶 [`NATIVE_MAX_BITRATE_KBPS`]），帧率不变。
+///
+/// 只有 `native_resolution == true` **且**协商到硬件 H.264 时才会用到；VP9 与默认
+/// 1920 宽会话原样返回档位值。
+#[must_use]
+pub const fn native_bitrate_ceiling(preset_kbps: u32) -> u32 {
+    let doubled = preset_kbps.saturating_mul(2);
+    if doubled > NATIVE_MAX_BITRATE_KBPS {
+        NATIVE_MAX_BITRATE_KBPS
+    } else {
+        doubled
+    }
+}
+
 /// 屏幕编码参数——自阶段 3 起是**档位上限**。
 ///
 /// 语义变更（阶段 3 QoS 闭环）：本结构描述的是「这个档位最多给到多少」，**不是**实际生效值。
@@ -575,6 +655,10 @@ pub trait Clipboard: Send + Sync + 'static {
 /// 由此产生的一条硬约束：**上限字段的变化路径与生效值不同**。几何（`scale` → 编码尺寸）变化
 /// 需要重建编码器 + 强制 IDR；而 `target_bitrate_kbps` / `max_fps` 由闭环**在线重配置**，不重建、
 /// 不插 IDR（见 `vendor/shiguredo_libvpx` 的补丁 6）。把码率放进「重建键」会让闭环每秒插一个关键帧。
+///
+/// **原生分辨率会话**（`ControlledConfig::native_resolution` 且协商到硬件 H.264）：封顶宽度换成
+/// [`crate::video::NATIVE_MAX_ENCODE_WIDTH`]（3840），`target_bitrate_kbps` 经
+/// [`native_bitrate_ceiling`] 翻倍。VP9 与默认会话不变。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EncodeOptions {
     /// 目标码率**上限**（kbps）。VP9 CBR 的目标值；实际值由闭环在 `[BR_MIN, 本值]` 内浮动。
@@ -726,6 +810,29 @@ impl FrameSink for NullFrameSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 原生分辨率（硬件 H.264 4K）的码率规则：档位翻倍，封顶 30 Mbps，帧率不动。
+    ///
+    /// 钉住两条：① 默认三档翻倍后仍在封顶之下（2000→4000 / 6000→12000 / 10000→20000）；
+    /// ② 任何输入都不越过 [`NATIVE_MAX_BITRATE_KBPS`]（饱和乘法 + 封顶，不溢出）。
+    #[test]
+    fn native_bitrate_ceiling_doubles_and_caps() {
+        assert_eq!(native_bitrate_ceiling(2000), 4000);
+        assert_eq!(native_bitrate_ceiling(6000), 12_000);
+        assert_eq!(native_bitrate_ceiling(10_000), 20_000);
+        assert_eq!(native_bitrate_ceiling(20_000), NATIVE_MAX_BITRATE_KBPS);
+        assert_eq!(native_bitrate_ceiling(u32::MAX), NATIVE_MAX_BITRATE_KBPS);
+        // 帧率与分辨率无关：档位原样给出（这里用现有档位钉住「只翻码率」）。
+        for preset in QualityPreset::all() {
+            let doubled = native_bitrate_ceiling(preset.options().target_bitrate_kbps);
+            assert_eq!(
+                doubled,
+                preset.options().target_bitrate_kbps * 2,
+                "{} 档应恰好翻倍",
+                preset.label()
+            );
+        }
+    }
 
     #[test]
     fn scaled_dimension_has_floor_of_one_pixel() {
@@ -881,6 +988,103 @@ mod tests {
         assert!(!frame.apply_patch(0, &valid));
         assert!(!frame.apply_patch(7, &valid));
         assert_eq!(frame, original);
+    }
+
+    /// 一批补丁要么**全部应用**，要么一字节都不改。
+    ///
+    /// [`DecodedNv12::apply_patch`] 只保证单个矩形原子：第二个矩形失败时第一个已经写进去了。
+    /// 这种半截应用会永久留在持久合成帧里（画面缺一块且无法回滚），故批次层用
+    /// [`DecodedNv12::apply_patches`] 先全验、再原地写——**不克隆整帧做回滚副本**。
+    #[test]
+    fn apply_patches_is_all_or_nothing() {
+        // 8×6 整帧：Y 48 字节、UV 24 字节。
+        let original = DecodedNv12 {
+            y: vec![0xAA; 48],
+            uv: vec![0xBB; 24],
+        };
+        let valid = ScreenPatch {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+            nv12: vec![1; 12],
+        };
+        // 全部合法：两块都写进去。
+        let mut composite = original.clone();
+        let second = ScreenPatch {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            nv12: vec![2; 6],
+        };
+        assert!(composite.apply_patches(8, &[valid.clone(), second]));
+        assert_eq!(composite.y[2 * 8 + 2], 1, "第一块应已应用");
+        assert_eq!(composite.y[0], 2, "第二块应已应用");
+
+        // 第二块越界：第一块也不能留下。
+        let mut composite = original.clone();
+        let bad = ScreenPatch {
+            x: 6,
+            y: 0,
+            width: 4,
+            height: 2,
+            nv12: vec![3; 12],
+        };
+        assert!(!composite.apply_patches(8, &[valid, bad]));
+        assert_eq!(composite, original, "整批失败时不得留下半截应用");
+
+        // 空批次是合法空操作（补丁保活）。
+        let mut composite = original.clone();
+        assert!(composite.apply_patches(8, &[]));
+        assert_eq!(composite, original);
+    }
+
+    /// `validate_patch` 与 `apply_patch` 的判据必须完全一致：批次层靠它实现「先全验、再全写」，
+    /// 若两者有分歧，就会出现「校验通过却应用失败」的半截写入。
+    #[test]
+    fn validate_patch_matches_apply_patch_preconditions() {
+        let frame = DecodedNv12 {
+            y: vec![0xAA; 48],
+            uv: vec![0xBB; 24],
+        };
+        let valid = ScreenPatch {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+            nv12: vec![0; 12],
+        };
+        assert!(frame.validate_patch(8, &valid));
+
+        let cases = [
+            ScreenPatch { width: 3, ..valid.clone() },
+            ScreenPatch { height: 3, ..valid.clone() },
+            ScreenPatch { x: 3, ..valid.clone() },
+            ScreenPatch { y: 3, ..valid.clone() },
+            ScreenPatch { x: 6, ..valid.clone() },
+            ScreenPatch { y: 6, ..valid.clone() },
+            ScreenPatch { nv12: vec![0; 11], ..valid.clone() },
+            ScreenPatch { nv12: vec![0; 13], ..valid.clone() },
+            ScreenPatch { width: 0, ..valid.clone() },
+            ScreenPatch { height: 0, ..valid.clone() },
+        ];
+        for (index, patch) in cases.into_iter().enumerate() {
+            assert!(!frame.validate_patch(8, &patch), "第 {index} 个非法补丁应被拒");
+            // 与真正应用的结果一致（且 `apply_patch` 不改动缓冲）。
+            let mut copy = frame.clone();
+            assert!(!copy.apply_patch(8, &patch), "第 {index} 个非法补丁应被 apply 拒绝");
+            assert_eq!(copy, frame);
+        }
+        // 整帧宽度非法（0 / 奇数）同样拒绝。
+        assert!(!frame.validate_patch(0, &valid));
+        assert!(!frame.validate_patch(7, &valid));
+        // 平面长度与帧宽不自洽的缓冲：任何补丁都不该被接受。
+        let ragged = DecodedNv12 {
+            y: vec![0; 47],
+            uv: vec![0; 24],
+        };
+        assert!(!ragged.validate_patch(8, &valid));
     }
 }
 

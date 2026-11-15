@@ -7,6 +7,7 @@
 use crate::d3d11;
 use crate::nvenc::{self, EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use crate::WinVideoError;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 构造一帧合成的自顶向下像素：渐变背景 + 随帧号移动的方块。
@@ -62,7 +63,7 @@ fn synthetic_pixels(width: u32, height: u32, frame: u32, format: InputFormat) ->
     buf
 }
 
-fn run_encode_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoError> {
+fn run_encode_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
     const FPS: u32 = 60;
@@ -157,7 +158,7 @@ fn run_encode_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoEr
     Ok(())
 }
 
-fn run_rgba_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoError> {
+fn run_rgba_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
     const FRAMES: u32 = 3;
@@ -209,7 +210,7 @@ fn run_rgba_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoErro
 /// 探测 NVENC 能否自行把 4K 输入缩放到 1080p 编码尺寸。
 ///
 /// 失败不视为探针失败：这条能力是可选的，结论会打印出来供适配层决策。
-fn run_scaling_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoError> {
+fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
     const ENCODE_WIDTH: u32 = 1920;
     const ENCODE_HEIGHT: u32 = 1080;
     const SOURCE_WIDTH: u32 = 3840;
@@ -221,7 +222,7 @@ fn run_scaling_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoE
     );
     let config = EncoderConfig::new(ENCODE_WIDTH, ENCODE_HEIGHT, 60, 6000)?
         .with_source_size(SOURCE_WIDTH, SOURCE_HEIGHT);
-    let mut encoder = match NvencEncoder::new(api, d3d, config) {
+    let mut encoder = match NvencEncoder::new(api, Arc::clone(&d3d), config) {
         Ok(encoder) => encoder,
         Err(err) => {
             println!("  编码器创建失败: {err}");
@@ -285,7 +286,7 @@ fn run_scaling_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoE
     println!("  缩放/裁剪判定：两趟独立会话，第 2 帧仅左上 {ENCODE_WIDTH}x{ENCODE_HEIGHT} 之外的区域不同");
     let baseline = scaling_test_p_frame(
         api,
-        d3d,
+        Arc::clone(&d3d),
         (ENCODE_WIDTH, ENCODE_HEIGHT),
         (SOURCE_WIDTH, SOURCE_HEIGHT),
         false,
@@ -315,7 +316,7 @@ fn run_scaling_probe(api: &NvencApi, d3d: &d3d11::D3d11) -> Result<(), WinVideoE
 /// `crop_width x crop_height` 之外的区域涂白，返回第 2 帧的 P 帧。
 fn scaling_test_p_frame(
     api: &NvencApi,
-    d3d: &d3d11::D3d11,
+    d3d: Arc<d3d11::D3d11>,
     encode: (u32, u32),
     source: (u32, u32),
     white_outside: bool,
@@ -613,7 +614,7 @@ pub fn run() -> Result<(), WinVideoError> {
     println!("  驱动版本: {dmaj}.{dmin}");
     println!("  请求版本: 0x{:08X}", api.requested_api_version());
 
-    let d3d = d3d11::create_nvidia()?;
+    let d3d = Arc::new(d3d11::create_nvidia()?);
     println!(
         "  NVENC 设备: {} (vendor=0x{:04X})",
         d3d.adapter.name, d3d.adapter.vendor_id
@@ -653,9 +654,9 @@ pub fn run() -> Result<(), WinVideoError> {
     }
 
     drop(session);
-    run_encode_probe(&api, &d3d)?;
-    run_rgba_probe(&api, &d3d)?;
-    run_scaling_probe(&api, &d3d)?;
+    run_encode_probe(&api, Arc::clone(&d3d))?;
+    run_rgba_probe(&api, Arc::clone(&d3d))?;
+    run_scaling_probe(&api, d3d)?;
 
     Ok(())
 }

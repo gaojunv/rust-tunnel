@@ -156,6 +156,13 @@ pub struct GuiPrefs {
     /// 档位是**上限**，实际码率/帧率仍由 QoS 闭环在上限之下浮动。会话建立时自动下发一次。
     #[serde(default)]
     pub remote_quality: QualityPreset,
+    /// 被控端是否使用**原生分辨率**（4K）编码。**默认关闭**。
+    ///
+    /// 只在协商到**硬件 H.264** 时生效：编码宽度上限从 1920 放宽到 3840，档位码率翻倍
+    /// （封顶 30 Mbps）。代价是控制器的解码/上屏压力随像素线性增长；VP9 路径不受影响。
+    /// 运行中修改只对下一次会话生效。
+    #[serde(default)]
+    pub remote_native_resolution: bool,
 }
 
 impl Default for GuiPrefs {
@@ -171,12 +178,14 @@ impl Default for GuiPrefs {
             remote_view_scale: ViewScale::default(),
             remote_window_size: WindowSize::default(),
             remote_clipboard_sync: false,
-            // 与 derive 时代的默认值保持一致（`#[serde(default = "default_true")]` 只在
-            // 配置文件缺键时生效，全新安装的历史行为是 false——不在本次改动里改变它）。
-            remote_auto_reconnect: false,
+            // **必须与字段上的 `#[serde(default = "default_true")]` 一致**：那一条只覆盖
+            // 「配置文件缺键」，全新安装/没有配置文件走的是这里。两处不一致会让「文档说默认开、
+            // 实际默认关」，断线后不重连。
+            remote_auto_reconnect: true,
             remote_stats_overlay: false,
             remote_frame_rate: default_remote_frame_rate(),
             remote_quality: QualityPreset::default(),
+            remote_native_resolution: false,
         }
     }
 }
@@ -385,6 +394,46 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert_eq!(reparsed.remote_frame_rate, 60);
+    }
+
+    /// 原生分辨率（4K）默认关闭，且显式开启后能 TOML 往返保留。
+    #[test]
+    fn native_resolution_defaults_off_and_survives_roundtrip() {
+        assert!(
+            !GuiPrefs::default().remote_native_resolution,
+            "全新安装不得默认开 4K（控制器解码压力更大，必须是显式选择）"
+        );
+        // 缺键的旧配置落到 false（serde default）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(!prefs.remote_native_resolution, "旧配置缺该键应默认关闭");
+        // 往返保留用户选择。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_native_resolution: true,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(reparsed.remote_native_resolution);
+    }
+
+    /// 断线自动重连的缺省：**两条路径必须一致**——`Default::default()`（全新安装）与
+    /// serde 缺键默认值（旧配置文件）。两处不一致会出现「文档说默认开、实际默认关」。
+    #[test]
+    fn auto_reconnect_defaults_to_true_in_both_paths() {
+        assert!(
+            GuiPrefs::default().remote_auto_reconnect,
+            "全新安装应默认开启断线自动重连"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(prefs.remote_auto_reconnect, "旧配置缺该键也应默认开启");
+        // 用户显式关掉要能持久化。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_auto_reconnect: false,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(!reparsed.remote_auto_reconnect);
     }
 
     /// 画质档位的缺省与往返：与帧率同理，旧配置缺键落到 `Balanced`，用户选择跨重启保留。
