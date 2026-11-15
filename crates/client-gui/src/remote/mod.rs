@@ -1549,6 +1549,12 @@ pub struct RemoteView {
     ///
     /// 工具条上的开关改它，`GuiApp::sync_display_prefs` 每帧比对后回写 `gui.toml`。
     pub toolbar_autohide: bool,
+    /// 工具条是否**手动收起**（只保留一枚延迟胶囊；**持久化镜像**，见
+    /// `GuiPrefs::remote_toolbar_collapsed`）。
+    ///
+    /// 与 [`Self::toolbar_visible`] 是两件事：后者是自动隐藏**算出来**的运行时结果，前者是用户的
+    /// 显式选择。收起态根本不参与自动隐藏——它已经小到不挡画面，再淡出反而让「只看延迟」落空。
+    pub toolbar_collapsed: bool,
     /// 工具条浮层**上一帧**的实测矩形（热区判据：指针是否停在工具条上）。
     ///
     /// 工具条是浮在画面之上的 `egui::Area`，隐现不影响布局；但「指针是否停在按钮上」仍要用实测
@@ -1635,6 +1641,7 @@ impl RemoteView {
             toolbar_visible: true,
             last_pointer_move: Instant::now(),
             toolbar_autohide: false,
+            toolbar_collapsed: false,
             toolbar_rect: None,
             stats_overlay: false,
             clipboard_sync_enabled: false,
@@ -1661,8 +1668,8 @@ impl RemoteView {
         }
     }
 
-    /// 从持久化偏好构造，把展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏）
-    /// 按上次的选择种下。
+    /// 从持久化偏好构造，把展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏与
+    /// 收起态）按上次的选择种下。
     ///
     /// 这些字段在 `RemoteView` 上是**运行时镜像**：工具条改它们，`GuiApp` 每帧比对后回写
     /// `gui.toml`（见其 `sync_display_prefs`）。之所以镜像而非直接读偏好，是因为改动发生在
@@ -1682,6 +1689,7 @@ impl RemoteView {
         view.stats_overlay = prefs.remote_stats_overlay;
         view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
         view.toolbar_autohide = prefs.remote_toolbar_autohide;
+        view.toolbar_collapsed = prefs.remote_toolbar_collapsed;
         view.frame_rate = prefs.remote_frame_rate;
         view.quality = prefs.remote_quality;
         view
@@ -1792,6 +1800,22 @@ impl RemoteView {
     pub fn set_quality(&mut self, preset: QualityPreset, manager: &Arc<RemoteManager>) {
         self.quality = preset;
         manager.set_quality(preset);
+    }
+
+    /// 收起悬浮工具条：画面之上只留一枚延迟胶囊（见 `ui::session_window` 的 `collapsed_pill`）。
+    ///
+    /// 用户嫌工具条挡画面时用；收起是**显式选择**，跨会话保留（`GuiPrefs::remote_toolbar_collapsed`）。
+    pub fn collapse_toolbar(&mut self) {
+        self.toolbar_collapsed = true;
+        // 收起态不画展开工具条，可见性同步归位；展开时由 [`Self::expand_toolbar`] 重新置 true。
+        self.toolbar_visible = false;
+    }
+
+    /// 从收起态展开工具条，并把自动隐藏计时重置到现在——用户刚点过，就该完整停留一个窗口。
+    pub fn expand_toolbar(&mut self) {
+        self.toolbar_collapsed = false;
+        self.toolbar_visible = true;
+        self.last_pointer_move = Instant::now();
     }
 
     /// 会话窗口的本地输入态（可编辑）。
@@ -2167,7 +2191,8 @@ impl RemoteView {
         self.fullscreen = false;
         // 新会话总是从「工具条可见」开始（首帧不该是空的）。`toolbar_autohide` 是**持久化镜像**，
         // 与 `scale`/`window_size` 一样跨会话保留——**不在这里复位**；`toolbar_rect`
-        // 同理（下一帧渲染时会以实测值覆盖）。
+        // 同理（下一帧渲染时会以实测值覆盖）。`toolbar_collapsed` 也跨会话保留：用户收起过一次，
+        // 新会话就该直接只有那枚延迟胶囊。
         self.toolbar_visible = true;
         self.fps = 0;
         self.fps_since = None;
@@ -3147,5 +3172,27 @@ mod tests {
         // 从未跟踪过控制器会话（本端只被控过）：任何结束事件都不触发。
         view.last_session_id = None;
         assert!(!view.should_auto_reconnect("sess-ctl", false, true));
+    }
+
+    /// 工具条收起/展开的一对动作必须同时改「显式选择」与「自动隐藏结果」。
+    ///
+    /// 回归锁：收起态由 `toolbar_collapsed` 决定，但渲染分支读的是 `toolbar_visible`——只改前者
+    /// 会让下一帧照样画出整条工具条；反过来展开时不重置计时，工具条会立刻被自动隐藏吞掉。
+    #[test]
+    fn collapsing_and_expanding_toolbar_toggle_both_flags() {
+        let mut view = RemoteView::new();
+        view.toolbar_visible = true;
+        view.collapse_toolbar();
+        assert!(view.toolbar_collapsed);
+        assert!(!view.toolbar_visible, "收起后不应再画展开态工具条");
+
+        view.last_pointer_move = Instant::now() - Duration::from_secs(600);
+        view.expand_toolbar();
+        assert!(!view.toolbar_collapsed);
+        assert!(view.toolbar_visible, "展开后必须立刻可见");
+        assert!(
+            view.last_pointer_move.elapsed() < Duration::from_secs(1),
+            "展开应重置自动隐藏计时，否则开启自动隐藏时它会瞬间消失"
+        );
     }
 }

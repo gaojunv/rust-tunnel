@@ -181,7 +181,8 @@ fn session_viewport_ui(
     }
 
     // 工具条可见时给一个定时重绘，否则静止画面下它永远不会淡出（画面静止时引擎不唤醒重绘）。
-    if v.toolbar_visible {
+    // 收起态同样需要：那枚延迟胶囊是唯一读数，心跳更新时视图未必会被重绘唤醒。
+    if v.toolbar_visible || v.toolbar_collapsed {
         ctx.request_repaint_after(Duration::from_millis(400));
     }
 }
@@ -214,6 +215,12 @@ fn handle_shortcuts(ctx: &egui::Context, v: &mut RemoteView) {
 /// 实测的矩形是标准做法，一帧延迟对「指针是否停在按钮上」无感。首帧尚未测得时用
 /// [`toolbar_fallback_rect`] 兜底。
 fn update_toolbar_visibility(ctx: &egui::Context, v: &mut RemoteView, autohide: bool) {
+    if v.toolbar_collapsed {
+        // 收起态只画一枚延迟胶囊：它已经小到不挡画面，**不参与**自动隐藏——淡出之后用户就看不到
+        // 本来就只想看的那条延迟了。展开态可见性留给 [`RemoteView::expand_toolbar`] 重新起算。
+        v.toolbar_visible = false;
+        return;
+    }
     let now = Instant::now();
     let (moved, down, pointer) = ctx.input(|i| {
         (
@@ -348,7 +355,9 @@ fn render(
             .id(egui::Id::new("session_window_embedded"))
             .default_size([900.0, 620.0])
             .show(ctx, |ui| {
-                if v.toolbar_visible {
+                if v.toolbar_collapsed {
+                    collapsed_pill(ui, v, state);
+                } else if v.toolbar_visible {
                     let bar = theme::toolbar_frame(ui.style()).show(ui, |ui| {
                         toolbar_contents(ui, v, manager, state, active);
                     });
@@ -373,8 +382,16 @@ fn render(
         .frame(theme::scene_frame(&ctx.style()))
         .show(ctx, |ui| scene(ui, v, manager, active));
 
-    if v.toolbar_visible {
-        // 浮在画面上缘居中：圆角半透明卡片，只留「状态 + 质量 + 当前档位 + 五个动作」。
+    if v.toolbar_collapsed {
+        // 收起态：**只有**一枚延迟胶囊（点它展开）。刻意不套 `toolbar_frame`——一层底板 + 内边距
+        // 会把这块放大到原来的三分之一，而「不挡画面」正是收起的全部意义。
+        let bar = egui::Area::new(egui::Id::new("session_toolbar_collapsed"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+            .show(ctx, |ui| collapsed_pill(ui, v, state));
+        v.toolbar_rect = Some(bar.response.rect);
+    } else if v.toolbar_visible {
+        // 浮在画面上缘居中：圆角半透明卡片，只留「状态 + 质量 + 当前档位 + 六个动作」。
         let bar = egui::Area::new(egui::Id::new("session_toolbar"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
@@ -450,7 +467,7 @@ fn render(
 
 /// 浮动工具条的内容（`ui` 位于 `theme::toolbar_frame` 之内）。
 ///
-/// 只放**一眼要看**的东西与五个动作；所有「进去改一次」的设置都搬到 [`settings_modal`]——
+/// 只放**一眼要看**的东西与六个动作；所有「进去改一次」的设置都搬到 [`settings_modal`]——
 /// 工具条曾经塞满选择器，窄窗口下折行成三排，把画面压掉一大块。
 fn toolbar_contents(
     ui: &mut Ui,
@@ -495,6 +512,11 @@ fn toolbar_contents(
         // 推到「可用宽度」的右缘（Area 的可用宽度是整个视口），整张卡片会被撑到全屏宽。
         // 断开放在最后：破坏性操作不该是手指落下的第一站。
         ui.add_space(4.0);
+        // 收起放最前：误触的后果只是工具条缩成一枚延迟胶囊，点一下就能回来；「断开」仍留在末尾，
+        // 破坏性操作不该和常用按钮做邻居。
+        if widgets::toolbar_button(ui, "收起", "收起到只显示延迟（点延迟胶囊可展开）").clicked() {
+            v.collapse_toolbar();
+        }
         if widgets::toolbar_button(ui, "设置", "画质 / 帧率 / 显示器 / 缩放 / 窗口尺寸 / 交互")
             .clicked()
         {
@@ -528,6 +550,21 @@ fn toolbar_contents(
             manager.abort_active();
         }
     });
+}
+
+/// 收起态的唯一内容：一枚延迟胶囊，点它展开工具条。
+///
+/// 「只显示延迟」是用户的原话，所以这里**不**再放状态点、路径、档位摘要——多一个字符就多挡一点
+/// 画面。延迟未知时显示 `延迟 —`，形状与有值时一致（收起的工具条不会因为一次心跳丢包而跳大小）。
+fn collapsed_pill(ui: &mut Ui, v: &mut RemoteView, state: &RemoteUiState) {
+    let p = theme::palette(ui.style());
+    let (text, color) = state.latency_ms.map_or_else(
+        || ("延迟 —".to_owned(), p.text_weak),
+        |ms| (format!("{ms} ms"), latency_color(ms)),
+    );
+    if widgets::pill_button(ui, &text, color, "点击展开工具条").clicked() {
+        v.expand_toolbar();
+    }
 }
 
 /// 会话设置弹层：旧工具条上所有「进去改一次」的项都在这里。
@@ -673,11 +710,30 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
     });
 
     widgets::section(ui, "界面", |ui| {
+        // 收起 = 画面之上只留一枚延迟胶囊。它是**持久化**的显式选择（工具条上的「收起」也改它），
+        // 这里是同一状态的第二个入口：收起后工具条虽然不见了，设置里仍看得到、也改得回来。
+        // 走一对方法而不是裸改字段：展开时还要置可见并重置自动隐藏计时，否则开启自动隐藏的
+        // 用户一取消勾选，工具条会停在「隐藏」状态，非得再挪一下鼠标才出来。
+        if ui
+            .checkbox(&mut v.toolbar_collapsed, "收起工具条（只显示延迟）")
+            .changed()
+        {
+            if v.toolbar_collapsed {
+                v.collapse_toolbar();
+            } else {
+                v.expand_toolbar();
+            }
+        }
+        // 自动隐藏只作用于展开态（收起态本来就不参与），因此在收起期间灰掉，免得用户以为
+        // 两个开关在打架。
         // 自动隐藏开关：这是**唯一**能让用户关掉「工具条偶尔消失」的入口。改动写进
         // 运行时镜像，由父窗口的 `sync_display_prefs` 回写 gui.toml。
-        ui.checkbox(
-            &mut v.toolbar_autohide,
-            "工具条自动隐藏（移到窗口上缘召回）",
+        ui.add_enabled(
+            !v.toolbar_collapsed,
+            egui::Checkbox::new(
+                &mut v.toolbar_autohide,
+                "工具条自动隐藏（移到窗口上缘召回）",
+            ),
         );
         ui.checkbox(&mut v.stats_overlay, "显示统计角标");
     });
