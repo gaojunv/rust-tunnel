@@ -14,8 +14,8 @@
 
 use super::{
     create_device_for, texture_dimensions, BgraReader, CaptureBackend, CaptureSource,
-    CapturedFrame, CapturedTexture, ChangeReport, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
-    NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
+    CapturedFrame, CapturedTexture, ChangeReport, DirtyGrid, MonitorInfo, TexturePool,
+    FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
 };
 use crate::d3d11;
 use crate::WinVideoError;
@@ -98,12 +98,20 @@ impl CaptureSource for WgcSource {
     }
 
     fn capture_texture(&mut self) -> Result<CapturedTexture, WinVideoError> {
-        self.capture_texture_with_change().map(|(texture, _)| texture)
+        self.capture_texture_with_dirty()
+            .map(|(texture, _, _)| texture)
     }
 
     fn capture_texture_with_change(
         &mut self,
     ) -> Result<(CapturedTexture, ChangeReport), WinVideoError> {
+        self.capture_texture_with_dirty()
+            .map(|(texture, report, _)| (texture, report))
+    }
+
+    fn capture_texture_with_dirty(
+        &mut self,
+    ) -> Result<(CapturedTexture, ChangeReport, Option<DirtyGrid>), WinVideoError> {
         let timeout = self.capture_timeout();
         let deadline = Instant::now() + timeout;
         loop {
@@ -117,9 +125,10 @@ impl CaptureSource for WgcSource {
                     let captured = result?;
                     // **像素级**变化检测：WGC 在基本静止的桌面上仍按合成器节奏产新帧
                     // （实测 120 次采集 119 次有新帧），所以「有新帧」不等于「有变化」。
-                    let report = self.change.changed(&self.d3d, &captured);
+                    // 同时拿到脏格点网格，供上层决定是否走补丁模式。
+                    let (report, grid) = self.change.changed_with_grid(&self.d3d, &captured);
                     self.last_texture = Some(captured.clone());
-                    return Ok((captured, report));
+                    return Ok((captured, report, grid));
                 }
                 Err(err) if err.code().is_ok() => {}
                 Err(err) => {
@@ -136,7 +145,9 @@ impl CaptureSource for WgcSource {
         // 超时：直接复用上一张纹理，**不做 CopyResource**（画面没变，拷贝纯属浪费）。
         // 返回「无变化」让上层跳过编码/发送；旧语义（恒为「有变化」）由默认实现保留。
         match &self.last_texture {
-            Some(texture) => Ok((texture.clone(), ChangeReport::unchanged())),
+            // 复用上一帧时**不能**给网格：它是上一拍的内容，补丁模式拿它去覆盖控制器
+            // 画面会让两侧错位。返回 `None` 让上层走全帧。
+            Some(texture) => Ok((texture.clone(), ChangeReport::unchanged(), None)),
             None => Err(WinVideoError::Capture(format!(
                 "WGC: {timeout:?} 内没有收到首帧（GPU 纹理）"
             ))),

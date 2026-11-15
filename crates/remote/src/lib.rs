@@ -42,7 +42,9 @@
 //!   会话的 token 常数时间比对（`hmac::verify_slice`），TTL 60s、一次性。
 //! - 版本：`Hello.proto_version` 硬相等校验（[`session::SESSION_PROTO_VERSION`]）。混合版本在
 //!   握手阶段**明文干净拒绝**，不会退化成 bincode 解码失败导致的硬断链。
-//! - 保活：[`session::HEARTBEAT_INTERVAL`]（10s，硬性小于 hbbr 的 30s `idle_timeout`）。
+//! - 保活：[`session::HEARTBEAT_INTERVAL`]（1s，硬性小于 hbbr 的 30s `idle_timeout`）。
+//!   1s 的探测节拍同时让 QoS 闭环每秒都拿到新鲜的 RTT 样本；可信上限另由
+//!   [`session::TRUSTED_RTT_MAX`]（10s）约束。
 //! - 加密：握手交换 X25519 临时公钥，ChaCha20-Poly1305 加密后续帧（见 [`crypto`]）。
 //!
 //! # 与 `crates/rustdesk` 的关系

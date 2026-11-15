@@ -801,19 +801,20 @@ async fn data_plane_relay_session_between_two_managers() {
     // 会话循环**复用既有** `Heartbeat` → `HeartbeatAck` 往返测 RTT（数据面变体一个都不加），
     // 经 `SessionStatsReporter` 上报，管理器 EMA 平滑后写入 `latency_ms`。本断言的关键不是「有
     // 读数」，而是「**很快**有」：心跳 interval 的首个 tick **立即到期**，所以会话一建立就有样本。
-    // 这里 3s 的上限远小于 `HEARTBEAT_INTERVAL`（10s）——把心跳起点改回 `now + HEARTBEAT_INTERVAL`
-    // （首个样本要等满一个周期）必然让本断言超时。回环 + hbbr 中继的 RTT 只可能是亚毫秒到毫秒级，
-    // 2000ms 是宽松上限。两侧各跑一次心跳循环，故两侧都应有读数。
+    // 上限必须**明显小于** `HEARTBEAT_INTERVAL`（1s）——把心跳起点改回
+    // `now + HEARTBEAT_INTERVAL`（首个样本要等满一个周期）必然让本断言超时。
+    // 回环 + hbbr 中继的 RTT 只可能是亚毫秒到毫秒级，800ms 是宽松上限。
+    // 两侧各跑一次心跳循环，故两侧都应有读数。
     assert!(
-        wait_within(Duration::from_secs(3), || ctrl.snapshot().latency_ms.is_some()).await,
-        "控制器应在会话建立后 3s 内就有延迟读数（首个心跳 tick 立即到期），实得 {:?}",
+        wait_within(Duration::from_millis(800), || ctrl.snapshot().latency_ms.is_some()).await,
+        "控制器应在会话建立后 800ms 内就有延迟读数（首个心跳 tick 立即到期），实得 {:?}",
         ctrl.snapshot().latency_ms
     );
     let latency = ctrl.snapshot().latency_ms.expect("刚断言过有读数");
     assert!(latency < 2000, "中继回环延迟应是合理小值，实得 {latency}ms");
     assert!(
-        wait_within(Duration::from_secs(3), || ctld.snapshot().latency_ms.is_some()).await,
-        "被控端应在会话建立后 3s 内就有延迟读数，实得 {:?}",
+        wait_within(Duration::from_millis(800), || ctld.snapshot().latency_ms.is_some()).await,
+        "被控端应在会话建立后 800ms 内就有延迟读数，实得 {:?}",
         ctld.snapshot().latency_ms
     );
 
@@ -1376,7 +1377,7 @@ async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
 /// 在 `budget` 内轮询等待条件成立；超时返回条件的最终值。
 ///
 /// 与 [`wait_for`]（上限 10s）分开，是为了让「延迟读数必须**很快**出现」这类断言真的能失败：
-/// 它的上限必须明显小于 `HEARTBEAT_INTERVAL`（10s），否则把心跳起点写成「延迟一个周期到期」也
+/// 它的上限必须明显小于 `HEARTBEAT_INTERVAL`（1s），否则把心跳起点写成「延迟一个周期到期」也
 /// 照样通过——断言就锁不住「首个 tick 立即到期」这条不变量。
 async fn wait_within(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + budget;

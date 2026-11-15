@@ -69,10 +69,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
 /// 小面积变化漏检的概率越高。128×72 在 4K 屏上只抽 1/900 的像素，16×16 的变化
 /// 只有约一半概率被看到；320×180 把采样密度提到 4 倍而**检测耗时不变**（4K 实测
 /// 0.36 ms），960×540 才会明显变贵（0.87 ms）。
-const GRID_WIDTH: u32 = 320;
+pub(crate) const GRID_WIDTH: u32 = 320;
 
 /// 变化检测使用的网格高度（像素）。偶数（4:2:0 要求），与 [`GRID_WIDTH`] 保持 16:9。
-const GRID_HEIGHT: u32 = 180;
+pub(crate) const GRID_HEIGHT: u32 = 180;
 
 /// 判定「有变化」的单像素差阈值（8 位）。
 ///
@@ -127,6 +127,24 @@ impl ChangeReport {
     }
 }
 
+/// 一帧的**脏格点网格**：每个格点 1 字节，`0` = 未变、`1` = 有变化。
+///
+/// 网格恒为 [`GRID_WIDTH`]×[`GRID_HEIGHT`]（320×180），按行优先排列（索引 =
+/// `row * width + col`）。它是脏矩形补丁模式（[`super::extract_rects`]）的输入：
+/// 采集层在比较这一帧与上一帧时顺手填好，引擎只在画面活跃度低时才会用到它。
+///
+/// 首帧、检测器不可用或读网格失败时**没有**网格（`Option<DirtyGrid>` 为 `None`），
+/// 调用方据此退回全帧视频。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyGrid {
+    /// 网格宽度（格点数，恒为 [`GRID_WIDTH`]）。
+    pub width: u32,
+    /// 网格高度（格点数，恒为 [`GRID_HEIGHT`]）。
+    pub height: u32,
+    /// 行优先的格点值（`0`/`1`），长度 = `width * height`。
+    pub cells: Vec<u8>,
+}
+
 /// 每个采集源一个的变化检测器（**只尝试构造一次**）。
 ///
 /// 采集源在 `WGC` / `DXGI` 两条路径里各持有一个；构造失败后永久退回「有变化」，
@@ -156,23 +174,45 @@ impl TextureChangeTracker {
 
     /// 判断这一帧与上一帧是否有可见差异，并给出变化面积。
     ///
+    /// 这是 [`Self::changed_with_grid`] 的薄包装：只需要「变没变」的调用方用它，
+    /// 不必持有（并丢弃）脏格点网格。
+    ///
     /// 首帧、检测器尚未初始化、以及任何内部失败都返回 [`ChangeReport::changed_all`]——宁可
     /// 多编码一帧，也不能丢画面，更不能把「面积未知」当成「没变化」去压制码率。
+    #[allow(
+        dead_code,
+        reason = "保留薄包装供只需要 ChangeReport 的调用方（当前仅单测）使用"
+    )]
     pub(crate) fn changed(&mut self, device: &D3d11, frame: &CapturedTexture) -> ChangeReport {
+        self.changed_with_grid(device, frame).0
+    }
+
+    /// 判断这一帧与上一帧是否有可见差异，并同时给出**脏格点网格**。
+    ///
+    /// 第二个返回值为 `None` 表示这一帧没有可用的网格（首帧没有基准、检测器不可用、
+    /// 读网格失败）：调用方**不能**据此进入补丁模式，只能走全帧视频。
+    ///
+    /// 首帧、检测器尚未初始化、以及任何内部失败都返回 [`ChangeReport::changed_all`]——宁可
+    /// 多编码一帧，也不能丢画面，更不能把「面积未知」当成「没变化」去压制码率。
+    pub(crate) fn changed_with_grid(
+        &mut self,
+        device: &D3d11,
+        frame: &CapturedTexture,
+    ) -> (ChangeReport, Option<DirtyGrid>) {
         match &mut self.state {
-            State::Ready(detector) if detector.matches(frame) => detector.changed(frame),
-            State::Unavailable => ChangeReport::changed_all(),
+            State::Ready(detector) if detector.matches(frame) => detector.changed_with_grid(frame),
+            State::Unavailable => (ChangeReport::changed_all(), None),
             // 未初始化或尺寸/格式变了：重建（每个采集源只会走有限次）。
             _ => match ChangeDetector::new(device, frame) {
                 Ok(mut detector) => {
-                    let report = detector.changed(frame);
+                    let result = detector.changed_with_grid(frame);
                     self.state = State::Ready(detector);
-                    report
+                    result
                 }
                 Err(err) => {
                     tracing::debug!(error = %err, "GPU 变化检测不可用，退回逐帧编码");
                     self.state = State::Unavailable;
-                    ChangeReport::changed_all()
+                    (ChangeReport::changed_all(), None)
                 }
             },
         }
@@ -199,8 +239,13 @@ struct ChangeDetector {
     input_key: (u32, u32, DXGI_FORMAT),
     /// 按纹理裸指针缓存的输入视图（同时持有纹理引用，指针不会悬空）。
     input_views: Vec<(usize, ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
-    /// 上一帧的网格像素（Y + UV）。
+    /// 上一帧的**紧凑**网格像素（Y + UV，无行填充）。与 [`Self::current`] 每帧交换，
+    /// 避免为比较再分配一块缓冲。
     previous: Vec<u8>,
+    /// 本帧的紧凑网格像素（读回用缓冲；与 [`Self::previous`] 交换复用）。
+    current: Vec<u8>,
+    /// 脏格点网格的复用缓冲（每帧清零后重填）。
+    grid: DirtyGrid,
 }
 
 impl std::fmt::Debug for ChangeDetector {
@@ -343,6 +388,12 @@ impl ChangeDetector {
             input_key: (input_width, input_height, input_format),
             input_views: Vec::new(),
             previous: Vec::new(),
+            current: Vec::new(),
+            grid: DirtyGrid {
+                width: GRID_WIDTH,
+                height: GRID_HEIGHT,
+                cells: vec![0; grid_cells_len()],
+            },
         })
     }
 
@@ -354,56 +405,129 @@ impl ChangeDetector {
         self.input_key == (desc.Width, desc.Height, desc.Format)
     }
 
-    /// 判断这一帧与上一帧是否有可见差异，并统计变化面积；首帧恒为「有变化、满面积」。
-    ///
-    /// 比较失败（Blt/Map 出错、网格为空）时也返回 [`ChangeReport::changed_all`]：宁可多编码
-    /// 一帧，也不能丢画面；面积给满则不会让引擎误把失败当成「静止」而收紧码率。
+    /// [`Self::changed_with_grid`] 的薄包装：只关心「变没变」时用它。
+    #[allow(
+        dead_code,
+        reason = "保留薄包装供只需要 ChangeReport 的调用方（当前仅单测）使用"
+    )]
     fn changed(&mut self, frame: &CapturedTexture) -> ChangeReport {
+        self.changed_with_grid(frame).0
+    }
+
+    /// 判断这一帧与上一帧是否有可见差异，并统计变化面积、填出脏格点网格。
+    ///
+    /// 首帧恒为「有变化、满面积」且没有网格；比较失败（Blt/Map 出错、网格长度不对）时
+    /// 也返回 [`ChangeReport::changed_all`] 与 `None`：宁可多编码一帧，也不能丢画面；
+    /// 面积给满则不会让引擎误把失败当成「静止」而收紧码率。
+    fn changed_with_grid(
+        &mut self,
+        frame: &CapturedTexture,
+    ) -> (ChangeReport, Option<DirtyGrid>) {
         let started = Instant::now();
-        let Ok(current) = self.read_grid(frame) else {
-            return ChangeReport::changed_all();
-        };
-        if current.is_empty() {
-            // 读回成功但没有任何像素（Map 返回空指针/行距为 0）：等价于失败，保守处理。
-            return ChangeReport::changed_all();
+        // 取出读回缓冲（避免为每帧重新分配），结束后无论如何放回去复用。
+        let mut current = std::mem::take(&mut self.current);
+        let read = self.read_grid_into(frame, &mut current);
+        if read.is_err() || current.len() != grid_len() {
+            current.clear();
+            self.current = current;
+            return (ChangeReport::changed_all(), None);
         }
-        let report = if self.previous.len() == current.len() {
-            let differing = self
-                .previous
-                .iter()
-                .zip(current.iter())
-                .filter(|(before, now)| before.abs_diff(**now) > PIXEL_DELTA)
-                .count();
-            if differing == 0 {
-                ChangeReport::unchanged()
-            } else {
-                // 千分比 = 超阈值字节数 / 总字节数；至少记 1（有变化就绝不报 0）。
-                let permille = differing
-                    .saturating_mul(1000)
-                    .checked_div(current.len())
-                    .unwrap_or(1000)
-                    .clamp(1, 1000);
-                ChangeReport {
-                    changed: true,
-                    changed_permille: u16::try_from(permille).unwrap_or(1000),
-                }
-            }
+        let (report, grid) = if self.previous.len() == current.len() {
+            let (report, grid) = self.compare(&current);
+            (report, Some(grid))
         } else {
-            // 首帧（或网格尺寸变化）：没有基准，按满面积处理。
-            ChangeReport::changed_all()
+            // 首帧（或网格尺寸变化）：没有基准，按满面积处理，不提供网格。
+            (ChangeReport::changed_all(), None)
         };
-        self.previous = current;
+        // 交换而非复制：`current` 变成上一帧的缓冲，供下一次读回复用。
+        std::mem::swap(&mut self.previous, &mut current);
+        self.current = current;
         tracing::trace!(
             changed = report.changed,
             changed_permille = report.changed_permille,
             micros = u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX),
             "变化检测"
         );
-        report
+        (report, grid)
     }
 
-    /// 把采集纹理缩到网格并读回（Y + UV）。
-    fn read_grid(&mut self, frame: &CapturedTexture) -> Result<Vec<u8>, WinVideoError> {
+    /// 比较紧凑网格并与上一帧的差异填进 [`Self::grid`]。
+    ///
+    /// 只比较真实像素：`current` 已按行去掉 `RowPitch` 的填充字节，所以行尾的未初始化
+    /// 内存不会制造假阳性。Y 平面与格点一一对应；UV 平面每个字节代表一个 2×2 色度块，
+    /// 它的首个亮度行（`ur * 2`）与左侧亮度列（`uc & !1`）决定落在哪个格点。
+    fn compare(&mut self, current: &[u8]) -> (ChangeReport, DirtyGrid) {
+        let width = usize::try_from(self.grid.width).unwrap_or(0);
+        let luma_len = width.saturating_mul(usize::try_from(self.grid.height).unwrap_or(0));
+        self.grid.cells.fill(0);
+        let mut differing = 0usize;
+
+        for (index, (before, now)) in self
+            .previous
+            .iter()
+            .zip(current.iter())
+            .take(luma_len)
+            .enumerate()
+        {
+            if before.abs_diff(*now) > PIXEL_DELTA {
+                differing = differing.saturating_add(1);
+                if let Some(cell) = self.grid.cells.get_mut(index) {
+                    *cell = 1;
+                }
+            }
+        }
+        for (offset, (before, now)) in self
+            .previous
+            .iter()
+            .skip(luma_len)
+            .zip(current.iter().skip(luma_len))
+            .enumerate()
+        {
+            if before.abs_diff(*now) <= PIXEL_DELTA {
+                continue;
+            }
+            differing = differing.saturating_add(1);
+            let uv_row = offset / width.max(1);
+            let uv_col = offset % width.max(1);
+            let row = uv_row.saturating_mul(2);
+            let col = uv_col & !1;
+            let cell = row.saturating_mul(width).saturating_add(col);
+            if let Some(value) = self.grid.cells.get_mut(cell) {
+                *value = 1;
+            }
+        }
+
+        let report = if differing == 0 {
+            ChangeReport::unchanged()
+        } else {
+            // 千分比 = 超阈值字节数 / 总字节数；至少记 1（有变化就绝不报 0）。
+            let permille = differing
+                .saturating_mul(1000)
+                .checked_div(current.len())
+                .unwrap_or(1000)
+                .clamp(1, 1000);
+            ChangeReport {
+                changed: true,
+                changed_permille: u16::try_from(permille).unwrap_or(1000),
+            }
+        };
+        let grid = DirtyGrid {
+            width: self.grid.width,
+            height: self.grid.height,
+            cells: self.grid.cells.clone(),
+        };
+        (report, grid)
+    }
+
+    /// 把采集纹理缩到网格并**按行去掉填充**读回成紧凑 NV12（Y + UV）。
+    ///
+    /// `out` 的长度恒为 [`grid_len`]（Y 平面 `W × H`、UV 平面紧随其后 `W × H / 2`）。
+    /// 写入前会 `resize`（长度不变时是 no-op），因此缓冲可以跨帧复用。
+    fn read_grid_into(
+        &mut self,
+        frame: &CapturedTexture,
+        out: &mut Vec<u8>,
+    ) -> Result<(), WinVideoError> {
         let view = self.input_view(frame)?;
         // `pInputSurface` 是 ManuallyDrop：Blt 不接管所有权，调用后手动取出来释放。
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
@@ -443,19 +567,48 @@ impl ChangeDetector {
                 .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))
         }
         .map_err(|err| WinVideoError::Encode(format!("变化检测 Map 失败: {err}")))?;
-        let pitch = usize::try_from(mapped.RowPitch).unwrap_or(0);
-        let rows = usize::try_from(GRID_HEIGHT).unwrap_or(0);
-        // NV12：Y 平面 `pitch × H`，UV 平面紧随其后 `pitch × H / 2`。
-        let len = pitch.saturating_mul(rows).saturating_mul(3) / 2;
-        let grid = if mapped.pData.is_null() || pitch == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: Map 成功后驱动保证至少 `pitch × H × 1.5` 字节可读；长度已按此计算。
-            unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), len) }.to_vec()
-        };
+        let result = Self::copy_compact(&mapped, out);
         // SAFETY: 与上面的 Map 配对。
         unsafe { frame.device.context.Unmap(&self.staging, 0) };
-        Ok(grid)
+        result
+    }
+
+    /// 从 Map 出来的 NV12 网格中只拷真实像素（跳过 `RowPitch` 的行尾填充）。
+    ///
+    /// **必须按 `mapped.RowPitch` 索引、不能假设它等于 `GRID_WIDTH`**：驱动普遍会把行距
+    /// 对齐到 128/256 字节，填充字节的内容未定义，直接整块比较会制造假阳性（旧实现的
+    /// 潜在缺陷）。宽度方向 NV12 的 UV 行与 Y 行同为 `GRID_WIDTH` 字节。
+    fn copy_compact(
+        mapped: &D3D11_MAPPED_SUBRESOURCE,
+        out: &mut Vec<u8>,
+    ) -> Result<(), WinVideoError> {
+        let width = usize::try_from(GRID_WIDTH).unwrap_or(0);
+        let height = usize::try_from(GRID_HEIGHT).unwrap_or(0);
+        let pitch = usize::try_from(mapped.RowPitch).unwrap_or(0);
+        if mapped.pData.is_null() || width == 0 || pitch < width {
+            return Err(WinVideoError::Capture(format!(
+                "变化检测网格读回不可用（空指针或 RowPitch {pitch} < 网格宽度 {width}）"
+            )));
+        }
+        // NV12：Y 平面 `height` 行，UV 平面紧随其后 `height / 2` 行。
+        let uv_rows = height / 2;
+        let source_len = pitch.saturating_mul(height.saturating_add(uv_rows));
+        // SAFETY: Map 成功后驱动保证至少 `RowPitch × H × 1.5` 字节可读；长度已按此计算。
+        let source = unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), source_len) };
+
+        out.resize(grid_len(), 0);
+        let luma_len = width.saturating_mul(height);
+        for row in 0..height {
+            let src = row.saturating_mul(pitch);
+            let dst = row.saturating_mul(width);
+            out[dst..dst + width].copy_from_slice(&source[src..src + width]);
+        }
+        for row in 0..uv_rows {
+            let src = height.saturating_add(row).saturating_mul(pitch);
+            let dst = luma_len.saturating_add(row.saturating_mul(width));
+            out[dst..dst + width].copy_from_slice(&source[src..src + width]);
+        }
+        Ok(())
     }
 
     /// 取得（或创建并缓存）给定纹理的 VideoProcessor 输入视图。
@@ -533,8 +686,25 @@ fn create_texture(
     texture.ok_or_else(|| WinVideoError::Config("CreateTexture2D 返回空纹理".to_owned()))
 }
 
+/// 紧凑 NV12 网格的字节数：Y 平面 `W × H` + UV 平面 `W × H / 2`。
+fn grid_len() -> usize {
+    usize::try_from(GRID_WIDTH)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(GRID_HEIGHT).unwrap_or(0))
+        .saturating_mul(3)
+        / 2
+}
+
+/// 网格格点总数（`GRID_WIDTH × GRID_HEIGHT`）。
+fn grid_cells_len() -> usize {
+    usize::try_from(GRID_WIDTH)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(GRID_HEIGHT).unwrap_or(0))
+}
+
 // 编译期把几条判据钉住：
 // - 4:2:0 要求宽高为偶数（网格尺寸是常量，防止日后改成奇数）；
+// - `W × H × 3 / 2` 必须是整数（H 为偶数即保证）；
 // - 阈值必须严格大于缩放/抖动的 ±1–2 噪声。
 const _: () = assert!(GRID_WIDTH.is_multiple_of(2));
 const _: () = assert!(GRID_HEIGHT.is_multiple_of(2));
@@ -702,6 +872,46 @@ mod tests {
                 "16×16 的变化在 ({left}, {top}) 漏检（检查网格密度与缩放矩形是否覆盖整帧）"
             );
         }
+    }
+
+    /// `changed_with_grid` 必须给出 320×180 的网格，且只把真正变化的格点标脏。
+    ///
+    /// 首帧没有基准，网格必须是 `None`——引擎据此不进入补丁模式；第二帧才给网格。
+    #[test]
+    fn dirty_grid_marks_only_changed_cells() {
+        let Some(device) = hardware_device() else {
+            return;
+        };
+        let Some(base_texture) = create_texture(&device.device, &base_pixels()) else {
+            eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+            return;
+        };
+        let base = captured(&device, base_texture);
+        let center = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2);
+        let Some(texture) = create_texture(&device.device, &block_pixels(center.0, center.1)) else {
+            eprintln!("跳过变化检测测试：创建 4K 测试纹理失败");
+            return;
+        };
+        let changed_frame = captured(&device, texture);
+        let Ok(mut detector) = ChangeDetector::new(&device, &base) else {
+            eprintln!("跳过变化检测测试：本端不支持 VideoProcessor 变化检测");
+            return;
+        };
+        let (first, grid) = detector.changed_with_grid(&base);
+        assert!(first.changed, "首帧没有基准，必须判为有变化");
+        assert!(grid.is_none(), "首帧没有基准，不能提供脏格点网格");
+
+        let (report, grid) = detector.changed_with_grid(&changed_frame);
+        assert!(report.changed, "16×16 白块必须被检出");
+        let grid = grid.expect("第二帧应当有网格");
+        assert_eq!((grid.width, grid.height), (GRID_WIDTH, GRID_HEIGHT));
+        assert_eq!(grid.cells.len(), grid_cells_len());
+        let dirty = grid.cells.iter().filter(|&&cell| cell != 0).count();
+        assert!(dirty > 0, "16×16 白块必须标脏至少一个格点");
+        assert!(
+            dirty < 100,
+            "一个小块不应污染整张网格（实际标脏 {dirty} 个格点）"
+        );
     }
 
     /// 变化面积只覆盖真正变化的区域：4K 上一个 16×16 白块远小于满帧，千分比必须落在

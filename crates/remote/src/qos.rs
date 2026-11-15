@@ -48,6 +48,28 @@
 //! 面积**不进** `QosFeedback`：那是控制器的网络反馈，面积是被控端本地的采集读数，两者方向
 //! 与来源都不同；塞进线上结构要改 `SESSION_PROTO_VERSION`，而本特性不需要跨端信息。
 //!
+//! # 解码瓶颈与网络拥塞必须分开（阶段 4）
+//!
+//! 两者的**解法相反**：网络拥塞该降码率/分辨率（少占链路），解码瓶颈再降码率只会让画面更糊
+//! 却一点都不减轻解码负担——真正该降的是**帧率**（单位时间要解的帧数），其次分辨率，最后才是
+//! 码率。早先的闭环只有一条「码率 → 帧率 → 分辨率」阶梯，解码跟不上时先把码率砍到地板，
+//! 用户看到的是「画面又糊又卡」，而解码耗时一点没降。
+//!
+//! 判据用**解码占用率** `decode_util = decode_ms × fps / 1000`：控制器每秒回报一帧解码耗时，
+//! 乘以当前帧率就是「解码器被占用的时间比例」。`>= decode_budget_ratio`（0.8）且（有积压或
+//! `>= 1.0`，即单帧已经解不及）即判**饱和**；连续 `decode_bound_ticks`（2）个 tick 才动作，
+//! 避免单帧抖动。饱和优先于网络拥塞判定。
+//!
+//! 网络侧另加两条辅助判据：
+//! - **出/收码率比**：被控端知道自己窗口内实际发出去多少（`sent_kbps`），控制器回报收到多少
+//!   （`recv_kbps`）。比值 `< delivery_ratio_threshold`（0.7）连续 `delivery_ratio_ticks`（3）
+//!   个 tick，说明链路在真实丢包/限速（RTT 可能还没抬升）。`sent_kbps=0` 或 `recv_kbps=0`
+//!   是「无样本」哨兵，绝不触发该路径。
+//! - **每像素比特数（bpp）地板**：`bitrate / (编码宽 × 编码高 × fps)` 低于
+//!   `min_bits_per_pixel`（0.04）时，码率已经低到画面不可用，再乘性砍码率没有意义——改为
+//!   **降分辨率**（`bpp_hysteresis_ticks` = 2 个 tick 确认，避免瞬时抖动）。降分辨率是几何
+//!   变化，需要强制关键帧；码率那一 tick 不再额外下砍。
+//!
 //! # 阈值依据
 //!
 //! **RTT 判据是相对的**：会话内观测到的最小 RTT（[`RateController::baseline_rtt_ms`]）代表
@@ -116,8 +138,22 @@ pub struct QosParams {
     pub rtt_margin_ms: u32,
     /// 健康容限（毫秒）：`rtt <= baseline + 本值` **且**队列空才升 10%。
     pub fast_margin_ms: u32,
-    /// 解码耗时阈值（毫秒）：帧率已到下限仍拥塞、且解码耗时达到它时，才降编码分辨率。
+    /// 解码耗时阈值（毫秒）：**网络拥塞路径**下、帧率已到下限仍拥塞、且解码耗时达到它时，
+    /// 才降编码分辨率。
     pub decode_ms_threshold: u32,
+    /// 解码占用率判据（0.8 = 解码器 80% 的时间在忙）：`decode_ms × fps / 1000` 达到它、
+    /// 且（有积压或单帧已解不及）即判解码饱和。
+    pub decode_budget_ratio: f32,
+    /// 连续多少个 tick 判解码饱和才动作（防单帧抖动）。
+    pub decode_bound_ticks: u32,
+    /// 每像素比特数地板（bit/pixel）。低于它时再砍码率只会让画面不可用，改为降分辨率。
+    pub min_bits_per_pixel: f32,
+    /// 低 bpp 触发降分辨率所需的连续 tick 数（迟滞）。
+    pub bpp_hysteresis_ticks: u32,
+    /// 出/收码率比阈值：`recv_kbps / sent_kbps` 低于它即视为链路在丢包/限速。
+    pub delivery_ratio_threshold: f32,
+    /// 出/收码率比持续低于阈值的 tick 数（达到即判网络拥塞）。
+    pub delivery_ratio_ticks: u32,
     /// 拥塞时码率的乘性下降因子（0.8 = 降 20%）。
     pub decrease_factor: f32,
     /// 健康时码率的加性上升因子（1.1 = 升 10%）。
@@ -168,6 +204,12 @@ impl Default for QosParams {
             rtt_margin_ms: 120,
             fast_margin_ms: 30,
             decode_ms_threshold: 37,
+            decode_budget_ratio: 0.8,
+            decode_bound_ticks: 2,
+            min_bits_per_pixel: 0.04,
+            bpp_hysteresis_ticks: 2,
+            delivery_ratio_threshold: 0.7,
+            delivery_ratio_ticks: 3,
             decrease_factor: 0.8,
             increase_factor: 1.1,
             min_bitrate_kbps: 200,
@@ -242,6 +284,17 @@ pub struct RateController {
     max_scale_level: u32,
     /// 连续「有积压」的 tick 数。
     backlog_streak: u32,
+    /// 连续判「解码饱和」的 tick 数（见模块文档的「解码瓶颈与网络拥塞必须分开」）。
+    decode_bound_streak: u32,
+    /// 连续「出/收码率比过低」的 tick 数。
+    delivery_bad_streak: u32,
+    /// 连续「每像素比特数低于地板」的 tick 数（降分辨率的迟滞）。
+    bpp_low_streak: u32,
+    /// 被控端原始采集尺寸（显示尺寸，`width`/`height`）。用于算每像素比特数（bpp）。
+    ///
+    /// `None` = 未知（测试/早期会话），此时 [`Self::bits_per_pixel`] 返回无穷大，bpp 判据
+    /// 自动退化失效（绝不误触发降分辨率）。
+    source_dims: Option<(u32, u32)>,
     /// 上一次动作（日志/断言用）。
     last_action: QosAction,
     /// 会话内观测到的**最小** RTT（毫秒），作为地理/路径基线；尚无真实样本时为 `None`。
@@ -281,6 +334,10 @@ impl RateController {
             scale_level: 0,
             max_scale_level,
             backlog_streak: 0,
+            decode_bound_streak: 0,
+            delivery_bad_streak: 0,
+            bpp_low_streak: 0,
+            source_dims: None,
             last_action: QosAction::Hold,
             baseline_rtt_ms: None,
             activity: Activity::Active,
@@ -391,7 +448,22 @@ impl RateController {
         self.fps = ceiling.max_fps;
         self.scale_level = 0;
         self.backlog_streak = 0;
+        self.decode_bound_streak = 0;
+        self.delivery_bad_streak = 0;
+        self.bpp_low_streak = 0;
+        // **不重置 `source_dims`**：换画质档位不改变采集源的原始尺寸，bpp 判据必须继续成立。
         self.last_action = QosAction::Hold;
+    }
+
+    /// 记录采集源的**原始**尺寸（显示尺寸，不是编码尺寸）。
+    ///
+    /// 每像素比特数（bpp）必须按**编码后**的像素算：编码宽度受
+    /// [`crate::video::MAX_ENCODE_WIDTH`] 与 `scale` 约束。故这里存原始尺寸，[`Self::bits_per_pixel`]
+    /// 再经 [`crate::video::encode_dimensions`] 换算。会话开始与切换显示器时调用。
+    pub fn set_source_dims(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.source_dims = Some((width, height));
+        }
     }
 
     /// 只改帧率**上限**（控制器显式选择 30 / 60），码率 / 缩放 / 闭环历史一概不动。
@@ -411,8 +483,10 @@ impl RateController {
     /// 处理一次反馈，产出新的生效值。
     ///
     /// `local_backlog` 是被控端**本地**出站队列的积压帧数（编码任务的输出队列）；与反馈里的
-    /// 控制器侧积压一起参与判定。
-    pub fn on_feedback(&mut self, fb: Feedback, local_backlog: u32) -> QosDecision {
+    /// 控制器侧积压一起参与判定。`sent_kbps` 是被控端本窗口实际发出的视频码率（编码任务的出码
+    /// 字节速率），与控制器回报的 `recv_kbps` 一起算**投递率**——RTT 还没抬升时，投递率是唯一
+    /// 能看出链路在丢包/限速的信号。
+    pub fn on_feedback(&mut self, fb: Feedback, local_backlog: u32, sent_kbps: u32) -> QosDecision {
         // 会话内最小 RTT = 地理/路径基线（只降不升）。RTT 为 0 是控制器「尚无样本」的哨兵，
         // 不能让它把基线永久钉在 0（否则真实链路再也判不成健康、也永远相对基线上涨）。
         if fb.rtt_ms > 0 {
@@ -426,7 +500,32 @@ impl RateController {
             self.backlog_streak = 0;
         }
 
-        // 拥塞 = RTT 相对基线显著抬升 **或** 持续积压（单次积压抖动不算）。
+        // 解码占用率：`decode_ms × fps / 1000` = 解码器忙于解码的时间比例。
+        // `decode_ms == 0` 是「尚无解码样本」哨兵（首帧前），不参与饱和判定。
+        let fps = self.current().fps.max(1);
+        let decode_util = f64::from(fb.decode_ms) * f64::from(fps) / 1000.0;
+        let saturated = fb.decode_ms > 0
+            && decode_util >= f64::from(self.params.decode_budget_ratio)
+            && (fb.backlog > 0 || decode_util >= 1.0);
+        if saturated {
+            self.decode_bound_streak = self.decode_bound_streak.saturating_add(1);
+        } else {
+            self.decode_bound_streak = 0;
+        }
+
+        // 投递率：`recv/sent` 持续低于阈值 = 链路在丢/限。任一侧为 0 是「无样本」哨兵，
+        // 绝不触发（否则会话刚开始或静止画面会把闭环误判成丢包）。
+        let delivery_bad = sent_kbps >= 100
+            && fb.recv_kbps > 0
+            && f64::from(fb.recv_kbps) / f64::from(sent_kbps) < f64::from(self.params.delivery_ratio_threshold);
+        if delivery_bad {
+            self.delivery_bad_streak = self.delivery_bad_streak.saturating_add(1);
+        } else {
+            self.delivery_bad_streak = 0;
+        }
+        let delivery_bad_sustained = self.delivery_bad_streak >= self.params.delivery_ratio_ticks;
+
+        // 拥塞 = RTT 相对基线显著抬升 **或** 持续积压 **或** 投递率持续过低。
         // 尚无基线时退回绝对地板。绝对地板保证基线很低时仍不允许高延迟。
         let congestion_threshold = self.baseline_rtt_ms.map_or(self.params.delay_threshold_ms, |baseline| {
             baseline
@@ -434,17 +533,26 @@ impl RateController {
                 .max(self.params.delay_threshold_ms)
         });
         let rtt_congested = fb.rtt_ms > congestion_threshold;
-        let congested = rtt_congested || self.backlog_streak >= self.params.backlog_ticks;
-        // 健康 = RTT 贴着基线（无基线时按绝对阈值）**且**两侧队列都空。
+        let congested =
+            rtt_congested || self.backlog_streak >= self.params.backlog_ticks || delivery_bad_sustained;
+        // 健康 = RTT 贴着基线（无基线时按绝对阈值）**且**两侧队列都空，**且**解码未饱和、
+        // 投递率未恶化。
         // `rtt_ms == 0` 是未知哨兵：既不算拥塞，也绝不能算健康（否则会一边「无样本」一边升码率）。
         let healthy_rtt = fb.rtt_ms > 0
             && self.baseline_rtt_ms.map_or(fb.rtt_ms < ABSOLUTE_FAST_THRESHOLD_MS, |baseline| {
                 fb.rtt_ms <= baseline.saturating_add(self.params.fast_margin_ms)
             });
-        let healthy = healthy_rtt && fb.backlog == 0 && local_backlog == 0;
+        let healthy = healthy_rtt
+            && fb.backlog == 0
+            && local_backlog == 0
+            && !saturated
+            && !delivery_bad;
 
-        if congested {
-            self.decide_decrease(fb.decode_ms)
+        // 顺序：解码饱和优先。它说明瓶颈在控制器解码器，降码率只会让画面更糊而不减轻解码负担。
+        if self.decode_bound_streak >= self.params.decode_bound_ticks {
+            self.decide_decrease_decode()
+        } else if congested {
+            self.decide_decrease_network(fb.decode_ms)
         } else if healthy {
             self.decide_increase()
         } else {
@@ -454,9 +562,68 @@ impl RateController {
         }
     }
 
-    /// 拥塞路径：码率 → 帧率 → 分辨率，逐级用尽。
-    fn decide_decrease(&mut self, decode_ms: u32) -> QosDecision {
+    /// 解码瓶颈路径：**先降帧率**（直接减轻单位时间的解码量），再降分辨率，最后才砍码率。
+    ///
+    /// 与网络拥塞路径相反：这里砍码率对解码耗时几乎没有帮助（解码成本主要由像素数与帧数决定），
+    /// 只会让画面先糊掉。码率只作为最后的地板兜底。
+    fn decide_decrease_decode(&mut self) -> QosDecision {
         let mut force_keyframe = false;
+        if self.fps > self.params.min_fps {
+            // 1) 降帧率：每秒少解几帧，解码占用率立刻下降。
+            //
+            // **乘性下降（×3/4）而不是 -1**：解码饱和是「现在就解不动」，从 60 降到 15
+            // 如果每 tick 只减 1，要 45 秒才收敛，期间画面一直在积压/丢帧。乘性下降
+            // 5 个 tick 就能从 60 落到 15，与网络路径的降级节奏接近。
+            let target = (u32::from(self.fps) * 3 / 4).max(u32::from(self.params.min_fps));
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "目标帧率被钳在 [min_fps, 当前 fps] 之间，落在 u8 内"
+            )]
+            {
+                self.fps = target as u8;
+            }
+            self.last_action = QosAction::Decrease;
+        } else if self.scale_level < self.max_scale_level {
+            // 2) 帧率已到下限：降编码分辨率（几何变化 → 重建 + 强制 IDR）。
+            self.scale_level += 1;
+            force_keyframe = true;
+            self.last_action = QosAction::Decrease;
+        } else {
+            // 3) 分辨率也用尽：码率再降 10%（地板）——聊胜于无，但不越过最小码率。
+            let target = self.scaled_bitrate(0.9);
+            if target < self.bitrate_kbps {
+                self.bitrate_kbps = target;
+                self.last_action = QosAction::Decrease;
+            } else {
+                self.last_action = QosAction::Hold;
+            }
+        }
+        self.decision(force_keyframe)
+    }
+
+    /// 网络拥塞路径：**每像素比特数地板**优先降分辨率，否则码率 → 帧率 → 分辨率。
+    fn decide_decrease_network(&mut self, decode_ms: u32) -> QosDecision {
+        let mut force_keyframe = false;
+        // 0) 码率已经低到每像素不足 `min_bits_per_pixel`：继续乘性砍码率只会让画面不可用，
+        //    改为降分辨率（编码像素数少了，同码率下每个像素的比特数反而回升）。
+        let bpp = self.bits_per_pixel();
+        // **只有还能再降分辨率时**才走 bpp 分支。已经到分辨率地板时必须落回普通阶梯
+        // （否则会永远 Hold，既不降帧率也不降码率——链路真的没余量时那等于不动作）。
+        if bpp < self.params.min_bits_per_pixel && self.scale_level < self.max_scale_level {
+            self.bpp_low_streak = self.bpp_low_streak.saturating_add(1);
+            if self.bpp_low_streak >= self.params.bpp_hysteresis_ticks {
+                self.scale_level += 1;
+                force_keyframe = true;
+                self.last_action = QosAction::Decrease;
+                self.bpp_low_streak = 0;
+            } else {
+                // 迟滞未满：本 tick 按住，不再额外砍码率。
+                self.last_action = QosAction::Hold;
+            }
+            return self.decision(force_keyframe);
+        }
+        self.bpp_low_streak = 0;
+
         // 1) 码率降 20%，地板 `min_bitrate_kbps`。
         let target = self.scaled_bitrate(self.params.decrease_factor);
         if target < self.bitrate_kbps {
@@ -476,6 +643,37 @@ impl RateController {
             self.last_action = QosAction::Hold;
         }
         self.decision(force_keyframe)
+    }
+
+    /// 当前生效值的**每像素比特数**（bit/pixel）；采集尺寸未知时返回无穷大（判据失效）。
+    ///
+    /// 编码尺寸不是显示尺寸：它受 `scale` 与 [`crate::video::MAX_ENCODE_WIDTH`] 约束，必须用
+    /// [`crate::video::encode_dimensions`] 换算，否则 4K 源会把 bpp 低估 4 倍。
+    fn bits_per_pixel(&self) -> f32 {
+        let Some((width, height)) = self.source_dims else {
+            return f32::INFINITY;
+        };
+        let (enc_w, enc_h) = crate::video::encode_dimensions(
+            width,
+            height,
+            self.effective_scale(),
+            crate::video::MAX_ENCODE_WIDTH,
+        );
+        if enc_w == 0 || enc_h == 0 {
+            return f32::INFINITY;
+        }
+        let fps = self.effective_fps().max(1);
+        let pixels_per_second = f64::from(enc_w) * f64::from(enc_h) * f64::from(fps);
+        // **用 AIMD 的链路估计（`self.bitrate_kbps`），不是内容上限钳制后的生效值**：
+        // UI 场景的内容上限（1.2 Mbps）是「这类内容不值得花更多」，不是「链路只有这么多」。
+        // 拿它算 bpp 会让静止桌面在正常链路上也被判成「每像素比特不足」，一路把分辨率降下去。
+        // 分辨率应当跟随**链路预算**，而链路预算正是 AIMD 在估计的东西。
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bpp 是用于阈值比较的观测量，f32 精度足够"
+        )]
+        let bpp = (f64::from(self.bitrate_kbps) * 1000.0 / pixels_per_second) as f32;
+        bpp
     }
 
     /// 健康路径：码率 → 帧率 → 分辨率，逐级回升。
@@ -597,7 +795,7 @@ mod tests {
     /// 先喂一个低 RTT 样本建立基线。**必须**先建基线：否则首个高 RTT 样本会把基线设成它自己，
     /// 相对判据会认为「一直就这么慢」，不判拥塞。
     fn prime(c: &mut RateController) {
-        c.on_feedback(fb(50, 10, 0), 0);
+        c.on_feedback(fb(50, 10, 0), 0, 0);
     }
 
     #[test]
@@ -619,12 +817,12 @@ mod tests {
     fn congestion_decreases_bitrate_by_20_percent() {
         let mut c = balanced();
         prime(&mut c);
-        let d = c.on_feedback(fb(300, 10, 0), 0);
+        let d = c.on_feedback(fb(300, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
         assert_eq!(d.rates.bitrate_kbps, 4800, "6000 × 0.8 = 4800");
         assert!(!d.force_keyframe, "普通码率步进绝不插 IDR");
         // 再降一次。
-        let d = c.on_feedback(fb(300, 10, 0), 0);
+        let d = c.on_feedback(fb(300, 10, 0), 0, 0);
         assert_eq!(d.rates.bitrate_kbps, 3840, "4800 × 0.8 = 3840");
         assert!(!d.force_keyframe);
         // 帧率/分辨率不受影响（还没到地板）。
@@ -637,17 +835,17 @@ mod tests {
         let mut c = balanced();
         prime(&mut c);
         // 先降到 3840。
-        c.on_feedback(fb(300, 10, 0), 0);
-        c.on_feedback(fb(300, 10, 0), 0);
+        c.on_feedback(fb(300, 10, 0), 0, 0);
+        c.on_feedback(fb(300, 10, 0), 0, 0);
         assert_eq!(c.current().bitrate_kbps, 3840);
         // 健康：升 10%（3840 × 1.1 = 4224）。
-        let d = c.on_feedback(fb(50, 10, 0), 0);
+        let d = c.on_feedback(fb(50, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Increase);
         assert_eq!(d.rates.bitrate_kbps, 4224);
         assert!(!d.force_keyframe);
         // 一直升，绝不超过上限。
         for _ in 0..50 {
-            let d = c.on_feedback(fb(50, 10, 0), 0);
+            let d = c.on_feedback(fb(50, 10, 0), 0, 0);
             assert!(
                 d.rates.bitrate_kbps <= 6000,
                 "码率不得越过档位上限：{}",
@@ -662,7 +860,7 @@ mod tests {
         let mut c = balanced();
         prime(&mut c);
         // 基线 50：rtt 在 (50+30, 50+120] 之间、无积压——既不降也不升。
-        let d = c.on_feedback(fb(120, 10, 0), 0);
+        let d = c.on_feedback(fb(120, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Hold);
         assert_eq!(d.rates.bitrate_kbps, 6000);
     }
@@ -671,10 +869,10 @@ mod tests {
     fn single_backlog_tick_is_not_congestion() {
         let mut c = balanced();
         // 单次积压（rtt 正常）：不算拥塞（需连续 2 个 tick）。
-        let d = c.on_feedback(fb(50, 10, 1), 0);
+        let d = c.on_feedback(fb(50, 10, 1), 0, 0);
         assert_eq!(d.action, QosAction::Hold, "单次积压抖动不该触发降码率");
         // 第二次连续积压 → 判拥塞。
-        let d = c.on_feedback(fb(50, 10, 1), 0);
+        let d = c.on_feedback(fb(50, 10, 1), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
         assert_eq!(d.rates.bitrate_kbps, 4800);
     }
@@ -683,8 +881,8 @@ mod tests {
     fn local_backlog_counts_toward_congestion() {
         let mut c = balanced();
         // 反馈里的积压为 0，但本地出站队列有积压，连续两 tick → 拥塞。
-        c.on_feedback(fb(50, 10, 0), 3);
-        let d = c.on_feedback(fb(50, 10, 0), 3);
+        c.on_feedback(fb(50, 10, 0), 3, 0);
+        let d = c.on_feedback(fb(50, 10, 0), 3, 0);
         assert_eq!(d.action, QosAction::Decrease);
     }
 
@@ -695,7 +893,7 @@ mod tests {
         // 持续拥塞：先把码率压到地板。
         let mut guard = 0;
         while c.current().bitrate_kbps > 200 && guard < 100 {
-            c.on_feedback(fb(300, 10, 0), 0);
+            c.on_feedback(fb(300, 10, 0), 0, 0);
             guard += 1;
         }
         assert_eq!(c.current().bitrate_kbps, 200, "码率应压到地板");
@@ -703,7 +901,7 @@ mod tests {
 
         // 继续拥塞：帧率逐 tick 下降，地板是 15（不是 5）。
         for _ in 0..40 {
-            c.on_feedback(fb(300, 10, 0), 0);
+            c.on_feedback(fb(300, 10, 0), 0, 0);
         }
         assert_eq!(c.current().fps, 15, "帧率地板应为 15");
         assert!((c.current().scale - 1.0).abs() < f32::EPSILON, "解码不慢时不降分辨率");
@@ -715,7 +913,7 @@ mod tests {
         prime(&mut c);
         // 远超降到地板所需的 tick 数。
         for _ in 0..200 {
-            c.on_feedback(fb(300, 10, 0), 0);
+            c.on_feedback(fb(300, 10, 0), 0, 0);
         }
         assert_eq!(c.params.min_fps, 15);
         assert_eq!(c.current().fps, 15, "帧率不得跌破 15");
@@ -725,21 +923,21 @@ mod tests {
     fn stable_high_rtt_is_not_congestion_and_recovers() {
         let mut c = balanced();
         // 基线 200ms：跨地域中继的常态，本身不该被判拥塞。
-        let d = c.on_feedback(fb(200, 10, 0), 0);
+        let d = c.on_feedback(fb(200, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Hold, "基线内且已在封顶");
         // 稳定在 205ms、队列空：绝不降级（在封顶时动作为 Hold）。
         for _ in 0..20 {
-            let d = c.on_feedback(fb(205, 10, 0), 0);
+            let d = c.on_feedback(fb(205, 10, 0), 0, 0);
             assert_ne!(d.action, QosAction::Decrease, "稳定在基线附近不应降级");
             assert_eq!(d.rates.bitrate_kbps, 6000, "码率不该被压低");
         }
 
         // 真正拥塞后（相对基线抬升）能恢复：先降一档，再让 RTT 回到基线附近。
-        let d = c.on_feedback(fb(500, 10, 0), 0);
+        let d = c.on_feedback(fb(500, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
         let low = d.rates.bitrate_kbps;
         for _ in 0..3 {
-            let d = c.on_feedback(fb(205, 10, 0), 0);
+            let d = c.on_feedback(fb(205, 10, 0), 0, 0);
             assert_ne!(d.action, QosAction::Decrease, "回到基线附近不应继续降级");
         }
         assert!(c.current().bitrate_kbps > low, "应能回升");
@@ -750,14 +948,14 @@ mod tests {
         let mut c = balanced();
         prime(&mut c); // 基线 50ms
         // 基线 50 + 容限 120 = 170，400ms 已显著抬升。
-        let d = c.on_feedback(fb(400, 10, 0), 0);
+        let d = c.on_feedback(fb(400, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
         assert_eq!(d.rates.bitrate_kbps, 4800);
 
         // 高基线同理：200ms 基线 + 120 容限 = 320，400ms 仍判拥塞。
         let mut c = balanced();
-        c.on_feedback(fb(200, 10, 0), 0);
-        let d = c.on_feedback(fb(400, 10, 0), 0);
+        c.on_feedback(fb(200, 10, 0), 0, 0);
+        let d = c.on_feedback(fb(400, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
         assert_eq!(d.rates.bitrate_kbps, 4800);
     }
@@ -768,16 +966,16 @@ mod tests {
         // 控制器在首个心跳 ack 前会发 rtt_ms=0（「尚无样本」哨兵）：既不算拥塞也不算健康，
         // 更不能把基线学成 0。
         for _ in 0..10 {
-            let d = c.on_feedback(fb(0, 0, 0), 0);
+            let d = c.on_feedback(fb(0, 0, 0), 0, 0);
             assert_eq!(d.action, QosAction::Hold, "无样本时不该升也不该降");
         }
         assert_eq!(c.baseline_rtt_ms(), None, "0 不参与基线学习");
 
         // 首个真实样本建立 200ms 基线；随后稳定 205ms 不再被误判拥塞。
-        c.on_feedback(fb(200, 10, 0), 0);
+        c.on_feedback(fb(200, 10, 0), 0, 0);
         assert_eq!(c.baseline_rtt_ms(), Some(200));
         for _ in 0..10 {
-            let d = c.on_feedback(fb(205, 10, 0), 0);
+            let d = c.on_feedback(fb(205, 10, 0), 0, 0);
             assert_ne!(d.action, QosAction::Decrease, "稳定中继链路不应降级");
         }
     }
@@ -786,14 +984,14 @@ mod tests {
     fn baseline_tracks_session_minimum_rtt() {
         let mut c = balanced();
         assert_eq!(c.baseline_rtt_ms(), None);
-        c.on_feedback(fb(180, 10, 0), 0);
+        c.on_feedback(fb(180, 10, 0), 0, 0);
         assert_eq!(c.baseline_rtt_ms(), Some(180));
-        c.on_feedback(fb(140, 10, 0), 0);
+        c.on_feedback(fb(140, 10, 0), 0, 0);
         assert_eq!(c.baseline_rtt_ms(), Some(140), "更低样本更新基线");
-        c.on_feedback(fb(220, 10, 0), 0);
+        c.on_feedback(fb(220, 10, 0), 0, 0);
         assert_eq!(c.baseline_rtt_ms(), Some(140), "基线只降不升");
         // 0 是「尚无样本」哨兵，不参与基线。
-        c.on_feedback(fb(0, 10, 0), 0);
+        c.on_feedback(fb(0, 10, 0), 0, 0);
         assert_eq!(c.baseline_rtt_ms(), Some(140));
     }
 
@@ -803,7 +1001,7 @@ mod tests {
         let mut c = balanced();
         prime(&mut c);
         for _ in 0..80 {
-            let d = c.on_feedback(fb(300, 10, 0), 0);
+            let d = c.on_feedback(fb(300, 10, 0), 0, 0);
             assert!(!d.force_keyframe, "解码不慢时不应降分辨率");
         }
         assert!((c.current().scale - 1.0).abs() < f32::EPSILON);
@@ -813,7 +1011,7 @@ mod tests {
         prime(&mut c);
         let mut saw_scale_drop = false;
         for _ in 0..80 {
-            let d = c.on_feedback(fb(300, 40, 0), 0);
+            let d = c.on_feedback(fb(300, 40, 0), 0, 0);
             if d.force_keyframe {
                 saw_scale_drop = true;
                 break;
@@ -829,7 +1027,7 @@ mod tests {
         prime(&mut c);
         // 压到地板 + 帧率下限。
         for _ in 0..80 {
-            c.on_feedback(fb(300, 10, 0), 0);
+            c.on_feedback(fb(300, 10, 0), 0, 0);
         }
         assert_eq!(c.current().bitrate_kbps, 200);
         assert_eq!(c.current().fps, 15);
@@ -837,13 +1035,13 @@ mod tests {
         // 健康：码率逐 tick 回升；**在码率回到上限之前，帧率不得恢复**（否则会来回抖）。
         let mut ticks = 0;
         while c.current().bitrate_kbps < 6000 {
-            let d = c.on_feedback(fb(50, 10, 0), 0);
+            let d = c.on_feedback(fb(50, 10, 0), 0, 0);
             assert_eq!(d.rates.fps, 15, "码率回到上限前不应恢复帧率");
             ticks += 1;
             assert!(ticks < 200, "码率回升不应无限进行");
         }
         // 码率到顶后，帧率开始回升。
-        let d = c.on_feedback(fb(50, 10, 0), 0);
+        let d = c.on_feedback(fb(50, 10, 0), 0, 0);
         assert_eq!(d.rates.fps, 16, "码率到顶后应恢复帧率");
         assert_eq!(d.action, QosAction::Increase);
     }
@@ -857,7 +1055,7 @@ mod tests {
         let seq = [fb(300, 60, 5), fb(10, 0, 0), fb(200, 40, 1), fb(5, 0, 0), fb(150, 0, 0)];
         for _ in 0..200 {
             for f in seq {
-                let d = c.on_feedback(f, 0);
+                let d = c.on_feedback(f, 0, 0);
                 assert!(d.rates.bitrate_kbps >= 200 && d.rates.bitrate_kbps <= 2000);
                 assert!(d.rates.fps >= 15 && d.rates.fps <= 20);
                 assert!(d.rates.scale >= 0.25 - f32::EPSILON && d.rates.scale <= 0.5 + f32::EPSILON);
@@ -869,7 +1067,7 @@ mod tests {
     fn set_ceiling_resets_to_new_ceiling() {
         let mut c = balanced();
         prime(&mut c);
-        c.on_feedback(fb(300, 10, 0), 0);
+        c.on_feedback(fb(300, 10, 0), 0, 0);
         assert!(c.current().bitrate_kbps < 6000);
         c.set_ceiling(QualityPreset::Hd.options());
         assert_eq!(
@@ -888,7 +1086,7 @@ mod tests {
         let mut c = balanced(); // 档位上限 30
         prime(&mut c);
         // 先让闭环降一点码率，验证 `set_frame_rate_ceiling` 不动它。
-        let d = c.on_feedback(fb(300, 10, 0), 0);
+        let d = c.on_feedback(fb(300, 10, 0), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
         let bitrate = c.current().bitrate_kbps;
         let scale = c.current().scale;
@@ -935,8 +1133,8 @@ mod tests {
     fn congestion_beats_health_when_both_signals_present() {
         // rtt 极低但队列有积压：拥塞判定优先（不能一边积压一边升码率）。
         let mut c = balanced();
-        c.on_feedback(fb(50, 10, 1), 0);
-        let d = c.on_feedback(fb(50, 10, 1), 0);
+        c.on_feedback(fb(50, 10, 1), 0, 0);
+        let d = c.on_feedback(fb(50, 10, 1), 0, 0);
         assert_eq!(d.action, QosAction::Decrease);
     }
 
@@ -972,7 +1170,7 @@ mod tests {
         assert_eq!(c.current().bitrate_kbps, 6000, "面积变大应立刻回到 AIMD 水平");
         assert_eq!(c.current().fps, 30);
         assert_eq!(c.content_cap_kbps(), None);
-        let d = c.on_feedback(fb(50, 10, 0), 0);
+        let d = c.on_feedback(fb(50, 10, 0), 0, 0);
         assert!(!d.force_keyframe, "上限变化绝不置关键帧");
     }
 
@@ -1035,7 +1233,7 @@ mod tests {
         );
         // 后续一次健康反馈：动作可以是 Increase/Hold，但**绝不**因上限变化置关键帧。
         for _ in 0..5 {
-            let d = c.on_feedback(fb(50, 10, 0), 0);
+            let d = c.on_feedback(fb(50, 10, 0), 0, 0);
             assert!(!d.force_keyframe, "内容上限绝不带出 IDR");
             assert!((d.rates.scale - 1.0).abs() < f32::EPSILON);
         }
@@ -1043,5 +1241,167 @@ mod tests {
         c.observe_activity(1000);
         assert_eq!(c.current().bitrate_kbps, 6000);
         assert_eq!(c.current().fps, 30);
+    }
+
+    // ───────────────── 解码瓶颈 vs 网络拥塞（阶段 4） ─────────────────
+
+    #[test]
+    fn decode_bound_reduces_fps_before_bitrate() {
+        let mut c = RateController::new(QualityPreset::Hd.options()); // 10000 kbps / 60 fps
+        c.on_feedback(fb(50, 10, 0), 0, 0); // 建立 RTT 基线；健康且已在封顶 → Hold
+        // decode_ms=20 @60fps → 占用率 1.2（单帧已解不及），且 backlog>0 → 判饱和。
+        let d = c.on_feedback(fb(50, 20, 1), 0, 0);
+        assert_eq!(d.action, QosAction::Hold, "第一个饱和 tick 属于迟滞期");
+        let d = c.on_feedback(fb(50, 20, 1), 0, 0);
+        assert_eq!(d.action, QosAction::Decrease);
+        // 乘性下降 ×3/4：60 → 45（不是 -1）。饱和是「现在就解不动」，必须比网络路径更快收敛。
+        assert_eq!(d.rates.fps, 45, "解码瓶颈应**先降帧率**且乘性下降");
+        assert_eq!(d.rates.bitrate_kbps, 10_000, "解码瓶颈不得先砍码率");
+        assert!(!d.force_keyframe, "改帧率不是几何变化，不该插 IDR");
+
+        // 连续饱和（60ms/帧，降到 15fps 后仍是 0.9 ≥ 0.8）：
+        // 60 → 45 → 33 → 24 → 18 → 15，5 个 tick 落到地板（旧的 -1/tick 要 45 个 tick）。
+        let mut ticks = 0;
+        while c.current().fps > 15 {
+            c.on_feedback(fb(50, 60, 1), 0, 0);
+            ticks += 1;
+            assert!(ticks < 10, "乘性下降应在个位数 tick 内到地板");
+        }
+        assert_eq!(c.current().fps, 15);
+        assert_eq!(c.current().bitrate_kbps, 10_000, "降帧率期间不得砍码率");
+    }
+
+    #[test]
+    fn decode_bound_eventually_drops_scale_and_requests_keyframe() {
+        let mut c = RateController::new(QualityPreset::Hd.options());
+        c.on_feedback(fb(50, 10, 0), 0, 0);
+        // 60ms @ 60fps = 3.6；降到 15fps 后仍是 0.9 ≥ 0.8 且 backlog>0 → 始终饱和。
+        let mut saw_scale_drop = false;
+        for _ in 0..120 {
+            let d = c.on_feedback(fb(50, 60, 1), 0, 0);
+            if d.force_keyframe {
+                saw_scale_drop = true;
+                break;
+            }
+        }
+        assert!(saw_scale_drop, "帧率降到下限后应降分辨率并强制关键帧");
+        assert!(c.current().scale < 1.0, "分辨率应下降");
+    }
+
+    #[test]
+    fn network_congestion_with_low_bpp_drops_scale_before_further_bitrate_cuts() {
+        let mut c = RateController::with_params(QualityPreset::Smooth.options(), QosParams::default());
+        c.set_source_dims(3840, 2160);
+        // 2000 kbps / 60 fps，编码宽度被 MAX_ENCODE_WIDTH 限到 1920×1080 → bpp ≈ 0.016 < 0.04。
+        c.set_frame_rate_ceiling(60);
+        c.on_feedback(fb(50, 10, 0), 0, 0);
+        // 第一个拥塞 tick：低 bpp 的迟滞未满，按住。
+        let d = c.on_feedback(fb(400, 10, 0), 0, 0);
+        assert_eq!(d.action, QosAction::Hold, "低 bpp 降分辨率需要连续 2 个 tick");
+        let d = c.on_feedback(fb(400, 10, 0), 0, 0);
+        assert_eq!(d.action, QosAction::Decrease);
+        assert!(d.force_keyframe, "低 bpp 应降分辨率并强制关键帧");
+        assert!(d.rates.scale < 1.0, "分辨率应下降");
+        assert_eq!(d.rates.bitrate_kbps, 2000, "降分辨率的这一 tick 不再额外砍码率");
+    }
+
+    #[test]
+    fn delivery_ratio_below_threshold_needs_three_ticks() {
+        let mut c = balanced();
+        prime(&mut c);
+        // RTT 健康、无积压，但出 1000 kbps 只收到 500 kbps（0.5 < 0.7）。
+        let bad = || Feedback {
+            rtt_ms: 50,
+            recv_kbps: 500,
+            decode_ms: 10,
+            backlog: 0,
+        };
+        let d = c.on_feedback(bad(), 0, 1000);
+        assert_eq!(d.action, QosAction::Hold, "1 tick 投递率差是噪声");
+        let d = c.on_feedback(bad(), 0, 1000);
+        assert_eq!(d.action, QosAction::Hold, "2 tick 仍未到阈值");
+        let d = c.on_feedback(bad(), 0, 1000);
+        assert_eq!(d.action, QosAction::Decrease, "连续 3 tick 投递率 <0.7 判网络拥塞");
+        assert_eq!(d.rates.bitrate_kbps, 4800);
+    }
+
+    #[test]
+    fn delivery_ratio_ignores_zero_samples() {
+        // recv_kbps = 0（控制器尚无接收样本）：即便 sent 很高也不得判丢包。
+        let mut c = balanced();
+        prime(&mut c);
+        c.on_feedback(fb(300, 10, 0), 0, 0); // 先降一档，制造可回升的空间
+        let low = c.current().bitrate_kbps;
+        let d = c.on_feedback(
+            Feedback {
+                rtt_ms: 50,
+                recv_kbps: 0,
+                decode_ms: 10,
+                backlog: 0,
+            },
+            0,
+            1000,
+        );
+        assert_eq!(d.action, QosAction::Increase, "recv_kbps=0 是「无样本」哨兵");
+        assert!(d.rates.bitrate_kbps > low, "健康时应正常回升");
+
+        // sent_kbps = 0（编码任务尚未上报窗口字节）：同样不得触发投递率路径。
+        let mut c = balanced();
+        prime(&mut c);
+        c.on_feedback(fb(300, 10, 0), 0, 0);
+        let low = c.current().bitrate_kbps;
+        let d = c.on_feedback(
+            Feedback {
+                rtt_ms: 50,
+                recv_kbps: 500,
+                decode_ms: 10,
+                backlog: 0,
+            },
+            0,
+            0,
+        );
+        assert_eq!(d.action, QosAction::Increase, "sent_kbps=0 是「无样本」哨兵");
+        assert!(d.rates.bitrate_kbps > low, "健康时应正常回升");
+    }
+
+    /// **内容上限不得触发 bpp 降分辨率**：UI 场景的上限（1.2 Mbps/15 fps）会让
+    /// `effective_bitrate_kbps()` 的 bpp 只有 0.0386（低于 0.04），但那是「这类内容不值得
+    /// 花更多」，不是「链路只有这么多」。bpp 必须跟 AIMD 的链路估计走，否则静止桌面在
+    /// 正常链路上也会一路降到 540p。
+    #[test]
+    fn content_cap_does_not_trigger_bpp_scale_drop() {
+        let mut c = activity_controller(); // Balanced：6000 kbps / 30 fps
+        c.set_source_dims(1920, 1080);
+        prime(&mut c);
+        // 进入 UI 档（连续 2 tick 安静）→ 生效值被钳到 1.2 Mbps / 15 fps。
+        lo_activity_twice(&mut c);
+        assert_eq!(c.current().bitrate_kbps, 1200);
+        assert_eq!(c.current().fps, 15);
+
+        // 网络拥塞：AIMD 仍有 6000 kbps 的链路估计 → bpp = 6000/(1920*1080*15) ≈ 0.19，
+        // 远高于 0.04，不应降分辨率（只按普通阶梯砍码率）。
+        let d = c.on_feedback(fb(400, 10, 0), 0, 0);
+        assert_eq!(d.action, QosAction::Decrease);
+        assert!(!d.force_keyframe, "内容上限造成的低 bpp 不得降分辨率");
+        assert!((d.rates.scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// 分辨率已经到地板时，低 bpp **必须落回普通阶梯**（否则永远 Hold，链路真的没余量
+    /// 时既不降帧率也不降码率）。
+    #[test]
+    fn low_bpp_at_min_scale_falls_back_to_network_ladder() {
+        let params = QosParams {
+            min_scale: 1.0, // 一开始就是分辨率地板（max_scale_level = 0）
+            ..QosParams::default()
+        };
+        let mut c = RateController::with_params(QualityPreset::Smooth.options(), params);
+        c.set_source_dims(3840, 2160);
+        c.set_frame_rate_ceiling(60);
+        prime(&mut c);
+        // 2000 kbps @1920x1080/60fps → bpp ≈ 0.016 < 0.04，但已无分辨率可降。
+        let d = c.on_feedback(fb(400, 10, 0), 0, 0);
+        assert_eq!(d.action, QosAction::Decrease, "无分辨率可降时必须继续走网络阶梯");
+        assert!(!d.force_keyframe, "没有几何变化就不该插 IDR");
+        assert!(d.rates.bitrate_kbps < 2000, "应降码率");
     }
 }

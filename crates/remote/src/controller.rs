@@ -8,17 +8,18 @@ use crate::auth::verify_ack_mac;
 use crate::codec::{vp9_decoder_factory, VideoDecoderApi, VideoDecoderFactory};
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{DecodedFrame, FrameSink, InputEvent, QualityPreset};
+use crate::screen::{DecodedFrame, DecodedPatch, FrameSink, InputEvent, QualityPreset, ScreenPatch};
 use crate::session::{
-    trusted_rtt, CodecId, ControllerHandshake, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
-    HEARTBEAT_INTERVAL, VIDEO_FLAG_KEYFRAME,
+    trusted_rtt, CodecId, ControllerHandshake, RegionRect, SessionCodec, SessionEnd, SessionFrame,
+    SessionMessage, HEARTBEAT_INTERVAL, MAX_REGION_RECTS, REGION_FLAG_ZSTD, VIDEO_FLAG_KEYFRAME,
 };
-use crate::stats::{SessionStats, SessionStatsReporter};
+use crate::stats::{KeyframeReason, SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
 use crate::video::MAX_FRAME_DIM;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +54,9 @@ const DECODE_QUEUE: usize = 16;
 /// 每个 IDR 都是带宽尖峰，反而让解码队列更满、继续丢包。400 ms 内最多一次，既压住风暴，
 /// 又保证等待中的请求会在该窗口内被重试（不会永久卡在等 IDR）。
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
+
+/// 在途心跳时刻队列的上限（1s 探测、10s 可信上限 ⇒ 8 个足够覆盖任何可信延迟）。
+const HEARTBEAT_SENT_CAP: usize = 8;
 
 /// QoS 反馈间隔（秒级）。每秒向被控端发一条 `QosFeedback`（含 RTT / 收码率 / 解码耗时 / 积压），
 /// 驱动被控端的 AIMD 闭环（见 [`crate::qos`]）。同时按同一节拍把解码侧读数经进程内
@@ -90,6 +94,21 @@ enum DecodeJob {
         /// 帧数据。
         data: Vec<u8>,
     },
+    /// 一批脏矩形补丁（协议 v5 `RegionUpdate`，仅 H.264 补丁模式）。
+    ///
+    /// 与 `Packet` 走**同一条**队列，因此 [`FrameSink::on_frame`] / [`FrameSink::on_patch`]
+    /// 的调用顺序就是线上顺序——补丁永远应用在它前面那个全帧之上。这是补丁模式能够
+    /// 「只带脏矩形」的全部前提（见 [`decode_loop`]）。
+    Region {
+        /// 目标显示器编号。
+        display: u32,
+        /// 目标帧缓冲宽度（编码尺寸，偶数）。
+        width: u32,
+        /// 目标帧缓冲高度（编码尺寸，偶数）。
+        height: u32,
+        /// 已通过主循环粗校验的矩形；解压与逐矩形细校验在解码任务里做。
+        rects: Vec<RegionRect>,
+    },
 }
 
 /// 主循环与解码任务共享的原子读数/状态。
@@ -103,6 +122,12 @@ struct DecodeShared {
     drop_epoch: Arc<AtomicU32>,
     /// 解码任务是否正在等 IDR（主循环据此在入队前丢 P 帧）。
     awaiting_keyframe: Arc<AtomicBool>,
+    /// 解码任务**已应用**到合成帧的补丁批数（主循环每秒 `swap(0)` 取走，填进
+    /// [`SessionStats::Decode`] 的 `patches` 字段）。
+    ///
+    /// 计数放在解码侧而不是主循环：**收到**的补丁可能因等待关键帧/几何不符被丢弃，
+    /// 只有真正交给 `on_patch` 的才算生效。
+    applied_patches: Arc<AtomicU32>,
 }
 
 impl DecodeShared {
@@ -111,6 +136,7 @@ impl DecodeShared {
             decode_ms: Arc::new(AtomicU32::new(0)),
             drop_epoch: Arc::new(AtomicU32::new(0)),
             awaiting_keyframe: Arc::new(AtomicBool::new(false)),
+            applied_patches: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -269,7 +295,8 @@ pub async fn run_controller(
     let (decode_tx, decode_rx) = mpsc::channel::<DecodeJob>(DECODE_QUEUE);
     // 解码任务 → 循环的关键帧请求通道（无界：只承载「重置后请对端补一个 IDR」这种低频控制）。
     // 循环自己保留 `keyframe_tx`，故 `recv()` 永不返回 `None`（否则会 100% 空转）。
-    let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<u32>();
+    // 载荷是 `(显示器, 原因)`：原因只进管理面（进程内 `SessionStats`），**不上线**。
+    let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
     // 主循环与解码任务共享的原子读数/状态（见 [`DecodeShared`]）：
     // - 解码耗时：由解码任务写、主循环读（填进 `QosFeedback`）；
     // - `drop_epoch`：队列溢出时推进，解码任务据此整体作废陈旧 P 帧；
@@ -298,10 +325,13 @@ pub async fn run_controller(
     // 起点取 `now + QOS_INTERVAL`：第一个样本要有一整秒的统计窗口才有意义。
     let mut qos_tick = interval_at(Instant::now() + QOS_INTERVAL, QOS_INTERVAL);
     qos_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // RTT 样本：发 `Heartbeat` 时记时刻，收到 `HeartbeatAck` 时配对算 RTT。**复用既有心跳往返**，
-    // 不新增数据面变体（新增 `SessionMessage` 变体会让混合版本的一端直接断链，见 `HEARTBEAT_INTERVAL`）。
-    // 首个样本由上面那个「立即到期的 tick」给出，故这里先置空。
-    let mut pending_heartbeat: Option<Instant> = None;
+    // RTT 样本：发 `Heartbeat` 时把时刻压入队列，收到 `HeartbeatAck` 时从队首弹出配对。
+    // **复用既有心跳往返**，不新增数据面变体（新增 `SessionMessage` 变体会让混合版本的一端直接断链，
+    // 见 `HEARTBEAT_INTERVAL`）。首个样本由上面那个「立即到期的 tick」给出，故这里先置空。
+    //
+    // 用队列而不是单个 `Option`：1s 探测在高 RTT 链路上会有多个心跳同时在途，单槽位会把迟到的
+    // ack 与更新的心跳配错对。FIFO 配对最坏只让样本旧一个周期；上限 8 防止对端不应答时无限增长。
+    let mut heartbeat_sent: VecDeque<Instant> = VecDeque::new();
     // 最近一次可信 RTT（毫秒）：填进 `QosFeedback`。无样本时为 0（闭环此时按「未知」处理，
     // 不会误判为健康——`0 < fast_threshold` 但队列非空时仍可能判拥塞）。
     let mut last_rtt_ms: Option<u32> = None;
@@ -344,8 +374,11 @@ pub async fn run_controller(
                 break Ok(SessionEnd { reason: reason.clone(), deliberate: true });
             }
             _ = heartbeat.tick() => {
-                // 覆盖旧样本：上一个 ack 迟迟不来时，下一次心跳的往返才是与当前时刻相关的读数。
-                pending_heartbeat = Some(Instant::now());
+                // FIFO 配对：迟到的 ack 认领最老的未应答心跳，而不是最新那个。
+                if heartbeat_sent.len() >= HEARTBEAT_SENT_CAP {
+                    heartbeat_sent.pop_front();
+                }
+                heartbeat_sent.push_back(Instant::now());
                 if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
                     break Err(err);
                 }
@@ -373,12 +406,13 @@ pub async fn run_controller(
                     break Err(err);
                 }
                 // 同节拍把解码侧读数经进程内通道送到 UI（不落线）。`QosFeedback` 的字段
-                // **不变**：收包/丢包只是本地观测，不进协议。
+                // **不变**：收包/丢包/补丁只是本地观测，不进协议。
                 config.stats.report(SessionStats::Decode {
                     decode_ms,
                     recv_kbps,
                     packets: window_packets,
                     dropped: window_dropped,
+                    patches: decode_shared.applied_patches.swap(0, Ordering::Relaxed),
                 });
                 recv_bytes = 0;
                 window_packets = 0;
@@ -415,6 +449,9 @@ pub async fn run_controller(
                         if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(request)).await {
                             break Err(err);
                         }
+                        config.stats.report(SessionStats::KeyframeRequest {
+                            reason: KeyframeReason::StalledNoFrame,
+                        });
                         last_keyframe_request_at = Some(Instant::now());
                     }
                 }
@@ -480,9 +517,9 @@ pub async fn run_controller(
                         Err(err) => warn!(error = %err, "文件操作发起失败"),
                     },
                     ControllerCommand::Ping => {
-                        // 已有在途样本时不打扰：否则会覆盖它、让那次往返的读数作废。
-                        if pending_heartbeat.is_none() {
-                            pending_heartbeat = Some(Instant::now());
+                        // 已有在途样本时不打扰：否则会多一条在途心跳，让用户此刻想要的读数被推迟。
+                        if heartbeat_sent.is_empty() {
+                            heartbeat_sent.push_back(Instant::now());
                             if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::control(SessionMessage::Heartbeat)).await {
                                 break Err(err);
                             }
@@ -492,10 +529,12 @@ pub async fn run_controller(
             }
             // 解码任务请求关键帧（解码失败 / 丢弃了参考帧）：转达给被控端，让它补一个 IDR。
             // `keyframe_tx` 常驻于本函数 → `recv()` 不会返回 `None`，本分支只在真的有请求时触发。
-            Some(display) = keyframe_rx.recv() => {
+            // 原因只进管理面（进程内上报），线上 `RequestKeyframe` 仍只有 `display` 一个字段。
+            Some((display, reason)) = keyframe_rx.recv() => {
                 if let Err(err) = send_cancellable(&mut writer, &cancel, SessionFrame::screen(SessionMessage::RequestKeyframe { display })).await {
                     break Err(err);
                 }
+                config.stats.report(SessionStats::KeyframeRequest { reason });
             }
             _ = file_tick.tick(), if transfer.has_outgoing() => {
                 match transfer.next_outbound().await {
@@ -574,6 +613,75 @@ pub async fn run_controller(
                             }
                         }
                         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
+                        SessionMessage::RegionUpdate {
+                            display: monitor,
+                            width,
+                            height,
+                            rects,
+                        } => {
+                            // 补丁也是「收到画面帧」：它证明对端采集/编码还活着，「长时间无帧」
+                            // 看门狗必须因此保持安静（否则静止桌面在补丁模式下每 3s 白请 IDR）。
+                            stall_requests = 0;
+                            last_frame_at = Instant::now();
+                            // 空批 = 保活：不入队、不重绘，只让上面的看门狗计时生效。
+                            if rects.is_empty() {
+                                continue;
+                            }
+                            // 补丁载荷同样是接收码率的一部分：补丁模式下几乎没有全帧，
+                            // 只统计 `VideoPacket` 会让 `recv_kbps` 失真。
+                            let patch_bytes = rects.iter().fold(0_u64, |acc, rect| {
+                                acc.saturating_add(
+                                    u64::try_from(rect.data.len()).unwrap_or(u64::MAX),
+                                )
+                            });
+                            recv_bytes = recv_bytes.saturating_add(patch_bytes);
+                            // 廉价校验放在主循环：畸形几何/超量矩形不该占用解码队列。
+                            // 补丁**不允许静默丢弃**——丢弃必须换回一个关键帧。
+                            if width == 0
+                                || height == 0
+                                || width > MAX_FRAME_DIM
+                                || height > MAX_FRAME_DIM
+                                || !width.is_multiple_of(2)
+                                || !height.is_multiple_of(2)
+                                || rects.len() > MAX_REGION_RECTS
+                            {
+                                debug!(
+                                    monitor,
+                                    width,
+                                    height,
+                                    rects = rects.len(),
+                                    "补丁批的帧几何非法，丢弃并请求关键帧"
+                                );
+                                let _ = keyframe_tx.send((monitor, KeyframeReason::DecodeError));
+                                continue;
+                            }
+                            // 补丁走 `try_send`：它绝不能卡住主循环（输入/心跳照常轮询）。
+                            match enqueue_decode(
+                                &decode_tx,
+                                DecodeJob::Region {
+                                    display: monitor,
+                                    width,
+                                    height,
+                                    rects,
+                                },
+                            ) {
+                                DecodeEnqueue::Queued => {}
+                                DecodeEnqueue::Dropped => {
+                                    // 队列满时**不**推进 `drop_epoch`：补丁不是参考链上的帧，
+                                    // 直接请一个全帧 IDR 即可——被控端收到后会退出补丁模式并
+                                    // 发一整帧，合成帧随之重建。
+                                    debug!(monitor, "解码队列已满，丢弃补丁批并请求关键帧");
+                                    let _ = keyframe_tx
+                                        .send((monitor, KeyframeReason::QueueOverflow));
+                                }
+                                DecodeEnqueue::Closed => {
+                                    break Err(RemoteError::Platform(
+                                        "画面解码任务已结束".to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                        // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
                         SessionMessage::ScreenConfig { display: monitor, codec, width, height } => {
                             // 编码尺寸/codec 的通告。解码器本身能在关键帧处跟随分辨率变化
                             // （由 `video` 的单测锁定），故这里只记录、不重建。
@@ -624,7 +732,7 @@ pub async fn run_controller(
                             }
                         }
                         SessionMessage::HeartbeatAck => {
-                            if let Some(sent) = pending_heartbeat.take() {
+                            if let Some(sent) = heartbeat_sent.pop_front() {
                                 if let Some(rtt) = trusted_rtt(sent, Instant::now()) {
                                     // 存一份毫秒读数：`QosFeedback` 要用它填 `rtt_ms`。
                                     last_rtt_ms = Some(u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
@@ -759,18 +867,19 @@ fn decoder_factory_for(
 /// [`decode_loop`] 的 400 ms tick 补发。这样断层/溢出风暴里 400 ms 内最多一个 IDR，
 /// 又不会让请求永久丢失（tick 保证 400 ms 内必定重试）。
 fn request_keyframe(
-    tx: &mpsc::UnboundedSender<u32>,
+    tx: &mpsc::UnboundedSender<(u32, KeyframeReason)>,
     last: &mut Option<Instant>,
-    pending: &mut Option<u32>,
+    pending: &mut Option<(u32, KeyframeReason)>,
     monitor: u32,
+    reason: KeyframeReason,
 ) {
     let now = Instant::now();
     if last.is_none_or(|sent| now.duration_since(sent) >= KEYFRAME_REQUEST_INTERVAL) {
-        let _ = tx.send(monitor);
+        let _ = tx.send((monitor, reason));
         *last = Some(now);
         *pending = None;
     } else {
-        *pending = Some(monitor);
+        *pending = Some((monitor, reason));
     }
 }
 
@@ -780,7 +889,7 @@ fn request_keyframe(
 )]
 async fn decode_loop(
     mut rx: mpsc::Receiver<DecodeJob>,
-    keyframe_tx: mpsc::UnboundedSender<u32>,
+    keyframe_tx: mpsc::UnboundedSender<(u32, KeyframeReason)>,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
     decode_shared: Arc<DecodeShared>,
@@ -797,7 +906,7 @@ async fn decode_loop(
     let mut expected_seq: Option<u64> = None;
     // 关键帧请求限频状态：上次真正发出的时刻、被限频挂起的显示器。
     let mut last_kf_request: Option<Instant> = None;
-    let mut kf_pending: Option<u32> = None;
+    let mut kf_pending: Option<(u32, KeyframeReason)> = None;
     // 定期检查挂起的请求：距上次请求已满一个窗口就发出去，保证不会永久等 IDR。
     let mut kf_tick = tokio::time::interval_at(
         Instant::now() + KEYFRAME_REQUEST_INTERVAL,
@@ -810,8 +919,8 @@ async fn decode_loop(
             () = cancel.cancelled() => break,
             _ = kf_tick.tick() => {
                 if awaiting_keyframe {
-                    if let Some(monitor) = kf_pending.take() {
-                        let _ = keyframe_tx.send(monitor);
+                    if let Some((monitor, reason)) = kf_pending.take() {
+                        let _ = keyframe_tx.send((monitor, reason));
                         last_kf_request = Some(Instant::now());
                     }
                 } else {
@@ -852,6 +961,98 @@ async fn decode_loop(
                 }
                 continue;
             }
+            // 补丁批：校验/解压后交给 `FrameSink::on_patch`。
+            //
+            // **顺序保证**：补丁与全帧都从本函数出队，所以 `on_patch` 必然排在前一个
+            // `on_frame`（或前一批补丁）之后——UI 侧的持久合成帧因此可以盲目按矩形覆写。
+            // 补丁**不占用** `expected_seq`（被控端在补丁模式下不产全帧，视频序号不前进），
+            // 退出补丁模式后的第一个全帧仍与解码端的期望值连续。
+            DecodeJob::Region {
+                display: monitor,
+                width,
+                height,
+                rects,
+            } => {
+                // 空批 = 保活（主循环已过滤；这里兜底，避免未来的调用方把空批当一帧上屏）。
+                if rects.is_empty() {
+                    continue;
+                }
+                // 丢弃分两类，**只有一类可以静默**：正在等 IDR 时关键帧请求已经在途，再请
+                // 一次只会浪费限频窗口；其余任何丢弃都必须换回一个关键帧（补丁丢一个，
+                // 画面就永久缺一块）。
+                //
+                // 因此 codec / 几何检查排在 `awaiting_keyframe` **之前**：几何不符意味着
+                // 我们的合成帧基底与对端以为的不是同一块缓冲，这正是必须换回全帧的理由，
+                // 即使此刻已经在等 IDR。
+                if codec != Some(CodecId::H264) {
+                    debug!(monitor, ?codec, "非 H.264 会话收到补丁，丢弃并请求关键帧");
+                    request_keyframe(
+                        &keyframe_tx,
+                        &mut last_kf_request,
+                        &mut kf_pending,
+                        monitor,
+                        KeyframeReason::DecodeError,
+                    );
+                    continue;
+                }
+                if configured_dims != Some((width, height)) {
+                    debug!(
+                        monitor,
+                        width,
+                        height,
+                        ?configured_dims,
+                        "补丁尺寸与当前合成帧不符，丢弃并请求关键帧"
+                    );
+                    awaiting_keyframe = true;
+                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                    request_keyframe(
+                        &keyframe_tx,
+                        &mut last_kf_request,
+                        &mut kf_pending,
+                        monitor,
+                        KeyframeReason::DecodeError,
+                    );
+                    continue;
+                }
+                if awaiting_keyframe {
+                    // 还没有可应用的全帧基底；关键帧请求已经在途（见上）。
+                    continue;
+                }
+                let mut patches = Vec::with_capacity(rects.len());
+                let mut failed = false;
+                for rect in &rects {
+                    let Some(patch) = decode_region_rect(width, height, rect) else {
+                        failed = true;
+                        break;
+                    };
+                    patches.push(patch);
+                }
+                if failed {
+                    // 整批丢弃：解压/校验只做了一半也没有可应用的部分，半批补丁同样会让
+                    // 画面缺块。
+                    debug!(monitor, width, height, "补丁矩形非法或解压失败，丢弃整批并请求关键帧");
+                    awaiting_keyframe = true;
+                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                    request_keyframe(
+                        &keyframe_tx,
+                        &mut last_kf_request,
+                        &mut kf_pending,
+                        monitor,
+                        KeyframeReason::DecodeError,
+                    );
+                    continue;
+                }
+                sink.on_patch(DecodedPatch {
+                    display: monitor,
+                    width,
+                    height,
+                    rects: patches,
+                });
+                decode_shared
+                    .applied_patches
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             DecodeJob::Packet {
                 display,
                 seq,
@@ -877,6 +1078,7 @@ async fn decode_loop(
                 &mut last_kf_request,
                 &mut kf_pending,
                 monitor,
+                KeyframeReason::QueueOverflow,
             );
             continue;
         }
@@ -909,6 +1111,7 @@ async fn decode_loop(
                 &mut last_kf_request,
                 &mut kf_pending,
                 monitor,
+                KeyframeReason::SeqGap,
             );
         }
         expected_seq = Some(seq.wrapping_add(1));
@@ -925,6 +1128,7 @@ async fn decode_loop(
                 &mut last_kf_request,
                 &mut kf_pending,
                 monitor,
+                KeyframeReason::NoDecoder,
             );
             continue;
         }
@@ -940,6 +1144,7 @@ async fn decode_loop(
                     &mut last_kf_request,
                     &mut kf_pending,
                     monitor,
+                    KeyframeReason::NoDecoder,
                 );
                 continue;
             };
@@ -976,6 +1181,7 @@ async fn decode_loop(
                         &mut last_kf_request,
                         &mut kf_pending,
                         monitor,
+                        KeyframeReason::ConfigureFailed,
                     );
                     continue;
                 }
@@ -1019,10 +1225,61 @@ async fn decode_loop(
                     &mut last_kf_request,
                     &mut kf_pending,
                     monitor,
+                    KeyframeReason::DecodeError,
                 );
             }
         }
     }
+}
+
+/// 校验并解压一个补丁矩形；任何非法输入返回 `None`（调用方据此丢弃整批）。
+///
+/// 校验项与 [`ScreenPatch`] / [`crate::screen::DecodedNv12::apply_patch`] 的契约一字不差：
+/// 坐标与尺寸全部为偶数、非零、落在声明帧内，解压后长度精确等于 `w*h*3/2`。控制器先把关，
+/// UI 侧才不会拿到半个能应用的矩形。
+///
+/// zstd 解压带 `expected` 上限：超限即报错，不会按对端声明的尺寸无界分配。
+fn decode_region_rect(
+    frame_width: u32,
+    frame_height: u32,
+    rect: &RegionRect,
+) -> Option<ScreenPatch> {
+    let (x, y, width, height) = (rect.x, rect.y, rect.width, rect.height);
+    if width == 0
+        || height == 0
+        || !width.is_multiple_of(2)
+        || !height.is_multiple_of(2)
+        || !x.is_multiple_of(2)
+        || !y.is_multiple_of(2)
+    {
+        return None;
+    }
+    if x.checked_add(width)? > frame_width || y.checked_add(height)? > frame_height {
+        return None;
+    }
+    let expected = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(3)?
+        .checked_div(2)?;
+    let nv12 = if rect.flags & REGION_FLAG_ZSTD != 0 {
+        zstd::bulk::decompress(&rect.data, expected).ok()?
+    } else {
+        if rect.data.len() != expected {
+            return None;
+        }
+        rect.data.clone()
+    };
+    if nv12.len() != expected {
+        return None;
+    }
+    Some(ScreenPatch {
+        x,
+        y,
+        width,
+        height,
+        nv12,
+    })
 }
 
 /// [`enqueue_decode`] 的结果。
@@ -1330,8 +1587,8 @@ mod tests {
     /// 4. 会话一建立就发一次心跳，往返被算成延迟样本上报。
     ///
     /// UI 的「开窗即有读数」全靠这一点：心跳 interval 的起点写成 `now + HEARTBEAT_INTERVAL` 时，
-    /// 首个样本要等满一个周期（10s）才出现，用户开窗看到的是空白。所以这里用 **1s** 的上限锁住
-    /// 「立即」——远小于 [`HEARTBEAT_INTERVAL`]，写成延迟起点必然超时。
+    /// 首个样本要等满一个周期才出现，用户开窗看到的是空白。所以这里用 **300ms** 的上限锁住
+    /// 「立即」——远小于 [`HEARTBEAT_INTERVAL`]（1s），写成延迟起点必然超时。
     #[tokio::test]
     async fn session_start_reports_rtt_immediately() {
         let (a, b) = tokio::io::duplex(64 * 1024);
@@ -1371,7 +1628,7 @@ mod tests {
 
         // 首个样本应是 RTT（心跳的起点取 `now`，首个 tick 立即到期）；解码侧读数要等 1s 的
         // QoS 窗口，故这里跳过非 RTT 事件，直到拿到 RTT 或超时。
-        let rtt = tokio::time::timeout(Duration::from_secs(1), async {
+        let rtt = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
                 match stats_rx.recv().await {
                     Some(SessionStats::Rtt(rtt)) => break rtt,
@@ -1382,8 +1639,8 @@ mod tests {
             }
         })
         .await
-        .expect("会话建立后 1s 内就该有延迟样本（首个 tick 立即到期）");
-        assert!(rtt < Duration::from_secs(1), "内存管道 RTT 不该是 {rtt:?}");
+        .expect("会话建立后 300ms 内就该有延迟样本（首个 tick 立即到期）");
+        assert!(rtt < Duration::from_millis(300), "内存管道 RTT 不该是 {rtt:?}");
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, task).await;
@@ -1556,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn codec_select_uses_injected_h264_decoder_factory() {
         let (job_tx, job_rx) = mpsc::channel::<DecodeJob>(4);
-        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<u32>();
+        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
         let sink = Arc::new(CountingSink::default());
         let cancel = CancellationToken::new();
         let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1635,7 +1892,7 @@ mod tests {
     #[tokio::test]
     async fn decoder_configure_runs_on_first_packet_and_on_size_change_only() {
         let (job_tx, job_rx) = mpsc::channel::<DecodeJob>(8);
-        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<u32>();
+        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
         let sink = Arc::new(CountingSink::default());
         let cancel = CancellationToken::new();
         let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1716,5 +1973,407 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, task).await;
+    }
+
+    // ── 协议 v5 脏矩形补丁（控制器侧）────────────────────────────────
+
+    /// 上报目标看到的事件（顺序即 [`FrameSink`] 的调用顺序）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum PatchEvent {
+        /// 一帧全帧。
+        Frame,
+        /// 一批补丁。
+        Patch(DecodedPatch),
+    }
+
+    /// 记录全帧/补丁及其**调用顺序**的假上报目标。
+    #[derive(Default)]
+    struct PatchSink {
+        frames: std::sync::atomic::AtomicUsize,
+        events: Mutex<Vec<PatchEvent>>,
+    }
+
+    impl FrameSink for PatchSink {
+        fn on_displays(&self, _displays: Vec<DisplayInfo>) {}
+        fn on_frame(&self, _frame: DecodedFrame) {
+            self.frames.fetch_add(1, Ordering::SeqCst);
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(PatchEvent::Frame);
+        }
+        fn on_patch(&self, patch: DecodedPatch) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(PatchEvent::Patch(patch));
+        }
+        fn on_closed(&self, _reason: String) {}
+    }
+
+    impl PatchSink {
+        fn frames(&self) -> usize {
+            self.frames.load(Ordering::SeqCst)
+        }
+
+        /// 已上屏的补丁批（按到达顺序）。
+        fn patches(&self) -> Vec<DecodedPatch> {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter_map(|event| match event {
+                    PatchEvent::Patch(patch) => Some(patch.clone()),
+                    PatchEvent::Frame => None,
+                })
+                .collect()
+        }
+
+        /// 取走最早一批尚未取走的补丁。
+        fn take_next_patch(&self) -> Option<DecodedPatch> {
+            let mut guard = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = guard
+                .iter()
+                .position(|event| matches!(event, PatchEvent::Patch(_)))?;
+            match guard.remove(index) {
+                PatchEvent::Patch(patch) => Some(patch),
+                PatchEvent::Frame => None,
+            }
+        }
+    }
+
+    /// 解码任务测试装置：H.264 假工厂 + 记录型 sink + 关键帧请求接收端。
+    struct DecodeHarness {
+        jobs: mpsc::Sender<DecodeJob>,
+        keyframes: mpsc::UnboundedReceiver<(u32, KeyframeReason)>,
+        sink: Arc<PatchSink>,
+        cancel: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl DecodeHarness {
+        fn spawn() -> Self {
+            let (jobs, job_rx) = mpsc::channel::<DecodeJob>(8);
+            let (keyframe_tx, keyframes) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
+            let sink = Arc::new(PatchSink::default());
+            let cancel = CancellationToken::new();
+            let factory: Arc<dyn VideoDecoderFactory> = Arc::new(RecordingDecoderFactory {
+                codec: CodecId::H264,
+                created: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            });
+            let task = tokio::spawn(decode_loop(
+                job_rx,
+                keyframe_tx,
+                sink.clone(),
+                cancel.clone(),
+                Arc::new(DecodeShared::new()),
+                Some(factory),
+            ));
+            Self {
+                jobs,
+                keyframes,
+                sink,
+                cancel,
+                task,
+            }
+        }
+
+        /// 走完「选 codec → 首帧关键帧」，让解码任务进入可应用补丁的状态。
+        async fn prime(&self, width: u32, height: u32) {
+            self.jobs
+                .send(DecodeJob::SelectCodec(CodecId::H264))
+                .await
+                .expect("投递 codec 选择");
+            self.jobs
+                .send(DecodeJob::Packet {
+                    display: 0,
+                    seq: 1,
+                    epoch: 0,
+                    codec: CodecId::H264,
+                    flags: VIDEO_FLAG_KEYFRAME,
+                    width,
+                    height,
+                    data: vec![1, 2, 3],
+                })
+                .await
+                .expect("投递关键帧");
+            let decoded = tokio::time::timeout(WAIT, async {
+                for _ in 0..200 {
+                    if self.sink.frames() >= 1 {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                false
+            })
+            .await
+            .expect("解码任务应及时出帧");
+            assert!(decoded, "prime 应解出一个全帧");
+        }
+
+        async fn region(&self, width: u32, height: u32, rects: Vec<RegionRect>) {
+            self.jobs
+                .send(DecodeJob::Region {
+                    display: 0,
+                    width,
+                    height,
+                    rects,
+                })
+                .await
+                .expect("投递补丁批");
+        }
+
+        /// 等一批补丁上屏（解码是异步的）。
+        async fn next_patch(&self) -> DecodedPatch {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    if let Some(patch) = self.sink.take_next_patch() {
+                        return patch;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("应收到补丁批")
+        }
+
+        /// 等解码任务请求关键帧；返回 `(显示器, 原因)`。
+        async fn expect_keyframe(&mut self) -> (u32, KeyframeReason) {
+            tokio::time::timeout(WAIT, self.keyframes.recv())
+                .await
+                .expect("补丁被丢弃时必须请求关键帧")
+                .expect("关键帧请求通道不应关闭")
+        }
+    }
+
+    impl Drop for DecodeHarness {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            self.task.abort();
+        }
+    }
+
+    /// **解压正确性**：zstd 矩形与原始矩形都要原样变成 [`ScreenPatch`] 交给 sink。
+    #[tokio::test]
+    async fn region_update_delivers_zstd_and_raw_rects() {
+        let mut harness = DecodeHarness::spawn();
+        harness.prime(8, 8).await;
+
+        let zstd_nv12 = vec![0x11_u8; 4 * 4 * 3 / 2];
+        let zstd_data = zstd::bulk::compress(&zstd_nv12, 1).expect("压缩应成功");
+        let raw_nv12 = vec![0x22_u8; 2 * 2 * 3 / 2];
+        harness
+            .region(
+                8,
+                8,
+                vec![
+                    RegionRect {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                        flags: REGION_FLAG_ZSTD,
+                        data: zstd_data,
+                    },
+                    RegionRect {
+                        x: 4,
+                        y: 4,
+                        width: 2,
+                        height: 2,
+                        flags: 0,
+                        data: raw_nv12.clone(),
+                    },
+                ],
+            )
+            .await;
+
+        let patch = harness.next_patch().await;
+        assert_eq!(patch.display, 0);
+        assert_eq!((patch.width, patch.height), (8, 8));
+        assert_eq!(
+            patch.rects,
+            vec![
+                ScreenPatch {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                    nv12: zstd_nv12,
+                },
+                ScreenPatch {
+                    x: 4,
+                    y: 4,
+                    width: 2,
+                    height: 2,
+                    nv12: raw_nv12,
+                },
+            ],
+            "两种 flags 都应解成同一份紧包 NV12"
+        );
+        assert!(
+            harness.keyframes.try_recv().is_err(),
+            "合法补丁不该请求关键帧"
+        );
+    }
+
+    /// **基底不存在**：首个全帧之前到达的补丁没有可应用的目标，必须丢弃并请求关键帧。
+    #[tokio::test]
+    async fn region_update_before_any_video_packet_drops_and_requests_keyframe() {
+        let mut harness = DecodeHarness::spawn();
+        // 只选 codec、不投视频包：`configured_dims` 仍为空。
+        harness
+            .jobs
+            .send(DecodeJob::SelectCodec(CodecId::H264))
+            .await
+            .expect("投递 codec 选择");
+        harness
+            .region(
+                8,
+                8,
+                vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                    flags: 0,
+                    data: vec![0_u8; 6],
+                }],
+            )
+            .await;
+
+        assert_eq!(
+            harness.expect_keyframe().await,
+            (0, KeyframeReason::DecodeError)
+        );
+        assert!(
+            harness.sink.patches().is_empty(),
+            "没有全帧基底时补丁不得上屏"
+        );
+    }
+
+    /// 起一个已 prime 的解码任务，投一批非法补丁，断言「丢弃 + 请求关键帧 + 零上屏」。
+    async fn assert_bad_region_requests_keyframe(rect: RegionRect) {
+        let mut harness = DecodeHarness::spawn();
+        harness.prime(8, 8).await;
+        harness.region(8, 8, vec![rect]).await;
+        assert_eq!(
+            harness.expect_keyframe().await,
+            (0, KeyframeReason::DecodeError)
+        );
+        assert!(harness.sink.patches().is_empty(), "非法补丁不得上屏");
+    }
+
+    /// **载荷损坏/长度不符**：解压失败与原始长度错误都必须整批丢弃并请求关键帧。
+    #[tokio::test]
+    async fn corrupt_or_mismatched_region_payload_requests_keyframe() {
+        // 不是合法 zstd 帧（魔数都不对）。
+        assert_bad_region_requests_keyframe(RegionRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            flags: REGION_FLAG_ZSTD,
+            data: vec![0xFF, 0x00, 0x13],
+        })
+        .await;
+        // 未压缩但长度不等于 2*2*3/2 = 6。
+        assert_bad_region_requests_keyframe(RegionRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            flags: 0,
+            data: vec![0_u8; 5],
+        })
+        .await;
+    }
+
+    /// **几何非法**：奇数坐标/奇数尺寸/越界都必须拒绝（否则 UV 会错位或写出缓冲）。
+    #[tokio::test]
+    async fn invalid_region_geometry_requests_keyframe() {
+        // 奇数 X。
+        assert_bad_region_requests_keyframe(RegionRect {
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 2,
+            flags: 0,
+            data: vec![0_u8; 6],
+        })
+        .await;
+        // 奇数高度。
+        assert_bad_region_requests_keyframe(RegionRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 3,
+            flags: 0,
+            data: vec![0_u8; 9],
+        })
+        .await;
+        // 越界：x + width = 10 > 8。
+        assert_bad_region_requests_keyframe(RegionRect {
+            x: 6,
+            y: 0,
+            width: 4,
+            height: 2,
+            flags: 0,
+            data: vec![0_u8; 12],
+        })
+        .await;
+    }
+
+    /// **顺序保证**：全帧先于它的补丁到达 sink（同一条解码队列 ⇒ 调用顺序即线上顺序）。
+    ///
+    /// 破坏它会怎样：UI 把补丁拼到一块还没建立的合成帧上（或拼到上一帧上），画面缺块。
+    #[tokio::test]
+    async fn patch_is_delivered_after_the_full_frame_it_builds_on() {
+        let harness = DecodeHarness::spawn();
+        harness.prime(8, 8).await;
+        harness
+            .region(
+                8,
+                8,
+                vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                    flags: 0,
+                    data: vec![7_u8; 6],
+                }],
+            )
+            .await;
+        // 等补丁上屏，但**不要取走**事件——下面要检查完整顺序。
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if !harness.sink.patches().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("应收到补丁批");
+
+        let events = harness
+            .sink
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(events.len(), 2, "一次全帧 + 一批补丁只应产生两个事件");
+        assert!(
+            matches!(events.first(), Some(PatchEvent::Frame)),
+            "首个事件必须是全帧"
+        );
+        assert!(
+            matches!(events.get(1), Some(PatchEvent::Patch(_))),
+            "补丁必须排在它的基底全帧之后"
+        );
     }
 }

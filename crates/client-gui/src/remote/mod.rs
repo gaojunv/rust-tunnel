@@ -47,6 +47,8 @@ use rust_tunnel_remote::{
     RemoteError, RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole, VideoDecoderFactory,
     VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
+// 补丁相关类型未在 crate 根 re-export（`screen` 是公开模块），直接按模块路径引入。
+use rust_tunnel_remote::screen::{DecodedPatch, ScreenPatch};
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
 //
@@ -908,6 +910,17 @@ fn query_origins() -> Vec<(u32, i32, i32)> {
 pub struct FrameState {
     /// 最新一帧**整帧**（VP9 数据面下每一帧都是整帧）。UI 取走即清；未消费时被覆盖，只保留最新。
     pub latest: Option<DecodedFrame>,
+    /// 持久 NV12 合成帧（编码尺寸）。全帧到达时整块替换，补丁到达时按矩形覆写。
+    ///
+    /// 这是补丁模式的基底：`RegionUpdate` 只带脏矩形，必须合成到上一帧之上。VP9/RGBA 帧
+    /// 到达时清空（补丁模式是 H.264-only）。
+    ///
+    /// 代价是**每个全帧多一次整块克隆**（1080p 约 3 MB）：渲染侧本来就要把整帧 NV12 上传，
+    /// 多出来的只是这一次 `Vec` 拷贝。换成 `Arc<DecodedNv12>` 能省掉它，但那要改引擎里
+    /// `DecodedFrame.nv12` 的类型（牵动会话数据面），不值得为一次拷贝动它。
+    composite: Option<DecodedNv12>,
+    /// `composite` 的编码尺寸（宽, 高）；`(0, 0)` 表示没有合成帧。
+    composite_dims: (u32, u32),
     /// 显示器列表（会话建立时下发一次）。
     pub displays: Vec<DisplayInfo>,
     /// 会话关闭原因（UI 取走即清）。
@@ -919,6 +932,10 @@ pub struct FrameState {
     /// 放在这里而不是引擎另开计数：帧到达本就要进这把锁，顺手自增是零成本；另开结构反而要再
     /// 同步一次。计数器会回绕（`u32`），UI 用 `wrapping_sub` 取差。
     pub frame_count: u32,
+    /// 本会话累计**上屏**的补丁批数（与 `frame_count` 同款：UI 按秒差分即得到补丁速率）。
+    ///
+    /// 只有成功应用到合成帧的批次才计数；因无基底/矩形非法被整批丢弃的不算。
+    pub patch_count: u32,
 }
 
 /// [`FrameSink`] 的 egui 实现：把帧塞进共享槽并唤醒 UI 重绘。
@@ -949,9 +966,62 @@ impl FrameSink for GuiFrameSink {
 
     fn on_frame(&self, frame: DecodedFrame) {
         if let Ok(mut guard) = self.shared.lock() {
+            // 持久合成帧随全帧整块替换（见 `FrameState::composite`）。VP9/RGBA 帧
+            // （`nv12 == None`）清空它——补丁模式是 H.264-only，RGBA 帧没有 NV12 基底。
+            if let Some(nv12) = frame.nv12.as_ref() {
+                guard.composite = Some(nv12.clone());
+                guard.composite_dims = (frame.width, frame.height);
+            } else {
+                guard.composite = None;
+                guard.composite_dims = (0, 0);
+            }
             guard.latest = Some(frame);
             guard.frame_count = guard.frame_count.wrapping_add(1);
         }
+        self.ctx.request_repaint_of(self.viewport);
+    }
+
+    /// 一批脏矩形补丁：先合成到持久帧缓冲，再把**整帧**交给渲染。
+    ///
+    /// 渲染侧只认整帧（`upload` 只看 `latest`），故补丁落地后必须把合成结果整块交出去。
+    /// 任何一步失败都整批丢弃：没有基底（还没收到全帧）或任一矩形非法时不重绘——保持上一次
+    /// 完整画面，等引擎请求回来的全帧（解码任务在丢弃补丁前已经请求关键帧）。
+    fn on_patch(&self, patch: DecodedPatch) {
+        let Ok(mut guard) = self.shared.lock() else {
+            return;
+        };
+        // 先取尺寸，再可变借用 `composite`（两个字段的借用互不重叠）。
+        let dims_match = guard.composite_dims == (patch.width, patch.height);
+        let mut composed = None;
+        if dims_match {
+            if let Some(composite) = guard.composite.as_mut() {
+                if apply_patch_batch(composite, patch.width, &patch.rects) {
+                    // 渲染侧拿到的是整帧快照；持久缓冲仍要留着承接下一批补丁。
+                    composed = Some(composite.clone());
+                }
+            }
+        }
+        let Some(nv12) = composed else {
+            tracing::debug!(
+                display = patch.display,
+                width = patch.width,
+                height = patch.height,
+                rects = patch.rects.len(),
+                "补丁没有可用基底或矩形非法，整批丢弃"
+            );
+            return;
+        };
+        guard.patch_count = guard.patch_count.wrapping_add(1);
+        guard.latest = Some(DecodedFrame {
+            display: patch.display,
+            width: patch.width,
+            height: patch.height,
+            // 补丁不占视频序号（见 `session::RegionUpdate` 的文档）；渲染侧用的是本地 paint 序号。
+            seq: 0,
+            rgba: Vec::new(),
+            nv12: Some(nv12),
+        });
+        drop(guard);
         self.ctx.request_repaint_of(self.viewport);
     }
 
@@ -966,11 +1036,30 @@ impl FrameSink for GuiFrameSink {
     fn on_closed(&self, reason: String) {
         if let Ok(mut guard) = self.shared.lock() {
             guard.closed = Some(reason);
+            // 合成帧的基底已作废：重连/新会话必须从全帧重新开始。
+            guard.composite = None;
+            guard.composite_dims = (0, 0);
         }
         // 会话窗口要显示「已结束」，根窗口也要更新会话状态（否则它只在 300/600 ms 的定时里刷）。
         self.ctx.request_repaint_of(self.viewport);
         self.ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
+}
+
+/// 把一批补丁**原子地**应用到合成帧；任一矩形非法则整批放弃，`composite` 保持原样。
+///
+/// [`DecodedNv12::apply_patch`] 只保证**单个**矩形原子：第二个矩形失败时第一个已经写进去了。
+/// 那种「半截应用」会永久留在持久缓冲里（画面缺一块且无法回滚），所以先应用到副本、全部
+/// 成功再整体提交。补丁模式下批次很小且不频繁，这次整块拷贝换来的是「不可能半截」。
+fn apply_patch_batch(composite: &mut DecodedNv12, width: u32, rects: &[ScreenPatch]) -> bool {
+    let mut candidate = composite.clone();
+    for rect in rects {
+        if !candidate.apply_patch(width, rect) {
+            return false;
+        }
+    }
+    *composite = candidate;
+    true
 }
 
 // ── 会话视图状态 ────────────────────────────────────────────────────
@@ -1145,6 +1234,14 @@ pub struct RemoteView {
     fps_base: u32,
     /// 上一次结算帧率的时刻（`None` = 尚未开始统计）。
     fps_since: Option<Instant>,
+    /// 关键帧请求速率（每秒结算一次；累计值来自 [`RemoteUiState::keyframe_requests`]）。
+    ///
+    /// 与 [`Self::fps`] 同一套「累计值差分」手法：管理面只维护累计计数，UI 每秒求一次差。
+    pub keyframe_rate: u32,
+    /// 上一次结算关键帧请求速率时的累计值基线。
+    keyframe_base: u32,
+    /// 上一次结算关键帧请求速率的时刻（`None` = 尚未开始统计）。
+    keyframe_since: Option<Instant>,
     /// 本次会话累计转达的输入事件数（[`Self::forward_input`] 自增，用于结算速率）。
     input_count: u32,
     /// 上一次结算输入速率时的累计事件数基线。
@@ -1201,6 +1298,9 @@ impl RemoteView {
             fps: 0,
             fps_base: 0,
             fps_since: None,
+            keyframe_rate: 0,
+            keyframe_base: 0,
+            keyframe_since: None,
             input_count: 0,
             input_base: 0,
             input_rate: 0,
@@ -1667,6 +1767,9 @@ impl RemoteView {
         self.toolbar_visible = true;
         self.fps = 0;
         self.fps_since = None;
+        self.keyframe_rate = 0;
+        self.keyframe_base = 0;
+        self.keyframe_since = None;
         // 首帧到达前的初始窗口尺寸：远端分辨率这时还未知（`reset_session` 刚清空），先用一个
         // 保守值占位；远端首帧一到，`ui::session_window::show` 会重算并锁定（见 `size_initialized`）。
         self.inner_size = self.desired_inner(None);
@@ -1685,6 +1788,9 @@ impl RemoteView {
         self.fullscreen = false;
         self.fps = 0;
         self.fps_since = None;
+        self.keyframe_rate = 0;
+        self.keyframe_base = 0;
+        self.keyframe_since = None;
     }
 
     /// 清空剪贴板自动同步的去重基线（换会话时对端可能已经不是原来那个，旧基线无从沿用）。
@@ -1782,6 +1888,20 @@ impl RemoteView {
         Self::settle_rate(frames, &mut self.fps_base, &mut self.fps, &mut self.fps_since, now);
         let inputs = self.input_count;
         Self::settle_rate(inputs, &mut self.input_base, &mut self.input_rate, &mut self.input_since, now);
+    }
+
+    /// 每秒结算一次关键帧请求速率（累计值来自 [`RemoteUiState::keyframe_requests`] 的各原因之和）。
+    ///
+    /// 与 [`Self::poll_fps`] 同一套差分：管理面只累计计数，UI 每秒求差并归一成「次/秒」。
+    /// 调用点在会话统计角标渲染处（只有角标可见时才需要这个读数）。
+    pub fn poll_keyframe_rate(&mut self, total: u32, now: Instant) {
+        Self::settle_rate(
+            total,
+            &mut self.keyframe_base,
+            &mut self.keyframe_rate,
+            &mut self.keyframe_since,
+            now,
+        );
     }
 
     /// 结算一个「每秒速率」计数器的通用步骤：距上次结算不足 1 秒不动；否则按流逝秒数算平均并推进
@@ -2311,6 +2431,50 @@ mod tests {
         // 尺寸乘积溢出 usize → 拒（不 panic）。用 u32::MAX×u32::MAX×4 会溢出。
         let huge = DecodedFrame { width: u32::MAX, height: u32::MAX, rgba: Vec::new(), ..frame };
         assert_eq!(valid_frame_dims(&huge), None);
+    }
+
+    /// 一批补丁要么**全部应用**，要么一字节都不改。
+    ///
+    /// `DecodedNv12::apply_patch` 只保证单个矩形原子：第二个矩形失败时第一个已经写进去了。
+    /// 这种半截应用会永久留在持久合成帧里（画面缺一块且无法回滚），故必须由批次层兜住。
+    #[test]
+    fn apply_patch_batch_is_all_or_nothing() {
+        // 8×6 整帧：Y 48 字节、UV 24 字节。
+        let original = DecodedNv12 {
+            y: vec![0xAA; 48],
+            uv: vec![0xBB; 24],
+        };
+        let valid = ScreenPatch {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 2,
+            nv12: vec![1; 12],
+        };
+        // 全部合法：两块都写进去。
+        let mut composite = original.clone();
+        let second = ScreenPatch {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            nv12: vec![2; 6],
+        };
+        assert!(apply_patch_batch(&mut composite, 8, &[valid.clone(), second]));
+        assert_eq!(composite.y[2 * 8 + 2], 1, "第一块应已应用");
+        assert_eq!(composite.y[0], 2, "第二块应已应用");
+
+        // 第二块越界：第一块也不能留下。
+        let mut composite = original.clone();
+        let bad = ScreenPatch {
+            x: 6,
+            y: 0,
+            width: 4,
+            height: 2,
+            nv12: vec![3; 12],
+        };
+        assert!(!apply_patch_batch(&mut composite, 8, &[valid, bad]));
+        assert_eq!(composite, original, "整批失败时不得留下半截应用");
     }
 
     #[test]

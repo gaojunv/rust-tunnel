@@ -5,6 +5,7 @@
 //! 口可被最小化（会话继续保留），故这里必须留一个把它召回入口。
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use egui::{RichText, Ui};
 use rust_tunnel_common::protocol::RemoteMode;
@@ -155,8 +156,9 @@ pub fn controlled_banner(ui: &mut Ui, manager: Option<&Arc<RemoteManager>>) {
                 });
             });
             // 延迟与数据面路径是被控方最关心的两项（卡不卡、走的直连还是中继）。
+            // 关键帧请求速率是被控端**收到**的请求（控制方发起），这里的横幅不展示。
             ui.horizontal(|ui| {
-                show_latency(ui, &state);
+                show_latency(ui, &state, None);
             });
             // 被控时明确告知对外共享的目录，让用户一眼看到别人能读到什么。
             if let Some(dir) = manager.share_dir() {
@@ -181,6 +183,19 @@ fn show_session(
         return;
     };
 
+    // 关键帧请求速率：管理面只累计计数，这里按「累计值差分」每秒结算一次（与帧率同款）。
+    // 只有控制器会发关键帧请求；被控端保持 `None`，不显示这一项。
+    let keyframe_rate = (active.role == SessionRole::Controller).then(|| {
+        let total = state
+            .keyframe_requests
+            .iter()
+            .copied()
+            .fold(0u32, u32::saturating_add);
+        let mut view = lock(view);
+        view.poll_keyframe_rate(total, Instant::now());
+        view.keyframe_rate
+    });
+
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -194,7 +209,7 @@ fn show_session(
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                show_latency(ui, state);
+                show_latency(ui, state, keyframe_rate);
             });
 
             if active.role == SessionRole::Controlled {
@@ -221,7 +236,9 @@ fn show_session(
 }
 
 /// 延迟（按阈值上色）与数据面路径；本端作为**被控端**时另有编码侧读数（阶段 3 QoS）。
-fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
+///
+/// `keyframe_rate` 是控制器侧的关键帧请求速率（次/秒）；被控端传 `None`。
+fn show_latency(ui: &mut Ui, state: &RemoteUiState, keyframe_rate: Option<u32>) {
     match state.latency_ms {
         Some(ms) => {
             ui.colored_label(latency_color(ms), RichText::new(format!("延迟 {ms} ms")).small());
@@ -253,6 +270,15 @@ fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
         if let Some(kbps) = state.encode_idr_kbps.filter(|n| *n > 0) {
             parts.push(format!("关键帧 {}", format_kbps(kbps)));
         }
+        // 单个关键帧的平均大小：`累计关键帧字节 / 关键帧数 / 1024`。同为「关键帧 x kbps」时，
+        // 大量小 IDR 与少量巨大 IDR 的观感完全不同，这个数才是带宽尖峰的真正尺度。
+        if let (Some(bytes), Some(n)) = (
+            state.encode_idr_bytes,
+            state.encode_keyframes.filter(|n| *n > 0),
+        ) {
+            let avg_kb = bytes / (u64::from(n) * 1024);
+            parts.push(format!("关键帧平均 {avg_kb} KB"));
+        }
         if let Some(kbps) = state.encode_p_kbps.filter(|n| *n > 0) {
             parts.push(format!("普通帧 {}", format_kbps(kbps)));
         }
@@ -260,6 +286,16 @@ fn show_latency(ui: &mut Ui, state: &RemoteUiState) {
             parts.push(format!("变化 {}", format_permille_percent(permille)));
         }
         ui.label(RichText::new(parts.join(" · ")).weak().small());
+    }
+    // 控制器侧的关键帧请求速率：这一项说明「画面在靠补 IDR 恢复」的频率，配合上面的丢包
+    // 读数可区分「对端没出帧」与「本端解码链反复断裂」。0/s 时不占版面。
+    if let Some(rate) = keyframe_rate.filter(|n| *n > 0) {
+        ui.label(RichText::new(format!("关键帧请求 {rate}/s")).weak().small());
+    }
+    // 控制器侧的补丁速率：补丁模式下画面靠脏矩形增量更新，全帧几乎不再出现，这一项说明
+    // 增量通道在工作（与上面的关键帧请求同为弱化小字）。0/s 时不占版面。
+    if let Some(n) = state.decode_patches.filter(|n| *n > 0) {
+        ui.label(RichText::new(format!("补丁 {n}/s")).weak().small());
     }
 }
 

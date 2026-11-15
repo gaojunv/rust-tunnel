@@ -29,7 +29,8 @@
 //! 1080p@30fps、目标 8 Mbps 时静止帧仍是 ~21.6 KB/帧），远程桌面一静止就白占链路。
 
 mod bitstream;
-mod convert;
+// 纯 RGBA→NV12 转换：补丁模式（`capture::patches`）复用它，故对 crate 内可见。
+pub(crate) mod convert;
 mod device;
 mod mfplat;
 mod video_processor;

@@ -8412,7 +8412,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tunnel-client"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -8443,7 +8443,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tunnel-client-gui"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -8665,6 +8665,7 @@ dependencies = [
  "tracing",
  "uuid",
  "x25519-dalek",
+ "zstd",
 ]
 
 [[package]]
@@ -8808,7 +8809,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tunnel-win-platform"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "tracing",
  "windows-sys 0.61.2",
@@ -8816,7 +8817,7 @@ dependencies = [
 
 [[package]]
 name = "rust-tunnel-win-service"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "rust-tunnel-win-platform",
  "tracing",

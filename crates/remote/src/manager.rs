@@ -175,8 +175,19 @@ pub struct RemoteUiState {
     pub encode_keyframes: Option<u32>,
     /// 被控端最近上报的**关键帧出码码率**（kbps）。仅被控端填。
     pub encode_idr_kbps: Option<u32>,
+    /// 被控端最近上报的**关键帧累计出码字节数**（与 `encode_keyframes` 同一窗口）。
+    ///
+    /// 与 `encode_keyframes` 一起可算「单个关键帧平均多大」——同样的 `encode_idr_kbps`
+    /// 可能来自很多小 IDR，也可能来自少量巨大 IDR。仅被控端填。
+    pub encode_idr_bytes: Option<u64>,
     /// 被控端最近上报的**普通帧出码码率**（kbps）。仅被控端填。
     pub encode_p_kbps: Option<u32>,
+    /// 控制器本次会话累计发出的关键帧请求数，**按原因分桶**（下标见
+    /// [`crate::stats::KeyframeReason::index`]）。
+    ///
+    /// 累计值而非速率：UI 自己跨轮询求差（与帧率计数器同款手法），避免管理面再引入一个
+    /// 每秒定时器。会话结束时清零。
+    pub keyframe_requests: [u32; 7],
     /// 被控端最近上报的**平均变化面积**（千分比，0..=1000）。仅被控端填。
     pub encode_changed_permille: Option<u32>,
     /// 控制器最近上报的**解码侧**读数：最近一帧解码耗时（毫秒）。仅控制器填。
@@ -187,6 +198,10 @@ pub struct RemoteUiState {
     pub decode_packets: Option<u32>,
     /// 控制器最近一秒因解码队列满/等待 IDR 而丢弃的视频包数。仅控制器填。
     pub decode_dropped: Option<u32>,
+    /// 控制器最近一秒**已应用**到合成帧的补丁批数（协议 v5 脏矩形增量）。仅控制器填。
+    ///
+    /// 补丁模式（Windows H.264）下全帧几乎不再出现，这一项代替「收包」说明画面在更新。
+    pub decode_patches: Option<u32>,
     /// 本次会话的数据面路径（P2P 直连 / 中继）；会话未建立/已结束时为 `None`。
     pub transport: Option<TransportPath>,
     /// 最近一次**由会话循环观测到**的会话结束信息（session_id + 结束原因），供 UI 提示与断线
@@ -231,12 +246,15 @@ impl RemoteUiState {
         self.encode_kbps = None;
         self.encode_keyframes = None;
         self.encode_idr_kbps = None;
+        self.encode_idr_bytes = None;
         self.encode_p_kbps = None;
         self.encode_changed_permille = None;
+        self.keyframe_requests = [0; 7];
         self.decode_ms = None;
         self.recv_kbps = None;
         self.decode_packets = None;
         self.decode_dropped = None;
+        self.decode_patches = None;
     }
 }
 
@@ -626,7 +644,7 @@ impl RemoteManager {
     /// 立刻探测一次延迟（结果异步进 [`RemoteUiState::latency_ms`]，非阻塞）。
     ///
     /// 供 UI 的「测延迟」按钮与切到会话窗口时刷新读数用。会话循环**仅在当前无在途心跳样本时**
-    /// 才真的发一次心跳；周期读数仍由 10s 的心跳给出（见 [`crate::session::HEARTBEAT_INTERVAL`]）。
+    /// 才真的发一次心跳；周期读数仍由 1s 的心跳给出（见 [`crate::session::HEARTBEAT_INTERVAL`]）。
     pub fn ping(&self) {
         self.send_command(ControllerCommand::Ping);
     }
@@ -1918,6 +1936,7 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
             skipped,
             keyframes,
             idr_kbps,
+            idr_bytes,
             p_kbps,
             changed_permille,
         } => {
@@ -1930,8 +1949,18 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
                 s.encode_kbps = Some(bitrate_kbps);
                 s.encode_keyframes = Some(keyframes);
                 s.encode_idr_kbps = Some(idr_kbps);
+                s.encode_idr_bytes = Some(idr_bytes);
                 s.encode_p_kbps = Some(p_kbps);
                 s.encode_changed_permille = Some(changed_permille);
+            });
+        }
+        SessionStats::KeyframeRequest { reason } => {
+            // 按原因累计。UI 跨轮询求差得到每秒速率（见 `RemoteView::poll_keyframe_rate`）。
+            let index = reason.index();
+            mgr.update_ui(|s| {
+                if let Some(slot) = s.keyframe_requests.get_mut(index) {
+                    *slot = slot.saturating_add(1);
+                }
             });
         }
         SessionStats::Decode {
@@ -1939,12 +1968,14 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
             recv_kbps,
             packets,
             dropped,
+            patches,
         } => {
             mgr.update_ui(|s| {
                 s.decode_ms = Some(decode_ms);
                 s.recv_kbps = Some(recv_kbps);
                 s.decode_packets = Some(packets);
                 s.decode_dropped = Some(dropped);
+                s.decode_patches = Some(patches);
             });
         }
     }
