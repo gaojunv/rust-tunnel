@@ -11,8 +11,9 @@
 //! # 与 `win-platform` 的分工
 //!
 //! `rust_tunnel_win_platform::desktop::DesktopKind` 是 Windows 侧的分类结果；本模块
-//! 用 [`follow_of_name`] 按**桌面名**做同一套分类（只认 `Default` / `Winlogon` 两个
-//! 目标，其余一律 [`FollowDesktop::Unsupported`]）。之所以不复用 `DesktopKind`：
+//! 用 [`follow_of_name`] 按**桌面名**做同一套分类（可挂目标是 `Default` /
+//! `Winlogon` / `Screen-saver` 三个，其余——`Disconnect` / 未知名 / 空名——一律
+//! [`FollowDesktop::Unsupported`]）。之所以不复用 `DesktopKind`：
 //! `rust-tunnel-win-platform` 在本 crate 里是 **windows-only 依赖**，纯逻辑模块引用它
 //! 就会在 macOS 上编译不过，可测性随之消失。
 
@@ -25,15 +26,25 @@
 
 /// 状态机识别的桌面。
 ///
-/// **只有 [`Self::Default`] 与 [`Self::Winlogon`] 是会被挂上去的目标**；其余桌面
-/// （屏保 / 会话断开 / 未知）一律落到 [`Self::Unsupported`]——不挂，且保持当前挂载。
+/// **可挂目标是 [`Self::Default`]、[`Self::Winlogon`] 与 [`Self::ScreenSaver`]**；
+/// 其余桌面（`Disconnect` / 未知名 / 空名）一律落到 [`Self::Unsupported`]——不挂，
+/// 且保持当前挂载。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FollowDesktop {
     /// `Default`：普通用户桌面（登录后、未锁屏）。
     Default,
     /// `Winlogon`：**锁屏与登录界面**都在这里（本特性唯一必须拿下的桌面）。
     Winlogon,
-    /// 其余桌面（`Screen-saver` / `Disconnect` / 未知名 / 空名）——**不是**挂载目标。
+    /// `Screen-saver`：屏保抢走输入时切换到的**安全桌面**（`WinSta0\Screen-saver`）。
+    ///
+    /// **必须挂**：屏保激活后输入桌面从这里离开 `Default`，而采集依赖「调用线程所在的
+    /// 桌面」（GDI `BitBlt` 的作用域）。不挂的话线程留在**已不活动**的 `Default` 上，
+    /// `BitBlt` 取不到有效画面（失败或阻塞），控制器就一直停在「等待画面…」；等用户
+    /// 解锁（或用 ToDesk 登录）让 `Default` 重新活动，同一条线程下一拍就采到了，画面
+    /// **突然出现**——这正是现场症状。屏保桌面同样是安全桌面（System 完整性），
+    /// 也意味着它只有 SYSTEM 实例挂得上。
+    ScreenSaver,
+    /// 其余桌面（`Disconnect` / 未知名 / 空名）——**不是**挂载目标。
     Unsupported,
 }
 
@@ -44,6 +55,7 @@ impl FollowDesktop {
         match self {
             Self::Default => "Default",
             Self::Winlogon => "Winlogon",
+            Self::ScreenSaver => "Screen-saver",
             Self::Unsupported => "Unsupported",
         }
     }
@@ -51,7 +63,7 @@ impl FollowDesktop {
     /// 是否是**会挂上去的**目标桌面。
     #[must_use]
     pub const fn is_attachable(self) -> bool {
-        matches!(self, Self::Default | Self::Winlogon)
+        matches!(self, Self::Default | Self::Winlogon | Self::ScreenSaver)
     }
 }
 
@@ -66,6 +78,11 @@ pub fn follow_of_name(name: &str) -> FollowDesktop {
         FollowDesktop::Default
     } else if name.eq_ignore_ascii_case("Winlogon") {
         FollowDesktop::Winlogon
+    } else if name.eq_ignore_ascii_case("Screen-saver") || name.eq_ignore_ascii_case("Screensaver")
+    {
+        // 屏保桌面的名字在 Win32 里是 `Screen-saver`；不带连字符的写法也一并认下，
+        // 与 `win-platform::DesktopKind::from_name` 保持同规则（分类结论不能因调用点而异）。
+        FollowDesktop::ScreenSaver
     } else {
         FollowDesktop::Unsupported
     }
@@ -105,7 +122,7 @@ pub fn decide(attached: Option<FollowDesktop>, observed: Option<FollowDesktop>) 
 mod tests {
     //! 表格驱动的状态机单测：**这台机器（macOS）上唯一能验证桌面跟随逻辑的地方**。
 
-    use super::FollowDesktop::{Default, Unsupported, Winlogon};
+    use super::FollowDesktop::{Default, ScreenSaver, Unsupported, Winlogon};
     use super::*;
 
     #[test]
@@ -115,21 +132,29 @@ mod tests {
             // 尚未挂载：见到可挂目标就挂。
             (None, Some(Default), FollowAction::Attach(Default)),
             (None, Some(Winlogon), FollowAction::Attach(Winlogon)),
+            (None, Some(ScreenSaver), FollowAction::Attach(ScreenSaver)),
             // 不可挂目标 / 探测失败：保持现状（不挂）。
             (None, Some(Unsupported), FollowAction::NoChange),
             (None, None, FollowAction::NoChange),
             // 已挂在目标上：幂等，不重复切。
             (Some(Default), Some(Default), FollowAction::NoChange),
             (Some(Winlogon), Some(Winlogon), FollowAction::NoChange),
-            // 桌面真的变了：切过去（锁屏 / 解锁两个方向都要）。
+            (Some(ScreenSaver), Some(ScreenSaver), FollowAction::NoChange),
+            // 桌面真的变了：切过去（锁屏 / 解锁 / 屏保进出，三个方向两两都要）。
             (Some(Default), Some(Winlogon), FollowAction::Attach(Winlogon)),
             (Some(Winlogon), Some(Default), FollowAction::Attach(Default)),
+            (Some(Default), Some(ScreenSaver), FollowAction::Attach(ScreenSaver)),
+            (Some(ScreenSaver), Some(Default), FollowAction::Attach(Default)),
+            (Some(Winlogon), Some(ScreenSaver), FollowAction::Attach(ScreenSaver)),
+            (Some(ScreenSaver), Some(Winlogon), FollowAction::Attach(Winlogon)),
             // 探测失败：绝不因为「探测不到」就把线程从 Winlogon 踢回 Default。
             (Some(Winlogon), None, FollowAction::NoChange),
             (Some(Default), None, FollowAction::NoChange),
-            // 输入桌面跑到不支持的桌面上（屏保 / 断开）：保持现状，不挂。
+            (Some(ScreenSaver), None, FollowAction::NoChange),
+            // 输入桌面跑到不支持/不认识的桌面上（断开 / 未知名）：保持现状，不挂。
             (Some(Default), Some(Unsupported), FollowAction::NoChange),
             (Some(Winlogon), Some(Unsupported), FollowAction::NoChange),
+            (Some(ScreenSaver), Some(Unsupported), FollowAction::NoChange),
         ];
         for (attached, observed, expected) in cases {
             assert_eq!(
@@ -144,7 +169,7 @@ mod tests {
     /// 重建一次线程（桌面变化是低频事件，重建不该变成常驻开销）。
     #[test]
     fn deciding_again_after_attach_is_a_no_op() {
-        for target in [Default, Winlogon] {
+        for target in [Default, Winlogon, ScreenSaver] {
             let action = decide(None, Some(target));
             assert_eq!(action, FollowAction::Attach(target));
             let FollowAction::Attach(target) = action else {
@@ -162,8 +187,8 @@ mod tests {
     /// 挂一个不该挂的桌面。
     #[test]
     fn attach_targets_are_always_attachable() {
-        for observed in [Default, Winlogon, Unsupported] {
-            for attached in [None, Some(Default), Some(Winlogon)] {
+        for observed in [Default, Winlogon, ScreenSaver, Unsupported] {
+            for attached in [None, Some(Default), Some(Winlogon), Some(ScreenSaver)] {
                 if let FollowAction::Attach(target) = decide(attached, Some(observed)) {
                     assert!(target.is_attachable(), "{target:?} 不该被 Attach");
                 }
@@ -175,11 +200,14 @@ mod tests {
     fn name_classification_matches_win32_names() {
         assert_eq!(follow_of_name("Default"), Default);
         assert_eq!(follow_of_name("Winlogon"), Winlogon);
+        assert_eq!(follow_of_name("Screen-saver"), ScreenSaver);
+        assert_eq!(follow_of_name("Screensaver"), ScreenSaver);
         // 大小写与空白容忍。
         assert_eq!(follow_of_name("  winlogon\n"), Winlogon);
         assert_eq!(follow_of_name("default"), Default);
+        assert_eq!(follow_of_name("\tSCREEN-SAVER "), ScreenSaver);
         // 其余一切（含空名）都不是挂载目标。
-        for other in ["", "Screen-saver", "Screensaver", "Disconnect", "SomeOther"] {
+        for other in ["", "Disconnect", "SomeOther"] {
             assert_eq!(follow_of_name(other), Unsupported, "{other:?}");
         }
     }
@@ -188,7 +216,8 @@ mod tests {
     fn as_str_is_stable_and_round_trips_for_targets() {
         assert_eq!(FollowDesktop::Default.as_str(), "Default");
         assert_eq!(FollowDesktop::Winlogon.as_str(), "Winlogon");
-        for target in [Default, Winlogon] {
+        assert_eq!(FollowDesktop::ScreenSaver.as_str(), "Screen-saver");
+        for target in [Default, Winlogon, ScreenSaver] {
             assert_eq!(follow_of_name(target.as_str()), target);
         }
     }
