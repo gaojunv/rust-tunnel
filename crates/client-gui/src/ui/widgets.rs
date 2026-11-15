@@ -94,6 +94,30 @@ pub fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
     ui.painter().galley(rect.min + padding, galley, fg);
 }
 
+/// 可点击的胶囊按钮（会话工具条收起后**唯一**的控件：只显示延迟，点它展开）。
+///
+/// 与 [`pill`] 的区别是它有交互：悬停换成抬升底色并给出提示，点击由调用方处理。整块都是点击
+/// 热区（包括内边距），所以收起态不需要再套一层底板——那会把这块放大到原本的三分之一，而
+/// 「不挡画面」正是收起的全部意义。
+#[must_use]
+pub fn pill_button(ui: &mut Ui, text: &str, fg: Color32, tip: &str) -> egui::Response {
+    let p = palette(ui.style());
+    let font = TextStyle::Small.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
+    let padding = egui::vec2(10.0, 5.0);
+    let size = galley.size() + padding * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let bg = if resp.hovered() {
+        p.surface_raised
+    } else {
+        p.surface
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(11), bg);
+    ui.painter().galley(rect.min + padding, galley, fg);
+    resp.on_hover_text(tip)
+}
+
 /// 弹层标题行：左侧标题、右侧「关闭」；返回是否点了关闭。
 #[must_use]
 pub fn modal_title(ui: &mut Ui, title: &str) -> bool {

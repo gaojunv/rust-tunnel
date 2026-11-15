@@ -315,6 +315,10 @@ impl GuiApp {
             self.prefs.remote_toolbar_autohide = view.toolbar_autohide;
             changed = true;
         }
+        if self.prefs.remote_toolbar_collapsed != view.toolbar_collapsed {
+            self.prefs.remote_toolbar_collapsed = view.toolbar_collapsed;
+            changed = true;
+        }
         if self.prefs.remote_frame_rate != view.frame_rate {
             self.prefs.remote_frame_rate = view.frame_rate;
             changed = true;

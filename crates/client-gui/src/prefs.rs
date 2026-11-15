@@ -110,6 +110,12 @@ pub struct GuiPrefs {
     /// （见 `ui::session_window::toolbar`），不是这个默认值。
     #[serde(default)]
     pub remote_toolbar_autohide: bool,
+    /// 远程会话窗口：悬浮工具条是否**收起到只显示延迟**。
+    ///
+    /// 默认展开。收起是显式选择，跨会话与重启保留；自动隐藏（`remote_toolbar_autohide`）
+    /// 只作用于展开态——收起态已经足够小，再淡出就看不到延迟了。
+    #[serde(default)]
+    pub remote_toolbar_collapsed: bool,
     /// 一次性迁移标志：`remote_toolbar_autohide` 的旧默认 `true` 是否已强制改为 `false`。
     ///
     /// 缺键读作 `false`（= 尚未迁移），见 `migrate_toolbar_autohide`。置位后**永不再迁移**，
@@ -152,6 +158,7 @@ impl Default for GuiPrefs {
             allow_remote: false,
             remote_approval: ApprovalPolicy::default(),
             remote_toolbar_autohide: false,
+            remote_toolbar_collapsed: false,
             remote_toolbar_autohide_migrated: false,
             remote_view_scale: ViewScale::default(),
             remote_window_size: WindowSize::default(),
@@ -391,6 +398,23 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert_eq!(reparsed.remote_quality, QualityPreset::Hd);
+    }
+
+    /// 工具条收起态的缺省与往返：默认展开，旧配置缺键也是展开，用户收起后跨重启保留。
+    #[test]
+    fn toolbar_collapsed_defaults_to_expanded_and_survives_roundtrip() {
+        assert!(!GuiPrefs::default().remote_toolbar_collapsed, "新配置默认展开");
+        // 缺失该键的旧配置也落到展开（serde default）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(!prefs.remote_toolbar_collapsed);
+        // 往返保留用户选择。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_toolbar_collapsed: true,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(reparsed.remote_toolbar_collapsed);
     }
 
     #[test]
