@@ -110,6 +110,12 @@ impl ServiceOp {
 ///
 /// `approval` 取用户当前的偏好。注意 **`Confirm` 在无人值守下无人可点**：实例是无头的，
 /// 接入请求会在 45 秒后超时。UI 必须把这个后果说出来（见 `ui/settings.rs`），不要静默。
+///
+/// # 自动锁屏
+///
+/// `auto_lock` 同样取用户当前的偏好（`GuiPrefs::remote_auto_lock_on_disconnect`）。它写进
+/// `host.toml` 的 `auto_lock` 键，由实例在**会话收尾**时执行；实例模式下锁屏后仍可由服务
+/// 实例继续承载身份并接受下一次接入（GUI 模式则通常失去画面，见根 `CLAUDE.md`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSeed {
     /// 服务端地址（`host:port`）。
@@ -128,6 +134,8 @@ pub struct HostSeed {
     log: String,
     /// 接入确认策略。
     approval: ApprovalPolicy,
+    /// 会话结束后是否自动锁定屏幕。
+    auto_lock: bool,
 }
 
 impl HostSeed {
@@ -136,6 +144,7 @@ impl HostSeed {
     pub fn from_config(
         config: &rust_tunnel_client::ClientConfig,
         approval: ApprovalPolicy,
+        auto_lock: bool,
     ) -> Self {
         Self {
             server: config.server.clone(),
@@ -146,6 +155,7 @@ impl HostSeed {
             tls_insecure: config.tls_insecure,
             log: config.log.clone(),
             approval,
+            auto_lock,
         }
     }
 
@@ -176,6 +186,7 @@ impl HostSeed {
             tls_insecure: bool,
             log: &'a str,
             approval: ApprovalPolicy,
+            auto_lock: bool,
         }
         let file = File {
             server: &self.server,
@@ -186,6 +197,7 @@ impl HostSeed {
             tls_insecure: self.tls_insecure,
             log: &self.log,
             approval: self.approval,
+            auto_lock: self.auto_lock,
         };
         toml::to_string(&file).map_err(|err| format!("生成 host.toml 失败：{err}"))
     }
@@ -775,7 +787,7 @@ mod tests {
             ..Default::default()
         };
 
-        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto);
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto, true);
         assert_eq!(seed.approval(), ApprovalPolicy::Auto);
         let text = seed.to_toml().unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -787,6 +799,11 @@ mod tests {
         assert_eq!(parsed["tls_insecure"].as_bool(), Some(false));
         assert_eq!(parsed["log"].as_str(), Some("debug"));
         assert_eq!(parsed["approval"].as_str(), Some("Auto"));
+        assert_eq!(
+            parsed["auto_lock"].as_bool(),
+            Some(true),
+            "会话结束自动锁屏应写进 host.toml"
+        );
         // 没有 SNI 时不该写一个空字符串键（实例侧会把它当成真的 SNI）。
         assert!(parsed.get("tls_server_name").is_none());
     }
@@ -800,11 +817,12 @@ mod tests {
             password: "token".to_owned(),
             ..Default::default()
         };
-        let seed = HostSeed::from_config(&config, ApprovalPolicy::Confirm);
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Confirm, false);
         let path = write_temp_host_toml(&seed).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("server = \"127.0.0.1:8080\""), "{text}");
         assert!(text.contains("approval = \"Confirm\""), "{text}");
+        assert!(text.contains("auto_lock = false"), "{text}");
         let _ = std::fs::remove_file(path);
     }
 

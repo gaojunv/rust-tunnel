@@ -37,7 +37,12 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 6
+/// # 为什么是 7
+///
+/// 版本 7 只在末尾追加了 [`SessionMessage::LockScreen`]（控制器 → 被控端，请求锁定屏幕）。
+/// 它没有任何新旧共存语义：老端在 bincode 解码到判别式 27 时会失败，故版本号必须抬，
+/// 且**两端必须同为 v7**——旧端（v6）会在握手阶段被 `Hello.proto_version` 的硬相等校验
+/// 干净拒绝（回 `HelloAck{accepted:false}`），不会退化成硬断链。
 ///
 /// 版本 6 在我们这条分支上把两件事合到了一起：
 ///
@@ -57,9 +62,9 @@ use tokio_util::codec::{Decoder, Encoder};
 /// [`CodecId::H264`]）。
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
-/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v6**——先把携带版本 6 的客户端
-/// 铺开（v6 ↔ v5/v4 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 6;
+/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v7**——先把携带版本 7 的客户端
+/// 铺开（v7 ↔ v6/v5/v4 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 7;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -438,6 +443,12 @@ pub enum SessionMessage {
         /// 本批矩形；空 = 保活。
         rects: Vec<RegionRect>,
     },
+    /// 请求被控端**锁定本机屏幕**（控制器 → 被控端）。
+    ///
+    /// 纯 UI 动作：被控端只在**完全控制**模式下执行（仅观看/仅文件传输不该改变远端机器
+    /// 状态），其余模式忽略并记日志。会话本身保持连接；锁屏后 Windows 进入安全桌面，
+    /// GUI 模式被控端通常无法继续采集画面（见根目录 `CLAUDE.md` 的锁屏说明）。
+    LockScreen,
 }
 
 /// 一个带 `lane` 的会话帧。
@@ -1106,6 +1117,7 @@ mod tests {
                 },
                 Lane::Screen,
             ),
+            (SessionMessage::LockScreen, Lane::Control),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -1285,6 +1297,7 @@ mod tests {
                 },
                 26,
             ),
+            ("LockScreen", SessionMessage::LockScreen, 27),
         ];
         for (name, msg, want) in &cases {
             let bytes = bincode::serialize(msg).unwrap();

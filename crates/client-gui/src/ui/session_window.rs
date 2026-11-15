@@ -529,6 +529,25 @@ fn toolbar_contents(
         {
             v.side_panel_open = !v.side_panel_open;
         }
+        // 锁屏只在「完全控制」模式可用：仅观看/仅文件传输不该改变远端机器状态。
+        let can_lock = active.mode == RemoteMode::Control;
+        let lock = ui
+            .add_enabled_ui(can_lock, |ui| {
+                widgets::toolbar_button(
+                    ui,
+                    "锁屏",
+                    "锁定远端屏幕（会话保持连接；锁屏后画面可能无法继续采集）",
+                )
+            })
+            .inner;
+        let lock = if can_lock {
+            lock
+        } else {
+            lock.on_disabled_hover_text("仅『完全控制』模式可锁定远端屏幕")
+        };
+        if lock.clicked() {
+            manager.lock_screen();
+        }
         if ui
             .selectable_label(v.fullscreen, "全屏")
             .on_hover_text("切换全屏（F11；全屏时 Esc 退出）")

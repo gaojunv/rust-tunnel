@@ -115,15 +115,17 @@ pub fn default_download_dir() -> PathBuf {
 }
 
 /// 读 `host.toml`：复用 `client` 的 [`ClientConfig`]（同一套 `server`/`password`/`name`/
-/// `tls*` 字段），审批策略取同文件里的 `approval` 键（[`ClientConfigFile`] 不认识它，
-/// 故单独解析一次）。
+/// `tls*` 字段），审批策略与「会话结束后自动锁屏」取同文件里的 `approval` / `auto_lock`
+/// 键（[`ClientConfigFile`] 不认识它们，故单独解析一次）。
+///
+/// 返回 `(配置, 审批策略, 会话结束后自动锁屏)`。
 ///
 /// [`ClientConfigFile`]: rust_tunnel_client::config::ClientConfigFile
 ///
 /// # Errors
 ///
 /// 文件不存在（给出期望路径与「应由服务安装时创建」的说明）或字段不合法时返回 `Err`。
-pub fn load_host_config(path: &Path) -> anyhow::Result<(ClientConfig, ApprovalPolicy)> {
+pub fn load_host_config(path: &Path) -> anyhow::Result<(ClientConfig, ApprovalPolicy, bool)> {
     if !path.exists() {
         anyhow::bail!(
             "找不到实例配置 {}。\n\
@@ -154,29 +156,38 @@ pub fn load_host_config(path: &Path) -> anyhow::Result<(ClientConfig, ApprovalPo
     };
     let config = ClientConfig::from_cli(cli)
         .map_err(|err| anyhow::anyhow!("实例配置无效（{}）：{err}", path.display()))?;
-    let approval = read_approval(path).unwrap_or_default();
-    Ok((config, approval))
+    let extras = read_host_extras(path);
+    Ok((
+        config,
+        extras.approval.unwrap_or_default(),
+        extras.auto_lock,
+    ))
 }
 
 /// `host.toml` 里与实例有关、但 [`ClientConfig`] 不认识的字段。
-#[derive(Debug, serde::Deserialize)]
-struct ApprovalFile {
+#[derive(Debug, Default, serde::Deserialize)]
+struct HostExtras {
     /// 接入确认策略；缺省 [`ApprovalPolicy::Confirm`]（安全侧默认）。
     #[serde(default)]
     approval: Option<ApprovalPolicy>,
+    /// 会话结束后是否自动锁定屏幕；缺省 `false`。
+    #[serde(default)]
+    auto_lock: bool,
 }
 
-/// 从 `host.toml` 里单独解析 `approval`（解析失败按缺省处理并告警）。
-fn read_approval(path: &Path) -> Option<ApprovalPolicy> {
-    let content = std::fs::read_to_string(path).ok()?;
-    match toml::from_str::<ApprovalFile>(&content) {
-        Ok(parsed) => parsed.approval,
+/// 从 `host.toml` 里单独解析 `approval` / `auto_lock`（解析失败按缺省处理并告警）。
+fn read_host_extras(path: &Path) -> HostExtras {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HostExtras::default();
+    };
+    match toml::from_str::<HostExtras>(&content) {
+        Ok(parsed) => parsed,
         Err(err) => {
             tracing::warn!(
-                "解析 {} 的 approval 字段失败（回落到 Confirm）：{err}",
+                "解析 {} 的 approval / auto_lock 字段失败（回落到 Confirm / false）：{err}",
                 path.display()
             );
-            None
+            HostExtras::default()
         }
     }
 }
@@ -293,7 +304,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
 
     // 配置读不出来时，日志还没起来（级别来自配置），而服务把本进程的 stderr 丢弃了——
     // 直接落文件，否则这条失败对任何人都不可见（见 `log_config_failure` 的文档）。
-    let (config, approval) = match load_host_config(&opts.config_path) {
+    let (config, approval, auto_lock) = match load_host_config(&opts.config_path) {
         Ok(loaded) => loaded,
         Err(err) => {
             log_config_failure(&opts.config_path, &err);
@@ -307,11 +318,12 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         name = ?config.name,
         share = %opts.share_dir.display(),
         download = %opts.download_dir.display(),
+        auto_lock,
         "无头实例启动"
     );
 
     let exit = Arc::new(AtomicBool::new(false));
-    spawn_instance_runtime(config, approval, opts, Arc::clone(&exit));
+    spawn_instance_runtime(config, approval, auto_lock, opts, Arc::clone(&exit));
     // 主线程 park：等运行时线程给出退出信号（注册被拒 / Ctrl+C）。
     wait_for_exit(&exit);
     tracing::info!("无头实例退出");
@@ -322,6 +334,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
 pub(crate) fn spawn_instance_runtime(
     config: ClientConfig,
     approval: ApprovalPolicy,
+    auto_lock: bool,
     opts: &InstanceOptions,
     exit: Arc<AtomicBool>,
 ) {
@@ -344,6 +357,7 @@ pub(crate) fn spawn_instance_runtime(
                     // 无人值守实例**默认允许被远程控制**（开关本就是这个进程存在的理由）。
                     enabled: true,
                     approval_policy: approval,
+                    auto_lock_on_disconnect: auto_lock,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

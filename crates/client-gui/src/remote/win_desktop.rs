@@ -758,6 +758,12 @@ impl InputSink for WinInput {
         Ok(())
     }
 
+    fn lock_screen(&self) -> RemoteResult<()> {
+        // 不需要挂载桌面：`LockWorkStation` 作用于**进程所在的交互式会话**，而实例进程
+        // 本就以 SYSTEM 运行在控制台会话里（桌面挂载只影响采集/注入）。
+        super::lock_platform_screen()
+    }
+
     /// 覆写默认分发：直接投递整条事件，避免再拆一遍（引擎调用的就是这个入口）。
     fn apply(&self, event: InputEvent) -> RemoteResult<()> {
         self.push(event);

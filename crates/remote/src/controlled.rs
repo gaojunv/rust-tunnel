@@ -469,6 +469,34 @@ pub struct ControlledConfig {
     /// `None` = 本端只能编码 VP9，协商时一律选 VP9。**与控制器 offer 的交集**才是最终选择：
     /// 只有本字段为 `Some` **且** `CodecOffer.h264 == true` 时才选 H.264。
     pub h264_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
+    /// 会话结束后是否**自动锁定本机屏幕**。
+    ///
+    /// 由收尾守卫（[`AutoLockOnExit`]）在会话结束时**实时读取**，故用户在会话进行中打开设置
+    /// 也立即生效。纯文件传输会话不创建守卫，因此不触发。
+    pub lock_on_disconnect: Arc<AtomicBool>,
+}
+
+/// 会话收尾时按用户偏好锁定屏幕。
+///
+/// 用 `Drop` 而不是在函数末尾显式调用：主循环有多个退出路径（取消/对端关闭/IO 错误），
+/// 守卫保证**所有**路径都会走到；它只在握手鉴权成功、且会话真的共享了画面之后才创建。
+struct AutoLockOnExit {
+    /// 平台注入目标（锁屏是 [`InputSink::lock_screen`]）。
+    input: Arc<dyn InputSink>,
+    /// 用户偏好（原子位实时读取）。
+    enabled: Arc<AtomicBool>,
+}
+
+impl Drop for AutoLockOnExit {
+    fn drop(&mut self) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.input.lock_screen() {
+            Ok(()) => info!("会话结束，已自动锁定屏幕"),
+            Err(err) => warn!(error = %err, "会话结束自动锁屏失败"),
+        }
+    }
 }
 
 /// 被控端读半边类型（协商与主循环共用）。
@@ -710,6 +738,12 @@ pub async fn run_controlled(
 
     let capture = config.mode != RemoteMode::FileTransfer;
     let inject = config.mode == RemoteMode::Control;
+    // 会话收尾自动锁屏：只在本会话**真的共享了画面**时创建。位置在握手鉴权与编解码协商
+    // 之后，因此版本不匹配/鉴权失败的连接绝不会锁屏；纯文件传输会话也不锁。
+    let _auto_lock = capture.then(|| AutoLockOnExit {
+        input: Arc::clone(&input),
+        enabled: Arc::clone(&config.lock_on_disconnect),
+    });
     // GPU 采集只在**协商到 H.264** 且平台采集源支持时启用。计算一次即可：codec 在
     // 会话内不变，平台能力也不会在会话中翻转。H.264 编码器在 GPU 输入不可用时由
     // 适配器自行回退 CPU（`RawFrame::gpu == None` 走原来的 rgba 路径）。
@@ -1057,6 +1091,17 @@ pub async fn run_controlled(
                                 if let Err(err) = input.apply(event) {
                                     warn!(error = %err, "输入注入失败");
                                 }
+                            }
+                        }
+                        SessionMessage::LockScreen => {
+                            // 仅完全控制模式：仅观看/仅文件传输不该改变远端机器状态。
+                            if inject {
+                                match input.lock_screen() {
+                                    Ok(()) => info!("控制端请求锁定屏幕，已执行"),
+                                    Err(err) => warn!(error = %err, "控制端请求锁定屏幕失败"),
+                                }
+                            } else {
+                                debug!("非完全控制模式，忽略锁屏请求");
                             }
                         }
                         SessionMessage::SelectDisplay { display: target } => {
@@ -2029,7 +2074,7 @@ mod tests {
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
     use rust_tunnel_common::protocol::RemoteMode;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use std::pin::Pin;
@@ -2200,6 +2245,8 @@ mod tests {
     /// 记录注入事件（并经通道转发，供时序断言）。
     struct RecordingInput {
         notify: Mutex<Option<mpsc::UnboundedSender<InputEvent>>>,
+        /// 锁屏调用次数（`Insert` 之外的 `InputSink::lock_screen`）。
+        locks: AtomicU32,
     }
 
     impl RecordingInput {
@@ -2208,9 +2255,15 @@ mod tests {
             (
                 Arc::new(Self {
                     notify: Mutex::new(Some(tx)),
+                    locks: AtomicU32::new(0),
                 }),
                 rx,
             )
+        }
+
+        /// 本端被请求锁屏的次数。
+        fn lock_count(&self) -> u32 {
+            self.locks.load(Ordering::SeqCst)
         }
 
         fn record(&self, event: InputEvent) {
@@ -2237,6 +2290,10 @@ mod tests {
         }
         fn key(&self, event: KeyEvent) -> RemoteResult<()> {
             self.record(InputEvent::Key(event));
+            Ok(())
+        }
+        fn lock_screen(&self) -> RemoteResult<()> {
+            self.locks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2267,6 +2324,7 @@ mod tests {
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3354,6 +3412,163 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "收尾不应等满剪贴板读取（实得 {:?}）",
             started.elapsed()
+        );
+    }
+
+    // ───────────────── 锁屏（协议 v7） ─────────────────
+
+    /// 等被控端完成编解码协商（看到 `CodecSelect` 即说明 offer 已被处理）。
+    async fn wait_codec_select(peer_reader: &mut PeerRead) {
+        let frame = tokio::time::timeout(WAIT, peer_reader.next())
+            .await
+            .expect("协商完成前应收到 CodecSelect")
+            .expect("流不应关闭")
+            .expect("CodecSelect 应可解码");
+        assert!(
+            matches!(frame.message, SessionMessage::CodecSelect { .. }),
+            "首帧应为 CodecSelect，实得 {:?}",
+            frame.message
+        );
+    }
+
+    /// 等被控端**主循环**真正跑起来（首个 `Heartbeat` 立即到期）。
+    ///
+    /// 收尾守卫在编解码协商之后、主循环之前创建，故看到主循环发出的帧就证明守卫已经建立——
+    /// 比固定睡眠更可靠（不会在负载高的机器上把取消抢在守卫创建之前）。
+    async fn wait_loop_started(peer_reader: &mut PeerRead) {
+        loop {
+            let frame = tokio::time::timeout(WAIT, peer_reader.next())
+                .await
+                .expect("主循环应发出首帧")
+                .expect("流不应关闭")
+                .expect("帧应可解码");
+            if matches!(frame.message, SessionMessage::Heartbeat) {
+                return;
+            }
+        }
+    }
+
+    /// 仅观看模式下 `LockScreen` 必须被忽略：它不该改变远端机器状态。
+    #[tokio::test]
+    async fn lock_screen_request_is_ignored_outside_control_mode() {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config(pending_with("TOK"), RemoteMode::ViewOnly),
+            Arc::new(EmptyScreenSource),
+            Arc::clone(&input) as Arc<dyn InputSink>,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        let (mut peer_reader, mut peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        wait_codec_select(&mut peer_reader).await;
+
+        peer_writer
+            .send(SessionFrame::control(SessionMessage::LockScreen))
+            .await
+            .expect("发送锁屏请求应成功");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(input.lock_count(), 0, "仅观看模式不得执行锁屏");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, ctld).await;
+        drop(peer_writer);
+    }
+
+    /// 完全控制模式下 `LockScreen` 应执行一次。
+    #[tokio::test]
+    async fn lock_screen_request_locks_in_control_mode() {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config(pending_with("TOK"), RemoteMode::Control),
+            Arc::new(EmptyScreenSource),
+            Arc::clone(&input) as Arc<dyn InputSink>,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        let (mut peer_reader, mut peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        wait_codec_select(&mut peer_reader).await;
+
+        peer_writer
+            .send(SessionFrame::control(SessionMessage::LockScreen))
+            .await
+            .expect("发送锁屏请求应成功");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while input.lock_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("完全控制模式下应执行锁屏");
+        assert_eq!(input.lock_count(), 1, "一次请求只应锁屏一次");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, ctld).await;
+        drop(peer_writer);
+    }
+
+    /// 跑一场已建立（握手 + 协商完成）的会话，返回会话结束时累计的锁屏次数。
+    ///
+    /// 守住「守卫在下行路径上确实被创建」这一点：等待 `CodecSelect` 之后再多给一点时间，
+    /// 让 `run_controlled` 走到创建守卫那一行（它在协商完成之后、主循环之前）。
+    async fn auto_lock_count_on_session_end(lock_on_disconnect: bool) -> u32 {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+        let mut config = config(pending_with("TOK"), RemoteMode::Control);
+        config.lock_on_disconnect = Arc::new(AtomicBool::new(lock_on_disconnect));
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            config,
+            Arc::new(EmptyScreenSource),
+            Arc::clone(&input) as Arc<dyn InputSink>,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        let (mut peer_reader, peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        wait_codec_select(&mut peer_reader).await;
+        // 主循环起来 = 收尾守卫已创建；此刻取消，结束路径必然经过守卫的 `Drop`。
+        wait_loop_started(&mut peer_reader).await;
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, ctld)
+            .await
+            .expect("取消后被控端应结束");
+        drop(peer_writer);
+        input.lock_count()
+    }
+
+    /// 会话结束（这里是取消路径，网络断开同样走主循环出口）后按偏好自动锁屏。
+    #[tokio::test]
+    async fn auto_lock_fires_when_an_established_session_ends() {
+        assert_eq!(
+            auto_lock_count_on_session_end(true).await,
+            1,
+            "开启偏好后，已建立会话结束应锁屏一次"
+        );
+    }
+
+    /// 偏好关闭时不得锁屏。
+    #[tokio::test]
+    async fn auto_lock_does_not_fire_when_disabled() {
+        assert_eq!(
+            auto_lock_count_on_session_end(false).await,
+            0,
+            "偏好关闭时会话结束不得锁屏"
         );
     }
 

@@ -123,6 +123,21 @@ impl GuiApp {
         tracing::info!("允许被远程控制：{}", if on { "开" } else { "关" });
     }
 
+    /// 应用「会话结束后自动锁定本机屏幕」的新状态：同步到引擎并落盘 gui.toml。
+    ///
+    /// 引擎里写的是原子位，被控端会话收尾守卫**实时读取**——会话进行中打开此设置，
+    /// 那一场结束时就会锁屏。
+    fn apply_auto_lock_on_disconnect(&mut self, on: bool) {
+        self.prefs.remote_auto_lock_on_disconnect = on;
+        if let Some(manager) = self.app_state.remote() {
+            manager.set_auto_lock_on_disconnect(on);
+        }
+        if let Err(e) = prefs::save(&self.prefs) {
+            tracing::warn!("自动锁屏设置保存失败：{e}");
+        }
+        tracing::info!("会话结束后自动锁屏：{}", if on { "开" } else { "关" });
+    }
+
     /// 应用接入确认策略的新状态：同步到引擎并落盘 gui.toml。
     fn apply_approval_policy(&mut self, policy: ApprovalPolicy) {
         self.prefs.remote_approval = policy;
@@ -416,6 +431,9 @@ impl eframe::App for GuiApp {
         if let Some(policy) = remote_actions.approval_policy {
             self.apply_approval_policy(policy);
         }
+        if let Some(on) = remote_actions.auto_lock_on_disconnect {
+            self.apply_auto_lock_on_disconnect(on);
+        }
         // 接入确认弹窗常驻所有 Tab 之上（与 `controlled_banner` 同理）。
         ui::remote::approval_modal(ctx, &mut self.approval_remember, remote_manager.as_ref());
 
@@ -446,6 +464,8 @@ struct ManagerOptions {
     enabled: bool,
     /// 接入确认策略。
     approval_policy: ApprovalPolicy,
+    /// 被控端会话结束后是否自动锁定屏幕（GUI 取自 `GuiPrefs`，实例取自 `host.toml`）。
+    auto_lock_on_disconnect: bool,
     /// 平台实现模式（**必须在构造期选定**，见 [`remote::PlatformMode`]）。
     platform_mode: remote::PlatformMode,
     /// 被控端共享目录（`None` = 不接受文件请求）。
@@ -484,6 +504,8 @@ fn build_remote_manager(
         h264_encoder_factory,
         h264_decoder_factory,
     });
+    // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
+    manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);
     // 平台实现在这里**一次性**选定：引擎受理会话时就把 `Arc<dyn ScreenSource>` /
     // `Arc<dyn InputSink>` 克隆走了，之后 `install_platform` 再覆盖对已建立的会话无效。
     let release = remote::install_platform(&manager, opts.platform_mode);
@@ -492,10 +514,15 @@ fn build_remote_manager(
 
 /// GUI 路径的引擎选项：共享目录固定为「下载」目录下的 `rust-tunnel-share`——可见、易找，
 /// 且与用户的个人目录隔离（用户要换目录只需在这里改一处）。
-fn gui_manager_options(enabled: bool, approval_policy: ApprovalPolicy) -> ManagerOptions {
+fn gui_manager_options(
+    enabled: bool,
+    approval_policy: ApprovalPolicy,
+    auto_lock_on_disconnect: bool,
+) -> ManagerOptions {
     ManagerOptions {
         enabled,
         approval_policy,
+        auto_lock_on_disconnect,
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
@@ -515,6 +542,7 @@ fn spawn_runtime(
     reconnect_flag: Arc<AtomicBool>,
     initial_allow_remote: bool,
     initial_approval: ApprovalPolicy,
+    initial_auto_lock: bool,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -602,7 +630,7 @@ fn spawn_runtime(
             // 客户端名要等磁盘配置加载完；无配置时上面的循环会先等到配置。
             let (remote_manager, _release) = build_remote_manager(
                 &config,
-                gui_manager_options(initial_allow_remote, initial_approval),
+                gui_manager_options(initial_allow_remote, initial_approval, initial_auto_lock),
             );
             app_state.set_remote(Arc::clone(&remote_manager));
 
@@ -1164,6 +1192,7 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         reconnect_flag,
         prefs.allow_remote,
         prefs.remote_approval,
+        prefs.remote_auto_lock_on_disconnect,
     );
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，

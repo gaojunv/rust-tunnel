@@ -5,7 +5,8 @@ name = "rust-tunnel-client-gui"
 # 数据面 v6（键位码输入 + 脏矩形增量补丁）起要求 ≥ 0.13.0；两端必须一起升级
 # （v5/v4 ↔ v6 在握手阶段被 `Hello.proto_version` 的硬相等校验干净拒绝）。
 # 0.13.1 = 仅 QoS 闭环修正（网络拥塞不再改分辨率），协议仍是 v6，与 0.13.0 可互通。
-version = "0.13.1"
+# 0.14.0 = 数据面 v7（新增锁屏 `SessionMessage::LockScreen`），两端必须同为 0.14.0。
+version = "0.14.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -92,6 +93,8 @@ windows-sys = { workspace = true, features = [
     # `timeBeginPeriod(1)`：把定时器粒度从 15.6 ms 降到 1 ms，避免 MFT/WGC 的
     # 短 sleep 轮询被放大（见 main.rs）。
     "Win32_Media",
+    # `LockWorkStation`（协议 v7 的锁屏；见 remote/mod.rs 的 lock_platform_screen）。
+    "Win32_System_Shutdown",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

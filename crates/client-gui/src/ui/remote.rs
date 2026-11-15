@@ -37,6 +37,8 @@ pub struct RemoteTabActions {
     pub allow_remote: Option<bool>,
     /// 用户切换了接入确认策略（`Some` 表示有变化）。
     pub approval_policy: Option<ApprovalPolicy>,
+    /// 用户切换了「会话结束后自动锁定本机屏幕」（`Some` 表示有变化）。
+    pub auto_lock_on_disconnect: Option<bool>,
 }
 
 /// 渲染「远程」Tab。返回本帧的用户操作，由调用方（`GuiApp`）同步到引擎、托盘与偏好文件。
@@ -435,6 +437,25 @@ fn show_switch(ui: &mut Ui, state: &RemoteUiState) -> RemoteTabActions {
             } else {
                 ui.label(RichText::new("需要确认：每次接入都会弹窗，由你决定是否放行。").weak().small());
             }
+            ui.add_space(4.0);
+
+            // 会话结束后自动锁屏：默认关闭。它改变的是**本机**状态，故必须在接入确认
+            // 策略旁边让用户显式选择；纯文件传输会话不触发（会话收尾守卫只在该会话共享
+            // 画面时创建）。
+            ui.horizontal(|ui| {
+                let mut auto_lock = state.auto_lock_on_disconnect;
+                if ui
+                    .checkbox(&mut auto_lock, "会话结束后自动锁定本机屏幕")
+                    .changed()
+                {
+                    actions.auto_lock_on_disconnect = Some(auto_lock);
+                }
+            });
+            ui.label(
+                RichText::new("被控会话结束（含网络断开）后锁定本机屏幕；仅文件传输会话不触发。")
+                    .weak()
+                    .small(),
+            );
             ui.add_space(4.0);
 
             egui::Grid::new("remote_meta")

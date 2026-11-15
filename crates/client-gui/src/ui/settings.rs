@@ -280,7 +280,10 @@ pub fn show_service_section(ui: &mut Ui, app_state: &Arc<AppState>, service: &mu
                     let approval = app_state
                         .remote()
                         .map_or(ApprovalPolicy::Confirm, |manager| manager.approval_policy());
-                    HostSeed::from_config(&config, approval)
+                    let auto_lock = app_state
+                        .remote()
+                        .is_some_and(|manager| manager.auto_lock_on_disconnect());
+                    HostSeed::from_config(&config, approval, auto_lock)
                 });
             // `Absent` = 确定没装；其余（含 `Unknown`）按「已装」处理，多给几个按钮总比
             // 在查询偶发失败时把「卸载」藏起来强。
