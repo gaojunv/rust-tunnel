@@ -3186,7 +3186,10 @@ mod tests {
         assert!(view.toolbar_collapsed);
         assert!(!view.toolbar_visible, "收起后不应再画展开态工具条");
 
-        view.last_pointer_move = Instant::now() - Duration::from_secs(600);
+        // 假装用户已经静止很久；展开必须把这个计时拉回现在。
+        view.last_pointer_move = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("测试时钟应能回退十分钟");
         view.expand_toolbar();
         assert!(!view.toolbar_collapsed);
         assert!(view.toolbar_visible, "展开后必须立刻可见");
