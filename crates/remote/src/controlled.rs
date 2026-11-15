@@ -77,8 +77,8 @@ use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
-    CapturedPatches, Clipboard, DisplayInfo, EncodeOptions, EncodeRates, InputSink, RawFrame,
-    ScreenSource,
+    native_bitrate_ceiling, CapturedPatches, Clipboard, DisplayInfo, EncodeOptions, EncodeRates,
+    InputSink, RawFrame, ScreenSource,
 };
 use crate::session::{
     trusted_rtt, CodecId, RegionRect, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
@@ -88,7 +88,7 @@ use crate::session::{
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
-use crate::video::{encode_dimensions, EncodedVideo, MAX_ENCODE_WIDTH};
+use crate::video::{encode_dimensions, EncodedVideo, MAX_ENCODE_WIDTH, NATIVE_MAX_ENCODE_WIDTH};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
@@ -613,14 +613,48 @@ fn display_signature(displays: &[DisplayInfo]) -> Vec<(u32, u32, u32)> {
 
 /// 显示尺寸 → **最终编码尺寸**，与视频路径的计算顺序完全一致。
 ///
-/// 平台采集源会先按 [`MAX_ENCODE_WIDTH`] 封顶（Windows 的 `capture_gpu_frame` /
+/// 平台采集源会先按 `max_width` 封顶（Windows 的 `capture_gpu_frame` /
 /// `capture_hardware` 用 `encode_dimensions(.., 1.0, ..)`），编码循环随后再施加 `rates.scale`。
 /// 补丁模式的目标帧缓冲必须落在**同一套**结果上，否则 4K + 非 1.0 缩放时两边会差一档
 /// （视频 960×540、补丁 1920×1080），控制端就会因尺寸不符拒绝所有补丁。
-fn encode_target_dims(display_width: u32, display_height: u32, scale: f32) -> (u32, u32) {
+///
+/// `max_width` 必须是**本会话协商后的**有效上限（见 [`effective_max_encode_width`]）：
+/// 默认 1920，硬件 H.264 + 原生分辨率时 3840。
+fn encode_target_dims(
+    display_width: u32,
+    display_height: u32,
+    scale: f32,
+    max_width: u32,
+) -> (u32, u32) {
     let (capped_width, capped_height) =
-        encode_dimensions(display_width, display_height, 1.0, MAX_ENCODE_WIDTH);
-    encode_dimensions(capped_width, capped_height, scale, MAX_ENCODE_WIDTH)
+        encode_dimensions(display_width, display_height, 1.0, max_width);
+    encode_dimensions(capped_width, capped_height, scale, max_width)
+}
+
+/// 本会话的有效编码宽度上限（像素）。
+///
+/// **只有硬件 H.264 + 用户显式开启原生分辨率**才放宽到
+/// [`NATIVE_MAX_ENCODE_WIDTH`]（3840）；其余一律 [`MAX_ENCODE_WIDTH`]（1920）——
+/// 包括「开了选项但对端只有 VP9」：VP9 软件解码 4K 在控制器侧仍是 37–58 ms 一帧。
+#[must_use]
+fn effective_max_encode_width(codec: CodecId, native_resolution: bool) -> u32 {
+    if native_resolution && codec == CodecId::H264 {
+        NATIVE_MAX_ENCODE_WIDTH
+    } else {
+        MAX_ENCODE_WIDTH
+    }
+}
+
+/// 原生分辨率会话把档位码率上限翻倍（帧率、缩放不动），见 [`native_bitrate_ceiling`]。
+fn session_encode_options(options: EncodeOptions, native_active: bool) -> EncodeOptions {
+    if native_active {
+        EncodeOptions {
+            target_bitrate_kbps: native_bitrate_ceiling(options.target_bitrate_kbps),
+            ..options
+        }
+    } else {
+        options
+    }
 }
 
 /// 退出补丁模式：回到全帧视频、强制关键帧，并让采集节拍重新对齐到视频档位。
@@ -706,6 +740,13 @@ pub struct ControlledConfig {
     /// 自阶段 3 起它是档位**上限**，不是实际生效值——实际值由 QoS 闭环
     /// （[`crate::qos::RateController`]）在上限之下浮动，见 [`crate::screen::EncodeRates`]。
     pub encode: EncodeOptions,
+    /// 是否允许**原生分辨率**（4K）编码（默认 `false`）。
+    ///
+    /// 仅在协商到**硬件 H.264** 时生效：编码宽度上限从 [`MAX_ENCODE_WIDTH`]（1920）
+    /// 放宽到 [`NATIVE_MAX_ENCODE_WIDTH`]（3840），档位码率经
+    /// [`crate::screen::native_bitrate_ceiling`] 翻倍（封顶 30 Mbps）；VP9 路径不受影响。
+    /// 这一项只在**会话开始**时读取，运行中改它只影响下一次会话。
+    pub native_resolution: bool,
     /// 在途采集的看门狗时限（见 [`CAPTURE_WATCHDOG`]）。
     ///
     /// 做成字段而非直接读常量，是为了让测试用极短的值验证「采集 panic/挂死之后仍能恢复」，
@@ -940,6 +981,14 @@ pub async fn run_controlled(
         .await?;
     info!("编解码协商完成（被控端） codec={codec:?}");
 
+    // 本会话的**有效编码宽度上限**：只有硬件 H.264 + 用户显式开启原生分辨率才放宽到 3840
+    // （见 [`effective_max_encode_width`]）。采集侧也按它预缩放——采集实现必须与编码循环用
+    // 同一个值，否则补丁/全帧两条路径的尺寸会差一档。
+    let max_encode_width = effective_max_encode_width(codec, config.native_resolution);
+    let native_active = max_encode_width > MAX_ENCODE_WIDTH;
+    screen.set_max_encode_width(max_encode_width);
+    info!("编码宽度上限（被控端） max_width={max_encode_width} native={native_active}");
+
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
     //
@@ -960,6 +1009,7 @@ pub async fn run_controlled(
         config.unchanged_resend,
         Arc::clone(&sent_kbps),
         Arc::clone(&base_frame_sent),
+        max_encode_width,
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -985,7 +1035,10 @@ pub async fn run_controlled(
     let patch_capable = patch_compressor.is_some();
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
-    let mut rate = RateController::new(config.encode);
+    //
+    // 原生分辨率会话把上限**翻倍**（封顶 30 Mbps）：4K 桌面文字在 10 Mbps 下明显不够。
+    // 只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
+    let mut rate = RateController::new(session_encode_options(config.encode, native_active));
     let mut encode = rate.current();
     let mut display_id = displays
         .iter()
@@ -1133,7 +1186,12 @@ pub async fn run_controlled(
                                         .iter()
                                         .find(|d| d.id == display_id)
                                         .map_or((0, 0), |d| {
-                                            encode_target_dims(d.width, d.height, encode.scale)
+                                            encode_target_dims(
+                                                d.width,
+                                                d.height,
+                                                encode.scale,
+                                                max_encode_width,
+                                            )
                                         });
                                     if patches.width != want_w || patches.height != want_h {
                                         warn!(
@@ -1296,7 +1354,7 @@ pub async fn run_controlled(
                     let request = match screen_mode.mode {
                         ScreenMode::Patches => CaptureRequest::Patches {
                             scale: encode.scale,
-                            max_width: MAX_ENCODE_WIDTH,
+                            max_width: max_encode_width,
                         },
                         ScreenMode::Video => CaptureRequest::Frame { gpu: gpu_capture },
                     };
@@ -1430,7 +1488,11 @@ pub async fn run_controlled(
                         }
                         SessionMessage::SetQuality { preset } => {
                             // 档位是**上限**：换上限并把闭环重置到新上限（用户显式意图，不带降级历史）。
-                            rate.set_ceiling(preset.options());
+                            // 原生分辨率会话同样翻倍（见 `session_encode_options`）。
+                            rate.set_ceiling(session_encode_options(
+                                preset.options(),
+                                native_active,
+                            ));
                             // 用户显式选的帧率优先级高于档位默认值：换画质不应把它覆盖回去。
                             if let Some(fps) = selected_fps {
                                 rate.set_frame_rate_ceiling(fps);
@@ -2051,6 +2113,9 @@ async fn encode_loop(
     unchanged_resend: Duration,
     sent_kbps: Arc<AtomicU32>,
     base_frame_sent: Arc<AtomicBool>,
+    // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
+    // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。
+    max_encode_width: u32,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -2097,7 +2162,8 @@ async fn encode_loop(
         } else {
             prev_rgba.as_deref() == Some(frame.rgba.as_slice())
         };
-        let (width, height) = encode_dimensions(frame.width, frame.height, rates.scale, MAX_ENCODE_WIDTH);
+        let (width, height) =
+            encode_dimensions(frame.width, frame.height, rates.scale, max_encode_width);
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
         if geometry_changed {
@@ -2660,6 +2726,7 @@ mod tests {
             mode,
             pending,
             encode: EncodeOptions::default(),
+            native_resolution: false,
             capture_watchdog,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
@@ -3172,6 +3239,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -3241,6 +3309,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -3364,6 +3433,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
 
         job_tx
@@ -3426,6 +3496,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -3504,6 +3575,7 @@ mod tests {
             Duration::from_secs(3600),
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -3587,6 +3659,7 @@ mod tests {
             Duration::ZERO,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -4122,20 +4195,74 @@ mod tests {
         );
     }
 
-    /// 补丁目标尺寸必须与视频路径的**双重换算**一致（先按 1920 封顶，再乘 scale）。
+    /// 补丁目标尺寸必须与视频路径的**双重换算**一致（先按 `max_width` 封顶，再乘 scale）。
     ///
     /// 这条锁住的是 4K + 非 1.0 缩放的错位：直接用「原始宽 × scale 再封顶」会得到
     /// 1920×1080，而视频路径得到 960×540，控制端会因尺寸不符拒绝所有补丁。
     #[test]
     fn encode_target_dims_matches_the_video_path_double_step() {
-        assert_eq!(encode_target_dims(1920, 1080, 1.0), (1920, 1080));
-        assert_eq!(encode_target_dims(1920, 1080, 0.5), (960, 540));
+        assert_eq!(encode_target_dims(1920, 1080, 1.0, MAX_ENCODE_WIDTH), (1920, 1080));
+        assert_eq!(encode_target_dims(1920, 1080, 0.5, MAX_ENCODE_WIDTH), (960, 540));
         // 4K：先封顶到 1920×1080，再乘 scale。
-        assert_eq!(encode_target_dims(3840, 2160, 1.0), (1920, 1080));
-        assert_eq!(encode_target_dims(3840, 2160, 0.5), (960, 540));
-        assert_eq!(encode_target_dims(3840, 2160, 0.75), (1440, 810));
+        assert_eq!(
+            encode_target_dims(3840, 2160, 1.0, MAX_ENCODE_WIDTH),
+            (1920, 1080)
+        );
+        assert_eq!(
+            encode_target_dims(3840, 2160, 0.5, MAX_ENCODE_WIDTH),
+            (960, 540)
+        );
+        assert_eq!(
+            encode_target_dims(3840, 2160, 0.75, MAX_ENCODE_WIDTH),
+            (1440, 810)
+        );
         // 超宽屏（5120）：同样先封顶。
-        assert_eq!(encode_target_dims(5120, 2880, 0.5), (960, 540));
+        assert_eq!(
+            encode_target_dims(5120, 2880, 0.5, MAX_ENCODE_WIDTH),
+            (960, 540)
+        );
+        // 原生分辨率：4K 原生保真；0.5 缩放仍得到 1920（与视频路径一致）。
+        assert_eq!(
+            encode_target_dims(3840, 2160, 1.0, NATIVE_MAX_ENCODE_WIDTH),
+            (3840, 2160)
+        );
+        assert_eq!(
+            encode_target_dims(3840, 2160, 0.5, NATIVE_MAX_ENCODE_WIDTH),
+            (1920, 1080)
+        );
+    }
+
+    /// 有效上限只对**硬件 H.264 + 显式开启**放宽；开了选项但只有 VP9 仍是 1920。
+    ///
+    /// 这是「原生分辨率」的完整真值表：VP9 软件解 4K 的成本不允许被这个开关带进来。
+    #[test]
+    fn effective_max_encode_width_table() {
+        assert_eq!(effective_max_encode_width(CodecId::H264, true), 3840);
+        assert_eq!(effective_max_encode_width(CodecId::Vp9, true), MAX_ENCODE_WIDTH);
+        assert_eq!(effective_max_encode_width(CodecId::H264, false), MAX_ENCODE_WIDTH);
+        assert_eq!(effective_max_encode_width(CodecId::Vp9, false), MAX_ENCODE_WIDTH);
+        assert_eq!(NATIVE_MAX_ENCODE_WIDTH, 3840);
+    }
+
+    /// 原生分辨率只翻**码率上限**：帧率/缩放原样，封顶 30 Mbps。
+    #[test]
+    fn native_resolution_doubles_only_the_bitrate_ceiling() {
+        let hd = EncodeOptions::default();
+        let native = session_encode_options(hd, true);
+        assert_eq!(native.target_bitrate_kbps, hd.target_bitrate_kbps * 2);
+        assert_eq!(native.max_fps, hd.max_fps, "帧率不动");
+        assert!((native.scale - hd.scale).abs() < f32::EPSILON, "缩放不动");
+        // 非原生：逐字段原样（不悄悄改上限）。
+        assert_eq!(session_encode_options(hd, false), hd);
+        // 各档位都翻倍且不越过封顶。
+        for preset in crate::screen::QualityPreset::all() {
+            let doubled = session_encode_options(preset.options(), true);
+            assert_eq!(
+                doubled.target_bitrate_kbps,
+                preset.options().target_bitrate_kbps * 2
+            );
+            assert!(doubled.target_bitrate_kbps <= crate::screen::NATIVE_MAX_BITRATE_KBPS);
+        }
     }
 
     /// 顺序不变量：基准关键帧**真正写出**后才进入补丁模式；等不到就放弃并清零计数。

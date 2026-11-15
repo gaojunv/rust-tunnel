@@ -4,19 +4,22 @@
 //!
 //! - **采集**：优先用 `rust-tunnel-win-video` 的 WGC/DXGI（自顶向下 BGRA，
 //!   4K 实测约 20 ms/帧），失败时**逐帧回退**到既有的 xcap（GDI）。
-//! - **编码**：NVENC H.264 4:2:0。NVENC 对输入只做左上角裁剪、不做缩放，
-//!   所以源尺寸与编码尺寸不同（例如 4K 采集、1920 宽编码）时，适配器先用
-//!   [`scale_rgba_box`] 在 CPU 上下采样。
+//! - **编码**：NVENC H.264 4:2:0。采集纹理与编码器**同设备且尺寸相等**时直接
+//!   注册给 NVENC（零拷贝，不落 CPU）；否则回读 BGRA，必要时 CPU 盒式下采样后再
+//!   上传（NVENC 对输入只做左上角裁剪、不做缩放，例如 4K 采集 → 1920 宽编码）。
 //! - **解码**：Media Foundation 的 `MSH264DecoderMFT`（控制器侧）。
 //!
-//! 平台能力探测在 [`factories`]：只有 NVENC DLL、NVIDIA 适配器与 H.264 MFT
-//! 都真的可用时才返回对应的工厂；否则该侧保持 `None`，数据面协商回退 VP9。
+//! 平台能力探测在 [`factories`]：NVENC（DLL + NVIDIA 适配器）可用、或 NVENC
+//! 不可用但硬件 MFT 可用时才注入 H.264 编码工厂；否则该侧保持 `None`，数据面
+//! 协商回退 VP9。**编码后端在 `create()` 时按采集适配器选路**（见
+//! [`choose_backend`]）：混合显卡下采集设备常是 Intel 核显，此时优先 QSV MFT
+//! 才能复用同一块设备；无条件优先 NVENC 只会退化成跨设备回读。
 //!
 //! **实例模式（`--instance`）不走这里**：那条路径由 `win-platform` 用 BitBlt
 //! 采集安全桌面，本模块只服务用户会话里的 GUI 进程。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -24,6 +27,7 @@ use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
 use rust_tunnel_remote::screen::{CapturedPatches, ScreenPatch};
+use rust_tunnel_remote::video::NATIVE_MAX_ENCODE_WIDTH;
 use rust_tunnel_remote::{
     encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo, GpuFrame,
     RawFrame, RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
@@ -143,8 +147,9 @@ fn gpu_context() -> &'static Arc<GpuContext> {
 
 /// 引擎侧 [`RawFrame::gpu`] 的 Windows 载体：一张采集源纹理池里的 BGRA 纹理。
 ///
-/// `frame.width/height`（逻辑编码尺寸）可能小于纹理的物理尺寸（4K 采集先封顶到
-/// 1920），故这里同时保留 `source_width/source_height` 供编码器缩放。
+/// `frame.width/height`（逻辑编码尺寸）可能小于纹理的物理尺寸（4K 采集先按会话
+/// 上限封顶：默认 1920，原生分辨率下就是 3840），故这里同时保留
+/// `source_width/source_height` 供编码器缩放。
 struct WinGpuFrame {
     /// 采集纹理（持有池槽位租约，直到整帧被丢弃）。
     texture: capture::CapturedTexture,
@@ -167,6 +172,9 @@ impl GpuFrame for WinGpuFrame {
 pub struct WinVideoScreen {
     /// 每个显示器 id 对应的已打开采集源。
     sources: Mutex<HashMap<u32, CachedSource>>,
+    /// 本会话的编码宽度上限（像素）。引擎在会话开始、codec 协商完成后设定：
+    /// 默认 1920，硬件 H.264 + 原生分辨率时 3840（见 [`clamp_encode_width`]）。
+    max_encode_width: AtomicU32,
 }
 
 impl WinVideoScreen {
@@ -175,7 +183,13 @@ impl WinVideoScreen {
     pub fn new() -> Self {
         Self {
             sources: Mutex::new(HashMap::new()),
+            max_encode_width: AtomicU32::new(MAX_ENCODE_WIDTH),
         }
+    }
+
+    /// 当前会话的编码宽度上限。
+    fn max_encode_width(&self) -> u32 {
+        self.max_encode_width.load(Ordering::Relaxed)
     }
 
     /// 在缓存/重建好的采集源上执行一次操作。
@@ -212,12 +226,13 @@ impl WinVideoScreen {
                 .capture()
                 .map_err(|err| RemoteError::Platform(format!("硬件采集失败: {err}")))
         })?;
-        // **在采集层就封顶到 1920 宽**：4K 源若原样交给引擎，会先生成 33 MB
+        // **在采集层就按会话上限封顶**：4K 源若原样交给引擎，会先生成 33 MB
         // 的 RGBA、再做一次 memcmp 去重与下采样；这里一步 BGRA→目标尺寸 RGBA
-        // 把中间缓冲直接压到 1920×1080。`rates.scale` 仍由引擎在这之后生效
-        // （例如「流畅」档在半分辨率上再乘 0.5）。
+        // 把中间缓冲直接压到上限尺寸（默认 1920×1080，原生分辨率下 3840）。
+        // `rates.scale` 仍由引擎在这之后生效（例如「流畅」档在半分辨率上再乘 0.5）。
+        let max_width = self.max_encode_width();
         let (dst_width, dst_height) =
-            encode_dimensions(captured.width, captured.height, 1.0, MAX_ENCODE_WIDTH);
+            encode_dimensions(captured.width, captured.height, 1.0, max_width);
         let rgba = if (captured.width, captured.height) == (dst_width, dst_height) {
             bgra_to_rgba(&captured.bgra)
         } else {
@@ -245,9 +260,10 @@ impl WinVideoScreen {
 
     /// 用硬件后端采集一帧 **GPU 纹理**（不落 CPU）。
     ///
-    /// 逻辑尺寸与 CPU 路径一致：先按 [`MAX_ENCODE_WIDTH`] 封顶，`rates.scale` 稍后
-    /// 由引擎施加。任何一次失败都会**永久禁用**本进程的 GPU 路径并回退到
-    /// [`Self::capture`]（CPU），而不是每帧重试。
+    /// 逻辑尺寸与 CPU 路径一致：先按**会话上限**（默认
+    /// [`MAX_ENCODE_WIDTH`]，原生分辨率下 [`NATIVE_MAX_ENCODE_WIDTH`]）封顶，
+    /// `rates.scale` 稍后由引擎施加。任何一次失败都会**永久禁用**本进程的 GPU
+    /// 路径并回退到 [`Self::capture`]（CPU），而不是每帧重试。
     ///
     /// 同时把采集层的**像素级**变化判断填进 [`RawFrame::changed`] 与变化面积
     /// [`RawFrame::changed_permille`]：前者决定是否跳过这一拍，后者供被控端按内容活跃度
@@ -270,8 +286,12 @@ impl WinVideoScreen {
         let (source_width, source_height) = (captured.width, captured.height);
         gpu_context().set_device(Arc::clone(&captured.device));
         gpu_context().log_enabled_once(&captured.device.adapter.name);
-        let (width, height) =
-            encode_dimensions(source_width, source_height, 1.0, MAX_ENCODE_WIDTH);
+        let (width, height) = encode_dimensions(
+            source_width,
+            source_height,
+            1.0,
+            self.max_encode_width(),
+        );
         Ok(RawFrame {
             display: display_id,
             width,
@@ -359,6 +379,16 @@ fn refresh_cached_source(
     Ok(())
 }
 
+/// 把引擎给的编码宽度上限钳到 `[MAX_ENCODE_WIDTH, NATIVE_MAX_ENCODE_WIDTH]` 并对齐偶数。
+///
+/// 引擎目前只会传 1920 / 3840，这里仍做钳制：平台侧是**防御边界**。越界值（未来引擎
+/// 传 8K、或某个调用方直接调 trait 方法）不该让采集层产出远超编码能力的纹理；
+/// 下界 1920 则保证「传 0 / 垃圾值」不会把画面缩成 2 像素。两个边界都是偶数，`& !1`
+/// 只影响中间值（保持 NV12 的 4:2:0 偶数约束）。
+fn clamp_encode_width(width: u32) -> u32 {
+    width.clamp(MAX_ENCODE_WIDTH, NATIVE_MAX_ENCODE_WIDTH) & !1
+}
+
 impl Default for WinVideoScreen {
     fn default() -> Self {
         Self::new()
@@ -379,6 +409,15 @@ impl ScreenSource for WinVideoScreen {
                 XcapScreen.capture(display_id)
             }
         }
+    }
+
+    /// 引擎在会话开始、codec 协商完成后设定本会话的编码宽度上限。
+    ///
+    /// 采集源据此把源帧一步缩到目标尺寸：默认 1920（4K 源缩 1080p），原生分辨率
+    /// 硬件 H.264 时 3840（4K 源保持原尺寸 → NVENC 纹理直通有机会命中）。
+    fn set_max_encode_width(&self, width: u32) {
+        self.max_encode_width
+            .store(clamp_encode_width(width), Ordering::Relaxed);
     }
 
     fn supports_gpu_capture(&self) -> bool {
@@ -536,14 +575,144 @@ unsafe impl Send for SharedNvencApi {}
 // SAFETY: 同上——只读函数表可以被多个线程同时读取。
 unsafe impl Sync for SharedNvencApi {}
 
-/// NVENC H.264 4:2:0 编码器工厂。
-#[derive(Debug)]
-pub struct NvencEncoderFactory {
-    /// 进程级函数表。
-    api: SharedNvencApi,
+/// 一种硬件 H.264 编码后端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// NVIDIA NVENC（H.264 4:2:0，输入可以复用 NVIDIA 采集设备）。
+    Nvenc,
+    /// Media Foundation 硬件编码 MFT（Intel QSV / AMD VCE 等）。
+    Mft,
 }
 
-impl VideoEncoderFactory for NvencEncoderFactory {
+/// 按**采集适配器**决定候选编码后端（按优先级排列）。
+///
+/// # 为什么不能无条件优先 NVENC
+///
+/// 混合显卡（Intel 核显负责输出 + NVIDIA 独显）下，采集设备是显示器所接的
+/// **Intel** 那块，而 NVENC 会话必须在 NVIDIA 设备上开。跨设备只能回读，
+/// 恰好放弃了 Intel QSV「采集纹理 → VideoProcessor → MFT」同一设备的零拷贝
+/// 路径。所以采集设备是 Intel/AMD 时先试 MFT；NVIDIA 采集设备、或纯 CPU
+/// 路径（`None`，例如 xcap 回退）才先试 NVENC。
+///
+/// 返回值是**候选序列**而不是单一结论：`create()` 依次尝试，首选失败还能
+/// 落到另一个后端，不至于把已经协商好的 H.264 会话直接打断。NVENC 可用但
+/// 采集在 Intel、且 MFT 探测为假时，序列里仍有 NVENC（跨设备回读，画面正常）。
+fn choose_backend(capture_vendor: Option<u32>, nvenc: bool, mft: bool) -> Vec<Backend> {
+    let mut order = Vec::with_capacity(2);
+    // Intel/AMD 采集设备：MFT 有机会复用采集设备（Intel 零拷贝，AMD 走 CPU 输入）。
+    let prefer_mft = matches!(
+        capture_vendor,
+        Some(d3d11::VENDOR_INTEL | d3d11::VENDOR_AMD)
+    );
+    if prefer_mft && mft {
+        order.push(Backend::Mft);
+    }
+    if nvenc {
+        order.push(Backend::Nvenc);
+    }
+    if mft && !prefer_mft {
+        order.push(Backend::Mft);
+    }
+    order
+}
+
+/// 进程级 MFT 编码器可用性（**懒探测**）。
+///
+/// `MftH264Encoder::new` 要枚举硬件 MFT、初始化 COM/Media Foundation，启动成本
+/// 明显高于加载 NVENC 函数表。只有真正可能用到它——NVENC 不可用，或采集设备是
+/// Intel/AMD——时才付这笔钱。探测结果在进程内缓存，失败不重试。
+static MFT_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// 取（或首次探测）硬件 H.264 编码 MFT 是否可用。
+fn mft_available() -> bool {
+    *MFT_AVAILABLE.get_or_init(|| {
+        let available = MftEncoderFactory::probe();
+        if available {
+            info!("Intel/AMD 硬件 MFT H.264 编码可用");
+        }
+        available
+    })
+}
+
+/// 进程启动时探测一次 NVENC：驱动 DLL 可加载 **且** 存在非软件 NVIDIA 适配器。
+fn nvenc_supported() -> Option<SharedNvencApi> {
+    let api = nvenc_api()?;
+    match d3d11::adapters() {
+        Ok(adapters) if adapters.iter().any(d3d11::AdapterInfo::is_nvidia) => Some(api),
+        Ok(_) => {
+            info!("没有可用的 NVIDIA 适配器，NVENC 不参与 H.264 编码");
+            None
+        }
+        Err(err) => {
+            info!("枚举 DXGI 适配器失败，NVENC 不参与 H.264 编码：{err}");
+            None
+        }
+    }
+}
+
+/// 统一的硬件 H.264 编码器工厂：在 NVENC 与 MFT 之间按采集设备选路。
+///
+/// 取代原先「只要 NVENC 可用就无条件选 NVENC、否则才探测 MFT」的二选一，
+/// 让混合显卡能落到与采集设备同设备的编码器。`api` 为 `None` 表示本进程
+/// 没有 NVENC（此时只有 MFT 可作为后端）。
+#[derive(Debug)]
+pub struct HardwareEncoderFactory {
+    /// 进程级 NVENC 函数表。
+    api: Option<SharedNvencApi>,
+}
+
+impl HardwareEncoderFactory {
+    /// 按指定后端创建编码器适配器。
+    fn create_backend(
+        &self,
+        backend: Backend,
+        capture: Option<&Arc<d3d11::D3d11>>,
+        width: u32,
+        height: u32,
+        target_bitrate_kbps: u32,
+        max_fps: u8,
+    ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+        match backend {
+            Backend::Nvenc => {
+                let api = self
+                    .api
+                    .ok_or_else(|| RemoteError::Encode("NVENC 不可用".to_owned()))?;
+                // 采集设备是 NVIDIA 时**直接复用它**：回读变成设备内 CopyResource，
+                // 也避免了第二块设备的显存/上下文开销。其它情况（Intel/AMD 采集、
+                // 纯 CPU 路径）才新建一块 NVIDIA 设备，由回读器做跨适配器复制。
+                let device = match capture {
+                    Some(device) if device.adapter.is_nvidia() => Arc::clone(device),
+                    _ => Arc::new(d3d11::create_nvidia().map_err(|err| {
+                        RemoteError::Encode(format!("创建 NVIDIA D3D11 设备失败: {err}"))
+                    })?),
+                };
+                let config =
+                    EncoderConfig::new(width, height, u32::from(max_fps), target_bitrate_kbps)
+                        .map_err(|err| RemoteError::Encode(format!("H.264 编码参数非法: {err}")))?
+                        // 回读出来的是 BGRA，而 `NV_ENC_BUFFER_FORMAT_ARGB` 在内存里
+                        // 就是 BGRA 字节序：直接上传，省掉一次整帧通道交换。
+                        .with_input_format(InputFormat::Bgra);
+                let encoder = NvencEncoder::new(api.0, device, config)
+                    .map_err(|err| RemoteError::Encode(format!("NVENC 编码器创建失败: {err}")))?;
+                Ok(Box::new(NvencAdapter {
+                    encoder,
+                    readback: BgraReadback::new(),
+                    zero_copy_disabled: false,
+                    zero_copy_logged: false,
+                }))
+            }
+            Backend::Mft => <MftEncoderFactory as VideoEncoderFactory>::create(
+                &MftEncoderFactory,
+                width,
+                height,
+                target_bitrate_kbps,
+                max_fps,
+            ),
+        }
+    }
+}
+
+impl VideoEncoderFactory for HardwareEncoderFactory {
     fn codec(&self) -> CodecId {
         CodecId::H264
     }
@@ -555,56 +724,139 @@ impl VideoEncoderFactory for NvencEncoderFactory {
         target_bitrate_kbps: u32,
         max_fps: u8,
     ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
-        let d3d = d3d11::create_nvidia()
-            .map_err(|err| RemoteError::Encode(format!("创建 NVIDIA D3D11 设备失败: {err}")))?;
-        let config = EncoderConfig::new(width, height, u32::from(max_fps), target_bitrate_kbps)
-            .map_err(|err| RemoteError::Encode(format!("H.264 编码参数非法: {err}")))?
-            .with_input_format(InputFormat::Rgba);
-        let encoder = NvencEncoder::new(self.api.0, &d3d, config)
-            .map_err(|err| RemoteError::Encode(format!("NVENC 编码器创建失败: {err}")))?;
-        Ok(Box::new(NvencAdapter {
-            encoder,
-            readback: BgraReadback::new(),
-        }))
+        // 创建编码器时首帧采集通常已经发生，`device()` 就是「显示器所接的适配器」。
+        let capture = if gpu_context().is_disabled() {
+            None
+        } else {
+            gpu_context().device()
+        };
+        let capture_vendor = capture.as_ref().map(|device| device.adapter.vendor_id);
+        let nvenc = self.api.is_some();
+        // 懒探测：只有 NVENC 不可用、或采集在 Intel/AMD 时 MFT 才可能入选。
+        let mft_needed = !nvenc
+            || matches!(
+                capture_vendor,
+                Some(d3d11::VENDOR_INTEL | d3d11::VENDOR_AMD)
+            );
+        let mft = mft_needed && mft_available();
+        let mut last_error = None;
+        for backend in choose_backend(capture_vendor, nvenc, mft) {
+            match self.create_backend(
+                backend,
+                capture.as_ref(),
+                width,
+                height,
+                target_bitrate_kbps,
+                max_fps,
+            ) {
+                Ok(encoder) => {
+                    // GUI 日志层会丢 tracing 字段，原因全部内联。
+                    info!(
+                        "H.264 硬件编码后端已选定 backend={backend:?} 采集厂商={capture_vendor:?} 尺寸={width}x{height}"
+                    );
+                    return Ok(encoder);
+                }
+                Err(err) => {
+                    info!("H.264 编码后端 {backend:?} 创建失败，尝试下一个：{err}");
+                    last_error = Some(err);
+                }
+            }
+        }
+        // 候选里不含 MFT（懒探测未触发）时最后兜底一次：NVENC 创建失败不该
+        // 直接打断已经协商好的 H.264 会话。
+        if !mft && mft_available() {
+            match self.create_backend(
+                Backend::Mft,
+                capture.as_ref(),
+                width,
+                height,
+                target_bitrate_kbps,
+                max_fps,
+            ) {
+                Ok(encoder) => {
+                    info!("H.264 编码后端回退到 MFT（采集厂商={capture_vendor:?}）");
+                    return Ok(encoder);
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| RemoteError::Encode("没有可用的 H.264 硬件编码后端".to_owned())))
     }
 }
 
-/// `NvencEncoder` 的 remote 适配器：尺寸不同时先做 CPU 盒式下采样。
+/// 是否可以用零拷贝直通（把采集纹理直接交给 NVENC，`nvEncRegisterResource`）。
 ///
-/// NVENC 的输入纹理必须由它自己的设备创建，不能直接吃采集纹理（与 MFT 不同），
-/// 所以收到 GPU 帧时先回读 BGRA 再走原有的 RGBA 上传路径。**这条回读没有 GPU
-/// 收益**，只是为了让「被控端有 NVIDIA 独显」时不至于因 GPU 帧而失败。
+/// 三个条件缺一不可：
+/// - **同设备**：注册给 NVENC 的资源必须与编码会话在同一块 D3D11 设备上；跨设备
+///   注册会被驱动直接拒绝（混合显卡下采集常常落在 Intel 核显）。
+/// - **尺寸相等**：NVENC 的 `inputWidth/Height` 只做左上角裁剪、**不缩放**，4K 采集
+///   按默认上限缩到 1920 时尺寸不同，必须先回读 + CPU 盒式下采样；原生分辨率（3840）
+///   下两者相等，直通才有机会命中。
+/// - **本会话未禁用直通**：注册/映射失败过一次就永久回退（单向开关），避免每帧
+///   重试一次注定失败的驱动调用。
+fn can_use_direct_texture(
+    same_device: bool,
+    source: (u32, u32),
+    encode: (u32, u32),
+    disabled: bool,
+) -> bool {
+    same_device && source == encode && !disabled
+}
+
+/// `NvencEncoder` 的 remote 适配器。
+///
+/// **两条输入路径**（见 [`can_use_direct_texture`]）：
+/// - 采集纹理与编码器同设备且尺寸相等时，纹理**直接注册给 NVENC**，全程不落 CPU；
+/// - 否则（混合显卡跨设备、4K → 1920 缩放、或直通已在本会话失败过）回读 BGRA，
+///   必要时做 CPU 盒式下采样，再走 `UpdateSubresource` 上传。
+///
+/// 直通失败只关掉直通本身，**不关 GPU 采集**：回读路径仍然可用，当帧照常编码。
 struct NvencAdapter {
-    /// 硬件编码器（只借用 `'static` 的函数表）。
+    /// 硬件编码器（只借用 `'static` 的函数表，设备由编码器持有）。
     encoder: NvencEncoder<'static>,
     /// 可复用的 GPU→CPU 回读器（staging 纹理按尺寸缓存）。
     readback: BgraReadback,
+    /// 本会话是否已禁用纹理直通（单向；只影响直通，不影响 GPU 采集）。
+    zero_copy_disabled: bool,
+    /// 是否已打印过「直通已启用」日志（只打一次，便于真机确认走的是零拷贝）。
+    zero_copy_logged: bool,
 }
 
 impl NvencAdapter {
-    /// 把采集纹理回读成编码器尺寸的 RGBA。
+    /// 把采集纹理回读成编码器尺寸的 **BGRA**。
     ///
-    /// 4K 采集封顶到 1920 时，`source_width/height` 仍是纹理物理尺寸，故这里用
-    /// [`scale_bgra_to_rgba`] 一步完成下采样 + 通道交换（不是先转 RGBA 再缩）。
-    fn readback_to_rgba(&mut self, gpu: &WinGpuFrame) -> RemoteResult<Vec<u8>> {
-        let (src_width, src_height, bgra) =
-            self.readback.read(&gpu.texture).map_err(|err| {
-                gpu_context().disable(&format!("NVENC GPU 帧回读失败: {err}"));
-                RemoteError::Encode(format!("NVENC GPU 帧回读失败: {err}"))
-            })?;
+    /// 同尺寸时直接返回回读结果（零转换）；4K 采集封顶到 1920 时用
+    /// [`scale_bgra_to_rgba`] 一步完成下采样，再**原地**把 R/B 换回来（通道交换
+    /// 自反，省掉一次分配）。编码器配成 [`InputFormat::Bgra`]，所以上传前
+    /// **不再**做整帧通道交换。
+    fn readback_to_bgra(&mut self, gpu: &WinGpuFrame) -> RemoteResult<Vec<u8>> {
+        let (src_width, src_height, bgra) = self.readback.read(&gpu.texture).map_err(|err| {
+            gpu_context().disable(&format!("NVENC GPU 帧回读失败: {err}"));
+            RemoteError::Encode(format!("NVENC GPU 帧回读失败: {err}"))
+        })?;
         let (dst_width, dst_height) = self.encoder.size();
-        let rgba = if (src_width, src_height) == (dst_width, dst_height) {
-            bgra_to_rgba(&bgra)
-        } else {
-            scale_bgra_to_rgba(&bgra, src_width, src_height, dst_width, dst_height).map_err(
-                |err| {
-                    gpu_context().disable(&format!("NVENC GPU 帧下采样失败: {err}"));
-                    RemoteError::Encode(format!("NVENC GPU 帧下采样失败: {err}"))
-                },
-            )?
-        };
-        Ok(rgba)
+        if (src_width, src_height) == (dst_width, dst_height) {
+            return Ok(bgra);
+        }
+        let mut scaled = scale_bgra_to_rgba(&bgra, src_width, src_height, dst_width, dst_height)
+            .map_err(|err| {
+                gpu_context().disable(&format!("NVENC GPU 帧下采样失败: {err}"));
+                RemoteError::Encode(format!("NVENC GPU 帧下采样失败: {err}"))
+            })?;
+        for pixel in scaled.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        Ok(scaled)
     }
+}
+
+/// RGBA → BGRA。
+///
+/// 通道交换是**自反的**（只交换第 0/2 字节），所以直接复用 [`bgra_to_rgba`]
+/// 的优化实现；名字只是为了让调用点的方向一目了然。
+fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    bgra_to_rgba(rgba)
 }
 
 impl VideoEncoderApi for NvencAdapter {
@@ -652,14 +904,20 @@ impl VideoEncoderApi for NvencAdapter {
         let (dst_width, dst_height) = self.encoder.size();
         // NVENC 只按 inputWidth/Height 做左上角裁剪，绝不缩放，所以 4K 源必须
         // 在 CPU 上缩到编码尺寸（4K→1080p 命中 2×2 快速路径）。
-        let packet = if (src_width, src_height) == (dst_width, dst_height) {
-            self.encoder.encode_rgba(rgba, force_keyframe)
+        //
+        // **CPU 输入是 RGBA，而编码器配的是 BGRA**：这里要换一次通道（GPU 回读
+        // 路径则天然是 BGRA，不必换）。两条输入路径的格式不能混。
+        let bgra = if (src_width, src_height) == (dst_width, dst_height) {
+            rgba_to_bgra(rgba)
         } else {
             let scaled = scale_rgba_box(rgba, src_width, src_height, dst_width, dst_height)
                 .map_err(|err| RemoteError::Encode(format!("H.264 输入下采样失败: {err}")))?;
-            self.encoder.encode_rgba(&scaled, force_keyframe)
-        }
-        .map_err(|err| RemoteError::Encode(format!("NVENC 编码失败: {err}")))?;
+            rgba_to_bgra(&scaled)
+        };
+        let packet = self
+            .encoder
+            .encode_bgra(&bgra, force_keyframe)
+            .map_err(|err| RemoteError::Encode(format!("NVENC 编码失败: {err}")))?;
         Ok(EncodedVideo {
             data: packet.data,
             keyframe: packet.keyframe,
@@ -675,22 +933,69 @@ impl VideoEncoderApi for NvencAdapter {
             // CPU 帧：与默认实现等价。
             return self.encode(&frame.rgba, frame.width, frame.height, force_keyframe);
         };
-        // NVENC 不能直接吃 WGC/DXGI 的采集纹理（跨设备），只能回读。代码路径统一
-        // 走 `WinGpuFrame`，未知载体说明上游接错了，直接报错（不静默编码空帧）。
-        let gpu_frame = gpu.as_any().downcast_ref::<WinGpuFrame>().ok_or_else(|| {
-            RemoteError::Encode("NVENC 收到无法识别的 GPU 帧".to_owned())
-        })?;
-        let rgba = self.readback_to_rgba(gpu_frame)?;
-        let (dst_width, dst_height) = self.encoder.size();
-        self.encode(&rgba, dst_width, dst_height, force_keyframe)
+        // 代码路径统一走 `WinGpuFrame`；未知载体说明上游接错了，直接报错
+        // （不静默编码空帧）。
+        let gpu_frame = gpu
+            .as_any()
+            .downcast_ref::<WinGpuFrame>()
+            .ok_or_else(|| RemoteError::Encode("NVENC 收到无法识别的 GPU 帧".to_owned()))?;
+        // 直通选路。**同设备**由 `Arc::ptr_eq` 判断：工厂在采集设备是 NVIDIA 时
+        // 直接复用它，采集源重建换设备后这里会自动落回回读。
+        let source = (gpu_frame.source_width, gpu_frame.source_height);
+        if can_use_direct_texture(
+            self.encoder.is_same_device(&gpu_frame.texture.device),
+            source,
+            self.encoder.size(),
+            self.zero_copy_disabled,
+        ) {
+            match self
+                .encoder
+                .encode_texture(&gpu_frame.texture.texture, force_keyframe)
+            {
+                Ok(packet) => {
+                    if !self.zero_copy_logged {
+                        self.zero_copy_logged = true;
+                        // GUI 日志层会丢 tracing 字段，全部内联。
+                        info!(
+                            "NVENC 纹理直通已启用（零拷贝） adapter={} 尺寸={}x{}",
+                            gpu_frame.texture.device.adapter.name,
+                            gpu_frame.source_width,
+                            gpu_frame.source_height,
+                        );
+                    }
+                    return Ok(EncodedVideo {
+                        data: packet.data,
+                        keyframe: packet.keyframe,
+                    });
+                }
+                Err(err) => {
+                    // 直通失败**只关直通**：回读路径照常可用，本帧继续编码。
+                    // 关掉整个 GPU 采集会让一次驱动拒绝把画面整体降级到 xcap。
+                    self.zero_copy_disabled = true;
+                    // GUI 日志层会丢 tracing 字段，原因全部内联。
+                    warn!("NVENC 纹理直通不可用，本会话回退回读上传：{err}");
+                }
+            }
+        }
+        let bgra = self.readback_to_bgra(gpu_frame)?;
+        // 回读结果已经是编码器尺寸的 BGRA，直接上传。
+        let packet = self
+            .encoder
+            .encode_bgra(&bgra, force_keyframe)
+            .map_err(|err| RemoteError::Encode(format!("NVENC 编码失败: {err}")))?;
+        Ok(EncodedVideo {
+            data: packet.data,
+            keyframe: packet.keyframe,
+        })
     }
 }
 
 /// Media Foundation 硬件 H.264 编码器工厂（Intel QSV / AMD VCE 等）。
 ///
-/// 只在 NVENC 不可用时才探测；实际是否可用由 `MftH264Encoder::new` 的硬件
-/// MFT 枚举决定。Intel MFT 不支持运行期改帧率，适配器会保持内部帧率，只让
-/// 采集节奏随 QoS 变化，避免重建编码器/插 IDR。
+/// 探测是**懒加载**的（见 [`mft_available`]）：NVENC 可用的机器只有在采集设备
+/// 是 Intel/AMD 时才会付 `MftEncoderFactory::probe()` 的启动成本。实际是否可用
+/// 由 `MftH264Encoder::new` 的硬件 MFT 枚举决定。Intel MFT 不支持运行期改帧率，
+/// 适配器会保持内部帧率，只让采集节奏随 QoS 变化，避免重建编码器/插 IDR。
 #[derive(Debug)]
 pub struct MftEncoderFactory;
 
@@ -1084,8 +1389,12 @@ impl VideoDecoderApi for H264DecoderAdapter {
 
 /// 探测并构造 Windows 硬件编解码工厂。
 ///
-/// 返回的每一侧都是独立的：NVENC 不可用不影响 MFT 解码声明，反之亦然。
+/// 返回的每一侧都是独立的：NVENC/MFT 不可用不影响 MFT 解码声明，反之亦然。
 /// 任一侧为 `None` 时，协商会回退到 VP9。
+///
+/// **编码后端在这里不锁定**：NVENC 可用时只代表「H.264 值得声明」，具体用
+/// NVENC 还是 MFT 由 [`HardwareEncoderFactory::create`] 在会话建立时按采集
+/// 适配器决定（见 [`choose_backend`]）。MFT 探测对 NVENC 可用的机器保持懒加载。
 #[must_use]
 pub fn factories() -> super::HardwareFactories {
     // 现场诊断开关：怀疑 NVENC/Media Foundation 探测导致启动问题时置 1，
@@ -1094,33 +1403,18 @@ pub fn factories() -> super::HardwareFactories {
         info!("RUST_TUNNEL_DISABLE_HWCODEC 已设置，跳过 NVENC/MFT 探测");
         return (None, None);
     }
-    let nvenc = match nvenc_api() {
-        Some(api) => match d3d11::create_nvidia() {
-            Ok(_) => {
-                info!("NVENC H.264 硬件编码已注入");
-                let factory: Arc<dyn VideoEncoderFactory> = Arc::new(NvencEncoderFactory { api });
-                Some(factory)
-            }
-            Err(err) => {
-                info!(error = %err, "没有可用的 NVIDIA 适配器，尝试 Intel/AMD 硬件 MFT");
-                None
-            }
-        },
-        None => None,
-    };
-    // NVENC 优先；没有 NVIDIA 时再探测 Intel QSV / AMD VCE 的硬件编码 MFT。
-    let encoder = match nvenc {
-        Some(factory) => Some(factory),
-        None => {
-            if MftEncoderFactory::probe() {
-                info!("Intel/AMD 硬件 MFT H.264 编码已注入");
-                let factory: Arc<dyn VideoEncoderFactory> = Arc::new(MftEncoderFactory);
-                Some(factory)
-            } else {
-                info!("没有可用的硬件 H.264 编码器（NVENC/MFT），回退 VP9");
-                None
-            }
-        }
+    let api = nvenc_supported();
+    let encoder = if api.is_some() {
+        info!("NVENC H.264 硬件编码已注入（编码后端在会话建立时按采集设备选路）");
+        let factory: Arc<dyn VideoEncoderFactory> = Arc::new(HardwareEncoderFactory { api });
+        Some(factory)
+    } else if mft_available() {
+        info!("Intel/AMD 硬件 MFT H.264 编码已注入");
+        let factory: Arc<dyn VideoEncoderFactory> = Arc::new(HardwareEncoderFactory { api: None });
+        Some(factory)
+    } else {
+        info!("没有可用的硬件 H.264 编码器（NVENC/MFT），回退 VP9");
+        None
     };
     let decoder = H264DecoderFactory::new().map(|factory| {
         let factory: Arc<dyn VideoDecoderFactory> = Arc::new(factory);
@@ -1147,5 +1441,161 @@ pub fn enable_per_monitor_dpi_awareness() {
     let ok = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     if ok == 0 {
         debug!("SetProcessDpiAwarenessContext(PMv2) 失败（可能已设置过），沿用当前感知级别");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // 测试代码豁免 panic 风险 lint：断言失败即 panic 是测试的预期行为。
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{can_use_direct_texture, choose_backend, clamp_encode_width, Backend};
+    use rust_tunnel_win_video::d3d11::{VENDOR_AMD, VENDOR_INTEL, VENDOR_NVIDIA};
+
+    /// 采集侧上限的钳制表：只接受 `[1920, 3840]`、结果恒为偶数。
+    ///
+    /// 钉住两条：① 引擎传的 1920/3840 原样落地（原生选项不被悄悄降级）；
+    /// ② 越界/垃圾值被钳到边界且不产生奇数（奇数会让 NV12 色度块错位）。
+    #[test]
+    fn clamp_encode_width_table() {
+        assert_eq!(clamp_encode_width(1920), 1920);
+        assert_eq!(clamp_encode_width(3840), 3840);
+        assert_eq!(clamp_encode_width(2560), 2560);
+        // 低于下界：钳到 1920（0 也不会把画面缩没）。
+        assert_eq!(clamp_encode_width(0), 1920);
+        assert_eq!(clamp_encode_width(1280), 1920);
+        // 高于上界：钳到 3840。
+        assert_eq!(clamp_encode_width(7680), 3840);
+        assert_eq!(clamp_encode_width(u32::MAX), 3840);
+        // 奇数对齐（中间值）。
+        assert_eq!(clamp_encode_width(2559), 2558);
+        assert_eq!(clamp_encode_width(1921), 1920);
+    }
+
+    /// 厂商 × 后端可用性 → 候选序列的完整表格。
+    ///
+    /// 钉住的**不变量**：
+    /// - Intel/AMD 采集设备上，MFT 可用时**绝不能**把 NVENC 排在前面
+    ///   （否则混合显卡会退化成跨设备回读，白丢 QSV 零拷贝）；
+    /// - NVIDIA 采集设备 / 未知厂商 / 无采集设备（CPU 路径）优先 NVENC；
+    /// - NVENC 不可用时必须回退 MFT（且绝不能返回空序列而漏掉 MFT）；
+    /// - 两个后端都不可用时返回空序列（`create()` 才不会误报成功）。
+    #[test]
+    fn choose_backend_table() {
+        const NVIDIA: Option<u32> = Some(VENDOR_NVIDIA);
+        const INTEL: Option<u32> = Some(VENDOR_INTEL);
+        const AMD: Option<u32> = Some(VENDOR_AMD);
+        const OTHER: Option<u32> = Some(0x9999);
+        const NONE: Option<u32> = None;
+        let cases: [(Option<u32>, bool, bool, Vec<Backend>); 14] = [
+            // NVIDIA 采集设备：同设备 NVENC 优先，MFT 作兜底。
+            (NVIDIA, true, true, vec![Backend::Nvenc, Backend::Mft]),
+            (NVIDIA, true, false, vec![Backend::Nvenc]),
+            (NVIDIA, false, true, vec![Backend::Mft]),
+            // Intel 采集设备：MFT 永远排在 NVENC 前面。
+            (INTEL, true, true, vec![Backend::Mft, Backend::Nvenc]),
+            (INTEL, true, false, vec![Backend::Nvenc]),
+            (INTEL, false, true, vec![Backend::Mft]),
+            // AMD 采集设备：MFT 优先（当前是 CPU RGBA 输入，未验证零拷贝）。
+            (AMD, true, true, vec![Backend::Mft, Backend::Nvenc]),
+            (AMD, false, true, vec![Backend::Mft]),
+            // 其它厂商：与无采集设备同规则（NVENC 优先）。
+            (OTHER, true, true, vec![Backend::Nvenc, Backend::Mft]),
+            (OTHER, false, true, vec![Backend::Mft]),
+            // 无采集设备（CPU 路径）：NVENC 优先。
+            (NONE, true, true, vec![Backend::Nvenc, Backend::Mft]),
+            (NONE, true, false, vec![Backend::Nvenc]),
+            (NONE, false, true, vec![Backend::Mft]),
+            (NONE, false, false, vec![]),
+        ];
+        for (vendor, nvenc, mft, expected) in cases {
+            assert_eq!(
+                choose_backend(vendor, nvenc, mft),
+                expected,
+                "vendor={vendor:?} nvenc={nvenc} mft={mft}"
+            );
+        }
+    }
+
+    /// 两条最容易被「顺手优化」推翻的不变量，单独钉一遍。
+    #[test]
+    fn intel_capture_never_prefers_nvenc() {
+        for nvenc in [true, false] {
+            let order = choose_backend(Some(VENDOR_INTEL), nvenc, true);
+            assert_eq!(order.first(), Some(&Backend::Mft), "nvenc={nvenc}");
+        }
+    }
+
+    /// NVENC 不可用时，只要 MFT 可用就必须有候选（不能因为采集设备是
+    /// NVIDIA 就返回空序列）。
+    #[test]
+    fn mft_is_used_when_nvenc_is_unavailable() {
+        for vendor in [
+            None,
+            Some(VENDOR_NVIDIA),
+            Some(VENDOR_INTEL),
+            Some(VENDOR_AMD),
+            Some(0x9999),
+        ] {
+            assert_eq!(
+                choose_backend(vendor, false, true),
+                vec![Backend::Mft],
+                "vendor={vendor:?}"
+            );
+        }
+    }
+
+    /// 直通选路的完整表格。
+    ///
+    /// 钉住的**不变量**：
+    /// - 跨设备（混合显卡：采集在 Intel、编码在 NVIDIA）**永远不能**直通——
+    ///   NVENC 注册会失败，而失败一次就会把直通永久关掉；
+    /// - 尺寸不等（4K 采集封顶到 1920）**永远不能**直通——NVENC 只裁剪不缩放，
+    ///   否则画面会被裁成左上角而不是缩放；
+    /// - 会话级 `disabled` 一旦置位，即使前面两个条件恢复也不能再直通。
+    #[test]
+    fn can_use_direct_texture_table() {
+        const HD: (u32, u32) = (1920, 1080);
+        const UHD: (u32, u32) = (3840, 2160);
+        let cases: [(bool, (u32, u32), (u32, u32), bool, bool); 8] = [
+            // 同设备 + 同尺寸 + 未禁用 → 直通。
+            (true, HD, HD, false, true),
+            // 4K 纹理 / 1080p 编码：要缩放，只能回读。
+            (true, UHD, HD, false, false),
+            // 跨设备：注册必失败。
+            (false, HD, HD, false, false),
+            // 会话级禁用：无论其它条件如何都回读。
+            (true, HD, HD, true, false),
+            (true, UHD, HD, true, false),
+            (false, HD, HD, true, false),
+            // 编码器比采集纹理大（不该出现，但不能因此误判成可直通）。
+            (true, HD, UHD, false, false),
+            // 尺寸与设备同时满足、但禁用标志为真。
+            (true, HD, HD, true, false),
+        ];
+        for (same_device, source, encode, disabled, expected) in cases {
+            assert_eq!(
+                can_use_direct_texture(same_device, source, encode, disabled),
+                expected,
+                "same_device={same_device} source={source:?} encode={encode:?} disabled={disabled}"
+            );
+        }
+    }
+
+    /// 禁用标志是单向的：一旦置位，健康条件下也不能重新启用（避免每帧重试）。
+    #[test]
+    fn direct_texture_stays_disabled_once_flagged() {
+        assert!(can_use_direct_texture(
+            true,
+            (1920, 1080),
+            (1920, 1080),
+            false
+        ));
+        assert!(!can_use_direct_texture(
+            true,
+            (1920, 1080),
+            (1920, 1080),
+            true
+        ));
     }
 }

@@ -273,6 +273,12 @@ pub struct RemoteManagerConfig {
     pub enabled: bool,
     /// 数据面建立器。
     pub establisher: Arc<dyn TransportEstablisher>,
+    /// 是否允许**原生分辨率**（4K）编码（默认 `false`）。
+    ///
+    /// 仅在被控端协商到**硬件 H.264** 时生效：编码宽度上限从 1920 放宽到 3840，档位码率
+    /// 翻倍（封顶 30 Mbps）。VP9 路径不受影响。运行中修改经
+    /// [`RemoteManager::set_native_resolution`]，只对**下一次会话**生效。
+    pub native_resolution: bool,
     /// 屏幕编码参数。
     pub encode: EncodeOptions,
     /// 被控端对外共享的目录；`None` = 本端不接受任何文件请求。
@@ -418,6 +424,11 @@ pub struct RemoteManager {
     share: Option<ShareDir>,
     /// 自引用弱指针（供同步方法 `spawn` 使用）。
     self_weak: Weak<RemoteManager>,
+    /// 被控端是否允许原生分辨率（4K）编码。
+    ///
+    /// 用原子而不是 `Inner` 锁：由 GUI 的 UI 线程在会话进行中随时调用，会话任务只在**开始**
+    /// 时读一次；没必要为一次读抢内部锁。改动只影响下一次会话（编码宽度在协商后固定）。
+    native_resolution: AtomicBool,
     /// 构造时所在的 Tokio 运行时句柄。
     ///
     /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
@@ -456,6 +467,7 @@ impl RemoteManager {
         let rt = tokio::runtime::Handle::try_current().ok();
         let out_pump = rt.as_ref().map(|_| Arc::new(Notify::new()));
         let rt_field = rt.clone();
+        let native_resolution = cfg.native_resolution;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -478,6 +490,7 @@ impl RemoteManager {
             share,
             self_weak: weak.clone(),
             rt: rt_field,
+            native_resolution: AtomicBool::new(native_resolution),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -643,6 +656,14 @@ impl RemoteManager {
     pub fn set_frame_rate(&self, fps: u8) {
         self.update_ui(|s| s.frame_rate = fps);
         self.send_command(ControllerCommand::SetFrameRate(fps));
+    }
+
+    /// 设置被控端是否允许**原生分辨率（4K）**编码（默认关闭）。
+    ///
+    /// 只对**下一次**会话生效：编码宽度上限在会话开始、codec 协商完成后确定，运行中的会话
+    /// 不重建编码器（重建会强制 IDR）。对端只支持 VP9 时该开关被忽略（仍按 1920 编码）。
+    pub fn set_native_resolution(&self, on: bool) {
+        self.native_resolution.store(on, Ordering::Relaxed);
     }
 
     /// 把本机剪贴板文本发给被控端。
@@ -1540,6 +1561,7 @@ impl RemoteManager {
             mode,
             pending,
             encode: self.cfg.encode,
+            native_resolution: self.native_resolution.load(Ordering::Relaxed),
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: self.build_stats_reporter(cancel.clone()),
@@ -2097,6 +2119,7 @@ mod tests {
             displays: 1,
             enabled,
             establisher,
+            native_resolution: false,
             encode: EncodeOptions::default(),
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),
@@ -2258,6 +2281,7 @@ mod tests {
             displays: 1,
             enabled,
             establisher: Arc::new(NeverEstablisher),
+            native_resolution: false,
             encode: EncodeOptions::default(),
             share_dir: None,
             download_dir: std::path::PathBuf::from("/tmp/rt-remote-test"),

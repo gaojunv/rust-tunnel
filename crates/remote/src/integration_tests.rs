@@ -297,6 +297,7 @@ fn manager_with_dirs(
         displays: 1,
         enabled,
         establisher,
+        native_resolution: false,
         encode: EncodeOptions {
             target_bitrate_kbps: 2000,
             scale: 1.0,
@@ -642,6 +643,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         mode: RemoteMode::Control,
         pending,
         encode: EncodeOptions::default(),
+        native_resolution: false,
         capture_watchdog: CAPTURE_WATCHDOG,
         unchanged_resend: UNCHANGED_RESEND_INTERVAL,
         stats: SessionStatsReporter::noop(),
@@ -718,6 +720,7 @@ async fn correct_token_completes_handshake_and_streams() {
             mode: RemoteMode::ViewOnly,
             pending,
             encode: EncodeOptions::default(),
+            native_resolution: false,
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
@@ -1391,6 +1394,7 @@ async fn handshake_against_unregistered_token(
             // 而不是「一张新造的空表里查不到」。
             pending,
             encode: EncodeOptions::default(),
+            native_resolution: false,
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),

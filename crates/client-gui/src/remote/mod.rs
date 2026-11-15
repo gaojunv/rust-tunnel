@@ -48,7 +48,9 @@ use rust_tunnel_remote::{
     VideoDecoderFactory, VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 // 补丁相关类型未在 crate 根 re-export（`screen` 是公开模块），直接按模块路径引入。
-use rust_tunnel_remote::screen::{DecodedPatch, ScreenPatch};
+use rust_tunnel_remote::screen::DecodedPatch;
+
+use nv12_renderer::CompositeFrame;
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
 //
@@ -1255,19 +1257,16 @@ fn query_origins() -> Vec<(u32, i32, i32)> {
 /// 引擎侧 [`FrameSink`] 与 UI 共享的画面槽。
 #[derive(Default)]
 pub struct FrameState {
-    /// 最新一帧**整帧**（VP9 数据面下每一帧都是整帧）。UI 取走即清；未消费时被覆盖，只保留最新。
+    /// 最新一帧 **RGBA** 画面（VP9 数据面）。NV12 帧不在这里——它们整块移进 [`Self::composite`]，
+    /// UI 侧经共享 `Arc` 直接交给渲染线程，不再「`composite` 一份 + `latest` 一份」。
     pub latest: Option<DecodedFrame>,
-    /// 持久 NV12 合成帧（编码尺寸）。全帧到达时整块替换，补丁到达时按矩形覆写。
+    /// 与渲染线程共享的持久 NV12 合成帧（编码尺寸）。
     ///
-    /// 这是补丁模式的基底：`RegionUpdate` 只带脏矩形，必须合成到上一帧之上。VP9/RGBA 帧
-    /// 到达时清空（补丁模式是 H.264-only）。
-    ///
-    /// 代价是**每个全帧多一次整块克隆**（1080p 约 3 MB）：渲染侧本来就要把整帧 NV12 上传，
-    /// 多出来的只是这一次 `Vec` 拷贝。换成 `Arc<DecodedNv12>` 能省掉它，但那要改引擎里
-    /// `DecodedFrame.nv12` 的类型（牵动会话数据面），不值得为一次拷贝动它。
-    composite: Option<DecodedNv12>,
-    /// `composite` 的编码尺寸（宽, 高）；`(0, 0)` 表示没有合成帧。
-    composite_dims: (u32, u32),
+    /// 全帧到达时**换一个新实例**（帧数据 move 进去，不 clone）；补丁到达时在同一块缓冲上原地
+    /// 覆写并累积脏矩形。渲染线程经 [`CompositeFrame::take_upload`] 取走脏矩形、只上传这些区域，
+    /// 因此补丁路径既没有整帧 clone、也没有整帧上传。VP9/RGBA 帧到达时清空（补丁模式是
+    /// H.264-only）。
+    composite: Option<Arc<CompositeFrame>>,
     /// 显示器列表（会话建立时下发一次）。
     pub displays: Vec<DisplayInfo>,
     /// 会话关闭原因（UI 取走即清）。
@@ -1281,7 +1280,7 @@ pub struct FrameState {
     pub frame_count: u32,
     /// 本会话累计**上屏**的补丁批数（与 `frame_count` 同款：UI 按秒差分即得到补丁速率）。
     ///
-    /// 只有成功应用到合成帧的批次才计数；因无基底/矩形非法被整批丢弃的不算。
+    /// 只有成功应用到合成帧的批次才计数；因无基底/尺寸不符/矩形非法被整批丢弃的不算。
     pub patch_count: u32,
 }
 
@@ -1311,63 +1310,74 @@ impl FrameSink for GuiFrameSink {
         self.ctx.request_repaint_of(self.viewport);
     }
 
-    fn on_frame(&self, frame: DecodedFrame) {
+    fn on_frame(&self, mut frame: DecodedFrame) {
+        // 把 NV12 **移出**帧（不 clone），整块交给共享合成缓冲。
+        let nv12 = frame.nv12.take();
         if let Ok(mut guard) = self.shared.lock() {
-            // 持久合成帧随全帧整块替换（见 `FrameState::composite`）。VP9/RGBA 帧
-            // （`nv12 == None`）清空它——补丁模式是 H.264-only，RGBA 帧没有 NV12 基底。
-            if let Some(nv12) = frame.nv12.as_ref() {
-                guard.composite = Some(nv12.clone());
-                guard.composite_dims = (frame.width, frame.height);
+            if let Some(nv12) = nv12 {
+                // 持久合成帧随全帧**换新实例**（数据 move 进去，零拷贝）。VP9/RGBA 帧
+                // （`nv12 == None`）清空它——补丁模式是 H.264-only，RGBA 帧没有 NV12 基底。
+                if let Some(composite) = CompositeFrame::new(frame.width, frame.height, nv12) {
+                    guard.composite = Some(Arc::new(composite));
+                    guard.latest = None;
+                } else {
+                    tracing::warn!(
+                        width = frame.width,
+                        height = frame.height,
+                        "NV12 帧尺寸/平面长度不自洽，丢弃整帧"
+                    );
+                }
             } else {
                 guard.composite = None;
-                guard.composite_dims = (0, 0);
+                guard.latest = Some(frame);
             }
-            guard.latest = Some(frame);
             guard.frame_count = guard.frame_count.wrapping_add(1);
         }
         self.ctx.request_repaint_of(self.viewport);
     }
 
-    /// 一批脏矩形补丁：先合成到持久帧缓冲，再把**整帧**交给渲染。
+    /// 一批脏矩形补丁：**原地**拼进共享合成帧，并登记脏区供渲染侧增量上传。
     ///
-    /// 渲染侧只认整帧（`upload` 只看 `latest`），故补丁落地后必须把合成结果整块交出去。
-    /// 任何一步失败都整批丢弃：没有基底（还没收到全帧）或任一矩形非法时不重绘——保持上一次
-    /// 完整画面，等引擎请求回来的全帧（解码任务在丢弃补丁前已经请求关键帧）。
+    /// 没有基底（还没收到全帧）、尺寸与基底不符、或任一矩形非法时整批丢弃：缓冲一个字节都不改
+    /// （批次层先逐块校验、全部合法才写，不需要克隆整帧做回滚副本），保持上一次完整画面，等引擎
+    /// 请求回来的全帧（解码任务在丢弃补丁前已经请求关键帧）。
     fn on_patch(&self, patch: DecodedPatch) {
         let Ok(mut guard) = self.shared.lock() else {
             return;
         };
-        // 先取尺寸，再可变借用 `composite`（两个字段的借用互不重叠）。
-        let dims_match = guard.composite_dims == (patch.width, patch.height);
-        let mut composed = None;
-        if dims_match {
-            if let Some(composite) = guard.composite.as_mut() {
-                if apply_patch_batch(composite, patch.width, &patch.rects) {
-                    // 渲染侧拿到的是整帧快照；持久缓冲仍要留着承接下一批补丁。
-                    composed = Some(composite.clone());
-                }
-            }
-        }
-        let Some(nv12) = composed else {
+        // 克隆 `Arc`（指针级）后立刻放掉 FrameState 的锁：补丁应用只需合成帧自己的锁。
+        let Some(composite) = guard.composite.clone() else {
             tracing::debug!(
                 display = patch.display,
                 width = patch.width,
                 height = patch.height,
                 rects = patch.rects.len(),
-                "补丁没有可用基底或矩形非法，整批丢弃"
+                "补丁没有可用基底，整批丢弃"
             );
             return;
         };
+        if composite.dims() != (patch.width, patch.height) {
+            tracing::debug!(
+                display = patch.display,
+                width = patch.width,
+                height = patch.height,
+                frame = ?composite.dims(),
+                rects = patch.rects.len(),
+                "补丁尺寸与合成帧不符，整批丢弃"
+            );
+            return;
+        }
+        if !composite.apply_patches(&patch.rects) {
+            tracing::debug!(
+                display = patch.display,
+                width = patch.width,
+                height = patch.height,
+                rects = patch.rects.len(),
+                "补丁矩形非法，整批丢弃"
+            );
+            return;
+        }
         guard.patch_count = guard.patch_count.wrapping_add(1);
-        guard.latest = Some(DecodedFrame {
-            display: patch.display,
-            width: patch.width,
-            height: patch.height,
-            // 补丁不占视频序号（见 `session::RegionUpdate` 的文档）；渲染侧用的是本地 paint 序号。
-            seq: 0,
-            rgba: Vec::new(),
-            nv12: Some(nv12),
-        });
         drop(guard);
         self.ctx.request_repaint_of(self.viewport);
     }
@@ -1385,28 +1395,11 @@ impl FrameSink for GuiFrameSink {
             guard.closed = Some(reason);
             // 合成帧的基底已作废：重连/新会话必须从全帧重新开始。
             guard.composite = None;
-            guard.composite_dims = (0, 0);
         }
         // 会话窗口要显示「已结束」，根窗口也要更新会话状态（否则它只在 300/600 ms 的定时里刷）。
         self.ctx.request_repaint_of(self.viewport);
         self.ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
-}
-
-/// 把一批补丁**原子地**应用到合成帧；任一矩形非法则整批放弃，`composite` 保持原样。
-///
-/// [`DecodedNv12::apply_patch`] 只保证**单个**矩形原子：第二个矩形失败时第一个已经写进去了。
-/// 那种「半截应用」会永久留在持久缓冲里（画面缺一块且无法回滚），所以先应用到副本、全部
-/// 成功再整体提交。补丁模式下批次很小且不频繁，这次整块拷贝换来的是「不可能半截」。
-fn apply_patch_batch(composite: &mut DecodedNv12, width: u32, rects: &[ScreenPatch]) -> bool {
-    let mut candidate = composite.clone();
-    for rect in rects {
-        if !candidate.apply_patch(width, rect) {
-            return false;
-        }
-    }
-    *composite = candidate;
-    true
 }
 
 // ── 会话视图状态 ────────────────────────────────────────────────────
@@ -1448,14 +1441,12 @@ pub enum FramePaint {
     },
     /// 紧包 NV12：交给 wgpu 着色器直接采样上屏（Windows H.264 硬件路径）。
     Nv12 {
-        /// 解码后的 NV12 两个平面。
-        frame: Arc<DecodedNv12>,
+        /// 与解码线程共享的持久合成帧（全帧 + 已应用的补丁；渲染侧按脏矩形增量上传）。
+        frame: Arc<CompositeFrame>,
         /// 可见画面宽度（像素）。
         width: u32,
         /// 可见画面高度（像素）。
         height: u32,
-        /// 帧序号（GPU 侧据此去重上传）。
-        seq: u64,
         /// egui 渲染目标格式（决定 shader 的片元入口）。
         target_format: egui_wgpu::wgpu::TextureFormat,
     },
@@ -1493,12 +1484,12 @@ pub struct RemoteView {
     wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
     /// 上一帧画出来的画面；没有新帧时复用它（避免画面在静止时消失）。
     last_paint: Option<FramePaint>,
-    /// NV12 GPU 上传的本地帧序号（单调递增，**跨会话不重置**）。
+    /// CPU 回退路径（Glow）上一次转换的 NV12 内容标识 `(generation, version)`。
     ///
-    /// 不能用数据面的 `frame.seq` 去重：被控端每个会话都从 1 开始，而 GPU 资源
-    /// （`Nv12Resources`）活在 egui 的 `CallbackResources` 里、跨会话存活，撞号会让新会话的
-    /// 首帧被当成「同一帧」跳过上传，画面上留着上一场的画面。本地计数器与资源同寿命。
-    paint_seq: u64,
+    /// GPU 路径用不上（上传去重由 [`CompositeFrame`] 的脏区状态负责）；CPU 回退每次都要整帧
+    /// NV12→RGBA，故只在内容真的变化时重转。`generation` 是缓冲实例编号（跨会话不复用），
+    /// 防止新会话的首帧因版本号相同被跳过。
+    nv12_key: Option<(u64, u64)>,
     /// 是否已安装 [`FrameSink`]。
     sink_installed: bool,
     /// 当前观看的显示器编号。
@@ -1620,7 +1611,7 @@ impl RemoteView {
             tex_size: (0, 0),
             wgpu_target_format: None,
             last_paint: None,
-            paint_seq: 0,
+            nv12_key: None,
             sink_installed: false,
             selected_display: None,
             inputs: SessionInputs::default(),
@@ -1727,6 +1718,7 @@ impl RemoteView {
         self.texture = None;
         self.tex_size = (0, 0);
         self.last_paint = None;
+        self.nv12_key = None;
         self.last_mouse = None;
         self.gate.reset();
         self.capture_this_frame = false;
@@ -1836,6 +1828,7 @@ impl RemoteView {
             self.texture = None;
             self.tex_size = (0, 0);
             self.last_paint = None;
+            self.nv12_key = None;
             // 引擎会据此强制下一个关键帧（尺寸变了，差分基准失效）。
             manager.select_display(id);
         }
@@ -1849,42 +1842,56 @@ impl RemoteView {
 
     /// 把最新画面落到纹理/GPU 回调，返回本帧要画的 [`FramePaint`]；无新画面时返回上一帧。
     ///
-    /// 每一帧都是**整帧**：VP9 给 RGBA；Windows H.264 硬件路径给紧包 NV12。NV12 在 wgpu
-    /// 渲染器下直接交给着色器（Y/UV 两张纹理 + BT.709 转换，GPU 负责缩放）；没有 wgpu
-    /// （Glow / 无 render state）时保留 CPU 回退，转成 RGBA 后走与 VP9 相同的纹理路径。
+    /// VP9 给 RGBA 整帧；Windows H.264 硬件路径给**共享的** NV12 合成帧（[`CompositeFrame`]）。
+    /// NV12 在 wgpu 渲染器下直接交给着色器（Y/UV 两张纹理 + BT.709 转换，GPU 负责缩放）：
+    /// 这里只做一次指针级 `Arc` 克隆，**不复制像素**，补丁的脏矩形由渲染线程 `prepare` 取走；
+    /// 没有 wgpu（Glow / 无 render state）时保留 CPU 回退，整帧转成 RGBA——只在内容变化时重转。
     pub fn upload(&mut self, ctx: &egui::Context) -> Option<FramePaint> {
+        // 1) RGBA（VP9）整帧：取走即清（NV12 帧不再进这里，见 `FrameState::latest`）。
         let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
-                if let Some(nv12) = frame.nv12 {
-                    if let Some(target_format) = self.wgpu_target_format {
-                        // GPU 路径：不在 UI 线程做任何逐像素转换，只包一层 `Arc`。
-                        let (width, height) = (frame.width, frame.height);
-                        self.tex_size = (width, height);
-                        // 用本地序号（见 `paint_seq` 的文档），不直接用 `frame.seq`。
-                        self.paint_seq = self.paint_seq.wrapping_add(1);
-                        let paint = FramePaint::Nv12 {
-                            frame: Arc::new(nv12),
-                            width,
-                            height,
-                            seq: self.paint_seq,
-                            target_format,
-                        };
-                        self.last_paint = Some(paint.clone());
-                        return Some(paint);
-                    }
-                    // 无 wgpu：CPU 回退（过渡路径）。
-                    if let Some(image) =
-                        nv12_to_color_image(&nv12, frame.width, frame.height, pixel_w, pixel_h)
-                    {
-                        self.upload_texture(ctx, image, frame.width, frame.height);
-                    }
-                } else if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
+                if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
                     self.upload_texture(ctx, image, frame.width, frame.height);
                 }
             }
         }
 
+        // 2) NV12 共享合成帧（全帧 + 补丁）。
+        let composite = self.shared.lock().ok().and_then(|guard| guard.composite.clone());
+        let Some(frame) = composite else {
+            return self.last_paint.clone();
+        };
+        let (width, height) = frame.dims();
+        self.tex_size = (width, height);
+        if let Some(target_format) = self.wgpu_target_format {
+            let paint = FramePaint::Nv12 {
+                frame,
+                width,
+                height,
+                target_format,
+            };
+            self.last_paint = Some(paint.clone());
+            return Some(paint);
+        }
+
+        // 无 wgpu：CPU 回退（过渡路径）。整帧 NV12→RGBA 很贵，故按内容标识去重。
+        let key = (frame.generation(), frame.version());
+        if self.nv12_key != Some(key) {
+            let converted = frame.with_data(|nv12| {
+                nv12_to_color_image(
+                    nv12,
+                    width,
+                    height,
+                    usize::try_from(width).unwrap_or(0),
+                    usize::try_from(height).unwrap_or(0),
+                )
+            });
+            if let Some(image) = converted {
+                self.upload_texture(ctx, image, width, height);
+            }
+            self.nv12_key = Some(key);
+        }
         self.last_paint.clone()
     }
 
@@ -2509,6 +2516,8 @@ mod tests {
     //! `wants_keyboard_input()`、平台注入）无法在无头环境验证，只能由这些单测锁住判定规则。
 
     use super::*;
+    use crate::remote::nv12_renderer::UploadChunk;
+    use rust_tunnel_remote::screen::ScreenPatch;
 
     /// 构造一条鼠标按键事件（测试用）。
     fn mouse_btn(button: MouseButton, pressed: bool) -> InputEvent {
@@ -3052,48 +3061,134 @@ mod tests {
         assert_eq!(valid_frame_dims(&huge), None);
     }
 
-    /// 一批补丁要么**全部应用**，要么一字节都不改。
-    ///
-    /// `DecodedNv12::apply_patch` 只保证单个矩形原子：第二个矩形失败时第一个已经写进去了。
-    /// 这种半截应用会永久留在持久合成帧里（画面缺一块且无法回滚），故必须由批次层兜住。
+    /// 回归锁：补丁路径必须**复用同一块共享缓冲**，不得再「`composite` 一份 + `latest` 一份」
+    /// 或 clone 整帧；渲染侧拿到的应是脏矩形，而不是整帧。
     #[test]
-    fn apply_patch_batch_is_all_or_nothing() {
-        // 8×6 整帧：Y 48 字节、UV 24 字节。
-        let original = DecodedNv12 {
-            y: vec![0xAA; 48],
-            uv: vec![0xBB; 24],
+    fn patch_path_reuses_the_shared_buffer_without_cloning() {
+        let shared: Arc<Mutex<FrameState>> = Arc::new(Mutex::new(FrameState::default()));
+        let sink = GuiFrameSink {
+            shared: Arc::clone(&shared),
+            ctx: egui::Context::default(),
+            viewport: egui::ViewportId::ROOT,
+        };
+        sink.on_frame(DecodedFrame {
+            display: 0,
+            width: 8,
+            height: 8,
+            seq: 1,
+            rgba: Vec::new(),
+            nv12: Some(DecodedNv12 {
+                y: vec![0x11; 64],
+                uv: vec![0x22; 32],
+            }),
+        });
+        let first = shared.lock().unwrap().composite.clone().expect("全帧应建立合成缓冲");
+        assert!(matches!(first.take_upload(false), Some(UploadChunk::Full { .. })));
+        // 全帧不再留一份在 `latest` 里（RGBA 路径专用）。
+        assert!(shared.lock().unwrap().latest.is_none());
+
+        sink.on_patch(DecodedPatch {
+            display: 0,
+            width: 8,
+            height: 8,
+            rects: vec![ScreenPatch {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 2,
+                nv12: vec![0x33; 12],
+            }],
+        });
+        let second = shared.lock().unwrap().composite.clone().expect("补丁不应清空缓冲");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "补丁路径必须复用同一块缓冲（不得 clone 整帧/换实例）"
+        );
+        assert_eq!(shared.lock().unwrap().patch_count, 1);
+        match second.take_upload(false) {
+            Some(UploadChunk::Rects(rects)) => {
+                assert_eq!(rects.len(), 1);
+                assert_eq!(
+                    rects[0].rect,
+                    nv12_renderer::DirtyRect {
+                        x: 2,
+                        y: 2,
+                        width: 4,
+                        height: 2
+                    }
+                );
+                assert_eq!(rects[0].y, vec![0x33; 8]);
+                assert_eq!(rects[0].uv, vec![0x33; 4]);
+            }
+            _ => panic!("补丁应只登记脏矩形，不应整帧上传"),
+        }
+        // 数据确实原地写进共享缓冲。
+        second.with_data(|data| {
+            assert_eq!(data.y[2 * 8 + 2], 0x33);
+            assert_eq!(data.y[0], 0x11, "矩形外不应被写");
+        });
+    }
+
+    /// 没有基底 / 尺寸不符 / 矩形非法：整批丢弃，缓冲与计数都不动（等引擎回关键帧）。
+    #[test]
+    fn patch_is_dropped_without_a_matching_composite() {
+        let shared: Arc<Mutex<FrameState>> = Arc::new(Mutex::new(FrameState::default()));
+        let sink = GuiFrameSink {
+            shared: Arc::clone(&shared),
+            ctx: egui::Context::default(),
+            viewport: egui::ViewportId::ROOT,
         };
         let valid = ScreenPatch {
-            x: 2,
-            y: 2,
-            width: 4,
-            height: 2,
-            nv12: vec![1; 12],
-        };
-        // 全部合法：两块都写进去。
-        let mut composite = original.clone();
-        let second = ScreenPatch {
             x: 0,
             y: 0,
             width: 2,
             height: 2,
-            nv12: vec![2; 6],
+            nv12: vec![0x44; 6],
         };
-        assert!(apply_patch_batch(&mut composite, 8, &[valid.clone(), second]));
-        assert_eq!(composite.y[2 * 8 + 2], 1, "第一块应已应用");
-        assert_eq!(composite.y[0], 2, "第二块应已应用");
+        // 1) 还没有全帧。
+        sink.on_patch(DecodedPatch {
+            display: 0,
+            width: 8,
+            height: 8,
+            rects: vec![valid.clone()],
+        });
+        assert_eq!(shared.lock().unwrap().patch_count, 0);
 
-        // 第二块越界：第一块也不能留下。
-        let mut composite = original.clone();
-        let bad = ScreenPatch {
-            x: 6,
-            y: 0,
+        // 2) 有基底但尺寸不符。
+        sink.on_frame(DecodedFrame {
+            display: 0,
+            width: 8,
+            height: 8,
+            seq: 1,
+            rgba: Vec::new(),
+            nv12: Some(DecodedNv12 {
+                y: vec![0x11; 64],
+                uv: vec![0x22; 32],
+            }),
+        });
+        let composite = shared.lock().unwrap().composite.clone().unwrap();
+        assert!(composite.take_upload(false).is_some());
+        sink.on_patch(DecodedPatch {
+            display: 0,
             width: 4,
-            height: 2,
-            nv12: vec![3; 12],
-        };
-        assert!(!apply_patch_batch(&mut composite, 8, &[valid, bad]));
-        assert_eq!(composite, original, "整批失败时不得留下半截应用");
+            height: 4,
+            rects: vec![valid.clone()],
+        });
+        assert_eq!(shared.lock().unwrap().patch_count, 0);
+
+        // 3) 尺寸对上但矩形越界：整批丢弃、缓冲不变、不登记脏区。
+        sink.on_patch(DecodedPatch {
+            display: 0,
+            width: 8,
+            height: 8,
+            rects: vec![
+                ScreenPatch { x: 0, ..valid.clone() },
+                ScreenPatch { x: 8, ..valid },
+            ],
+        });
+        assert_eq!(shared.lock().unwrap().patch_count, 0);
+        assert!(composite.take_upload(false).is_none(), "非法批次不应登记脏区");
+        composite.with_data(|data| assert_eq!(data.y, vec![0x11; 64]));
     }
 
     #[test]

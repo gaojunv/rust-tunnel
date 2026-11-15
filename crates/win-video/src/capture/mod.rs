@@ -386,6 +386,10 @@ impl TexturePool {
 }
 
 /// 创建一张池纹理：默认用途、可作渲染目标与着色器资源，供 VideoProcessor 输入。
+///
+/// **`D3D11_BIND_RENDER_TARGET` 不能去掉**：NVENC 纹理直通
+/// （`nvEncRegisterResource`）要求注册为输入图像的 D3D11 纹理带 render-target
+/// （或 unordered-access）绑定；缺了会让注册失败，适配器只能回退到回读上传。
 fn create_pool_texture(
     device: &ID3D11Device,
     width: u32,

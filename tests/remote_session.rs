@@ -532,6 +532,7 @@ fn manager(
         displays: 1,
         enabled,
         establisher,
+        native_resolution: false,
         encode: EncodeOptions {
             target_bitrate_kbps: 2000,
             scale: 1.0,
@@ -572,6 +573,7 @@ fn manager_lazy(
         displays: 1,
         enabled,
         establisher: Arc::new(LazyTransport::new(server_host.to_owned())),
+        native_resolution: false,
         encode: EncodeOptions {
             target_bitrate_kbps: 2000,
             scale: 1.0,
@@ -1402,6 +1404,7 @@ fn control_channel_manager(server_host: &str, name: &str, enabled: bool) -> Arc<
         enabled,
         // 本用例不建立数据面（被拒），用延迟建立器即可——只有真的走到 `establish` 才会构造传输。
         establisher: Arc::new(LazyTransport::new(server_host.to_owned())),
+        native_resolution: false,
         encode: EncodeOptions {
             target_bitrate_kbps: 2000,
             scale: 1.0,

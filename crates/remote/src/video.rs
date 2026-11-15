@@ -41,6 +41,14 @@ use std::num::NonZeroUsize;
 /// ≤ 1920**，4K 只能作为显式选项。1080p 编码在 `cpu_used = 8` 下远快于 40 ms 预算。
 pub const MAX_ENCODE_WIDTH: u32 = 1920;
 
+/// 原生分辨率（硬件 H.264）允许的最大编码宽度（像素）。
+///
+/// **只给 Windows 硬件 H.264（NVENC / Intel·AMD 硬件 MFT）的显式选项**用（被控端
+/// `ControlledConfig::native_resolution`）：这些编码器编 4K 绰绰有余，限制来自早期
+/// VP9 软件解码的耗时。4K 解码在控制器侧仍更贵（DXVA 优先，但回读/上屏开销随像素
+/// 线性增长），故默认关闭。VP9 软件路径**永远**按 [`MAX_ENCODE_WIDTH`] 封顶。
+pub const NATIVE_MAX_ENCODE_WIDTH: u32 = 3840;
+
 /// 单帧声明/解码尺寸的合理性上限（像素，对宽、高各自生效）。
 ///
 /// 这不是「能显示多大」的限制，而是给**对端单方声明**的尺寸兜底：真实单台显示器最大为 8K
@@ -672,6 +680,21 @@ mod tests {
         assert_eq!(encode_dimensions(101, 77, 1.0, MAX_ENCODE_WIDTH), (100, 76));
         // 极小尺寸 → 下限 2 像素（偶数）。
         assert_eq!(encode_dimensions(1, 1, 1.0, MAX_ENCODE_WIDTH), (2, 2));
+        // 原生分辨率（硬件 H.264 的显式选项）：3840 封顶下 4K 源保持原尺寸。
+        assert_eq!(
+            encode_dimensions(3840, 2160, 1.0, NATIVE_MAX_ENCODE_WIDTH),
+            (3840, 2160)
+        );
+        // 8K 源在原生上限下仍按宽高比缩到 3840 宽。
+        assert_eq!(
+            encode_dimensions(7680, 4320, 1.0, NATIVE_MAX_ENCODE_WIDTH),
+            (3840, 2160)
+        );
+        // 超额缩放仍是先乘 scale 再封顶。
+        assert_eq!(
+            encode_dimensions(3840, 2160, 0.5, NATIVE_MAX_ENCODE_WIDTH),
+            (1920, 1080)
+        );
     }
 
     #[test]

@@ -344,6 +344,8 @@ pub(crate) fn spawn_instance_runtime(
                     // 无人值守实例**默认允许被远程控制**（开关本就是这个进程存在的理由）。
                     enabled: true,
                     approval_policy: approval,
+                    // 实例模式（安全桌面）走 GDI/BitBlt 采集，不做 4K：编码宽度保持 1920。
+                    native_resolution: false,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

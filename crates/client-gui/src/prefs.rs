@@ -149,6 +149,13 @@ pub struct GuiPrefs {
     /// 档位是**上限**，实际码率/帧率仍由 QoS 闭环在上限之下浮动。会话建立时自动下发一次。
     #[serde(default)]
     pub remote_quality: QualityPreset,
+    /// 被控端是否使用**原生分辨率**（4K）编码。**默认关闭**。
+    ///
+    /// 只在协商到**硬件 H.264** 时生效：编码宽度上限从 1920 放宽到 3840，档位码率翻倍
+    /// （封顶 30 Mbps）。代价是控制器的解码/上屏压力随像素线性增长；VP9 路径不受影响。
+    /// 运行中修改只对下一次会话生效。
+    #[serde(default)]
+    pub remote_native_resolution: bool,
 }
 
 impl Default for GuiPrefs {
@@ -170,6 +177,7 @@ impl Default for GuiPrefs {
             remote_stats_overlay: false,
             remote_frame_rate: default_remote_frame_rate(),
             remote_quality: QualityPreset::default(),
+            remote_native_resolution: false,
         }
     }
 }
@@ -378,6 +386,26 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert_eq!(reparsed.remote_frame_rate, 60);
+    }
+
+    /// 原生分辨率（4K）默认关闭，且显式开启后能 TOML 往返保留。
+    #[test]
+    fn native_resolution_defaults_off_and_survives_roundtrip() {
+        assert!(
+            !GuiPrefs::default().remote_native_resolution,
+            "全新安装不得默认开 4K（控制器解码压力更大，必须是显式选择）"
+        );
+        // 缺键的旧配置落到 false（serde default）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(!prefs.remote_native_resolution, "旧配置缺该键应默认关闭");
+        // 往返保留用户选择。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_native_resolution: true,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(reparsed.remote_native_resolution);
     }
 
     /// 断线自动重连的缺省：**两条路径必须一致**——`Default::default()`（全新安装）与
