@@ -738,11 +738,6 @@ pub async fn run_controlled(
         .find(|d| d.primary)
         .or_else(|| displays.first())
         .map_or(0, |d| d.id);
-    // 每像素比特数（bpp）判据需要采集源的**原始尺寸**：编码尺寸受 scale / MAX_ENCODE_WIDTH
-    // 约束，不能拿显示尺寸直接算。会话开始与切显示器时更新（见 `set_source_dims`）。
-    if let Some(display) = displays.iter().find(|d| d.id == display_id) {
-        rate.set_source_dims(display.width, display.height);
-    }
 
     // 3) 主循环。
     // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**，会话一建立就发
@@ -1066,10 +1061,8 @@ pub async fn run_controlled(
                         }
                         SessionMessage::SelectDisplay { display: target } => {
                             // 切换采集目标后参考画面作废：分辨率/内容都变了，必须重发关键帧。
-                            if let Some(display) = displays.iter().find(|d| d.id == target) {
+                            if displays.iter().any(|d| d.id == target) {
                                 display_id = target;
-                                // 新显示器的原始尺寸不同 → bpp 判据要跟着换（编码尺寸也随之变化）。
-                                rate.set_source_dims(display.width, display.height);
                                 // 几何变了：补丁模式（以及正在等的进入）一律作废，控制器那块
                                 // 持久帧缓冲的尺寸已经不对了。
                                 screen_mode.exit();
@@ -1163,9 +1156,10 @@ pub async fn run_controlled(
                                     0.0
                                 };
                                 info!(
-                                    "QoS 调整 action={:?} rtt={}ms baseline={:?} recv_kbps={} sent_kbps={} delivery_ratio={:.2} decode_ms={} backlog={} local_backlog={} bitrate_kbps={} fps={} scale={:.3} changed_permille={} cap_kbps={:?} cap_fps={:?}",
+                                    "QoS 调整 action={:?} rtt={}ms rtt_smooth={:?} baseline={:?} recv_kbps={} sent_kbps={} delivery_ratio={:.2} decode_ms={} backlog={} local_backlog={} bitrate_kbps={} fps={} scale={:.3} changed_permille={} cap_kbps={:?} cap_fps={:?}",
                                     decision.action,
                                     rtt_ms,
+                                    rate.smoothed_rtt_ms(),
                                     rate.baseline_rtt_ms(),
                                     recv_kbps,
                                     sent_kbps_now,
