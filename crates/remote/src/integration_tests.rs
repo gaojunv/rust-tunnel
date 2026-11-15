@@ -966,7 +966,7 @@ async fn file_transfer_download_and_upload() {
     std::fs::create_dir_all(&share).unwrap();
     std::fs::create_dir_all(&dl).unwrap();
 
-    // 源文件大于单块（CHUNK_SIZE = 64 KiB），保证多块流动。
+    // 源文件大于单块（CHUNK_SIZE = 16 KiB），保证多块流动。
     let payload = pseudo_bytes(200 * 1024);
     std::fs::write(share.join("source.bin"), &payload).unwrap();
 

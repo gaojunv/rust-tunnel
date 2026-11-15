@@ -163,9 +163,10 @@ impl Default for GuiPrefs {
             remote_view_scale: ViewScale::default(),
             remote_window_size: WindowSize::default(),
             remote_clipboard_sync: false,
-            // 与 derive 时代的默认值保持一致（`#[serde(default = "default_true")]` 只在
-            // 配置文件缺键时生效，全新安装的历史行为是 false——不在本次改动里改变它）。
-            remote_auto_reconnect: false,
+            // **必须与字段上的 `#[serde(default = "default_true")]` 一致**：那一条只覆盖
+            // 「配置文件缺键」，全新安装/没有配置文件走的是这里。两处不一致会让「文档说默认开、
+            // 实际默认关」，断线后不重连。
+            remote_auto_reconnect: true,
             remote_stats_overlay: false,
             remote_frame_rate: default_remote_frame_rate(),
             remote_quality: QualityPreset::default(),
@@ -377,6 +378,26 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert_eq!(reparsed.remote_frame_rate, 60);
+    }
+
+    /// 断线自动重连的缺省：**两条路径必须一致**——`Default::default()`（全新安装）与
+    /// serde 缺键默认值（旧配置文件）。两处不一致会出现「文档说默认开、实际默认关」。
+    #[test]
+    fn auto_reconnect_defaults_to_true_in_both_paths() {
+        assert!(
+            GuiPrefs::default().remote_auto_reconnect,
+            "全新安装应默认开启断线自动重连"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(prefs.remote_auto_reconnect, "旧配置缺该键也应默认开启");
+        // 用户显式关掉要能持久化。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_auto_reconnect: false,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(!reparsed.remote_auto_reconnect);
     }
 
     /// 画质档位的缺省与往返：与帧率同理，旧配置缺键落到 `Balanced`，用户选择跨重启保留。

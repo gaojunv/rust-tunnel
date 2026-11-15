@@ -61,6 +61,7 @@ pub mod controlled;
 pub mod crypto;
 pub mod error;
 pub mod file;
+pub(crate) mod input_buffer;
 pub mod manager;
 pub(crate) mod nat;
 pub(crate) mod punch;
@@ -95,8 +96,9 @@ pub use screen::{
     GpuFrame, InputEvent, InputSink, KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource,
 };
 pub use session::{
-    CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd,
-    SessionFrame, SessionMessage, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
+    CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, Lane, MAX_SESSION_FRAME,
+    SESSION_PROTO_VERSION, SessionEnd, SessionFrame, SessionMessage, VIDEO_FLAG_CONFIG,
+    VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
 };
 pub use stats::{SessionStats, SessionStatsReporter};
 pub use transfer::{

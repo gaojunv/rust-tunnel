@@ -72,6 +72,17 @@ pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
 /// 「发出时刻队列」而不是单个 `Option<Instant>`（见 `controller.rs` / `controlled.rs`）。
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 存活超时：连续这么久收不到对端 `HeartbeatAck` 就判定链路已断。
+///
+/// = 4 × [`HEARTBEAT_INTERVAL`]。**必须 ≥ 2 个心跳周期**，否则一次调度抖动或一个迟到的 ack
+/// 就会误杀健康会话；又必须**远小于 hbbr 中继的 30s `idle_timeout`**——链路半开（中继停转发
+/// 但 TCP 不断、接收方零窗口）时中继本身不会报任何错，只能靠这个上界把「会话永久冻结、UI 仍
+/// 显示在线」变成一次明确的断线结束（`deliberate: false`，从而触发自动重连）。
+///
+/// 判据只看**队首**（最老的未应答心跳）的年龄：队首超时说明最早那一拍都没回来，后面的读数
+/// 自然也不可信。**没有发出过心跳时（队列空）不判**——会话刚建立还没有样本。
+pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// RTT 样本的可信上限。
 ///
 /// 心跳是**零载荷**的固定往返，正常 RTT 远小于它；一旦读数达到 10s，只可能是把一个迟到的
