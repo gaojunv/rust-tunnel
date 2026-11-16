@@ -105,7 +105,7 @@ pub struct DownloadQuery {
 ///
 /// 只放行 ASCII 字母数字与 `.` `_` `-` `+`，并显式拒绝 `.` / `..`。
 /// 由于字符集不含任何路径分隔符，通过此校验的段无法跨出单层目录。
-fn is_safe_segment(segment: &str) -> bool {
+pub(crate) fn is_safe_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= MAX_SEGMENT_LEN
         && segment != "."
@@ -171,6 +171,23 @@ fn platform_from_filename(name: &str) -> (String, String, Option<String>) {
     }
 }
 
+/// 服务端自更新只认可直接替换本机程序的 GUI 主程序产物。
+///
+/// 三个条件缺一不可：
+///
+/// 1. 文件名以 `rust-tunnel-client-gui-` 开头 —— 排除 CLI 二进制、无人值守服务
+///    exe（`rust-tunnel-client-service-*`）与 Windows 单包 zip；
+/// 2. 扩展名为 `exe` 或无扩展名 —— 本机自更新**不做解包**，`.zip` / `.dmg`
+///    无法就地替换（macOS 的自动更新产物是不带扩展名的裸二进制）；
+/// 3. `SHA256SUMS` 里记录了 64 位十六进制摘要 —— 客户端在替换可执行文件前
+///    必须能校验，没有校验和的产物一律不下发。
+#[must_use]
+pub(crate) fn is_auto_update_file(file: &ClientDownloadFile) -> bool {
+    file.name.starts_with("rust-tunnel-client-gui-")
+        && (file.format.as_deref() == Some("exe") || file.format.is_none())
+        && file.sha256.as_deref().is_some_and(|hash| hash.len() == 64)
+}
+
 /// 解析 `sha256sum` 输出为 `文件名 → 小写十六进制摘要`。
 ///
 /// 兼容 binary 模式输出的 `*filename` 前缀；非 64 位十六进制的行直接丢弃。
@@ -191,7 +208,7 @@ fn parse_checksums(content: &str) -> HashMap<String, String> {
 }
 
 /// 解析 `v1.2.3` / `1.2.3` / `1.2.3-rc1` 为可比较三元组；无法解析返回 `None`。
-fn semver_key(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn semver_key(version: &str) -> Option<(u64, u64, u64)> {
     let trimmed = version.strip_prefix('v').unwrap_or(version);
     // 预发布 / 构建元数据后缀不参与数值比较
     let core = trimmed.split(['-', '+']).next().unwrap_or(trimmed);
@@ -219,7 +236,7 @@ fn compare_versions(a: &ClientDownloadVersion, b: &ClientDownloadVersion) -> Ord
 ///
 /// 两段都过 [`is_safe_segment`]，随后规范化并断言仍落在 `base` 之内 ——
 /// 后一步兜住软链指向目录外的情况（正常 CI 布局不会出现）。
-fn resolve_download_path(
+pub(crate) fn resolve_download_path(
     base: &Path,
     version: &str,
     file: &str,
@@ -654,6 +671,68 @@ mod tests {
             platform_from_filename("some-tool-macos"),
             ("some".into(), "tool".into(), None)
         );
+    }
+
+    /// 构造一个用于自更新判定的文件描述。
+    fn update_file(name: &str, format: Option<&str>, sha256: Option<&str>) -> ClientDownloadFile {
+        ClientDownloadFile {
+            name: name.to_string(),
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            format: format.map(str::to_string),
+            size: 1024,
+            sha256: sha256.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn auto_update_file_accepts_only_replaceable_gui_binaries() {
+        let digest = "d".repeat(64);
+        // Windows GUI 主程序：可自动替换
+        assert!(is_auto_update_file(&update_file(
+            "rust-tunnel-client-gui-windows-x86_64.exe",
+            Some("exe"),
+            Some(&digest),
+        )));
+        // macOS 裸二进制（无扩展名）：同样可就地替换
+        assert!(is_auto_update_file(&update_file(
+            "rust-tunnel-client-gui-macos-aarch64",
+            None,
+            Some(&digest),
+        )));
+        // CLI 二进制与无人值守服务 exe 都不能替换本机 GUI
+        assert!(!is_auto_update_file(&update_file(
+            "rust-tunnel-client-windows-x86_64.exe",
+            Some("exe"),
+            Some(&digest),
+        )));
+        assert!(!is_auto_update_file(&update_file(
+            "rust-tunnel-client-service-windows-x86_64.exe",
+            Some("exe"),
+            Some(&digest),
+        )));
+        // 单包 zip / dmg 需要解包，自动更新不做解包
+        assert!(!is_auto_update_file(&update_file(
+            "rust-tunnel-client-gui-windows-x86_64.zip",
+            Some("zip"),
+            Some(&digest),
+        )));
+        assert!(!is_auto_update_file(&update_file(
+            "rust-tunnel-client-gui-macos-aarch64.dmg",
+            Some("dmg"),
+            Some(&digest),
+        )));
+        // 缺校验和 / 摘要长度不对：一律不认（客户端必须能校验后再替换）
+        assert!(!is_auto_update_file(&update_file(
+            "rust-tunnel-client-gui-windows-x86_64.exe",
+            Some("exe"),
+            None,
+        )));
+        assert!(!is_auto_update_file(&update_file(
+            "rust-tunnel-client-gui-windows-x86_64.exe",
+            Some("exe"),
+            Some("deadbeef"),
+        )));
     }
 
     #[test]

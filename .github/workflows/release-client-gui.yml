@@ -209,7 +209,7 @@ jobs:
         run: |
           bash scripts/bundle-macos.sh
           ls -lh dist/
-      - name: Upload dmg
+      - name: Upload dmg and raw binary
         shell: bash
         env:
           VER: ${{ needs.version.outputs.value }}
@@ -227,9 +227,15 @@ jobs:
           PORT="${SSH_PORT:-22}"
           DEST="${DEPLOY_PATH}/client/${VER}"
           DMG="dist/RustTunnel-${VER}-macos-aarch64.dmg"
+          # 原始可执行文件：GUI 自更新要在本机就地替换程序，dmg 无法直接解包，
+          # 故额外发布一份裸二进制（下载页按 `rust-tunnel-client-gui-` 前缀 + 无扩展名
+          # 识别为可自动安装的产物）。
+          RAW="target/aarch64-apple-darwin/release/rust-tunnel-client-gui"
+          ASSET="rust-tunnel-client-gui-macos-aarch64"
           SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
           ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
           scp "${SSH_OPTS[@]}" -P "${PORT}" "$DMG" "${SSH_USER}@${SSH_HOST}:${DEST}/"
+          scp "${SSH_OPTS[@]}" -P "${PORT}" "$RAW" "${SSH_USER}@${SSH_HOST}:${DEST}/${ASSET}"
           rm -f "${KEY}"
 
   # 无人值守被控端服务（Windows / MSVC）：`rust-tunnel-client-service.exe`，

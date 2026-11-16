@@ -371,7 +371,7 @@ pub(crate) fn spawn_instance_runtime(
             // `service_owner` 传 `None`：实例**就是**服务的孩子，它必须始终注册——身份归属
             // 的监督只属于用户桌面的常规 GUI（见 `crate::service_watch`）。
             tokio::select! {
-                exit = run_client_loop(config, None, None, None, manager, None) => match exit {
+                exit = run_client_loop(config, None, None, None, manager, None, None) => match exit {
                     LoopExit::Unrecoverable => tracing::warn!(
                         "控制通道循环结束（注册被拒等不可重连的错误），实例退出"
                     ),

@@ -7,4 +7,5 @@ pub mod session_window;
 pub mod settings;
 pub mod status;
 pub mod theme;
+pub mod update;
 pub mod widgets;

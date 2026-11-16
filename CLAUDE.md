@@ -205,6 +205,20 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 **中继约束**：hbbr 按 uuid 配对，先发**恰好一个**带帧的 `RequestRelay` 然后转裸字节、**没有 ack**；`pair_window` 与 `idle_timeout` 都是 30s（任何字节都会重置 idle，每 3s 检查一次）。因此会话必须靠应用层心跳保活（`HEARTBEAT_INTERVAL` 低于 30s），**静止画面也不例外**。配对超时不会有任何错误通知，控制器必须自己按窗口超时提示，否则用户看到的是「卡在连接中」。
 
+#### 客户端 GUI 自更新（控制通道内传输）
+
+**复用控制通道，不新开 HTTP 鉴权面**：GUI 客户端只有客户端 token、没有管理员 JWT，与远程控制控制面的取舍一致。服务端在客户端注册后（以及客户端主动 `ClientUpdateCheck` 时）扫描 `client_dist_dir`，把版本通告与**文件分片**都经同一条加密控制通道下发；`ClientUpdate*` 变体全部**追加在 `ControlMessage` 末尾**（bincode 序数只增不改，机械锁 `test_update_variants_append_after_remote_session_end`）。
+
+**双向版本门控**（`MIN_UPDATE_CLIENT_VERSION = (0,15,0)`，见 `crates/agent/src/runner/version_gate.rs`）：服务端只在客户端版本 ≥ 此值时才下发任何 S→C 更新变体；客户端也只在**收到过服务端更新消息**后才上行 `ClientUpdateCheck` / `ClientUpdateRequest`（否则新客户端配老服务端会因未知 bincode 变体断连）。因此服务端即使是「已是最新」也**必须**回一条 `ClientUpdateUpToDate`——它同时是「对端理解更新协议」的能力凭据。
+
+**更新源与产物选择**：`control_plane/update.rs::select_update` 从归档中取**语义化版本最高、且含可自动替换 GUI 产物**的目录（不依赖 `latest` 软链——它只由 CLI 发布流程维护）。可自动替换 = 文件名以 `rust-tunnel-client-gui-` 开头 + 扩展名 `.exe` 或无扩展名 + `SHA256SUMS` 有 64 位摘要；CLI 二进制、无人值守服务 exe、Windows 单包 zip、macOS dmg 一律排除（本机自更新不做解包）。macOS 发布 workflow 因此额外上传裸二进制 `rust-tunnel-client-gui-macos-aarch64`（dmg 仍保留给首次安装）。
+
+**传输**：`ClientUpdateChunk` 按 **256 KiB** 分片（控制通道单条上限 1 MiB），带 `transfer_id` + `offset`，最后一片 `data` 为空、`last = true`；同一客户端同一时刻只允许一个传输（`ClientEntry::update_transfer_active` 原子位），失败/结束必定释放。分片在独立任务里推送，不阻塞控制通道读循环。
+
+**客户端**（`crates/client-gui/src/update.rs`）：`UpdateBridge` 在控制通道读循环里同步收包（`ClientUpdateBridge`，接口在 `common/update_bridge.rs`，与 `RemoteBridge` 同构），内存拼装 → **SHA-256 必校验** → 写临时目录 → GUI 线程取走并替换。哈希不匹配/长度不符**绝不**进入可执行状态。UI 弹窗（`ui/update.rs::modal`）显示版本号并常驻所有 Tab 之上，首次出现强制显示并聚焦窗口；设置页提供「自动检查更新」（6 小时轮询，默认开）、手动检查、「稍后」与「跳过此版本」（后者落盘 `GuiPrefs.update_skipped_version`，新版本到来时自动重新弹窗）。
+
+**替换与重启**：Windows 不能覆盖正在运行的 exe，故以**下载到的新 exe** 作为 updater 拉起 `--apply-update <target>`，本进程立即退出；updater 轮询复制（最长 30 秒）到目标路径后重启目标。Unix 走同目录临时文件 + 原子 `rename` 再拉起新进程。目标目录不可写（如 `Program Files` 下的服务安装副本）时更新会失败并在弹窗中报错，需手工处理。
+
 #### Windows 无人值守被控端（SYSTEM 服务 + 无头实例）
 
 **要解决的两个问题**：控制 Windows 客户端时，**锁屏/登录界面**点不动，**任务管理器**这类提权窗口也点不动。前者根因三层且缺一不可（Winlogon 桌面 ACL 不放行 Administrators + UIPI + 会话隔离），**「以管理员身份运行」无效**；后者**只是 UIPI**——任务管理器在**默认桌面**上，只是完整性为 high，而 GUI 是 medium。唯一正路都是 SYSTEM 服务把进程拉进控制台会话。完整架构/部署/排障见根目录 `WINDOWS-SECURE-DESKTOP.md`。

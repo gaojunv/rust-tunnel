@@ -14,6 +14,8 @@ pub struct AppState {
     pub config: Arc<Mutex<Option<ClientConfig>>>,
     pub reconnect_requested: Arc<AtomicBool>,
     pub should_exit: Arc<AtomicBool>,
+    /// 客户端自更新桥接：控制通道读循环把 `ClientUpdate*` 消息交给它，GUI 每帧读快照。
+    pub update: Arc<crate::update::UpdateBridge>,
     /// 客户端身份的当前归属：Windows 服务在跑时本进程**不注册**（服务端按客户端名唯一，
     /// 同名会互相踢）。由 [`crate::service_watch`] 的轮询任务持续刷新；初值
     /// [`IdentityOwner::Gui`]，对从不安装服务的用户就是今天的行为。
@@ -42,6 +44,7 @@ impl AppState {
             config: Arc::new(Mutex::new(None)),
             reconnect_requested: Arc::new(AtomicBool::new(false)),
             should_exit: Arc::new(AtomicBool::new(false)),
+            update: Arc::new(crate::update::UpdateBridge::new()),
             service_owner_rx: owner_rx,
             service_owner_tx: Arc::new(owner_tx),
             remote: Mutex::new(None),
