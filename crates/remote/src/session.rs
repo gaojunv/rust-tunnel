@@ -758,6 +758,18 @@ impl SessionCodec {
             .map_err(|err| RemoteError::Codec(err.to_string()))?;
         Ok(buf.to_vec())
     }
+
+    /// 同 [`Self::encode_frame_bytes`]，但**按值**接收帧——被控端对大帧做分段 pacing 时每帧可达
+    /// 数百 KB，那里没有理由再 clone 一份（`encoder_mut()` 拿到的就是所有权）。
+    ///
+    /// # Errors
+    /// bincode 编码失败或载荷超过上限时返回 [`RemoteError::Codec`]。
+    pub fn encode_frame_owned(&mut self, frame: SessionFrame) -> RemoteResult<Vec<u8>> {
+        let mut buf = BytesMut::new();
+        self.encode(frame, &mut buf)
+            .map_err(|err| RemoteError::Codec(err.to_string()))?;
+        Ok(buf.to_vec())
+    }
 }
 
 impl Default for SessionCodec {

@@ -15,7 +15,6 @@ use crate::d3d11::{self, D3d11};
 use crate::WinVideoError;
 use std::sync::Arc;
 use windows::core::Interface as _;
-use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Media::MediaFoundation::{
     IMFDXGIDeviceManager, IMFTransform, MFT_MESSAGE_SET_D3D_MANAGER,
 };
@@ -58,20 +57,9 @@ pub(super) fn create() -> Result<EncodeDevice, WinVideoError> {
 /// GPU 纹理路径（采集纹理直接喂编码器）必须走这里：VideoProcessor 的输入纹理
 /// 与编码器 MFT 的设备管理器必须处在**同一个**设备上。**不新建设备**。
 pub(super) fn create_with_device(device: Arc<D3d11>) -> Result<EncodeDevice, WinVideoError> {
-    // D3D11_CREATE_DEVICE_VIDEO_SUPPORT 要求开启多线程保护；编码器 MFT 可能
-    // 在自己的工作线程上访问设备。
-    match device.device.cast::<ID3D10Multithread>() {
-        Ok(multithread) => {
-            // SAFETY: `multithread` 是设备上的有效接口；设置是幂等的设备级开关。
-            let was_protected = unsafe { multithread.SetMultithreadProtected(true) };
-            if !was_protected.as_bool() {
-                tracing::debug!("D3D11 设备多线程保护已开启");
-            }
-        }
-        Err(err) => {
-            tracing::debug!(%err, "D3D11 设备不支持 ID3D10Multithread，跳过多线程保护");
-        }
-    }
+    // 多线程保护在 `d3d11::create` 里已统一开启；这里再调一次是幂等的（用于调用方
+    // 传入的、不一定是本模块创建的设备），日志会区分「此前已开启」与「本次开启」。
+    d3d11::enable_multithread_protection(&device.device);
 
     let (manager, reset_token) = mfplat::create_dxgi_device_manager()?;
     // SAFETY: `manager` 与 `device.device` 都有效；reset token 与本管理器匹配。

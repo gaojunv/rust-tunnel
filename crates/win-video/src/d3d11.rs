@@ -17,6 +17,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
 };
+use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
@@ -120,13 +121,58 @@ impl std::fmt::Debug for D3d11 {
     }
 }
 
+/// 为设备开启 D3D11 多线程保护（`ID3D10Multithread::SetMultithreadProtected`）。
+///
+/// # 为什么必须开
+///
+/// 设备是以 `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` 创建的，Microsoft 文档要求这类设备
+/// 显式开启多线程保护（视频 API 与视频 MFT 会从各自的线程访问设备），而 D3D11
+/// **立即上下文**（`D3d11::context`）本身不是线程安全的。
+///
+/// 在本项目里这不是防御性编程，而是**正确性要求**：采集线程（WGC/DXGI 的
+/// `CopyResource` / `VideoProcessorBlt` / staging `Map`）与编码线程（VideoProcessor
+/// 缩放 / `UpdateSubresource`）共用同一个 `Arc<D3d11>`，即同一个立即上下文；并发调用
+/// 未加保护的上下文属于未定义行为，现场表现是画面撕裂/花屏、设备挂起乃至
+/// `DXGI_ERROR_DEVICE_REMOVED`。
+///
+/// # 代价
+///
+/// 它是一把**设备级锁**：开启后经由该设备的所有 D3D 调用被驱动串行化，采集与编码不再
+/// 真正并行（一方持锁时另一方阻塞），且 `Map()` 会等待已提交的 GPU 工作完成，所以采集
+/// 节拍会与编码耗时耦合。这是刻意取舍——正确性优先。要把两者解耦应当改用 deferred
+/// context / 专用编码线程，**而不是**关掉保护。
+///
+/// # 失败策略
+///
+/// `ID3D10Multithread` 在个别老驱动或精简环境上可能 cast 失败，此时只记 `debug!` 并
+/// 降级为「不保护」：不能因为老驱动不支持就让设备创建整体失败（单线程路径仍可用）。
+pub fn enable_multithread_protection(device: &ID3D11Device) {
+    match device.cast::<ID3D10Multithread>() {
+        Ok(multithread) => {
+            // SAFETY: `multithread` 是本设备上的有效接口；设置是幂等的设备级开关，
+            // 调用本身不会失败，返回值是**设置前**的状态。
+            let was_protected = unsafe { multithread.SetMultithreadProtected(true) };
+            if was_protected.as_bool() {
+                tracing::debug!("D3D11 多线程保护：此前已开启");
+            } else {
+                tracing::debug!("D3D11 多线程保护：此前未开启，本次已开启");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(%err, "D3D11 设备不支持 ID3D10Multithread，跳过多线程保护");
+        }
+    }
+}
+
 /// 在指定适配器上创建 D3D11 设备。
 ///
 /// 传 `adapter_index == None` 时选**第一块非软件适配器**；需要 NVENC 时应显式传
 /// NVIDIA 适配器的序号（见 [`adapters`]）。
 ///
 /// 设备同时打开 `BGRA_SUPPORT`（WGC 的帧纹理是 `B8G8R8A8_UNORM`）与
-/// `VIDEO_SUPPORT`（D3D11 VideoProcessor / DXVA 解码需要）。
+/// `VIDEO_SUPPORT`（D3D11 VideoProcessor / DXVA 解码需要），并在创建成功后立即调用
+/// [`enable_multithread_protection`]（`VIDEO_SUPPORT` 的要求，也是采集/编码并发共用
+/// 立即上下文的前提）。
 ///
 /// # Errors
 /// 适配器不存在或 `D3D11CreateDevice` 失败时返回 [`WinVideoError::Windows`]。
@@ -178,6 +224,14 @@ pub fn create(adapter_index: Option<u32>) -> Result<D3d11, WinVideoError> {
         device.ok_or_else(|| WinVideoError::Config("D3D11CreateDevice 返回空设备".to_owned()))?;
     let context = context
         .ok_or_else(|| WinVideoError::Config("D3D11CreateDevice 返回空上下文".to_owned()))?;
+
+    // 设备带 `D3D11_CREATE_DEVICE_VIDEO_SUPPORT`，MS 要求这类设备开启多线程保护；
+    // 而且这里创建的设备会被 `Arc<D3d11>` 共享给采集线程与编码线程，两边并发使用
+    // **同一个**立即上下文，保护是正确性要求（不是性能选项）。代价是设备级锁会把
+    // 两边的 D3D 调用串行化——正确性优先，见 `enable_multithread_protection` 的说明。
+    // 所有设备都从本函数创建，故在此统一开启，避免各调用方（NVENC 复用采集设备等）
+    // 各写一遍、漏写一遍。
+    enable_multithread_protection(&device);
 
     tracing::debug!(
         adapter = %info.name,
