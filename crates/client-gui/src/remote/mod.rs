@@ -30,9 +30,7 @@ pub mod win_video;
 
 pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
-pub use view_scale::{
-    display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER,
-};
+pub use view_scale::{display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER};
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -43,12 +41,12 @@ use enigo::{Keyboard as _, Mouse as _};
 // `Clipboard::get` 供后台线程读取本机剪贴板（见 `RemoteView::request_local_clipboard`）。
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
-    DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent, MouseButton, QualityPreset,
-    RawFrame, RemoteError, RemoteManager, RemoteResult, RemoteUiState, ScreenSource, SessionRole,
-    VideoDecoderFactory, VideoEncoderFactory, DEFAULT_FRAME_RATE,
+    DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent,
+    MouseButton, QualityPreset, RawFrame, RemoteError, RemoteManager, RemoteResult, RemoteUiState,
+    ScreenSource, SessionRole, VideoDecoderFactory, VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 // 补丁相关类型未在 crate 根 re-export（`screen` 是公开模块），直接按模块路径引入。
-use rust_tunnel_remote::screen::DecodedPatch;
+use rust_tunnel_remote::screen::{CaptureInfo, DecodedPatch};
 
 use nv12_renderer::CompositeFrame;
 
@@ -58,23 +56,23 @@ use nv12_renderer::CompositeFrame;
 // `screen_and_input(mode)`。GUI 模式下截屏与注入的实体在三个平台完全一致
 // （xcap/enigo 内部消化差异），故仅权限与设置跳转按平台分派；`PlatformMode::Instance`
 // 只有 Windows 有对应实现（见 `win_desktop`），其余平台按 GUI 那套返回。
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod unsupported;
-
-#[cfg(target_os = "macos")]
-use macos as platform;
 #[cfg(target_os = "windows")]
-use windows as platform;
+mod windows;
+
 #[cfg(target_os = "linux")]
 use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 use unsupported as platform;
+#[cfg(target_os = "windows")]
+use windows as platform;
 
 /// 本端平台标识（下发给服务端，用于可远程列表展示与对端提示）。
 #[must_use]
@@ -607,7 +605,10 @@ pub fn code_to_enigo(code: u32) -> Option<enigo::Key> {
 /// 与输入法决定最终字符。文本键（[`keycode::TEXT`]）不在表里：那是旧控制器的遗留路径。
 #[cfg_attr(
     not(target_os = "windows"),
-    allow(dead_code, reason = "只有 Windows 实例路径（remote::win_desktop）调用它")
+    allow(
+        dead_code,
+        reason = "只有 Windows 实例路径（remote::win_desktop）调用它"
+    )
 )]
 #[must_use]
 pub fn code_to_vk(code: u32) -> Option<u16> {
@@ -679,17 +680,17 @@ fn printable_vk(code: u32) -> Option<u16> {
         return Some(0x30 + u16::try_from(code - keycode::DIGIT_0).ok()?);
     }
     Some(match code {
-        keycode::MINUS => 0xBD,          // VK_OEM_MINUS
-        keycode::EQUALS => 0xBB,         // VK_OEM_PLUS
-        keycode::OPEN_BRACKET => 0xDB,   // VK_OEM_4
-        keycode::CLOSE_BRACKET => 0xDD,  // VK_OEM_6
-        keycode::BACKSLASH => 0xDC,      // VK_OEM_5
-        keycode::SEMICOLON => 0xBA,      // VK_OEM_1
-        keycode::QUOTE => 0xDE,          // VK_OEM_7
-        keycode::BACKTICK => 0xC0,       // VK_OEM_3
-        keycode::COMMA => 0xBC,          // VK_OEM_COMMA
-        keycode::PERIOD => 0xBE,         // VK_OEM_PERIOD
-        keycode::SLASH => 0xBF,          // VK_OEM_2
+        keycode::MINUS => 0xBD,         // VK_OEM_MINUS
+        keycode::EQUALS => 0xBB,        // VK_OEM_PLUS
+        keycode::OPEN_BRACKET => 0xDB,  // VK_OEM_4
+        keycode::CLOSE_BRACKET => 0xDD, // VK_OEM_6
+        keycode::BACKSLASH => 0xDC,     // VK_OEM_5
+        keycode::SEMICOLON => 0xBA,     // VK_OEM_1
+        keycode::QUOTE => 0xDE,         // VK_OEM_7
+        keycode::BACKTICK => 0xC0,      // VK_OEM_3
+        keycode::COMMA => 0xBC,         // VK_OEM_COMMA
+        keycode::PERIOD => 0xBE,        // VK_OEM_PERIOD
+        keycode::SLASH => 0xBF,         // VK_OEM_2
         _ => return None,
     })
 }
@@ -811,11 +812,17 @@ const MODIFIER_CODES: [(u8, u32); 4] = [
 ];
 
 /// 鼠标键顺序（下标与 `mouse_forwarded` 对应）。
-const MOUSE_BUTTONS: [MouseButton; 3] = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+const MOUSE_BUTTONS: [MouseButton; 3] =
+    [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
 
 /// 组一个键盘 [`InputEvent`]（减少重复字面量）。
 fn key_event(code: u32, pressed: bool, text: Option<String>, modifiers: u8) -> InputEvent {
-    InputEvent::Key(KeyEvent { code, pressed, text, modifiers })
+    InputEvent::Key(KeyEvent {
+        code,
+        pressed,
+        text,
+        modifiers,
+    })
 }
 
 /// `MouseButton` → 数组下标（与 [`MOUSE_BUTTONS`] 对应）。
@@ -881,7 +888,12 @@ impl InputGate {
     /// 跨帧保持、只由按键事件改写：漏掉一次抬起事件会让电平**永久**停在按下，此后每一次按下都被当成
     /// 「无变化」丢掉。改成边沿后这两条都不复存在：事件流里有什么边沿就转达什么边沿。
     #[must_use]
-    pub fn mouse_button(&mut self, button: MouseButton, pressed: bool, pointer_in_image: bool) -> Option<InputEvent> {
+    pub fn mouse_button(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        pointer_in_image: bool,
+    ) -> Option<InputEvent> {
         let idx = mouse_index(button);
         if pressed {
             // 按下：只有指针在画面上才转达。
@@ -889,11 +901,17 @@ impl InputGate {
                 return None;
             }
             self.mouse_forwarded[idx] = true;
-            Some(InputEvent::MouseButton { button, pressed: true })
+            Some(InputEvent::MouseButton {
+                button,
+                pressed: true,
+            })
         } else if self.mouse_forwarded[idx] {
             // 抬起：这次按下曾转达过 → 无条件转达（哪怕指针已移出画面）。
             self.mouse_forwarded[idx] = false;
-            Some(InputEvent::MouseButton { button, pressed: false })
+            Some(InputEvent::MouseButton {
+                button,
+                pressed: false,
+            })
         } else {
             // 这次按下从未转达（当时指针在画面外）→ 不能凭空给远端发抬起。
             None
@@ -923,7 +941,13 @@ impl InputGate {
     /// 输入处理（多数窗口程序按 keydown 事件重复，少数看的是按键状态），故不能在控制器侧把它
     /// 折成一条「按下」——那样两端都会失去自动重复。
     #[must_use]
-    pub fn key(&mut self, code: u32, pressed: bool, keyboard_enabled: bool, modifiers: u8) -> Vec<InputEvent> {
+    pub fn key(
+        &mut self,
+        code: u32,
+        pressed: bool,
+        keyboard_enabled: bool,
+        modifiers: u8,
+    ) -> Vec<InputEvent> {
         if !keyboard_enabled {
             return self.release_keys();
         }
@@ -1012,7 +1036,10 @@ impl InputGate {
         for (idx, button) in MOUSE_BUTTONS.iter().enumerate() {
             if self.mouse_forwarded[idx] {
                 self.mouse_forwarded[idx] = false;
-                out.push(InputEvent::MouseButton { button: *button, pressed: false });
+                out.push(InputEvent::MouseButton {
+                    button: *button,
+                    pressed: false,
+                });
             }
         }
         out.extend(self.release_modifiers());
@@ -1070,12 +1097,25 @@ fn monitor_info(monitor: &xcap::Monitor, fallback_id: u32) -> DisplayInfo {
         id: monitor.id().unwrap_or(fallback_id),
         width: monitor.width().unwrap_or(0),
         height: monitor.height().unwrap_or(0),
-        name: monitor.name().unwrap_or_else(|_| format!("显示器 {fallback_id}")),
+        name: monitor
+            .name()
+            .unwrap_or_else(|_| format!("显示器 {fallback_id}")),
         primary: monitor.is_primary().unwrap_or(false),
     }
 }
 
 impl ScreenSource for XcapScreen {
+    /// 统计角标里的采集方式：xcap（CPU 截屏，三平台通用）。
+    ///
+    /// 其余字段保持默认——xcap 没有 GPU 零拷贝、没有可枚举的适配器，也没有源内计数器；
+    /// Windows 用户会话的硬件采集走 `win_video::WinVideoScreen`，那份 `capture_info` 会填全。
+    fn capture_info(&self) -> CaptureInfo {
+        CaptureInfo {
+            backend: "xcap".to_owned(),
+            ..CaptureInfo::default()
+        }
+    }
+
     fn displays(&self) -> Vec<DisplayInfo> {
         xcap::Monitor::all().map_or_else(
             |_| Vec::new(),
@@ -1090,8 +1130,8 @@ impl ScreenSource for XcapScreen {
     }
 
     fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
-        let monitors =
-            xcap::Monitor::all().map_err(|e| RemoteError::Platform(format!("枚举显示器失败: {e}")))?;
+        let monitors = xcap::Monitor::all()
+            .map_err(|e| RemoteError::Platform(format!("枚举显示器失败: {e}")))?;
         let monitor = monitors
             .iter()
             .find(|m| m.id().ok() == Some(display))
@@ -1153,7 +1193,8 @@ fn lock_platform_screen() -> RemoteResult<()> {
     #[cfg(target_os = "linux")]
     {
         // 依次尝试 systemd（loginctl）与 X11 时代的 xdg-screensaver；成功即返回。
-        let mut last_error = String::from("没有可用的锁屏命令（已尝试 loginctl 与 xdg-screensaver）");
+        let mut last_error =
+            String::from("没有可用的锁屏命令（已尝试 loginctl 与 xdg-screensaver）");
         for (program, args) in [
             ("loginctl", &["lock-session"][..]),
             ("xdg-screensaver", &["lock"][..]),
@@ -1209,7 +1250,10 @@ impl EnigoInput {
     }
 
     /// 在注入器上执行一段操作；未初始化时返回明确错误。
-    fn with_enigo<R>(&self, f: impl FnOnce(&mut enigo::Enigo) -> RemoteResult<R>) -> RemoteResult<R> {
+    fn with_enigo<R>(
+        &self,
+        f: impl FnOnce(&mut enigo::Enigo) -> RemoteResult<R>,
+    ) -> RemoteResult<R> {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let enigo = guard.as_mut().ok_or_else(|| {
             RemoteError::Platform("输入注入不可用（请授予辅助功能权限）".to_owned())
@@ -1267,7 +1311,9 @@ impl InputSink for EnigoInput {
                 enigo.scroll(dy, enigo::Axis::Vertical).map_err(input_err)?;
             }
             if dx != 0 {
-                enigo.scroll(dx, enigo::Axis::Horizontal).map_err(input_err)?;
+                enigo
+                    .scroll(dx, enigo::Axis::Horizontal)
+                    .map_err(input_err)?;
             }
             Ok(())
         })
@@ -1291,7 +1337,11 @@ impl InputSink for EnigoInput {
         // 故按「点按」展开（按下+抬起）。新控制器不再发送，保留只为兼容。
         if let Some(text) = event.text.as_deref() {
             for ch in text.chars() {
-                self.with_enigo(|enigo| enigo.key(enigo::Key::Unicode(ch), enigo::Direction::Click).map_err(input_err))?;
+                self.with_enigo(|enigo| {
+                    enigo
+                        .key(enigo::Key::Unicode(ch), enigo::Direction::Click)
+                        .map_err(input_err)
+                })?;
             }
         }
         Ok(())
@@ -1346,6 +1396,16 @@ pub struct FrameState {
     ///
     /// 只有成功应用到合成帧的批次才计数；因无基底/尺寸不符/矩形非法被整批丢弃的不算。
     pub patch_count: u32,
+    /// 最近一次**成功上屏**的画面（全帧或补丁）的**被控端采集时刻**（µs，被控端单调时钟）。
+    ///
+    /// UI 用它配合 [`RemoteUiState::clock_offset_us`] 与 `clock::now_us()` 算「采集 → 上屏」的
+    /// 端到端延迟（协议 v8）。`None` = 还没有画面，或对端没带时间戳（旧协议/降级路径）。
+    pub last_capture_ts_us: Option<u64>,
+}
+
+/// 把线上的采集时刻转成「可信时间戳」：`0` 是对端未填的哨兵，按未知处理。
+fn capture_timestamp(capture_ts_us: u64) -> Option<u64> {
+    (capture_ts_us > 0).then_some(capture_ts_us)
 }
 
 /// [`FrameSink`] 的 egui 实现：把帧塞进共享槽并唤醒 UI 重绘。
@@ -1375,6 +1435,9 @@ impl FrameSink for GuiFrameSink {
     }
 
     fn on_frame(&self, mut frame: DecodedFrame) {
+        // 采集时刻与被控端时钟（协议 v8）；`on_frame` 之后 `frame` 的其余字段会 move 进合成缓冲，
+        // 故先取出。`0` 表示对端未填，按未知处理。
+        let capture_ts = capture_timestamp(frame.capture_ts_us);
         // 把 NV12 **移出**帧（不 clone），整块交给共享合成缓冲。
         let nv12 = frame.nv12.take();
         if let Ok(mut guard) = self.shared.lock() {
@@ -1384,6 +1447,7 @@ impl FrameSink for GuiFrameSink {
                 if let Some(composite) = CompositeFrame::new(frame.width, frame.height, nv12) {
                     guard.composite = Some(Arc::new(composite));
                     guard.latest = None;
+                    guard.last_capture_ts_us = capture_ts;
                 } else {
                     tracing::warn!(
                         width = frame.width,
@@ -1394,6 +1458,7 @@ impl FrameSink for GuiFrameSink {
             } else {
                 guard.composite = None;
                 guard.latest = Some(frame);
+                guard.last_capture_ts_us = capture_ts;
             }
             guard.frame_count = guard.frame_count.wrapping_add(1);
         }
@@ -1442,6 +1507,7 @@ impl FrameSink for GuiFrameSink {
             return;
         }
         guard.patch_count = guard.patch_count.wrapping_add(1);
+        guard.last_capture_ts_us = capture_timestamp(patch.capture_ts_us);
         drop(guard);
         self.ctx.request_repaint_of(self.viewport);
     }
@@ -1452,7 +1518,6 @@ impl FrameSink for GuiFrameSink {
         }
         self.ctx.request_repaint_of(self.viewport);
     }
-
 
     fn on_closed(&self, reason: String) {
         if let Ok(mut guard) = self.shared.lock() {
@@ -1617,6 +1682,11 @@ pub struct RemoteView {
     pub toolbar_rect: Option<egui::Rect>,
     /// 统计角标是否常显（持久化镜像）。
     pub stats_overlay: bool,
+    /// 统计角标是否显示**详细指标**（持久化镜像，见 `GuiPrefs::remote_stats_detail`）。
+    ///
+    /// 与 [`Self::stats_overlay`] 一样是跨会话保留的展示偏好：`reset_session` / `begin_session`
+    /// **不得**清它（它不是本场会话的读数）。
+    pub stats_detail: bool,
     /// 剪贴板自动同步开关（持久化镜像）。
     pub clipboard_sync_enabled: bool,
     /// 自动同步去重状态机；仅同步开启时存在（关闭 / 换会话时置 `None`，下次启用重建）。
@@ -1699,6 +1769,7 @@ impl RemoteView {
             toolbar_collapsed: false,
             toolbar_rect: None,
             stats_overlay: false,
+            stats_detail: false,
             clipboard_sync_enabled: false,
             clipboard_sync: None,
             exclusive_keyboard: false,
@@ -1742,6 +1813,7 @@ impl RemoteView {
         view.scale = prefs.remote_view_scale;
         view.window_size = prefs.remote_window_size;
         view.stats_overlay = prefs.remote_stats_overlay;
+        view.stats_detail = prefs.remote_stats_detail;
         view.clipboard_sync_enabled = prefs.remote_clipboard_sync;
         view.toolbar_autohide = prefs.remote_toolbar_autohide;
         view.toolbar_collapsed = prefs.remote_toolbar_collapsed;
@@ -1754,6 +1826,31 @@ impl RemoteView {
     #[must_use]
     pub fn frame_dims(&self) -> (u32, u32) {
         self.tex_size
+    }
+
+    /// 最近一次成功上屏画面的**被控端采集时刻**（µs，被控端单调时钟）。
+    ///
+    /// 统计角标用它算「采集 → 上屏」端到端延迟（见 `ui::session_window::stats_overlay`）。
+    /// `None` = 还没有画面，或对端未带时间戳。
+    #[must_use]
+    pub fn last_capture_ts_us(&self) -> Option<u64> {
+        self.shared.lock().map_or_else(
+            |e| e.into_inner().last_capture_ts_us,
+            |guard| guard.last_capture_ts_us,
+        )
+    }
+
+    /// 本端上屏渲染后端的中文标签（统计角标 A4）。
+    ///
+    /// `wgpu_target_format` 为 `Some` 表示 NV12 帧经 wgpu 着色器在 GPU 上完成 BT.709 转换与缩放；
+    /// `None` 是 Glow 下的 CPU 回退（先转 RGBA 再上传纹理）。
+    #[must_use]
+    pub fn render_backend(&self) -> &'static str {
+        if self.wgpu_target_format.is_some() {
+            "wgpu（GPU）"
+        } else {
+            "glow（CPU）"
+        }
     }
 
     /// 管理器就绪后安装 [`FrameSink`]（幂等；需 egui 上下文以唤醒重绘）。
@@ -1792,6 +1889,11 @@ impl RemoteView {
         // 画质同理；设置弹窗属于上一场的 UI 状态，不应带到下一场。
         self.quality_sent = false;
         self.settings_open = false;
+        // 采集时刻属于**上一场会话**：不清掉的话，新会话首帧到达前角标会用旧时间戳
+        // 配新会话的时钟偏差，算出一个虚假的「采集→上屏」延迟。
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.last_capture_ts_us = None;
+        }
         // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
         self.input_count = 0;
         self.input_base = 0;
@@ -1809,9 +1911,10 @@ impl RemoteView {
     /// 当前显示器列表（引擎下发）。
     #[must_use]
     pub fn displays(&self) -> Vec<DisplayInfo> {
-        self.shared
-            .lock()
-            .map_or_else(|e| e.into_inner().displays.clone(), |guard| guard.displays.clone())
+        self.shared.lock().map_or_else(
+            |e| e.into_inner().displays.clone(),
+            |guard| guard.displays.clone(),
+        )
     }
 
     /// 输入坐标应映射到的目标尺寸。
@@ -1912,7 +2015,11 @@ impl RemoteView {
     /// 没有 wgpu（Glow / 无 render state）时保留 CPU 回退，整帧转成 RGBA——只在内容变化时重转。
     pub fn upload(&mut self, ctx: &egui::Context) -> Option<FramePaint> {
         // 1) RGBA（VP9）整帧：取走即清（NV12 帧不再进这里，见 `FrameState::latest`）。
-        let frame = self.shared.lock().ok().and_then(|mut guard| guard.latest.take());
+        let frame = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.latest.take());
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
                 if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
@@ -1922,7 +2029,11 @@ impl RemoteView {
         }
 
         // 2) NV12 共享合成帧（全帧 + 补丁）。
-        let composite = self.shared.lock().ok().and_then(|guard| guard.composite.clone());
+        let composite = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|guard| guard.composite.clone());
         let Some(frame) = composite else {
             return self.last_paint.clone();
         };
@@ -1995,6 +2106,10 @@ impl RemoteView {
     /// 画面上时转达、抬起只要曾转达过就无条件转达；滚轮只在指针位于画面上时转达；键盘只在窗口
     /// 有焦点且无控件吃键盘输入时转达。鼠标键按下/抬起直接取 `i.events` 里的 `PointerButton`
     /// **边沿**（电平式 `button_down()` 会吞掉整帧内完成的短按，见 [`InputGate::mouse_button`]）。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "输入捕获按事件类型逐段处理；拆成子函数会让「指针在不在画面上」这份共享判据与各门控状态更难对齐"
+    )]
     pub fn capture_input(&mut self, ui: &egui::Ui, manager: &Arc<RemoteManager>, rect: egui::Rect) {
         // 独占键盘的退出组合键**先**拦截：命中即关闭独占、本帧不转发任何输入（组合键不能泄给远端）。
         // 不置 `capture_this_frame`，让窗口回调在本帧补发一次抬起——刚改了键盘语义，先松开最安全。
@@ -2014,11 +2129,8 @@ impl RemoteView {
         // 目标坐标系 = 所选显示器的尺寸（与注入端同一套全局显示坐标），不是纹理像素尺寸。
         let (target_w, target_h) = self.input_target_size(display);
 
-        // 有效画面区域：画面矩形再与本 UI 的裁剪矩形相交（画面被滚动区裁掉时，露在外面的部分才可交互）。
-        // 还要**再加半条层级判据**：该位置最上层的可交互 area 必须是本面板。否则浮在画面之上的会话
-        // 统计角标（`egui::Window`）与任何弹出层都会被当成画面——点它们会同时注入远端一次点击。
-        // 旧的 `hovered()` 天然含这一条（"本控件在最上层"就是它的语义），换成几何判据后必须自己补。
-        // 面板（工具条/侧栏）不占画面矩形，故不受影响。
+        // 有效画面区域 = 画面矩形 ∩ 裁剪矩形，且最上层可交互 area 必须是本面板（否则浮层会被当成画面）。
+        // 统计角标是 `.interactable(false)` 的 `egui::Area`，`layer_id_at` 只遍历可交互层 → 点击穿透。
         let clip = rect.intersect(ui.clip_rect());
         let panel_layer = ui.layer_id();
         let in_image =
@@ -2028,7 +2140,10 @@ impl RemoteView {
         //    会被 egui 的交互簿记影响（任何别的控件被拖动、或画面上方有别的 layer 覆盖时它为
         //    `false`），远端输入不该由它决定；用「指针是否落在画面矩形内」这个判据，语义更直接也更稳。
         //    `latest_pos()` 在 `PointerGone`（指针离开视口）后为 `None`，故不会拿陈旧坐标继续注入。
-        if let Some(pos) = ui.input(|i| i.pointer.latest_pos()).filter(|pos| in_image(*pos)) {
+        if let Some(pos) = ui
+            .input(|i| i.pointer.latest_pos())
+            .filter(|pos| in_image(*pos))
+        {
             let x = scale_axis(pos.x - rect.min.x, rect.width(), target_w);
             let y = scale_axis(pos.y - rect.min.y, rect.height(), target_h);
             if self.last_mouse != Some((x, y)) {
@@ -2057,8 +2172,16 @@ impl RemoteView {
         //    `button_pressed`/`any_pressed` 的文档注记），所以这条路径不会丢短按；按顺序扫描保证
         //    「按下→抬起」的先后关系不被颠倒。
         for event in &events {
-            if let egui::Event::PointerButton { pos, button, pressed, .. } = event {
-                let Some(button) = mouse_button_of(*button) else { continue }; // 只认左/右/中键
+            if let egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } = event
+            {
+                let Some(button) = mouse_button_of(*button) else {
+                    continue;
+                }; // 只认左/右/中键
                 if let Some(event) = self.gate.mouse_button(button, *pressed, in_image(*pos)) {
                     self.forward_input(manager, event);
                 }
@@ -2067,7 +2190,9 @@ impl RemoteView {
         // 滚轮：gate 不变，但「指针是否在画面上」取当前原始指针位置（滚轮事件不带坐标）。
         let pointer_in_image = ui.input(|i| i.pointer.latest_pos()).is_some_and(in_image);
         // egui 的滚动量为正表示内容上移，enigo 正值为向下滚动 → 取反。
-        if let Some(event) = InputGate::wheel(pointer_in_image, -round_i32(scroll.x), -round_i32(scroll.y)) {
+        if let Some(event) =
+            InputGate::wheel(pointer_in_image, -round_i32(scroll.x), -round_i32(scroll.y))
+        {
             self.forward_input(manager, event);
         }
         for event in self.gate.modifiers(mods, keyboard_enabled) {
@@ -2097,7 +2222,12 @@ impl RemoteView {
         };
         for event in &events {
             match event {
-                egui::Event::Key { key, pressed, modifiers, .. } => {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } => {
                     // 本窗口的本地快捷键不转发：`F11` 切全屏恒不转发；`Esc` 只在全屏时被本端
                     // 消费（退出全屏），非全屏时照常透传给远端。
                     if *key == egui::Key::F11 || (*key == egui::Key::Escape && self.fullscreen) {
@@ -2120,14 +2250,14 @@ impl RemoteView {
                         continue;
                     }
                     let code = match event {
-                        egui::Event::Cut => keycode::LETTER_A + 23, // X
+                        egui::Event::Cut => keycode::LETTER_A + 23,      // X
                         egui::Event::Paste(_) => keycode::LETTER_A + 21, // V
                         // Copy，以及将来可能新增的同类变体：按复制处理。
                         _ => keycode::LETTER_A + 2, // C
                     };
-                    for out in self
-                        .gate
-                        .shortcut_click(code, shortcut_mod_mask, shortcut_mod_code, mods)
+                    for out in
+                        self.gate
+                            .shortcut_click(code, shortcut_mod_mask, shortcut_mod_code, mods)
                     {
                         self.forward_input(manager, out);
                     }
@@ -2235,7 +2365,11 @@ impl RemoteView {
         }
         self.reconnect_active = self.reconnect.is_active();
         self.reconnect_note = match step {
-            ReconnectStep::Waiting { attempt, total, remaining } => Some(format!(
+            ReconnectStep::Waiting {
+                attempt,
+                total,
+                remaining,
+            } => Some(format!(
                 "正在重连（{attempt}/{total}），{} 秒后重试",
                 remaining.as_secs().max(1)
             )),
@@ -2339,7 +2473,9 @@ impl RemoteView {
         if let Some(text) = self.take_clipboard() {
             self.inputs.clipboard_in = Some(text.clone());
             if self.clipboard_sync_enabled {
-                let sync = self.clipboard_sync.get_or_insert_with(ClipboardSync::default);
+                let sync = self
+                    .clipboard_sync
+                    .get_or_insert_with(ClipboardSync::default);
                 if let ClipboardAction::Apply(apply) = sync.on_remote(&text) {
                     // 写本机剪贴板可能阻塞（X11 下要抢 selection），丢短命线程，绝不卡 UI。
                     std::thread::spawn(move || {
@@ -2368,7 +2504,9 @@ impl RemoteView {
                 Ok(text) => {
                     self.inputs.clipboard_out.clone_from(&text);
                     if self.clipboard_sync_enabled {
-                        let sync = self.clipboard_sync.get_or_insert_with(ClipboardSync::default);
+                        let sync = self
+                            .clipboard_sync
+                            .get_or_insert_with(ClipboardSync::default);
                         if let ClipboardAction::Send(send) = sync.on_local(&text) {
                             manager.send_clipboard(send);
                         }
@@ -2385,9 +2523,21 @@ impl RemoteView {
     /// （捕获路径自增）。两者都按流逝秒数算平均。
     pub fn poll_fps(&mut self, now: Instant) {
         let frames = self.shared.lock().map_or(0, |guard| guard.frame_count);
-        Self::settle_rate(frames, &mut self.fps_base, &mut self.fps, &mut self.fps_since, now);
+        Self::settle_rate(
+            frames,
+            &mut self.fps_base,
+            &mut self.fps,
+            &mut self.fps_since,
+            now,
+        );
         let inputs = self.input_count;
-        Self::settle_rate(inputs, &mut self.input_base, &mut self.input_rate, &mut self.input_since, now);
+        Self::settle_rate(
+            inputs,
+            &mut self.input_base,
+            &mut self.input_rate,
+            &mut self.input_since,
+            now,
+        );
     }
 
     /// 每秒结算一次关键帧请求速率（累计值来自 [`RemoteUiState::keyframe_requests`] 的各原因之和）。
@@ -2406,7 +2556,13 @@ impl RemoteView {
 
     /// 结算一个「每秒速率」计数器的通用步骤：距上次结算不足 1 秒不动；否则按流逝秒数算平均并推进
     /// 基线。首次调用只记下基线（`None` 起步的计数器在第二个采样窗口才有读数）。
-    fn settle_rate(count: u32, base: &mut u32, rate: &mut u32, since: &mut Option<Instant>, now: Instant) {
+    fn settle_rate(
+        count: u32,
+        base: &mut u32,
+        rate: &mut u32,
+        since: &mut Option<Instant>,
+        now: Instant,
+    ) {
         let Some(last) = *since else {
             *since = Some(now);
             *base = count;
@@ -2434,8 +2590,9 @@ impl RemoteView {
         let slot = Arc::clone(&self.clipboard_read);
         std::thread::spawn(move || {
             // 后台线程 panic 会静默丢掉结果并让槽位空转；用 catch_unwind 兜底成错误信息。
-            let result = std::panic::catch_unwind(|| SystemClipboard.get().map_err(|err| err.to_string()))
-                .unwrap_or_else(|_| Err("读取本机剪贴板时发生内部错误".to_owned()));
+            let result =
+                std::panic::catch_unwind(|| SystemClipboard.get().map_err(|err| err.to_string()))
+                    .unwrap_or_else(|_| Err("读取本机剪贴板时发生内部错误".to_owned()));
             if let Ok(mut guard) = slot.lock() {
                 // 只写入不比槽内更旧的结果：连点两次时后发起的（代更大）胜出，先发起者若晚到也不
                 // 覆盖它；复位后旧代的结果同样在此被丢弃。
@@ -2590,7 +2747,12 @@ mod tests {
 
     /// 构造一条键盘事件（测试用）。
     fn key_ev(code: u32, pressed: bool) -> InputEvent {
-        InputEvent::Key(KeyEvent { code, pressed, text: None, modifiers: 0 })
+        InputEvent::Key(KeyEvent {
+            code,
+            pressed,
+            text: None,
+            modifiers: 0,
+        })
     }
 
     // ── InputGate：鼠标按键门控矩阵 ──────────────────────────────────
@@ -2607,7 +2769,10 @@ mod tests {
     #[test]
     fn mouse_press_inside_image_is_forwarded() {
         let mut gate = InputGate::default();
-        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, true, true),
+            Some(mouse_btn(MouseButton::Left, true))
+        );
     }
 
     /// 同一帧内完成的「按下 + 抬起」：两条边沿都必须转达（点击不能凭空消失）。
@@ -2619,8 +2784,14 @@ mod tests {
     #[test]
     fn press_and_release_in_one_frame_are_both_forwarded() {
         let mut gate = InputGate::default();
-        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
-        assert_eq!(gate.mouse_button(MouseButton::Left, false, true), Some(mouse_btn(MouseButton::Left, false)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, true, true),
+            Some(mouse_btn(MouseButton::Left, true))
+        );
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, false, true),
+            Some(mouse_btn(MouseButton::Left, false))
+        );
     }
 
     /// 漏掉一次「抬起」事件之后，下一次「按下」仍必须转达。
@@ -2631,11 +2802,20 @@ mod tests {
     #[test]
     fn missed_release_does_not_swallow_the_next_press() {
         let mut gate = InputGate::default();
-        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, true, true),
+            Some(mouse_btn(MouseButton::Left, true))
+        );
         // 抬起事件丢了（未调用 `mouse_button(.., false, ..)`）→ 直接又来一次按下边沿，仍要转达。
-        assert_eq!(gate.mouse_button(MouseButton::Left, true, true), Some(mouse_btn(MouseButton::Left, true)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, true, true),
+            Some(mouse_btn(MouseButton::Left, true))
+        );
         // 远端此刻只见过按下：会话收尾的 `release_all` 会把抬起补齐（幂等，重复调用返回空）。
-        assert_eq!(gate.release_all(), vec![mouse_btn(MouseButton::Left, false)]);
+        assert_eq!(
+            gate.release_all(),
+            vec![mouse_btn(MouseButton::Left, false)]
+        );
     }
 
     #[test]
@@ -2643,7 +2823,10 @@ mod tests {
         let mut gate = InputGate::default();
         assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
         // 按下已转达过 → 即便指针已移出画面（甚至窗口），抬起仍必须转达。
-        assert_eq!(gate.mouse_button(MouseButton::Left, false, false), Some(mouse_btn(MouseButton::Left, false)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, false, false),
+            Some(mouse_btn(MouseButton::Left, false))
+        );
         // 再抬起（本就没按下）→ 不转达。
         assert_eq!(gate.mouse_button(MouseButton::Left, false, false), None);
     }
@@ -2666,7 +2849,10 @@ mod tests {
         // 拖动期间指针离开画面：`pointer_in_image` 由「指针是否落在画面矩形内」决定，这里验证
         // 「指针在画面外」时不会凭空多出一次按下、抬起照发。
         assert_eq!(gate.mouse_button(MouseButton::Left, true, false), None);
-        assert_eq!(gate.mouse_button(MouseButton::Left, false, false), Some(mouse_btn(MouseButton::Left, false)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, false, false),
+            Some(mouse_btn(MouseButton::Left, false))
+        );
     }
 
     // ── InputGate：滚轮门控 ──────────────────────────────────────────
@@ -2675,7 +2861,10 @@ mod tests {
     fn wheel_only_forwards_when_pointer_in_image() {
         assert_eq!(InputGate::wheel(false, 3, -4), None);
         assert_eq!(InputGate::wheel(true, 0, 0), None);
-        assert_eq!(InputGate::wheel(true, 3, -4), Some(InputEvent::Wheel { dx: 3, dy: -4 }));
+        assert_eq!(
+            InputGate::wheel(true, 3, -4),
+            Some(InputEvent::Wheel { dx: 3, dy: -4 })
+        );
     }
 
     // ── InputGate：键盘 / 文本 / 修饰键门控 ──────────────────────────
@@ -2692,9 +2881,15 @@ mod tests {
     #[test]
     fn key_release_is_forwarded_after_gated_press_even_if_gate_closed() {
         let mut gate = InputGate::default();
-        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+        assert_eq!(
+            gate.key(keycode::ENTER, true, true, 0),
+            vec![key_ev(keycode::ENTER, true)]
+        );
         // 随后门控关闭（失焦 / 输入框获得焦点）→ key() 的补偿路径把该键补发抬起，远端不会卡住 Enter。
-        assert_eq!(gate.key(keycode::ENTER, false, false, 0), vec![key_ev(keycode::ENTER, false)]);
+        assert_eq!(
+            gate.key(keycode::ENTER, false, false, 0),
+            vec![key_ev(keycode::ENTER, false)]
+        );
     }
 
     /// 门控关闭时 `key()` 走与 `modifiers()` 对称的补偿路径：回收已转达按下的键。
@@ -2702,9 +2897,15 @@ mod tests {
     fn key_recovers_forwarded_keys_when_gate_closes() {
         let mut gate = InputGate::default();
         // 门控开启时按下方向键 → 转达按下。
-        assert_eq!(gate.key(keycode::ARROW_UP, true, true, 0), vec![key_ev(keycode::ARROW_UP, true)]);
+        assert_eq!(
+            gate.key(keycode::ARROW_UP, true, true, 0),
+            vec![key_ev(keycode::ARROW_UP, true)]
+        );
         // 失焦（门控关闭）：不再转发任何按下，而是把该键补发抬起。
-        assert_eq!(gate.key(keycode::ARROW_UP, true, false, 0), vec![key_ev(keycode::ARROW_UP, false)]);
+        assert_eq!(
+            gate.key(keycode::ARROW_UP, true, false, 0),
+            vec![key_ev(keycode::ARROW_UP, false)]
+        );
         // 幂等：状态已清干净，重复调用（无论 pressed 真假）都不再重发抬起。
         assert!(gate.key(keycode::ARROW_UP, true, false, 0).is_empty());
         assert!(gate.key(keycode::ARROW_UP, false, false, 0).is_empty());
@@ -2716,11 +2917,20 @@ mod tests {
     #[test]
     fn key_can_press_again_after_gate_reopens() {
         let mut gate = InputGate::default();
-        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+        assert_eq!(
+            gate.key(keycode::ENTER, true, true, 0),
+            vec![key_ev(keycode::ENTER, true)]
+        );
         // 门控关闭 → 补发抬起、清空 keys_forwarded。
-        assert_eq!(gate.key(keycode::ENTER, true, false, 0), vec![key_ev(keycode::ENTER, false)]);
+        assert_eq!(
+            gate.key(keycode::ENTER, true, false, 0),
+            vec![key_ev(keycode::ENTER, false)]
+        );
         // 重新放行：同一键再次按下必须能产生新的「按下」边沿。
-        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
+        assert_eq!(
+            gate.key(keycode::ENTER, true, true, 0),
+            vec![key_ev(keycode::ENTER, true)]
+        );
     }
 
     /// `release_keys` 只回收键盘（不动鼠标），且幂等。
@@ -2728,13 +2938,22 @@ mod tests {
     fn release_keys_leaves_mouse_untouched_and_is_idempotent() {
         let mut gate = InputGate::default();
         assert!(gate.mouse_button(MouseButton::Left, true, true).is_some());
-        assert_eq!(gate.key(keycode::ENTER, true, true, 0), vec![key_ev(keycode::ENTER, true)]);
-        assert_eq!(gate.key(keycode::F1, true, true, 0), vec![key_ev(keycode::F1, true)]);
+        assert_eq!(
+            gate.key(keycode::ENTER, true, true, 0),
+            vec![key_ev(keycode::ENTER, true)]
+        );
+        assert_eq!(
+            gate.key(keycode::F1, true, true, 0),
+            vec![key_ev(keycode::F1, true)]
+        );
         let released = gate.release_keys();
         assert!(released.contains(&key_ev(keycode::ENTER, false)));
         assert!(released.contains(&key_ev(keycode::F1, false)));
         // 鼠标键未被键盘回收触碰，仍处于「已转达按下」。
-        assert_eq!(gate.mouse_button(MouseButton::Left, false, true), Some(mouse_btn(MouseButton::Left, false)));
+        assert_eq!(
+            gate.mouse_button(MouseButton::Left, false, true),
+            Some(mouse_btn(MouseButton::Left, false))
+        );
         // 幂等：再次回收键盘返回空。
         assert!(gate.release_keys().is_empty());
     }
@@ -2745,10 +2964,18 @@ mod tests {
         // Ctrl 按下边沿 → 转达按下。
         assert_eq!(
             gate.modifiers(modifier::CTRL, true),
-            vec![InputEvent::Key(KeyEvent { code: keycode::CTRL, pressed: true, text: None, modifiers: modifier::CTRL })]
+            vec![InputEvent::Key(KeyEvent {
+                code: keycode::CTRL,
+                pressed: true,
+                text: None,
+                modifiers: modifier::CTRL
+            })]
         );
         // 门控关闭 → 补发 Ctrl 抬起（否则远端残留一个按下的 Ctrl）。
-        assert_eq!(gate.modifiers(modifier::CTRL, false), vec![key_ev(keycode::CTRL, false)]);
+        assert_eq!(
+            gate.modifiers(modifier::CTRL, false),
+            vec![key_ev(keycode::CTRL, false)]
+        );
         // 重新放行：基线已同步为 CTRL，不应凭空再产生一次「按下」边沿。
         assert!(gate.modifiers(modifier::CTRL, true).is_empty());
         // 真正的抬起边沿照常转达。
@@ -2802,8 +3029,14 @@ mod tests {
     fn egui_key_to_code_maps_specials() {
         assert_eq!(egui_key_to_code(egui::Key::Enter), Some(keycode::ENTER));
         assert_eq!(egui_key_to_code(egui::Key::Escape), Some(keycode::ESCAPE));
-        assert_eq!(egui_key_to_code(egui::Key::ArrowUp), Some(keycode::ARROW_UP));
-        assert_eq!(egui_key_to_code(egui::Key::ArrowLeft), Some(keycode::ARROW_LEFT));
+        assert_eq!(
+            egui_key_to_code(egui::Key::ArrowUp),
+            Some(keycode::ARROW_UP)
+        );
+        assert_eq!(
+            egui_key_to_code(egui::Key::ArrowLeft),
+            Some(keycode::ARROW_LEFT)
+        );
         assert_eq!(egui_key_to_code(egui::Key::Insert), Some(keycode::INSERT));
         assert_eq!(egui_key_to_code(egui::Key::F1), Some(keycode::F1));
         assert_eq!(egui_key_to_code(egui::Key::F12), Some(keycode::F1 + 11));
@@ -2827,12 +3060,27 @@ mod tests {
         assert_eq!(egui_key_to_code(egui::Key::Num9), Some(keycode::DIGIT_9));
         assert_eq!(egui_key_to_code(egui::Key::Minus), Some(keycode::MINUS));
         assert_eq!(egui_key_to_code(egui::Key::Equals), Some(keycode::EQUALS));
-        assert_eq!(egui_key_to_code(egui::Key::OpenBracket), Some(keycode::OPEN_BRACKET));
-        assert_eq!(egui_key_to_code(egui::Key::CloseBracket), Some(keycode::CLOSE_BRACKET));
-        assert_eq!(egui_key_to_code(egui::Key::Backslash), Some(keycode::BACKSLASH));
-        assert_eq!(egui_key_to_code(egui::Key::Semicolon), Some(keycode::SEMICOLON));
+        assert_eq!(
+            egui_key_to_code(egui::Key::OpenBracket),
+            Some(keycode::OPEN_BRACKET)
+        );
+        assert_eq!(
+            egui_key_to_code(egui::Key::CloseBracket),
+            Some(keycode::CLOSE_BRACKET)
+        );
+        assert_eq!(
+            egui_key_to_code(egui::Key::Backslash),
+            Some(keycode::BACKSLASH)
+        );
+        assert_eq!(
+            egui_key_to_code(egui::Key::Semicolon),
+            Some(keycode::SEMICOLON)
+        );
         assert_eq!(egui_key_to_code(egui::Key::Quote), Some(keycode::QUOTE));
-        assert_eq!(egui_key_to_code(egui::Key::Backtick), Some(keycode::BACKTICK));
+        assert_eq!(
+            egui_key_to_code(egui::Key::Backtick),
+            Some(keycode::BACKTICK)
+        );
         assert_eq!(egui_key_to_code(egui::Key::Comma), Some(keycode::COMMA));
         assert_eq!(egui_key_to_code(egui::Key::Period), Some(keycode::PERIOD));
         assert_eq!(egui_key_to_code(egui::Key::Slash), Some(keycode::SLASH));
@@ -2840,11 +3088,23 @@ mod tests {
         // 上档标点 → 同一物理键（Shift 由修饰键事件单独转发）。
         assert_eq!(egui_key_to_code(egui::Key::Colon), Some(keycode::SEMICOLON));
         assert_eq!(egui_key_to_code(egui::Key::Plus), Some(keycode::EQUALS));
-        assert_eq!(egui_key_to_code(egui::Key::Exclamationmark), Some(keycode::DIGIT_0 + 1));
-        assert_eq!(egui_key_to_code(egui::Key::OpenCurlyBracket), Some(keycode::OPEN_BRACKET));
-        assert_eq!(egui_key_to_code(egui::Key::CloseCurlyBracket), Some(keycode::CLOSE_BRACKET));
+        assert_eq!(
+            egui_key_to_code(egui::Key::Exclamationmark),
+            Some(keycode::DIGIT_0 + 1)
+        );
+        assert_eq!(
+            egui_key_to_code(egui::Key::OpenCurlyBracket),
+            Some(keycode::OPEN_BRACKET)
+        );
+        assert_eq!(
+            egui_key_to_code(egui::Key::CloseCurlyBracket),
+            Some(keycode::CLOSE_BRACKET)
+        );
         assert_eq!(egui_key_to_code(egui::Key::Pipe), Some(keycode::BACKSLASH));
-        assert_eq!(egui_key_to_code(egui::Key::Questionmark), Some(keycode::SLASH));
+        assert_eq!(
+            egui_key_to_code(egui::Key::Questionmark),
+            Some(keycode::SLASH)
+        );
     }
 
     /// 键码区间不得撞号：若按「F1 + (n-1)」扩展，F21..=F24 会落在 40..=43，正好与
@@ -2912,15 +3172,27 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(code_to_enigo(keycode::LETTER_A), Some(enigo::Key::Other(0x41)));
-            assert_eq!(code_to_enigo(keycode::DIGIT_0), Some(enigo::Key::Other(0x30)));
-            assert_eq!(code_to_enigo(keycode::SEMICOLON), Some(enigo::Key::Other(0xBA)));
+            assert_eq!(
+                code_to_enigo(keycode::LETTER_A),
+                Some(enigo::Key::Other(0x41))
+            );
+            assert_eq!(
+                code_to_enigo(keycode::DIGIT_0),
+                Some(enigo::Key::Other(0x30))
+            );
+            assert_eq!(
+                code_to_enigo(keycode::SEMICOLON),
+                Some(enigo::Key::Other(0xBA))
+            );
         }
         #[cfg(target_os = "macos")]
         {
             assert_eq!(code_to_enigo(keycode::LETTER_A), Some(enigo::Key::Other(0)));
             assert_eq!(code_to_enigo(keycode::DIGIT_0), Some(enigo::Key::Other(29)));
-            assert_eq!(code_to_enigo(keycode::SEMICOLON), Some(enigo::Key::Other(41)));
+            assert_eq!(
+                code_to_enigo(keycode::SEMICOLON),
+                Some(enigo::Key::Other(41))
+            );
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -2964,13 +3236,19 @@ mod tests {
         assert_eq!(code_to_vk(keycode::F1), Some(0x70));
         assert_eq!(code_to_vk(keycode::F1 + 11), Some(0x7B));
         for i in 0..12 {
-            assert_eq!(code_to_vk(keycode::F1 + i), Some(0x70 + u16::try_from(i).unwrap()));
+            assert_eq!(
+                code_to_vk(keycode::F1 + i),
+                Some(0x70 + u16::try_from(i).unwrap())
+            );
         }
         // F13..=F24 是 0x7C..=0x87 的另一段连续区间。
         assert_eq!(code_to_vk(keycode::F13), Some(0x7C));
         assert_eq!(code_to_vk(keycode::F24), Some(0x87));
         for i in 0..12 {
-            assert_eq!(code_to_vk(keycode::F13 + i), Some(0x7C + u16::try_from(i).unwrap()));
+            assert_eq!(
+                code_to_vk(keycode::F13 + i),
+                Some(0x7C + u16::try_from(i).unwrap())
+            );
         }
         // 文本键与未知码不给 VK（文本是旧控制器的遗留路径）。
         assert_eq!(code_to_vk(keycode::TEXT), None);
@@ -3046,7 +3324,12 @@ mod tests {
         // Ctrl 已由 `modifiers()` 转达按下 → 只发 C 的按下+抬起。
         assert_eq!(gate.modifiers(modifier::CTRL, true).len(), 1);
         assert_eq!(
-            gate.shortcut_click(keycode::LETTER_A + 2, modifier::CTRL, keycode::CTRL, modifier::CTRL),
+            gate.shortcut_click(
+                keycode::LETTER_A + 2,
+                modifier::CTRL,
+                keycode::CTRL,
+                modifier::CTRL
+            ),
             vec![
                 key_event(keycode::LETTER_A + 2, true, None, modifier::CTRL),
                 key_event(keycode::LETTER_A + 2, false, None, modifier::CTRL),
@@ -3061,7 +3344,12 @@ mod tests {
         let mut gate = InputGate::default();
         // 修饰键边沿没赶上：临时补一对，顺序必须是 mod down / key down / key up / mod up。
         assert_eq!(
-            gate.shortcut_click(keycode::LETTER_A + 23, modifier::CTRL, keycode::CTRL, modifier::CTRL),
+            gate.shortcut_click(
+                keycode::LETTER_A + 23,
+                modifier::CTRL,
+                keycode::CTRL,
+                modifier::CTRL
+            ),
             vec![
                 key_event(keycode::CTRL, true, None, modifier::CTRL),
                 key_event(keycode::LETTER_A + 23, true, None, modifier::CTRL),
@@ -3108,20 +3396,42 @@ mod tests {
             seq: 0,
             rgba: vec![0; 16],
             nv12: None,
+            capture_ts_us: 0,
         };
         assert_eq!(valid_frame_dims(&frame), Some((2, 2)));
         // 像素数据长度与尺寸不符 → 拒。
-        let short = DecodedFrame { rgba: vec![0; 15], ..frame.clone() };
+        let short = DecodedFrame {
+            rgba: vec![0; 15],
+            ..frame.clone()
+        };
         assert_eq!(valid_frame_dims(&short), None);
-        let long = DecodedFrame { rgba: vec![0; 17], ..frame.clone() };
+        let long = DecodedFrame {
+            rgba: vec![0; 17],
+            ..frame.clone()
+        };
         assert_eq!(valid_frame_dims(&long), None);
         // 任一维为 0 → 拒。
-        let zero_w = DecodedFrame { width: 0, height: 2, rgba: Vec::new(), ..frame.clone() };
+        let zero_w = DecodedFrame {
+            width: 0,
+            height: 2,
+            rgba: Vec::new(),
+            ..frame.clone()
+        };
         assert_eq!(valid_frame_dims(&zero_w), None);
-        let zero_h = DecodedFrame { width: 2, height: 0, rgba: Vec::new(), ..frame.clone() };
+        let zero_h = DecodedFrame {
+            width: 2,
+            height: 0,
+            rgba: Vec::new(),
+            ..frame.clone()
+        };
         assert_eq!(valid_frame_dims(&zero_h), None);
         // 尺寸乘积溢出 usize → 拒（不 panic）。用 u32::MAX×u32::MAX×4 会溢出。
-        let huge = DecodedFrame { width: u32::MAX, height: u32::MAX, rgba: Vec::new(), ..frame };
+        let huge = DecodedFrame {
+            width: u32::MAX,
+            height: u32::MAX,
+            rgba: Vec::new(),
+            ..frame
+        };
         assert_eq!(valid_frame_dims(&huge), None);
     }
 
@@ -3145,9 +3455,18 @@ mod tests {
                 y: vec![0x11; 64],
                 uv: vec![0x22; 32],
             }),
+            capture_ts_us: 0,
         });
-        let first = shared.lock().unwrap().composite.clone().expect("全帧应建立合成缓冲");
-        assert!(matches!(first.take_upload(false), Some(UploadChunk::Full { .. })));
+        let first = shared
+            .lock()
+            .unwrap()
+            .composite
+            .clone()
+            .expect("全帧应建立合成缓冲");
+        assert!(matches!(
+            first.take_upload(false),
+            Some(UploadChunk::Full { .. })
+        ));
         // 全帧不再留一份在 `latest` 里（RGBA 路径专用）。
         assert!(shared.lock().unwrap().latest.is_none());
 
@@ -3162,8 +3481,14 @@ mod tests {
                 height: 2,
                 nv12: vec![0x33; 12],
             }],
+            capture_ts_us: 0,
         });
-        let second = shared.lock().unwrap().composite.clone().expect("补丁不应清空缓冲");
+        let second = shared
+            .lock()
+            .unwrap()
+            .composite
+            .clone()
+            .expect("补丁不应清空缓冲");
         assert!(
             Arc::ptr_eq(&first, &second),
             "补丁路径必须复用同一块缓冲（不得 clone 整帧/换实例）"
@@ -3215,6 +3540,7 @@ mod tests {
             width: 8,
             height: 8,
             rects: vec![valid.clone()],
+            capture_ts_us: 0,
         });
         assert_eq!(shared.lock().unwrap().patch_count, 0);
 
@@ -3229,6 +3555,7 @@ mod tests {
                 y: vec![0x11; 64],
                 uv: vec![0x22; 32],
             }),
+            capture_ts_us: 0,
         });
         let composite = shared.lock().unwrap().composite.clone().unwrap();
         assert!(composite.take_upload(false).is_some());
@@ -3237,6 +3564,7 @@ mod tests {
             width: 4,
             height: 4,
             rects: vec![valid.clone()],
+            capture_ts_us: 0,
         });
         assert_eq!(shared.lock().unwrap().patch_count, 0);
 
@@ -3246,13 +3574,61 @@ mod tests {
             width: 8,
             height: 8,
             rects: vec![
-                ScreenPatch { x: 0, ..valid.clone() },
+                ScreenPatch {
+                    x: 0,
+                    ..valid.clone()
+                },
                 ScreenPatch { x: 8, ..valid },
             ],
+            capture_ts_us: 0,
         });
         assert_eq!(shared.lock().unwrap().patch_count, 0);
-        assert!(composite.take_upload(false).is_none(), "非法批次不应登记脏区");
+        assert!(
+            composite.take_upload(false).is_none(),
+            "非法批次不应登记脏区"
+        );
         composite.with_data(|data| assert_eq!(data.y, vec![0x11; 64]));
+    }
+
+    /// 采集时刻的哨兵语义：`0` 是对端未填（→ `None`），非零原样保留。
+    #[test]
+    fn capture_timestamp_treats_zero_as_unknown() {
+        assert_eq!(capture_timestamp(0), None);
+        assert_eq!(capture_timestamp(1), Some(1));
+        assert_eq!(capture_timestamp(u64::MAX), Some(u64::MAX));
+    }
+
+    /// 成功上屏的全帧必须把被控端采集时刻记进共享槽（角标据此算「采集 → 上屏」）。
+    #[test]
+    fn sink_records_capture_timestamp_of_applied_frames() {
+        let shared: Arc<Mutex<FrameState>> = Arc::new(Mutex::new(FrameState::default()));
+        let sink = GuiFrameSink {
+            shared: Arc::clone(&shared),
+            ctx: egui::Context::default(),
+            viewport: egui::ViewportId::ROOT,
+        };
+        assert_eq!(shared.lock().unwrap().last_capture_ts_us, None);
+        sink.on_frame(DecodedFrame {
+            display: 0,
+            width: 4,
+            height: 4,
+            seq: 1,
+            rgba: vec![0; 64],
+            nv12: None,
+            capture_ts_us: 1234,
+        });
+        assert_eq!(shared.lock().unwrap().last_capture_ts_us, Some(1234));
+        // 对端未填（旧协议/降级）→ 回到未知，不把 0 当成一个真实时刻。
+        sink.on_frame(DecodedFrame {
+            display: 0,
+            width: 4,
+            height: 4,
+            seq: 2,
+            rgba: vec![0; 64],
+            nv12: None,
+            capture_ts_us: 0,
+        });
+        assert_eq!(shared.lock().unwrap().last_capture_ts_us, None);
     }
 
     #[test]
@@ -3264,9 +3640,13 @@ mod tests {
             seq: 0,
             rgba: Vec::new(),
             nv12: Some(DecodedNv12 { y, uv }),
+            capture_ts_us: 0,
         };
         // 4×4 → Y 16 字节、UV 8 字节。
-        assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 8])), Some((4, 4)));
+        assert_eq!(
+            valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 8])),
+            Some((4, 4))
+        );
         // 任一平面长度不符 → 拒。
         assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 15], vec![0; 8])), None);
         assert_eq!(valid_frame_dims(&nv12_frame(vec![0; 16], vec![0; 7])), None);
@@ -3320,13 +3700,22 @@ mod tests {
         let mut view = RemoteView::new();
         view.last_session_id = Some("sess-ctl".to_owned());
 
-        assert!(view.should_auto_reconnect("sess-ctl", false, true), "本端控制器会话断线 → 重连");
+        assert!(
+            view.should_auto_reconnect("sess-ctl", false, true),
+            "本端控制器会话断线 → 重连"
+        );
         assert!(
             !view.should_auto_reconnect("sess-other", false, true),
             "结束的是别的会话（本端被控）→ 不该由本端拨号"
         );
-        assert!(!view.should_auto_reconnect("sess-ctl", true, true), "主动结束 → 不重连");
-        assert!(!view.should_auto_reconnect("sess-ctl", false, false), "开关关闭 → 不重连");
+        assert!(
+            !view.should_auto_reconnect("sess-ctl", true, true),
+            "主动结束 → 不重连"
+        );
+        assert!(
+            !view.should_auto_reconnect("sess-ctl", false, false),
+            "开关关闭 → 不重连"
+        );
 
         // 从未跟踪过控制器会话（本端只被控过）：任何结束事件都不触发。
         view.last_session_id = None;

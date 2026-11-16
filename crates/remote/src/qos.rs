@@ -290,14 +290,30 @@ pub struct QosDecision {
 }
 
 /// 由**变化面积**推出的内容活跃等级（`Ord` 用于「升档立刻、降档迟滞」的比较）。
+///
+/// 公开它是因为被控端要把当前档位随每秒的 [`crate::session::HostStats`] 上报给控制器
+/// （统计角标显示「活跃档」）。对应的线上类型是 [`crate::session::HostActivity`]——两者
+/// 刻意分开：本类型是本地策略，线上类型要能序列化。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Activity {
+pub enum Activity {
     /// UI 操作（打字/菜单/光标）：面积 < [`QosParams::ui_ratio_permille`]。
     Ui,
     /// 介于两者之间。
     Mixed,
     /// 运动/视频：面积 > [`QosParams::active_ratio_permille`]。
     Active,
+}
+
+impl Activity {
+    /// 面向 UI 的中文标签。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ui => "界面",
+            Self::Mixed => "混合",
+            Self::Active => "运动",
+        }
+    }
 }
 
 impl QosParams {
@@ -470,6 +486,15 @@ impl RateController {
     #[must_use]
     pub fn content_cap_fps(&self) -> Option<u8> {
         self.content_cap_fps
+    }
+
+    /// 当前生效的内容活跃等级（[`Self::observe_activity`] 的结果，含迟滞）。
+    ///
+    /// 被控端每秒把它映射成 [`crate::session::HostActivity`] 上报给控制器（统计角标
+    /// 显示「活跃档」）。它只描述**内容**，不是拥塞判据。
+    #[must_use]
+    pub fn activity(&self) -> Activity {
+        self.activity
     }
 
     /// 上一次动作。

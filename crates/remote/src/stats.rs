@@ -4,9 +4,11 @@
 //! 管理器也不该被数据面拖住）。这里用一个单向通道解耦：循环通过 [`SessionStatsReporter`]
 //! 上报，管理器侧的任务把事件泵进 [`crate::manager::RemoteUiState`]。
 //!
-//! **不是控制协议的一部分**：数据面的 `SessionMessage` 变体一个都不加（新增变体会让混合
-//! 版本的一端 bincode 解码失败而硬断链），这里只在**进程内**传递，不上线。
+//! **本通道不是控制协议**：它只在**进程内**传递，不上线。跨端的被控端遥测走协议 v8 的
+//! [`crate::session::SessionMessage::HostStats`]（那是一次显式的版本升级：两端必须同为 v8）；
+//! 收到后由控制器循环转成 [`SessionStats::Host`] 喂进本通道，与本机读数共用同一条 UI 通路。
 
+use crate::session::{CodecId, HostStats};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -55,6 +57,24 @@ impl KeyframeReason {
         }
     }
 
+    /// 由稳定的数组下标反查变体（与 [`Self::index`] 互逆）。
+    ///
+    /// 越界返回 `None`：UI 遍历 [`crate::manager::RemoteUiState::keyframe_requests`] 时用它
+    /// 把计数下标翻回可读原因，**不依赖数组顺序**。
+    #[must_use]
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::SeqGap),
+            1 => Some(Self::QueueOverflow),
+            2 => Some(Self::DecodeError),
+            3 => Some(Self::NoDecoder),
+            4 => Some(Self::ConfigureFailed),
+            5 => Some(Self::StalledNoFrame),
+            6 => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
     /// 面向 UI/日志的中文标签。
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -70,8 +90,30 @@ impl KeyframeReason {
     }
 }
 
+/// 可靠层（UDP 打洞路径）每秒增量读数（**进程内观测值，不上线**）。
+///
+/// 各字段都是「本窗口内新增的事件次数」，由控制器在每秒的 QoS tick 里与上一份
+/// [`crate::reliable::ReliableSnapshot`] 求差得到。直连/中继路径没有可靠层，故此时控制器不发
+/// [`SessionStats::Transport`]。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    /// RTO 超时重传次数。
+    pub rto: u32,
+    /// 快速重传次数（3 个重复 ACK 触发）。
+    pub fast_retransmit: u32,
+    /// 收到的乱序段数。
+    pub out_of_order: u32,
+    /// 收到的重复段数。
+    pub duplicate: u32,
+    /// 因超出接收窗口被丢弃的段数。
+    pub out_of_window: u32,
+}
+
 /// 会话循环 → 管理器的统计数据。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **不是 `Copy`**：`Host(Box<HostStats>)` 持有 36 个字段的整机遥测（含多个 `String`），
+/// 逐次拷贝没有意义；上层按值消费即可（`apply_session_stats` 一次匹配完）。
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionStats {
     /// 一次心跳往返测得的 RTT（复用既有 `Heartbeat` → `HeartbeatAck`，不新增数据面变体）。
     Rtt(Duration),
@@ -122,7 +164,49 @@ pub enum SessionStats {
         /// 统计的是解码侧真正交给 `FrameSink::on_patch` 的批次：因等待关键帧/几何不符被
         /// 丢弃的补丁不计入。补丁模式下全帧几乎为零，这一项是「增量通道在工作」的唯一读数。
         patches: u32,
+        /// 最近一帧的**端到端**延迟（采集完成 → 解码完成，毫秒；D2）。
+        ///
+        /// 由解码任务用「本端时刻 + 时钟偏差 - `capture_ts_us`」算出（见
+        /// [`crate::clock::elapsed_ms`]）；偏差尚未估计出来、或对端没填时间戳时为 0。
+        e2e_ms: u32,
+        /// 解码队列当前积压（帧）。1s 采样，A10 用它显示「解码积压」。
+        backlog: u32,
+        /// 帧到达抖动（毫秒）：本窗口内相邻视频包到达间隔的 `|dt_i - dt_{i-1}|` 平均（A5）。
+        ///
+        /// 间隔 > 1s 的样本被丢弃（那是一次「重新开始」，不是抖动）。窗口内不足两个样本时为 0。
+        jitter_ms: u32,
+        /// 当前估计的**对端时钟相对本端的偏差**（微秒，正值 = 对端更快）。
+        ///
+        /// 未知时是 [`crate::clock::UNKNOWN_OFFSET`]（`i64::MIN`）——UI 见到它就显示「—」，
+        /// 不要拿它去算端到端。它只在控制器侧有意义（被控端不发这个事件）。
+        clock_offset_us: i64,
     },
+    /// 本端 codec（会话协商结果，A1）。
+    Codec {
+        /// 选定 codec。
+        codec: CodecId,
+    },
+    /// 当前**编码尺寸**（A2；与被控端 `ScreenConfig` / 首个 `VideoPacket` 一致）。
+    EncodeDims {
+        /// 编码宽度（像素）。
+        width: u32,
+        /// 编码高度（像素）。
+        height: u32,
+    },
+    /// 本端**解码器**信息（A3；控制器侧，解码器创建/尺寸配置成功后上报，只在变化时发）。
+    DecoderInfo {
+        /// 解码后端（`"MF DXVA"` / `"MF Software"` / `"libvpx"`）。
+        backend: String,
+        /// 适配器名（软件解码为空）。
+        adapter: String,
+        /// 是否硬件解码。
+        hardware: bool,
+    },
+    /// 被控端**整机遥测**（B1–B14 / C2 / C3 / C5；每秒一条，线上走
+    /// [`crate::session::SessionMessage::HostStats`]，本端 UI 也消费同一份）。
+    Host(Box<HostStats>),
+    /// 可靠层每秒增量（A7；仅 UDP 打洞路径）。
+    Transport(TransportStats),
     /// 控制器发出的一次关键帧请求及原因（每秒可能多次；管理面按原因累计计数）。
     KeyframeRequest {
         /// 请求原因。
@@ -161,6 +245,16 @@ impl SessionStatsReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyframe_reason_index_round_trips() {
+        for index in 0..KeyframeReason::COUNT {
+            let reason = KeyframeReason::from_index(index).expect("0..COUNT 都应有变体");
+            assert_eq!(reason.index(), index, "下标/变体必须互逆");
+            assert!(!reason.label().is_empty(), "每个原因都要有可读标签");
+        }
+        assert_eq!(KeyframeReason::from_index(KeyframeReason::COUNT), None);
+    }
 
     #[test]
     fn noop_reporter_discards_silently() {

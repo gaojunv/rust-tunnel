@@ -3,10 +3,7 @@
 #![allow(clippy::missing_docs_in_private_items, reason = "GUI 二进制")]
 // 单测豁免（与各 lib crate 的 `lib.rs` 头部一致）：restriction 组在测试里放宽。
 // 本 crate 是 bin，没有 lib.rs，故这行放在这里。
-#![cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 // Release 构建在 Windows 上隐藏控制台窗口（双击启动仅显示 GUI）
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -31,7 +28,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
-use rust_tunnel_remote::{ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig, SessionRole};
+use rust_tunnel_remote::{
+    ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig, SessionRole,
+};
 
 use service_watch::IdentityOwner;
 
@@ -300,7 +299,7 @@ impl GuiApp {
                 ui.add_space(2.0);
             });
     }
-    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏 / 帧率上限）回写 `gui.toml`。
+    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标简洁或详细 / 剪贴板同步 / 工具条自动隐藏 / 帧率上限）回写 `gui.toml`。
     ///
     /// 这些字段在 [`remote::RemoteView`] 上是运行时镜像——改动发生在 deferred viewport 的回调里
     /// （与 `update` 不在同一时刻），只能靠每帧比对把差异落盘。`save` 只在确有变化时才写。
@@ -320,6 +319,10 @@ impl GuiApp {
         }
         if self.prefs.remote_stats_overlay != view.stats_overlay {
             self.prefs.remote_stats_overlay = view.stats_overlay;
+            changed = true;
+        }
+        if self.prefs.remote_stats_detail != view.stats_detail {
+            self.prefs.remote_stats_detail = view.stats_detail;
             changed = true;
         }
         if self.prefs.remote_clipboard_sync != view.clipboard_sync_enabled {
@@ -414,7 +417,8 @@ impl eframe::App for GuiApp {
                 0 => ui::status::show(ui, &status, app_state.service_owner()),
                 1 => ui::mappings::show(ui, &status),
                 2 => {
-                    remote_actions = ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
+                    remote_actions =
+                        ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
                 }
                 3 => {
                     ui::settings::show(ui, settings, app_state);
@@ -663,7 +667,9 @@ fn spawn_runtime(
             // 会保留最后一次值，一次就够——每 2 秒 tick 都 send 只会白白刷屏。
             let mut passive = false;
             loop {
-                let owner = owner_rx.as_ref().map_or(IdentityOwner::Gui, |rx| *rx.borrow());
+                let owner = owner_rx
+                    .as_ref()
+                    .map_or(IdentityOwner::Gui, |rx| *rx.borrow());
                 if owner.is_service() {
                     if !passive {
                         publish_passive_status(&status_tx);
@@ -867,8 +873,8 @@ async fn run_client_loop(
             };
             if flag.load(std::sync::atomic::Ordering::SeqCst) {
                 flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                if let Some(c) = config_store::load_from_default_path()
-                    .or_else(|| ClientConfig::load().ok())
+                if let Some(c) =
+                    config_store::load_from_default_path().or_else(|| ClientConfig::load().ok())
                 {
                     // 钥匙串回填
                     let mut c2 = c;
@@ -1032,12 +1038,10 @@ fn log_startup_error(path: &std::path::Path, err: &anyhow::Error) {
 #[cfg(target_os = "windows")]
 fn show_startup_error_dialog(message: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-    let text: Vec<u16> = format!(
-        "{message}\n\n日志: %LOCALAPPDATA%\\rust-tunnel\\gui-startup.log"
-    )
-    .encode_utf16()
-    .chain(std::iter::once(0))
-    .collect();
+    let text: Vec<u16> = format!("{message}\n\n日志: %LOCALAPPDATA%\\rust-tunnel\\gui-startup.log")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let title: Vec<u16> = "Rust Tunnel 启动失败"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -1277,7 +1281,10 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             // `wgpu_render_state` 是「本次运行真的在 wgpu 上」的唯一判据：有它才能用 GPU
             // 着色器上屏，否则 NV12 走 CPU 回退。把目标格式记进启动日志，便于现场确认
             // sRGB/非 sRGB 选对了片元入口。
-            let wgpu_target_format = cc.wgpu_render_state.as_ref().map(|state| state.target_format);
+            let wgpu_target_format = cc
+                .wgpu_render_state
+                .as_ref()
+                .map(|state| state.target_format);
             if let Some(path) = startup_log.as_deref() {
                 if let Some(format) = wgpu_target_format {
                     append_startup_log(path, &format!("wgpu target format: {format:?}"));

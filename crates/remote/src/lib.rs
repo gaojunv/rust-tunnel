@@ -55,6 +55,7 @@
 
 pub mod approval;
 pub mod auth;
+pub mod clock;
 pub mod codec;
 pub mod controller;
 pub mod controlled;
@@ -91,16 +92,18 @@ pub use manager::{
     DEFAULT_FRAME_RATE,
 };
 pub use qos::{Feedback, QosAction, QosDecision, QosParams, RateController};
+pub use reliable::{ReliableMetrics, ReliableSnapshot};
 pub use screen::{
-    Clipboard, DecodedFrame, DecodedNv12, DisplayInfo, EncodeOptions, EncodeRates, FileEntry, FrameSink,
-    GpuFrame, InputEvent, InputSink, KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource,
+    CaptureInfo, Clipboard, DecodedFrame, DecodedNv12, DecoderInfo, DisplayInfo, EncodeOptions,
+    EncodeRates, EncoderInfo, FileEntry, FrameSink, GpuFrame, InputEvent, InputSink, KeyEvent,
+    MouseButton, QualityPreset, RawFrame, ScreenSource,
 };
 pub use session::{
-    CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, Lane, MAX_SESSION_FRAME,
-    SESSION_PROTO_VERSION, SessionEnd, SessionFrame, SessionMessage, VIDEO_FLAG_CONFIG,
-    VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
+    CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, HostActivity, HostStats, LIVENESS_TIMEOUT, Lane,
+    MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd, SessionFrame, SessionMessage,
+    VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
 };
-pub use stats::{SessionStats, SessionStatsReporter};
+pub use stats::{KeyframeReason, SessionStats, SessionStatsReporter, TransportStats};
 pub use transfer::{
     TransferCommand, TransferDirection, TransferEvent, TransferHub, TransferProgress, CHUNK_PAUSE, CHUNK_SIZE,
 };

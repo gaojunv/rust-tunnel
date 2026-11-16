@@ -18,8 +18,10 @@
 //!   「打洞失败后凑出来的」——**谎报路径等于骗用户**。
 
 use crate::error::RemoteResult;
+use crate::reliable::ReliableMetrics;
 use async_trait::async_trait;
 use rust_tunnel_common::protocol::RemoteParams;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 一条双向字节流（中继连接 / 直连连接 / 内存替身）。
@@ -53,6 +55,12 @@ pub struct EstablishedStream {
     pub stream: BoxDuplex,
     /// 该流实际走的路径（供 UI 展示「打洞 / 直连 / 中继」）。
     pub path: TransportPath,
+    /// 可靠层指标句柄（仅 [`TransportPath::Punch`] 路径存在）。
+    ///
+    /// 直连与中继走 TCP，没有本端可靠层，故为 `None`——控制器据此决定**不发**
+    /// `SessionStats::Transport`（没有数据就不该显示 0 重传，那会被误读成完美链路）。
+    /// 打洞路径下控制器每秒与上一份快照求差，得到重传/乱序的每秒增量。
+    pub reliable: Option<Arc<ReliableMetrics>>,
 }
 
 impl std::fmt::Debug for EstablishedStream {

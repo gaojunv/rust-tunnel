@@ -37,12 +37,37 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 7
+/// # 为什么是 8
 ///
-/// 版本 7 只在末尾追加了 [`SessionMessage::LockScreen`]（控制器 → 被控端，请求锁定屏幕）。
+/// 版本 8 做了四件事，**都不向后兼容**：
+///
+/// - [`SessionMessage::Heartbeat`] / [`SessionMessage::HeartbeatAck`] 带上单调时钟时间戳
+///   （`t1_us` / `t2_us` + `t3_us`），用于 NTP 式四时间戳估计两端时钟偏差，进而算端到端延迟；
+/// - [`SessionMessage::VideoPacket`] / [`SessionMessage::RegionUpdate`] 各追加一个
+///   `capture_ts_us`（被控端采集完成的时刻）；
+/// - 末尾追加 [`SessionMessage::HostStats`]（判别式 28，被控端每秒上报的整机遥测）；
+/// - 心跳/视频帧的字段形状变化本身就会让任何旧端 bincode 解码失败。
+///
+/// 因此**两端必须同为 v8**：旧端（v7 及更早）会在握手阶段被 `Hello.proto_version` 的硬相等
+/// 校验干净拒绝（回 `HelloAck{accepted:false}`），不会退化成硬断链。`Hello` / `HelloAck` /
+/// `DisplayInfo` 的字节形状**一个字都没动**（两条机械锁守着），所以这条拒绝路径仍然成立。
+///
+/// # 发布顺序（**重要**）
+///
+/// **先把携带 v8 的客户端铺开，再部署依赖它的服务端门控**。v8 ↔ v7 互不可控（握手阶段被
+/// 硬相等校验拒绝），所以同一次升级必须让所有 GUI 客户端都到 v8；服务端
+/// `MIN_REMOTE_CLIENT_VERSION`（`crates/agent/src/runner/version_gate.rs`）按需再抬一档。
+/// 客户端上报的是 `CARGO_PKG_VERSION`，而发布 workflow 只从 git tag 取版本、**不写回**
+/// `Cargo.toml`，所以 `crates/client` / `crates/client-gui` 的版本号仍要手工抬。
+///
+/// # 版本 7
+///
+/// 只在末尾追加了 [`SessionMessage::LockScreen`]（控制器 → 被控端，请求锁定屏幕）。
 /// 它没有任何新旧共存语义：老端在 bincode 解码到判别式 27 时会失败，故版本号必须抬，
 /// 且**两端必须同为 v7**——旧端（v6）会在握手阶段被 `Hello.proto_version` 的硬相等校验
 /// 干净拒绝（回 `HelloAck{accepted:false}`），不会退化成硬断链。
+///
+/// # 版本 6
 ///
 /// 版本 6 在我们这条分支上把两件事合到了一起：
 ///
@@ -62,9 +87,8 @@ use tokio_util::codec::{Decoder, Encoder};
 /// [`CodecId::H264`]）。
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
-/// `MIN_REMOTE_CLIENT_VERSION`）。**发布顺序：两端必须同为 v7**——先把携带版本 7 的客户端
-/// 铺开（v7 ↔ v6/v5/v4 会干净拒绝、互不可控），再按需抬服务端门控。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 7;
+/// `MIN_REMOTE_CLIENT_VERSION`）。故此处刻意只动本常量。
+pub const SESSION_PROTO_VERSION: u16 = 8;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -273,10 +297,26 @@ pub enum SessionMessage {
     ClipboardRequest,
     /// 显示器列表（会话中变更时下发）。
     DisplayList(Vec<DisplayInfo>),
-    /// 心跳。
-    Heartbeat,
-    /// 心跳应答。
-    HeartbeatAck,
+    /// 心跳（同时是延迟/时钟探测；双向）。
+    ///
+    /// `t1_us` 是**发送方**的单调时钟（[`crate::clock::now_us`]）。对端据此算出四时间戳里的
+    /// `t1`，配合自己的 `t2`（收到时刻）与 `t3`（应答发出时刻），发送方再用 `t4`（收到 ack）
+    /// 估计两端时钟偏差（[`crate::clock::clock_offset_us`]）。时间戳**只**用于观测：
+    /// 它不进任何控制决策，也绝不参与鉴权/密钥派生。
+    Heartbeat {
+        /// 发送时刻（发送方进程内单调时钟，微秒）。
+        t1_us: u64,
+    },
+    /// 心跳应答（双向）。
+    ///
+    /// `t2_us` / `t3_us` 都是**应答方**的单调时钟：`t2` 是收到 `Heartbeat` 的时刻、`t3` 是
+    /// 发出本应答的时刻。两者只在四时间戳公式里使用，不承担同步语义。
+    HeartbeatAck {
+        /// 收到对端 `Heartbeat` 的时刻（应答方本地时钟，微秒）。
+        t2_us: u64,
+        /// 发出本应答的时刻（应答方本地时钟，微秒）。
+        t3_us: u64,
+    },
     /// 会话结束。
     Bye {
         /// 结束原因。
@@ -367,6 +407,11 @@ pub enum SessionMessage {
         height: u32,
         /// 帧数据（长度前缀拼接）。
         data: Vec<u8>,
+        /// 该帧**采集完成**的时刻（被控端单调时钟，微秒；[`crate::clock::now_us`]）。
+        ///
+        /// 控制器用 `本地时刻 + 时钟偏差 - capture_ts_us` 算端到端延迟（采集 → 解码完成）。
+        /// 它只是观测值：0 表示未知（旧逻辑/异常路径），控制器此时不报端到端。
+        capture_ts_us: u64,
     },
     /// 控制器请求关键帧（解码失败、丢弃了参考帧、或长时间无帧）。
     RequestKeyframe {
@@ -453,6 +498,9 @@ pub enum SessionMessage {
         height: u32,
         /// 本批矩形；空 = 保活。
         rects: Vec<RegionRect>,
+        /// 该批补丁**采集完成**的时刻（被控端单调时钟，微秒；语义同
+        /// [`SessionMessage::VideoPacket::capture_ts_us`]）。
+        capture_ts_us: u64,
     },
     /// 请求被控端**锁定本机屏幕**（控制器 → 被控端）。
     ///
@@ -460,6 +508,142 @@ pub enum SessionMessage {
     /// 状态），其余模式忽略并记日志。会话本身保持连接；锁屏后 Windows 进入安全桌面，
     /// GUI 模式被控端通常无法继续采集画面（见根目录 `CLAUDE.md` 的锁屏说明）。
     LockScreen,
+    /// 被控端**整机遥测**（被控端 → 控制器，每秒一条）。
+    ///
+    /// 控制器的会话角标据此显示对端身份（平台、编码器/采集后端与适配器）与实时遥测
+    /// （采集/编码耗时、实测 fps、码率、关键帧拆解、出站队列积压、编码器重建次数……）。
+    ///
+    /// **只读观测面**：控制器收到后不据此做任何控制决策（QoS 闭环仍只看 `QosFeedback`），
+    /// 也绝不回发。字段是 v8 的线上契约，新增一律追加在结构体末尾。
+    HostStats(HostStats),
+}
+
+/// 由**变化面积**推出的内容活跃等级（被控端本地 `qos` 的判断，随 [`HostStats`] 上报展示）。
+///
+/// 与 [`crate::qos`] 内部的同名概念一一对应，但它必须能序列化（要上线），所以单独定义在
+/// 协议模块里。判别式顺序（Ui = 0 / Mixed = 1 / Active = 2）是线上契约，**只追加、不插入**。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostActivity {
+    /// UI 操作（打字/菜单/光标）：变化面积很小。
+    Ui,
+    /// 介于两者之间。
+    #[default]
+    Mixed,
+    /// 运动/视频：变化面积大，不设内容驱动的码率上限。
+    Active,
+}
+
+impl HostActivity {
+    /// 面向 UI 的中文标签。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ui => "界面",
+            Self::Mixed => "混合",
+            Self::Active => "运动",
+        }
+    }
+}
+
+/// 被控端每秒上报的整机遥测（**线上类型**，v8 新增）。
+///
+/// # 为什么要单独一条消息
+///
+/// 这些读数只在**被控端**存在（编码器后端、采集适配器、出站队列积压……），而控制器的统计
+/// 角标要显示它们。进程内的 [`crate::stats::SessionStats`] 只在本端有效，必须跨端传一份。
+///
+/// # 语义
+///
+/// - 身份字段（`platform` / `*_backend` / `*_adapter`）每次上报都填当前值，控制器直接覆盖；
+/// - 每秒遥测字段是**本秒窗口**的读数（`capture_us` 是平均单帧、`fps` 是实测出帧率）；
+/// - C2/C3/C5 字段（`out_queue_*` / `encoder_rebuilds` / `forced_idrs` / `capture_*` /
+///   `no_new_frame`）是**每秒增量**，不是累计值。
+///
+/// 控制器收到后只写进 [`crate::manager::RemoteUiState`]（甚至不参与 QoS 决策）。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "线上遥测天然由若干互不相关的独立开关（GPU 采集/零拷贝/禁用/原生分辨率/补丁模式）\
+              组成，合并成枚举只会让序列化形状与对端契约更难核对"
+)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStats {
+    /// 平台标识（`windows` / `macos` / `linux`）。
+    pub platform: String,
+    /// 编码器后端（`"NVENC"` / `"Intel QSV"` / `"AMD VCE"` / `"MFT"` / `"libvpx"`）。
+    pub encoder_backend: String,
+    /// 编码器名称（例如 `"NVIDIA NVENC H.264"`）。
+    pub encoder_name: String,
+    /// 编码器所在适配器名（显卡名；软件编码时为空）。
+    pub encoder_adapter: String,
+    /// 采集后端（`"WGC"` / `"DXGI"` / `"xcap"` / `"BitBlt"`）。
+    pub capture_backend: String,
+    /// 采集适配器名（GPU 采集时为显卡名；CPU 采集为空）。
+    pub capture_adapter: String,
+    /// 采集是否走 GPU（零拷贝 / 纹理直通）。
+    pub gpu_capture: bool,
+    /// 编码器后端是否使用 **GPU 纹理输入**（NVENC 直通 / 复用采集设备的 MFT）。
+    ///
+    /// 这是**编码器的输入形态**，不是「这一帧一定没有回读」：NVENC 在跨设备或需要缩放时
+    /// 仍会回读（见 `win_video.rs` 的直通条件）。角标据此区分编码器是 GPU 还是 CPU 路径。
+    pub gpu_encode: bool,
+    /// GPU 路径是否已被永久禁用（任一环失败）。
+    pub gpu_disabled: bool,
+    /// GPU 被禁用的原因（未禁用时为空串）。
+    pub gpu_disabled_reason: String,
+    /// 是否**原生分辨率**会话（4K 编码，仅硬件 H.264 的显式选项）。
+    pub native_resolution: bool,
+    /// 当前编码宽度（像素）。
+    pub encode_width: u32,
+    /// 当前编码高度（像素）。
+    pub encode_height: u32,
+    /// 当前显示器的物理宽度（像素）。
+    pub display_width: u32,
+    /// 当前显示器的物理高度（像素）。
+    pub display_height: u32,
+    /// 最近一秒平均单帧**采集**耗时（微秒；GPU 采集常在 1 ms 内，毫秒取整会恒为 0）。
+    pub capture_us: u32,
+    /// 最近一秒平均单帧**编码**耗时（毫秒）。
+    pub encode_ms: u32,
+    /// 最近一秒**实测**编码帧率（帧/秒，不是目标值）。
+    pub fps: u32,
+    /// 当前**生效**的目标码率（kbps，闭环在上限之下浮动后的值）。
+    pub bitrate_kbps: u32,
+    /// 最近一秒**实际出码**速率（kbps）。
+    pub sent_kbps: u32,
+    /// 最近一秒因「无变化」跳过的帧数。
+    pub skipped: u32,
+    /// 最近一秒的关键帧数。
+    pub keyframes: u32,
+    /// 最近一秒关键帧出码码率（kbps）。
+    pub idr_kbps: u32,
+    /// 最近一秒关键帧出码字节数（与 `idr_kbps` 同一窗口，可算「关键帧平均多大」）。
+    pub idr_bytes: u64,
+    /// 最近一秒普通帧出码码率（kbps）。
+    pub p_kbps: u32,
+    /// 最近一秒编码帧的平均变化面积（千分比，0..=1000）。
+    pub changed_permille: u32,
+    /// 当前生效的缩放（千分比；1000 = 原始尺寸）。
+    pub scale_permille: u16,
+    /// 内容活跃等级。
+    pub activity: HostActivity,
+    /// 是否处于脏矩形补丁模式。
+    pub patch_mode: bool,
+    /// 出站画面队列当前深度（帧）。
+    pub out_queue_depth: u32,
+    /// 最近一秒因出站队列满而在**编码之前**跳过的帧数（背压）。
+    pub out_queue_skips: u32,
+    /// 最近一秒编码器重建次数（几何变化才重建）。
+    pub encoder_rebuilds: u32,
+    /// 最近一秒因 `force` 而真正产出的关键帧数。
+    pub forced_idrs: u32,
+    /// 最近一秒采集失败次数（采集调用返回错误）。
+    pub capture_failures: u32,
+    /// 最近一秒硬件采集失败回退到 CPU 采集的次数（`WGC/DXGI → xcap`）。
+    pub capture_fallbacks: u32,
+    /// 最近一秒打开采集源时 `WGC → DXGI` 回退的次数。
+    pub capture_open_fallbacks: u32,
+    /// 最近一秒采集后端「没有新帧」（超时/无新合成帧）的次数。
+    pub no_new_frame: u32,
 }
 
 /// 一个带 `lane` 的会话帧。
@@ -834,6 +1018,7 @@ mod tests {
                     width: 640,
                     height: 480,
                     data: vec![0x10, 0x20, 0x30],
+                    capture_ts_us: 1_234_567,
                 },
                 Lane::Screen,
             ),
@@ -844,8 +1029,17 @@ mod tests {
                 }),
                 Lane::Control,
             ),
-            (SessionMessage::Heartbeat, Lane::Control),
-            (SessionMessage::HeartbeatAck, Lane::Control),
+            (
+                SessionMessage::Heartbeat { t1_us: 42 },
+                Lane::Control,
+            ),
+            (
+                SessionMessage::HeartbeatAck {
+                    t2_us: 43,
+                    t3_us: 44,
+                },
+                Lane::Control,
+            ),
             (
                 SessionMessage::Bye {
                     reason: "done".into(),
@@ -951,10 +1145,11 @@ mod tests {
                     width: 640,
                     height: 480,
                     data: vec![0x10, 0x20, 0x30],
+                    capture_ts_us: 9_999,
                 },
                 Lane::Screen,
             ),
-            // 边界：空 VP9 数据（编码器本轮无输出）。
+            // 边界：空 VP9 数据（编码器本轮无输出）+ 未知采集时刻。
             (
                 SessionMessage::VideoPacket {
                     display: 1,
@@ -964,6 +1159,7 @@ mod tests {
                     width: 0,
                     height: 0,
                     data: vec![],
+                    capture_ts_us: 0,
                 },
                 Lane::Screen,
             ),
@@ -1033,8 +1229,14 @@ mod tests {
             (SessionMessage::DisplayList(vec![display(0), display(1)]), Lane::Control),
             // 边界：显示器列表为空（无显示器）。
             (SessionMessage::DisplayList(vec![]), Lane::Control),
-            (SessionMessage::Heartbeat, Lane::Control),
-            (SessionMessage::HeartbeatAck, Lane::Control),
+            (SessionMessage::Heartbeat { t1_us: 0 }, Lane::Control),
+            (
+                SessionMessage::HeartbeatAck {
+                    t2_us: u64::MAX,
+                    t3_us: 1,
+                },
+                Lane::Control,
+            ),
             // 边界：空结束原因。
             (SessionMessage::Bye { reason: String::new() }, Lane::Control),
             // 边界：根路径（`""` = 共享根）。
@@ -1115,6 +1317,7 @@ mod tests {
                             data: vec![0x22; 384],
                         },
                     ],
+                    capture_ts_us: 4_242,
                 },
                 Lane::Screen,
             ),
@@ -1125,10 +1328,58 @@ mod tests {
                     width: 2,
                     height: 2,
                     rects: vec![],
+                    capture_ts_us: 0,
                 },
                 Lane::Screen,
             ),
             (SessionMessage::LockScreen, Lane::Control),
+            // 被控端遥测：满字段与全默认（空）各一条。
+            (
+                SessionMessage::HostStats(HostStats {
+                    platform: "windows".into(),
+                    encoder_backend: "NVENC".into(),
+                    encoder_name: "NVIDIA NVENC H.264".into(),
+                    encoder_adapter: "NVIDIA GeForce RTX 5070 Ti".into(),
+                    capture_backend: "WGC".into(),
+                    capture_adapter: "NVIDIA GeForce RTX 5070 Ti".into(),
+                    gpu_capture: true,
+                    gpu_encode: true,
+                    gpu_disabled: false,
+                    gpu_disabled_reason: String::new(),
+                    native_resolution: true,
+                    encode_width: 3840,
+                    encode_height: 2160,
+                    display_width: 3840,
+                    display_height: 2160,
+                    capture_us: 31_000,
+                    encode_ms: 3,
+                    fps: 60,
+                    bitrate_kbps: 12_000,
+                    sent_kbps: 8_500,
+                    skipped: 12,
+                    keyframes: 1,
+                    idr_kbps: 900,
+                    idr_bytes: 112_500,
+                    p_kbps: 7_600,
+                    changed_permille: 421,
+                    scale_permille: 1000,
+                    activity: HostActivity::Active,
+                    patch_mode: false,
+                    out_queue_depth: 2,
+                    out_queue_skips: 0,
+                    encoder_rebuilds: 0,
+                    forced_idrs: 1,
+                    capture_failures: 0,
+                    capture_fallbacks: 1,
+                    capture_open_fallbacks: 0,
+                    no_new_frame: 3,
+                }),
+                Lane::Control,
+            ),
+            (
+                SessionMessage::HostStats(HostStats::default()),
+                Lane::Control,
+            ),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -1218,8 +1469,15 @@ mod tests {
             ("Clipboard", SessionMessage::Clipboard { text: "x".into() }, 5),
             ("ClipboardRequest", SessionMessage::ClipboardRequest, 6),
             ("DisplayList", SessionMessage::DisplayList(vec![]), 7),
-            ("Heartbeat", SessionMessage::Heartbeat, 8),
-            ("HeartbeatAck", SessionMessage::HeartbeatAck, 9),
+            ("Heartbeat", SessionMessage::Heartbeat { t1_us: 0 }, 8),
+            (
+                "HeartbeatAck",
+                SessionMessage::HeartbeatAck {
+                    t2_us: 0,
+                    t3_us: 0,
+                },
+                9,
+            ),
             ("Bye", SessionMessage::Bye { reason: String::new() }, 10),
             (
                 "FileListRequest",
@@ -1259,6 +1517,7 @@ mod tests {
                     width: 0,
                     height: 0,
                     data: vec![],
+                    capture_ts_us: 0,
                 },
                 19,
             ),
@@ -1305,10 +1564,16 @@ mod tests {
                     width: 0,
                     height: 0,
                     rects: vec![],
+                    capture_ts_us: 0,
                 },
                 26,
             ),
             ("LockScreen", SessionMessage::LockScreen, 27),
+            (
+                "HostStats",
+                SessionMessage::HostStats(HostStats::default()),
+                28,
+            ),
         ];
         for (name, msg, want) in &cases {
             let bytes = bincode::serialize(msg).unwrap();
@@ -1318,6 +1583,68 @@ mod tests {
         // 序号必须连续无洞：任何「删一个变体」的改动都会让这张表与实现脱节。
         for (i, (_, _, want)) in cases.iter().enumerate() {
             assert_eq!(usize::try_from(*want).unwrap(), i, "判别式必须从 0 起连续");
+        }
+    }
+
+    /// **`HostStats` bincode 往返**：满字段与全默认各走一遍编解码。
+    ///
+    /// 它是 v8 新增的**唯一**大结构（36 个字段），字段顺序/类型漂移只会到真机联调才暴露；
+    /// 这里把「编解码后逐字段相等」钉死在单测里。`HostActivity` 的判别式也一并锁住。
+    #[test]
+    fn host_stats_roundtrip() {
+        let full = HostStats {
+            platform: "windows".into(),
+            encoder_backend: "Intel QSV".into(),
+            encoder_name: "H.264 MFT".into(),
+            encoder_adapter: "Intel UHD Graphics 770".into(),
+            capture_backend: "DXGI".into(),
+            capture_adapter: "Intel UHD Graphics 770".into(),
+            gpu_capture: true,
+            gpu_encode: true,
+            gpu_disabled: true,
+            gpu_disabled_reason: "设备丢失".into(),
+            native_resolution: false,
+            encode_width: 1920,
+            encode_height: 1080,
+            display_width: 2560,
+            display_height: 1440,
+            capture_us: 8_250,
+            encode_ms: 13,
+            fps: 30,
+            bitrate_kbps: 6_000,
+            sent_kbps: 4_321,
+            skipped: 7,
+            keyframes: 2,
+            idr_kbps: 512,
+            idr_bytes: 64_000,
+            p_kbps: 3_809,
+            changed_permille: 37,
+            scale_permille: 750,
+            activity: HostActivity::Ui,
+            patch_mode: true,
+            out_queue_depth: 1,
+            out_queue_skips: 4,
+            encoder_rebuilds: 1,
+            forced_idrs: 2,
+            capture_failures: 3,
+            capture_fallbacks: 5,
+            capture_open_fallbacks: 1,
+            no_new_frame: 6,
+        };
+        for stats in [full, HostStats::default()] {
+            let bytes = bincode::serialize(&stats).unwrap();
+            let back: HostStats = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back, stats);
+        }
+        // `HostActivity` 的判别式是 u32 小端、按声明顺序：Ui = 0 / Mixed = 1 / Active = 2。
+        for (activity, want) in [
+            (HostActivity::Ui, 0u32),
+            (HostActivity::Mixed, 1),
+            (HostActivity::Active, 2),
+        ] {
+            let bytes = bincode::serialize(&activity).unwrap();
+            assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), want);
+            assert!(!activity.label().is_empty());
         }
     }
 
@@ -1395,6 +1722,7 @@ mod tests {
             width: 1,
             height: 1,
             data: vec![0u8; 64],
+            capture_ts_us: 0,
         };
         assert!(enc.encode(SessionFrame::screen(big), &mut wire).is_err());
 
@@ -1441,7 +1769,7 @@ mod tests {
         let mut enc = SessionCodec::new();
         let mut wire = BytesMut::new();
         enc.encode(
-            SessionFrame::control(SessionMessage::Heartbeat),
+            SessionFrame::control(SessionMessage::Heartbeat { t1_us: 7 }),
             &mut wire,
         )
         .unwrap();
@@ -1452,7 +1780,7 @@ mod tests {
         wire.extend_from_slice(&tail);
         assert_eq!(
             dec.decode(&mut wire).unwrap().unwrap().message,
-            SessionMessage::Heartbeat
+            SessionMessage::Heartbeat { t1_us: 7 }
         );
     }
 

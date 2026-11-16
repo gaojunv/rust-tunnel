@@ -5,25 +5,29 @@
 //! 之后的帧全部加密。
 
 use crate::auth::verify_ack_mac;
+use crate::clock::{clock_offset_us, elapsed_ms, now_us, UNKNOWN_OFFSET};
 use crate::codec::{vp9_decoder_factory, VideoDecoderApi, VideoDecoderFactory};
 use crate::controlled::{send_cancellable, writer_loop, OutboundQueues};
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
 use crate::input_buffer::InputBuffer;
-use crate::screen::{DecodedFrame, DecodedPatch, FrameSink, InputEvent, QualityPreset, ScreenPatch};
+use crate::reliable::{ReliableMetrics, ReliableSnapshot};
+use crate::screen::{
+    DecodedFrame, DecodedPatch, DecoderInfo, FrameSink, InputEvent, QualityPreset, ScreenPatch,
+};
 use crate::session::{
     trusted_rtt, CodecId, ControllerHandshake, RegionRect, SessionCodec, SessionEnd, SessionFrame,
     SessionMessage, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS, REGION_FLAG_ZSTD,
     VIDEO_FLAG_KEYFRAME,
 };
-use crate::stats::{KeyframeReason, SessionStats, SessionStatsReporter};
+use crate::stats::{KeyframeReason, SessionStats, SessionStatsReporter, TransportStats};
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
 use crate::transport::BoxDuplex;
 use crate::video::MAX_FRAME_DIM;
 use futures_util::StreamExt as _;
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -96,6 +100,8 @@ enum DecodeJob {
         height: u32,
         /// 帧数据。
         data: Vec<u8>,
+        /// 该帧采集完成的时刻（被控端单调时钟，微秒；`0` = 未知）。端到端延迟用。
+        capture_ts_us: u64,
     },
     /// 一批脏矩形补丁（协议 v5 `RegionUpdate`，仅 H.264 补丁模式）。
     ///
@@ -111,6 +117,8 @@ enum DecodeJob {
         height: u32,
         /// 已通过主循环粗校验的矩形；解压与逐矩形细校验在解码任务里做。
         rects: Vec<RegionRect>,
+        /// 该批补丁采集完成的时刻（被控端单调时钟，微秒；`0` = 未知）。端到端延迟用。
+        capture_ts_us: u64,
     },
 }
 
@@ -131,6 +139,12 @@ struct DecodeShared {
     /// 计数放在解码侧而不是主循环：**收到**的补丁可能因等待关键帧/几何不符被丢弃，
     /// 只有真正交给 `on_patch` 的才算生效。
     applied_patches: Arc<AtomicU32>,
+    /// 当前估计的**对端时钟相对本端偏差**（微秒；[`UNKNOWN_OFFSET`] = 尚未估计）。
+    ///
+    /// 主循环在心跳 ack 上更新它（最小 RTT 样本优先 + EMA），解码任务读它算端到端延迟。
+    clock_offset_us: Arc<AtomicI64>,
+    /// 解码任务最近一次算出的端到端延迟（毫秒；采集完成 → 解码完成）。
+    e2e_ms: Arc<AtomicU32>,
 }
 
 impl DecodeShared {
@@ -140,6 +154,8 @@ impl DecodeShared {
             drop_epoch: Arc::new(AtomicU32::new(0)),
             awaiting_keyframe: Arc::new(AtomicBool::new(false)),
             applied_patches: Arc::new(AtomicU32::new(0)),
+            clock_offset_us: Arc::new(AtomicI64::new(UNKNOWN_OFFSET)),
+            e2e_ms: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -191,6 +207,12 @@ pub struct ControllerConfig {
     ///
     /// `None` = 本端只能解 VP9，`CodecOffer.h264` 因此为 `false`，被控端不会选 H.264。
     pub h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    /// 数据面可靠层指标句柄（仅 UDP 打洞路径为 `Some`，见
+    /// [`crate::transport::EstablishedStream::reliable`]）。
+    ///
+    /// 主循环每秒取一份快照与上一份求差，上报 [`SessionStats::Transport`]（A7 的重传/乱序
+    /// 读数）。直连/中继路径没有本端可靠层，为 `None` 时**不发**该事件（没有数据就不该显示 0）。
+    pub reliable: Option<Arc<ReliableMetrics>>,
 }
 
 /// 跑一次控制器会话，直到取消、对端关闭或出错（**不注入外部输入来源**）。
@@ -361,6 +383,7 @@ pub(crate) async fn run_controller_with_input(
         cancel.clone(),
         Arc::clone(&decode_shared),
         config.h264_decoder_factory.clone(),
+        config.stats.clone(),
     ));
 
     // 3) 主循环。
@@ -375,13 +398,15 @@ pub(crate) async fn run_controller_with_input(
     // 起点取 `now + QOS_INTERVAL`：第一个样本要有一整秒的统计窗口才有意义。
     let mut qos_tick = interval_at(Instant::now() + QOS_INTERVAL, QOS_INTERVAL);
     qos_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // RTT 样本：发 `Heartbeat` 时把时刻压入队列，收到 `HeartbeatAck` 时从队首弹出配对。
-    // **复用既有心跳往返**，不新增数据面变体（新增 `SessionMessage` 变体会让混合版本的一端直接断链，
-    // 见 `HEARTBEAT_INTERVAL`）。首个样本由上面那个「立即到期的 tick」给出，故这里先置空。
+    // RTT 样本：发 `Heartbeat` 时把 `(发出时刻, t1_us)` 压入队列，收到 `HeartbeatAck` 时从队首
+    // 弹出配对。`t1_us` 是本端单调时钟读数，用于估计两端时钟偏差（见 [`crate::clock`]）。
     //
     // 用队列而不是单个 `Option`：1s 探测在高 RTT 链路上会有多个心跳同时在途，单槽位会把迟到的
     // ack 与更新的心跳配错对。FIFO 配对最坏只让样本旧一个周期；上限 8 防止对端不应答时无限增长。
-    let mut heartbeat_sent: VecDeque<Instant> = VecDeque::new();
+    let mut heartbeat_sent: VecDeque<(Instant, u64)> = VecDeque::new();
+    // 时钟偏差估计状态：当前 offset + 对应的最小 RTT 样本。最小 RTT 样本直接覆盖，其余样本
+    // 走 EMA（排队不对称会污染单次估计，最小 RTT 的那个样本污染最小）。
+    let mut clock_sync: Option<(Duration, i64)> = None;
     // 最近一次收到 `HeartbeatAck` 的时刻：仅用于超时告警里区分「从未通过」与「刚刚断掉」，
     // 便于现场判断（不上线、不进协议）。
     let mut last_ack_at: Option<Instant> = None;
@@ -394,6 +419,15 @@ pub(crate) async fn run_controller_with_input(
     let mut window_packets: u32 = 0;
     let mut window_dropped: u32 = 0;
     let mut qos_window_start = Instant::now();
+    // 帧到达抖动（A5）：上一个视频包的到达时刻、再上一个到达间隔、本窗口的抖动累加与样本数。
+    let mut last_packet_at: Option<Instant> = None;
+    let mut prev_packet_interval: Option<Duration> = None;
+    let mut jitter_sum_us: u64 = 0;
+    let mut jitter_samples: u32 = 0;
+    // 已上报给 UI 的编码尺寸（去重：`ScreenConfig` 与每个 `VideoPacket` 都会声明它）。
+    let mut reported_dims: Option<(u32, u32)> = None;
+    // 可靠层上一份快照（每秒求差 → `SessionStats::Transport`）。
+    let mut last_transport: Option<ReliableSnapshot> = None;
     // 最近一次收到画面帧的时刻（「长时间无帧」看门狗用）。
     let mut last_frame_at = Instant::now();
     // 最近一次请求关键帧的时刻（限频，避免静止桌面上刷屏）。
@@ -445,7 +479,7 @@ pub(crate) async fn run_controller_with_input(
                 // **必须在下面容量上限的 `pop_front` 之前判**——上限（8）大于超时对应的 4 个周期，
                 // 正常配置挤不到队首，但把判据放在前面才不会在将来调参后悄悄把超时掩盖掉。
                 // 队列空（还没发过心跳）时 `front()` 为 `None`，不判。
-                if heartbeat_sent.front().is_some_and(|sent| sent.elapsed() >= LIVENESS_TIMEOUT) {
+                if heartbeat_sent.front().is_some_and(|(sent, _)| sent.elapsed() >= LIVENESS_TIMEOUT) {
                     let last_ack_ms = last_ack_at
                         .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
                     warn!(?last_ack_ms, "对端心跳超时（链路可能已中断），结束会话");
@@ -456,9 +490,13 @@ pub(crate) async fn run_controller_with_input(
                 if heartbeat_sent.len() >= HEARTBEAT_SENT_CAP {
                     heartbeat_sent.pop_front();
                 }
-                heartbeat_sent.push_back(Instant::now());
+                let t1_us = now_us();
+                heartbeat_sent.push_back((Instant::now(), t1_us));
                 if let Err(err) = queues
-                    .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat))
+                    .enqueue_ctrl(
+                        &cancel,
+                        SessionFrame::control(SessionMessage::Heartbeat { t1_us }),
+                    )
                     .await
                 {
                     break Err(err);
@@ -492,17 +530,36 @@ pub(crate) async fn run_controller_with_input(
                     break Err(err);
                 }
                 // 同节拍把解码侧读数经进程内通道送到 UI（不落线）。`QosFeedback` 的字段
-                // **不变**：收包/丢包/补丁只是本地观测，不进协议。
+                // **不变**：收包/丢包/补丁/端到端/抖动只是本地观测，不进协议。
+                let jitter_ms = if jitter_samples == 0 {
+                    0
+                } else {
+                    u32::try_from(jitter_sum_us / u64::from(jitter_samples) / 1000).unwrap_or(u32::MAX)
+                };
                 config.stats.report(SessionStats::Decode {
                     decode_ms,
                     recv_kbps,
                     packets: window_packets,
                     dropped: window_dropped,
                     patches: decode_shared.applied_patches.swap(0, Ordering::Relaxed),
+                    e2e_ms: decode_shared.e2e_ms.load(Ordering::Relaxed),
+                    backlog,
+                    jitter_ms,
+                    clock_offset_us: decode_shared.clock_offset_us.load(Ordering::Relaxed),
                 });
+                // 可靠层每秒增量（A7）。只有打洞路径有句柄；直连/中继不发（见 `ControllerConfig`）。
+                if let Some(metrics) = &config.reliable {
+                    let now_snapshot = metrics.snapshot();
+                    if let Some(prev) = last_transport {
+                        config.stats.report(SessionStats::Transport(transport_delta(prev, now_snapshot)));
+                    }
+                    last_transport = Some(now_snapshot);
+                }
                 recv_bytes = 0;
                 window_packets = 0;
                 window_dropped = 0;
+                jitter_sum_us = 0;
+                jitter_samples = 0;
                 qos_window_start = Instant::now();
 
                 // 「长时间无帧」看门狗（阶段 3）：对端采集/编码挂住、或中继半死时，画面会永久冻结
@@ -640,9 +697,13 @@ pub(crate) async fn run_controller_with_input(
                     ControllerCommand::Ping => {
                         // 已有在途样本时不打扰：否则会多一条在途心跳，让用户此刻想要的读数被推迟。
                         if heartbeat_sent.is_empty() {
-                            heartbeat_sent.push_back(Instant::now());
+                            let t1_us = now_us();
+                            heartbeat_sent.push_back((Instant::now(), t1_us));
                             if let Err(err) = queues
-                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat))
+                                .enqueue_ctrl(
+                                    &cancel,
+                                    SessionFrame::control(SessionMessage::Heartbeat { t1_us }),
+                                )
                                 .await
                             {
                                 break Err(err);
@@ -707,6 +768,7 @@ pub(crate) async fn run_controller_with_input(
                             width,
                             height,
                             data,
+                            capture_ts_us,
                         } => {
                             // 只投递原始载荷；解码在独立任务里做（见 `decode_loop`）。
                             // 同时记收码率窗口与「最近收帧时刻」（QoS 反馈 / 无帧看门狗用）。
@@ -717,6 +779,27 @@ pub(crate) async fn run_controller_with_input(
                             stall_requests = 0;
                             last_frame_at = Instant::now();
                             window_packets = window_packets.saturating_add(1);
+                            // 帧到达抖动（A5）：相邻到达间隔的**二阶差分**，间隔 > 1s 的样本
+                            // 丢弃（那是「重新开始」，不是抖动）。
+                            if let Some(prev_at) = last_packet_at.replace(Instant::now()) {
+                                let interval = prev_at.elapsed();
+                                if interval <= Duration::from_secs(1) {
+                                    if let Some(prev_interval) = prev_packet_interval {
+                                        let delta = interval.abs_diff(prev_interval);
+                                        jitter_sum_us = jitter_sum_us
+                                            .saturating_add(u64::try_from(delta.as_micros()).unwrap_or(u64::MAX));
+                                        jitter_samples = jitter_samples.saturating_add(1);
+                                    }
+                                    prev_packet_interval = Some(interval);
+                                } else {
+                                    prev_packet_interval = None;
+                                }
+                            }
+                            // 编码尺寸（A2）：`ScreenConfig` 也会报，这里按包兜底去重。
+                            if reported_dims != Some((width, height)) {
+                                reported_dims = Some((width, height));
+                                config.stats.report(SessionStats::EncodeDims { width, height });
+                            }
                             if selected_codec.is_some_and(|selected| selected != codec) {
                                 debug!(?codec, ?selected_codec, "视频包 codec 与已选 codec 不一致");
                             }
@@ -740,6 +823,7 @@ pub(crate) async fn run_controller_with_input(
                                 width,
                                 height,
                                 data,
+                                capture_ts_us,
                             }) {
                                 DecodeEnqueue::Queued => {}
                                 // 第二道兜底：队列满时推进 epoch，让队列里的陈旧 P 帧
@@ -761,6 +845,7 @@ pub(crate) async fn run_controller_with_input(
                             width,
                             height,
                             rects,
+                            capture_ts_us,
                         } => {
                             // 补丁也是「收到画面帧」：它证明对端采集/编码还活着，「长时间无帧」
                             // 看门狗必须因此保持安静（否则静止桌面在补丁模式下每 3s 白请 IDR）。
@@ -806,6 +891,7 @@ pub(crate) async fn run_controller_with_input(
                                     width,
                                     height,
                                     rects,
+                                    capture_ts_us,
                                 },
                             ) {
                                 DecodeEnqueue::Queued => {}
@@ -831,6 +917,10 @@ pub(crate) async fn run_controller_with_input(
                             if selected_codec.is_some_and(|selected| selected != codec) {
                                 debug!(monitor, ?codec, ?selected_codec, "ScreenConfig codec 与已选 codec 不一致");
                             }
+                            if reported_dims != Some((width, height)) {
+                                reported_dims = Some((width, height));
+                                config.stats.report(SessionStats::EncodeDims { width, height });
+                            }
                             debug!(monitor, ?codec, width, height, "收到屏幕配置");
                         }
                         SessionMessage::CodecSelect { codec } => {
@@ -851,6 +941,8 @@ pub(crate) async fn run_controller_with_input(
                                         "画面解码任务已结束".to_owned(),
                                     ));
                                 }
+                                // A1：协商结果上报本端 UI（角标显示 codec）。
+                                config.stats.report(SessionStats::Codec { codec });
                             }
                             info!("编解码协商完成（控制器） codec={codec:?}");
                         }
@@ -869,24 +961,60 @@ pub(crate) async fn run_controller_with_input(
                             // 侧根本没有 `Clipboard` 实现可应答。收到即说明对端实现异常，记一条日志。
                             debug!("控制器收到 ClipboardRequest，但控制器不实现剪贴板应答，忽略");
                         }
-                        SessionMessage::Heartbeat => {
+                        SessionMessage::Heartbeat { .. } => {
+                            // 本端是**应答方**：t2 = 收到时刻、t3 = 发出时刻（都是本端单调时钟）。
+                            // 发起方用 t1..t4 估计两端时钟偏差（见 [`crate::clock`]）。
+                            let t2_us = now_us();
+                            let ack = SessionMessage::HeartbeatAck {
+                                t2_us,
+                                t3_us: now_us(),
+                            };
                             if let Err(err) = queues
-                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::HeartbeatAck))
+                                .enqueue_ctrl(&cancel, SessionFrame::control(ack))
                                 .await
                             {
                                 break Err(err);
                             }
                         }
-                        SessionMessage::HeartbeatAck => {
+                        SessionMessage::HeartbeatAck { t2_us, t3_us } => {
                             let now = Instant::now();
+                            let t4_us = now_us();
                             last_ack_at = Some(now);
-                            if let Some(sent) = heartbeat_sent.pop_front() {
+                            if let Some((sent, t1_us)) = heartbeat_sent.pop_front() {
                                 if let Some(rtt) = trusted_rtt(sent, now) {
                                     // 存一份毫秒读数：`QosFeedback` 要用它填 `rtt_ms`。
                                     last_rtt_ms = Some(u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
                                     config.stats.report(SessionStats::Rtt(rtt));
+                                    // 时钟偏差：最小 RTT 样本直接覆盖（排队最少的那个最可信），
+                                    // 其余样本走 1/8 EMA。偏差未知时先落最小 RTT 样本。
+                                    let sample = clock_offset_us(t1_us, t2_us, t3_us, t4_us);
+                                    let offset = match clock_sync {
+                                        None => {
+                                            clock_sync = Some((rtt, sample));
+                                            sample
+                                        }
+                                        Some((min_rtt, _old)) if rtt <= min_rtt => {
+                                            clock_sync = Some((rtt, sample));
+                                            sample
+                                        }
+                                        Some((min_rtt, old)) => {
+                                            let smoothed = i64::try_from(
+                                                (i128::from(old) * 7 + i128::from(sample)) / 8,
+                                            )
+                                            .unwrap_or(old);
+                                            clock_sync = Some((min_rtt, smoothed));
+                                            smoothed
+                                        }
+                                    };
+                                    decode_shared
+                                        .clock_offset_us
+                                        .store(offset, Ordering::Relaxed);
                                 }
                             }
+                        }
+                        // 被控端每秒上报的整机遥测：只进 UI（不参与任何控制决策）。
+                        SessionMessage::HostStats(host) => {
+                            config.stats.report(SessionStats::Host(Box::new(host)));
                         }
                         SessionMessage::Bye { reason: r } => {
                             reason = r;
@@ -1055,9 +1183,12 @@ async fn decode_loop(
     cancel: CancellationToken,
     decode_shared: Arc<DecodeShared>,
     h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    stats: SessionStatsReporter,
 ) {
     let mut codec: Option<CodecId> = None;
     let mut decoder: Option<Box<dyn VideoDecoderApi>> = None;
+    // 已上报给 UI 的解码器信息（A3；**只在变化时**发，避免每秒刷一条一模一样的读数）。
+    let mut last_decoder_info: Option<DecoderInfo> = None;
     // 当前解码器已经 `configure` 过的编码尺寸；`None` = 新实例，首个包必须先 configure。
     // 尺寸来自 `VideoPacket`（即编码尺寸），**不是** `ScreenConfig`——后者不经过解码队列。
     let mut configured_dims: Option<(u32, u32)> = None;
@@ -1096,7 +1227,7 @@ async fn decode_loop(
             },
         };
         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
-        let (monitor, seq, epoch, packet_codec, flags, width, height, data) = match job {
+        let (monitor, seq, epoch, packet_codec, flags, width, height, data, capture_ts_us) = match job {
             DecodeJob::SelectCodec(selected) => {
                 // 换 codec：旧解码器的参考帧不可用，重置并等新 codec 的关键帧。
                 if codec != Some(selected) {
@@ -1112,7 +1243,10 @@ async fn decode_loop(
                         decoder_factory_for(selected, h264_decoder_factory.as_ref())
                     {
                         match factory.create() {
-                            Ok(dec) => decoder = Some(dec),
+                            Ok(dec) => {
+                                report_decoder_info(&stats, &mut last_decoder_info, dec.as_ref());
+                                decoder = Some(dec);
+                            }
                             // 创建失败不必终止：首个关键帧到达时会再试一次（下方 `is_none` 分支）。
                             Err(err) => warn!(error = %err, "解码器创建失败"),
                         }
@@ -1133,6 +1267,7 @@ async fn decode_loop(
                 width,
                 height,
                 rects,
+                capture_ts_us,
             } => {
                 // 空批 = 保活（主循环已过滤；这里兜底，避免未来的调用方把空批当一帧上屏）。
                 if rects.is_empty() {
@@ -1208,10 +1343,16 @@ async fn decode_loop(
                     width,
                     height,
                     rects: patches,
+                    capture_ts_us,
                 });
                 decode_shared
                     .applied_patches
                     .fetch_add(1, Ordering::Relaxed);
+                // 补丁的端到端：采集完成 → 本端应用完成（与全帧同一套公式）。
+                let offset = decode_shared.clock_offset_us.load(Ordering::Relaxed);
+                decode_shared
+                    .e2e_ms
+                    .store(elapsed_ms(now_us(), offset, capture_ts_us), Ordering::Relaxed);
                 continue;
             }
             DecodeJob::Packet {
@@ -1223,7 +1364,8 @@ async fn decode_loop(
                 width,
                 height,
                 data,
-            } => (display, seq, epoch, codec, flags, width, height, data),
+                capture_ts_us,
+            } => (display, seq, epoch, codec, flags, width, height, data, capture_ts_us),
         };
         // 队列曾溢出（主循环推进了 epoch）：本包已被更新的包取代。丢掉它并重置参考链，
         // `expected_seq = None` 避免紧接着的下一个包再触发一次「断层」重置。
@@ -1311,6 +1453,7 @@ async fn decode_loop(
             };
             match factory.create() {
                 Ok(dec) => {
+                    report_decoder_info(&stats, &mut last_decoder_info, dec.as_ref());
                     decoder = Some(dec);
                     // 新实例尚未 configure：下面立即按本包的编码尺寸配置。
                     configured_dims = None;
@@ -1329,7 +1472,13 @@ async fn decode_loop(
                 None => Err(RemoteError::Platform("解码器不存在".to_owned())),
             };
             match result {
-                Ok(()) => configured_dims = Some((width, height)),
+                Ok(()) => {
+                    configured_dims = Some((width, height));
+                    // 硬件解码器可能到 configure 之后才知道真正的后端（DXVA 还是软件回退）。
+                    if let Some(dec) = decoder.as_ref() {
+                        report_decoder_info(&stats, &mut last_decoder_info, dec.as_ref());
+                    }
+                }
                 Err(err) => {
                     // 与解码失败同款处理：配置失败的实例不可信，丢弃并等下一个关键帧。
                     warn!(error = %err, width, height, "解码器配置尺寸失败，重置解码器并请求关键帧");
@@ -1376,6 +1525,12 @@ async fn decode_loop(
                 decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
                 // IDR 已解出：被限频挂起的请求没有意义了。
                 kf_pending = None;
+                // 端到端（D2）：采集完成 → 本端解码完成。偏差未知/时间戳缺失时给 0
+                // （见 [`crate::clock::elapsed_ms`]）。
+                let offset = decode_shared.clock_offset_us.load(Ordering::Relaxed);
+                decode_shared
+                    .e2e_ms
+                    .store(elapsed_ms(now_us(), offset, capture_ts_us), Ordering::Relaxed);
                 sink.on_frame(DecodedFrame {
                     display: monitor,
                     width: frame.width,
@@ -1383,6 +1538,7 @@ async fn decode_loop(
                     seq,
                     rgba: frame.rgba,
                     nv12: frame.nv12,
+                    capture_ts_us,
                 });
             }
             // 本批无输出（理论路径；`lag_in_frames = 1` 下每次都有）。
@@ -1430,6 +1586,42 @@ async fn decode_loop(
                 );
             }
         }
+    }
+}
+
+/// 把解码器的后端信息上报给 UI，**只在变化时**发。
+///
+/// 解码任务持有解码器，UI 在另一个任务里——信息走既有的进程内 [`SessionStatsReporter`]，
+/// 不新增线上变体（`SessionMessage` 里没有它，也不该有）。
+fn report_decoder_info(
+    stats: &SessionStatsReporter,
+    last: &mut Option<DecoderInfo>,
+    decoder: &dyn VideoDecoderApi,
+) {
+    let info = decoder.info();
+    if last.as_ref() == Some(&info) {
+        return;
+    }
+    stats.report(SessionStats::DecoderInfo {
+        backend: info.backend.clone(),
+        adapter: info.adapter.clone(),
+        hardware: info.hardware,
+    });
+    *last = Some(info);
+}
+
+/// 两份**累计**可靠层快照求差，得到每秒增量（[`TransportStats`]）。
+///
+/// `saturating_sub`：计数器理论上单调，但会话重建/快照竞争下出现倒退时宁可给 0，也不 panic
+/// 或回绕成天文数字。
+fn transport_delta(prev: ReliableSnapshot, now: ReliableSnapshot) -> TransportStats {
+    let delta = |now: u64, prev: u64| u32::try_from(now.saturating_sub(prev)).unwrap_or(u32::MAX);
+    TransportStats {
+        rto: delta(now.rto_timeouts, prev.rto_timeouts),
+        fast_retransmit: delta(now.fast_retransmits, prev.fast_retransmits),
+        out_of_order: delta(now.out_of_order_segments, prev.out_of_order_segments),
+        duplicate: delta(now.duplicate_segments, prev.duplicate_segments),
+        out_of_window: delta(now.out_of_window_drops, prev.out_of_window_drops),
     }
 }
 
@@ -1647,6 +1839,7 @@ mod tests {
             mode: RemoteMode::Control,
             stats: SessionStatsReporter::noop(),
             h264_decoder_factory: None,
+            reliable: None,
         }
     }
 
@@ -1785,9 +1978,12 @@ mod tests {
         // 被控端：把收到的 `Heartbeat` 回一个 `HeartbeatAck`（其余帧不管）。
         let peer = tokio::spawn(async move {
             while let Some(Ok(frame)) = peer_reader.next().await {
-                if matches!(frame.message, SessionMessage::Heartbeat)
+                if matches!(frame.message, SessionMessage::Heartbeat { .. })
                     && peer_writer
-                        .send(SessionFrame::control(SessionMessage::HeartbeatAck))
+                        .send(SessionFrame::control(SessionMessage::HeartbeatAck {
+                            t2_us: 1,
+                            t3_us: 2,
+                        }))
                         .await
                         .is_err()
                 {
@@ -1923,9 +2119,12 @@ mod tests {
         let peer = tokio::spawn(async move {
             while let Some(Ok(frame)) = peer_reader.next().await {
                 match frame.message {
-                    SessionMessage::Heartbeat => {
+                    SessionMessage::Heartbeat { .. } => {
                         if peer_writer
-                            .send(SessionFrame::control(SessionMessage::HeartbeatAck))
+                            .send(SessionFrame::control(SessionMessage::HeartbeatAck {
+                                t2_us: 1,
+                                t3_us: 2,
+                            }))
                             .await
                             .is_err()
                         {
@@ -2023,7 +2222,7 @@ mod tests {
             let peer_ready = ready.clone();
             tokio::spawn(async move {
                 while let Some(Ok(frame)) = peer_reader.next().await {
-                    if matches!(frame.message, SessionMessage::Heartbeat) {
+                    if matches!(frame.message, SessionMessage::Heartbeat { .. }) {
                         peer_ready.notify_one();
                     }
                 }
@@ -2153,6 +2352,7 @@ mod tests {
             cancel.clone(),
             Arc::new(DecodeShared::new()),
             Some(factory),
+            SessionStatsReporter::noop(),
         ));
 
         job_tx
@@ -2169,6 +2369,7 @@ mod tests {
                 width: 2,
                 height: 2,
                 data: vec![1, 2, 3],
+                capture_ts_us: 0,
             })
             .await
             .expect("投递关键帧");
@@ -2232,6 +2433,7 @@ mod tests {
             cancel.clone(),
             Arc::new(DecodeShared::new()),
             Some(factory),
+            SessionStatsReporter::noop(),
         ));
 
         job_tx
@@ -2248,6 +2450,7 @@ mod tests {
             width,
             height,
             data: vec![1, 2, 3],
+            capture_ts_us: 0,
         };
         // 首包（关键帧）→ configure + decode。
         job_tx
@@ -2395,6 +2598,7 @@ mod tests {
                 cancel.clone(),
                 Arc::new(DecodeShared::new()),
                 Some(factory),
+                SessionStatsReporter::noop(),
             ));
             Self {
                 jobs,
@@ -2421,6 +2625,7 @@ mod tests {
                     width,
                     height,
                     data: vec![1, 2, 3],
+                    capture_ts_us: 0,
                 })
                 .await
                 .expect("投递关键帧");
@@ -2445,6 +2650,7 @@ mod tests {
                     width,
                     height,
                     rects,
+                    capture_ts_us: 0,
                 })
                 .await
                 .expect("投递补丁批");

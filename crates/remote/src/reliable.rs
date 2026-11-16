@@ -36,6 +36,7 @@ use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -286,6 +287,100 @@ struct ConnStats {
     in_order_segments: u64,
 }
 
+/// 跨任务共享的**可靠层指标**（原子计数，A7 用）。
+///
+/// 协议任务每轮循环把 [`ConnStats`] 同步进这里（见 [`Conn::sync_metrics`]），控制器每秒
+/// 读一次 [`ReliableMetrics::snapshot`] 并与上一份求差，得到 `SessionStats::Transport` 的每秒
+/// 增量。字段名与 [`ConnStats`] 一一对应（都是 `u64` 累计值）。
+///
+/// **为什么不用锁**：写入点在协议任务的每次 `select!` 循环里，读点在控制器每秒一次的 tick 上；
+/// 全是 `Relaxed` 单调计数，没有跨字段的一致性要求（几纳秒的错位对「每秒重传几次」毫无影响）。
+#[derive(Debug, Default)]
+pub struct ReliableMetrics {
+    /// 已发出的数据段数（累计）。
+    pub(crate) sent_segments: AtomicU64,
+    /// 已确认的数据段数（累计）。
+    pub(crate) acked_segments: AtomicU64,
+    /// RTO 超时次数（累计）。
+    pub(crate) rto_timeouts: AtomicU64,
+    /// 快速重传次数（累计）。
+    pub(crate) fast_retransmits: AtomicU64,
+    /// 收到的乱序段数（累计）。
+    pub(crate) out_of_order_segments: AtomicU64,
+    /// 收到的重复段数（累计）。
+    pub(crate) duplicate_segments: AtomicU64,
+    /// 因超出接收窗口而丢弃的段数（累计）。
+    pub(crate) out_of_window_drops: AtomicU64,
+    /// 收到的按序段数（累计）。
+    pub(crate) in_order_segments: AtomicU64,
+}
+
+/// 一次原子快照（全部是**累计值**；调用方自己跨秒求差）。
+///
+/// 直连/中继路径没有可靠层，自然也没有快照——控制器此时不发 `SessionStats::Transport`。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReliableSnapshot {
+    /// 已发出的数据段数。
+    pub sent_segments: u64,
+    /// 已确认的数据段数。
+    pub acked_segments: u64,
+    /// RTO 超时次数。
+    pub rto_timeouts: u64,
+    /// 快速重传次数。
+    pub fast_retransmits: u64,
+    /// 收到的乱序段数。
+    pub out_of_order_segments: u64,
+    /// 收到的重复段数。
+    pub duplicate_segments: u64,
+    /// 因超出接收窗口而丢弃的段数。
+    pub out_of_window_drops: u64,
+    /// 收到的按序段数。
+    pub in_order_segments: u64,
+}
+
+impl ReliableMetrics {
+    /// 取一份当前值的快照（各字段独立 `Relaxed` 读取，见类型文档）。
+    #[must_use]
+    pub fn snapshot(&self) -> ReliableSnapshot {
+        let read = |cell: &AtomicU64| cell.load(Ordering::Relaxed);
+        ReliableSnapshot {
+            sent_segments: read(&self.sent_segments),
+            acked_segments: read(&self.acked_segments),
+            rto_timeouts: read(&self.rto_timeouts),
+            fast_retransmits: read(&self.fast_retransmits),
+            out_of_order_segments: read(&self.out_of_order_segments),
+            duplicate_segments: read(&self.duplicate_segments),
+            out_of_window_drops: read(&self.out_of_window_drops),
+            in_order_segments: read(&self.in_order_segments),
+        }
+    }
+
+    /// 用一份 [`ConnStats`] 覆盖所有计数（协议任务每轮调用；单调不减）。
+    fn store(&self, stats: &ConnStats) {
+        let store = |cell: &AtomicU64, value: u64| cell.store(value, Ordering::Relaxed);
+        store(&self.sent_segments, stats.sent_segments);
+        store(&self.acked_segments, stats.acked_segments);
+        store(&self.rto_timeouts, stats.rto_timeouts);
+        store(&self.fast_retransmits, stats.fast_retransmits);
+        store(&self.out_of_order_segments, stats.out_of_order_segments);
+        store(&self.duplicate_segments, stats.duplicate_segments);
+        store(&self.out_of_window_drops, stats.out_of_window_drops);
+        store(&self.in_order_segments, stats.in_order_segments);
+    }
+}
+
+/// 可靠层握手成功后返回给调用方的两样东西：应用侧字节流 + 指标句柄。
+///
+/// `metrics` 与协议任务共享同一个 `Arc`，因此会话循环随时可以取快照；流本身仍可直接当
+/// `AsyncRead + AsyncWrite` 用（塞进 [`crate::transport::BoxDuplex`]）。
+#[derive(Debug)]
+pub(crate) struct ReliableStream {
+    /// 应用侧那一半流。
+    pub stream: DuplexStream,
+    /// 指标句柄（累计值，见 [`ReliableMetrics`]）。
+    pub metrics: Arc<ReliableMetrics>,
+}
+
 /// 一条可靠连接的协议状态机（同步，便于单测用虚拟时钟直接驱动）。
 #[expect(
     clippy::struct_excessive_bools,
@@ -363,6 +458,8 @@ struct Conn {
     outgoing: Vec<Vec<u8>>,
     /// 统计。
     stats: ConnStats,
+    /// 与本任务共享给调用方的指标句柄（每轮 [`Conn::sync_metrics`] 同步一次）。
+    metrics: Arc<ReliableMetrics>,
     /// 致命错误（RST 或重传耗尽）：置位后任务退出、应用侧流关闭。
     fatal: bool,
 }
@@ -401,8 +498,14 @@ impl Conn {
             consecutive_timeouts: 0,
             outgoing: Vec::new(),
             stats: ConnStats::default(),
+            metrics: Arc::new(ReliableMetrics::default()),
             fatal: false,
         }
+    }
+
+    /// 把当前 [`ConnStats`] 同步进共享指标（每轮循环调一次；`Relaxed` 单调写）。
+    fn sync_metrics(&self) {
+        self.metrics.store(&self.stats);
     }
 
     /// 当前接收窗口（段）。
@@ -918,11 +1021,15 @@ impl Conn {
     }
 }
 
-/// 起协议任务、返回应用侧那一半流。
-fn spawn_conn(conn: Conn, rx: DatagramRx) -> DuplexStream {
+/// 起协议任务、返回应用侧那一半流与指标句柄。
+fn spawn_conn(conn: Conn, rx: DatagramRx) -> ReliableStream {
     let (app_side, task_side) = tokio::io::duplex(DUPLEX_CAPACITY);
+    let metrics = Arc::clone(&conn.metrics);
     tokio::spawn(run_conn(conn, task_side, rx));
-    app_side
+    ReliableStream {
+        stream: app_side,
+        metrics,
+    }
 }
 
 /// 协议任务：在应用侧流与数据报之间搬运字节。
@@ -936,9 +1043,10 @@ async fn run_conn(mut conn: Conn, task_side: DuplexStream, mut rx: DatagramRx) {
             break;
         }
 
-        // 推进状态机并冲刷出站数据报。
+        // 推进状态机并冲刷出站数据报，然后把累计计数同步给指标句柄。
         conn.step(Instant::now());
         conn.send_out().await;
+        conn.sync_metrics();
 
         // 对端 FIN：数据交付完后半关闭应用侧写端（应用读到 EOF，但仍可继续写）。
         if conn.peer_fin && !write_shutdown && conn.recv_deliver.is_empty() {
@@ -972,8 +1080,11 @@ async fn run_conn(mut conn: Conn, task_side: DuplexStream, mut rx: DatagramRx) {
             },
             () = &mut sleep => conn.on_timeout(Instant::now()),
         }
+        // 本轮事件可能改了计数（收段/重传/RTO）：立刻同步给指标句柄，避免读数滞后一轮。
+        conn.sync_metrics();
     }
     // 退出即丢弃 task_side：应用侧读端 EOF、写端 BrokenPipe。
+    conn.sync_metrics();
 }
 
 /// 主动方：周期发 `SYN` 直到收到匹配的 `SYN|ACK`，**只有收到它才进入 Established**
@@ -987,7 +1098,7 @@ pub(crate) async fn connect(
     mut rx: DatagramRx,
     peer: SocketAddr,
     budget: Duration,
-) -> RemoteResult<DuplexStream> {
+) -> RemoteResult<ReliableStream> {
     let deadline = Instant::now() + budget;
     loop {
         let sent_at = Instant::now();
@@ -1036,7 +1147,7 @@ pub(crate) async fn accept(
     conn_id: u64,
     mut rx: DatagramRx,
     budget: Duration,
-) -> RemoteResult<DuplexStream> {
+) -> RemoteResult<ReliableStream> {
     let deadline = Instant::now() + budget;
     let wait = async {
         while let Some((from, data)) = rx.recv().await {
@@ -1256,7 +1367,38 @@ mod tests {
         let a = connect(link_a, conn_id, rx_a, addr_b, PUNCH_BUDGET);
         let b = accept(link_b, conn_id, rx_b, PUNCH_BUDGET);
         let (ra, rb) = tokio::join!(a, b);
-        (ra.unwrap(), rb.unwrap())
+        (ra.unwrap().stream, rb.unwrap().stream)
+    }
+
+    /// 指标句柄必须跟随协议任务推进：写入数据后 `sent_segments` / `acked_segments` 增长。
+    ///
+    /// 这是 A7（重传/乱序角标）的数据来源——若 `Conn` 忘了把 `ConnStats` 同步进
+    /// [`ReliableMetrics`]，控制器永远显示 0，看上去就像一条完美链路。
+    #[tokio::test(start_paused = true)]
+    async fn metrics_snapshot_tracks_progress() {
+        let net = Net::new(21);
+        let (link_a, rx_a, _addr_a) = endpoint(&net, "10.0.0.1:1111");
+        let (link_b, rx_b, addr_b) = endpoint(&net, "10.0.0.2:2222");
+        let conn_id = 7;
+        let (ra, rb) = tokio::join!(
+            connect(link_a, conn_id, rx_a, addr_b, PUNCH_BUDGET),
+            accept(link_b, conn_id, rx_b, PUNCH_BUDGET)
+        );
+        let ra = ra.expect("主动方应建立成功");
+        // 被动方那一半必须活着：drop 会让对端读到 EOF 并发 FIN。
+        let _b = rb.expect("被动方应建立成功");
+        let ReliableStream {
+            mut stream,
+            metrics,
+        } = ra;
+        assert_eq!(metrics.snapshot(), ReliableSnapshot::default(), "握手期还没有数据段");
+        stream.write_all(&pattern(4096)).await.unwrap();
+        // 虚拟时钟前进：协议任务有机会把数据发出去、收 ACK 并同步计数。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snap = metrics.snapshot();
+        assert!(snap.sent_segments > 0, "发送后应有数据段计数，实得 {snap:?}");
+        assert!(snap.acked_segments > 0, "对端应确认这些段，实得 {snap:?}");
+        assert_eq!(snap.rto_timeouts, 0, "好链路上不应有 RTO");
     }
 
     /// 造一段确定性图案。

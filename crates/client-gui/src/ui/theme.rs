@@ -260,11 +260,34 @@ pub fn scene_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::new().fill(palette(style).bg)
 }
 
+/// 统计角标：**半透明**浮层底板（角标盖在画面上，不能把它挡成一块实心板）。
+///
+/// 与 [`card_frame`] 的区别只有三处，且都是为了「不挡画面、不吃点击」：
+/// - 底色 alpha 降到 170（深色）/ 190（浅色），能透出底下的视频画面；
+/// - 细描边 + 圆角 10、内边距 10×8（比卡片更紧凑）；
+/// - **没有投影**——投影会在画面边缘投出一圈灰雾，而角标只是读数，不需要浮起感。
+///
+/// 角标本身必须挂在 `egui::Area::interactable(false)` 上才真正点击穿透（见
+/// [`crate::ui::session_window::stats_overlay`]）；这里的半透明只解决视觉遮挡。
+pub fn stats_frame(style: &egui::Style) -> egui::Frame {
+    let p = palette(style);
+    let fill = if style.visuals.dark_mode {
+        egui::Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2B, 170)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 190)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0_f32, p.stroke))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+}
+
 #[cfg(test)]
 mod tests {
     //! 纯样式测试：不构造 `egui::Context`（`scoped_session_style` 需要在真实上下文里调用）。
 
-    use super::{palette, session_style};
+    use super::{card_frame, palette, session_style, stats_frame};
     use egui::{FontFamily, Style, TextStyle};
 
     /// 粗略感知亮度（0.0–1.0），只用于「文字与背景确实有对比」这一条断言。
@@ -326,5 +349,29 @@ mod tests {
         assert!(heading.size > body.size);
         assert_eq!(heading.family, FontFamily::Proportional);
         assert_eq!(body.family, FontFamily::Proportional);
+    }
+
+    /// 统计角标底板必须**半透明、无投影**：它盖在画面上，实心底板或投影都会挡住视频。
+    #[test]
+    fn stats_frame_is_translucent_without_shadow() {
+        for dark in [true, false] {
+            let mut base = Style::default();
+            base.visuals.dark_mode = dark;
+            let stats = stats_frame(&base);
+            let card = card_frame(&base);
+            let expected_alpha = if dark { 170 } else { 190 };
+            assert_eq!(
+                stats.fill.a(),
+                expected_alpha,
+                "角标底色 alpha 应可透出画面"
+            );
+            assert!(
+                stats.fill.a() < card.fill.a(),
+                "角标必须比实心卡片更透明（dark={dark}）"
+            );
+            assert_eq!(stats.shadow.blur, 0, "角标不得带投影");
+            assert_eq!(stats.shadow.color.a(), 0, "角标投影必须完全透明");
+            assert_eq!(stats.corner_radius, egui::CornerRadius::same(10));
+        }
     }
 }

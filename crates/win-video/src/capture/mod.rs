@@ -13,6 +13,8 @@
 //!   避免帧内远端光标与本机光标并存造成「双光标」。
 //! - [`open_best`]：按 WGC → DXGI 的顺序尝试，返回实际后端；两个后端都失败时
 //!   错误信息里同时带上两侧的原因。
+//! - [`CaptureSource::stats`]：累计诊断计数（[`CaptureCounters`]，目前只有「无新帧」
+//!   次数）。它是**单调累加**的，上层每秒与上一份求差得到每秒增量。
 //!
 //! 安全桌面（Winlogon）不属于本模块：那条路径只能用 GDI `BitBlt`，由
 //! `client-gui`/`win-platform` 的实例模式处理。
@@ -143,6 +145,25 @@ impl fmt::Display for CaptureBackend {
     }
 }
 
+/// 采集后端的**累计**诊断计数（进程内，不进线上协议）。
+///
+/// 只用于给上层（`client-gui` 的被控端遥测）提供「无新帧」这类无法从单帧结果看出
+/// 的读数。上层每秒与上一份快照求差得到每秒增量，因此这里必须是**单调累加**的
+/// `u64`，且**不要**在重建采集源之后清零（上层手里还握着旧值）。
+///
+/// 这是本 crate 自己的类型，与 `rust-tunnel-remote` 的 `CaptureInfo` **无关**：
+/// 后者是平台无关的 trait 元数据，本 crate 不依赖 `remote`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureCounters {
+    /// 「超时 / 无新帧 / 复用上一帧」的次数累计。
+    ///
+    /// WGC 的 `TryGetNextFrame` 与 DXGI 的 `AcquireNextFrame` 在桌面静止时都可能
+    /// 拿不到新帧（DXGI 直接超时，WGC 在只有指针更新时不交付图像）；这些拍不算
+    /// 错误——采集源会复用上一帧（见模块文档），这里只记下发生了多少次，供上层
+    /// 区分「真的没画面在动」与「采集链路卡住了」。
+    pub no_new_frame: u64,
+}
+
 /// 一帧采集结果。
 ///
 /// `bgra` 是**自顶向下**的 BGRA8（每像素 4 字节，行间无填充），长度恒为
@@ -261,8 +282,11 @@ impl BgraReadback {
             self.inner = BgraReader::default();
             self.device = Some(Arc::clone(&captured.device));
         }
-        self.inner
-            .read(&captured.device.device, &captured.device.context, &captured.texture)
+        self.inner.read(
+            &captured.device.device,
+            &captured.device.context,
+            &captured.texture,
+        )
     }
 }
 
@@ -530,6 +554,14 @@ pub trait CaptureSource: Send {
     /// 默认返回 `None`（后端不支持 GPU 纹理）。
     fn device(&self) -> Option<Arc<d3d11::D3d11>> {
         None
+    }
+
+    /// 本采集源的**累计**诊断计数。
+    ///
+    /// 默认全零；WGC / DXGI 实现会统计「无新帧」的次数（见 [`CaptureCounters`]）。
+    /// 上层每秒取一次并与上一份求差，得到每秒增量。
+    fn stats(&self) -> CaptureCounters {
+        CaptureCounters::default()
     }
 }
 

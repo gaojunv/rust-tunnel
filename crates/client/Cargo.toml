@@ -5,7 +5,8 @@ name = "rust-tunnel-client"
 # release-client-gui.yml 的 VERSION 只取 git tag、不写回 Cargo.toml —— 这里漏抬会让门控把所有客户端一起挡掉。
 # 0.13.1 = 仅 QoS 闭环修正（网络拥塞不再改分辨率），协议仍是 v6，与 0.13.0 可互通。
 # 0.14.0 = 数据面 v7（新增锁屏 `SessionMessage::LockScreen`），两端必须同为 0.14.0。
-version = "0.14.0"
+# 0.15.0 = 数据面 v8（`HostStats` 遥测 + 心跳时间戳 + 采集时间戳/端到端），两端必须同为 0.15.0。
+version = "0.15.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"
