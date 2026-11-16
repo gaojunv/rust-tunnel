@@ -14,6 +14,8 @@ pub mod server;
 pub mod state;
 /// 隧道字节流（AsyncRead/Write）。
 pub mod tunnel_stream;
+/// 客户端 GUI 自更新控制面（版本判定与文件分片推送）。
+pub mod update;
 
 pub use acme_config::*;
 pub use port_info::*;

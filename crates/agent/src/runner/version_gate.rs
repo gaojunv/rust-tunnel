@@ -143,6 +143,26 @@ pub fn client_supports_remote(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_REMOTE_CLIENT_VERSION)
 }
 
+/// 首个支持控制通道自更新（`ClientUpdateAvailable` 等变体）的客户端版本。
+///
+/// 服务端只在客户端版本 ≥ 此值时才下发任何 `ClientUpdate*` 变体；客户端也只在
+/// 收到过服务端更新消息后才上行 `ClientUpdateCheck` / `ClientUpdateRequest`。
+/// 这道**双向门控**保证新客户端配老服务端同样安全——老服务端不认识上行变体，
+/// 收到会因 bincode 解码失败直接断开控制通道。
+///
+/// 抬版本时**必须同步** `crates/client/Cargo.toml` 与 `crates/client-gui/Cargo.toml`
+/// （客户端上报的是 `CARGO_PKG_VERSION`，发布 workflow 不写回 Cargo.toml）。
+pub const MIN_UPDATE_CLIENT_VERSION: (u64, u64, u64) = (0, 15, 0);
+
+/// 客户端版本是否支持控制通道自更新；缺失/非法视为不支持（保守策略，
+/// 避免老客户端收到未知 bincode 变体后反序列化失败断开控制连接）。
+#[must_use]
+pub fn client_supports_update(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_UPDATE_CLIENT_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +265,19 @@ mod tests {
         // 回归：agent 模式版本后缀 +agent 不得破坏版本门控。
         assert!(client_supports_remote(Some("0.10.0+agent")));
         assert!(!client_supports_remote(Some("0.9.0+agent")));
+    }
+
+    #[test]
+    fn test_client_supports_update() {
+        assert!(client_supports_update(Some("0.15.0")));
+        assert!(client_supports_update(Some("v0.15.0")));
+        assert!(client_supports_update(Some("0.15.0+agent")));
+        assert!(client_supports_update(Some("1.0.0")));
+        // 0.14.x 及更早的客户端不认识 `ClientUpdate*` 变体，绝不能被下发。
+        assert!(!client_supports_update(Some("0.14.0")));
+        assert!(!client_supports_update(Some("0.14.99")));
+        assert!(!client_supports_update(None));
+        assert!(!client_supports_update(Some("garbage")));
     }
 
     // ── agent_result_to_text WriteOutcome ───────────────────

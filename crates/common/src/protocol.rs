@@ -528,6 +528,79 @@ pub enum ControlMessage {
         /// 结束原因（用户主动断开/网络中断/被控端关闭开关）。
         reason: String,
     },
+    // ── 客户端自更新（GUI 客户端；新增变体一律追加在末尾以保持 bincode 序数稳定）──
+    /// 服务端告知客户端有新版本可用（server -> client）。
+    ///
+    /// **只在客户端版本 ≥ `MIN_UPDATE_CLIENT_VERSION` 时下发**：老客户端不认识
+    /// 本变体，收到会反序列化失败并断开控制通道。`files` 只包含可**自动替换**的
+    /// GUI 主程序产物（Windows `.exe` / macOS 裸二进制），不含 zip/dmg——本机自
+    /// 更新不做解包。`files` 为空表示「已是最新」，与 [`Self::ClientUpdateUpToDate`]
+    /// 同义，保留它是为了兼容「先推能力、后推版本」的时序。
+    ClientUpdateAvailable {
+        /// 最新版本号（版本目录名，如 `v0.15.0`）。
+        version: String,
+        /// 可用于自动更新的文件清单。
+        files: Vec<ClientUpdateFile>,
+    },
+    /// 客户端请求检查更新（client -> server）。
+    ///
+    /// **客户端只在收到过服务端的更新消息后才允许发送本变体**：老服务端不认识
+    /// 它，会因 bincode 解码失败断开控制通道（与远程控制的双向门控同理）。
+    ClientUpdateCheck,
+    /// 服务端确认当前已是最新（server -> client）。
+    ClientUpdateUpToDate {
+        /// 服务端已知的最新 GUI 版本号（未知时回显客户端自己的版本）。
+        version: String,
+    },
+    /// 客户端请求下载一个更新文件（client -> server）。
+    ClientUpdateRequest {
+        /// 客户端生成的传输 ID，用于把分片与请求配对（同一时刻只允许一个传输）。
+        transfer_id: u32,
+        /// 版本目录名。
+        version: String,
+        /// 文件名（必须是 [`Self::ClientUpdateAvailable`] 的 `files` 中的一项）。
+        file: String,
+    },
+    /// 服务端回传更新文件分片（server -> client）。
+    ///
+    /// 分片按偏移顺序发送、单条 ≤ 256 KiB（远低于控制通道 1 MiB 上限）；
+    /// 最后一片的 `data` 为空、`last = true`。
+    ClientUpdateChunk {
+        /// 传输 ID。
+        transfer_id: u32,
+        /// 分片在文件中的偏移。
+        offset: u64,
+        /// 分片数据。
+        data: Vec<u8>,
+        /// 是否为最后一片（最后一片的 `data` 为空）。
+        last: bool,
+    },
+    /// 服务端拒绝/中止更新下载（server -> client）。
+    ClientUpdateFailed {
+        /// 传输 ID。
+        transfer_id: u32,
+        /// 失败原因。
+        message: String,
+    },
+}
+
+/// 可自动替换的客户端 GUI 主程序产物。
+///
+/// 服务端从 `client_dist_dir/<version>/` 的文件名解析出平台信息后下发；客户端按
+/// `os` / `arch` 挑选与本机匹配的一项。`sha256` 是**必须**的：客户端校验通过后才
+/// 允许替换本机可执行文件。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientUpdateFile {
+    /// 文件名（下载请求里原样回填）。
+    pub name: String,
+    /// 目标操作系统：`windows` / `macos` / `linux`。
+    pub os: String,
+    /// 目标架构：`x86_64` / `aarch64`。
+    pub arch: String,
+    /// 文件字节数。
+    pub size: u64,
+    /// SHA-256 十六进制摘要（小写，64 个字符）。
+    pub sha256: String,
 }
 
 /// RustDesk 会合/中继运行参数（服务端生效配置，经控制通道下发给客户端）。
@@ -1791,6 +1864,98 @@ mod tests {
                 "变体 {msg:?} 的序数（首字节 {}）必须大于 ClientMappingSummary（{}）",
                 bytes[0],
                 summary[0]
+            );
+        }
+    }
+
+    // ── 客户端自更新变体 ─────────────────────────────────────────────────
+
+    /// 自更新全部新变体的 bincode roundtrip。
+    #[test]
+    fn test_update_variants_roundtrip() {
+        let file = ClientUpdateFile {
+            name: "rust-tunnel-client-gui-windows-x86_64.exe".into(),
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            size: 16_777_216,
+            sha256: "a".repeat(64),
+        };
+        let variants = vec![
+            ControlMessage::ClientUpdateAvailable {
+                version: "v0.16.0".into(),
+                files: vec![file],
+            },
+            ControlMessage::ClientUpdateCheck,
+            ControlMessage::ClientUpdateUpToDate {
+                version: "v0.16.0".into(),
+            },
+            ControlMessage::ClientUpdateRequest {
+                transfer_id: 7,
+                version: "v0.16.0".into(),
+                file: "rust-tunnel-client-gui-windows-x86_64.exe".into(),
+            },
+            ControlMessage::ClientUpdateChunk {
+                transfer_id: 7,
+                offset: 256 * 1024,
+                data: vec![1, 2, 3],
+                last: false,
+            },
+            ControlMessage::ClientUpdateFailed {
+                transfer_id: 7,
+                message: "通道已关闭".into(),
+            },
+        ];
+        for msg in &variants {
+            let bytes = bincode::serialize(msg).unwrap();
+            let back: ControlMessage = bincode::deserialize(&bytes).unwrap();
+            assert!(
+                format!("{back:?}") == format!("{msg:?}"),
+                "roundtrip mismatch: {msg:?}"
+            );
+        }
+    }
+
+    /// 自更新变体必须追加在 `RemoteSessionEnd` 之后：老客户端收到未知变体会
+    /// 反序列化失败并断连，故序数只能增大、不能重排。
+    #[test]
+    fn test_update_variants_append_after_remote_session_end() {
+        let anchor = bincode::serialize(&ControlMessage::RemoteSessionEnd {
+            session_id: String::new(),
+            reason: String::new(),
+        })
+        .unwrap();
+        let appended = vec![
+            ControlMessage::ClientUpdateAvailable {
+                version: String::new(),
+                files: vec![],
+            },
+            ControlMessage::ClientUpdateCheck,
+            ControlMessage::ClientUpdateUpToDate {
+                version: String::new(),
+            },
+            ControlMessage::ClientUpdateRequest {
+                transfer_id: 0,
+                version: String::new(),
+                file: String::new(),
+            },
+            ControlMessage::ClientUpdateChunk {
+                transfer_id: 0,
+                offset: 0,
+                data: vec![],
+                last: true,
+            },
+            ControlMessage::ClientUpdateFailed {
+                transfer_id: 0,
+                message: String::new(),
+            },
+        ];
+        for msg in &appended {
+            let bytes = bincode::serialize(msg).unwrap();
+            assert!(
+                bytes[0] > anchor[0],
+                "变体 {msg:?} 的序数（首字节 {}）必须大于 RemoteSessionEnd（{}）",
+                bytes[0],
+                anchor[0]
             );
         }
     }

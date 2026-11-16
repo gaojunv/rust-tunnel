@@ -125,7 +125,8 @@ async fn handle_client_connection(
     let (write_dead_tx, mut write_dead_rx) = watch::channel(false);
     tokio::spawn(async move {
         while let Some(msg) = send_rx.recv().await {
-            match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, msg.write_to_stream(&mut writer)).await
+            match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, msg.write_to_stream(&mut writer))
+                .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -158,6 +159,10 @@ async fn handle_client_connection(
     // 首包远程能力通告（内部按 `client_supports_remote` 门控，老客户端收不到任何远程变体）。
     // `rd_id` 分配失败已在 `push_remote_config` 内回落成未启用，不影响注册。
     let _ = push_remote_config(&state, &entry.name).await;
+
+    // 首包更新状态（内部按 `client_supports_update` 门控）。即使「已是最新」也会发一条，
+    // 客户端据此确认服务端理解更新协议，之后才允许上行 `ClientUpdateCheck`。
+    crate::control_plane::update::push_update_status(&state, &entry).await;
 
     // 2. Reader loop: dispatch to registry active_connections / heartbeat / etc.
     let name_for_cleanup = entry.name.clone();
@@ -352,6 +357,25 @@ async fn handle_client_connection(
                 // 任一端发起会话结束：消费会话并通知对端。
                 ControlMessage::RemoteSessionEnd { session_id, reason } => {
                     handle_session_end(&state, &entry.name, &session_id, &reason).await;
+                }
+                // 客户端主动检查更新（与注册时推送同一逻辑）。
+                ControlMessage::ClientUpdateCheck => {
+                    crate::control_plane::update::handle_update_check(&state, &entry).await;
+                }
+                // 客户端请求下载更新文件：校验后起任务分片推送，不阻塞读循环。
+                ControlMessage::ClientUpdateRequest {
+                    transfer_id,
+                    version,
+                    file,
+                } => {
+                    crate::control_plane::update::handle_update_request(
+                        &state,
+                        &entry,
+                        transfer_id,
+                        &version,
+                        &file,
+                    )
+                    .await;
                 }
                 // Mesh variants: forward to mesh_manager
                 m @ (ControlMessage::MeshJoin { .. }

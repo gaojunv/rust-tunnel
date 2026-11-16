@@ -163,6 +163,16 @@ pub struct GuiPrefs {
     /// 运行中修改只对下一次会话生效。
     #[serde(default)]
     pub remote_native_resolution: bool,
+    /// 自动检查客户端更新。**默认开启**：服务端在注册时也会主动推送一次，此项控制的是
+    /// 长连接期间的 6 小时轮询。关掉后仍可在设置页手动检查。
+    #[serde(default = "default_true")]
+    pub update_auto_check: bool,
+    /// 用户选择「跳过此版本」的版本号；缺省 `None`。
+    ///
+    /// 只影响弹窗：设置页仍会显示「有新版本（已跳过）」并提供入口。新版本到来时
+    /// 自更新逻辑会正常弹窗，不需要用户回来清除本字段。
+    #[serde(default)]
+    pub update_skipped_version: Option<String>,
 }
 
 impl Default for GuiPrefs {
@@ -186,6 +196,8 @@ impl Default for GuiPrefs {
             remote_frame_rate: default_remote_frame_rate(),
             remote_quality: QualityPreset::default(),
             remote_native_resolution: false,
+            update_auto_check: true,
+            update_skipped_version: None,
         }
     }
 }
@@ -309,7 +321,10 @@ mod tests {
             remote_toolbar_autohide: true,
             ..GuiPrefs::default()
         };
-        assert!(!prefs.remote_toolbar_autohide_migrated, "构造的应是未迁移态");
+        assert!(
+            !prefs.remote_toolbar_autohide_migrated,
+            "构造的应是未迁移态"
+        );
 
         assert!(migrate_toolbar_autohide(&mut prefs), "旧配置应发生迁移");
         assert!(prefs.remote_toolbar_autohide_migrated);
@@ -329,7 +344,10 @@ mod tests {
             !migrate_toolbar_autohide(&mut prefs),
             "已迁移的文件不得再次迁移"
         );
-        assert!(prefs.remote_toolbar_autohide, "用户重新打开的自动隐藏必须保留");
+        assert!(
+            prefs.remote_toolbar_autohide,
+            "用户重新打开的自动隐藏必须保留"
+        );
         assert!(prefs.remote_toolbar_autohide_migrated);
     }
 
@@ -356,7 +374,11 @@ mod tests {
         .unwrap();
         let legacy = legacy_full
             .lines()
-            .filter(|line| !line.trim_start().starts_with("remote_toolbar_autohide_migrated"))
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("remote_toolbar_autohide_migrated")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -372,7 +394,10 @@ mod tests {
         // 落盘 → 重新解析：这次必须不再迁移。
         let saved = toml::to_string(&prefs).unwrap();
         let mut reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
-        assert!(reparsed.remote_toolbar_autohide_migrated, "迁移标志应已落盘");
+        assert!(
+            reparsed.remote_toolbar_autohide_migrated,
+            "迁移标志应已落盘"
+        );
         assert!(
             !migrate_toolbar_autohide(&mut reparsed),
             "已迁移的文件不得再次迁移"
@@ -460,7 +485,10 @@ mod tests {
     /// 工具条收起态的缺省与往返：默认展开，旧配置缺键也是展开，用户收起后跨重启保留。
     #[test]
     fn toolbar_collapsed_defaults_to_expanded_and_survives_roundtrip() {
-        assert!(!GuiPrefs::default().remote_toolbar_collapsed, "新配置默认展开");
+        assert!(
+            !GuiPrefs::default().remote_toolbar_collapsed,
+            "新配置默认展开"
+        );
         // 缺失该键的旧配置也落到展开（serde default）。
         let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
         assert!(!prefs.remote_toolbar_collapsed);

@@ -23,6 +23,8 @@ pub mod remote_bridge;
 pub mod stun;
 /// TLS 证书与连接工具。
 pub mod tls;
+/// 客户端自更新与控制通道的桥接接口。
+pub mod update_bridge;
 
 pub use error::*;
 pub use logging::*;
@@ -32,3 +34,4 @@ pub use pty::DEFAULT_PTY_PORT;
 pub use remote_bridge::*;
 pub use stun::*;
 pub use tls::*;
+pub use update_bridge::*;

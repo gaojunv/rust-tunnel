@@ -100,6 +100,12 @@ pub struct ClientEntry {
     /// 远程控制能力（被控开关/平台/显示器数/RustDesk ID）。临界区极短且无 await，
     /// 用 `std::sync::Mutex` 避免把读快照也染成 async。
     remote_caps: std::sync::Mutex<RemoteCaps>,
+    /// 客户端自更新传输是否进行中。
+    ///
+    /// 同一客户端同一时刻只允许一个传输（两条传输会交叉写入客户端的同一个临时
+    /// 文件），由 `control_plane::update::handle_update_request` 用
+    /// `compare_exchange` 抢占、推送任务结束时释放。
+    pub update_transfer_active: std::sync::atomic::AtomicBool,
 }
 
 impl ClientEntry {
@@ -222,6 +228,7 @@ impl ClientRegistry {
             active_connections: Mutex::new(HashMap::new()),
             agent_pending: Mutex::new(HashMap::new()),
             remote_caps: std::sync::Mutex::new(RemoteCaps::default()),
+            update_transfer_active: std::sync::atomic::AtomicBool::new(false),
         });
         self.entries
             .write()

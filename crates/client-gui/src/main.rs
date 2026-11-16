@@ -3,10 +3,7 @@
 #![allow(clippy::missing_docs_in_private_items, reason = "GUI 二进制")]
 // 单测豁免（与各 lib crate 的 `lib.rs` 头部一致）：restriction 组在测试里放宽。
 // 本 crate 是 bin，没有 lib.rs，故这行放在这里。
-#![cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 // Release 构建在 Windows 上隐藏控制台窗口（双击启动仅显示 GUI）
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -23,6 +20,7 @@ mod service_watch;
 mod tray;
 mod tray_worker;
 mod ui;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
@@ -31,7 +29,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use rust_tunnel_client::{ClientConfig, ClientStatus, LogBuffer, ReconnectPolicy};
-use rust_tunnel_remote::{ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig, SessionRole};
+use rust_tunnel_remote::{
+    ApprovalPolicy, EncodeOptions, RemoteManager, RemoteManagerConfig, SessionRole,
+};
 
 use service_watch::IdentityOwner;
 
@@ -71,6 +71,9 @@ struct GuiApp {
     last_pending_approval: Option<String>,
     /// 无人值守被控端的操作与状态（在途操作 / 最近结果 / 服务状态缓存），跨帧存活。
     service_ui: service_ui::ServiceOps,
+    /// 上一帧看到的「可用更新版本」。用于检测新版本首次出现时强制显示并聚焦窗口
+    /// （窗口可能已隐藏到托盘，更新提示不能只在后台）。
+    last_update_version: Option<String>,
 }
 
 impl GuiApp {
@@ -102,6 +105,7 @@ impl GuiApp {
             approval_remember: false,
             last_pending_approval: None,
             service_ui: service_ui::ServiceOps::default(),
+            last_update_version: None,
         }
     }
 
@@ -154,6 +158,42 @@ impl GuiApp {
                 ApprovalPolicy::Confirm => "需要确认",
             }
         );
+    }
+
+    /// 执行更新 UI 上的动作（弹窗与设置页共用）。
+    fn apply_update_action(&mut self, action: ui::update::UpdateAction, ctx: &egui::Context) {
+        match action {
+            ui::update::UpdateAction::Download => {
+                if let Err(e) = self.app_state.update.start_download() {
+                    self.app_state.update.fail(e);
+                }
+            }
+            ui::update::UpdateAction::Dismiss => self.app_state.update.dismiss(),
+            ui::update::UpdateAction::Skip(version) => {
+                tracing::info!("跳过客户端版本 {version}");
+                self.app_state.update.set_skipped(Some(version.clone()));
+                self.prefs.update_skipped_version = Some(version);
+                if let Err(e) = prefs::save(&self.prefs) {
+                    tracing::warn!("跳过版本偏好保存失败：{e}");
+                }
+                self.app_state.update.dismiss();
+            }
+            ui::update::UpdateAction::CancelSkip => {
+                self.app_state.update.set_skipped(None);
+                self.app_state.update.undismiss();
+                self.prefs.update_skipped_version = None;
+                if let Err(e) = prefs::save(&self.prefs) {
+                    tracing::warn!("取消跳过版本保存失败：{e}");
+                }
+            }
+            ui::update::UpdateAction::CheckNow => {
+                if let Err(e) = self.app_state.update.check_now() {
+                    self.app_state.update.fail(e);
+                }
+            }
+            ui::update::UpdateAction::ClearError => self.app_state.update.clear_error(),
+        }
+        ctx.request_repaint();
     }
 }
 
@@ -352,6 +392,10 @@ impl GuiApp {
 }
 
 impl eframe::App for GuiApp {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "每帧编排：托盘、远程会话、自更新、弹窗与重绘节奏都在这里收敛，拆分只会把共享状态再传一遍"
+    )]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.intercept_close(ctx) {
             return;
@@ -360,6 +404,27 @@ impl eframe::App for GuiApp {
         self.sync_allow_remote_from_tray();
         // 抽干服务操作的结果通道：一次 --install 要跑约二十秒，结果只能在后续帧里看到。
         self.service_ui.poll();
+
+        // 自更新：到点自动检查；已校验完成的包在这里执行替换并退出。
+        self.app_state
+            .update
+            .maybe_check(self.prefs.update_auto_check);
+        if let Some(staged) = self.app_state.update.take_staged() {
+            match update::apply_and_restart(&staged.path) {
+                Ok(()) => {
+                    tracing::info!(version = %staged.version, "更新包已就绪，正在重启应用");
+                    self.app_state
+                        .should_exit
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!("应用更新失败：{e}");
+                    self.app_state.update.fail(e);
+                }
+            }
+        }
 
         let status = self.app_state.status_rx.borrow().clone();
 
@@ -380,6 +445,23 @@ impl eframe::App for GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.last_pending_approval = pending_id;
+
+        // 可用更新首次出现：与接入确认同理，窗口可能已隐藏到托盘，更新提示不能被
+        // 静默错过。仅在版本变化时抢一次焦点，避免每帧与用户抢。
+        let update_snapshot = self.app_state.update.snapshot();
+        let offered_version = update_snapshot
+            .available
+            .as_ref()
+            .map(|available| available.version.clone());
+        if let Some(version) = offered_version.as_deref() {
+            let skipped = self.prefs.update_skipped_version.as_deref() == Some(version);
+            let first_time = self.last_update_version.as_deref() != Some(version);
+            if first_time && !skipped && !update_snapshot.dismissed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+        self.last_update_version = offered_version;
 
         // 远程会话的每帧收敛（父窗口负责，因为它必须每帧都跑，而子窗口回调只在窗口存在时才跑）：
         // 安装帧通道、开窗 / 关窗 / 断线重连、剪贴板同步、帧率结算。
@@ -402,6 +484,7 @@ impl eframe::App for GuiApp {
         }
 
         let mut remote_actions = ui::remote::RemoteTabActions::default();
+        let mut update_action: Option<ui::update::UpdateAction> = None;
         let settings = &mut self.settings;
         let service_ui = &mut self.service_ui;
         let remote_view = Arc::clone(&self.remote_view);
@@ -414,21 +497,42 @@ impl eframe::App for GuiApp {
                 0 => ui::status::show(ui, &status, app_state.service_owner()),
                 1 => ui::mappings::show(ui, &status),
                 2 => {
-                    remote_actions = ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
+                    remote_actions =
+                        ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
                 }
                 3 => {
-                    ui::settings::show(ui, settings, app_state);
-                    if ui::settings::show_remote_section(
-                        ui,
-                        &mut self.prefs,
-                        remote_manager.as_ref(),
-                    ) {
-                        if let Err(e) = prefs::save(&self.prefs) {
-                            tracing::warn!("GUI 偏好保存失败：{e}");
-                        }
-                    }
-                    // 「无人值守被控端」一节独立于 `show`（那已背着 too_many_lines 豁免）。
-                    ui::settings::show_service_section(ui, app_state, service_ui);
+                    // 设置页内容已超过窗口高度（尤其 Windows 的「无人值守被控端」风险说明
+                    // 很长），必须可滚动，否则新增的「软件更新」一节会被裁在窗口下方。
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui::settings::show(ui, settings, app_state);
+                            if ui::settings::show_remote_section(
+                                ui,
+                                &mut self.prefs,
+                                remote_manager.as_ref(),
+                            ) {
+                                if let Err(e) = prefs::save(&self.prefs) {
+                                    tracing::warn!("GUI 偏好保存失败：{e}");
+                                }
+                            }
+                            // 「无人值守被控端」一节独立于 `show`（那已背着 too_many_lines 豁免）。
+                            ui::settings::show_service_section(ui, app_state, service_ui);
+                            // 「软件更新」一节：当前版本 / 自动检查 / 手动检查 / 可用更新。
+                            let (prefs_changed, action) = ui::update::settings_section(
+                                ui,
+                                app_state.update.as_ref(),
+                                &mut self.prefs,
+                            );
+                            if prefs_changed {
+                                if let Err(e) = prefs::save(&self.prefs) {
+                                    tracing::warn!("GUI 偏好保存失败：{e}");
+                                }
+                            }
+                            if action.is_some() {
+                                update_action = action;
+                            }
+                        });
                 }
                 4 => ui::logs::show(ui, &app_state.log_buffer),
                 _ => {}
@@ -443,6 +547,15 @@ impl eframe::App for GuiApp {
         if let Some(on) = remote_actions.auto_lock_on_disconnect {
             self.apply_auto_lock_on_disconnect(on);
         }
+        // 更新弹窗与接入确认一样常驻所有 Tab 之上；设置页里的按钮优先于弹窗。
+        let modal_action = ui::update::modal(
+            ctx,
+            self.app_state.update.as_ref(),
+            self.prefs.update_skipped_version.as_deref(),
+        );
+        if let Some(action) = update_action.take().or(modal_action) {
+            self.apply_update_action(action, ctx);
+        }
         // 接入确认弹窗常驻所有 Tab 之上（与 `controlled_banner` 同理）。
         ui::remote::approval_modal(ctx, &mut self.approval_remember, remote_manager.as_ref());
 
@@ -455,8 +568,16 @@ impl eframe::App for GuiApp {
 
         // 服务操作在途时也要勤刷：结果要靠 `poll` 才被看到（在途期间按钮已禁用）。
         let service_busy = self.service_ui.in_flight().is_some();
-        let needs_repaint = !status.connected || status.last_error.is_some() || service_busy;
-        if needs_repaint {
+        let update_snapshot = self.app_state.update.snapshot();
+        let update_active = update_snapshot.download.is_some();
+        let needs_repaint = !status.connected
+            || status.last_error.is_some()
+            || service_busy
+            || update_active
+            || update_snapshot.available.is_some();
+        if update_active {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        } else if needs_repaint {
             ctx.request_repaint_after(Duration::from_millis(300));
         } else {
             ctx.request_repaint_after(Duration::from_millis(600));
@@ -608,6 +729,8 @@ fn spawn_runtime(
             tracing::info!("配置路径: {}", config_store::default_path().display());
         }
         rt.block_on(async move {
+            // 自更新桥接：控制通道读循环把 `ClientUpdate*` 交给它；GUI 侧从 AppState 读同一份。
+            let update_bridge = Arc::clone(&app_state.update);
             // 初始配置：优先 GUI 默认路径，其次 CLI env/TOML
             let mut config = if let Some(c) = config_store::load_from_default_path() {
                 c
@@ -663,7 +786,9 @@ fn spawn_runtime(
             // 会保留最后一次值，一次就够——每 2 秒 tick 都 send 只会白白刷屏。
             let mut passive = false;
             loop {
-                let owner = owner_rx.as_ref().map_or(IdentityOwner::Gui, |rx| *rx.borrow());
+                let owner = owner_rx
+                    .as_ref()
+                    .map_or(IdentityOwner::Gui, |rx| *rx.borrow());
                 if owner.is_service() {
                     if !passive {
                         publish_passive_status(&status_tx);
@@ -685,6 +810,7 @@ fn spawn_runtime(
                     Some(Arc::clone(&log_buffer)),
                     Some(Arc::clone(&reconnect_flag)),
                     Arc::clone(&remote_manager),
+                    Some(Arc::clone(&update_bridge)),
                     owner_rx.clone(),
                 )
                 .await
@@ -767,6 +893,7 @@ async fn run_client_loop(
     log_buffer: Option<Arc<LogBuffer>>,
     reconnect_flag: Option<Arc<AtomicBool>>,
     remote_manager: Arc<RemoteManager>,
+    update_bridge: Option<Arc<update::UpdateBridge>>,
     mut service_owner: Option<tokio::sync::watch::Receiver<IdentityOwner>>,
 ) -> LoopExit {
     let gui = status_tx.is_some();
@@ -777,6 +904,10 @@ async fn run_client_loop(
         let cfg = config.clone();
         // 控制通道读循环把远程变体交给引擎，上行经桥接回写同一条通道。
         let bridge = Some(remote_manager.bridge());
+        // 自更新桥接：重连时由控制循环热替换上行发送端；无头实例传 `None`。
+        let update: Option<Arc<dyn rust_tunnel_common::ClientUpdateBridge>> = update_bridge
+            .as_ref()
+            .map(|bridge| Arc::clone(bridge) as Arc<dyn rust_tunnel_common::ClientUpdateBridge>);
         // 连接期间与「服务接管」竞速：服务一起来就立刻让出，不等控制通道自己断。
         // 无 `service_owner`（非 Windows / 无头实例）时走原来的纯 await 路径。
         let mut yielded = false;
@@ -788,6 +919,7 @@ async fn run_client_loop(
                         status_tx.clone(),
                         log_buffer.clone(),
                         bridge,
+                        update.clone(),
                     ) => r,
                     () = wait_for_service_owner(rx) => {
                         yielded = true;
@@ -801,6 +933,7 @@ async fn run_client_loop(
                     status_tx.clone(),
                     log_buffer.clone(),
                     bridge,
+                    update,
                 )
                 .await
             }
@@ -867,8 +1000,8 @@ async fn run_client_loop(
             };
             if flag.load(std::sync::atomic::Ordering::SeqCst) {
                 flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                if let Some(c) = config_store::load_from_default_path()
-                    .or_else(|| ClientConfig::load().ok())
+                if let Some(c) =
+                    config_store::load_from_default_path().or_else(|| ClientConfig::load().ok())
                 {
                     // 钥匙串回填
                     let mut c2 = c;
@@ -896,6 +1029,9 @@ enum LaunchMode {
     Gui,
     /// 无头实例：SYSTEM 服务用 `CreateProcessAsUserW` 拉起（见 `--instance`）。
     Instance(instance::InstanceOptions),
+    /// 自更新收尾：等待旧进程退出后把当前 exe 复制到目标路径并重启
+    /// （Windows 专用；由 `update::apply_and_restart` 以内建参数拉起）。
+    ApplyUpdate(PathBuf),
 }
 
 /// 解析命令行。
@@ -924,24 +1060,30 @@ fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMo
     --share <dir>      被控端对外共享的目录。默认 %ProgramData%\\rust-tunnel\\share
     --download <dir>   控制端下载文件的落盘目录。默认 %ProgramData%\\rust-tunnel\\download
                        （三者也可用环境变量 RUST_TUNNEL_HOST_CONFIG / RUST_TUNNEL_SHARE_DIR /
-                       RUST_TUNNEL_DOWNLOAD_DIR 覆盖）";
+                       RUST_TUNNEL_DOWNLOAD_DIR 覆盖）
+
+  rust-tunnel-client-gui --apply-update <target>
+      自更新收尾（内部使用）：等待 target 被释放后复制当前 exe 过去并重启。
+      由新版客户端在替换 Windows 上正在运行的程序时自动拉起，不要手工调用。";
 
     let mut instance = false;
     let mut config_path: Option<PathBuf> = None;
     let mut share_dir: Option<PathBuf> = None;
     let mut download_dir: Option<PathBuf> = None;
+    let mut apply_update: Option<PathBuf> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--instance" => instance = true,
-            "--config" | "--share" | "--download" => {
+            "--config" | "--share" | "--download" | "--apply-update" => {
                 let Some(value) = iter.next() else {
                     return Err(format!("{arg} 需要一个路径参数\n\n{USAGE}"));
                 };
                 let slot = match arg.as_str() {
                     "--config" => &mut config_path,
                     "--share" => &mut share_dir,
+                    "--apply-update" => &mut apply_update,
                     _ => &mut download_dir,
                 };
                 *slot = Some(PathBuf::from(value));
@@ -950,6 +1092,14 @@ fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMo
         }
     }
 
+    if let Some(target) = apply_update {
+        if instance || config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
+            return Err(format!(
+                "--apply-update 是内部自更新模式，不能与其他参数一起用\n\n{USAGE}"
+            ));
+        }
+        return Ok(LaunchMode::ApplyUpdate(target));
+    }
     if instance {
         Ok(LaunchMode::Instance(instance::InstanceOptions::resolve(
             config_path,
@@ -1032,12 +1182,10 @@ fn log_startup_error(path: &std::path::Path, err: &anyhow::Error) {
 #[cfg(target_os = "windows")]
 fn show_startup_error_dialog(message: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-    let text: Vec<u16> = format!(
-        "{message}\n\n日志: %LOCALAPPDATA%\\rust-tunnel\\gui-startup.log"
-    )
-    .encode_utf16()
-    .chain(std::iter::once(0))
-    .collect();
+    let text: Vec<u16> = format!("{message}\n\n日志: %LOCALAPPDATA%\\rust-tunnel\\gui-startup.log")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let title: Vec<u16> = "Rust Tunnel 启动失败"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -1175,6 +1323,10 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // 走到托盘/eframe 就会起窗口（那是它明确不该做的事）。
     match parse_launch_mode(std::env::args().skip(1)) {
         Ok(LaunchMode::Instance(opts)) => return instance::run(&opts),
+        // 自更新收尾：无窗口、无桌面要求，必须在托盘/eframe 之前分派。
+        Ok(LaunchMode::ApplyUpdate(target)) => {
+            return update::run_apply_update(&target);
+        }
         Ok(LaunchMode::Gui) => {}
         Err(message) => {
             eprintln!("{message}");
@@ -1204,6 +1356,11 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // 偏好须在构建托盘与运行时之前加载：托盘的「允许被远程控制」勾选项要以持久化值为初态，
     // 且远程引擎的初始开关态取自该偏好（否则重启后菜单显示未勾选、而实际仍在被控状态）。
     let prefs = prefs::load();
+    // 「跳过此版本」镜像必须在**控制通道启动前**就位：托盘线程 50 ms 一轮，
+    // 可能在 `GuiApp` 构造前就看到服务端推送的可用更新。
+    app_state
+        .update
+        .set_skipped(prefs.update_skipped_version.clone());
 
     // 后台 tokio 运行时（控制通道/隧道 + 远程控制引擎）
     spawn_runtime(
@@ -1277,7 +1434,10 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             // `wgpu_render_state` 是「本次运行真的在 wgpu 上」的唯一判据：有它才能用 GPU
             // 着色器上屏，否则 NV12 走 CPU 回退。把目标格式记进启动日志，便于现场确认
             // sRGB/非 sRGB 选对了片元入口。
-            let wgpu_target_format = cc.wgpu_render_state.as_ref().map(|state| state.target_format);
+            let wgpu_target_format = cc
+                .wgpu_render_state
+                .as_ref()
+                .map(|state| state.target_format);
             if let Some(path) = startup_log.as_deref() {
                 if let Some(format) = wgpu_target_format {
                     append_startup_log(path, &format!("wgpu target format: {format:?}"));
@@ -1408,5 +1568,22 @@ mod tests {
             let err = parse_launch_mode(args(&[flag, "x"])).unwrap_err();
             assert!(err.contains("只能与 --instance 一起用"), "{flag}: {err}");
         }
+    }
+
+    /// 自更新收尾模式：只接受一个目标路径，且不能与其他模式混用。
+    #[test]
+    fn apply_update_mode_is_internal_and_exclusive() {
+        let target = r"C:\Program Files\rust-tunnel\rust-tunnel-client-gui.exe";
+        let parsed = parse_launch_mode(args(&["--apply-update", target])).unwrap();
+        let LaunchMode::ApplyUpdate(path) = parsed else {
+            panic!("应当是自更新模式");
+        };
+        assert_eq!(path, PathBuf::from(target));
+
+        // 缺目标路径
+        assert!(parse_launch_mode(args(&["--apply-update"])).is_err());
+        // 不能与实例模式混用
+        let err = parse_launch_mode(args(&["--instance", "--apply-update", target])).unwrap_err();
+        assert!(err.contains("不能与其他参数一起用"), "{err}");
     }
 }

@@ -145,13 +145,40 @@ fn run(bridge: &TrayBridge, app_state: &AppState) {
     // 只在「待确认请求首次出现」时抢焦点：用户拒绝/批准前可能反复出现，
     // 每 50 ms 把窗口弹一次会让人没法操作。
     let mut last_pending: Option<String> = None;
+    // 更新提示同理：只在某个新版本**首次出现**时把窗口叫回来。
+    let mut last_update: Option<String> = None;
     loop {
         for action in tray::poll_tray_actions() {
             handle(bridge, app_state, action);
         }
         poll_pending_approval(bridge, app_state, &mut last_pending);
+        poll_update_available(bridge, app_state, &mut last_update);
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// 窗口隐藏时 `update` 不跑，更新弹窗没人渲染。这里在**新版本首次出现**时把窗口
+/// 叫回来（用户点了「稍后」或「跳过此版本」则不再打扰）。
+fn poll_update_available(
+    bridge: &TrayBridge,
+    app_state: &AppState,
+    last_update: &mut Option<String>,
+) {
+    let snapshot = app_state.update.snapshot();
+    let offered = snapshot
+        .available
+        .as_ref()
+        .map(|available| available.version.clone());
+    if let Some(version) = offered.as_deref() {
+        let skipped = snapshot.skipped.as_deref() == Some(version);
+        if last_update.as_deref() != Some(version) && !skipped && !snapshot.dismissed {
+            tracing::info!("发现客户端新版本 {version}，显示主窗口");
+            // 设置页的「软件更新」一节在 Tab 3；弹窗仍常驻所有 Tab 之上。
+            bridge.set_tab(3);
+            bridge.show();
+        }
+    }
+    *last_update = offered;
 }
 
 /// 隐藏状态下 `update` 不跑：待确认请求没人渲染，超时后会静默拒绝。这里在它

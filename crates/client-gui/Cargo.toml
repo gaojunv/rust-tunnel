@@ -6,7 +6,9 @@ name = "rust-tunnel-client-gui"
 # （v5/v4 ↔ v6 在握手阶段被 `Hello.proto_version` 的硬相等校验干净拒绝）。
 # 0.13.1 = 仅 QoS 闭环修正（网络拥塞不再改分辨率），协议仍是 v6，与 0.13.0 可互通。
 # 0.14.0 = 数据面 v7（新增锁屏 `SessionMessage::LockScreen`），两端必须同为 0.14.0。
-version = "0.14.0"
+# 0.15.0 = 控制通道自更新（`ClientUpdate*` 变体）；服务端按 `MIN_UPDATE_CLIENT_VERSION`
+# 门控，旧客户端不会收到未知变体。数据面协议仍是 v7，可与 0.14.0 互控。
+version = "0.15.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -28,6 +30,8 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 自更新包的 SHA-256 校验（服务端从 SHA256SUMS 下发摘要，客户端校验通过才替换本机程序）。
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
