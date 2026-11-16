@@ -782,6 +782,36 @@ fn input_capture_target(
     }
 }
 
+/// 输入到达时是否把下一拍**提前**：只在 `target` 早于既定计划时才返回它。
+///
+/// `next_capture_at` 必须是**与 `Sleep` 同步**的最新计划时刻（见 [`schedule_capture`]）。
+/// 否则帧率下调后它会停在过去，`target < next_capture_at` 不成立，提前采集会被静默丢弃
+/// ——恰好是「空闲后 QoS 降到 15 fps，用户重新开始拖窗」这个最需要它的时刻。
+fn input_capture_pull(
+    now: Instant,
+    last_capture_at: Option<Instant>,
+    period: Duration,
+    next_capture_at: Instant,
+) -> Option<Instant> {
+    let target = input_capture_target(now, last_capture_at, period);
+    (target < next_capture_at).then_some(target)
+}
+
+/// 重排采集节拍：**`next_capture_at` 与 `Sleep` 必须同时更新**。
+///
+/// 固定相位推进（tick 分支）与输入提前采集都读 `next_capture_at`。只 reset `Sleep` 会
+/// 让两者不一致——例如 QoS 把帧率降到 15 后 `Sleep` 被推到 66 ms，而 `next_capture_at`
+/// 仍停在旧的 16 ms，下一次输入提前采集就会被 `target < next_capture_at` 静默丢弃，
+/// 第一帧仍要等满新周期。**所有**重排都必须走这里。
+fn schedule_capture(
+    capture_tick: &mut Pin<Box<Sleep>>,
+    next_capture_at: &mut Instant,
+    at: Instant,
+) {
+    *next_capture_at = at;
+    capture_tick.as_mut().reset(at);
+}
+
 /// 显示列表的**比较签名**：按 `id` 排序后的 `(id, width, height)`。
 ///
 /// 只取这三个字段：`name`/`primary` 变化不影响采集（GUI 列表刷新本身需要整份 `DisplayList`，
@@ -850,13 +880,18 @@ fn refresh_activity(
     encode: &mut EncodeRates,
     queues: &OutboundQueues,
     capture_tick: &mut Pin<Box<Sleep>>,
+    next_capture_at: &mut Instant,
     mode: ScreenMode,
     changed_permille: u16,
 ) {
     rate.promote_activity(changed_permille);
     let next = rate.current();
     if next.fps != encode.fps {
-        capture_tick.as_mut().reset(Instant::now() + capture_tick_period(mode, &next));
+        schedule_capture(
+            capture_tick,
+            next_capture_at,
+            Instant::now() + capture_tick_period(mode, &next),
+        );
     }
     *encode = next;
     // 面积驱动的升档会抬高生效码率：pacing 必须跟着走，否则大帧按旧码率摊开、比目标更快或更慢。
@@ -876,13 +911,16 @@ fn exit_patch_mode(
     force_encode: &mut bool,
     last_changed_permille: &mut u16,
     capture_tick: &mut Pin<Box<Sleep>>,
+    next_capture_at: &mut Instant,
 ) {
     mode.exit(std::time::Instant::now());
     *force_encode = true;
     // 面积未知/刚发生大变化：保守给满面积，别让下一次 1Hz 反馈拿补丁模式里的旧值
     // 把内容上限压回 UI 档（15 fps / 1.2 Mbps）。
     *last_changed_permille = 1000;
-    capture_tick.as_mut().reset(Instant::now());
+    // 立刻抓一帧，并把 `next_capture_at` 一起锚到现在；否则它仍停在未来，下一次输入
+    // 提前采集会因为 `target < next_capture_at` 反过来把这个「立刻」推迟。
+    schedule_capture(capture_tick, next_capture_at, Instant::now());
 }
 
 /// 一段已编码（压缩或原始）的横向条块，坐标是**目标帧缓冲**坐标系。
@@ -1873,14 +1911,13 @@ pub async fn run_controlled(
                         // 因为采集期间可能刚换过档位或进出过补丁模式。
                         if input_capture_pending {
                             input_capture_pending = false;
-                            let target = input_capture_target(
+                            if let Some(target) = input_capture_pull(
                                 Instant::now(),
                                 last_capture_tick,
                                 capture_tick_period(screen_mode.mode, &encode),
-                            );
-                            if target < next_capture_at {
-                                next_capture_at = target;
-                                capture_tick.as_mut().reset(target);
+                                next_capture_at,
+                            ) {
+                                schedule_capture(&mut capture_tick, &mut next_capture_at, target);
                             }
                         }
                         // 远端光标形状：**只在变化时**发一条控制帧。`None` 表示平台不支持/读不到，
@@ -1920,6 +1957,7 @@ pub async fn run_controlled(
                                         &mut encode,
                                         &queues,
                                         &mut capture_tick,
+                                        &mut next_capture_at,
                                         screen_mode.mode,
                                         last_changed_permille,
                                     );
@@ -2011,6 +2049,7 @@ pub async fn run_controlled(
                                             &mut force_encode,
                                             &mut last_changed_permille,
                                             &mut capture_tick,
+                                            &mut next_capture_at,
                                         );
                                         force_keyframe = true;
                                     } else if changed_permille > PATCH_EXIT_PERMILLE {
@@ -2021,6 +2060,7 @@ pub async fn run_controlled(
                                             &mut force_encode,
                                             &mut last_changed_permille,
                                             &mut capture_tick,
+                                            &mut next_capture_at,
                                         );
                                     } else if rect_count > MAX_REGION_RECTS {
                                         warn!(rects = rect_count, "脏矩形过多，退出补丁模式");
@@ -2029,6 +2069,7 @@ pub async fn run_controlled(
                                             &mut force_encode,
                                             &mut last_changed_permille,
                                             &mut capture_tick,
+                                            &mut next_capture_at,
                                         );
                                     } else {
                                         last_changed_permille = changed_permille;
@@ -2040,6 +2081,7 @@ pub async fn run_controlled(
                                             &mut encode,
                                             &queues,
                                             &mut capture_tick,
+                                            &mut next_capture_at,
                                             screen_mode.mode,
                                             last_changed_permille,
                                         );
@@ -2121,6 +2163,7 @@ pub async fn run_controlled(
                                                         &mut force_encode,
                                                         &mut last_changed_permille,
                                                         &mut capture_tick,
+                                                        &mut next_capture_at,
                                                     );
                                                     force_keyframe = true;
                                                 }
@@ -2135,6 +2178,7 @@ pub async fn run_controlled(
                                                     &mut force_encode,
                                                     &mut last_changed_permille,
                                                     &mut capture_tick,
+                                                    &mut next_capture_at,
                                                 );
                                             }
                                         } else {
@@ -2149,6 +2193,7 @@ pub async fn run_controlled(
                                                 &mut force_encode,
                                                 &mut last_changed_permille,
                                                 &mut capture_tick,
+                                                &mut next_capture_at,
                                             );
                                         }
                                     }
@@ -2161,6 +2206,7 @@ pub async fn run_controlled(
                                         &mut force_encode,
                                         &mut last_changed_permille,
                                         &mut capture_tick,
+                                        &mut next_capture_at,
                                     );
                                 }
                             }
@@ -2181,14 +2227,13 @@ pub async fn run_controlled(
                 // 让交互延迟多等一个周期。
                 if input_capture_pending {
                     input_capture_pending = false;
-                    let target = input_capture_target(
+                    if let Some(target) = input_capture_pull(
                         Instant::now(),
                         last_capture_tick,
                         capture_tick_period(screen_mode.mode, &encode),
-                    );
-                    if target < next_capture_at {
-                        next_capture_at = target;
-                        capture_tick.as_mut().reset(target);
+                        next_capture_at,
+                    ) {
+                        schedule_capture(&mut capture_tick, &mut next_capture_at, target);
                     }
                 }
                 capture_timeouts = capture_timeouts.saturating_add(1);
@@ -2227,7 +2272,8 @@ pub async fn run_controlled(
                 if next_capture_at <= tick_now {
                     next_capture_at = tick_now + period;
                 }
-                capture_tick.as_mut().reset(next_capture_at);
+                let scheduled = next_capture_at;
+                schedule_capture(&mut capture_tick, &mut next_capture_at, scheduled);
                 // 串行采集：上一次还没回来就跳过本轮，避免把阻塞线程池堆满。
                 if capture_deadline.is_none() {
                     capture_request_us = Some(crate::clock::now_us());
@@ -2303,7 +2349,11 @@ pub async fn run_controlled(
                             // 几何/来源都变了：补丁模式的持久缓冲与编码器尺寸都要重建。
                             screen_mode.exit(std::time::Instant::now());
                             force_keyframe = true;
-                            capture_tick.as_mut().reset(Instant::now());
+                            schedule_capture(
+                                &mut capture_tick,
+                                &mut next_capture_at,
+                                Instant::now(),
+                            );
                         }
                         // 当前显示器还在但分辨率变了：同上（控制器那块合成帧已作废）。
                         (Some(old), Some(new))
@@ -2315,7 +2365,11 @@ pub async fn run_controlled(
                             );
                             screen_mode.exit(std::time::Instant::now());
                             force_keyframe = true;
-                            capture_tick.as_mut().reset(Instant::now());
+                            schedule_capture(
+                                &mut capture_tick,
+                                &mut next_capture_at,
+                                Instant::now(),
+                            );
                         }
                         // 其它变化（拔插了别的显示器、primary 变了）：列表已刷新，当前采集目标
                         // 不受影响，参考链与几何都没变，**不**插 IDR。
@@ -2382,17 +2436,20 @@ pub async fn run_controlled(
                             // 纯鼠标移动本身不进画面（采集帧不含光标，控制端用本机光标），
                             // 但它会触发悬停效果、拖动窗口、滚动条等——照样要立刻采一拍照。
                             if capture {
-                                let target = input_capture_target(
-                                    Instant::now(),
-                                    last_capture_tick,
-                                    capture_tick_period(screen_mode.mode, &encode),
-                                );
                                 if capture_deadline.is_some() {
                                     // 采集在途：等结果回来时立刻补拍（见 capture_rx 分支）。
                                     input_capture_pending = true;
-                                } else if target < next_capture_at {
-                                    next_capture_at = target;
-                                    capture_tick.as_mut().reset(target);
+                                } else if let Some(target) = input_capture_pull(
+                                    Instant::now(),
+                                    last_capture_tick,
+                                    capture_tick_period(screen_mode.mode, &encode),
+                                    next_capture_at,
+                                ) {
+                                    schedule_capture(
+                                        &mut capture_tick,
+                                        &mut next_capture_at,
+                                        target,
+                                    );
                                 }
                             }
                         }
@@ -2415,7 +2472,8 @@ pub async fn run_controlled(
                                 // 持久帧缓冲的尺寸已经不对了。
                                 screen_mode.exit(std::time::Instant::now());
                                 force_keyframe = true;
-                                capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
+                                let at = Instant::now() + encode.capture_interval();
+                                schedule_capture(&mut capture_tick, &mut next_capture_at, at);
                             } else {
                                 // `display` 会与 `tracing::display` 撞名，故用 target 命名。
                                 warn!(target, "控制器请求了不存在的显示器");
@@ -2438,7 +2496,8 @@ pub async fn run_controlled(
                             // 档位可能改缩放 → 几何可能变化：补丁模式的持久缓冲尺寸随之作废，
                             // 必须退出（并靠下面的 `force_keyframe` 重发基准）。
                             screen_mode.exit(std::time::Instant::now());
-                            capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
+                            let at = Instant::now() + encode.capture_interval();
+                            schedule_capture(&mut capture_tick, &mut next_capture_at, at);
                             force_keyframe = true;
                         }
                         SessionMessage::SetFrameRate { fps } => {
@@ -2448,8 +2507,8 @@ pub async fn run_controlled(
                             encode = rate.current();
                             queues.set_screen_pacing_kbps(encode.bitrate_kbps);
                             // 补丁模式可以留着（帧率只影响空补丁的保活节拍），但节拍要按新值重排。
-                            capture_tick.as_mut()
-                                .reset(Instant::now() + capture_tick_period(screen_mode.mode, &encode));
+                            let at = Instant::now() + capture_tick_period(screen_mode.mode, &encode);
+                            schedule_capture(&mut capture_tick, &mut next_capture_at, at);
                             // **不置 `force_keyframe`**：纯帧率变化只动采集节拍与编码器的在线 fps，
                             // 参考链不变；插 IDR 会多一个带宽尖峰（阶段 2/3 一直在避免的）。
                             // `SetQuality` 需要关键帧是因为它可能改变编码分辨率（几何变化）。
@@ -2497,7 +2556,8 @@ pub async fn run_controlled(
                             );
                             if decision.rates.fps != encode.fps {
                                 // 帧率变了：采集节拍要立刻跟着变（与 `SetQuality` 同款）。
-                                capture_tick.as_mut().reset(Instant::now() + decision.rates.capture_interval());
+                                let at = Instant::now() + decision.rates.capture_interval();
+                                schedule_capture(&mut capture_tick, &mut next_capture_at, at);
                             }
                             encode = decision.rates;
                             queues.set_screen_pacing_kbps(encode.bitrate_kbps);
@@ -2551,6 +2611,7 @@ pub async fn run_controlled(
                                     &mut force_encode,
                                     &mut last_changed_permille,
                                     &mut capture_tick,
+                                    &mut next_capture_at,
                                 );
                             }
                             // 「请求了就一定 IDR」（仅限请求的就是当前显示器）：这是控制器明确
@@ -6164,6 +6225,32 @@ mod tests {
             input_capture_target(now + Duration::from_millis(20), Some(last), period),
             now + Duration::from_millis(20),
             "已超过半个周期 → 立刻采，不把目标时刻推到过去"
+        );
+    }
+
+    /// 帧率被下调后，`next_capture_at` 必须与 `Sleep` 一起重排，否则输入提前采集会被丢弃。
+    ///
+    /// 复现修复前的失败序列：上一拍 T，30 fps 时计划时刻 T+16 ms；QoS 把帧率降到 15
+    /// 并把下一拍重排到 T+16+66 ms。若计划时刻仍是陈旧的 T+16，输入到达时 `target`
+    /// （T+33）不早于它，提前采集被静默丢弃；同步之后才成立。
+    #[test]
+    fn input_pull_requires_a_synchronized_capture_deadline() {
+        let t0 = tokio::time::Instant::now();
+        let period = Duration::from_millis(66);
+        let last = t0;
+        let now = t0 + Duration::from_millis(17);
+        // 同一时刻、同一输入：陈旧的计划时刻让提前采集失效。
+        assert_eq!(
+            input_capture_pull(now, Some(last), period, t0 + Duration::from_millis(16)),
+            None,
+            "陈旧的 next_capture_at 会让提前采集被静默丢弃"
+        );
+        // `schedule_capture` 同步之后（T+16 重排到 T+16+66），提前采集正常生效。
+        let scheduled = t0 + Duration::from_millis(16) + period;
+        assert_eq!(
+            input_capture_pull(now, Some(last), period, scheduled),
+            Some(t0 + Duration::from_millis(33)),
+            "同步后应提前到上一拍后半个周期"
         );
     }
 
