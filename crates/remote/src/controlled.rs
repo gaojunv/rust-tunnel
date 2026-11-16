@@ -43,7 +43,8 @@
 //! 主循环持有 [`RateController`]（AIMD）：每收到一条控制器的 `QosFeedback` 就决策一次，把新的
 //! **生效值**（[`EncodeRates`]）交给下一次编码任务。码率/帧率变化由编码任务**在线重配置**
 //! （vendor 补丁 6），**不重建、不插 IDR**；只有降编码分辨率（几何变化）才重建 + 强制 IDR。
-//! 详见 [`crate::qos`] 的模块文档。
+//! 变化面积**逐帧**喂给 [`RateController::promote_activity`]（只升档，用户一开始操作就放量），
+//! 降档仍由每秒反馈的 `observe_activity` 按迟滞处理。详见 [`crate::qos`] 的模块文档。
 //!
 //! # 编解码协商（阶段 5）
 //!
@@ -61,13 +62,18 @@
 //! 不再走编码器，而是把脏矩形的紧包 NV12（zstd level 1 压缩，压不下去就存原始）装进
 //! [`SessionMessage::RegionUpdate`] 直接发出。控制器维护一块持久 NV12 帧缓冲，逐块覆写。
 //!
-//! 三条硬约束：
-//! - **顺序**：补丁必须排在那块全帧基准**之后**。进入模式前先强制一个基准 IDR，且只在该 IDR
-//!   **真正投进出站队列**（编码任务回报 `base_frame_sent`）之后才切模式；两者走**同一条画面
-//!   队列**（`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::enqueue_screen`]
+//! 四条硬约束：
+//! - **顺序**：补丁必须排在那块全帧基准**之后**。进入模式前先让一帧基准全帧**真正投进出站
+//!   队列**（编码任务回报 `base_frame_sent`）之后才切模式；两者走**同一条画面队列**
+//!   （`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::enqueue_screen`]
 //!   （可取消地等、绝不丢弃）。
-//! - **退出即全帧**：任何让参考/几何失效的事件（`RequestKeyframe` / `SelectDisplay` /
-//!   `SetQuality`、补丁采集失败、活跃度过高、矩形过多/过大）都立刻回到全帧并强制 IDR。
+//! - **进/出补丁模式都用 P 帧**：补丁只改控制器侧的合成帧缓冲，**不碰 H.264 参考链**
+//!   （补丁模式期间编码器根本不编码），所以基准帧与退出后的第一帧都只需一帧普通 P 帧。
+//!   只有真正让参考链/几何失效的事件才 IDR：会话首帧、`RequestKeyframe`、`SelectDisplay` /
+//!   `SetQuality`、显示器分辨率变化、QoS 降分辨率、编码器重建。无条件插 IDR 会让每次切窗口/
+//!   开文件夹都付出一个 150–400 KB 的带宽尖峰。
+//! - **退出即全帧**：补丁采集失败、活跃度过高、矩形过多/过大等只回到全帧并**立刻抓帧**
+//!   （不插 IDR）；几何真的变了（显示器/缩放）才连带强制 IDR。
 //! - **QoS 闭环在补丁模式下暂停**：控制器此时不解码视频，`decode_ms`/`recv_kbps` 是陈旧值，
 //!   喂给 AIMD 只会制造假拥塞。回到全帧后的下一条 `QosFeedback` 自然恢复闭环。
 
@@ -400,7 +406,7 @@ pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_millis(250);
 /// 进入补丁模式的**变化面积**门槛（千分比，3%）：低于它才算「安静」。
 ///
 /// 与 [`PATCH_EXIT_PERMILLE`] 分开是**迟滞**：进入要求连续多次低活跃，退出只要一次高活跃。
-/// 共用同一个值会在门槛附近来回抖，每次抖动都要一次基准 IDR（带宽尖峰），正好抵消补丁的收益。
+/// 共用同一个值会在门槛附近来回抖，每次抖动都要多一次全帧基准帧往返，正好抵消补丁的收益。
 const PATCH_ENTER_PERMILLE: u16 = 30;
 
 /// 退出补丁模式的**变化面积**门槛（千分比，8%）：超过它立刻回到全帧。
@@ -414,11 +420,13 @@ const PATCH_ENTER_TICKS: u32 = 3;
 /// 控制器侧有「长时间无帧」看门狗；补丁模式下没有视频帧，空 `RegionUpdate` 就是它的心跳。
 const PATCH_KEEPALIVE: Duration = Duration::from_millis(250);
 
-/// 补丁模式的最大采集间隔（≈15 fps）。
+/// 补丁模式的**固定**采集间隔（30 fps）。
 ///
-/// 补丁本身很小（几 KB），帧率没必要跟着画质档位到 30/60：静桌面上的小变化以 15 fps 呈现
-/// 已经足够跟手，再快只是重复发送「没有变化」。
-const PATCH_MAX_INTERVAL: Duration = Duration::from_millis(66);
+/// 补丁本身很小（几 KB），带宽由 [`PatchMode::admit_patch_bytes`] 的窗口兜底，所以帧率不必
+/// 跟着视频档位走。反过来，**不能**取 `max(生效帧率间隔, 33ms)`：进入补丁模式时内容上限通常
+/// 已经收紧到 UI 档（15 fps → 66 ms），取 max 仍是 66 ms，补丁节拍与「用户操作 → 检测到大
+/// 变化 → 退出补丁模式」的延迟都会被拖慢一倍，而这正是本模式要消除的顿挫。
+const PATCH_MAX_INTERVAL: Duration = Duration::from_millis(33);
 
 /// 脏矩形 NV12 的 zstd 压缩级别。
 ///
@@ -428,8 +436,8 @@ const PATCH_ZSTD_LEVEL: i32 = 1;
 /// 单条 `RegionUpdate` 压缩后**总字节**上限（64 KiB）。
 ///
 /// 超过它说明脏矩形过多/过大，补丁已经不比全帧划算，且会给控制端的解压/合成带来尖峰——
-/// 直接回全帧并强制 IDR。普通 UI 变化（一行文本/一个菜单）压缩后只有几 KB 到几十 KB；
-/// 64 KiB 已经是很宽松的单批上限。
+/// 直接回全帧（参考链没断，第一帧 P 帧即可）。普通 UI 变化（一行文本/一个菜单）压缩后只有
+/// 几 KB 到几十 KB；64 KiB 已经是很宽松的单批上限。
 const PATCH_MAX_TOTAL_BYTES: usize = 64 * 1024;
 
 /// 补丁出码的**窗口长度**（带宽保护）。
@@ -452,7 +460,7 @@ const PATCH_MIN_BUDGET_KBPS: u32 = 500;
 /// 兜底就形同虚设。2 Mbps 对「UI 小面积变化」足够宽裕，超过它就说明该走全帧了。
 const PATCH_MAX_BUDGET_KBPS: u32 = 2000;
 
-/// 等基准 IDR 真正写出的上限。
+/// 等基准帧真正写出的上限。
 ///
 /// 出站队列被背压卡住时基准帧可能迟迟发不出去；不能无限等（否则画面在补丁模式入口处停住）。
 /// 超时就放弃本次进入，留在全帧视频路径，下次连续安静再试。
@@ -476,9 +484,9 @@ struct PatchMode {
     mode: ScreenMode,
     /// 连续「低活跃采集」的次数。
     enter_streak: u32,
-    /// 已请求基准关键帧、正在等它真正写出。
+    /// 已请求基准帧、正在等它真正写出。
     enter_pending: bool,
-    /// 等待基准关键帧的截止时刻。
+    /// 等待基准帧的截止时刻。
     enter_deadline: Option<std::time::Instant>,
     /// 上一次真正发出 `RegionUpdate` 的时刻（空补丁保活用）。
     last_patch_sent: Option<std::time::Instant>,
@@ -536,8 +544,8 @@ impl PatchMode {
 
     /// 用一次**视频**采集的变化面积推进进入判据。
     ///
-    /// 返回 `true` 表示本帧必须作为**基准 IDR**：调用方据此置 `force_keyframe` 并清
-    /// `base_frame_sent`（见模块文档的「顺序」约束）。
+    /// 返回 `true` 表示本帧必须作为**基准全帧**：调用方据此置 `force_encode`（只需 P 帧，
+    /// 补丁不碰参考链）并清 `base_frame_sent`（见模块文档的「顺序」约束）。
     fn observe_video(&mut self, changed_permille: u16, now: std::time::Instant) -> bool {
         // 已经在等基准帧：不重复触发（否则每帧都会重置截止时刻）。
         if self.enter_pending {
@@ -591,11 +599,14 @@ impl PatchMode {
     }
 }
 
-/// 当前模式下的采集节拍：补丁模式吃 [`PATCH_MAX_INTERVAL`] 的地板。
+/// 当前模式下的采集节拍。
+///
+/// 视频路径跟随生效帧率；补丁路径**固定** [`PATCH_MAX_INTERVAL`]——补丁很小，带宽由
+/// `admit_patch_bytes` 兜底，不该被视频侧的内容上限（UI 档 15 fps）拖慢进入/退出判据的检测。
 fn capture_tick_period(mode: ScreenMode, encode: &EncodeRates) -> Duration {
     match mode {
         ScreenMode::Video => encode.capture_interval(),
-        ScreenMode::Patches => encode.capture_interval().max(PATCH_MAX_INTERVAL),
+        ScreenMode::Patches => PATCH_MAX_INTERVAL,
     }
 }
 
@@ -658,16 +669,42 @@ fn session_encode_options(options: EncodeOptions, native_active: bool) -> Encode
     }
 }
 
-/// 退出补丁模式：回到全帧视频、强制关键帧，并让采集节拍重新对齐到视频档位。
+/// 把逐帧变化面积喂给内容上限，并在帧率变化时立刻重排采集节拍。
+///
+/// 升档必须赶在**本帧**编码之前生效：调用方在更新 `last_changed_permille` 之后、构造
+/// [`EncodeJob`] 之前调用本函数。
+fn refresh_activity(
+    rate: &mut RateController,
+    encode: &mut EncodeRates,
+    capture_tick: &mut Pin<Box<Sleep>>,
+    mode: ScreenMode,
+    changed_permille: u16,
+) {
+    rate.promote_activity(changed_permille);
+    let next = rate.current();
+    if next.fps != encode.fps {
+        capture_tick.as_mut().reset(Instant::now() + capture_tick_period(mode, &next));
+    }
+    *encode = next;
+}
+
+/// 退出补丁模式：回到全帧视频，并让采集节拍**立刻**到期（先把用户操作的那一帧抓上来）。
+///
+/// **不在这里强制关键帧**：补丁不碰参考链，退出后的第一帧 P 帧就能被正确解码。
+/// 调用方只在参考链/几何真的失效时（`RequestKeyframe`、切显示器、改缩放）额外置
+/// `force_keyframe`。无条件插 IDR 会让每次切窗口/开文件夹都付出一个 150–400 KB 的尖峰。
 fn exit_patch_mode(
     mode: &mut PatchMode,
-    force_keyframe: &mut bool,
+    force_encode: &mut bool,
+    last_changed_permille: &mut u16,
     capture_tick: &mut Pin<Box<Sleep>>,
-    interval: Duration,
 ) {
     mode.exit();
-    *force_keyframe = true;
-    capture_tick.as_mut().reset(Instant::now() + interval);
+    *force_encode = true;
+    // 面积未知/刚发生大变化：保守给满面积，别让下一次 1Hz 反馈拿补丁模式里的旧值
+    // 把内容上限压回 UI 档（15 fps / 1.2 Mbps）。
+    *last_changed_permille = 1000;
+    capture_tick.as_mut().reset(Instant::now());
 }
 
 /// 把一批采集到的脏矩形装成一条 `RegionUpdate`。
@@ -1024,8 +1061,9 @@ pub async fn run_controlled(
     // `sent_kbps` 是编码任务每秒写入的**实际出码速率**（按窗口字节数算），由 QoS 闭环与控制器
     // 回报的 `recv_kbps` 相比得出投递率。它只在进程内传递，**不进** `QosFeedback`（线上字段不变）。
     let sent_kbps = Arc::new(AtomicU32::new(0));
-    // 补丁模式的「基准全帧已写出」信号：由编码任务在关键帧**投进出站队列之后**置位，
-    // 会话循环只在看到它之后才切补丁模式（顺序不变量，见模块文档）。
+    // 补丁模式的「基准全帧已写出」信号：由编码任务在该帧**投进出站队列之后**置位，
+    // 会话循环只在看到它之后才切补丁模式（顺序不变量，见模块文档）。基准帧是 P 帧，
+    // 所以信号不能只看 `keyframe`（见 [`encode_loop`]）。
     let base_frame_sent = Arc::new(AtomicBool::new(false));
     let (encode_tx, encode_rx) = mpsc::channel::<EncodeJob>(1);
     let encode_task = tokio::spawn(encode_loop(
@@ -1113,10 +1151,14 @@ pub async fn run_controlled(
     let mut capture_timeouts: u32 = 0;
     // 首帧（或切显示器/切档位/收到 RequestKeyframe 之后）必须先发关键帧：解码侧要有可重建的参考。
     let mut force_keyframe = true;
+    // 「必须真正编码一帧」与「必须是 IDR」是两件事：补丁模式的基准帧、退出补丁模式后的第一帧
+    // 都只需 P 帧（参考链没断），但不能被「无变化就跳过」的闸门吞掉。
+    let mut force_encode = false;
     // 脏矩形补丁模式的状态机（见模块文档）。`patch_capable == false` 时它永远停在 `Video`。
     let mut screen_mode = PatchMode::new();
-    // 最近一帧采集报告的**变化面积**（千分比），供 `QosFeedback` 里的内容自适应使用
-    // （`RateController::observe_activity`）。初值 1000 = 面积未知/满帧，保守地不收紧上限。
+    // 最近一帧采集报告的**变化面积**（千分比）：逐帧喂 `RateController::promote_activity`
+    // （升档立刻生效），每秒再随 `QosFeedback` 喂 `observe_activity`（带迟滞的降档）。
+    // 初值 1000 = 面积未知/满帧，保守地不收紧上限。
     let mut last_changed_permille: u16 = 1000;
     // 控制器显式选择的帧率上限（30 / 60）。`None` = 尚未下发，沿用画质档位默认。
     // 记住它是为了「换画质档位不覆盖用户选择」：`SetQuality` 换完档位后要重新应用它。
@@ -1181,12 +1223,21 @@ pub async fn run_controlled(
                                 if let Some(frame) = frame {
                                     debug!(capture_us, "采集一帧");
                                     last_changed_permille = frame.changed_permille;
+                                    // 逐帧升档：用户一开始拖窗/切窗口就放量，不等下一次 1 Hz 反馈
+                                    // （那正是「一开始操作先顿一下」的根因）。
+                                    refresh_activity(
+                                        &mut rate,
+                                        &mut encode,
+                                        &mut capture_tick,
+                                        screen_mode.mode,
+                                        last_changed_permille,
+                                    );
                                     // 进入判据只喂**视频**采集：连续多次低活跃才值得付补丁模式的
-                                    // 固定开销。命中时本帧必须充当**基准 IDR**（见模块文档的顺序约束）。
+                                    // 固定开销。命中时本帧必须充当**基准全帧**（见模块文档的顺序约束）。
                                     //
                                     // 必须排除已在补丁模式的情况：切换瞬间可能还有一次在途的
                                     // 视频采集结果，不排除的话它会把计数攒到阈值、在补丁模式里
-                                    // 又发一次强制 IDR。
+                                    // 又发一次强制全帧。
                                     if patch_capable
                                         && !screen_mode.is_patches()
                                         && screen_mode.observe_video(
@@ -1194,14 +1245,26 @@ pub async fn run_controlled(
                                             std::time::Instant::now(),
                                         )
                                     {
-                                        force_keyframe = true;
+                                        // 基准帧只需 P 帧：补丁不碰 H.264 参考链，编码器/解码器的
+                                        // 参考仍是上一全帧。
+                                        force_encode = true;
                                         base_frame_sent.store(false, Ordering::Relaxed);
                                     }
-                                    let job = EncodeJob { display: display_id, rates: encode, force_keyframe, capture_us, frame };
+                                    let job = EncodeJob {
+                                        display: display_id,
+                                        rates: encode,
+                                        force_keyframe,
+                                        force_encode,
+                                        capture_us,
+                                        frame,
+                                    };
                                     // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
-                                    // 帧（等价降帧率）。关键帧请求保留到真正投递成功的那一次。
+                                    // 帧（等价降帧率）。关键帧/强制编码请求保留到真正投递成功的那一次。
                                     match encode_tx.try_send(job) {
-                                        Ok(()) => force_keyframe = false,
+                                        Ok(()) => {
+                                            force_keyframe = false;
+                                            force_encode = false;
+                                        }
                                         Err(mpsc::error::TrySendError::Full(_)) => {
                                             debug!("编码队列已满，跳过本轮采集（编码前丢帧，不破坏参考链）");
                                         }
@@ -1236,33 +1299,47 @@ pub async fn run_controlled(
                                             want_h,
                                             "补丁尺寸与编码尺寸不符，回到全帧"
                                         );
+                                        // 尺寸不符 = 几何变化：参考链与控制器合成缓冲都作废，
+                                        // 退出后必须重发 IDR。
                                         exit_patch_mode(
                                             &mut screen_mode,
-                                            &mut force_keyframe,
+                                            &mut force_encode,
+                                            &mut last_changed_permille,
                                             &mut capture_tick,
-                                            encode.capture_interval(),
                                         );
+                                        force_keyframe = true;
                                     } else if patches.changed_permille > PATCH_EXIT_PERMILLE {
                                         debug!(
                                             changed_permille = patches.changed_permille,
                                             "画面活跃度回升，退出补丁模式"
                                         );
+                                        // 只是画面变忙：参考链完好，退出后的第一帧 P 帧即可。
                                         exit_patch_mode(
                                             &mut screen_mode,
-                                            &mut force_keyframe,
+                                            &mut force_encode,
+                                            &mut last_changed_permille,
                                             &mut capture_tick,
-                                            encode.capture_interval(),
                                         );
                                     } else if patches.rects.len() > MAX_REGION_RECTS {
                                         warn!(rects = patches.rects.len(), "脏矩形过多，退出补丁模式");
                                         exit_patch_mode(
                                             &mut screen_mode,
-                                            &mut force_keyframe,
+                                            &mut force_encode,
+                                            &mut last_changed_permille,
                                             &mut capture_tick,
-                                            encode.capture_interval(),
                                         );
                                     } else {
                                         last_changed_permille = patches.changed_permille;
+                                        // 补丁模式下 QoS 闭环暂停，但逐帧升档仍然有效：只要补丁
+                                        // 报告的面积跨过 Mixed/Active 边界，退出后的全帧帧率就
+                                        // 已经放开（降档仍归 1 Hz 反馈的迟滞）。
+                                        refresh_activity(
+                                            &mut rate,
+                                            &mut encode,
+                                            &mut capture_tick,
+                                            screen_mode.mode,
+                                            last_changed_permille,
+                                        );
                                         // 空矩形 = 本拍没有变化：只在保活间隔到点时发一条空
                                         // `RegionUpdate`（控制器侧的「长时间无帧」看门狗靠它）。
                                         let keepalive_due = screen_mode
@@ -1314,9 +1391,9 @@ pub async fn run_controlled(
                                                     );
                                                     exit_patch_mode(
                                                         &mut screen_mode,
-                                                        &mut force_keyframe,
+                                                        &mut force_encode,
+                                                        &mut last_changed_permille,
                                                         &mut capture_tick,
-                                                        encode.capture_interval(),
                                                     );
                                                 }
                                             } else {
@@ -1327,22 +1404,22 @@ pub async fn run_controlled(
                                                 );
                                                 exit_patch_mode(
                                                     &mut screen_mode,
-                                                    &mut force_keyframe,
+                                                    &mut force_encode,
+                                                    &mut last_changed_permille,
                                                     &mut capture_tick,
-                                                    encode.capture_interval(),
                                                 );
                                             }
                                         }
                                     }
                                 } else {
                                     // 补丁采集返回 None：本拍不适合补丁（活跃度/矩形数超限、
-                                    // 检测不可用……），立刻回全帧并强制 IDR。
+                                    // 检测不可用……），立刻回全帧。参考链没断，第一帧 P 帧即可。
                                     debug!("补丁采集未产出补丁，返回全帧视频");
                                     exit_patch_mode(
                                         &mut screen_mode,
-                                        &mut force_keyframe,
+                                        &mut force_encode,
+                                        &mut last_changed_permille,
                                         &mut capture_tick,
-                                        encode.capture_interval(),
                                     );
                                 }
                             }
@@ -1367,13 +1444,13 @@ pub async fn run_controlled(
                 warn!(count = capture_timeouts, "在途采集超过看门狗时限，判定已丢失");
             }
             () = &mut capture_tick, if capture => {
-                // 进入判据：基准关键帧**真正写出**之后才切模式（顺序不变量，见模块文档）。
+                // 进入判据：基准帧**真正写出**之后才切模式（顺序不变量，见模块文档）。
                 match screen_mode.poll_entry(
                     base_frame_sent.load(Ordering::Relaxed),
                     std::time::Instant::now(),
                 ) {
                     Some(true) => info!("进入脏矩形补丁模式"),
-                    Some(false) => debug!("等待基准关键帧超时，放弃进入补丁模式"),
+                    Some(false) => debug!("等待基准帧超时，放弃进入补丁模式"),
                     None => {}
                 }
                 capture_tick.as_mut().reset(
@@ -1584,7 +1661,8 @@ pub async fn run_controlled(
                             // `force_keyframe`（几何变化，见 [`crate::qos`]）。
                             //
                             // 先喂**本端**的变化面积：它只收紧/放开生效值上限，不改 AIMD 状态、
-                            // 不置关键帧（见 `RateController::observe_activity`）。
+                            // 不置关键帧（见 `RateController::observe_activity`）。升档已由每帧的
+                            // `promote_activity` 抢先完成，这里主要负责**带迟滞的降档**。
                             rate.observe_activity(last_changed_permille);
                             let local_backlog =
                                 u32::try_from(queues.screen_backlog()).unwrap_or(u32::MAX);
@@ -1645,11 +1723,13 @@ pub async fn run_controlled(
                             if screen_mode.is_patches() {
                                 exit_patch_mode(
                                     &mut screen_mode,
-                                    &mut force_keyframe,
+                                    &mut force_encode,
+                                    &mut last_changed_permille,
                                     &mut capture_tick,
-                                    encode.capture_interval(),
                                 );
                             }
+                            // 「请求了就一定 IDR」（仅限请求的就是当前显示器）：这是控制器明确
+                            // 报告参考帧不可信，与补丁模式自己退出时的 P 帧语义不同。
                             if display == display_id {
                                 force_keyframe = true;
                             }
@@ -1912,16 +1992,20 @@ struct CaptureOutcome {
 
 /// 交给编码任务的一帧。
 ///
-/// `display`/`rates`/`force_keyframe` 由会话循环带上：编码任务据此判断是否需要**重建**编码器
-/// （只有几何变化才重建）与是否强制关键帧（首帧、切显示器、切档位、`RequestKeyframe`、降分辨率）。
+/// `display`/`rates`/`force_keyframe`/`force_encode` 由会话循环带上：编码任务据此判断是否
+/// 需要**重建**编码器（只有几何变化才重建）、是否强制关键帧（首帧、切显示器、切档位、
+/// `RequestKeyframe`、降分辨率）以及是否只需**真正编码一次**（补丁模式的基准/退出帧，P 帧即可）。
 /// **码率/帧率不触发重建**——它们在编码任务里在线重配置（见 [`encode_loop`]）。
 struct EncodeJob {
     /// 来源显示器编号。
     display: u32,
     /// 当前**生效**编码参数（≤ 档位上限）。
     rates: EncodeRates,
-    /// 本帧是否强制关键帧。
+    /// 本帧必须是 IDR（首帧/切显示器/切档位/`RequestKeyframe`/降分辨率/编码器重建）。
     force_keyframe: bool,
+    /// 本帧必须真正编码一次（即使与上一帧相同），但**不要求** IDR。
+    /// 补丁模式的基准帧用这个：参考链没断时插 IDR 只是一个带宽尖峰。
+    force_encode: bool,
     /// 本帧的采集耗时（微秒），只进统计、不参与控制决策。
     capture_us: u64,
     /// 原始帧。
@@ -2131,7 +2215,7 @@ fn kbps_from_bytes(bytes: u64, elapsed: Duration) -> u32 {
 /// - **静止时也不是永远不发**：距上次真正编码超过 `unchanged_resend` 就补编一帧。检测有盲区
 ///   （点采样），编码前的背压出口与采集看门狗也会让「已检测到的变化」一帧都没发出去；
 ///   没有这条保活，用户看到的是「远端静止一段时间后，第一次变化要反复几次才出现」。
-///   **补编只绕过「无变化就跳过」这一道闸门，`force` 语义不变，因此绝不会带出 IDR。**
+///   **补编只绕过「无变化就跳过」这一道闸门，不参与 `idr` 的计算，因此绝不会带出 IDR。**
 /// - **输出队列满 → 在编码之前跳过这一帧**（等价降帧率）。**绝不**先编码再丢弃：时域编码的
 ///   参考链是串起来的，丢掉一个已编码的 P 帧会让后续引用它的帧在解码端永远解不出来。
 ///
@@ -2176,6 +2260,10 @@ async fn encode_loop(
     // 队列满被跳过，控制器就要一直等到 `KEYFRAME_INTERVAL` 的周期性兜底（数百帧）才恢复——
     // 用户看到的是「画面卡住十几秒」。关键帧请求不能因为一次背压丢弃而蒸发。
     let mut pending_keyframe = false;
+    // 同上，但只要求「真正编码一次」（P 帧即可）：补丁模式的基准帧/退出帧被背压跳过时，
+    // 请求同样不能蒸发——否则会话循环会一直等 `base_frame_sent`，直到 `PATCH_BASE_TIMEOUT`
+    // 放弃进入（白白再等一秒），或者退出后画面停在补丁模式的最后一帧。
+    let mut pending_encode = false;
     let mut seq: u64 = 0;
     let mut window = EncodeStatsWindow::new();
     // 上一次**真正编码**（含空包）的时刻：静止保活补编的水位（见 [`UNCHANGED_RESEND_INTERVAL`]）。
@@ -2189,6 +2277,7 @@ async fn encode_loop(
             display,
             rates,
             force_keyframe,
+            force_encode,
             capture_us,
             frame,
         } = job;
@@ -2229,26 +2318,33 @@ async fn encode_loop(
             prev_rgba = None;
             encoder_dims = Some((width, height));
         }
-        let force = force_keyframe || geometry_changed || pending_keyframe;
+        // IDR 只在参考链/几何真的失效时才需要。
+        let idr = force_keyframe || geometry_changed || pending_keyframe;
+        // 「必须编码一次」可以只要 P 帧（补丁模式的基准/退出帧）。`pending_encode` 是上一帧
+        // 因背压被跳过的同一请求，所以它也算「本帧被要求编码」。
+        let forced_encode = force_encode || pending_encode;
+        let encode_now = idr || forced_encode;
 
         // 静止保活：距上次真正编码超过 `unchanged_resend` 就补一帧。它只绕过下面的
-        // 「无变化就跳过」闸门——**不**参与 `force` 的计算，所以补编永远是普通 P 帧，
-        // 不会像 `force` 那样带出 IDR（QoS 每秒动一次就插 IDR 是专门修掉的回归）。
+        // 「无变化就跳过」闸门——**不**参与 `idr` 的计算，所以补编永远是普通 P 帧，
+        // 不会带出 IDR（QoS 每秒动一次就插 IDR 是专门修掉的回归）。
         let resend_due = last_encode.is_none_or(|at| at.elapsed() >= unchanged_resend);
 
         // 静止画面：**默认**不喂编码器（不转换、不编码、不发送），但距上次编码超过
         // `unchanged_resend` 时必须补编一帧（保活，见 [`UNCHANGED_RESEND_INTERVAL`]）——
         // 「永久不发」会让检测盲区/背压丢弃变成画面上永久冻结的一帧。
-        // `force`（首帧/切显示器/切档位/RequestKeyframe/几何变化）为真时必须照常编码，
-        // 否则控制器 `NO_FRAME_TIMEOUT` 要的 IDR 会被这里吞掉。
-        if !force && unchanged && !resend_due {
+        // `encode_now`（首帧/切显示器/切档位/RequestKeyframe/几何变化/补丁基准帧）为真时
+        // 必须照常编码，否则控制器要的 IDR、或补丁模式要的基准帧会被这里吞掉。
+        if !encode_now && unchanged && !resend_due {
             window.record_skip();
             continue;
         }
         // 背压出口在**编码之前**：出站队列满就跳过这一帧。绝不能改成「编码后丢弃」。
-        // 被跳过的关键帧请求必须留下（`pending_keyframe`），否则控制器的恢复请求会蒸发。
+        // 被跳过的关键帧请求必须留下（`pending_keyframe`），否则控制器的恢复请求会蒸发；
+        // 「只需编码一次」的请求同理（`pending_encode`）。
         if out.capacity() == 0 {
-            pending_keyframe |= force;
+            pending_keyframe |= idr;
+            pending_encode |= force_encode && !idr;
             debug!("出站队列已满，跳过本轮编码（编码前丢帧，不破坏参考链）");
             continue;
         }
@@ -2257,7 +2353,8 @@ async fn encode_loop(
                 Ok(enc) => encoder = Some(enc),
                 Err(err) => {
                     warn!(error = %err, "编码器创建失败，跳过本帧");
-                    pending_keyframe |= force;
+                    pending_keyframe |= idr;
+                    pending_encode |= force_encode && !idr;
                     continue;
                 }
             }
@@ -2271,7 +2368,7 @@ async fn encode_loop(
         // （`reconfig_and_encode`），与编码同一次阻塞调用。
         let joined = tokio::task::spawn_blocking(move || {
             let mut enc = enc;
-            let result = reconfig_and_encode(enc.as_mut(), &rates, &frame, force);
+            let result = reconfig_and_encode(enc.as_mut(), &rates, &frame, idr);
             (enc, result, frame)
         })
         .await;
@@ -2281,7 +2378,8 @@ async fn encode_loop(
                 warn!(error = %err, "编码任务失败");
                 encoder = None;
                 prev_rgba = None;
-                pending_keyframe |= force;
+                pending_keyframe |= idr;
+                pending_encode |= force_encode && !idr;
                 continue;
             }
         };
@@ -2294,8 +2392,9 @@ async fn encode_loop(
                 last_encode = Some(Instant::now());
                 // GPU 帧没有 CPU 像素可留作去重基准；置 `None` 让下一帧照常编码。
                 prev_rgba = if is_gpu { None } else { Some(frame.rgba) };
-                // `force` 为真时本帧必是 IDR，请求已被满足。
+                // `idr` 为真时本帧必是 IDR、「必须编码一次」也已满足，两类请求一并清掉。
                 pending_keyframe = false;
+                pending_encode = false;
                 if packet.is_empty() {
                     continue;
                 }
@@ -2327,9 +2426,14 @@ async fn encode_loop(
                 if !send_video(&out, &cancel, msg).await {
                     break;
                 }
-                if keyframe {
+                if keyframe || forced_encode {
                     // 通知会话循环：这块**全帧基准**已经进入出站队列。补丁走同一条 FIFO 队列，
                     // 因此之后的 `RegionUpdate` 必然排在它后面（顺序不变量，见模块文档）。
+                    //
+                    // 基准帧是 **P 帧**（补丁不碰参考链），所以不能只看 `keyframe`：
+                    // `forced_encode` 就是会话循环为「补丁模式基准帧」打的标记（含被背压跳过、
+                    // 在后续帧上补发的那个请求——没有它，重试成功也不会置位，进入只能等超时）。
+                    // 退出补丁模式的那一帧也带它，此时没有人在等这个信号，置位无副作用。
                     base_frame_sent.store(true, Ordering::Relaxed);
                 }
             }
@@ -2340,7 +2444,8 @@ async fn encode_loop(
                 encoder = None;
                 prev_rgba = None;
                 sent_dims = None;
-                pending_keyframe |= force;
+                pending_keyframe |= idr;
+                pending_encode |= force_encode && !idr;
             }
         }
     }
@@ -2515,7 +2620,7 @@ mod tests {
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
     use rust_tunnel_common::protocol::RemoteMode;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use std::pin::Pin;
@@ -3314,6 +3419,7 @@ mod tests {
                 display: 0,
                 rates: hi,
                 force_keyframe: true,
+                force_encode: false,
                 capture_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
@@ -3328,6 +3434,7 @@ mod tests {
                 display: 0,
                 rates: lo,
                 force_keyframe: false,
+                force_encode: false,
                 capture_us: 0,
                 frame: shaded(0, 64, 48, 40),
             })
@@ -3380,6 +3487,7 @@ mod tests {
                 display: 0,
                 rates: hi,
                 force_keyframe: true,
+                force_encode: false,
                 capture_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
@@ -3393,6 +3501,7 @@ mod tests {
                 display: 0,
                 rates: half,
                 force_keyframe: false,
+                force_encode: false,
                 capture_us: 0,
                 frame: shaded(0, 64, 48, 40),
             })
@@ -3500,6 +3609,7 @@ mod tests {
                 display: 0,
                 rates: EncodeRates::ceiling(EncodeOptions::default()),
                 force_keyframe: true,
+                force_encode: false,
                 capture_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
@@ -3562,6 +3672,7 @@ mod tests {
             display: 0,
             rates: opts,
             force_keyframe: force,
+            force_encode: false,
             capture_us: 0,
             frame,
         };
@@ -3641,6 +3752,7 @@ mod tests {
             display: 0,
             rates,
             force_keyframe: force,
+            force_encode: false,
             capture_us: 0,
             frame: RawFrame {
                 display: 0,
@@ -3697,6 +3809,78 @@ mod tests {
         let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
     }
 
+    /// **`force_encode` 语义锁**：补丁模式的基准帧要求「必须编码一次」但**不是** IDR。
+    ///
+    /// 同一像素内容、采集层报告无变化时，它仍必须产出一个 `VideoPacket`（否则基准帧会被
+    /// 「无变化就跳过」闸门吞掉，会话循环只能等到 `PATCH_BASE_TIMEOUT` 放弃进入），且
+    /// `KEYFRAME` 位必须为 0（参考链没断，插 IDR 只是带宽尖峰）。
+    #[tokio::test]
+    async fn forced_encode_without_idr_emits_p_frame_even_when_unchanged() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+            CodecId::H264,
+            Arc::new(FakeH264EncoderFactory),
+            // 保活间隔足够大：本用例只验证 `force_encode` 单独绕过无变化闸门。
+            Duration::from_secs(3600),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            MAX_ENCODE_WIDTH,
+        ));
+        let rates = EncodeRates::ceiling(EncodeOptions::default());
+        let gpu_job = |changed: bool, force_keyframe: bool, force_encode: bool| EncodeJob {
+            display: 0,
+            rates,
+            force_keyframe,
+            force_encode,
+            capture_us: 0,
+            frame: RawFrame {
+                display: 0,
+                width: 64,
+                height: 48,
+                rgba: Vec::new(),
+                gpu: Some(Arc::new(DummyGpuFrame)),
+                changed,
+                changed_permille: if changed { 1000 } else { 0 },
+            },
+        };
+
+        // 首帧：建立参考链。
+        job_tx
+            .send(gpu_job(true, true, false))
+            .await
+            .expect("投递首帧");
+        assert!(
+            matches!(
+                out_rx.recv().await,
+                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
+            ),
+            "首帧前应先下发 ScreenConfig"
+        );
+        let (flags, ..) = next_video(&mut out_rx).await;
+        assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "首帧应是关键帧");
+
+        // 同内容、无变化、不要求 IDR，但必须编码一次：正是补丁基准帧的语义。
+        job_tx
+            .send(gpu_job(false, false, true))
+            .await
+            .expect("投递基准帧");
+        let (flags, ..) = next_video(&mut out_rx).await;
+        assert_eq!(
+            flags & VIDEO_FLAG_KEYFRAME,
+            0,
+            "force_encode 必须绕过去重闸门，但不得带出 IDR"
+        );
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+    }
+
     /// **保活不变量**：`unchanged_resend = 0` 时，连续多帧 `changed == false` 也必须每帧
     /// 都编码发送，且都是普通 P 帧。
     ///
@@ -3725,6 +3909,7 @@ mod tests {
             display: 0,
             rates,
             force_keyframe: force,
+            force_encode: false,
             capture_us: 0,
             frame: RawFrame {
                 display: 0,
@@ -4376,7 +4561,7 @@ mod tests {
         assert!(!mode.observe_video(PATCH_ENTER_PERMILLE, now));
         assert!(
             mode.observe_video(PATCH_ENTER_PERMILLE, now),
-            "连续 {PATCH_ENTER_TICKS} 次低活跃才应请求基准 IDR"
+            "连续 {PATCH_ENTER_TICKS} 次低活跃才应请求基准帧"
         );
         assert!(mode.enter_pending);
         // 已在等待基准帧时不重复触发。
@@ -4481,9 +4666,9 @@ mod tests {
         }
     }
 
-    /// 顺序不变量：基准关键帧**真正写出**后才进入补丁模式；等不到就放弃并清零计数。
+    /// 顺序不变量：基准帧**真正写出**后才进入补丁模式；等不到就放弃并清零计数。
     #[test]
-    fn patch_mode_enters_only_after_base_keyframe_and_abandons_on_timeout() {
+    fn patch_mode_enters_only_after_base_frame_and_abandons_on_timeout() {
         let t0 = Instant::now();
         let mut mode = PatchMode::new();
         for _ in 0..PATCH_ENTER_TICKS {
@@ -4505,9 +4690,27 @@ mod tests {
         assert_eq!(mode.enter_streak, 0, "放弃后连续计数必须清零");
     }
 
-    /// 支持补丁的假采集源：视频采集报低活跃，补丁采集返回一块固定脏矩形。
+    /// 支持补丁的假采集源：视频/补丁采集各自报告一个可调的活跃度，补丁采集返回一块固定脏矩形。
+    ///
+    /// 活跃度做成原子变量是为了在会话**运行中**模拟「用户突然开始拖窗」：把它推到
+    /// [`PATCH_EXIT_PERMILLE`] 之上，下一次补丁采集就会走退出分支。
     struct PatchyScreen {
         patch_calls: AtomicUsize,
+        /// 视频采集报告的变化面积（千分比）。
+        video_permille: AtomicU16,
+        /// 补丁采集报告的变化面积（千分比）。
+        patch_permille: AtomicU16,
+    }
+
+    impl PatchyScreen {
+        /// 静桌面：两个路径都远低于进入门槛。
+        fn quiet() -> Self {
+            Self {
+                patch_calls: AtomicUsize::new(0),
+                video_permille: AtomicU16::new(8),
+                patch_permille: AtomicU16::new(8),
+            }
+        }
     }
 
     impl ScreenSource for PatchyScreen {
@@ -4523,7 +4726,7 @@ mod tests {
 
         fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
             let mut frame = solid(display, 32, 24);
-            frame.changed_permille = 8;
+            frame.changed_permille = self.video_permille.load(Ordering::SeqCst);
             Ok(frame)
         }
 
@@ -4543,7 +4746,7 @@ mod tests {
                 display,
                 width,
                 height,
-                changed_permille: 8,
+                changed_permille: self.patch_permille.load(Ordering::SeqCst),
                 rects: vec![ScreenPatch {
                     x: 0,
                     y: 0,
@@ -4565,15 +4768,13 @@ mod tests {
             .message
     }
 
-    /// 端到端：低活跃 + H.264 + 采集源支持补丁 → 先发基准关键帧，再发 `RegionUpdate`；
+    /// 端到端：低活跃 + H.264 + 采集源支持补丁 → 先发基准帧（P 帧），再发 `RegionUpdate`；
     /// 控制器 `RequestKeyframe` 后必须退回全帧并重发 IDR。
     #[tokio::test]
-    async fn patch_mode_sends_region_update_after_base_keyframe_and_exits_on_request() {
+    async fn patch_mode_sends_region_update_after_base_frame_and_exits_on_request() {
         let (a, b) = tokio::io::duplex(256 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
-        let screen = Arc::new(PatchyScreen {
-            patch_calls: AtomicUsize::new(0),
-        });
+        let screen = Arc::new(PatchyScreen::quiet());
         let run_screen: Arc<dyn ScreenSource> = screen.clone();
         let (input, _input_rx) = RecordingInput::with_notify();
         let cancel = CancellationToken::new();
@@ -4619,8 +4820,8 @@ mod tests {
         assert_eq!((width, height), (32, 24), "补丁坐标系是编码尺寸");
         assert!(!rects.is_empty(), "本拍有脏矩形");
         assert!(
-            keyframes >= 2,
-            "补丁之前必须已发出会话首帧与进入基准两个关键帧（实得 {keyframes}）"
+            keyframes >= 1,
+            "补丁之前至少已发出会话首帧；进入基准帧是 P 帧（补丁不碰参考链），不再额外插 IDR（实得 {keyframes}）"
         );
         assert!(
             screen.patch_calls.load(Ordering::SeqCst) >= 1,
@@ -4650,6 +4851,80 @@ mod tests {
         assert!(
             recovered.is_ok(),
             "RequestKeyframe 后必须退出补丁模式并重发全帧 IDR"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, ctld).await.expect("被控端应结束");
+    }
+
+    /// 根因 B 的回归锁：补丁模式的**基准帧**与「活跃度回升」退出后的**第一帧**都必须是 P 帧。
+    ///
+    /// 补丁只改控制器侧的合成帧缓冲，不碰 H.264 参考链（补丁模式期间编码器根本不编码），
+    /// 所以这两处插 IDR 只是给每次切窗口/开文件夹加一个 150–400 KB 的带宽尖峰。
+    #[tokio::test]
+    async fn patch_mode_base_and_activity_exit_use_p_frames() {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
+        let screen = Arc::new(PatchyScreen::quiet());
+        let run_screen: Arc<dyn ScreenSource> = screen.clone();
+        let (input, _input_rx) = RecordingInput::with_notify();
+        let cancel = CancellationToken::new();
+
+        let mut cfg = config(pending_with("TOK"), RemoteMode::Control);
+        cfg.h264_encoder_factory = Some(Arc::new(FakeH264EncoderFactory));
+        let ctld = tokio::spawn(run_controlled(
+            Box::new(b),
+            cfg,
+            run_screen,
+            input,
+            None,
+            transfer_hub().0,
+            cancel.clone(),
+        ));
+        // 声明支持 H.264：补丁模式的前提（VP9 的解码输出不维护持久 NV12 帧缓冲）。
+        let (mut peer_reader, _peer_writer) =
+            controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", Some((true, true))).await;
+
+        // 读到第一块补丁为止：在此之前只应有**会话首帧**一个 IDR（进入基准帧是 P 帧）。
+        let keyframes = tokio::time::timeout(WAIT, async {
+            let mut keyframes = 0u32;
+            loop {
+                match next_message(&mut peer_reader).await {
+                    SessionMessage::VideoPacket { flags, .. } => {
+                        if flags & VIDEO_FLAG_KEYFRAME != 0 {
+                            keyframes += 1;
+                        }
+                    }
+                    SessionMessage::RegionUpdate { .. } => return keyframes,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("低活跃画面应进入补丁模式并发出 RegionUpdate");
+        assert_eq!(
+            keyframes, 1,
+            "补丁之前只该有会话首帧一个 IDR；进入基准帧必须是 P 帧（实得 {keyframes}）"
+        );
+
+        // 模拟用户开始拖窗：下一次补丁采集报高活跃 → 退出补丁模式并立刻抓一帧全帧。
+        screen.patch_permille.store(1000, Ordering::SeqCst);
+        screen.video_permille.store(1000, Ordering::SeqCst);
+        let exit_flags = tokio::time::timeout(WAIT, async {
+            loop {
+                if let SessionMessage::VideoPacket { flags, .. } =
+                    next_message(&mut peer_reader).await
+                {
+                    return flags;
+                }
+            }
+        })
+        .await
+        .expect("退出补丁模式后应发出全帧视频包");
+        assert_eq!(
+            exit_flags & VIDEO_FLAG_KEYFRAME,
+            0,
+            "活跃度回升退出补丁模式后的第一帧必须是 P 帧（参考链没断，不该插 IDR）"
         );
 
         cancel.cancel();
