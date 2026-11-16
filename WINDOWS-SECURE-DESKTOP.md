@@ -41,10 +41,21 @@ SCM ──启动──> rust-tunnel-client-service.exe --run        (SYSTEM / �
                     ▼
               rust-tunnel-client-gui.exe --instance         (控制台会话 / SYSTEM 完整性)
                     │  无头：不起 eframe / 托盘 / 窗口，只跑控制通道 + 远程引擎
-                    │  采集与注入用 win-platform 并跟随输入桌面；配置来自 %ProgramData%\rust-tunnel\host.toml
+                    │  采集与注入跟随输入桌面；配置来自 %ProgramData%\rust-tunnel\host.toml
+                    │  Default 桌面 → WGC/DXGI + GPU 零拷贝；Winlogon/Screen-saver → GDI BitBlt
                     ▼
               服务端 ──> 控制器
 ```
+
+> **采集路径（混合，2026-11-16）**：实例不再全程走 GDI `BitBlt`。输入桌面是
+> `Default`（已登录、未锁屏）时，采集走 `win-video` 的 WGC（优先）/ DXGI，
+> 4K 采集纹理由 VideoProcessor 一步转 NV12 + 缩到 1920，直接交给 QSV/NVENC；
+> 只有 `Winlogon`（锁屏/登录）与 `Screen-saver`（安全桌面）才回退 `win-platform`
+> 的 BitBlt。分流与会话锁存在 `crates/client-gui/src/remote/win_hybrid.rs` 与
+> `instance_gpu.rs`；任何失败都 fail-open 回 BitBlt，不会永久关闭进程级 GPU。
+> 遥测会如实显示最近一帧的后端（`采集方式` / `采集耗时` / `GPU 零拷贝（采集）`）。
+> 现场需要**强制回 BitBlt** 时，给实例进程设 `RUST_TUNNEL_DISABLE_GPU_CAPTURE=1`
+> （服务模式下写进服务环境/重启服务；它会同时关掉 GPU 纹理与 WGC 的 CPU 回读）。
 
 **装它（推荐：一个 zip + GUI 里点一下）**：
 
@@ -227,6 +238,38 @@ Restart-Computer
 
 > 装过之后**每次开机**都会自动跑一遍探针并自己停下。阶段 0 这是有意的
 > （登录界面那一趟就靠它）；收尾时用 `--uninstall` 卸掉即可。
+
+### 第 4 趟：混合采集（Default 桌面的 WGC/DXGI）
+
+这条验的是「**实例在普通桌面上有没有用上 GPU 快路径**」，与上面三趟的注入闸门独立。
+
+**首选：直接看实例的真实遥测**（最接近 SYSTEM 实例的条件）。装好服务、在机器**已登录且
+未锁屏**时发起一次远程会话，看会话窗口右上角的统计角标：
+
+| 项 | 期望（快路径生效） | 若仍走 BitBlt |
+|---|---|---|
+| 采集方式 | `WGC`（或 `DXGI`） | `BitBlt` |
+| 采集耗时 | 毫秒级（GPU 纹理路径 ~3 ms；CPU 回读 4K ~31 ms） | ~40 ms（4K GDI） |
+| GPU 零拷贝（采集） | `GPU` | `CPU` |
+| 编码器 | `Intel QSV` / `NVENC` 等，且 `编码 GPU 输入` 为 `GPU` | `CPU` |
+
+锁屏/登录界面期间角标回到 `BitBlt` 是**正确行为**，不是故障。
+
+**独立探针**（在目标机有源码时）：
+
+```powershell
+cargo run --release -p rust-tunnel-win-video --bin win-video-capture-probe -- --out C:\Temp\capture-probe.txt
+```
+
+报告会先打印 **PID / 用户 / 会话 / 当前线程桌面**——这是这份报告最关键的上下文：
+只有 `当前线程桌面=Default` 那趟的 WGC/DXGI 结论才适用于混合采集的快路径；
+`Winlogon` / `Screen-saver` 上的失败是预期的。以管理员身份跑只能**近似** SYSTEM
+实例的条件，最终以实例的真实遥测为准。探针自己声明 per-monitor DPI 感知，所以
+报告里的显示器尺寸与 WGC 实际采到的像素一致（4K@150% 不会再显示成 2560×1440）。
+
+> **HDR 桌面**：DXGI Desktop Duplication 可能拿到 `R16G16B16A16_FLOAT`，`win-video`
+> 会明确失败（它只接受 BGRA8）；WGC 是首选路径，不受影响。探针报告的「强制 DXGI」
+> 段会直接写出这条原因。
 
 ### 收尾
 
@@ -432,5 +475,11 @@ rust-tunnel-client-service.exe --uninstall
 - `crates/win-platform/` —— 平台层（可移植模块 + Windows FFI）：桌面/采集/注入/令牌/
   会话/服务控制/探针。
 - `crates/win-service/` —— `rust-tunnel-client-service.exe` 本体（本文件描述的那个 exe）。
+- `crates/client-gui/src/remote/win_hybrid.rs` —— 实例的混合采集（Default → WGC/DXGI +
+  GPU 零拷贝，安全桌面/失败 → BitBlt）。
+- `crates/client-gui/src/remote/instance_gpu.rs` —— 混合采集的纯逻辑策略（会话锁存、
+  显示器 id 映射），全平台单测。
+- `crates/win-video/src/bin/capture_probe.rs` —— `win-video-capture-probe`（第 4 趟的
+  独立探针；打印进程身份/桌面并落盘报告）。
 - `CLAUDE.md` —— 架构总览中「Windows 无人值守被控端」一节。
 - `RUSTDESK.md` —— RustDesk 兼容服务（会合/中继）的部署与验证，与本功能相邻但独立。

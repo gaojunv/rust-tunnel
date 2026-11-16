@@ -358,7 +358,8 @@ pub(crate) fn spawn_instance_runtime(
                     enabled: true,
                     approval_policy: approval,
                     auto_lock_on_disconnect: auto_lock,
-                    // 实例模式（安全桌面）走 GDI/BitBlt 采集，不做 4K：编码宽度保持 1920。
+                    // 实例不做 4K（编码宽度保持 1920）：`Default` 桌面走 WGC/DXGI，
+                    // 安全桌面回退 GDI/BitBlt；两条路径都用这个上限。
                     native_resolution: false,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),

@@ -18,11 +18,14 @@
 //!
 //! - **监管线程**（`desktop-supervisor`，长驻）：以 ≤4Hz 探测输入桌面，发现变化就收掉旧
 //!   worker、起一个新 worker。它自己**不挂任何桌面**，只做生命周期管理。
-//! - **worker 线程**（`desktop-worker`，**一条线程一个桌面**）：挂到目标桌面后，采集、
-//!   注入、剪贴板**全部在它上面**跑——剪贴板同样是窗口站/桌面绑定的，绝不能留在调用线程上。
+//! - **worker 线程**（`desktop-worker`，**一条线程一个桌面**）：挂到目标桌面后，
+//!   **GDI `BitBlt` 采集**、注入、剪贴板在它上面跑——剪贴板同样是窗口站/桌面绑定的，
+//!   绝不能留在调用线程上。`Default` 桌面的 WGC/DXGI 混合采集**不**走这条线程
+//!   （它由 `win_hybrid` 在引擎的采集线程上做），所以 GPU 采集再慢也不会堵住注入。
 //!
 //! 桌面变化是**低频事件**（锁屏/解锁/切换用户），故「销毁+重建」的开销可以忽略；真正要
-//! 守住的是「切换期间绝不丢抬起事件」（见下）。
+//! 守住的是「切换期间绝不丢抬起事件」（见下）。当前挂载的桌面与显示器几何经
+//! [`Shared`] 发布给 `win_hybrid`，后者据此在 GPU 快路径与 BitBlt 兜底之间分流。
 //!
 //! # 采集是请求/应答、注入是有界队列
 //!
@@ -126,6 +129,16 @@ struct IoInner {
     clipboard: VecDeque<ClipboardRequest>,
     /// 显示器列表缓存（`ScreenSource::displays` **只读它**，绝不阻塞）。
     displays: Option<Vec<DisplayInfo>>,
+    /// 显示器几何缓存（含原点，供 GPU 采集把实例 id 映射到 xcap id）。
+    ///
+    /// 与 `displays` 分开存：`DisplayInfo` 冻结在 `HelloAck` 的字节形状里，不能加
+    /// 原点字段；而 GPU 路径需要几何来跨两套枚举做匹配。
+    monitors: Option<Vec<Monitor>>,
+    /// 当前 worker **实际挂着的**桌面（`None` = 尚未挂载/监管线程还没认下目标）。
+    ///
+    /// 只由监管线程在**成功起了 worker 之后**写入。探测到 `Unsupported` 时保持
+    /// 旧值——与「保持当前挂载」的跟随语义一致（见 `desktop_follow::decide`）。
+    desktop: Option<FollowDesktop>,
     /// 请求当前 worker 停止（监管线程换桌面、或进程收尾用）。
     stop: bool,
     /// 请求当前 worker 补发一次「全部抬起」（会话结束时由实例运行时触发）。
@@ -133,7 +146,9 @@ struct IoInner {
 }
 
 /// 共享状态 + 唤醒用的条件变量。
-struct Shared {
+///
+/// `pub(super)`：GPU 混合采集（`remote::win_hybrid`）要读当前桌面与显示器几何。
+pub(super) struct Shared {
     /// 受锁保护的状态。
     inner: Mutex<IoInner>,
     /// 有新活/停止信号时唤醒 worker。
@@ -149,6 +164,8 @@ impl Shared {
                 captures: VecDeque::new(),
                 clipboard: VecDeque::new(),
                 displays: None,
+                monitors: None,
+                desktop: None,
                 stop: false,
                 release_requested: false,
             }),
@@ -177,6 +194,29 @@ impl Shared {
     /// 更新显示器缓存（worker 在挂载成功/枚举成功后调用）。
     fn set_displays(&self, displays: Vec<DisplayInfo>) {
         self.lock().displays = Some(displays);
+    }
+
+    /// 更新显示器几何缓存（与 `set_displays` 同一次枚举发布）。
+    pub(super) fn set_monitors(&self, monitors: Vec<Monitor>) {
+        self.lock().monitors = Some(monitors);
+    }
+
+    /// 显示器几何缓存（可能尚未就绪；GPU 采集只读它，绝不阻塞）。
+    pub(super) fn cached_monitors(&self) -> Option<Vec<Monitor>> {
+        self.lock().monitors.clone()
+    }
+
+    /// 发布 worker 实际挂着的桌面（监管线程在 worker 起来之后调用）。
+    ///
+    /// 刻意**不在**探测到 `Unsupported` 时清除：那一刻 worker 仍挂在旧桌面上
+    /// （`decide` 返回 `NoChange`），清掉会让 GPU 路径误判成安全桌面。
+    pub(super) fn set_desktop(&self, desktop: Option<FollowDesktop>) {
+        self.lock().desktop = desktop;
+    }
+
+    /// 当前 worker 实际挂着的桌面（`None` = 尚未挂载）。
+    pub(super) fn desktop_kind(&self) -> Option<FollowDesktop> {
+        self.lock().desktop
     }
 
     /// 请当前 worker 停止（它会先补发「全部抬起」）。
@@ -335,6 +375,11 @@ fn supervisor_loop(shared: &Arc<Shared>) {
             worker = spawn_worker(Arc::clone(shared), target);
             // 只在**确实起了线程**时才认下这个目标：起失败时保持 `None`，下一轮会重试。
             current = worker.as_ref().map(|_| target);
+            if worker.is_some() {
+                // 采集策略据此判断能不能走 WGC/DXGI；必须晚于 worker 起来（那时挂载
+                // 已成功或正在重试），且只在真正认下目标时写。
+                shared.set_desktop(Some(target));
+            }
         }
         std::thread::sleep(DESKTOP_POLL_INTERVAL);
     }
@@ -431,6 +476,8 @@ fn worker_loop(shared: &Shared, target: FollowDesktop) {
     // 显示器几何在这条线程上枚举一次（本线程挂的桌面上的几何）。
     let (monitors, vs) = enumerate_screen();
     publish_displays(shared, &monitors);
+    // 同一份几何也给 GPU 混合采集：它需要原点来把实例 id 映射到 xcap id。
+    shared.set_monitors(monitors.clone());
 
     let mut held = HeldInputs::default();
     loop {
@@ -670,10 +717,20 @@ fn platform_err(err: WinError) -> RemoteError {
 
 // ── 引擎侧的三个 trait 实现 ─────────────────────────────────────────
 
-/// `win-platform` 支撑的采集源（实例用）。
-struct WinScreen {
+/// `win-platform` 支撑的采集源（实例的 GDI `BitBlt` 路径）。
+///
+/// `pub(super)`：GPU 混合采集（`remote::win_hybrid`）把它当作安全桌面与所有
+/// 回退场景的兜底。
+pub(super) struct WinScreen {
     /// 与 worker 共享的状态。
     io: Arc<Shared>,
+}
+
+impl WinScreen {
+    /// 由共享状态构造（不启动任何线程；线程由 [`screen_and_input`] 启动）。
+    pub(super) fn new(io: Arc<Shared>) -> Self {
+        Self { io }
+    }
 }
 
 impl ScreenSource for WinScreen {
@@ -703,8 +760,9 @@ impl ScreenSource for WinScreen {
         self.io.capture(display)
     }
 
-    /// 被控端遥测口径：安全桌面/实例模式只有 GDI `BitBlt`，没有 GPU 采集也没有
-    /// 适配器可言，其余字段（计数、GPU 状态、禁用原因）保持默认。
+    /// 被控端遥测口径：**这条源只负责 BitBlt**（安全桌面与所有回退场景），没有
+    /// GPU 采集也没有适配器可言。`Default` 桌面的 WGC/DXGI 遥测由
+    /// `win_hybrid` 按最近一帧的实际来源选择。
     fn capture_info(&self) -> CaptureInfo {
         CaptureInfo {
             backend: "BitBlt".to_owned(),
@@ -823,7 +881,9 @@ pub(super) fn screen_and_input() -> PlatformHandles {
     let clipboard = Arc::new(WinClipboard {
         io: Arc::clone(&io),
     });
-    let screen = Arc::new(WinScreen { io });
+    // 混合采集：Default 桌面走 WGC/DXGI + GPU 零拷贝，安全桌面/失败时回退
+    // `WinScreen` 的 GDI `BitBlt`（见 `remote::win_hybrid`）。
+    let screen = super::win_hybrid::screen(Arc::clone(&io));
     PlatformHandles {
         screen,
         input: input.clone(),

@@ -25,8 +25,10 @@ pub fn open_settings(_kind: super::PermissionKind) {}
 ///
 /// - [`super::PlatformMode::Gui`]：用户会话里的老路径（`xcap` + `enigo` + `arboard`），
 ///   **一行不改**（发布中的二进制，不承担回归风险）。
-/// - [`super::PlatformMode::Instance`]：SYSTEM 服务拉进控制台会话的无头实例，采集/注入/
-///   剪贴板都改用 `win-platform` 并跟随输入桌面（见 [`super::win_desktop`]）。
+/// - [`super::PlatformMode::Instance`]：SYSTEM 服务拉进控制台会话的无头实例，注入/剪贴板
+///   改用 `win-platform` 并跟随输入桌面；采集是混合的——`Default` 桌面走
+///   `win-video` 的 WGC/DXGI，安全桌面与回退走 `win-platform` 的 BitBlt
+///   （见 [`super::win_desktop`] / [`super::win_hybrid`]）。
 ///   **不能**复用 `EnigoInput`：`enigo` 的 `move_mouse(Coordinate::Abs)` 用
 ///   `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`（仅主显示器）归一化、且没有
 ///   `MOUSEEVENTF_VIRTUALDESK`，多显示器坐标本来就是错的；`win-platform` 的
