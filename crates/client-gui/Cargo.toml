@@ -81,8 +81,9 @@ keyring = { version = "3", features = ["windows-native"] }
 # 无头实例（`--instance`）的平台层：安全桌面采集/注入、桌面跟随、虚拟桌面几何归一化。
 # 只在 Windows 上编译（macOS/Linux 上本 crate 是零依赖的纯逻辑 crate）。
 rust-tunnel-win-platform = { path = "../win-platform" }
-# GUI 用户会话的硬件采集（WGC/DXGI）+ NVENC H.264 编码 + Media Foundation 解码。
-# 安全桌面的实例模式仍用 win-platform 的 BitBlt，不走这条路径。
+# 硬件采集（WGC/DXGI）+ NVENC H.264 编码 + Media Foundation 解码。
+# GUI 用户会话直接用；无人值守实例在 Default 桌面上也复用它（零拷贝），
+# Winlogon / Screen-saver 等安全桌面仍回退 win-platform 的 GDI BitBlt。
 rust-tunnel-win-video = { path = "../win-video" }
 # `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`
 # 与主线程 STA 占位（`OleInitialize`，避免 winit 在 MTA 线程上 panic）。

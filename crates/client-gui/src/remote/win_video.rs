@@ -15,8 +15,9 @@
 //! [`choose_backend`]）：混合显卡下采集设备常是 Intel 核显，此时优先 QSV MFT
 //! 才能复用同一块设备；无条件优先 NVENC 只会退化成跨设备回读。
 //!
-//! **实例模式（`--instance`）不走这里**：那条路径由 `win-platform` 用 BitBlt
-//! 采集安全桌面，本模块只服务用户会话里的 GUI 进程。
+//! **实例模式（`--instance`）也复用这里**：`remote::win_hybrid` 在当前桌面为
+//! `Default` 时用本模块的 WGC/DXGI + GPU 纹理直通；`Winlogon` / `Screen-saver`
+//! 等安全桌面仍由 `win-platform` 的 GDI `BitBlt` 采集。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -100,6 +101,13 @@ struct GpuContext {
     disable_reason: Mutex<Option<String>>,
     /// 是否已经打印过「GPU 路径已启用」日志（只打一次）。
     logged: AtomicBool,
+    /// 编码器工厂最近一次能否接受 **GPU 纹理**（`MftAdapter::gpu`）。
+    ///
+    /// `false` = 当前会话的编码器按 CPU 输入创建（采集设备不是 Intel，或
+    /// `new_with_device` 失败）。`ScreenSource` 必须在下一帧改交 CPU 帧——否则
+    /// `MftAdapter::encode_frame` 的 `!self.gpu` 分支会拒绝 GPU 帧。
+    /// 每次会话开始时由 `supports_gpu_capture()` 重置为 `true`（乐观重试）。
+    encode_gpu_ok: AtomicBool,
 }
 
 impl GpuContext {
@@ -133,6 +141,16 @@ impl GpuContext {
     /// GPU 路径是否已禁用。
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::SeqCst)
+    }
+
+    /// 当前会话的编码器能否接受 GPU 纹理（见 [`Self::encode_gpu_ok`]）。
+    fn encode_gpu_ok(&self) -> bool {
+        self.encode_gpu_ok.load(Ordering::SeqCst)
+    }
+
+    /// 记录编码器工厂的最新结论（创建编码器时写入）。
+    fn set_encode_gpu_ok(&self, ok: bool) {
+        self.encode_gpu_ok.store(ok, Ordering::SeqCst);
     }
 
     /// 禁用原因（未禁用时为 `None`）。
@@ -170,8 +188,19 @@ fn gpu_context() -> &'static Arc<GpuContext> {
                 env_disabled.then(|| "RUST_TUNNEL_DISABLE_GPU_CAPTURE 已设置".to_owned()),
             ),
             logged: AtomicBool::new(false),
+            encode_gpu_ok: AtomicBool::new(true),
         })
     })
+}
+
+/// 当前会话的编码器能否接受 GPU 纹理（供 `ScreenSource` 在采集侧判断）。
+///
+/// 只有 `MftEncoderFactory::create` 会把它置 `false`（非 Intel 采集设备、或
+/// `new_with_device` 失败）；`supports_gpu_capture()` 在每次会话开始时重置为
+/// `true`，让新会话有机会重新协商。
+#[must_use]
+pub(crate) fn encode_gpu_input_available() -> bool {
+    gpu_context().encode_gpu_ok()
 }
 
 /// 引擎侧 [`RawFrame::gpu`] 的 Windows 载体：一张采集源纹理池里的 BGRA 纹理。
@@ -327,6 +356,19 @@ impl WinVideoScreen {
         }
     }
 
+    /// 丢弃所有已打开的采集源（WGC/DXGI 会话与纹理池），下次采集重新打开。
+    ///
+    /// 实例的混合采集在**离开 `Default` 桌面**（锁屏/屏保）时调用：WGC 的捕获项
+    /// 与 DXGI 的 duplication 都绑定在当时的桌面/输出上，留在缓存里只会在解锁
+    /// 回来时先失败一次。计数器与编码宽度上限刻意保留：它们是会话/进程级读数，
+    /// 不随桌面切换归零。
+    pub(crate) fn reset_capture_sources(&self) {
+        let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
+        sources.clear();
+        self.last_display.store(u32::MAX, Ordering::Relaxed);
+        self.last_capture_was_gpu.store(false, Ordering::Relaxed);
+    }
+
     /// 当前采集源的「后端名 + 采集 D3D11 适配器名」。
     ///
     /// 缓存里没有采集源时（本拍之前从未采过帧、或最近一次硬件采集失败走了 xcap）
@@ -383,18 +425,40 @@ impl WinVideoScreen {
     /// 「没有新帧」的超时拍，再做 320×180 下采样 + 回读比较——只看「有没有新合成帧」不够，
     /// WGC 在静止桌面上仍按刷新节奏产帧。
     fn capture_gpu_frame(&self, display_id: u32) -> RemoteResult<RawFrame> {
-        let (captured, change) = match self.with_source(display_id, |source| {
+        // 编码器工厂已明确只能 CPU 输入（非 Intel 采集设备 / GPU 输入创建失败）：
+        // 再交 GPU 纹理会命中 `!self.gpu`。直接走 CPU 采集，别把进程级 GPU 关掉
+        // （那会连 WGC 的 CPU 回读一起废掉）。
+        if !encode_gpu_input_available() {
+            return self.capture(display_id);
+        }
+        match self.capture_gpu_frame_inner(display_id) {
+            Ok(frame) => Ok(frame),
+            Err(err) => {
+                // GUI 会话的既有策略：一次真实失败就把进程级 GPU 路径永久关掉，
+                // 但本会话继续有画面（回退 CPU 采集）。实例混合采集**不走**这里，
+                // 见 `capture_gpu_strict`。
+                gpu_context().disable(&err.to_string());
+                self.capture(display_id)
+            }
+        }
+    }
+
+    /// 只尝试一次 GPU 纹理采集，**不改**进程级禁用状态、也不自行回退 CPU。
+    ///
+    /// 实例（`--instance`）的混合采集专用：它会在锁屏/解锁、桌面切换期间反复
+    /// 调用，一次失败（例如恰好跨在桌面切换窗口上）不该把整个进程的 GPU 路径
+    /// 永久关掉。回退到 GDI `BitBlt` 由调用方决定（见 `remote::win_hybrid`）。
+    pub(crate) fn capture_gpu_strict(&self, display_id: u32) -> RemoteResult<RawFrame> {
+        self.capture_gpu_frame_inner(display_id)
+    }
+
+    /// GPU 采集的成功路径（不含失败处理）。
+    fn capture_gpu_frame_inner(&self, display_id: u32) -> RemoteResult<RawFrame> {
+        let (captured, change) = self.with_source(display_id, |source| {
             source
                 .capture_texture_with_change()
                 .map_err(|err| RemoteError::Platform(format!("GPU 采集失败: {err}")))
-        }) {
-            Ok(captured) => captured,
-            Err(err) => {
-                gpu_context().disable(&err.to_string());
-                // 回退 CPU 路径：本次会话继续有画面，只是不再尝试 GPU。
-                return self.capture(display_id);
-            }
-        };
+        })?;
         // 这次确实走的是 GPU 纹理路径：角标据此显示「采集 GPU」，而不是仅凭「能力可用」。
         self.last_capture_was_gpu.store(true, Ordering::Relaxed);
         let (source_width, source_height) = (captured.width, captured.height);
@@ -576,6 +640,9 @@ impl ScreenSource for WinVideoScreen {
     }
 
     fn supports_gpu_capture(&self) -> bool {
+        // 新会话：编码器还没创建，先乐观地认为它能接 GPU 纹理。若工厂随后发现
+        // 只能 CPU 输入，会把 hint 置 false，采集侧下一帧立刻改交 CPU 帧。
+        gpu_context().set_encode_gpu_ok(true);
         // 环境变量在 `gpu_context()` 初始化时已折算进 `disabled`。
         !gpu_context().is_disabled()
     }
@@ -1213,13 +1280,15 @@ impl VideoEncoderFactory for MftEncoderFactory {
         // GPU 零拷贝只在 **Intel** 采集设备上启用：VideoProcessor + QSV MFT 的同设备
         // 路径是本机验证过的那一条（见 `MftH264Encoder::encode_texture`）。其它厂商
         // （AMD 等）继续走 CPU RGBA 输入，避免未验证的组合。
-        let gpu_device = if gpu_context().is_disabled() {
+        let capture_device = if gpu_context().is_disabled() {
             None
         } else {
-            gpu_context()
-                .device()
-                .filter(|device| device.adapter.vendor_id == d3d11::VENDOR_INTEL)
+            gpu_context().device()
         };
+        let gpu_device = capture_device
+            .as_ref()
+            .filter(|device| device.adapter.vendor_id == d3d11::VENDOR_INTEL)
+            .cloned();
         let (encoder, device) = if let Some(device) = gpu_device {
             let adapter = device.adapter.name.clone();
             match MftH264Encoder::new_with_device(
@@ -1248,11 +1317,18 @@ impl VideoEncoderFactory for MftEncoderFactory {
                 .map_err(|err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")))?;
             (encoder, None)
         };
+        let gpu = device.is_some();
+        // 采集侧据此决定还要不要交 GPU 纹理。只有**确实有采集设备**时才写：
+        // `None` 说明本会话压根没走 GPU 采集（或 GPU 已被禁用），不该阻止下一个
+        // 会话在 `supports_gpu_capture()` 里重新尝试。
+        if capture_device.is_some() {
+            gpu_context().set_encode_gpu_ok(gpu);
+        }
         Ok(Box::new(MftAdapter {
             encoder,
             fps,
             frames: 0,
-            gpu: device.is_some(),
+            gpu,
             device,
         }))
     }
@@ -1392,9 +1468,10 @@ impl VideoEncoderApi for MftAdapter {
             return self.encode(&frame.rgba, frame.width, frame.height, force_keyframe);
         };
         if !self.gpu {
-            // 工厂没能复用采集设备（例如采集源换了适配器）：不能用空 `rgba` 编码，
-            // 禁用 GPU 让下一帧回退 CPU 采集。
-            gpu_context().disable("MFT 编码器未复用采集 D3D11 设备");
+            // 工厂只能建 CPU 输入适配器（采集设备不是 Intel，或 `new_with_device`
+            // 失败）。**不要永久禁用进程级 GPU**：那会把 WGC 的 CPU 回读也一起
+            // 关掉。只把「编码器吃不了 GPU 纹理」告诉采集侧，下一帧起它改交 CPU 帧。
+            gpu_context().set_encode_gpu_ok(false);
             return Err(RemoteError::Encode(
                 "MFT 编码器未启用 GPU 纹理输入".to_owned(),
             ));

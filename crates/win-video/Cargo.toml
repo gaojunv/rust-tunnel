@@ -59,8 +59,16 @@ windows = { version = "0.62", features = [
     # ICodecAPI（SetValue 收 VARIANT）：运行期改码率/帧率、强制关键帧
     "Win32_System_Ole",
     "Win32_System_Variant",
-    # 探针用 GetProcessTimes 量化软/硬解码的 CPU 时间（wall time 被 CPU 转换掩盖）
+    # 探针用 GetProcessTimes 量化软/硬解码的 CPU 时间（wall time 被 CPU 转换掩盖）。
+    # 采集探针还用 GetCurrentProcessId/GetCurrentThreadId 报告进程身份。
     "Win32_System_Threading",
+    # 采集探针必须在枚举显示器之前声明 per-monitor DPI 感知：否则 150% 缩放的
+    # 4K 屏会被报成 2560x1440，而 WGC 实际采到 3840x2160，几何匹配直接错位。
+    "Win32_UI_HiDpi",
+    # 采集探针报告「进程在哪个会话」：无人值守实例的混合采集只在控制台会话的
+    # Default 桌面上走 WGC/DXGI，Winlogon 上的失败是预期的。
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_WinRT",
     # WGC 的 interop（IGraphicsCaptureItemInterop::CreateForMonitor）
     "Win32_System_WinRT_Graphics_Capture",

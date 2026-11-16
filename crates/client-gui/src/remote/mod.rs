@@ -15,6 +15,8 @@
 
 pub mod clipboard_sync;
 pub mod desktop_follow;
+// 实例 GPU 采集的纯逻辑策略（会话锁存 + 显示器 id 映射）。全平台编译，便于单测。
+mod instance_gpu;
 pub mod input_queue;
 pub mod nv12_renderer;
 pub mod reconnect;
@@ -24,7 +26,12 @@ pub mod view_scale;
 // 私有模块：只有 `windows` 分派会调它的 `screen_and_input`，不对外暴露实现类型。
 #[cfg(target_os = "windows")]
 mod win_desktop;
-// Windows 用户会话的硬件采集 + NVENC/MFT 编解码适配；实例模式不使用它。
+// 实例的混合采集：`Default` 桌面用 WGC/DXGI + GPU 零拷贝，安全桌面回退 BitBlt。
+// 依赖 win_desktop 的共享状态与 win_video 的硬件采集源，只在 Windows 编译。
+#[cfg(target_os = "windows")]
+mod win_hybrid;
+// Windows 用户会话的硬件采集 + NVENC/MFT 编解码适配；实例的 `Default` 桌面也复用它
+// （见 `win_hybrid`），安全桌面与回退场景仍走 `win-platform` 的 BitBlt。
 #[cfg(target_os = "windows")]
 pub mod win_video;
 
@@ -139,7 +146,8 @@ pub type HardwareFactories = (
 pub enum PlatformMode {
     /// 用户会话里的常规 GUI 路径：`xcap` 采集 + `enigo` 注入。
     Gui,
-    /// SYSTEM 服务拉进控制台会话的无头实例：`win-platform` 采集/注入 + 桌面跟随。
+    /// SYSTEM 服务拉进控制台会话的无头实例：`win-platform` 注入/剪贴板 + 桌面跟随，
+    /// 采集按桌面混合（`Default` → WGC/DXGI，安全桌面 → BitBlt）。
     Instance,
 }
 
