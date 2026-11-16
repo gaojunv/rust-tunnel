@@ -27,6 +27,7 @@ mod windows_probe {
     use rust_tunnel_win_video::decode::H264Decoder;
     use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
     use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba};
+    use rust_tunnel_win_video::scale::TextureScaler;
     use rust_tunnel_win_video::WinVideoError;
     use std::fs::File;
     use std::io::{BufWriter, Write};
@@ -157,16 +158,23 @@ mod windows_probe {
         Ok(())
     }
 
-    /// 零拷贝对照：同一帧分别走「纹理直通」与「回读上传」编码，再各自解码比对。
+    /// 零拷贝对照：同一帧先走「GPU 缩放（VideoProcessor）+ 纹理直通」，再走
+    /// 「回读 + CPU 缩放 + 上传」，各自编码后解码比对。
     ///
     /// 只在**采集设备本身是 NVIDIA** 时才跑：否则 NVENC 会话开在另一块设备上，
-    /// `nvEncRegisterResource` 根本不适用（适配器会回读）。输出
-    /// `zero-copy used = true/false` 与失败原因，并打印两条路径的码流字节数、
-    /// 各自耗时，以及解码画面相对源帧的 MAD。
+    /// `nvEncRegisterResource` 根本不适用（适配器会回读）。
     ///
-    /// 判据（真机）：直通与回读的 MAD ≤ 2/255 —— 同一帧、同一编码器参数，两者
-    /// 只该有码率控制量化带来的细微差异；有结构性差异说明直通的颜色通道或
-    /// 步长（pitch）拿错了。
+    /// 判据（真机本机）：
+    /// - **GPU 缩放 + 直通编码的中位应 ≤ 10 ms**（预期 3–6 ms）；
+    /// - 回读路径（4K BGRA 回读 + CPU 盒式缩放 + 上传 + 编码）应明显更慢（~40 ms）；
+    /// - 直通 >20 ms 时打印 `zero-copy used = false` 与原因，**不假装通过**。
+    ///
+    /// 直通与回读两条路径的 MAD ≤ 2/255：同一帧、同一编码器参数，两者只该有码率
+    /// 控制量化带来的细微差异；有结构性差异说明缩放的颜色通道或步长拿错了。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "GPU 缩放直通、回读对照、判据与解码比对是一条不可分割的验证链"
+    )]
     fn zero_copy_ab(source: &mut dyn CaptureSource) -> Result<(), WinVideoError> {
         let Some(device) = source.device() else {
             println!(
@@ -181,6 +189,8 @@ mod windows_probe {
             );
             return Ok(());
         }
+        // 直接拿 4K 原始纹理：会话路径由 `TextureScaler` 在 GPU 上缩到编码尺寸，
+        // 这里**必须复现同一条路径**（旧写法让采集源先缩到 1920，等于绕过了缩放器）。
         let captured = match source.capture_texture() {
             Ok(captured) => captured,
             Err(err) => {
@@ -188,59 +198,116 @@ mod windows_probe {
                 return Ok(());
             }
         };
-        let (width, height) = (captured.width, captured.height);
+        let (src_w, src_h) = (captured.width, captured.height);
+        // 与会话路径一致：宽度封顶到编码上限，高度按比例取偶数。
+        let dst_w = src_w.clamp(2, MAX_WIDTH) & !1;
+        let dst_h = aspect_height(src_w, src_h, dst_w);
         println!(
-            "零拷贝对照: 采集设备 NVIDIA（{}），纹理 {width}x{height}",
+            "零拷贝对照: 采集设备 NVIDIA（{}），纹理 {src_w}x{src_h} → 编码 {dst_w}x{dst_h}",
             device.adapter.name
         );
-        if width > MAX_WIDTH {
-            println!(
-                "零拷贝对照: 纹理宽 {width} 超过编码上限 {MAX_WIDTH}（4K→1920 需要 CPU 缩放），zero-copy used = false 原因=尺寸超限"
-            );
-            return Ok(());
-        }
 
         let api = NvencApi::load()?;
-        let config = EncoderConfig::new(width, height, FPS, BITRATE_KBPS)?
+        let config = EncoderConfig::new(dst_w, dst_h, FPS, BITRATE_KBPS)?
             .with_input_format(InputFormat::Bgra);
         let mut encoder = NvencEncoder::new(&api, Arc::clone(&device), config)?;
 
-        // ① 纹理直通：采集纹理直接注册给 NVENC，不落 CPU。
+        // ① GPU 缩放 + 纹理直通：VideoProcessor 缩到编码尺寸 → 注册给 NVENC。
+        let mut gpu_scaler = match TextureScaler::new(Arc::clone(&device)) {
+            Ok(scaler) => scaler,
+            Err(err) => {
+                println!("零拷贝对照: GPU 缩放器创建失败，zero-copy used = false 原因={err}");
+                return Ok(());
+            }
+        };
+        let scale_started = Instant::now();
+        let scaled_tex = match gpu_scaler.scale(&captured.texture, (src_w, src_h), (dst_w, dst_h)) {
+            Ok(texture) => texture,
+            Err(err) => {
+                println!("零拷贝对照: GPU 缩放失败，zero-copy used = false 原因={err}");
+                return Ok(());
+            }
+        };
+        let first_scale_ms = scale_started.elapsed().as_secs_f64() * 1000.0;
         let direct_started = Instant::now();
-        let direct = match encoder.encode_texture(&captured.texture, true) {
+        let direct = match encoder.encode_texture(&scaled_tex, true) {
             Ok(packet) => packet,
             Err(err) => {
                 println!("零拷贝对照: 纹理直通失败，zero-copy used = false 原因={err}");
                 return Ok(());
             }
         };
-        let direct_ms = direct_started.elapsed().as_secs_f64() * 1000.0;
+        let first_encode_ms = direct_started.elapsed().as_secs_f64() * 1000.0;
 
-        // ② 回读上传：既有路径（staging CopyResource + Map + UpdateSubresource）。
+        // 会话路径每帧都重新缩放一次（采集纹理内容在变），所以 10 次循环里
+        // **缩放与编码都算进去**；只测编码会把真正的开销漏掉。
+        let mut repeat_ms = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let started = Instant::now();
+            let scaled_tex = gpu_scaler.scale(&captured.texture, (src_w, src_h), (dst_w, dst_h))?;
+            let _ = encoder.encode_texture(&scaled_tex, false)?;
+            repeat_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let (direct_median, direct_mean) = stats(&repeat_ms);
+        let direct_max = repeat_ms.iter().copied().fold(0.0_f64, f64::max);
+        println!(
+            "零拷贝对照: GPU 缩放 + 直通编码（同一帧 10 次）: 中位 {direct_median:.2} ms / \
+             均值 {direct_mean:.2} ms / 最大 {direct_max:.2} ms（首帧缩放 {first_scale_ms:.2} ms + \
+             编码 {first_encode_ms:.2} ms）"
+        );
+
+        // ② 回读上传：既有路径（staging CopyResource + Map + CPU 盒式缩放 +
+        // UpdateSubresource 上传 + 编码）。
         let mut readback = BgraReadback::new();
         let readback_started = Instant::now();
-        let (_, _, bgra) = readback.read(&captured)?;
+        let (rb_w, rb_h, bgra) = readback.read(&captured)?;
+        let mut scaled_bgra = if (rb_w, rb_h) == (dst_w, dst_h) {
+            bgra
+        } else {
+            scale_bgra_to_rgba(&bgra, rb_w, rb_h, dst_w, dst_h)?
+        };
+        // `scale_bgra_to_rgba` 返回的是 RGBA 字节序；编码器配的是 BGRA，换回来。
+        for pixel in scaled_bgra.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
         let readback_ms = readback_started.elapsed().as_secs_f64() * 1000.0;
         let encode_started = Instant::now();
-        let uploaded = encoder.encode_bgra(&bgra, true)?;
+        let uploaded = encoder.encode_bgra(&scaled_bgra, true)?;
         let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        let readback_total_ms = readback_ms + encode_ms;
 
         println!(
-            "零拷贝对照: 直通 {} 字节（{direct_ms:.2} ms）| 回读 {} 字节（回读 {readback_ms:.2} ms + 编码 {encode_ms:.2} ms），zero-copy used = true",
+            "零拷贝对照: 回读 + 缩放 + 编码 总计 {readback_total_ms:.2} ms（回读+缩放 {readback_ms:.2} ms \
+             + 编码 {encode_ms:.2} ms）| 直通 {} 字节 | 回读 {} 字节",
             direct.payload_len(),
             uploaded.payload_len(),
         );
 
+        // 判据：≤10 ms 达标；10–20 ms 报「高于预期但可用」；>20 ms 明确失败。
+        if direct_median > 20.0 {
+            println!(
+                "零拷贝对照: zero-copy used = false 原因=GPU 缩放 + 直通编码中位 {direct_median:.2} ms 超过 20 ms 阈值"
+            );
+        } else if direct_median > 10.0 {
+            println!(
+                "零拷贝对照: 警告：GPU 缩放 + 直通编码中位 {direct_median:.2} ms 高于 10 ms 预期（仍判定 zero-copy used = true）"
+            );
+        } else {
+            println!(
+                "零拷贝对照: zero-copy used = true（GPU 缩放 + 直通编码中位 {direct_median:.2} ms ≤ 10 ms，回读路径 {readback_total_ms:.2} ms）"
+            );
+        }
+
         // 解码比对放在最后：即使解码器建不起来（例如 4K 输入超出 MFT 能力），
-        // 上面的「直通确实编出了码流」仍然是有效结论。
-        let mut decoder = match H264Decoder::new(width, height) {
+        // 上面的耗时对照仍然是有效结论。
+        let mut decoder = match H264Decoder::new(dst_w, dst_h) {
             Ok(decoder) => decoder,
             Err(err) => {
                 println!("零拷贝对照: 解码器不可用，跳过像素比较（{err}）");
                 return Ok(());
             }
         };
-        let reference = bgra_to_rgba(&bgra);
+        let reference = bgra_to_rgba(&scaled_bgra);
         let direct_frame = decoder.decode(&direct.data)?;
         let uploaded_frame = decoder.decode(&uploaded.data)?;
         let (Some(direct_frame), Some(uploaded_frame)) = (direct_frame, uploaded_frame) else {

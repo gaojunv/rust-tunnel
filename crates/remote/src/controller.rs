@@ -851,6 +851,12 @@ pub(crate) async fn run_controller_with_input(
                             // 看门狗必须因此保持安静（否则静止桌面在补丁模式下每 3s 白请 IDR）。
                             stall_requests = 0;
                             last_frame_at = Instant::now();
+                            // 抖动读数跨模式切换不采样：补丁模式期间没有视频包，若沿用上一个
+                            // 视频包的到达时刻，模式切换那一刻会被算成一个巨大的「帧间隔」，
+                            // 把 A5 抖动读数冲高。补丁到达即视为序列中断，重新起算相邻视频包
+                            // 间隔——抖动的定义不变（仍是相邻视频包到达间隔的二阶差分）。
+                            last_packet_at = None;
+                            prev_packet_interval = None;
                             // 空批 = 保活：不入队、不重绘，只让上面的看门狗计时生效。
                             if rects.is_empty() {
                                 continue;

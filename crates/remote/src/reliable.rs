@@ -37,7 +37,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
@@ -313,6 +313,18 @@ pub struct ReliableMetrics {
     pub(crate) out_of_window_drops: AtomicU64,
     /// 收到的按序段数（累计）。
     pub(crate) in_order_segments: AtomicU64,
+    /// 最近一次采样的传输层平滑 RTT（微秒；0 = 尚无样本）。
+    pub(crate) srtt_us: AtomicU64,
+    /// 当前 RTO（微秒）。
+    pub(crate) rto_us: AtomicU64,
+    /// 当前拥塞窗口（字节）。
+    pub(crate) cwnd_bytes: AtomicU64,
+    /// 当前在途未确认字节。
+    pub(crate) inflight_bytes: AtomicU64,
+    /// 对端最近通告的接收窗口（段）。
+    pub(crate) peer_window_segments: AtomicU64,
+    /// 对端地址（建连时确定，之后不变）。
+    pub(crate) peer_addr: OnceLock<SocketAddr>,
 }
 
 /// 一次原子快照（全部是**累计值**；调用方自己跨秒求差）。
@@ -336,6 +348,18 @@ pub struct ReliableSnapshot {
     pub out_of_window_drops: u64,
     /// 收到的按序段数。
     pub in_order_segments: u64,
+    /// 传输层平滑 RTT（微秒；0 = 尚无样本）。
+    pub srtt_us: u64,
+    /// 当前 RTO（微秒）。
+    pub rto_us: u64,
+    /// 当前拥塞窗口（字节）。
+    pub cwnd_bytes: u64,
+    /// 当前在途未确认字节。
+    pub inflight_bytes: u64,
+    /// 对端最近通告的接收窗口（段）。
+    pub peer_window_segments: u64,
+    /// 对端地址。
+    pub peer_addr: Option<SocketAddr>,
 }
 
 impl ReliableMetrics {
@@ -352,6 +376,12 @@ impl ReliableMetrics {
             duplicate_segments: read(&self.duplicate_segments),
             out_of_window_drops: read(&self.out_of_window_drops),
             in_order_segments: read(&self.in_order_segments),
+            srtt_us: read(&self.srtt_us),
+            rto_us: read(&self.rto_us),
+            cwnd_bytes: read(&self.cwnd_bytes),
+            inflight_bytes: read(&self.inflight_bytes),
+            peer_window_segments: read(&self.peer_window_segments),
+            peer_addr: self.peer_addr.get().copied(),
         }
     }
 
@@ -467,6 +497,8 @@ struct Conn {
 impl Conn {
     /// 建一条新连接（握手的 SYN 已由 [`connect`]/[`accept`] 交换完毕）。
     fn new(link: Arc<dyn DatagramSender>, conn_id: u64, peer: SocketAddr) -> Self {
+        let metrics = Arc::new(ReliableMetrics::default());
+        metrics.peer_addr.set(peer).ok();
         Self {
             link,
             conn_id,
@@ -498,7 +530,7 @@ impl Conn {
             consecutive_timeouts: 0,
             outgoing: Vec::new(),
             stats: ConnStats::default(),
-            metrics: Arc::new(ReliableMetrics::default()),
+            metrics,
             fatal: false,
         }
     }
@@ -506,6 +538,26 @@ impl Conn {
     /// 把当前 [`ConnStats`] 同步进共享指标（每轮循环调一次；`Relaxed` 单调写）。
     fn sync_metrics(&self) {
         self.metrics.store(&self.stats);
+        // 诊断读数：传输层自己的 RTT/窗口状态。它们与 `ConnStats` 的累计计数不同，
+        // 是**瞬时值**，供日志区分「网络 RTT 高」与「应用层排队」。
+        let store = |cell: &AtomicU64, value: u64| cell.store(value, Ordering::Relaxed);
+        store(
+            &self.metrics.srtt_us,
+            u64::try_from(self.srtt.unwrap_or_default().as_micros()).unwrap_or(u64::MAX),
+        );
+        store(
+            &self.metrics.rto_us,
+            u64::try_from(self.rto.as_micros()).unwrap_or(u64::MAX),
+        );
+        store(&self.metrics.cwnd_bytes, u64::try_from(self.cwnd).unwrap_or(u64::MAX));
+        store(
+            &self.metrics.inflight_bytes,
+            u64::try_from(self.inflight_bytes()).unwrap_or(u64::MAX),
+        );
+        store(
+            &self.metrics.peer_window_segments,
+            u64::from(self.peer_window),
+        );
     }
 
     /// 当前接收窗口（段）。
@@ -1391,7 +1443,17 @@ mod tests {
             mut stream,
             metrics,
         } = ra;
-        assert_eq!(metrics.snapshot(), ReliableSnapshot::default(), "握手期还没有数据段");
+        assert_eq!(
+            (
+                metrics.snapshot().sent_segments,
+                metrics.snapshot().acked_segments,
+                metrics.snapshot().rto_timeouts,
+            ),
+            (0, 0, 0),
+            "握手期还没有数据段"
+        );
+        let handshake = metrics.snapshot();
+        assert_eq!(handshake.peer_addr, Some(addr_b), "建连后应锁定对端地址");
         stream.write_all(&pattern(4096)).await.unwrap();
         // 虚拟时钟前进：协议任务有机会把数据发出去、收 ACK 并同步计数。
         tokio::time::sleep(Duration::from_millis(500)).await;

@@ -19,7 +19,8 @@
 //!   = 25` 会把前 25 帧全缓冲住、一帧都不吐。
 //! - `cpu_used = 8`：4K 下唯一能落进 40 ms 预算的设置；本模块默认编码宽度 ≤
 //!   [`MAX_ENCODE_WIDTH`]（1080p 级），8 仍有充分余量。
-//! - `rc_buffer_size_ms ≈ 300`：默认 6000 ms 下 CBR 在秒级尺度几乎不控码率（补丁 4）。
+//! - `rc_buffer_size_ms` 约两帧时长（20/30/60 fps → 100/66/50 ms，带 50–300 ms 钳制）：
+//!   默认 6000 ms 下 CBR 在秒级尺度几乎不控码率，而固定半秒额度又让单帧能堵住链路（补丁 4）。
 //! - `keyframe_interval` 只作**兜底**：实测 libvpx 在 `VPX_KF_AUTO` + realtime + CBR 下
 //!   **不会**按场景切换自动插 IDR（250 帧逐帧整屏反色只在 `kf_max_dist` 的整数倍处出关键帧），
 //!   故无需 `kf_min_dist` 补丁。IDR 完全由上层显式驱动（首帧 / 配置变更 / `RequestKeyframe`）。
@@ -61,8 +62,20 @@ pub const MAX_FRAME_DIM: u32 = 16384;
 /// 关键帧兜底间隔（帧数）。约合 12 fps 下 25 秒；正常路径由显式 `RequestKeyframe` 驱动。
 const KEYFRAME_INTERVAL: usize = 300;
 
-/// CBR 的码率控制缓冲（毫秒）。交互级——见模块文档。
-const RC_BUFFER_MS: usize = 300;
+/// CBR 的码率控制缓冲：约两帧时长（毫秒），带下限保护。
+///
+/// 旧实现固定 300 ms（半秒量级）——单帧可以吃掉这么大额度，一帧就要在链路上走几百
+/// 毫秒，后续帧全被堵住（帧到达抖动 400–500 ms）。按帧算：20 fps → 100 ms、30 fps →
+/// 66 ms、60 fps → 50 ms（下限，libvpx 对过小的 rc buffer 不友好）。
+///
+/// **只在 [`VideoEncoder::new`] 构造时设定**：vendor 封装（补丁 6 的在线重配置口）只
+/// 暴露 `rc_target_bitrate` / `g_timebase`，没有改 `rc_buf_sz` 的入口，所以 `set_fps`
+/// 不会重算它（避免为此改 vendor）。
+fn rc_buffer_ms(fps: u32) -> usize {
+    // u32 在 32/64 位目标上都能无损转成 usize；`unwrap_or(1)` 只是防御。
+    let fps = usize::try_from(fps.max(1)).unwrap_or(1);
+    (2000 / fps).clamp(50, 300)
+}
 
 /// libvpx 编码速度档（VP9 0–9，越大越快）。4K 达标的唯一设置。
 const CPU_USED: usize = 8;
@@ -407,7 +420,7 @@ impl VideoEncoder {
         config.lag_in_frames = Some(NonZeroUsize::MIN);
         config.error_resilient = true;
         config.keyframe_interval = Some(nonzero(KEYFRAME_INTERVAL));
-        config.rc_buffer_size_ms = Some(nonzero(RC_BUFFER_MS));
+        config.rc_buffer_size_ms = Some(nonzero(rc_buffer_ms(u32::from(max_fps))));
 
         let inner = Encoder::new(config)
             .map_err(|err| RemoteError::Encode(format!("VP9 编码器创建失败: {err}")))?;
@@ -454,6 +467,10 @@ impl VideoEncoder {
     }
 
     /// **在线**重配置帧率（不重建编码器、不插 IDR）。同 [`VideoEncoder::set_bitrate`]。
+    ///
+    /// **VBV 只在构造时设定，fps 变化不重算**：vendor 的在线重配置口只改
+    /// `rc_target_bitrate` / `g_timebase`，没有 `rc_buf_sz` 的入口（见 [`rc_buffer_ms`]）。
+    /// 会话内 fps 变化幅度有限，构造时的两帧额度仍然成立，不值得为此改 vendor。
     ///
     /// # Errors
     /// libvpx 拒绝该配置时返回 [`RemoteError::Encode`]。
@@ -658,6 +675,19 @@ mod tests {
 
     fn encode_frame(enc: &mut VideoEncoder, rgba: &[u8], w: u32, h: u32, force: bool) -> EncodedVideo {
         enc.encode(rgba, w, h, force).expect("编码应成功")
+    }
+
+    /// rc buffer 按「约两帧时长」计算，并受 50–300 ms 钳制。
+    #[test]
+    fn rc_buffer_is_about_two_frames() {
+        assert_eq!(rc_buffer_ms(20), 100);
+        assert_eq!(rc_buffer_ms(30), 66);
+        // 60 fps 的两帧时长是 33 ms，触及 50 ms 下限（libvpx 对过小的 buffer 不友好）。
+        assert_eq!(rc_buffer_ms(60), 50);
+        // 极低帧率被 300 ms 上限截住（也就是旧固定值）。
+        assert_eq!(rc_buffer_ms(1), 300);
+        // 0 按 1 处理，不除零。
+        assert_eq!(rc_buffer_ms(0), 300);
     }
 
     #[test]

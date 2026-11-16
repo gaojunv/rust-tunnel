@@ -4,9 +4,10 @@
 //!
 //! - **采集**：优先用 `rust-tunnel-win-video` 的 WGC/DXGI（自顶向下 BGRA，
 //!   4K 实测约 20 ms/帧），失败时**逐帧回退**到既有的 xcap（GDI）。
-//! - **编码**：NVENC H.264 4:2:0。采集纹理与编码器**同设备且尺寸相等**时直接
-//!   注册给 NVENC（零拷贝，不落 CPU）；否则回读 BGRA，必要时 CPU 盒式下采样后再
-//!   上传（NVENC 对输入只做左上角裁剪、不做缩放，例如 4K 采集 → 1920 宽编码）。
+//! - **编码**：NVENC H.264 4:2:0。采集纹理与编码器**同设备**时直接注册给 NVENC
+//!   （零拷贝，不落 CPU）：尺寸相等就原样直通，尺寸不等（4K 采集 → 1920 编码）先用
+//!   同一块 GPU 上的 VideoProcessor 缩到编码尺寸再直通；只有跨设备（混合显卡）或
+//!   直通在本会话失败过时才回读 BGRA，必要时 CPU 盒式下采样后上传。
 //! - **解码**：Media Foundation 的 `MSH264DecoderMFT`（控制器侧）。
 //!
 //! 平台能力探测在 [`factories`]：NVENC（DLL + NVIDIA 适配器）可用、或 NVENC
@@ -43,6 +44,7 @@ use rust_tunnel_win_video::decode::{
 use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
+use rust_tunnel_win_video::scale::TextureScaler;
 use tracing::{debug, info, warn};
 
 use super::XcapScreen;
@@ -922,6 +924,8 @@ impl HardwareEncoderFactory {
                 Ok(Box::new(NvencAdapter {
                     encoder,
                     readback: BgraReadback::new(),
+                    scaler: None,
+                    scaler_unavailable: false,
                     zero_copy_disabled: false,
                     zero_copy_logged: false,
                 }))
@@ -1010,14 +1014,14 @@ impl VideoEncoderFactory for HardwareEncoderFactory {
     }
 }
 
-/// 是否可以用零拷贝直通（把采集纹理直接交给 NVENC，`nvEncRegisterResource`）。
+/// 是否可以用**同尺寸**零拷贝直通（把采集纹理直接交给 NVENC，`nvEncRegisterResource`）。
 ///
 /// 三个条件缺一不可：
 /// - **同设备**：注册给 NVENC 的资源必须与编码会话在同一块 D3D11 设备上；跨设备
 ///   注册会被驱动直接拒绝（混合显卡下采集常常落在 Intel 核显）。
-/// - **尺寸相等**：NVENC 的 `inputWidth/Height` 只做左上角裁剪、**不缩放**，4K 采集
-///   按默认上限缩到 1920 时尺寸不同，必须先回读 + CPU 盒式下采样；原生分辨率（3840）
-///   下两者相等，直通才有机会命中。
+/// - **尺寸相等**：NVENC 的 `inputWidth/Height` 只做左上角裁剪、**不缩放**。尺寸
+///   不等时先走 [`TextureScaler`] 在 GPU 上缩到编码尺寸再直通（`NvencAdapter::
+///   encode_frame` 的另一条分支）；本函数只判断「无需缩放」的同尺寸直通。
 /// - **本会话未禁用直通**：注册/映射失败过一次就永久回退（单向开关），避免每帧
 ///   重试一次注定失败的驱动调用。
 fn can_use_direct_texture(
@@ -1031,17 +1035,23 @@ fn can_use_direct_texture(
 
 /// `NvencEncoder` 的 remote 适配器。
 ///
-/// **两条输入路径**（见 [`can_use_direct_texture`]）：
-/// - 采集纹理与编码器同设备且尺寸相等时，纹理**直接注册给 NVENC**，全程不落 CPU；
-/// - 否则（混合显卡跨设备、4K → 1920 缩放、或直通已在本会话失败过）回读 BGRA，
+/// **三条输入路径**：
+/// - 采集纹理与编码器同设备且**尺寸相等**时，纹理直接注册给 NVENC，全程不落 CPU；
+/// - 同设备但**尺寸不等**（4K 采集 → 1920 编码）时，先用 [`TextureScaler`] 的
+///   VideoProcessor 在 GPU 上缩到编码尺寸，再走同一条纹理直通（零拷贝）；
+/// - 跨设备（混合显卡）、缩放器不可用、或直通已在本会话失败过时，回读 BGRA，
 ///   必要时做 CPU 盒式下采样，再走 `UpdateSubresource` 上传。
 ///
-/// 直通失败只关掉直通本身，**不关 GPU 采集**：回读路径仍然可用，当帧照常编码。
+/// 直通/缩放失败只关掉直通本身，**不关 GPU 采集**：回读路径仍然可用，当帧照常编码。
 struct NvencAdapter {
     /// 硬件编码器（只借用 `'static` 的函数表，设备由编码器持有）。
     encoder: NvencEncoder<'static>,
     /// 可复用的 GPU→CPU 回读器（staging 纹理按尺寸缓存）。
     readback: BgraReadback,
+    /// GPU 缩放器（同设备、尺寸不等时用；按需创建一次）。
+    scaler: Option<TextureScaler>,
+    /// 缩放器构造失败过：本会话不再重试（回读路径照常可用）。
+    scaler_unavailable: bool,
     /// 本会话是否已禁用纹理直通（单向；只影响直通，不影响 GPU 采集）。
     zero_copy_disabled: bool,
     /// 是否已打印过「直通已启用」日志（只打一次，便于真机确认走的是零拷贝）。
@@ -1049,6 +1059,31 @@ struct NvencAdapter {
 }
 
 impl NvencAdapter {
+    /// 取本会话的 GPU 缩放器，首次需要时创建。
+    ///
+    /// 构造失败（设备不支持 VideoProcessor 等）只把 [`Self::scaler_unavailable`]
+    /// 置位，**不**关闭纹理直通、更不关闭 GPU 采集：同尺寸直通与回读兜底都还在。
+    fn scaler(&mut self) -> Option<&mut TextureScaler> {
+        if self.scaler.is_none() && !self.scaler_unavailable {
+            match TextureScaler::new(Arc::clone(self.encoder.device())) {
+                Ok(scaler) => {
+                    // GUI 日志层会丢 tracing 字段，全部内联。
+                    info!(
+                        "NVENC GPU 缩放器已就绪 adapter={}（4K→编码尺寸走纹理零拷贝）",
+                        self.encoder.device().adapter.name
+                    );
+                    self.scaler = Some(scaler);
+                }
+                Err(err) => {
+                    self.scaler_unavailable = true;
+                    // GPU 缩放不可用只回退回读，不影响采集与同尺寸直通。
+                    warn!("NVENC GPU 缩放不可用，4K→编码尺寸回退回读上传：{err}");
+                }
+            }
+        }
+        self.scaler.as_mut()
+    }
+
     /// 把采集纹理回读成编码器尺寸的 **BGRA**。
     ///
     /// 同尺寸时直接返回回读结果（零转换）；4K 采集封顶到 1920 时用
@@ -1181,13 +1216,56 @@ impl VideoEncoderApi for NvencAdapter {
             .ok_or_else(|| RemoteError::Encode("NVENC 收到无法识别的 GPU 帧".to_owned()))?;
         // 直通选路。**同设备**由 `Arc::ptr_eq` 判断：工厂在采集设备是 NVIDIA 时
         // 直接复用它，采集源重建换设备后这里会自动落回回读。
+        let same_device = self.encoder.is_same_device(&gpu_frame.texture.device);
         let source = (gpu_frame.source_width, gpu_frame.source_height);
-        if can_use_direct_texture(
-            self.encoder.is_same_device(&gpu_frame.texture.device),
-            source,
-            self.encoder.size(),
-            self.zero_copy_disabled,
-        ) {
+        let target = self.encoder.size();
+        // 优先：同设备但尺寸不等（4K 采集 → 1080p 编码）。采集纹理**先在 GPU 上
+        // 缩到编码尺寸**（VideoProcessor），再走真正的纹理直通——否则 NVENC 只按
+        // `inputWidth/Height` 做左上角裁剪、根本不缩放，只能回读 4K（真机实测
+        // 回读 + CPU 缩放 + 上传合计 ~43 ms/帧，NVENC 本身只要 3.4 ms）。
+        if same_device && source != target && !self.zero_copy_disabled {
+            // 先把缩放结果拿出来，结束对 `self.scaler` 的借用，再动编码器。
+            // `None` = 缩放器构造失败（已在 `scaler()` 里打过一次日志）。
+            let scaled = match self.scaler() {
+                Some(scaler) => Some(scaler.scale(
+                    &gpu_frame.texture.texture,
+                    source,
+                    target,
+                )),
+                None => None,
+            };
+            match scaled {
+                Some(Ok(texture)) => match self.encoder.encode_texture(&texture, force_keyframe) {
+                    Ok(packet) => {
+                        if !self.zero_copy_logged {
+                            self.zero_copy_logged = true;
+                            // GUI 日志层会丢 tracing 字段，全部内联。
+                            info!(
+                                "NVENC 纹理直通已启用（GPU 缩放，零拷贝） source={source:?} target={target:?}"
+                            );
+                        }
+                        return Ok(EncodedVideo {
+                            data: packet.data,
+                            keyframe: packet.keyframe,
+                        });
+                    }
+                    Err(err) => {
+                        // 直通失败**只关直通**：回读路径照常可用，本帧继续编码。
+                        self.zero_copy_disabled = true;
+                        // GUI 日志层会丢 tracing 字段，原因全部内联。
+                        warn!("NVENC GPU 缩放直通不可用，本会话回退回读上传：{err}");
+                    }
+                },
+                Some(Err(err)) => {
+                    // 缩放失败同样只关直通（单向），采集与回读兜底不受影响。
+                    self.zero_copy_disabled = true;
+                    warn!("NVENC GPU 缩放失败，本会话回退回读上传：{err}");
+                }
+                // 缩放器构造失败：本帧回读，不改 `zero_copy_disabled`（同尺寸直通
+                // 仍可能可用，且不能再试一次注定失败的构造）。
+                None => {}
+            }
+        } else if can_use_direct_texture(same_device, source, target, self.zero_copy_disabled) {
             match self
                 .encoder
                 .encode_texture(&gpu_frame.texture.texture, force_keyframe)

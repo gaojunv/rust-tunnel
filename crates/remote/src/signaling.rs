@@ -591,6 +591,12 @@ impl RustDeskTransport {
     /// `always_use_relay` 是**两侧**的 kill switch。补上被控端这一侧（旧实现忽略它，导致规则
     /// 不对称：控制器强制中继、被控端仍去打洞/直连）。
     async fn establish_controlled(&self, request: &EstablishRequest) -> RemoteResult<EstablishedStream> {
+        debug!(
+            always_use_relay = self.cfg.always_use_relay,
+            nat = ?self.nat_class,
+            prefer_direct = request.prefer_direct,
+            "被控端开始建立数据面（路径候选）"
+        );
         if self.cfg.always_use_relay {
             self.wait_relay_push(&request.session_id, RELAY_WAIT).await?;
             let stream = self.connect_relay(&request.session_id, &[]).await?;

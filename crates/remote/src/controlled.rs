@@ -72,8 +72,13 @@
 //!   只有真正让参考链/几何失效的事件才 IDR：会话首帧、`RequestKeyframe`、`SelectDisplay` /
 //!   `SetQuality`、显示器分辨率变化、QoS 降分辨率、编码器重建。无条件插 IDR 会让每次切窗口/
 //!   开文件夹都付出一个 150–400 KB 的带宽尖峰。
-//! - **退出即全帧**：补丁采集失败、活跃度过高、矩形过多/过大等只回到全帧并**立刻抓帧**
-//!   （不插 IDR）；几何真的变了（显示器/缩放）才连带强制 IDR。
+//! - **超预算先拆批，不退出**：单条 `RegionUpdate` 的上限是 32 KiB，单个脏矩形编码后超限时
+//!   按行拆成若干横条分多条消息发出（同一拍总量 256 KiB / 最多 8 条）。只有**真的装不下**
+//!   （矩形数、单拍总量或条数超限）才回全帧。
+//! - **退出即全帧，且退出一律带冷却**：补丁采集失败、活跃度过高、装不下等只回到全帧并
+//!   **立刻抓帧**（不插 IDR）；几何真的变了（显示器/缩放）才连带强制 IDR。退出后
+//!   [`PATCH_REENTRY_HOLDOFF`]（2 s）内不重新进入，避免「退出 → 整帧 → 再进入 → 再整帧」
+//!   的抖动正反馈。
 //! - **QoS 闭环在补丁模式下暂停**：控制器此时不解码视频，`decode_ms`/`recv_kbps` 是陈旧值，
 //!   喂给 AIMD 只会制造假拥塞。回到全帧后的下一条 `QosFeedback` 自然恢复闭环。
 
@@ -84,7 +89,7 @@ use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
     native_bitrate_ceiling, CaptureInfo, CapturedPatches, Clipboard, DisplayInfo, EncodeOptions,
-    EncodeRates, EncoderInfo, InputSink, RawFrame, ScreenSource,
+    EncodeRates, EncoderInfo, InputSink, RawFrame, ScreenPatch, ScreenSource,
 };
 use crate::session::{
     trusted_rtt, CodecId, HostActivity, HostStats, RegionRect, SessionCodec, SessionEnd, SessionFrame,
@@ -99,7 +104,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -436,12 +441,40 @@ const PATCH_MAX_INTERVAL: Duration = Duration::from_millis(33);
 /// level 1 的编码速度远快于采集节拍，单块几 KB，收益却很明显（桌面文本/色块高度可压）。
 const PATCH_ZSTD_LEVEL: i32 = 1;
 
-/// 单条 `RegionUpdate` 压缩后**总字节**上限（64 KiB）。
+/// 单条 `RegionUpdate` 的压缩后**总字节**上限（32 KiB）。
 ///
-/// 超过它说明脏矩形过多/过大，补丁已经不比全帧划算，且会给控制端的解压/合成带来尖峰——
-/// 直接回全帧（参考链没断，第一帧 P 帧即可）。普通 UI 变化（一行文本/一个菜单）压缩后只有
-/// 几 KB 到几十 KB；64 KiB 已经是很宽松的单批上限。
-const PATCH_MAX_TOTAL_BYTES: usize = 64 * 1024;
+/// 单条越大，控制端的解压/合成尖峰越明显；取 32 KiB 之后，一个「面积不大但内容复杂」的
+/// 脏矩形可以被**拆成若干横条**分多条消息发出，而不是像以前那样一旦超过整批上限就退回全帧。
+/// 拆批的理由见 [`PATCH_MAX_TICK_BYTES`]。
+const PATCH_MESSAGE_MAX_BYTES: usize = 32 * 1024;
+
+/// 单拍（一次采集）最多发多少条 `RegionUpdate`。
+///
+/// 超过它说明这一拍的变化量已经大到补丁不比整帧划算，直接回全帧。
+const PATCH_MAX_MESSAGES_PER_TICK: usize = 8;
+
+/// 单拍（一次采集）补丁的压缩后**总字节**上限（256 KiB = 8 × 32 KiB）。
+///
+/// 它同时是「窗口预算」的天花板：补丁窗口兜底最多允许 `PATCH_MAX_BUDGET_KBPS`（2000 kbps）
+/// × 1s ≈ 250 KB，更大的单拍批本来就会被 `PatchMode::admit_patch_bytes` 拒绝。
+///
+/// **为什么从旧的单批 64 KiB 抬到这里**：真机日志里「一个面积不大但内容复杂的脏矩形压缩后
+/// 超过 64 KiB」会让补丁模式退出 → 发一整帧 → 0.2 s 后又进入（进入前还要再发一整帧基准帧）
+/// → 再次超预算，形成 200–700 ms 的整帧循环，正是角标抖动与卡顿的来源。现在单条消息仍有
+/// 32 KiB 上限（控制端不吃尖峰），单拍总量只约束「一次 UI 变化」的规模。
+///
+/// 拆出来的多条消息是同一条画面 FIFO 上的**独立帧**，控制器按到达顺序**逐条**合成，所以
+/// 首块在约「32 KiB / 链路速率」后就能显示，不必等整批发完——这正是它能替代「退回全帧」
+/// 的原因（整帧要等编码完成且整帧送达才可见）。
+const PATCH_MAX_TICK_BYTES: usize = PATCH_MESSAGE_MAX_BYTES * PATCH_MAX_MESSAGES_PER_TICK;
+
+/// 退出补丁模式后的**重入冷却**（2 秒）。
+///
+/// 退出原因（超预算、关键帧请求、活跃度回升）往往下一拍就消失；没有冷却时连续
+/// [`PATCH_ENTER_TICKS`] 个安静拍（≈100 ms）就会重新进入，而进入前必须把一整帧基准帧写进
+/// 队列——「退出 → 全帧 → 再进入 → 再全帧」因此会变成正反馈。2 秒足够让一次突发过去，又
+/// 不至于让静止桌面长时间停在整帧模式。
+const PATCH_REENTRY_HOLDOFF: Duration = Duration::from_secs(2);
 
 /// 补丁出码的**窗口长度**（带宽保护）。
 const PATCH_BANDWIDTH_WINDOW: Duration = Duration::from_secs(1);
@@ -497,6 +530,8 @@ struct PatchMode {
     patch_window_start: std::time::Instant,
     /// 本窗口内已发出的补丁字节数。
     patch_window_bytes: u64,
+    /// 重入冷却的截止时刻（见 [`PATCH_REENTRY_HOLDOFF`]）：`None` = 不在冷却期。
+    holdoff_until: Option<std::time::Instant>,
 }
 
 impl PatchMode {
@@ -509,6 +544,7 @@ impl PatchMode {
             last_patch_sent: None,
             patch_window_start: std::time::Instant::now(),
             patch_window_bytes: 0,
+            holdoff_until: None,
         }
     }
 
@@ -550,6 +586,15 @@ impl PatchMode {
     /// 返回 `true` 表示本帧必须作为**基准全帧**：调用方据此置 `force_encode`（只需 P 帧，
     /// 补丁不碰参考链）并清 `base_frame_sent`（见模块文档的「顺序」约束）。
     fn observe_video(&mut self, changed_permille: u16, now: std::time::Instant) -> bool {
+        // 重入冷却：刚退出补丁模式的一段时间内连续安静也**不**重新进入。冷却期内把连续计数
+        // 清零，冷却结束后重新从 0 开始累计（见 [`PATCH_REENTRY_HOLDOFF`]）。
+        if let Some(until) = self.holdoff_until {
+            if now < until {
+                self.enter_streak = 0;
+                return false;
+            }
+            self.holdoff_until = None;
+        }
         // 已经在等基准帧：不重复触发（否则每帧都会重置截止时刻）。
         if self.enter_pending {
             return false;
@@ -594,11 +639,15 @@ impl PatchMode {
     }
 
     /// 退出补丁模式并清掉进入判据的历史（几何/参考已失效，需要重新积累）。
-    fn exit(&mut self) {
+    ///
+    /// `now` 由调用方传入（而不是内部取 `Instant::now()`）：单测要能直接构造时刻验证冷却，
+    /// 不必真的等待 [`PATCH_REENTRY_HOLDOFF`]。
+    fn exit(&mut self, now: std::time::Instant) {
         self.mode = ScreenMode::Video;
         self.enter_streak = 0;
         self.enter_pending = false;
         self.enter_deadline = None;
+        self.holdoff_until = Some(now + PATCH_REENTRY_HOLDOFF);
     }
 }
 
@@ -696,13 +745,16 @@ fn refresh_activity(
 /// **不在这里强制关键帧**：补丁不碰参考链，退出后的第一帧 P 帧就能被正确解码。
 /// 调用方只在参考链/几何真的失效时（`RequestKeyframe`、切显示器、改缩放）额外置
 /// `force_keyframe`。无条件插 IDR 会让每次切窗口/开文件夹都付出一个 150–400 KB 的尖峰。
+///
+/// 退出同时开启重入冷却（[`PATCH_REENTRY_HOLDOFF`]），避免「退出 → 整帧 → 立刻再进入 →
+/// 再整帧」的抖动正反馈。
 fn exit_patch_mode(
     mode: &mut PatchMode,
     force_encode: &mut bool,
     last_changed_permille: &mut u16,
     capture_tick: &mut Pin<Box<Sleep>>,
 ) {
-    mode.exit();
+    mode.exit(std::time::Instant::now());
     *force_encode = true;
     // 面积未知/刚发生大变化：保守给满面积，别让下一次 1Hz 反馈拿补丁模式里的旧值
     // 把内容上限压回 UI 档（15 fps / 1.2 Mbps）。
@@ -710,53 +762,217 @@ fn exit_patch_mode(
     capture_tick.as_mut().reset(Instant::now());
 }
 
-/// 把一批采集到的脏矩形装成一条 `RegionUpdate`。
+/// 一段已编码（压缩或原始）的横向条块，坐标是**目标帧缓冲**坐标系。
+struct EncodedRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    flags: u8,
+    data: Vec<u8>,
+}
+
+/// 压缩一段紧包 NV12：压缩后**确实更小**才用 [`REGION_FLAG_ZSTD`]，否则存原始（极小块的
+/// zstd 帧头开销比省下的字节还多）。
+fn encode_nv12(compressor: &mut zstd::bulk::Compressor<'static>, nv12: &[u8]) -> (u8, Vec<u8>) {
+    match compressor
+        .compress(nv12)
+        .ok()
+        .filter(|data| data.len() < nv12.len())
+    {
+        Some(data) => (REGION_FLAG_ZSTD, data),
+        None => (0u8, nv12.to_vec()),
+    }
+}
+
+/// 从矩形的紧包 NV12 里取一段**横向条带**：`[y0, y1)` 行（两个端点都是偶数）的 Y 平面 +
+/// 对应的 UV 行。
 ///
-/// 每个矩形独立压缩：压缩后**确实更小**才用 [`REGION_FLAG_ZSTD`]，否则存原始 NV12（极小块
-/// 的 zstd 帧头开销比省下的字节还多）。总字节超过 [`PATCH_MAX_TOTAL_BYTES`] 或矩形数超过
-/// [`MAX_REGION_RECTS`] 时返回 `None`：调用方据此回到全帧。
+/// 布局是 `Y(width*height) ‖ UV(width*height/2)`、无行填充（见 [`ScreenPatch`]），所以：
+/// - Y：`y0*width .. y1*width`
+/// - UV 每行 `width` 字节、共 `height/2` 行，起始偏移 `width*height + (y0/2)*width`
 ///
-/// `capture_ts_us` 是本批采集完成的时刻，原样写进消息供控制器算端到端延迟。
-fn build_region_update(
+/// 输出长度固定为 `width*(y1-y0)*3/2`。源缓冲长度不符时返回 `None`（宁可回全帧，也不读越界）。
+fn nv12_band(rect: &ScreenPatch, y0: u32, y1: u32) -> Option<Vec<u8>> {
+    let width = usize::try_from(rect.width).ok()?;
+    let height = usize::try_from(rect.height).ok()?;
+    let expected = width.checked_mul(height)?.checked_mul(3)? / 2;
+    if rect.nv12.len() != expected {
+        return None;
+    }
+    let top = usize::try_from(y0).ok()?;
+    let bottom = usize::try_from(y1).ok()?;
+    let y_start = top.checked_mul(width)?;
+    let y_end = bottom.checked_mul(width)?;
+    let uv_base = width.checked_mul(height)?;
+    let uv_start = uv_base.checked_add(top.checked_div(2)?.checked_mul(width)?)?;
+    let uv_end = uv_base.checked_add(bottom.checked_div(2)?.checked_mul(width)?)?;
+    let mut band = Vec::with_capacity((y_end - y_start) + (uv_end - uv_start));
+    band.extend_from_slice(rect.nv12.get(y_start..y_end)?);
+    band.extend_from_slice(rect.nv12.get(uv_start..uv_end)?);
+    Some(band)
+}
+
+/// 编码矩形 `[y0, y1)` 这一段行；超出单条消息上限时按高度二分递归，直到每段都装得下。
+///
+/// 切点取 `(span / 2) & !1`：**两个半区的高度都是偶数**（`y0` 本身是偶数，故子段的起点也
+/// 是偶数），且都至少 2 行。所有递归产出的条带按顺序首尾相接、**无缝且无重叠**地覆盖原矩形。
+fn encode_region_range(
+    compressor: &mut zstd::bulk::Compressor<'static>,
+    rect: &ScreenPatch,
+    y0: u32,
+    y1: u32,
+    max_bytes: usize,
+    out: &mut Vec<EncodedRegion>,
+) -> Option<()> {
+    let (flags, data) = if y0 == 0 && y1 == rect.height {
+        encode_nv12(compressor, &rect.nv12)
+    } else {
+        let band = nv12_band(rect, y0, y1)?;
+        encode_nv12(compressor, &band)
+    };
+    if data.len() <= max_bytes {
+        out.push(EncodedRegion {
+            x: rect.x,
+            y: rect.y.checked_add(y0)?,
+            width: rect.width,
+            height: y1 - y0,
+            flags,
+            data,
+        });
+        return Some(());
+    }
+    // 放不下：按高度二分。2 行仍超上限时无法再拆——宽 ≤ 3840 时 2 行 NV12 ≤ 11520 B，
+    // 不可能发生；真发生说明输入几何异常，交给调用方回全帧。
+    let span = y1 - y0;
+    if span < 4 {
+        return None;
+    }
+    let mid = y0 + ((span / 2) & !1);
+    encode_region_range(compressor, rect, y0, mid, max_bytes, out)?;
+    encode_region_range(compressor, rect, mid, y1, max_bytes, out)
+}
+
+/// 把一批采集到的脏矩形装成**任意条** `RegionUpdate`（生产路径，单条上限
+/// [`PATCH_MESSAGE_MAX_BYTES`]）。
+///
+/// 拆批/装箱逻辑见 [`build_region_updates_with_cap`]。
+fn build_region_updates(
     compressor: &mut zstd::bulk::Compressor<'static>,
     display: u32,
     patches: &CapturedPatches,
     capture_ts_us: u64,
-) -> Option<SessionMessage> {
+) -> Option<Vec<SessionMessage>> {
+    build_region_updates_with_cap(
+        compressor,
+        display,
+        patches,
+        capture_ts_us,
+        PATCH_MESSAGE_MAX_BYTES,
+    )
+}
+
+/// 把一批采集到的脏矩形装成**任意条** `RegionUpdate`。
+///
+/// 每个矩形独立压缩；单个矩形编码后超过 `message_max_bytes` 时按行拆成若干横条
+/// （见 [`encode_region_range`]），再按顺序装箱：每条消息的总字节不超过
+/// `message_max_bytes`、矩形数不超过 [`MAX_REGION_RECTS`]。
+///
+/// `message_max_bytes` 做成参数只为了单测能用很小的上限触发拆分（不必构造几十 KB 的
+/// 随机数据）；生产路径见 [`build_region_updates`]。
+///
+/// 返回 `None` 只代表**真的装不下**：矩形数超过 [`MAX_REGION_RECTS`]、单拍总量超过
+/// [`PATCH_MAX_TICK_BYTES`]、或消息条数超过 [`PATCH_MAX_MESSAGES_PER_TICK`]。调用方据此回
+/// 全帧。空矩形列表仍然产出一条空消息（保活语义不变）。
+///
+/// `capture_ts_us` 是本批采集完成的时刻，原样写进每条消息供控制器算端到端延迟。
+fn build_region_updates_with_cap(
+    compressor: &mut zstd::bulk::Compressor<'static>,
+    display: u32,
+    patches: &CapturedPatches,
+    capture_ts_us: u64,
+    message_max_bytes: usize,
+) -> Option<Vec<SessionMessage>> {
     if patches.rects.len() > MAX_REGION_RECTS {
         return None;
     }
-    let mut rects = Vec::with_capacity(patches.rects.len());
-    let mut total = 0usize;
+    if patches.rects.is_empty() {
+        return Some(vec![SessionMessage::RegionUpdate {
+            display,
+            width: patches.width,
+            height: patches.height,
+            rects: Vec::new(),
+            capture_ts_us,
+        }]);
+    }
+
+    // 1) 逐矩形编码；超限的按行拆成横条，直到每段都 ≤ 单条消息上限。
+    let mut encoded = Vec::new();
     for rect in &patches.rects {
-        let compressed = compressor
-            .compress(&rect.nv12)
-            .ok()
-            .filter(|data| data.len() < rect.nv12.len());
-        let (flags, data) = match compressed {
-            Some(data) => (REGION_FLAG_ZSTD, data),
-            None => (0u8, rect.nv12.clone()),
-        };
-        total = total.checked_add(data.len())?;
-        if total > PATCH_MAX_TOTAL_BYTES {
+        // `ScreenPatch` 的契约是偶数几何；不合契约就回全帧，不硬拆（拆出来会错位）。
+        if rect.width == 0
+            || rect.height == 0
+            || !rect.width.is_multiple_of(2)
+            || !rect.height.is_multiple_of(2)
+        {
+            return None;
+        }
+        encode_region_range(compressor, rect, 0, rect.height, message_max_bytes, &mut encoded)?;
+    }
+
+    // 2) 按顺序装箱：尽量把条块塞进同一条消息，装不下就开下一条。
+    let mut messages: Vec<SessionMessage> = Vec::new();
+    let mut rects: Vec<RegionRect> = Vec::new();
+    let mut message_bytes = 0usize;
+    let mut tick_bytes = 0usize;
+    for region in encoded {
+        let len = region.data.len();
+        if len > message_max_bytes {
+            return None;
+        }
+        if !rects.is_empty()
+            && (message_bytes.saturating_add(len) > message_max_bytes
+                || rects.len() >= MAX_REGION_RECTS)
+        {
+            messages.push(SessionMessage::RegionUpdate {
+                display,
+                width: patches.width,
+                height: patches.height,
+                rects: std::mem::take(&mut rects),
+                capture_ts_us,
+            });
+            if messages.len() > PATCH_MAX_MESSAGES_PER_TICK {
+                return None;
+            }
+            message_bytes = 0;
+        }
+        message_bytes = message_bytes.saturating_add(len);
+        tick_bytes = tick_bytes.saturating_add(len);
+        if tick_bytes > PATCH_MAX_TICK_BYTES {
             return None;
         }
         rects.push(RegionRect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-            flags,
-            data,
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+            flags: region.flags,
+            data: region.data,
         });
     }
-    Some(SessionMessage::RegionUpdate {
-        display,
-        width: patches.width,
-        height: patches.height,
-        rects,
-        capture_ts_us,
-    })
+    if !rects.is_empty() {
+        messages.push(SessionMessage::RegionUpdate {
+            display,
+            width: patches.width,
+            height: patches.height,
+            rects,
+            capture_ts_us,
+        });
+    }
+    if messages.len() > PATCH_MAX_MESSAGES_PER_TICK {
+        return None;
+    }
+    Some(messages)
 }
 
 /// 一条 `RegionUpdate` 的压缩后总字节数（带宽窗口统计用）。
@@ -766,6 +982,47 @@ fn region_update_bytes(msg: &SessionMessage) -> u64 {
             acc.saturating_add(u64::try_from(rect.data.len()).unwrap_or(u64::MAX))
         }),
         _ => 0,
+    }
+}
+
+/// 计量窗口换算：把「累计字节差值」按**实际间隔**算成 kbps。
+///
+/// 抽成纯函数便于单测：`elapsed` 为 0（两次反馈落在同一毫秒/计时精度不足）时由
+/// [`kbps_from_bytes`] 的 `max(1 ms)` 兜底，**绝不除零**。
+fn window_kbps(prev_bytes: u64, now_bytes: u64, elapsed: Duration) -> u32 {
+    kbps_from_bytes(now_bytes.saturating_sub(prev_bytes), elapsed)
+}
+
+/// 画面出站字节计量器（进程内，不上线）。
+///
+/// 只累计**真正交给画面队列**的载荷字节：视频是 `VideoPacket.data.len()`，补丁是各
+/// `RegionRect.data.len()` 之和。它与编码任务的 [`EncodeStatsWindow`] **互不影响**——后者
+/// 仍是「编码侧出码」，角标的「目标/实际码率」继续用它。
+///
+/// 速率**不在这里按固定节拍采样**：由会话主循环在每次收到 `QosFeedback` 时用累计差值与
+/// 实际间隔现算（见 `run_controlled` 的反馈分支）。这样发出的窗口恰好是「上一条反馈 → 本
+/// 条反馈」，与控制器 `recv_kbps` 的窗口只差一个单向延迟，不会因两个独立 1 s 计时器的相位
+/// 差把突发流量算成 `0.2×` 或 `5×`。
+struct ScreenSendMeter {
+    /// 累计交给画面队列的载荷字节数（编码任务与会话主循环都累加）。
+    bytes: AtomicU64,
+}
+
+impl ScreenSendMeter {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// 记一笔真正交付给画面队列的载荷字节。
+    fn add_bytes(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 累计字节数（主循环据此算窗口差值）。
+    fn total_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -1179,9 +1436,15 @@ pub async fn run_controlled(
     // 编码任务：独占编码器，从有界队列取原始帧、去重、编码，再把 `VideoPacket` 投给出站队列。
     // **绝不丢弃已编码的帧**（见模块文档的流水线说明）：输出队列满时跳过的是**编码之前**的这一帧。
     //
-    // `sent_kbps` 是编码任务每秒写入的**实际出码速率**（按窗口字节数算），由 QoS 闭环与控制器
-    // 回报的 `recv_kbps` 相比得出投递率。它只在进程内传递，**不进** `QosFeedback`（线上字段不变）。
-    let sent_kbps = Arc::new(AtomicU32::new(0));
+    // 画面出站计量器：编码任务（视频包）与会话主循环（补丁）都往里累加**真正交给画面队列**
+    // 的字节。主循环在**每条 `QosFeedback`** 到来时用差值算出该窗口的 `sent_kbps`——窗口
+    // 与控制器 `recv_kbps` 的窗口对齐（只差一个单向延迟），不受两个 1 s 计时器相位差影响。
+    // 它只在进程内传递，**不进** `QosFeedback`（线上字段不变）。
+    //
+    // **不能**沿用编码任务的 `EncodeStatsWindow`：补丁模式下没有编码任务，那个值会冻结在
+    // 进入补丁模式前的一秒，而 `recv_kbps` 是控制器当前窗口（含补丁），两者不可比——真机
+    // 日志里 `sent_kbps=643 / recv=69` 与 `sent=57 / recv=1617` 都是这么来的。
+    let screen_send_meter = Arc::new(ScreenSendMeter::new());
     // 补丁模式的「基准全帧已写出」信号：由编码任务在该帧**投进出站队列之后**置位，
     // 会话循环只在看到它之后才切补丁模式（顺序不变量，见模块文档）。基准帧是 P 帧，
     // 所以信号不能只看 `keyframe`（见 [`encode_loop`]）。
@@ -1200,7 +1463,7 @@ pub async fn run_controlled(
         codec,
         encoder_factory,
         config.unchanged_resend,
-        Arc::clone(&sent_kbps),
+        Arc::clone(&screen_send_meter),
         Arc::clone(&base_frame_sent),
         max_encode_width,
         Arc::clone(&encode_snapshot),
@@ -1219,20 +1482,10 @@ pub async fn run_controlled(
     // 适配器自行回退 CPU（`RawFrame::gpu == None` 走原来的 rgba 路径）。
     let gpu_capture = codec == CodecId::H264 && screen.supports_gpu_capture();
     // 补丁模式只在 **H.264 + 平台采集源支持** 时可用：VP9 的解码输出是 RGBA，控制器需要
-    // 另一套持久帧缓冲（见 [`ScreenSource::supports_patches`]）。压缩器跨拍复用（level 1，
-    // 单块几 KB），构造失败就整体禁用它。
-    let mut patch_compressor = if codec == CodecId::H264 && screen.supports_patches() {
-        match zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL) {
-            Ok(compressor) => Some(compressor),
-            Err(err) => {
-                warn!(error = %err, "zstd 压缩器创建失败，禁用脏矩形补丁模式");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let patch_capable = patch_compressor.is_some();
+    // 另一套持久帧缓冲（见 [`ScreenSource::supports_patches`]）。
+    // **压缩在采集任务的 `spawn_blocking` 里做**（见 `run_capture` / `build_patch_batch`），
+    // 不再占用会话循环——补丁模式下 zstd 曾同步阻塞循环 10–40 ms，直接拖慢采集节拍。
+    let patch_capable = codec == CodecId::H264 && screen.supports_patches();
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
     //
@@ -1264,6 +1517,22 @@ pub async fn run_controlled(
     // 采集节拍用「可重置的 sleep」而不是固定 interval：画质档位会改 `max_fps`，档位一变
     // 节拍要立刻跟着变（`interval_at` 的周期改不了，只能重建）。
     let mut capture_tick = Box::pin(sleep(encode.capture_interval()));
+    // 采集的**固定相位**截止时刻：tick 触发时从上一拍的计划时刻推进周期，而不是从
+    // `Instant::now()` 重新计时。否则循环里每拍的处理时间（输入注入、采集结果处理等）会被
+    // 叠加进周期，33 ms 的节拍会漂成 ~45 ms（真机实测只有 22 fps）。
+    let mut next_capture_at = Instant::now() + encode.capture_interval();
+    // 采集节拍诊断（每秒遥测）：实际间隔、慢拍数、因上一拍未返回而跳过的次数、采集等待。
+    let mut last_capture_tick: Option<Instant> = None;
+    let mut tick_dt_sum_ms = 0_u64;
+    let mut tick_dt_count = 0_u32;
+    let mut tick_slow = 0_u32;
+    let mut tick_spawn_skip = 0_u32;
+    let mut capture_request_us: Option<u64> = None;
+    let mut cap_wait_sum_ms = 0_u64;
+    let mut cap_wait_count = 0_u32;
+    let mut cap_wait_max_ms = 0_u64;
+    let mut input_events = 0_u32;
+    let mut display_max_ms = 0_u64;
     // 在途采集的结果经通道回传。`capture_deadline` 非空即代表有一次采集在途，保证同一时刻最多
     // 一次采集（并发两次会把阻塞线程池堆满）。循环自己保留 `capture_tx`，故 `recv()` 永不返回
     // `None`。
@@ -1309,6 +1578,14 @@ pub async fn run_controlled(
     let mut heartbeat_sent: VecDeque<Instant> = VecDeque::new();
     // 最近一次收到 `HeartbeatAck` 的时刻：仅用于超时告警（不上线、不进协议）。
     let mut last_ack_at: Option<Instant> = None;
+    // QoS 投递率的出码窗口：**每条 `QosFeedback` 推进一次**（不是固定 1 s 定时器），窗口
+    // 恰好是「上一条反馈 → 本条反馈」，与控制器 `recv_kbps` 的窗口只差一个单向延迟。
+    // `meter_primed == false` 时还没有窗口（首条反馈按无样本处理）。
+    // 推进发生在两个 `QosFeedback` 分支之前，因此补丁模式下被忽略的反馈也会推进窗口——
+    // 否则退出补丁模式后的第一窗口会把整个补丁期间的字节都算进一秒。
+    let mut meter_bytes = 0_u64;
+    let mut meter_at = Instant::now();
+    let mut meter_primed = false;
     let mut reason = String::from("会话结束");
     let result: RemoteResult<SessionEnd> = loop {
         tokio::select! {
@@ -1361,6 +1638,59 @@ pub async fn run_controlled(
                     capture_failures,
                     &mut last_capture_info,
                 );
+                // 诊断：每秒打印被控端真实遥测（**debug**；默认 info 下静默）。`fps` 是
+                // **实测**编码帧率（不是目标值），配合 `capture_us` / `encode_ms` /
+                // `out_queue_skips` 可判断掉帧发生在采集、编码还是发送背压。
+                debug!(
+                    fps = host.fps,
+                    capture_us = host.capture_us,
+                    encode_ms = host.encode_ms,
+                    skipped = host.skipped,
+                    keyframes = host.keyframes,
+                    idr_kbps = host.idr_kbps,
+                    p_kbps = host.p_kbps,
+                    changed_permille = host.changed_permille,
+                    out_queue_depth = host.out_queue_depth,
+                    out_queue_skips = host.out_queue_skips,
+                    encoder_rebuilds = host.encoder_rebuilds,
+                    forced_idrs = host.forced_idrs,
+                    patches = host.patch_mode,
+                    activity = ?host.activity,
+                    encoder_backend = %host.encoder_backend,
+                    encoder_name = %host.encoder_name,
+                    capture_backend = %host.capture_backend,
+                    gpu_capture = host.gpu_capture,
+                    gpu_encode = host.gpu_encode,
+                    encode_width = host.encode_width,
+                    encode_height = host.encode_height,
+                    scale_permille = host.scale_permille,
+                    tick_ms = if tick_dt_count > 0 {
+                        tick_dt_sum_ms / u64::from(tick_dt_count)
+                    } else {
+                        0
+                    },
+                    tick_slow,
+                    tick_spawn_skip,
+                    cap_wait_ms = if cap_wait_count > 0 {
+                        cap_wait_sum_ms / u64::from(cap_wait_count)
+                    } else {
+                        0
+                    },
+                    cap_wait_max_ms,
+                    input_events,
+                    display_max_ms,
+                    "被控端每秒遥测"
+                );
+                // 本秒诊断计数已上报，清零后重新累计。
+                tick_dt_sum_ms = 0;
+                tick_dt_count = 0;
+                tick_slow = 0;
+                tick_spawn_skip = 0;
+                cap_wait_sum_ms = 0;
+                cap_wait_count = 0;
+                cap_wait_max_ms = 0;
+                input_events = 0;
+                display_max_ms = 0;
                 config.stats.report(SessionStats::Host(Box::new(host.clone())));
                 if let Err(err) = queues
                     .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::HostStats(host)))
@@ -1381,6 +1711,12 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { payload, capture_us, capture_ts_us, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
+                        if let Some(request_us) = capture_request_us.take() {
+                            let wait_ms = capture_ts_us.saturating_sub(request_us) / 1000;
+                            cap_wait_sum_ms = cap_wait_sum_ms.saturating_add(wait_ms);
+                            cap_wait_count = cap_wait_count.saturating_add(1);
+                            cap_wait_max_ms = cap_wait_max_ms.max(wait_ms);
+                        }
                         match payload {
                             CapturePayload::Frame(frame) => {
                                 if let Some(frame) = frame {
@@ -1445,7 +1781,16 @@ pub async fn run_controlled(
                                     // 切模式/放弃之后才回来的在途补丁采集：丢掉即可。
                                     // `capture_deadline` 已在上面清掉，下一拍照常采集。
                                     debug!(capture_us, "丢弃补丁模式之外的补丁采集结果");
-                                } else if let Some(patches) = patches {
+                                } else if let Some(batch) = patches {
+                                    let PatchBatch {
+                                        width,
+                                        height,
+                                        changed_permille,
+                                        rect_count,
+                                        empty,
+                                        messages,
+                                        bytes,
+                                    } = batch;
                                     // 目标帧缓冲尺寸必须与当前编码尺寸一致：显示器分辨率或缩放变了
                                     // （`SetQuality` / QoS 降分辨率）时控制器那块持久缓冲已作废。
                                     let (want_w, want_h) = displays
@@ -1459,10 +1804,10 @@ pub async fn run_controlled(
                                                 max_encode_width,
                                             )
                                         });
-                                    if patches.width != want_w || patches.height != want_h {
+                                    if width != want_w || height != want_h {
                                         warn!(
-                                            got_w = patches.width,
-                                            got_h = patches.height,
+                                            got_w = width,
+                                            got_h = height,
                                             want_w,
                                             want_h,
                                             "补丁尺寸与编码尺寸不符，回到全帧"
@@ -1476,11 +1821,8 @@ pub async fn run_controlled(
                                             &mut capture_tick,
                                         );
                                         force_keyframe = true;
-                                    } else if patches.changed_permille > PATCH_EXIT_PERMILLE {
-                                        debug!(
-                                            changed_permille = patches.changed_permille,
-                                            "画面活跃度回升，退出补丁模式"
-                                        );
+                                    } else if changed_permille > PATCH_EXIT_PERMILLE {
+                                        debug!(changed_permille, "画面活跃度回升，退出补丁模式");
                                         // 只是画面变忙：参考链完好，退出后的第一帧 P 帧即可。
                                         exit_patch_mode(
                                             &mut screen_mode,
@@ -1488,8 +1830,8 @@ pub async fn run_controlled(
                                             &mut last_changed_permille,
                                             &mut capture_tick,
                                         );
-                                    } else if patches.rects.len() > MAX_REGION_RECTS {
-                                        warn!(rects = patches.rects.len(), "脏矩形过多，退出补丁模式");
+                                    } else if rect_count > MAX_REGION_RECTS {
+                                        warn!(rects = rect_count, "脏矩形过多，退出补丁模式");
                                         exit_patch_mode(
                                             &mut screen_mode,
                                             &mut force_encode,
@@ -1497,7 +1839,7 @@ pub async fn run_controlled(
                                             &mut capture_tick,
                                         );
                                     } else {
-                                        last_changed_permille = patches.changed_permille;
+                                        last_changed_permille = changed_permille;
                                         // 补丁模式下 QoS 闭环暂停，但逐帧升档仍然有效：只要补丁
                                         // 报告的面积跨过 Mixed/Active 边界，退出后的全帧帧率就
                                         // 已经放开（降档仍归 1 Hz 反馈的迟滞）。
@@ -1513,67 +1855,62 @@ pub async fn run_controlled(
                                         let keepalive_due = screen_mode
                                             .last_patch_sent
                                             .is_none_or(|at| at.elapsed() >= PATCH_KEEPALIVE);
-                                        if patches.rects.is_empty() && !keepalive_due {
+                                        if empty && !keepalive_due {
                                             debug!(capture_us, "补丁无变化且未到保活间隔，跳过");
-                                        } else {
-                                            let built = patch_compressor.as_mut().and_then(|compressor| {
-                                                build_region_update(
-                                                    compressor,
-                                                    display_id,
-                                                    &patches,
-                                                    capture_ts_us,
-                                                )
-                                            });
-                                            if let Some(msg) = built {
-                                                // 带宽兜底：补丁模式下 QoS 闭环暂停，若一个窗口的
-                                                // 补丁出码超过「有效码率 × 2」就回全帧——H.264 整帧
-                                                // 在同样字节下至少是正常码流，继续发补丁只会更糟。
-                                                let bytes = region_update_bytes(&msg);
-                                                let budget_kbps = rate
-                                                    .current()
-                                                    .bitrate_kbps
-                                                    .max(PATCH_MIN_BUDGET_KBPS)
-                                                    .saturating_mul(PATCH_BANDWIDTH_FACTOR)
-                                                    .min(PATCH_MAX_BUDGET_KBPS);
-                                                if screen_mode.admit_patch_bytes(
+                                        } else if let Some(messages) = messages {
+                                            // 压缩已在采集任务里完成；这里只做带宽预算与入队。
+                                            // 带宽兜底按**单拍总量**只判一次：补丁模式下 QoS
+                                            // 闭环暂停，若一个窗口的补丁出码超过「有效码率 × 2」
+                                            // 就回全帧——H.264 整帧在同样字节下至少是正常码流，
+                                            // 继续发补丁只会更糟。
+                                            let budget_kbps = rate
+                                                .current()
+                                                .bitrate_kbps
+                                                .max(PATCH_MIN_BUDGET_KBPS)
+                                                .saturating_mul(PATCH_BANDWIDTH_FACTOR)
+                                                .min(PATCH_MAX_BUDGET_KBPS);
+                                            if screen_mode.admit_patch_bytes(
+                                                bytes,
+                                                std::time::Instant::now(),
+                                                budget_kbps,
+                                            ) {
+                                                debug!(
+                                                    capture_us,
+                                                    messages = messages.len(),
+                                                    rects = rect_count,
                                                     bytes,
-                                                    std::time::Instant::now(),
-                                                    budget_kbps,
-                                                ) {
-                                                    debug!(
-                                                        capture_us,
-                                                        rects = patches.rects.len(),
-                                                        bytes,
-                                                        "发送脏矩形补丁"
-                                                    );
-                                                    // 补丁很小，但**绝不丢弃**（丢一个会让画面永久缺
-                                                    // 一块），故走画面队列的可取消等待。
+                                                    "发送脏矩形补丁"
+                                                );
+                                                // 补丁**绝不丢弃**（丢一个会让画面永久缺一块），
+                                                // 故走画面队列的可取消等待；同一次采集拆出的多条
+                                                // 消息必须按顺序投递（控制器按到达顺序合成）。
+                                                let mut write_err = None;
+                                                for msg in messages {
+                                                    let len = region_update_bytes(&msg);
                                                     if let Err(err) = queues
-                                                        .enqueue_screen(&cancel, SessionFrame::screen(msg))
+                                                        .enqueue_screen(
+                                                            &cancel,
+                                                            SessionFrame::screen(msg),
+                                                        )
                                                         .await
                                                     {
-                                                        break Err(err);
+                                                        write_err = Some(err);
+                                                        break;
                                                     }
+                                                    // 每条成功后都推进保活水位：中途断链时控制器
+                                                    // 已经收到的那几条不会再被重复发送。
                                                     screen_mode.last_patch_sent =
                                                         Some(std::time::Instant::now());
-                                                } else {
-                                                    warn!(
-                                                        bytes,
-                                                        budget_kbps,
-                                                        "补丁出码超过窗口预算，退出补丁模式"
-                                                    );
-                                                    exit_patch_mode(
-                                                        &mut screen_mode,
-                                                        &mut force_encode,
-                                                        &mut last_changed_permille,
-                                                        &mut capture_tick,
-                                                    );
+                                                    screen_send_meter.add_bytes(len);
+                                                }
+                                                if let Some(err) = write_err {
+                                                    break Err(err);
                                                 }
                                             } else {
                                                 warn!(
-                                                    capture_us,
-                                                    rects = patches.rects.len(),
-                                                    "补丁压缩后超出字节预算，退出补丁模式"
+                                                    bytes,
+                                                    budget_kbps,
+                                                    "补丁出码超过窗口预算，退出补丁模式"
                                                 );
                                                 exit_patch_mode(
                                                     &mut screen_mode,
@@ -1582,6 +1919,19 @@ pub async fn run_controlled(
                                                     &mut capture_tick,
                                                 );
                                             }
+                                        } else {
+                                            warn!(
+                                                capture_us,
+                                                messages = 0,
+                                                rects = rect_count,
+                                                "补丁无法装入单拍预算，退出补丁模式"
+                                            );
+                                            exit_patch_mode(
+                                                &mut screen_mode,
+                                                &mut force_encode,
+                                                &mut last_changed_permille,
+                                                &mut capture_tick,
+                                            );
                                         }
                                     }
                                 } else {
@@ -1607,6 +1957,7 @@ pub async fn run_controlled(
             // 链完好无损）；连续多次才终止会话（见 [`MAX_CAPTURE_TIMEOUTS`]）。
             () = sleep(capture_deadline.unwrap_or_else(Instant::now).saturating_duration_since(Instant::now())), if capture_deadline.is_some() => {
                 capture_deadline = None;
+                capture_request_us = None;
                 capture_timeouts = capture_timeouts.saturating_add(1);
                 if capture_timeouts >= MAX_CAPTURE_TIMEOUTS {
                     warn!(count = capture_timeouts, "采集连续超时，判定采集侧已失效，结束会话");
@@ -1626,11 +1977,27 @@ pub async fn run_controlled(
                     Some(false) => debug!("等待基准帧超时，放弃进入补丁模式"),
                     None => {}
                 }
-                capture_tick.as_mut().reset(
-                    Instant::now() + capture_tick_period(screen_mode.mode, &encode),
-                );
+                let period = capture_tick_period(screen_mode.mode, &encode);
+                let tick_now = Instant::now();
+                if let Some(last) = last_capture_tick.replace(tick_now) {
+                    let dt_ms = u64::try_from(tick_now.duration_since(last).as_millis())
+                        .unwrap_or(u64::MAX);
+                    tick_dt_sum_ms = tick_dt_sum_ms.saturating_add(dt_ms);
+                    tick_dt_count = tick_dt_count.saturating_add(1);
+                    if dt_ms > 40 {
+                        tick_slow = tick_slow.saturating_add(1);
+                    }
+                }
+                // 固定相位：从上一拍的计划时刻推进。落后超过一整拍（循环被长任务占住）
+                // 才重同步，避免追帧式突发。
+                next_capture_at += period;
+                if next_capture_at <= tick_now {
+                    next_capture_at = tick_now + period;
+                }
+                capture_tick.as_mut().reset(next_capture_at);
                 // 串行采集：上一次还没回来就跳过本轮，避免把阻塞线程池堆满。
                 if capture_deadline.is_none() {
+                    capture_request_us = Some(crate::clock::now_us());
                     capture_generation = capture_generation.wrapping_add(1);
                     capture_deadline = Some(Instant::now() + config.capture_watchdog);
                     let screen = Arc::clone(&screen);
@@ -1648,6 +2015,8 @@ pub async fn run_controlled(
                     tokio::task::spawn_blocking(move || {
                         run_capture(&*screen, display_now, generation_now, request, &tx);
                     });
+                } else {
+                    tick_spawn_skip = tick_spawn_skip.saturating_add(1);
                 }
             }
             // 显示器热插拔 / 分辨率变化复查。
@@ -1660,7 +2029,11 @@ pub async fn run_controlled(
             // 平台可能几十毫秒到数秒），不值得为它再引一条 `spawn_blocking` 通道与在途标志
             // ——那反而让分支状态机多一个可出错点。
             _ = display_tick.tick() => {
+                let display_started = Instant::now();
                 let fresh = screen.displays();
+                display_max_ms = display_max_ms.max(
+                    u64::try_from(display_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
                 if fresh.is_empty() {
                     // 空列表一律视为**一次枚举失败**（拔掉唯一显示器、锁屏/切桌面瞬间等）：
                     // 不应用。否则会把控制器列表清空、并把采集目标改成一块不存在的屏。
@@ -1695,7 +2068,7 @@ pub async fn run_controlled(
                                 display_id = new_id;
                             }
                             // 几何/来源都变了：补丁模式的持久缓冲与编码器尺寸都要重建。
-                            screen_mode.exit();
+                            screen_mode.exit(std::time::Instant::now());
                             force_keyframe = true;
                             capture_tick.as_mut().reset(Instant::now());
                         }
@@ -1707,7 +2080,7 @@ pub async fn run_controlled(
                                 "显示器 {display_id} 分辨率变化 {}x{} -> {}x{}，重建编码器并强制关键帧",
                                 old.width, old.height, new.width, new.height
                             );
-                            screen_mode.exit();
+                            screen_mode.exit(std::time::Instant::now());
                             force_keyframe = true;
                             capture_tick.as_mut().reset(Instant::now());
                         }
@@ -1746,9 +2119,23 @@ pub async fn run_controlled(
                 }
             }
             incoming = reader.next() => {
+                // 出码窗口推进器：每收到一条 `QosFeedback` 推进一次（无论这条反馈会不会被
+                // 补丁模式忽略），窗口因此恰好是「上一条反馈 → 本条反馈」，与控制器
+                // `recv_kbps` 的窗口只差一个单向延迟。首条反馈没有窗口，返回 `None`。
+                let mut advance_meter = |meter: &ScreenSendMeter| -> Option<u32> {
+                    let now = Instant::now();
+                    let total = meter.total_bytes();
+                    let sample = meter_primed
+                        .then(|| window_kbps(meter_bytes, total, now.duration_since(meter_at)));
+                    meter_bytes = total;
+                    meter_at = now;
+                    meter_primed = true;
+                    sample
+                };
                 match incoming {
                     Some(Ok(frame)) => match frame.message {
                         SessionMessage::Input(event) => {
+                            input_events = input_events.saturating_add(1);
                             // `InputSink::apply` 是 enigo 注入，快操作（微秒级），留在 async worker
                             // 上即可——为它付一次 `spawn_blocking` 的调度开销并不划算。
                             if inject {
@@ -1774,7 +2161,7 @@ pub async fn run_controlled(
                                 display_id = target;
                                 // 几何变了：补丁模式（以及正在等的进入）一律作废，控制器那块
                                 // 持久帧缓冲的尺寸已经不对了。
-                                screen_mode.exit();
+                                screen_mode.exit(std::time::Instant::now());
                                 force_keyframe = true;
                                 capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
                             } else {
@@ -1796,7 +2183,7 @@ pub async fn run_controlled(
                             encode = rate.current();
                             // 档位可能改缩放 → 几何可能变化：补丁模式的持久缓冲尺寸随之作废，
                             // 必须退出（并靠下面的 `force_keyframe` 重发基准）。
-                            screen_mode.exit();
+                            screen_mode.exit(std::time::Instant::now());
                             capture_tick.as_mut().reset(Instant::now() + encode.capture_interval());
                             force_keyframe = true;
                         }
@@ -1820,6 +2207,10 @@ pub async fn run_controlled(
                             // `recv_kbps` 都是陈旧值（甚至是 0），喂给 AIMD 只会制造假拥塞/假饱和，
                             // 把码率帧率压低，等回到全帧时画面先糊一截。回到全帧后的下一条反馈
                             // 自然恢复闭环（AIMD 状态本身没被污染）。
+                            //
+                            // 出码窗口仍要推进（丢弃返回值）：否则退出补丁模式后的首个窗口会把
+                            // 整个补丁期间的字节都算进去，得到一个虚高的 `sent_kbps`。
+                            let _ = advance_meter(&screen_send_meter);
                             debug!(
                                 rtt_ms,
                                 recv_kbps,
@@ -1839,9 +2230,11 @@ pub async fn run_controlled(
                             rate.observe_activity(last_changed_permille);
                             let local_backlog =
                                 u32::try_from(queues.screen_backlog()).unwrap_or(u32::MAX);
-                            // 本窗口**实际发出**的码率（编码任务每秒写入）。与控制器回报的
-                            // `recv_kbps` 一起算投递率，识别「RTT 还没抬升但链路已在丢包」。
-                            let sent_kbps_now = sent_kbps.load(Ordering::Relaxed);
+                            // 上一个窗口**实际交给画面队列**的码率（视频 + 补丁）。窗口由
+                            // `advance_meter` 推进为「上一条反馈 → 本条反馈」，与控制器回报的
+                            // `recv_kbps`（同一段窗口）只差一个单向延迟，可安全算投递率；
+                            // 首条反馈没有窗口（`None`），不算投递率。
+                            let sent_kbps_now = advance_meter(&screen_send_meter);
                             let decision = rate.on_feedback(
                                 Feedback { rtt_ms, recv_kbps, decode_ms, backlog },
                                 local_backlog,
@@ -1864,11 +2257,14 @@ pub async fn run_controlled(
                             if last_qos_log != Some(signature) {
                                 last_qos_log = Some(signature);
                                 // 投递率也内联进消息文本：GUI 日志层会丢掉 tracing 字段，只保留文本。
-                                let delivery_ratio = if sent_kbps_now > 0 {
-                                    f64::from(recv_kbps) / f64::from(sent_kbps_now)
-                                } else {
-                                    0.0
-                                };
+                                let delivery_ratio = sent_kbps_now.filter(|sent| *sent > 0).map_or(0.0, |sent| {
+                                    f64::from(recv_kbps) / f64::from(sent)
+                                });
+                                // 首条反馈尚无窗口时打印 `-`，别让读者把 0 当成真实出码。
+                                let sent_label = sent_kbps_now.map_or_else(
+                                    || "-".to_owned(),
+                                    |sent| sent.to_string(),
+                                );
                                 info!(
                                     "QoS 调整 action={:?} rtt={}ms rtt_smooth={:?} baseline={:?} recv_kbps={} sent_kbps={} delivery_ratio={:.2} decode_ms={} backlog={} local_backlog={} bitrate_kbps={} fps={} scale={:.3} changed_permille={} cap_kbps={:?} cap_fps={:?}",
                                     decision.action,
@@ -1876,7 +2272,7 @@ pub async fn run_controlled(
                                     rate.smoothed_rtt_ms(),
                                     rate.baseline_rtt_ms(),
                                     recv_kbps,
-                                    sent_kbps_now,
+                                    sent_label,
                                     delivery_ratio,
                                     decode_ms,
                                     backlog,
@@ -2154,8 +2550,29 @@ enum CaptureRequest {
 enum CapturePayload {
     /// 全帧原始帧；失败为 `None`。
     Frame(Option<RawFrame>),
-    /// 脏矩形补丁；失败或「本拍不适合补丁」为 `None`。
-    Patches(Option<CapturedPatches>),
+    /// 脏矩形补丁（**已在采集任务里压缩好**）；采集失败或「本拍不适合补丁」为 `None`。
+    Patches(Option<PatchBatch>),
+}
+
+/// 采集任务里**已经完成 zstd 压缩**的一拍补丁。
+///
+/// 会话循环只据此做尺寸/活跃度判断、带宽预算和入队——压缩本身发生在 `spawn_blocking`
+/// 的采集任务里，不再阻塞事件循环（旧实现会同步卡住循环 10–40 ms）。
+struct PatchBatch {
+    /// 目标帧缓冲宽度（编码尺寸）。
+    width: u32,
+    /// 目标帧缓冲高度（编码尺寸）。
+    height: u32,
+    /// 本拍变化面积（千分比）。
+    changed_permille: u16,
+    /// 原始脏矩形数（判断是否超过 [`MAX_REGION_RECTS`]）。
+    rect_count: usize,
+    /// 本拍没有变化（空补丁；只有保活间隔到点才发送）。
+    empty: bool,
+    /// 压缩后的 `RegionUpdate` 消息；`None` = 装不进单拍预算（调用方退出补丁模式）。
+    messages: Option<Vec<SessionMessage>>,
+    /// 压缩后总字节数（`messages` 为 `Some` 时有效）。
+    bytes: u64,
 }
 
 /// 一次后台采集的结果。
@@ -2215,35 +2632,41 @@ fn run_capture(
     tx: &mpsc::Sender<CaptureOutcome>,
 ) {
     let started = Instant::now();
-    let payload = match request {
+    let (payload, capture_us, capture_ts_us) = match request {
         CaptureRequest::Frame { gpu } => {
             let captured = if gpu {
                 screen.capture_gpu(display)
             } else {
                 screen.capture(display)
             };
-            CapturePayload::Frame(match captured {
+            let capture_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            // 采集**返回之后**立刻打时间戳：它是控制器的端到端延迟（采集→解码完成）的起点。
+            // 失败路径也打（结果不会上线，只是让所有分支形状一致）。
+            let capture_ts_us = crate::clock::now_us();
+            let payload = CapturePayload::Frame(match captured {
                 Ok(frame) => Some(frame),
                 Err(err) => {
                     warn!(error = %err, "屏幕采集失败");
                     None
                 }
-            })
+            });
+            (payload, capture_us, capture_ts_us)
         }
         CaptureRequest::Patches { scale, max_width } => {
-            CapturePayload::Patches(match screen.capture_patches(display, scale, max_width) {
-                Ok(patches) => patches,
+            let captured = screen.capture_patches(display, scale, max_width);
+            let capture_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let capture_ts_us = crate::clock::now_us();
+            let batch = match captured {
+                Ok(Some(patches)) => Some(build_patch_batch(display, &patches, capture_ts_us)),
+                Ok(None) => None,
                 Err(err) => {
                     warn!(error = %err, "脏矩形补丁采集失败");
                     None
                 }
-            })
+            };
+            (CapturePayload::Patches(batch), capture_us, capture_ts_us)
         }
     };
-    let capture_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    // 采集**返回之后**立刻打时间戳：它是控制器的端到端延迟（采集→解码完成）的起点。
-    // 失败路径也打（结果不会上线，只是让所有分支形状一致）。
-    let capture_ts_us = crate::clock::now_us();
     // 接收端随会话循环存活；会话已结束时发送失败是正常的，忽略。
     let _ = tx.blocking_send(CaptureOutcome {
         generation,
@@ -2251,6 +2674,41 @@ fn run_capture(
         capture_us,
         capture_ts_us,
     });
+}
+
+/// 在采集的 `spawn_blocking` 任务里压好这一拍补丁。
+///
+/// **为什么不在会话循环里压**：zstd level 1 对复杂桌面内容单拍可达 10–40 ms，同步执行会
+/// 直接拖慢采集节拍（真机表现为采集 30 Hz 掉到 ~22 Hz、偶发顿挫）。采集任务本来就是阻塞
+/// 上下文，把压缩放进来后循环只做预算判断与入队。
+///
+/// 压缩器每拍新建（zstd 上下文构造是微秒级；30 Hz 下开销可忽略），换取无需跨任务搬运
+/// 可变状态的简单性。
+fn build_patch_batch(display: u32, patches: &CapturedPatches, capture_ts_us: u64) -> PatchBatch {
+    let mut compressor = match zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL) {
+        Ok(compressor) => Some(compressor),
+        Err(err) => {
+            warn!(error = %err, "zstd 压缩器创建失败，本拍补丁作废");
+            None
+        }
+    };
+    let messages = compressor
+        .as_mut()
+        .and_then(|compressor| build_region_updates(compressor, display, patches, capture_ts_us));
+    let bytes = messages.as_ref().map_or(0, |messages| {
+        messages
+            .iter()
+            .fold(0_u64, |acc, msg| acc.saturating_add(region_update_bytes(msg)))
+    });
+    PatchBatch {
+        width: patches.width,
+        height: patches.height,
+        changed_permille: patches.changed_permille,
+        rect_count: patches.rects.len(),
+        empty: patches.rects.is_empty(),
+        messages,
+        bytes,
+    }
 }
 
 /// 编码任务每秒写给会话循环的**完整快照**（C2/C3/C5 与遥测的唯一来源）。
@@ -2387,8 +2845,8 @@ impl EncodeStatsWindow {
         self.skipped = self.skipped.saturating_add(1);
     }
 
-    /// 到点则上报一次并重置窗口。`bitrate_kbps` 是**当前生效的目标码率**（闭环值，非实测出码率）；
-    /// `sent_kbps` 是共享的实测出码速率槽，供 QoS 闭环算投递率。
+    /// 到点则上报一次并重置窗口。`bitrate_kbps` 是**当前生效的目标码率**（闭环值，非实测出码率）。
+    /// 实测出码速率只进 [`EncodeSnapshot`]（编码侧口径）；QoS 的投递率用 [`ScreenSendMeter`]。
     ///
     /// **重置之前**先把完整快照写进共享槽（`snapshot`）：会话主循环在同一拍（心跳 tick）读它组
     /// 装 `HostStats`。两者都在 ~1s 节拍上，读写顺序不影响正确性——最坏只是多显示/少显示一拍。
@@ -2396,7 +2854,6 @@ impl EncodeStatsWindow {
         &mut self,
         stats: &SessionStatsReporter,
         bitrate_kbps: u32,
-        sent_kbps: &AtomicU32,
         snapshot: &std::sync::Mutex<Option<EncodeSnapshot>>,
     ) {
         let elapsed = self.start.elapsed();
@@ -2404,8 +2861,9 @@ impl EncodeStatsWindow {
             return;
         }
         // 实测出码速率：窗口字节数 / 窗口时长。先算再重置窗口。
+        // 它只进 `EncodeSnapshot`（角标「实际码率」是编码侧口径）；QoS 的投递率改用
+        // [`ScreenSendMeter`]——那里含补丁字节且不受补丁模式冻结影响。
         let sent_kbps_value = kbps_from_bytes(self.bytes, elapsed);
-        sent_kbps.store(sent_kbps_value, Ordering::Relaxed);
         let secs = elapsed.as_secs_f64().max(f64::EPSILON);
         #[expect(
             clippy::cast_possible_truncation,
@@ -2529,7 +2987,7 @@ async fn encode_loop(
     codec: CodecId,
     encoder_factory: Arc<dyn VideoEncoderFactory>,
     unchanged_resend: Duration,
-    sent_kbps: Arc<AtomicU32>,
+    send_meter: Arc<ScreenSendMeter>,
     base_frame_sent: Arc<AtomicBool>,
     // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
     // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。
@@ -2579,7 +3037,7 @@ async fn encode_loop(
             .unwrap_or(u32::MAX);
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
         // 快照写入发生在窗口重置**之前**，因此主循环读到的是刚刚结束的那一秒。
-        window.maybe_report(&stats, rates.bitrate_kbps, &sent_kbps, &encode_snapshot);
+        window.maybe_report(&stats, rates.bitrate_kbps, &encode_snapshot);
 
         // GPU 帧没有 CPU 像素：不能做 memcmp 去重（也绝不能拿空 `rgba` 去比较）。
         let is_gpu = frame.gpu.is_some();
@@ -2709,8 +3167,9 @@ async fn encode_loop(
                     // 所以必须以 packet 实际是不是关键帧为准。
                     window.forced_idrs = window.forced_idrs.saturating_add(1);
                 }
+                let payload_bytes = packet.data.len();
                 window.record(
-                    packet.data.len(),
+                    payload_bytes,
                     encode_ms,
                     capture_us,
                     keyframe,
@@ -2736,6 +3195,9 @@ async fn encode_loop(
                 if !send_video(&out, &cancel, msg).await {
                     break;
                 }
+                // 真正进入画面队列之后才计入出码（QoS 投递率口径，见 [`ScreenSendMeter`]）。
+                // 被背压挡下/取消的帧没有交付，绝不能计入。
+                send_meter.add_bytes(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
                 if keyframe || forced_encode {
                     // 通知会话循环：这块**全帧基准**已经进入出站队列。补丁走同一条 FIFO 队列，
                     // 因此之后的 `RegionUpdate` 必然排在它后面（顺序不变量，见模块文档）。
@@ -2774,14 +3236,32 @@ fn reconfig_and_encode(
     frame: &RawFrame,
     force: bool,
 ) -> RemoteResult<EncodedVideo> {
+    // 诊断：把「在线重配置」与「真正编码」分开计时。正常 NVENC 1080p 的编码应在几毫秒；
+    // 持续几十毫秒时，这个拆解能区分是 `nvEncReconfigureEncoder` 慢，还是 encode 本身
+    // （CPU 输入回读/转换、GPU 上下文争用）。
+    let reconfig_started = std::time::Instant::now();
     if enc.bitrate_kbps() != rates.bitrate_kbps {
         enc.set_bitrate(rates.bitrate_kbps)?;
     }
     if enc.fps() != u32::from(rates.fps) {
         enc.set_fps(rates.fps)?;
     }
+    let reconfig_us = reconfig_started.elapsed().as_micros();
+    let encode_started = std::time::Instant::now();
     // CPU 帧走 trait 默认实现（= `encode`）；GPU 帧由平台实现覆盖。
-    enc.encode_frame(frame, force)
+    let result = enc.encode_frame(frame, force);
+    let encode_us = encode_started.elapsed().as_micros();
+    if encode_us >= 20_000 || reconfig_us >= 20_000 {
+        debug!(
+            reconfig_us,
+            encode_us,
+            gpu_input = frame.gpu.is_some(),
+            width = frame.width,
+            height = frame.height,
+            "慢帧编码拆解"
+        );
+    }
+    result
 }
 
 /// 把一帧画面消息投给出站写任务，**绝不丢弃**。
@@ -3714,7 +4194,7 @@ mod tests {
             CodecId::Vp9,
             vp9_encoder_factory(),
             UNCHANGED_RESEND_INTERVAL,
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3789,7 +4269,7 @@ mod tests {
             CodecId::Vp9,
             vp9_encoder_factory(),
             UNCHANGED_RESEND_INTERVAL,
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3918,7 +4398,7 @@ mod tests {
             CodecId::H264,
             Arc::new(FakeH264EncoderFactory),
             UNCHANGED_RESEND_INTERVAL,
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3984,7 +4464,7 @@ mod tests {
             CodecId::Vp9,
             vp9_encoder_factory(),
             UNCHANGED_RESEND_INTERVAL,
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4066,7 +4546,7 @@ mod tests {
             Arc::new(FakeH264EncoderFactory),
             // 语义锁：间隔足够大时「无变化就跳过」必须保持原语义（本用例不断言保活）。
             Duration::from_secs(3600),
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4153,7 +4633,7 @@ mod tests {
             Arc::new(FakeH264EncoderFactory),
             // 保活间隔足够大：本用例只验证 `force_encode` 单独绕过无变化闸门。
             Duration::from_secs(3600),
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4227,7 +4707,7 @@ mod tests {
             CodecId::H264,
             Arc::new(FakeH264EncoderFactory),
             Duration::ZERO,
-            Arc::new(AtomicU32::new(0)),
+            Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4742,7 +5222,7 @@ mod tests {
 
     /// 补丁打包：坐标原样保留、可压的用 zstd（能解回原文）、压不动的存原始 NV12。
     #[test]
-    fn build_region_update_compresses_rects_and_keeps_coordinates() {
+    fn build_region_updates_compress_rects_and_keep_coordinates() {
         let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
         let zero_nv12 = vec![0u8; 32 * 32 * 3 / 2];
         let tiny = vec![9u8, 8, 7, 6, 5, 4];
@@ -4768,7 +5248,9 @@ mod tests {
                 },
             ],
         };
-        let msg = build_region_update(&mut compressor, 3, &patches, 7_000).expect("应在预算内");
+        let messages = build_region_updates(&mut compressor, 3, &patches, 7_000).expect("应在预算内");
+        assert_eq!(messages.len(), 1, "小补丁应装进同一条消息");
+        let msg = messages.into_iter().next().expect("一条消息");
         let SessionMessage::RegionUpdate {
             display,
             width,
@@ -4806,7 +5288,7 @@ mod tests {
 
     /// 空矩形 = 保活：仍然产出一条 `RegionUpdate`（矩形列表为空）。
     #[test]
-    fn build_region_update_keeps_empty_keepalive() {
+    fn build_region_updates_keep_empty_keepalive() {
         let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
         let patches = CapturedPatches {
             display: 0,
@@ -4815,25 +5297,27 @@ mod tests {
             changed_permille: 0,
             rects: Vec::new(),
         };
-        match build_region_update(&mut compressor, 0, &patches, 7_000).expect("空补丁也应构造") {
+        let messages = build_region_updates(&mut compressor, 0, &patches, 7_000).expect("空补丁也应构造");
+        assert_eq!(messages.len(), 1, "空补丁只产出一条保活消息");
+        match &messages[0] {
             SessionMessage::RegionUpdate {
                 width,
                 height,
                 rects,
                 ..
             } => {
-                assert_eq!((width, height), (2, 2));
+                assert_eq!((*width, *height), (2, 2));
                 assert!(rects.is_empty(), "保活补丁的矩形列表为空");
             }
             other => panic!("应为 RegionUpdate，实得 {other:?}"),
         }
     }
 
-    /// 字节预算闸门：压缩后总字节超过 [`PATCH_MAX_TOTAL_BYTES`] 时必须放弃补丁。
+    /// 单拍总量闸门：整块不可压缩的 512×512 NV12（393216 字节）即使拆批也装不进
+    /// [`PATCH_MAX_TICK_BYTES`]/[`PATCH_MAX_MESSAGES_PER_TICK`] 时必须放弃补丁。
     #[test]
-    fn build_region_update_rejects_oversized_payload() {
+    fn build_region_updates_reject_payload_over_tick_budget() {
         let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
-        // 单块不可压缩的 512×512 NV12 = 393216 字节，已超过 256 KiB 预算。
         let patches = CapturedPatches {
             display: 0,
             width: 512,
@@ -4848,14 +5332,14 @@ mod tests {
             }],
         };
         assert!(
-            build_region_update(&mut compressor, 0, &patches, 7_000).is_none(),
-            "超预算应放弃补丁（回到全帧）"
+            build_region_updates(&mut compressor, 0, &patches, 7_000).is_none(),
+            "超过单拍总量/条数预算应放弃补丁（回到全帧）"
         );
     }
 
     /// 矩形数闸门：超过 [`MAX_REGION_RECTS`] 时必须放弃补丁。
     #[test]
-    fn build_region_update_rejects_too_many_rects() {
+    fn build_region_updates_reject_too_many_rects() {
         let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
         let rects = (0..=MAX_REGION_RECTS)
             .map(|i| ScreenPatch {
@@ -4874,9 +5358,188 @@ mod tests {
             rects,
         };
         assert!(
-            build_region_update(&mut compressor, 0, &patches, 7_000).is_none(),
+            build_region_updates(&mut compressor, 0, &patches, 7_000).is_none(),
             "矩形数超上限应放弃补丁（回到全帧）"
         );
+    }
+
+    /// 把横条按坐标写回目标帧缓冲，并抽出原矩形区域用于逐字节比对。
+    fn reassemble_rect(
+        messages: &[SessionMessage],
+        frame_width: u32,
+        frame_height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let fw = usize::try_from(frame_width).expect("宽");
+        let fh = usize::try_from(frame_height).expect("高");
+        let mut frame = vec![0u8; fw * fh * 3 / 2];
+        for msg in messages {
+            let SessionMessage::RegionUpdate { rects, .. } = msg else {
+                panic!("应为 RegionUpdate，实得 {msg:?}");
+            };
+            for band in rects {
+                let band_w = usize::try_from(band.width).expect("带宽");
+                let band_h = usize::try_from(band.height).expect("带高");
+                let expected = band_w * band_h * 3 / 2;
+                let data = if band.flags & REGION_FLAG_ZSTD != 0 {
+                    zstd::bulk::decompress(&band.data, expected).expect("补丁解压")
+                } else {
+                    band.data.clone()
+                };
+                assert_eq!(data.len(), expected, "横条载荷长度必须与几何一致");
+                for row in 0..band_h {
+                    let dst = (usize::try_from(band.y).expect("y") + row) * fw
+                        + usize::try_from(band.x).expect("x");
+                    let src = row * band_w;
+                    frame[dst..dst + band_w].copy_from_slice(&data[src..src + band_w]);
+                }
+                let uv_base = fw * fh;
+                for row in 0..band_h / 2 {
+                    let dst = uv_base
+                        + (usize::try_from(band.y).expect("y") / 2 + row) * fw
+                        + usize::try_from(band.x).expect("x");
+                    let src = band_w * band_h + row * band_w;
+                    frame[dst..dst + band_w].copy_from_slice(&data[src..src + band_w]);
+                }
+            }
+        }
+        // 抽出原矩形（Y 平面 + UV 平面），布局与输入 `nv12` 完全一致。
+        let rw = usize::try_from(width).expect("宽");
+        let rh = usize::try_from(height).expect("高");
+        let rx = usize::try_from(x).expect("x");
+        let ry = usize::try_from(y).expect("y");
+        let mut extracted = Vec::with_capacity(rw * rh * 3 / 2);
+        for row in 0..rh {
+            let start = (ry + row) * fw + rx;
+            extracted.extend_from_slice(&frame[start..start + rw]);
+        }
+        let uv_base = fw * fh;
+        for row in 0..rh / 2 {
+            let start = uv_base + (ry / 2 + row) * fw + rx;
+            extracted.extend_from_slice(&frame[start..start + rw]);
+        }
+        extracted
+    }
+
+    /// 拆批必须**无缝、无重叠、无损**：把横条拼回目标帧缓冲后与原矩形逐字节相等。
+    #[test]
+    fn split_patch_bands_reconstruct_original() {
+        let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
+        let original = pseudo_nv12(16, 16);
+        let patches = CapturedPatches {
+            display: 0,
+            width: 64,
+            height: 64,
+            changed_permille: 0,
+            rects: vec![ScreenPatch {
+                x: 4,
+                y: 6,
+                width: 16,
+                height: 16,
+                nv12: original.clone(),
+            }],
+        };
+        // 很小的单条上限：16×16 的 384 B 载荷必然被拆成多条横条。
+        let messages =
+            build_region_updates_with_cap(&mut compressor, 0, &patches, 0, 100).expect("应能拆批");
+        assert!(messages.len() >= 2, "小上限下必须拆成多条消息，实得 {}", messages.len());
+        let rebuilt = reassemble_rect(&messages, 64, 64, 4, 6, 16, 16);
+        assert_eq!(rebuilt, original, "横条拼回后必须与原矩形逐字节相等");
+    }
+
+    /// 单个矩形压缩后超过单条上限时必须**拆批而不是丢弃**：≥2 条消息、每条 ≤ 上限。
+    #[test]
+    fn oversized_single_patch_is_split_not_dropped() {
+        let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
+        // 256×128 的伪随机 NV12 = 49152 B，超过 32 KiB 单条上限。
+        let patches = CapturedPatches {
+            display: 0,
+            width: 256,
+            height: 128,
+            changed_permille: 20,
+            rects: vec![ScreenPatch {
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 128,
+                nv12: pseudo_nv12(256, 128),
+            }],
+        };
+        let messages =
+            build_region_updates(&mut compressor, 0, &patches, 7_000).expect("拆批后应装得下");
+        assert!(
+            messages.len() >= 2,
+            "超过单条上限的矩形必须拆成多条消息，实得 {}",
+            messages.len()
+        );
+        let mut total = 0usize;
+        for msg in &messages {
+            let bytes = usize::try_from(region_update_bytes(msg)).expect("字节数");
+            assert!(
+                bytes <= PATCH_MESSAGE_MAX_BYTES,
+                "单条消息 {bytes} B 超过上限 {PATCH_MESSAGE_MAX_BYTES} B"
+            );
+            total += bytes;
+        }
+        let sum_of_rects: usize = messages
+            .iter()
+            .map(|msg| match msg {
+                SessionMessage::RegionUpdate { rects, .. } => {
+                    rects.iter().map(|rect| rect.data.len()).sum()
+                }
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, sum_of_rects, "总量必须等于各条消息之和");
+        assert!(total <= PATCH_MAX_TICK_BYTES, "总字节应落在单拍预算内");
+    }
+
+    /// 拆出来的所有横条：偶数几何、x/width 与原矩形一致、按顺序无缝覆盖原高度。
+    #[test]
+    fn bands_have_even_geometry() {
+        let mut compressor = zstd::bulk::Compressor::new(PATCH_ZSTD_LEVEL).expect("压缩器");
+        let (x, y, width, height) = (8_u32, 10_u32, 16_u32, 16_u32);
+        let patches = CapturedPatches {
+            display: 0,
+            width: 64,
+            height: 64,
+            changed_permille: 0,
+            rects: vec![ScreenPatch {
+                x,
+                y,
+                width,
+                height,
+                nv12: pseudo_nv12(width, height),
+            }],
+        };
+        let messages =
+            build_region_updates_with_cap(&mut compressor, 0, &patches, 0, 100).expect("应能拆批");
+        let bands: Vec<&RegionRect> = messages
+            .iter()
+            .flat_map(|msg| match msg {
+                SessionMessage::RegionUpdate { rects, .. } => rects.iter(),
+                _ => panic!("应为 RegionUpdate"),
+            })
+            .collect();
+        assert!(bands.len() >= 2, "小上限下应拆出多条横条");
+        let mut expected_y = y;
+        for band in &bands {
+            assert_eq!(band.x, x, "横条的 x 必须与原矩形一致");
+            assert_eq!(band.width, width, "横条的 width 必须与原矩形一致");
+            assert!(band.y.is_multiple_of(2), "横条 y 必须是偶数，实得 {}", band.y);
+            assert!(
+                band.height.is_multiple_of(2),
+                "横条 height 必须是偶数，实得 {}",
+                band.height
+            );
+            assert!(band.height >= 2, "横条至少 2 行");
+            assert_eq!(band.y, expected_y, "横条必须首尾相接（无缝、无重叠）");
+            expected_y += band.height;
+        }
+        assert_eq!(expected_y, y + height, "横条必须恰好覆盖原矩形的高度");
     }
 
     /// 进入判据必须**连续**低活跃；一帧高活跃把计数清零。
@@ -4898,6 +5561,51 @@ mod tests {
         // 已在等待基准帧时不重复触发。
         assert!(!mode.observe_video(0, now));
         assert_eq!(mode.mode, ScreenMode::Video, "基准未发出前不得切模式");
+    }
+
+    /// 退出后的重入冷却：冷却期内连续安静也不进入，冷却结束才重新累计。
+    #[test]
+    fn patch_reentry_respects_holdoff() {
+        let mut mode = PatchMode::new();
+        let t0 = Instant::now();
+        mode.mode = ScreenMode::Patches;
+        mode.exit(t0);
+        // 冷却期内喂再多安静拍也不得触发（`enter_streak` 每拍被清零）。
+        for tick in 0..6_u32 {
+            assert!(
+                !mode.observe_video(0, t0 + Duration::from_millis(333) * tick),
+                "冷却期内第 {tick} 拍不得进入补丁模式"
+            );
+        }
+        // 冷却结束后需要重新凑满 PATCH_ENTER_TICKS 个安静拍。
+        let t1 = t0 + PATCH_REENTRY_HOLDOFF;
+        assert!(!mode.observe_video(0, t1));
+        assert!(!mode.observe_video(0, t1 + Duration::from_millis(33)));
+        assert!(
+            mode.observe_video(0, t1 + Duration::from_millis(66)),
+            "冷却结束且连续 {PATCH_ENTER_TICKS} 拍安静后应允许重新进入"
+        );
+    }
+
+    /// 出码窗口换算：累计字节差按**实际间隔**归一，间隔为 0 时不除零。
+    #[test]
+    fn window_kbps_converts_bytes_over_actual_elapsed() {
+        // 1 秒内多出 125 000 B → 1000 kbps（125000 × 8 / 1000 ms）。
+        assert_eq!(window_kbps(0, 125_000, Duration::from_secs(1)), 1000);
+        // 500 ms 内多出 62 500 B → 同样 1000 kbps（按实际间隔归一，不是按固定 1 s）。
+        assert_eq!(window_kbps(10_000, 72_500, Duration::from_millis(500)), 1000);
+        // 计数未增长 → 0。
+        assert_eq!(window_kbps(4096, 4096, Duration::from_secs(1)), 0);
+        // 极端：间隔为 0 不得 panic/除零（`kbps_from_bytes` 以 max(1 ms) 兜底）。
+        assert_eq!(window_kbps(0, 0, Duration::ZERO), 0);
+        assert!(window_kbps(0, 1000, Duration::ZERO) > 0);
+        // 计数器回绕/异常：饱和到 0 而不是巨大值。
+        assert_eq!(window_kbps(500, 100, Duration::from_secs(1)), 0);
+        // 计量器本身：累加与读取口径一致。
+        let meter = ScreenSendMeter::new();
+        meter.add_bytes(4096);
+        meter.add_bytes(1024);
+        assert_eq!(meter.total_bytes(), 5120);
     }
 
     /// 补丁带宽兜底：单批超一个窗口预算直接拒绝；窗口到点时按实际出码码率判定。
