@@ -53,7 +53,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
-    CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMaxFrameRate,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoOutputFrameRate, ICodecAPI, IMFActivate,
@@ -313,7 +313,7 @@ impl MftH264Encoder {
 
         let codec = transform.cast::<ICodecAPI>().ok();
         if let Some(codec) = &codec {
-            configure_codec_defaults(codec, bitrate_kbps.saturating_mul(1000));
+            configure_codec_defaults(codec, bitrate_kbps.saturating_mul(1000), fps);
         }
 
         configure_media_types(&transform, width, height, fps, bitrate_kbps)?;
@@ -585,7 +585,13 @@ impl MftH264Encoder {
     /// **只改均值**（`CODECAPI_AVEncCommonMeanBitRate`），不再重设码率控制模式与峰值：
     /// 探针实测 Intel QSV 在运行期改模式/峰值会**强制插一个 IDR**，而 QoS 每秒都会动一次
     /// 码率——那正好变成「每秒一个关键帧」，是阶段 2/3 一直在消灭的带宽尖峰。峰值保持
-    /// 会话创建时按档位设的上限（VBV 仍然约束突发），均值随闭环在它之下浮动。
+    /// 会话创建时按档位设的上限，均值随闭环在它之下浮动。
+    ///
+    /// **VBV 缓冲大小同样不能在运行期改**：`encode_mft_probe` 实测，在 `set_bitrate`
+    /// 之后再设 `CODECAPI_AVEncCommonBufferSize`，QSV 会给下一帧插一个 IDR
+    /// （`keyframe=true`，违反「在线改码率不插 IDR」的契约）。所以缓冲只在构造时按
+    /// 档位上限设一次；QoS 降码率后缓冲相对新码率会显得偏大，这是已知的取舍，
+    /// 不能靠运行期缩小缓冲来修。
     ///
     /// # Errors
     /// MFT 未暴露 `ICodecAPI`、不支持 `CODECAPI_AVEncCommonMeanBitRate` 或
@@ -988,6 +994,22 @@ fn is_async_transform(transform: &IMFTransform) -> Result<bool, WinVideoError> {
     Ok(is_async)
 }
 
+/// VBV 缓冲涵盖的帧数（与 NVENC 路径同口径）。
+const VBV_FRAMES: u32 = 2;
+
+/// `CODECAPI_AVEncCommonBufferSize` 的 VBV 缓冲大小：约 [`VBV_FRAMES`] 帧的码率，
+/// 至少 1 位。`fps == 0` 按 1 处理（避免除零）。
+///
+/// **单位是位，与 `MaxBitRate` / `MeanBitRate` 一致**：FFmpeg 的 `mfenc.c` 就是把
+/// `AVCodecContext.rc_buffer_size`（位）原样写进 `CODECAPI_AVEncCommonBufferSize`
+/// 的，不必除以 8。
+///
+/// 旧实现完全没设这个属性，驱动默认值允许很大的单帧突发：一帧就能吃掉半秒量级的
+/// 链路时间，后续帧全被堵住（帧到达抖动 400–500 ms）。按两帧口径设上限。
+fn vbv_bits(bps: u32, fps: u32) -> u32 {
+    (bps / fps.max(1)).saturating_mul(VBV_FRAMES).max(1)
+}
+
 /// 设置码率控制：优先**峰值受限 VBR**，编码器不支持时回退 CBR。
 ///
 /// # 为什么不是 CBR
@@ -1000,7 +1022,7 @@ fn is_async_transform(transform: &IMFTransform) -> Result<bool, WinVideoError> {
 /// # Errors
 /// 连 CBR 的均值码率都设不进去时返回 [`WinVideoError::Encode`]（调用方按「编码器不可信、
 /// 重建」处理）。
-fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32) -> Result<(), WinVideoError> {
+fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) -> Result<(), WinVideoError> {
     let vbr = u32::try_from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0).unwrap_or(1);
     let mean = bitrate_bps.saturating_mul(VBR_MEAN_PERCENT) / 100;
     // 逐项确认：有些 MFT 只认模式、不认峰值属性；任何一步失败都退回 CBR。
@@ -1011,7 +1033,13 @@ fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32) -> Result<(), WinVide
         && set_codec_u32(codec, &CODECAPI_AVEncCommonMaxBitRate, bitrate_bps).is_ok()
         && set_codec_u32(codec, &CODECAPI_AVEncCommonMeanBitRate, mean).is_ok();
     if vbr_applied {
-        tracing::debug!(bitrate_bps, mean, "码率控制：峰值受限 VBR");
+        // VBV 缓冲大小是**可选**的收紧项：不少 MFT 不实现这个属性，设不进去时
+        // 继续用驱动默认值即可，绝不因此把整个 VBR 回退成 CBR（那会让静止画面灌满上行）。
+        let vbv = vbv_bits(bitrate_bps, fps);
+        if let Err(err) = set_codec_u32(codec, &CODECAPI_AVEncCommonBufferSize, vbv) {
+            tracing::debug!(%err, vbv, "编码器不支持设置 VBV 缓冲大小，沿用驱动默认值");
+        }
+        tracing::debug!(bitrate_bps, mean, vbv, "码率控制：峰值受限 VBR");
         return Ok(());
     }
 
@@ -1025,8 +1053,8 @@ fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32) -> Result<(), WinVide
 }
 
 /// 设置编码器的默认参数（码率控制、低延迟、无 B 帧）；失败只记 debug。
-fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32) {
-    if let Err(err) = apply_rate_control(codec, bitrate_bps) {
+fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) {
+    if let Err(err) = apply_rate_control(codec, bitrate_bps, fps) {
         tracing::debug!(%err, "编码器拒绝码率控制参数，按 MFT 默认值继续");
     }
     let settings = [
@@ -1327,5 +1355,22 @@ mod tests {
         assert!(validate_config(1280, 720, 0, 4000).is_err());
         assert!(validate_config(1280, 720, 60, 0).is_err());
         assert!(validate_config(1280, 720, 60, 4000).is_ok());
+    }
+
+    /// VBV 缓冲按「约两帧的码率」计算，与 NVENC 路径同口径。
+    #[test]
+    fn vbv_bits_is_about_two_frames() {
+        assert_eq!(vbv_bits(10_000_000, 30), 666_666);
+        assert_eq!(vbv_bits(6_000_000, 30), 400_000);
+        assert_eq!(vbv_bits(2_000_000, 15), 266_666);
+        assert_eq!(VBV_FRAMES, 2);
+    }
+
+    /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
+    #[test]
+    fn vbv_bits_guards_zero() {
+        assert_eq!(vbv_bits(1, 0), 2);
+        assert_eq!(vbv_bits(0, 30), 1);
+        assert!(vbv_bits(u32::MAX, 1) > 0);
     }
 }

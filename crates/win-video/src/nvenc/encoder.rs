@@ -257,9 +257,18 @@ fn kbps_to_bps(kbps: u32) -> u32 {
     kbps.saturating_mul(1000)
 }
 
-/// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小：半秒码率，至少 1 位。
-fn vbv_size(bps: u32) -> u32 {
-    (bps / 2).max(1)
+/// VBV 缓冲涵盖的帧数。
+///
+/// 旧实现是「半秒码率」：10 Mbps 档允许单帧吃掉 625 KB，在 2 Mbps 链路上要走
+/// 500 ms，期间后续帧全被堵住（实测帧到达抖动 400–500 ms）。改成约两帧的额度，
+/// 把单帧突发压到「帧间隔量级」，同时仍给码率控制器留一点缓冲空间。
+const VBV_FRAMES: u32 = 2;
+
+/// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小：约 [`VBV_FRAMES`] 帧的码率，至少 1 位。
+///
+/// `fps == 0` 按 1 处理（避免除零；正常构造路径已拒绝 0 帧率）。
+fn vbv_size(bps: u32, fps: u32) -> u32 {
+    (bps / fps.max(1)).saturating_mul(VBV_FRAMES).max(1)
 }
 
 /// 峰值受限 VBR 的均值码率（峰值的 70%，与 MFT 路径保持一致）。
@@ -530,6 +539,7 @@ impl DirectInputCache {
 fn build_encode_config(
     session: &NvencSession<'_>,
     bitrate_bps: u32,
+    fps: u32,
 ) -> Result<sys::NV_ENC_CONFIG, WinVideoError> {
     let get_preset = session
         .api()
@@ -581,7 +591,7 @@ fn build_encode_config(
     config.rcParams.rateControlMode = sys::_NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
     config.rcParams.averageBitRate = vbr_average(bitrate_bps);
     config.rcParams.maxBitRate = bitrate_bps;
-    config.rcParams.vbvBufferSize = vbv_size(bitrate_bps);
+    config.rcParams.vbvBufferSize = vbv_size(bitrate_bps, fps);
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
     config.rcParams.multiPass = sys::_NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
 
@@ -686,7 +696,7 @@ impl<'a> NvencEncoder<'a> {
 
         let session = api.open_session(&d3d)?;
         let bitrate_bps = kbps_to_bps(config.bitrate_kbps);
-        let encode_config = build_encode_config(&session, bitrate_bps)?;
+        let encode_config = build_encode_config(&session, bitrate_bps, config.fps)?;
 
         let context = d3d.context.clone();
         let texture = create_texture(
@@ -1156,7 +1166,7 @@ impl<'a> NvencEncoder<'a> {
         let bps = kbps_to_bps(kbps);
         self.config.rcParams.averageBitRate = vbr_average(bps);
         self.config.rcParams.maxBitRate = bps;
-        self.config.rcParams.vbvBufferSize = vbv_size(bps);
+        self.config.rcParams.vbvBufferSize = vbv_size(bps, self.fps);
         self.config.rcParams.vbvInitialDelay = self.config.rcParams.vbvBufferSize;
         self.reconfigure()?;
         self.bitrate_bps = bps;
@@ -1172,6 +1182,10 @@ impl<'a> NvencEncoder<'a> {
             return Err(WinVideoError::Config("帧率不能为 0".to_owned()));
         }
         self.init.frameRateNum = fps;
+        // VBV 额度按帧数计算，帧率一变额度也跟着变，故必须重算后一起重配置
+        // （NVENC 的 `nvEncReconfigureEncoder` 同时接受帧率与 VBV，仍不重建/不插 IDR）。
+        self.config.rcParams.vbvBufferSize = vbv_size(self.bitrate_bps, fps);
+        self.config.rcParams.vbvInitialDelay = self.config.rcParams.vbvBufferSize;
         self.reconfigure()?;
         self.fps = fps;
         Ok(())
@@ -1229,7 +1243,29 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{vbr_average, LruCache};
+    use super::{vbr_average, vbv_size, LruCache, VBV_FRAMES};
+
+    /// VBV 额度是「约两帧的码率」：单帧不再能吃掉半秒预算（那会把后续帧全堵住）。
+    #[test]
+    fn vbv_size_is_about_two_frames() {
+        // 10 Mbps @ 30fps：每帧 333_333 位，两帧 666_666 位。
+        assert_eq!(vbv_size(10_000_000, 30), 666_666);
+        // 6 Mbps @ 30fps：每帧 200_000 位，两帧 400_000 位。
+        assert_eq!(vbv_size(6_000_000, 30), 400_000);
+        // 2 Mbps @ 15fps：每帧 133_333 位，两帧 266_666 位。
+        assert_eq!(vbv_size(2_000_000, 15), 266_666);
+        // 与帧数常量的口径一致（不是零散的魔数）。
+        assert_eq!(VBV_FRAMES, 2);
+    }
+
+    /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
+    #[test]
+    fn vbv_size_guards_zero() {
+        assert_eq!(vbv_size(1, 0), 2);
+        assert_eq!(vbv_size(0, 30), 1);
+        // 极大值走饱和乘法，不 panic。
+        assert!(vbv_size(u32::MAX, 1) > 0);
+    }
 
     #[test]
     fn vbr_average_is_seventy_percent_of_peak() {

@@ -44,6 +44,9 @@ pub mod nvenc;
 pub mod pixels;
 #[cfg(windows)]
 pub mod probe;
+/// GPU 纹理缩放（BGRA → BGRA，VideoProcessor），供 NVENC 零拷贝直通缩放使用。
+#[cfg(windows)]
+pub mod scale;
 
 /// 逐像素大循环按行并行时的 worker 数（1 = 单线程）。
 ///

@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// 会话命令队列容量。
 const COMMAND_CAPACITY: usize = 256;
@@ -1642,7 +1642,44 @@ impl RemoteManager {
         };
         let established = self.establish_guarded(request, Role::Controlled, &cancel).await?;
         // 记录实际路径（打洞 / 直连 / 中继），供 UI 展示。
-        self.mark_active(&session_id, established.path);
+        let path = established.path;
+        info!(?path, "被控端数据面已建立");
+        // 诊断：每秒打印可靠层自己的状态（**debug**；默认 info 下静默）。与
+        // `controlled.rs` 的 `QoS 调整` 日志（应用层心跳 RTT）对照，可区分
+        // 「网络传输层慢」与「应用层排队/单帧过大」。
+        let reliable_logger = established.reliable.as_ref().map(|metrics| {
+            let metrics = Arc::clone(metrics);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.tick().await;
+                let mut prev = metrics.snapshot();
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        _ = tick.tick() => {
+                            let now = metrics.snapshot();
+                            debug!(
+                                srtt_ms = now.srtt_us / 1000,
+                                rto_ms = now.rto_us / 1000,
+                                cwnd_kb = now.cwnd_bytes / 1024,
+                                inflight_kb = now.inflight_bytes / 1024,
+                                peer_window = now.peer_window_segments,
+                                rto_timeouts = now.rto_timeouts.saturating_sub(prev.rto_timeouts),
+                                fast_retransmits =
+                                    now.fast_retransmits.saturating_sub(prev.fast_retransmits),
+                                out_of_order =
+                                    now.out_of_order_segments.saturating_sub(prev.out_of_order_segments),
+                                duplicate = now.duplicate_segments.saturating_sub(prev.duplicate_segments),
+                                "可靠层状态"
+                            );
+                            prev = now;
+                        }
+                    }
+                }
+            })
+        });
+        self.mark_active(&session_id, path);
         let duplex = established.stream;
         let config = ControlledConfig {
             session_id,
@@ -1677,7 +1714,11 @@ impl RemoteManager {
             .as_ref()
             .map_or_else(|| self.cfg.download_dir.clone(), |s| s.path.clone());
         let transfer = self.build_transfer_hub(service, local_root, cancel.clone());
-        run_controlled(duplex, config, screen, input, clipboard, transfer, cancel).await
+        let result = run_controlled(duplex, config, screen, input, clipboard, transfer, cancel).await;
+        if let Some(handle) = reliable_logger {
+            handle.abort();
+        }
+        result
     }
 
     /// 处理 `RemoteSessionResponse`（控制器侧）。
