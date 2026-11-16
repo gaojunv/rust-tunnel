@@ -25,6 +25,18 @@
 //! 不把链路打死」。因此这里的 `cwnd` 初值小、RTO 下限低，绝不试图去「探测带宽」——那是 QoS
 //! 的活。传输层只负责**可靠性**（不丢、不乱、不重）。
 //!
+//! # 尾部丢包探测（TLP）
+//!
+//! 一帧的**最后一个段**丢失时不会产生 3 个重复 ACK（后面没有段能让对端「用乱序反证空洞」），
+//! 快速重传因此永远不触发，整帧只能等满 RTO（下限 200 ms）。视频帧大小通常只有几段，这个
+//! 场景极其常见，而 200 ms 正好是交互延迟预算的全部。
+//!
+//! 所以另起一个**尾部**计时器：最近一次「发出新数据 / 确认前进」之后超过
+//! `max(1.5 × SRTT, 30ms)` 仍有未确认段，就重传**最后一个**未确认段（[`Conn::tail_probe`]）。
+//! 它不改段格式、不增加新数据、不动 `cwnd`、不计入 `consecutive_timeouts`——只是给尾部
+//! 一次额外的机会。每个 `send_base` 最多探测一次：之后交给 RTO，避免「探测副本也丢了」时
+//! 每 1.5 RTT 打一个包、永远判不出链路死亡。RTO / 快速重传都会先取消它，绝不对同一段发两遍。
+//!
 //! # 段序号
 //!
 //! `SYN` 占 seq 0，**数据从 seq 1 开始**（两个方向各自独立）。ISN 恒为 0——`conn_id`
@@ -42,6 +54,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tracing::debug;
 
 /// 段头 magic（`b"RTP1"`）。
 pub(crate) const MAGIC: [u8; 4] = *b"RTP1";
@@ -83,6 +96,16 @@ const DELAYED_ACK: Duration = Duration::from_millis(50);
 
 /// 触发快速重传的重复 ACK 数。
 const DUP_ACK_THRESHOLD: u32 = 3;
+
+/// 尾部丢包探测（TLP）的下限间隔。
+///
+/// 真实链路里 `srtt` 可能只有几毫秒（同机内存链路、局域网），1.5×SRTT 会退化成「几乎
+/// 立刻重发」；30 ms 是 Windows 定时器粒度（GUI 已 `timeBeginPeriod(1)`，但内核/调度
+/// 仍有抖动）与「不要为一点点抖动浪费一个包」之间的折中。
+const TLP_MIN_INTERVAL: Duration = Duration::from_millis(30);
+
+/// TLP 相对 SRTT 的倍数：尾部丢包探测必须在 RTO 之前、又明显晚于一个 RTT。
+const TLP_SRTT_FACTOR: f32 = 1.5;
 
 /// 连续 RTO 超时上限：超过即判链路死亡、有界退出（不无限重传）。
 const MAX_RETRANSMITS: u32 = 8;
@@ -277,6 +300,12 @@ struct ConnStats {
     rto_timeouts: u64,
     /// 快速重传次数。
     fast_retransmits: u64,
+    /// 尾部丢包探测（TLP）次数。
+    ///
+    /// **刻意不透出到 [`ReliableSnapshot`]**：那会改动 `SessionStats::Transport` 的
+    /// `transport_delta` 契约（控制器侧），而 TLP 与快速重传在用户眼里是同一件事
+    /// （「丢包恢复」）。这里只留作单测断言与 `debug!` 诊断。
+    tlp_probes: u64,
     /// 收到的乱序段数。
     out_of_order_segments: u64,
     /// 收到的重复段数。
@@ -477,6 +506,18 @@ struct Conn {
     // ── 计时 ──
     /// RTO 到期时刻。
     rto_deadline: Option<Instant>,
+    /// 尾部丢包探测（TLP）到期时刻；`None` = 当前没有待触发的探测。
+    tlp_deadline: Option<Instant>,
+    /// 已经为哪个 `send_base` 做过尾部探测。
+    ///
+    /// `None` = 尚未探测；`Some(base)` = 这个 base 的尾部已经探过（或已被 RTO/快速重传
+    /// 接管）。**这就是「本次尾部探测已发」标志**：每个 base 只探一次，之后交给 RTO。
+    tlp_probed_base: Option<u32>,
+    /// 最近一次**前进**的时刻：发出新数据、或确认使 `send_base` 前移。
+    ///
+    /// TLP 的计时起点。**重传不刷新它**——否则一直重传就等于一直「有进展」，尾部永远不会
+    /// 被探测。它也是「链路真的在动」的唯一可信信号。
+    last_progress: Instant,
     /// 延迟确认到期时刻。
     ack_deadline: Option<Instant>,
     /// 零窗口 persist 探测到期时刻。
@@ -525,6 +566,9 @@ impl Conn {
             peer_fin_seq: None,
             app_eof: false,
             rto_deadline: None,
+            tlp_deadline: None,
+            tlp_probed_base: None,
+            last_progress: Instant::now(),
             ack_deadline: None,
             persist_deadline: None,
             consecutive_timeouts: 0,
@@ -632,10 +676,17 @@ impl Conn {
 
     /// 最近的一个计时器到期时刻。
     fn next_deadline(&self) -> Option<Instant> {
-        [self.rto_deadline, self.ack_deadline, self.persist_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        // TLP 必须在里面：尾部丢包时**没有任何入站报文**会唤醒协议任务，少了它这个探测
+        // 就只能等 RTO——而 RTO 正是我们要绕开的东西。
+        [
+            self.rto_deadline,
+            self.ack_deadline,
+            self.persist_deadline,
+            self.tlp_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// 收到一个数据报（已由 demux 按 `conn_id` 路由过来）。
@@ -744,6 +795,12 @@ impl Conn {
             if let Some(s) = sample {
                 self.update_rtt(s);
             }
+            // 确认前进 = 链路真的在动：新的 send_base 是新的尾部，旧探测作废并重新计时。
+            // 这里**必须**同时清 `tlp_probed_base`，否则被 RTO 标记过「已探测」的 base 会让
+            // 后续所有尾部探测永久失效。
+            self.tlp_deadline = None;
+            self.tlp_probed_base = None;
+            self.last_progress = now;
             self.arm_rto();
         } else if ack == self.send_base && !self.unacked.is_empty() {
             // 重复 ACK：对端收到了 send_base 之后的段（空洞探测）。
@@ -859,6 +916,86 @@ impl Conn {
         self.rto_deadline = deadline;
     }
 
+    /// 尾部丢包探测的间隔：`max(1.5 × SRTT, 30ms)`。
+    ///
+    /// `srtt` 未知（被动方刚建立、还没有 RTT 样本）时取 `RTO_MIN / 2`（100 ms）——既明显
+    /// 早于 RTO，又不会在真正的高延迟链路上刚发出去就重发一次。
+    fn tlp_interval(&self) -> Duration {
+        self.srtt.map_or(RTO_MIN / 2, |srtt| srtt.mul_f32(TLP_SRTT_FACTOR))
+            .max(TLP_MIN_INTERVAL)
+    }
+
+    /// 重新评估 TLP 定时器（每次 [`Conn::step`] 末尾调用）。
+    ///
+    /// 只在「还有未确认段、未收尾、且当前 `send_base` 尚未探测过」时 arm；条件不成立时
+    /// **清掉**而不是留着——否则 run_conn 会为一个永远不会触发的计时器反复醒来。
+    fn maybe_arm_tlp(&mut self) {
+        if self.fatal || self.fin_sent || self.unacked.is_empty() {
+            self.tlp_deadline = None;
+            if self.unacked.is_empty() {
+                self.tlp_probed_base = None;
+            }
+            return;
+        }
+        if self.tlp_probed_base == Some(self.send_base) {
+            // 当前 base 的尾部已经探过（或已被 RTO/快速重传接管）：交给 RTO。
+            // 不重新 arm 是关键——探测副本自己丢了也不能每 1.5 RTT 再探一次，
+            // 否则链路死亡时永远不会走到 `MAX_RETRANSMITS` 的有界退出。
+            self.tlp_deadline = None;
+            return;
+        }
+        // 起点是 `last_progress` 而不是 `now`：这样「同一个 base 上反复收到重复 ACK /
+        // 重复段」不会把探测无限往后推（那等于永不探测）。
+        self.tlp_deadline = Some(self.last_progress + self.tlp_interval());
+    }
+
+    /// 取消 TLP，并把当前 `send_base` 记为「已探测」。
+    ///
+    /// RTO 与 3-dup-ack 快速重传都调用它：它们已经重传过段了，再让 TLP 重传一次
+    /// **最后一个**段，在队列只有一个段（帧尾恰好也是帧头）时就是同一个段发两遍。
+    fn suppress_tlp(&mut self) {
+        self.tlp_deadline = None;
+        self.tlp_probed_base = Some(self.send_base);
+    }
+
+    /// TLP 到期：重传**最后一个**未确认段。
+    ///
+    /// 为什么是 `back()`：尾部丢包时被丢的是帧的最后一个段，它后面没有段能让对端产生
+    /// 重复 ACK。`front()`（RTO/快速重传的对象）在这里通常已被确认，重发它没有意义。
+    ///
+    /// 与 RTO 的区别（三条都不能混）：
+    /// - **不计 `consecutive_timeouts`**：TLP 不是拥塞信号，也不参与链路死亡判定；
+    /// - **不动 `cwnd`/`ssthresh`**：它重发的是一段**已在途**的数据，没有新增在途量；
+    /// - **不翻倍 `rto`**：退避是 RTO 的语义。
+    fn tail_probe(&mut self, now: Instant) {
+        self.tlp_deadline = None;
+        self.tlp_probed_base = Some(self.send_base);
+        let ack_bits = self.ack_bits();
+        let window = self.window();
+        let send_base = self.send_base;
+        let conn_id = self.conn_id;
+        if let Some(back) = self.unacked.back_mut() {
+            back.retransmitted = true;
+            back.last_sent = now;
+            let seq = back.seq;
+            let data = back.data.clone();
+            let flags = back.flags;
+            let seg = encode_segment(conn_id, seq, send_base, ack_bits, flags, window, &data);
+            self.outgoing.push(seg);
+            self.stats.tlp_probes += 1;
+            debug!(
+                conn_id,
+                seq,
+                send_base,
+                probes = self.stats.tlp_probes,
+                "尾部丢包探测：重传最后一个未确认段"
+            );
+        }
+        // 队列里只有这一段时，`last_sent` 刚被推到 now，`arm_rto` 随之把 RTO 整体后移一个
+        // RTO——这正是「TLP 与 RTO 不重复发同一段」的落点（见 `on_timeout`）。
+        self.arm_rto();
+    }
+
     /// 3 个重复 ACK 触发快速重传（必须早于 RTO）。
     fn fast_retransmit(&mut self, now: Instant) {
         self.ssthresh = (self.cwnd / 2).max(MIN_CWND_BYTES);
@@ -876,6 +1013,8 @@ impl Conn {
             self.outgoing.push(seg);
             self.stats.fast_retransmits += 1;
         }
+        // 3-dup-ack 优先于 TLP：这一段刚被重传，别让尾部探测在同一个 base 上再发一次。
+        self.suppress_tlp();
         self.arm_rto();
     }
 
@@ -904,6 +1043,8 @@ impl Conn {
         if self.consecutive_timeouts > MAX_RETRANSMITS {
             self.fatal = true;
         }
+        // RTO 接管：清掉 TLP 并标记当前 base 已探测，避免同一段再被探测副本发一遍。
+        self.suppress_tlp();
         self.arm_rto();
     }
 
@@ -949,6 +1090,8 @@ impl Conn {
             // 数据段自带 ack 字段，等于顺带把确认发出去了。
             self.ack_pending = false;
             self.ack_deadline = None;
+            // 真的发出去了新数据 = 前进：TLP 从这里重新计时。
+            self.last_progress = now;
         }
         self.arm_rto();
         self.arm_persist(now);
@@ -1036,10 +1179,15 @@ impl Conn {
                 self.flush_ack();
             }
         }
-        if let Some(deadline) = self.rto_deadline {
-            if now >= deadline && !self.unacked.is_empty() {
-                self.retransmit_oldest(now);
-            }
+        let rto_due = self.rto_deadline.is_some_and(|d| now >= d) && !self.unacked.is_empty();
+        // **RTO 到期时优先 RTO**：两者同时到期（说明尾部探测的 deadline 已被拖到 RTO 之后，
+        // 或者 `rto` 比 1.5×SRTT 还短）时若先探一次再立刻 RTO，在队列只有一个段时就是同一个
+        // 段发两遍。TLP 的价值只在「1.5×SRTT ≪ RTO」那段窗口里，所以这里让路没有损失。
+        if !rto_due && self.tlp_deadline.is_some_and(|d| now >= d) {
+            self.tail_probe(now);
+        }
+        if rto_due {
+            self.retransmit_oldest(now);
         }
         if let Some(deadline) = self.persist_deadline {
             if now >= deadline {
@@ -1048,7 +1196,7 @@ impl Conn {
         }
     }
 
-    /// 一次事件后推进状态机（发数据 → 发 FIN → 发立即确认）。
+    /// 一次事件后推进状态机（发数据 → 发 FIN → 发立即确认 → 评估尾部探测）。
     fn step(&mut self, now: Instant) {
         if self.fatal {
             return;
@@ -1058,6 +1206,8 @@ impl Conn {
         if self.ack_pending && self.ack_deadline.is_none() {
             self.flush_ack();
         }
+        // 放在最后：本轮的发送/确认已经把 `last_progress` 与 `send_base` 更新完毕。
+        self.maybe_arm_tlp();
     }
 
     /// 本端 FIN 是否已被确认。
@@ -1998,6 +2148,194 @@ mod tests {
         assert!(
             written < 1024 * 1024,
             "接收方不读时发送方必须有界阻塞（内存与对端行为无关），实写 {written} 字节"
+        );
+    }
+
+    // ───────────────────────── 尾部丢包探测（TLP） ─────────────────────────
+
+    /// 尾部丢包：一帧的**最后一个**段丢失，后面没有段能产生重复 ACK，快速重传不可能触发。
+    ///
+    /// 断言：`max(1.5 × SRTT, 30ms)`（这里是 1.5 × 40ms = 60ms）之后重传**最后一个**段，
+    /// 而不是等满 200ms 的 RTO。这条锁的正是 P1-2 的修复本身。
+    #[tokio::test(start_paused = true)]
+    async fn tail_loss_probe_retransmits_last_segment_before_rto() {
+        let net = Net::new(31);
+        let conn_id = 0x7A11_0BEE;
+        let mut conn = bare_conn(&net, conn_id);
+        // 40ms 的 RTT 样本 → SRTT=40ms、RTO=clamp(40+4×20,200,2000)=200ms、TLP 间隔 60ms。
+        conn.update_rtt(Duration::from_millis(40));
+        let t0 = Instant::now();
+        conn.push_app_data(&vec![7u8; 3 * MAX_PAYLOAD]);
+        conn.step(t0);
+        assert_eq!(conn.unacked.len(), 3, "三段的帧应全部发出");
+        assert_eq!(conn.rto, RTO_MIN, "RTO 在下限 200ms");
+        conn.outgoing.clear();
+
+        // 前两段到达、**最后一段丢失**：对端只 ACK 到 seq 3，之后再没有任何 ACK 能到达。
+        // 采样值刻意取 40ms（与已有 SRTT 相同），让 SRTT / TLP 间隔可精确断言。
+        let t_ack = t0 + Duration::from_millis(40);
+        conn.on_segment(peer_seg(conn_id, 0, 3, 0), &[], t_ack);
+        assert_eq!(conn.unacked.len(), 1, "只剩尾部那一段");
+        assert_eq!(conn.stats.fast_retransmits, 0, "尾部丢包产生不了重复 ACK");
+        conn.step(t_ack);
+
+        let tlp = conn.tlp_deadline.expect("尾部探测应被 arm");
+        let rto = conn.rto_deadline.expect("RTO 仍在");
+        assert!(tlp < rto, "TLP 必须早于 RTO（tlp={tlp:?} rto={rto:?}）");
+        assert_eq!(
+            tlp.saturating_duration_since(t_ack),
+            Duration::from_millis(60),
+            "间隔应为 1.5 × SRTT"
+        );
+
+        // 到点：重传最后一段，且**不是** RTO。
+        conn.on_timeout(tlp);
+        assert_eq!(conn.stats.tlp_probes, 1, "应记一次尾部探测");
+        assert_eq!(conn.stats.rto_timeouts, 0, "尾部丢包不该等 200ms RTO");
+        assert_eq!(conn.outgoing.len(), 1, "一次探测只发一个段");
+        let hdr = SegmentHeader::parse(&conn.outgoing[0]).expect("必须是合法段");
+        assert_eq!(hdr.seq, 3, "重传的必须是最后一个段");
+        assert_eq!(hdr.len, u16::try_from(MAX_PAYLOAD).unwrap(), "载荷应原样重发");
+        assert_eq!(hdr.ack, 3, "顺带通告当前确认点");
+
+        // 同一个 `send_base` 上**只探一次**：之后交给 RTO，不能每 1.5 RTT 打一个包。
+        conn.outgoing.clear();
+        conn.on_timeout(tlp + Duration::from_millis(1));
+        assert_eq!(conn.stats.tlp_probes, 1, "同一 base 不得重复探测");
+        assert!(conn.outgoing.is_empty(), "不应再发出任何段");
+        assert_eq!(conn.stats.rto_timeouts, 0, "此时也还没到 RTO");
+    }
+
+    /// ACK 及时到达：尾部探测必须被取消，不能事后补发一个多余的重传。
+    #[tokio::test(start_paused = true)]
+    async fn timely_ack_cancels_tail_loss_probe() {
+        let net = Net::new(32);
+        let conn_id = 0x7A11_0BF0;
+        let mut conn = bare_conn(&net, conn_id);
+        conn.update_rtt(Duration::from_millis(40));
+        let t0 = Instant::now();
+        conn.push_app_data(&vec![3u8; MAX_PAYLOAD]);
+        conn.step(t0);
+        assert!(conn.tlp_deadline.is_some(), "发完数据应 arm 尾部探测");
+        conn.outgoing.clear();
+
+        // 一个 RTT 内（10ms）确认到达：队列清空，探测取消。
+        conn.on_segment(peer_seg(conn_id, 0, 2, 0), &[], t0 + Duration::from_millis(10));
+        conn.step(t0 + Duration::from_millis(10));
+        assert!(conn.unacked.is_empty());
+        assert_eq!(conn.tlp_deadline, None, "确认前进必须取消 TLP");
+        assert_eq!(conn.stats.tlp_probes, 0);
+
+        // 即便时间越过原本的探测点，也不会有任何补发（没有计时器再被 arm）。
+        conn.on_timeout(t0 + Duration::from_secs(1));
+        assert_eq!(conn.stats.tlp_probes, 0, "健康链路不得触发尾部探测");
+        assert!(conn.outgoing.is_empty(), "健康链路不得有多余重传");
+    }
+
+    /// RTO 与 TLP 同时到期时只能发**一次**，且 `MAX_RETRANSMITS` 的语义不变
+    /// （TLP 不计入 `consecutive_timeouts`、不动 `cwnd`/`rto`）。
+    #[tokio::test(start_paused = true)]
+    async fn rto_suppresses_tail_probe_and_sends_segment_once() {
+        let net = Net::new(33);
+        let conn_id = 0x7A11_0BF2;
+        let mut conn = bare_conn(&net, conn_id);
+        // 无 RTT 样本：TLP 间隔 = RTO_MIN/2 = 100ms，RTO = 200ms。
+        let t0 = Instant::now();
+        conn.push_app_data(&[4u8; 100]);
+        conn.step(t0);
+        assert_eq!(conn.unacked.len(), 1);
+        assert_eq!(
+            conn.tlp_deadline.map(|d| d.saturating_duration_since(t0)),
+            Some(Duration::from_millis(100)),
+            "无 SRTT 时取 RTO_MIN / 2"
+        );
+        conn.outgoing.clear();
+
+        // 直接推进到 RTO 到期（此时 TLP 也早已到期）：RTO 优先，只发一次。
+        conn.on_timeout(t0 + Duration::from_millis(200));
+        assert_eq!(conn.stats.rto_timeouts, 1);
+        assert_eq!(conn.stats.tlp_probes, 0, "RTO 到期时 TLP 必须让路");
+        assert_eq!(conn.outgoing.len(), 1, "同一段只能发一遍（不能 TLP + RTO 各发一次）");
+        assert_eq!(conn.tlp_deadline, None, "RTO 接管后 TLP 必须清掉");
+        assert_eq!(conn.consecutive_timeouts, 1, "TLP 不得计入重传上限");
+
+        // 之后也不再 arm：交给 RTO 的退避链，`MAX_RETRANSMITS` 的有界退出不被拖慢成无限探测。
+        conn.step(t0 + Duration::from_millis(200));
+        assert_eq!(conn.tlp_deadline, None, "RTO 已接管当前 base，不得重新 arm");
+    }
+
+    /// 只丢**一次**指定 `seq` 的载荷段：模拟「一帧的最后一个段丢失」。
+    struct DropPayloadSeqOnce {
+        /// 真正的链路。
+        inner: Arc<dyn DatagramSender>,
+        /// 要丢弃的段序号（仅丢弃第一次）。
+        seq: u32,
+        /// 是否已经丢过。
+        dropped: AtomicBool,
+    }
+
+    #[async_trait]
+    impl DatagramSender for DropPayloadSeqOnce {
+        async fn send_datagram(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if let Some(hdr) = SegmentHeader::parse(buf) {
+                if hdr.seq == self.seq && hdr.len > 0 && !self.dropped.swap(true, Ordering::SeqCst) {
+                    // 静默丢弃（UDP 语义），但谎报已发送——发送方必须靠自己的计时器发现。
+                    return Ok(buf.len());
+                }
+            }
+            self.inner.send_datagram(buf, target).await
+        }
+    }
+
+    /// 端到端：`run_conn` 的定时唤醒必须能驱动 TLP（只调 `on_timeout` 的单测覆盖不到
+    /// `next_deadline` 忘加 `tlp_deadline` 这种缺陷——那会让探测永远等不到唤醒）。
+    #[tokio::test(start_paused = true)]
+    async fn tail_loss_probe_is_driven_by_run_conn_timer() {
+        let net = Net::new(34);
+        let (link_a, rx_a, _addr_a) = endpoint(&net, "10.0.0.1:1111");
+        let (link_b, rx_b, addr_b) = endpoint(&net, "10.0.0.2:2222");
+        // 数据段 seq 1..=3（SYN 占 seq 0），丢最后一个。
+        let link_a: Arc<dyn DatagramSender> = Arc::new(DropPayloadSeqOnce {
+            inner: link_a,
+            seq: 3,
+            dropped: AtomicBool::new(false),
+        });
+        let conn_id = 0x7A11_0BF4;
+        let (ra, rb) = tokio::join!(
+            connect(link_a, conn_id, rx_a, addr_b, PUNCH_BUDGET),
+            accept(link_b, conn_id, rx_b, PUNCH_BUDGET)
+        );
+        let ReliableStream {
+            stream: mut a,
+            metrics,
+        } = ra.expect("主动方应建立成功");
+        let mut b = rb.expect("被动方应建立成功").stream;
+
+        let payload = pattern(3 * MAX_PAYLOAD);
+        let expect = payload.clone();
+        let started = Instant::now();
+        let writer = tokio::spawn(async move {
+            a.write_all(&payload).await.unwrap();
+            a.shutdown().await.unwrap();
+        });
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), b.read_to_end(&mut got))
+            .await
+            .expect("尾部丢包应被 TLP 快速恢复")
+            .unwrap();
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+
+        assert_eq!(got, expect, "TLP 重传后数据必须逐字节相同");
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.fast_retransmits, 0,
+            "尾部段后面没有段可用乱序反证空洞，不可能走 3-dup-ack 快速重传"
+        );
+        assert_eq!(snap.rto_timeouts, 0, "尾部丢包必须由 TLP 恢复，而不是等 RTO");
+        assert!(
+            elapsed < RTO_MIN,
+            "应在 RTO（{RTO_MIN:?}）之前恢复，实际 {elapsed:?}"
         );
     }
 }

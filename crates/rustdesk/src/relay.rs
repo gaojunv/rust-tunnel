@@ -47,9 +47,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 use tokio::time::{interval, sleep, timeout, Instant, MissedTickBehavior};
 use tokio_util::codec::Decoder as _;
 use tracing::{debug, info, warn};
@@ -313,10 +314,10 @@ impl RelayServer {
             "中继开始转发"
         );
         let result = pump(
-            &mut first_stream,
-            &mut second_stream,
+            first_stream,
+            second_stream,
             &self.config,
-            &self.stats,
+            Arc::clone(&self.stats),
         )
         .await;
         debug!(uuid = %uuid, ?result, "中继转发结束");
@@ -355,45 +356,154 @@ async fn read_handshake(
     }
 }
 
-/// 裸字节双向转发，按 [`RelayConfig::idle_timeout`] 关闭死链。
-async fn pump(
-    first: &mut TcpStream,
-    second: &mut TcpStream,
-    config: &RelayConfig,
-    stats: &RelayStats,
+/// 转发方向：决定读到的字节数记到哪个计数器上。
+#[derive(Clone, Copy)]
+enum Direction {
+    /// 先到者 → 后到者。
+    First,
+    /// 后到者 → 先到者。
+    Second,
+}
+
+impl Direction {
+    /// 该方向对应的累计字节计数器。
+    fn counter(self, stats: &RelayStats) -> &AtomicU64 {
+        match self {
+            Self::First => &stats.bytes_from_first,
+            Self::Second => &stats.bytes_from_second,
+        }
+    }
+}
+
+/// 两条转发任务共享的「最近活动时刻」。
+///
+/// 存的是相对 `epoch` 的毫秒数而不是 `Instant`：`Instant` 不是整数、无法放进
+/// 原子量，而这条路径**可能每 64 KiB 就被写一次**，用 `Mutex<Instant>` 只会让
+/// 两个方向在热路径上互相争用。`Release`/`Acquire` 保证监督者读到时间戳时，
+/// 对应那批字节确实已经写出去（计数与活动时刻的先后关系见 [`forward`]）。
+#[derive(Clone)]
+struct ActivityClock {
+    epoch: Instant,
+    last_ms: Arc<AtomicU64>,
+}
+
+impl ActivityClock {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// 距基准时刻的毫秒数。
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// 记一次活动（任一方向成功转发都要调用）。
+    fn touch(&self) {
+        self.last_ms.store(self.elapsed_ms(), Ordering::Release);
+    }
+
+    /// 距最近一次活动的时长。
+    fn idle_for(&self) -> Duration {
+        let last = self.last_ms.load(Ordering::Acquire);
+        Duration::from_millis(self.elapsed_ms().saturating_sub(last))
+    }
+}
+
+/// 单个方向的裸字节转发：从 `reader` 读到就写进 `writer`，直到 EOF 或 IO 错误。
+///
+/// 两个方向各跑一个任务，**互不阻塞**：本方向卡在 `write_all`（对端接收窗口满、
+/// 网络拥塞）时，另一方向的任务照常读、照常写。此前两个方向共用一个
+/// `select!`，`write_all` 这一 await 期间另一方向的 `read` 根本没被 poll 过——
+/// 一段视频写不出去，反方向的键盘/鼠标输入就得排在那后面，正是延迟被放大的原因。
+async fn forward(
+    mut reader: OwnedReadHalf,
+    mut writer: OwnedWriteHalf,
+    direction: Direction,
+    stats: Arc<RelayStats>,
+    clock: ActivityClock,
 ) -> io::Result<()> {
-    let mut first_buf = vec![0u8; RELAY_BUF_SIZE];
-    let mut second_buf = vec![0u8; RELAY_BUF_SIZE];
-    let mut last_activity = Instant::now();
+    let mut buf = vec![0u8; RELAY_BUF_SIZE];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(()); // 该方向的对端关闭；整对的收尾由 pump 负责
+        }
+        writer.write_all(&buf[..n]).await?;
+        // 计数与活动时刻都放在写成功**之后**：语义是「已转发给对端的字节」，
+        // 与拆分前的单任务实现逐字一致（测试 wait_for_stats 也依赖这个顺序）。
+        direction
+            .counter(&stats)
+            .fetch_add(n as u64, Ordering::Relaxed);
+        clock.touch();
+    }
+}
+
+/// 拆成两条独立转发任务后，把 [`JoinSet`] 里的结果还原成 IO 结果。
+///
+/// 任务 panic 会以 `JoinError` 的形式出现（而不是让中继进程挂掉），这里把它折叠成
+/// 一次普通的连接错误，交给调用方记日志。
+fn join_result(joined: Result<io::Result<()>, JoinError>) -> io::Result<()> {
+    joined.unwrap_or_else(|err| Err(io::Error::other(err)))
+}
+
+/// 裸字节双向转发，按 [`RelayConfig::idle_timeout`] 关闭死链。
+///
+/// 两条方向各一个独立任务；本函数只做监督：
+///
+/// - **任一方向结束**（EOF / IO 错误 / panic）→ 收掉另一方向，整对关闭；
+/// - **空闲超时**：任一方向有字节都算活动，超过 `idle_timeout` 没有任何字节则整对关闭；
+/// - 接收的两条流在这里 `into_split`，读写半边随任务结束一起 drop（即关闭套接字）。
+async fn pump(
+    first: TcpStream,
+    second: TcpStream,
+    config: &RelayConfig,
+    stats: Arc<RelayStats>,
+) -> io::Result<()> {
+    // 每条方向拿「一条腿的读 + 另一条腿的写」，两者之间没有共享状态需要加锁。
+    let (first_read, first_write) = first.into_split();
+    let (second_read, second_write) = second.into_split();
+
+    let clock = ActivityClock::new();
+    let mut tasks: JoinSet<io::Result<()>> = JoinSet::new();
+    tasks.spawn(forward(
+        first_read,
+        second_write,
+        Direction::First,
+        Arc::clone(&stats),
+        clock.clone(),
+    ));
+    tasks.spawn(forward(
+        second_read,
+        first_write,
+        Direction::Second,
+        Arc::clone(&stats),
+        clock.clone(),
+    ));
+
     let mut ticker = interval(config.idle_check_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
+
+    let result = loop {
         tokio::select! {
-            read = first.read(&mut first_buf) => {
-                let n = read?;
-                if n == 0 {
-                    return Ok(()); // 先到者关闭
-                }
-                second.write_all(&first_buf[..n]).await?;
-                stats.bytes_from_first.fetch_add(n as u64, Ordering::Relaxed);
-                last_activity = Instant::now();
-            }
-            read = second.read(&mut second_buf) => {
-                let n = read?;
-                if n == 0 {
-                    return Ok(()); // 后到者关闭
-                }
-                first.write_all(&second_buf[..n]).await?;
-                stats.bytes_from_second.fetch_add(n as u64, Ordering::Relaxed);
-                last_activity = Instant::now();
-            }
+            // 两条任务都还在集合里，所以 join_next 不会返回 None；任一完成即收尾。
+            Some(joined) = tasks.join_next() => break join_result(joined),
             _ = ticker.tick() => {
-                if last_activity.elapsed() >= config.idle_timeout {
-                    return Ok(()); // 空闲超时
+                if clock.idle_for() >= config.idle_timeout {
+                    break Ok(()); // 空闲超时：整对关闭
                 }
             }
         }
-    }
+    };
+
+    // 另一方向可能还挂在 read/write 上（例如对端只关了一个半连接，或者正卡在
+    // write_all 里），必须 abort 掉：否则它的读写半边会一直持有套接字，对端看到的
+    // 是「通道还活着」，而 pump 已经返回、active_pairs 也已减一。
+    // shutdown 会 abort 全部未完成任务并等它们真正结束。
+    tasks.shutdown().await;
+    result
 }
 
 #[cfg(test)]
@@ -636,6 +746,93 @@ mod tests {
 
         // 静默超过 idle_timeout 后两端都应被关闭（读到 EOF）。
         assert_eq!(read_once(&mut first).await, 0, "空闲超时后应先到者关闭");
+    }
+
+    /// 轮询等待「A→B 方向确实卡住」，返回卡住时的转发字节数。
+    ///
+    /// 判据是 `bytes_from_first` **连续多次不再前进**：客户端在后台持续灌数据，
+    /// 只要转发还在推进计数就会涨；停止前进只可能是转发任务卡在 `write_all`
+    /// 上（对端不读 → 接收窗口关闭）。不用固定 sleep 猜时间：不同平台的 socket
+    /// 缓冲与自动调优差异很大，只有计数停住才是真的阻塞信号。
+    async fn wait_until_forwarding_stalls(server: &RelayServer) -> u64 {
+        const SAMPLE: Duration = Duration::from_millis(50);
+        const NEEDED: u32 = 6; // ≈300 ms 无进展
+        let mut last = server.stats().snapshot().bytes_from_first;
+        let mut stagnant = 0;
+        for _ in 0..400 {
+            sleep(SAMPLE).await;
+            let now = server.stats().snapshot().bytes_from_first;
+            if now == last {
+                stagnant += 1;
+                if now > 0 && stagnant >= NEEDED {
+                    return now;
+                }
+            } else {
+                stagnant = 0;
+                last = now;
+            }
+        }
+        panic!("A→B 方向始终没有阻塞（已转发 {last} 字节），无法构造队头阻塞场景");
+    }
+
+    /// 回归测试（延迟审查 P1-3）：一个方向的 `write_all` 卡住时，反方向必须照常转发。
+    ///
+    /// 旧实现用一个 `select!` 串行跑两个方向：A→B 的 `write_all` 一旦阻塞
+    /// （B 不读、发送缓冲满），`select!` 就根本不会再 poll 反方向的 `read`，
+    /// 于是 B 发出的输入帧要等这一整段数据发完才可能到达 A（实测就是永远不到）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_direction_does_not_stall_the_other() {
+        let relay = start_relay(
+            "k",
+            RelayConfig {
+                pair_window: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(30),
+                idle_check_interval: Duration::from_secs(1),
+            },
+        )
+        .await;
+
+        // A = 先到者（持续往 B 灌数据）；B = 后到者（**故意不读**）。
+        let (mut a_read, mut a_write) = connect(relay.addr).await.into_split();
+        a_write
+            .write_all(&request_relay_bytes("blocked-1", "k"))
+            .await
+            .unwrap();
+        wait_for_pending(&relay.server, 1).await;
+
+        let (b_read, mut b_write) = connect(relay.addr).await.into_split();
+        b_write
+            .write_all(&request_relay_bytes("blocked-1", "k"))
+            .await
+            .unwrap();
+        // b_read 故意不读，但要一直活着：丢半边不影响套接字，但保持语义清晰。
+        let _b_read = b_read;
+
+        // A 在后台无限灌数据，灌满链路缓冲后它自己也会阻塞；测试结束时 abort。
+        // 上限只是防御性的（远大于任何平台的缓冲总和），正常会在阻塞处停住。
+        let flood = tokio::spawn(async move {
+            let chunk = vec![0xAB_u8; RELAY_BUF_SIZE];
+            for _ in 0..2048 {
+                if a_write.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stalled_at = wait_until_forwarding_stalls(&relay.server).await;
+        assert!(stalled_at > 0, "应有字节被转发过才可能阻塞");
+
+        // 此刻 A→B 已阻塞；B→A 的小帧必须马上到 A。
+        b_write.write_all(b"PING").await.unwrap();
+        let mut ping = [0u8; 4];
+        timeout(Duration::from_secs(3), a_read.read_exact(&mut ping))
+            .await
+            .expect("B→A 方向被 A→B 的阻塞拖住了（队头阻塞回归）")
+            .unwrap();
+        assert_eq!(&ping, b"PING");
+
+        flood.abort();
+        let _ = flood.await;
     }
 
     #[tokio::test]

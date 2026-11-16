@@ -1419,9 +1419,18 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
         }
     }
 
+    // 上屏交换链只保留 1 帧在排队（wgpu 默认 2）。远程画面是**实时**内容：多排一帧就等于
+    // 把每一帧的上屏时间再推迟一个刷新周期（60 Hz 下约 16 ms），而平滑度收益几乎为零
+    // （画面到达本就被采集节拍打散）。egui-wgpu 的 `AutoVsync` 保持不变——窗口模式下由
+    // DWM 合成，降延迟不需要关 vsync。
+    let wgpu_options = egui_wgpu::WgpuConfiguration {
+        desired_maximum_frame_latency: Some(1),
+        ..Default::default()
+    };
     let options = eframe::NativeOptions {
         viewport,
         renderer,
+        wgpu_options,
         ..Default::default()
     };
 

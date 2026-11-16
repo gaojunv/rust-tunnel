@@ -38,6 +38,13 @@
 //! 保活——它只绕过「无变化就跳过」这一道闸门，**不会带出 IDR**。少了它，用户看到的是
 //! 「远端静止一段时间后，第一次变化要反复几次才出现」。
 //!
+//! # 输入触发采集
+//!
+//! 采集节拍是周期性的，而输入事件到达的时刻与节拍相位无关：拖动窗口时最多白等一个周期
+//! （30 fps 下 33 ms，且逐次随机），这正是「拖动延迟忽大忽小」的来源。故每次输入注入后
+//! 都把下一拍提前到「上一拍之后半个周期」（见 [`input_capture_target`]），交互期间有效
+//! 帧率最多翻倍；静止时仍按档位节拍，采集层的像素级变化检测会跳过编码，不额外耗带宽。
+//!
 //! # QoS 闭环（阶段 3）
 //!
 //! 主循环持有 [`RateController`]（AIMD）：每收到一条控制器的 `QosFeedback` 就决策一次，把新的
@@ -65,8 +72,10 @@
 //! 四条硬约束：
 //! - **顺序**：补丁必须排在那块全帧基准**之后**。进入模式前先让一帧基准全帧**真正投进出站
 //!   队列**（编码任务回报 `base_frame_sent`）之后才切模式；两者走**同一条画面队列**
-//!   （`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::enqueue_screen`]
-//!   （可取消地等、绝不丢弃）。
+//!   （`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::try_enqueue_screen`]
+//!   （**非阻塞**：主循环绝不能在补丁投递上 `.await`，否则网络拥塞时输入/心跳一并被卡住）。
+//!   队列满时退出补丁模式并强制一帧全帧 IDR——可能已发出同一批的**部分**横条，控制端那块
+//!   合成缓冲只有一帧完整 IDR 才能修复。
 //! - **进/出补丁模式都用 P 帧**：补丁只改控制器侧的合成帧缓冲，**不碰 H.264 参考链**
 //!   （补丁模式期间编码器根本不编码），所以基准帧与退出后的第一帧都只需一帧普通 P 帧。
 //!   只有真正让参考链/几何失效的事件才 IDR：会话首帧、`RequestKeyframe`、`SelectDisplay` /
@@ -104,9 +113,10 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, timeout, Instant, MissedTickBehavior, Sleep};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -134,9 +144,14 @@ pub(crate) const CTRL_QUEUE: usize = 32;
 
 /// 画面队列深度。
 ///
-/// 画面帧是大头（可达 MiB 级），队列过深会在写侧卡住时把内存顶上去；过浅则正常突发下容易丢帧。
-/// 4 足以吸收一次采集与心跳的抖动，同时把最坏内存压在「4 × 单帧」量级。
-pub(crate) const SCREEN_QUEUE: usize = 4;
+/// 这是**编码之后、绝不可丢弃**的队列（见模块文档的丢弃策略），所以它的深度**直接等于链路
+/// 上的常驻排队延迟**：`深度 / fps`。4 深在 30 fps 下就是 133 ms 的稳态排队——链路吞吐一旦
+/// 接近编码输出码率（QoS 闭环的目标正是如此），队列会长期装满，用户按一次键要等它排空。
+///
+/// 2 深把这段压到 66 ms，同时仍能吸收一次采集/心跳的抖动。**不必担心丢帧**：背压出口在
+/// **编码之前**（编码队列满就跳过这一帧，等价降帧率，语义合法），所以队列浅只是让「编码前
+/// 丢帧」更早发生，而不是让已编码的 P 帧丢失（那会断参考链）。
+pub(crate) const SCREEN_QUEUE: usize = 2;
 
 /// 文件队列深度。
 ///
@@ -225,12 +240,17 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
 /// `file_staging` 是文件类消息的**暂存区**：file 队列满时消息留在这里、下一拍重试，主循环
 /// 因此永远不必为文件数据 `.await`。它保持 FIFO，所以 `FileDone`/`FileError` 不会越过尚未
 /// 投递的 `FileChunk`。
+///
+/// `screen_pacing_kbps` 与接收端共享同一个原子：主循环在 QoS 生效值变化时写，写任务发送大帧
+/// 时读（见 [`pacing_plan`]）。用共享原子而不是加一条控制消息，是因为它只是「一个数字」，且
+/// 写任务不能为了拿到最新值而去等队列。
 pub(crate) struct OutboundQueues {
     ctrl: mpsc::Sender<SessionFrame>,
     screen: mpsc::Sender<SessionFrame>,
     file: mpsc::Sender<SessionFrame>,
     close: mpsc::UnboundedSender<SessionFrame>,
     file_staging: VecDeque<SessionMessage>,
+    screen_pacing_kbps: Arc<AtomicU32>,
 }
 
 /// [`OutboundQueues`] 的另一半：四个接收端，整体移交给 [`writer_loop`]。
@@ -239,6 +259,8 @@ pub(crate) struct OutboundReceivers {
     screen: mpsc::Receiver<SessionFrame>,
     file: mpsc::Receiver<SessionFrame>,
     close: mpsc::UnboundedReceiver<SessionFrame>,
+    /// 画面发送 pacing 的目标码率（kbps，0 = 关闭；见 [`OutboundQueues::set_screen_pacing_kbps`]）。
+    screen_pacing_kbps: Arc<AtomicU32>,
 }
 
 impl OutboundQueues {
@@ -249,6 +271,8 @@ impl OutboundQueues {
         let (screen_tx, screen_rx) = mpsc::channel(SCREEN_QUEUE);
         let (file_tx, file_rx) = mpsc::channel(FILE_QUEUE);
         let (close_tx, close_rx) = mpsc::unbounded_channel();
+        // 0 = 不 pace：控制器侧从不设置它（大帧 pacing 是被控端的发送侧策略）。
+        let screen_pacing_kbps = Arc::new(AtomicU32::new(0));
         (
             Self {
                 ctrl: ctrl_tx,
@@ -256,14 +280,30 @@ impl OutboundQueues {
                 file: file_tx,
                 close: close_tx,
                 file_staging: VecDeque::new(),
+                screen_pacing_kbps: Arc::clone(&screen_pacing_kbps),
             },
             OutboundReceivers {
                 ctrl: ctrl_rx,
                 screen: screen_rx,
                 file: file_rx,
                 close: close_rx,
+                screen_pacing_kbps,
             },
         )
+    }
+
+    /// 设置画面大帧的分段 pacing 目标码率（kbps；0 = 关闭）。
+    ///
+    /// 只在被控端、且只在 `encode = rate.current()` 更新之后调用——它必须与编码器的在线码率
+    /// 保持同一个值，否则 pacing 会按一个已经不存在的码率摊开。
+    pub(crate) fn set_screen_pacing_kbps(&self, kbps: u32) {
+        self.screen_pacing_kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    /// 当前 pacing 目标码率（kbps；0 = 关闭）。只在单测里读回验证，线上没有读者。
+    #[cfg(test)]
+    pub(crate) fn screen_pacing_kbps(&self) -> u32 {
+        self.screen_pacing_kbps.load(Ordering::Relaxed)
     }
 
     /// 画面发送端的克隆（编码任务需要独立持有）。
@@ -336,6 +376,9 @@ impl OutboundQueues {
 
     /// 投进画面队列（可取消地等空位，**绝不丢**；时域参考链不能断）。
     ///
+    /// 只用于**编码任务**（它阻塞在一个独立任务里，阻塞它不会卡住输入/心跳）。会话 `select!`
+    /// 主循环**绝不能**调用它——那里等一次队列，输入注入与采集节拍就一起停一次。
+    ///
     /// # Errors
     /// 取消令牌触发或写任务已结束时返回错误。
     pub(crate) async fn enqueue_screen(
@@ -347,6 +390,21 @@ impl OutboundQueues {
             biased;
             () = cancel.cancelled() => Err(RemoteError::Cancelled),
             res = self.screen.send(frame) => res.map_err(|_| link_closed()),
+        }
+    }
+
+    /// **非阻塞**地把一条画面帧投进去（补丁路径专用）。
+    ///
+    /// 返回 `Ok(true)` = 已入队；`Ok(false)` = 队列已满，调用方必须自己决定退让策略（补丁路径
+    /// 是「退出补丁模式 + 强制一帧 IDR」，见 `run_controlled`）——这里**不等待、不丢帧**。
+    ///
+    /// # Errors
+    /// 写任务已结束（通道关闭）时返回 [`link_closed`]。
+    pub(crate) fn try_enqueue_screen(&self, frame: SessionFrame) -> RemoteResult<bool> {
+        match self.screen.try_send(frame) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(link_closed()),
         }
     }
 
@@ -413,6 +471,43 @@ const MAX_CAPTURE_TIMEOUTS: u32 = 3;
 /// 的延迟上界压到 250 ms。代价可忽略：QSV/NVENC 实测静止 P 帧约 3 KB，4 fps ≈ 12 KB/s
 /// ≈ 100 kbps（1080p；这一帧同时会喂给控制端的解码器，不会额外触发关键帧）。
 pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_millis(250);
+
+/// 周期性强制关键帧的兜底间隔。
+///
+/// 正常情况下 IDR 只在参考链真的失效时才发（首帧、`RequestKeyframe`、切显示器/画质、几何
+/// 变化）。但如果控制端**整段**收不到帧（丢包风暴、可靠层重传耗尽、控制器看门狗刚好在
+/// 400 ms 限频窗口里没发出请求），恢复就只剩「控制器 3s 无帧看门狗 + 限频请求」这一条路，
+/// 用户会看到一次以秒计的冻结。
+///
+/// 10 秒是**兜底**而不是节拍：静止画面下 P 帧保活（[`UNCHANGED_RESEND_INTERVAL`]）已经让
+/// 控制端持续有画面，正常会话里这个定时器几乎不会命中；命中时也只多一个 150–400 KB 的 IDR
+/// 尖峰（pacing 会把它摊开）。
+const PERIODIC_KEYFRAME_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 大帧 pacing 的最小帧载荷（96 KiB）。
+///
+/// IDR 典型 150–400 KB，而普通 P 帧在静止/低活跃下只有几 KB。门槛定在这里，是为了让「真的
+/// 会把链路堵住的帧」才付分段写的代价：交互帧本身就是延迟，给它们加 sleep 只会更慢。
+const PACING_MIN_FRAME_BYTES: usize = 96 * 1024;
+
+/// 大帧分段写的块大小（32 KiB）。
+///
+/// 6 Mbps 上一块约 43 ms，恰好是「让后面排队的小帧有机会被内核/中继推进一个块」的粒度；
+/// 再大就失去交错的意义，再小则 write 次数与 TLS 记录开销都上去了。
+const PACING_CHUNK_BYTES: usize = 32 * 1024;
+
+/// 单个块间等待的绝对上限（100 ms）。
+///
+/// pacing 的目的是**削尖峰**，不是限速：码率读数偏低（刚降档、或读到的值还没跟上实际链路）
+/// 时，按目标码率算出的块间等待可能长达数百毫秒，一帧就会被拖成秒级。封顶之后即使读数
+/// 离谱，一帧最多也就多花「块数 × 100 ms」。
+const PACING_MAX_GAP: Duration = Duration::from_millis(100);
+
+/// 全部块间等待相对「该帧在目标码率下的自然串行时间」的上限倍数。
+///
+/// 与 [`PACING_MAX_GAP`] 是两道互补的闸门：前者管单个间隙，这条管总量（块数多时单个间隙
+/// 虽小、累加也可能超过一帧的自然时间）。
+const PACING_MAX_WAIT_FACTOR: u32 = 2;
 
 /// 进入补丁模式的**变化面积**门槛（千分比，3%）：低于它才算「安静」。
 ///
@@ -665,6 +760,28 @@ fn capture_tick_period(mode: ScreenMode, encode: &EncodeRates) -> Duration {
     }
 }
 
+/// 交互期间把下一拍采集**提前**到「上一拍开始后半个周期」（纯函数，便于单测）。
+///
+/// 采集是周期节拍，而输入事件到达的时刻与节拍相位无关：用户拖动窗口时，一次鼠标移动最
+/// 多要等满一个采集周期（默认 30 fps 下 33 ms）才会被采到，而且等待时长逐次随机——这正是
+/// 「拖动时延迟忽大忽小」的来源。输入生效后立刻把节拍拉近，采样相位的等待就从
+/// `0..period` 降到 `0..period/2`，拖动/打字的第一帧明显更跟手。
+///
+/// **只提前到半个周期**：上限是「交互期间最多把有效帧率翻倍」，而不是让输入把采集推到
+/// 不限速——那会在拖动时把编码器与带宽打满。编码器/出站队列本就有编码前丢帧出口，跟不上
+/// 时会自然降速。补丁模式同样适用（打字时游标/输入框反馈更即时）。
+fn input_capture_target(
+    now: Instant,
+    last_capture_at: Option<Instant>,
+    period: Duration,
+) -> Instant {
+    let min_interval = period / 2;
+    match last_capture_at {
+        Some(last) => (last + min_interval).max(now),
+        None => now,
+    }
+}
+
 /// 显示列表的**比较签名**：按 `id` 排序后的 `(id, width, height)`。
 ///
 /// 只取这三个字段：`name`/`primary` 变化不影响采集（GUI 列表刷新本身需要整份 `DisplayList`，
@@ -731,6 +848,7 @@ fn session_encode_options(options: EncodeOptions, native_active: bool) -> Encode
 fn refresh_activity(
     rate: &mut RateController,
     encode: &mut EncodeRates,
+    queues: &OutboundQueues,
     capture_tick: &mut Pin<Box<Sleep>>,
     mode: ScreenMode,
     changed_permille: u16,
@@ -741,6 +859,8 @@ fn refresh_activity(
         capture_tick.as_mut().reset(Instant::now() + capture_tick_period(mode, &next));
     }
     *encode = next;
+    // 面积驱动的升档会抬高生效码率：pacing 必须跟着走，否则大帧按旧码率摊开、比目标更快或更慢。
+    queues.set_screen_pacing_kbps(next.bitrate_kbps);
 }
 
 /// 退出补丁模式：回到全帧视频，并让采集节拍**立刻**到期（先把用户操作的那一帧抓上来）。
@@ -1452,6 +1572,10 @@ pub async fn run_controlled(
     // 会话循环只在看到它之后才切补丁模式（顺序不变量，见模块文档）。基准帧是 P 帧，
     // 所以信号不能只看 `keyframe`（见 [`encode_loop`]）。
     let base_frame_sent = Arc::new(AtomicBool::new(false));
+    // 最近一次**真正编码出关键帧**的时刻（本端单调时钟微秒，见 [`crate::clock::now_us`]）。
+    // 由编码任务写、主循环读，用来做周期性 IDR 兜底（[`PERIODIC_KEYFRAME_INTERVAL`]）。
+    // 初值 0 = 「还没有关键帧」：主循环据此跳过判断，等首帧 IDR 把值写上。
+    let last_keyframe_us = Arc::new(AtomicU64::new(0));
     // 编码任务每秒写入的完整快照（std `Mutex`，每秒只读/写一次）。主循环据此组装
     // `HostStats`——编码侧的真实读数（耗时、fps、出码、队列深度、重建/强制 IDR 次数）只在
     // 编码任务里，而 `SessionStats::Encode` 那条通道不带这些字段。
@@ -1468,6 +1592,7 @@ pub async fn run_controlled(
         config.unchanged_resend,
         Arc::clone(&screen_send_meter),
         Arc::clone(&base_frame_sent),
+        Arc::clone(&last_keyframe_us),
         max_encode_width,
         Arc::clone(&encode_snapshot),
     ));
@@ -1496,6 +1621,8 @@ pub async fn run_controlled(
     // 只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
     let mut rate = RateController::new(session_encode_options(config.encode, native_active));
     let mut encode = rate.current();
+    // pacing 与编码器的在线码率保持同一个值（见 [`pacing_plan`]）。
+    queues.set_screen_pacing_kbps(encode.bitrate_kbps);
     let mut display_id = displays
         .iter()
         .find(|d| d.primary)
@@ -1526,6 +1653,9 @@ pub async fn run_controlled(
     let mut next_capture_at = Instant::now() + encode.capture_interval();
     // 采集节拍诊断（每秒遥测）：实际间隔、慢拍数、因上一拍未返回而跳过的次数、采集等待。
     let mut last_capture_tick: Option<Instant> = None;
+    // 输入触发采集（见 [`input_capture_target`]）：采集在途时收到的输入只记一个标志，
+    // 等结果回来再立刻补拍——同一时刻绝不并发第二次采集（会把阻塞线程池堆满）。
+    let mut input_capture_pending = false;
     let mut tick_dt_sum_ms = 0_u64;
     let mut tick_dt_count = 0_u32;
     let mut tick_slow = 0_u32;
@@ -1610,6 +1740,27 @@ pub async fn run_controlled(
                     warn!(?last_ack_ms, "对端心跳超时（链路可能已中断），结束会话");
                     "对端心跳超时（链路可能已中断）".clone_into(&mut reason);
                     break Ok(SessionEnd { reason: reason.clone(), deliberate: false });
+                }
+                // 周期 IDR 兜底（1 Hz 心跳拍顺带检查，不额外引定时器）：全帧视频下若距上个
+                // 关键帧已超过 [`PERIODIC_KEYFRAME_INTERVAL`]，主动置一次 `force_keyframe`。
+                // 它只兜「控制端整段没恢复」（丢包风暴、请求被限频吞掉）；正常会话里静止 P 帧
+                // 保活已经让画面持续流动，这个分支几乎不会命中。
+                //
+                // `last_keyframe_us == 0` = 还没有关键帧（会话刚起）：跳过，等首帧 IDR 写值，
+                // 否则会话一开始就会白插一个重复的 IDR。`force_keyframe` 已为真时也不必重复。
+                let last_kf_us = last_keyframe_us.load(Ordering::Relaxed);
+                let periodic_us = u64::try_from(PERIODIC_KEYFRAME_INTERVAL.as_micros())
+                    .unwrap_or(u64::MAX);
+                if screen_mode.mode == ScreenMode::Video
+                    && !force_keyframe
+                    && last_kf_us != 0
+                    && crate::clock::now_us().saturating_sub(last_kf_us) >= periodic_us
+                {
+                    force_keyframe = true;
+                    debug!(
+                        age_ms = crate::clock::now_us().saturating_sub(last_kf_us) / 1000,
+                        "距上个关键帧超过周期兜底间隔，强制刷新 IDR"
+                    );
                 }
                 // FIFO 配对：迟到的 ack 认领最老的未应答心跳，而不是最新那个。
                 if heartbeat_sent.len() >= HEARTBEAT_SENT_CAP {
@@ -1717,6 +1868,21 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { payload, capture_us, capture_ts_us, cursor, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
+                        // 采集在途期间有输入到达：结果一回来就立刻安排下一拍，不再等满一个
+                        // 周期（见 [`input_capture_target`]）。这里用当前模式/生效帧率重算，
+                        // 因为采集期间可能刚换过档位或进出过补丁模式。
+                        if input_capture_pending {
+                            input_capture_pending = false;
+                            let target = input_capture_target(
+                                Instant::now(),
+                                last_capture_tick,
+                                capture_tick_period(screen_mode.mode, &encode),
+                            );
+                            if target < next_capture_at {
+                                next_capture_at = target;
+                                capture_tick.as_mut().reset(target);
+                            }
+                        }
                         // 远端光标形状：**只在变化时**发一条控制帧。`None` 表示平台不支持/读不到，
                         // 此时不发消息、也**不清** `last_cursor`（一次读取失败不该让控制端的光标
                         // 闪回箭头）。形状变化与鼠标是否移动无关，控制端据此更新图标。
@@ -1752,6 +1918,7 @@ pub async fn run_controlled(
                                     refresh_activity(
                                         &mut rate,
                                         &mut encode,
+                                        &queues,
                                         &mut capture_tick,
                                         screen_mode.mode,
                                         last_changed_permille,
@@ -1871,6 +2038,7 @@ pub async fn run_controlled(
                                         refresh_activity(
                                             &mut rate,
                                             &mut encode,
+                                            &queues,
                                             &mut capture_tick,
                                             screen_mode.mode,
                                             last_changed_permille,
@@ -1906,30 +2074,55 @@ pub async fn run_controlled(
                                                     bytes,
                                                     "发送脏矩形补丁"
                                                 );
-                                                // 补丁**绝不丢弃**（丢一个会让画面永久缺一块），
-                                                // 故走画面队列的可取消等待；同一次采集拆出的多条
-                                                // 消息必须按顺序投递（控制器按到达顺序合成）。
+                                                // 补丁按序投递（控制器按到达顺序合成），但**绝不能在
+                                                // 主循环里 `.await` 画面队列**：网络拥塞时那会把整个
+                                                // `select!` 卡住，期间读不到/注入不了输入、采集也停拍。
+                                                // 故走 `try_enqueue_screen`，满了就退让（见下）。
                                                 let mut write_err = None;
+                                                let mut enqueue_full = false;
                                                 for msg in messages {
                                                     let len = region_update_bytes(&msg);
-                                                    if let Err(err) = queues
-                                                        .enqueue_screen(
-                                                            &cancel,
-                                                            SessionFrame::screen(msg),
-                                                        )
-                                                        .await
+                                                    match queues
+                                                        .try_enqueue_screen(SessionFrame::screen(msg))
                                                     {
-                                                        write_err = Some(err);
-                                                        break;
+                                                        Ok(true) => {}
+                                                        Ok(false) => {
+                                                            enqueue_full = true;
+                                                            break;
+                                                        }
+                                                        Err(err) => {
+                                                            write_err = Some(err);
+                                                            break;
+                                                        }
                                                     }
-                                                    // 每条成功后都推进保活水位：中途断链时控制器
-                                                    // 已经收到的那几条不会再被重复发送。
+                                                    // 每条成功入队后才推进保活水位、才计出码：中途
+                                                    // 放弃时这两件事都不能假装发生过。
                                                     screen_mode.last_patch_sent =
                                                         Some(std::time::Instant::now());
                                                     screen_send_meter.add_bytes(len);
                                                 }
                                                 if let Some(err) = write_err {
                                                     break Err(err);
+                                                }
+                                                if enqueue_full {
+                                                    // 画面队列满 = 写侧已经跟不上。可能已发出本批的
+                                                    // **部分**横条，控制端那块合成缓冲只有一帧完整
+                                                    // IDR 才能修复，所以这里必须连带强制关键帧
+                                                    // （与其它「补丁装不下」路径的 P 帧语义不同）。
+                                                    // 已入队的那几条仍排在这一帧全帧之前（同一条画面
+                                                    // FIFO），顺序与合成语义都成立。
+                                                    warn!(
+                                                        bytes,
+                                                        rects = rect_count,
+                                                        "画面队列已满，补丁投递受阻，退出补丁模式并强制关键帧"
+                                                    );
+                                                    exit_patch_mode(
+                                                        &mut screen_mode,
+                                                        &mut force_encode,
+                                                        &mut last_changed_permille,
+                                                        &mut capture_tick,
+                                                    );
+                                                    force_keyframe = true;
                                                 }
                                             } else {
                                                 warn!(
@@ -1983,6 +2176,21 @@ pub async fn run_controlled(
             () = sleep(capture_deadline.unwrap_or_else(Instant::now).saturating_duration_since(Instant::now())), if capture_deadline.is_some() => {
                 capture_deadline = None;
                 capture_request_us = None;
+                // 在途期间有输入到达：超时放弃的这一次不算「刚采过」，立刻补一拍（见
+                // [`input_capture_target`]）。否则这个标志会挂到下一次正常采集的结果上，
+                // 让交互延迟多等一个周期。
+                if input_capture_pending {
+                    input_capture_pending = false;
+                    let target = input_capture_target(
+                        Instant::now(),
+                        last_capture_tick,
+                        capture_tick_period(screen_mode.mode, &encode),
+                    );
+                    if target < next_capture_at {
+                        next_capture_at = target;
+                        capture_tick.as_mut().reset(target);
+                    }
+                }
                 capture_timeouts = capture_timeouts.saturating_add(1);
                 if capture_timeouts >= MAX_CAPTURE_TIMEOUTS {
                     warn!(count = capture_timeouts, "采集连续超时，判定采集侧已失效，结束会话");
@@ -2168,6 +2376,25 @@ pub async fn run_controlled(
                                     warn!(error = %err, "输入注入失败");
                                 }
                             }
+                            // 输入**会改变远端画面**（拖窗/悬停/滚动/打字）：主动把下一拍采集
+                            // 拉近，不让用户白等一个周期节拍（见 [`input_capture_target`]）。
+                            //
+                            // 纯鼠标移动本身不进画面（采集帧不含光标，控制端用本机光标），
+                            // 但它会触发悬停效果、拖动窗口、滚动条等——照样要立刻采一拍照。
+                            if capture {
+                                let target = input_capture_target(
+                                    Instant::now(),
+                                    last_capture_tick,
+                                    capture_tick_period(screen_mode.mode, &encode),
+                                );
+                                if capture_deadline.is_some() {
+                                    // 采集在途：等结果回来时立刻补拍（见 capture_rx 分支）。
+                                    input_capture_pending = true;
+                                } else if target < next_capture_at {
+                                    next_capture_at = target;
+                                    capture_tick.as_mut().reset(target);
+                                }
+                            }
                         }
                         SessionMessage::LockScreen => {
                             // 仅完全控制模式：仅观看/仅文件传输不该改变远端机器状态。
@@ -2206,6 +2433,8 @@ pub async fn run_controlled(
                                 rate.set_frame_rate_ceiling(fps);
                             }
                             encode = rate.current();
+                            // pacing 跟随生效码率（大帧摊开的时间按它算）。
+                            queues.set_screen_pacing_kbps(encode.bitrate_kbps);
                             // 档位可能改缩放 → 几何可能变化：补丁模式的持久缓冲尺寸随之作废，
                             // 必须退出（并靠下面的 `force_keyframe` 重发基准）。
                             screen_mode.exit(std::time::Instant::now());
@@ -2217,6 +2446,7 @@ pub async fn run_controlled(
                             selected_fps = Some(fps);
                             rate.set_frame_rate_ceiling(fps);
                             encode = rate.current();
+                            queues.set_screen_pacing_kbps(encode.bitrate_kbps);
                             // 补丁模式可以留着（帧率只影响空补丁的保活节拍），但节拍要按新值重排。
                             capture_tick.as_mut()
                                 .reset(Instant::now() + capture_tick_period(screen_mode.mode, &encode));
@@ -2270,6 +2500,7 @@ pub async fn run_controlled(
                                 capture_tick.as_mut().reset(Instant::now() + decision.rates.capture_interval());
                             }
                             encode = decision.rates;
+                            queues.set_screen_pacing_kbps(encode.bitrate_kbps);
                             if decision.force_keyframe {
                                 force_keyframe = true;
                             }
@@ -2480,6 +2711,41 @@ pub async fn run_controlled(
     result
 }
 
+/// 计算一帧的 pacing 方案：`(每块字节数, 块间等待)`；`None` = 走原来的整帧发送。
+///
+/// 抽成纯函数便于单测锁定两条上界：
+/// - 单个间隙 ≤ [`PACING_MAX_GAP`]（码率读数离谱时不会把一帧拖成秒级）；
+/// - 全部间隙之和 ≤ [`PACING_MAX_WAIT_FACTOR`] × 该帧自然串行时间。
+///
+/// `kbps == 0` 表示关闭（控制器侧永远如此）；小于 [`PACING_MIN_FRAME_BYTES`] 的帧返回 `None`
+/// ——它们本身就是交互延迟，加 sleep 只会更慢。
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "帧长与码率都远小于 2^53，转 f64 只用于算时长，不损精度"
+)]
+fn pacing_plan(len: usize, kbps: u32) -> Option<(usize, Duration)> {
+    if kbps == 0 || len < PACING_MIN_FRAME_BYTES {
+        return None;
+    }
+    let chunk = len.min(PACING_CHUNK_BYTES);
+    // 每块、整帧在目标码率下的自然串行时间（秒 = 字节 × 8 / (kbps × 1000)）。
+    let chunk_natural = Duration::from_secs_f64((chunk as f64 * 8.0) / (f64::from(kbps) * 1000.0));
+    let frame_natural = Duration::from_secs_f64((len as f64 * 8.0) / (f64::from(kbps) * 1000.0));
+    // 块间等待的次数 = ceil(len / chunk) - 1（最后一块写完后不必等）。
+    let gap_count = len.div_ceil(chunk).saturating_sub(1);
+    if gap_count == 0 {
+        return Some((chunk, Duration::ZERO));
+    }
+    let gap_count = u32::try_from(gap_count).unwrap_or(u32::MAX);
+    let total_cap = frame_natural
+        .checked_mul(PACING_MAX_WAIT_FACTOR)
+        .unwrap_or(Duration::MAX);
+    let sleep = chunk_natural
+        .min(PACING_MAX_GAP)
+        .min(total_cap / gap_count);
+    Some((chunk, sleep))
+}
+
 /// 出站写任务：独占写半边，按**四档优先级**从队列取帧写线。
 ///
 /// 优先级固定为 close → ctrl → screen → file（`select!` 的 `biased`）。close 是收尾 `Bye`
@@ -2487,6 +2753,14 @@ pub async fn run_controlled(
 ///
 /// 取消语义：普通帧的发送同时等取消令牌（[`send_cancellable`]），取消一旦触发就丢弃后续普通帧、
 /// 只等收尾帧——这样「取消能立刻打断被背压卡住的发送」与「收尾 `Bye` 仍能尽力发出」两件事同时成立。
+///
+/// # 大帧 pacing
+///
+/// screen 档里**编码后 ≥ [`PACING_MIN_FRAME_BYTES`] 的帧**（典型是 IDR）不整帧 `send`，而是
+/// 编码成一段线上字节后**按 [`PACING_CHUNK_BYTES`] 分块写**，块间按目标码率 sleep
+/// （[`pacing_plan`]）。理由：一帧 300 KB 在 6 Mbps 上是 400 ms 的串行化尖峰，它会把后面排队的
+/// 输入回显帧一起堵住；摊开写之后抖动相位被打散，瓶颈处也不容易成片丢包。小帧、ctrl、file、
+/// close 全部走原路径，行为不变。
 pub(crate) async fn writer_loop(
     mut writer: FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
     mut rx: OutboundReceivers,
@@ -2509,7 +2783,8 @@ pub(crate) async fn writer_loop(
                 }
             }
             Some(frame) = rx.screen.recv(), if !cancelled => {
-                if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
+                let pacing_kbps = rx.screen_pacing_kbps.load(Ordering::Relaxed);
+                if !write_screen(&mut writer, &cancel, frame, &mut cancelled, pacing_kbps).await {
                     break;
                 }
             }
@@ -2544,6 +2819,96 @@ async fn write_ordinary(
             false
         }
     }
+}
+
+/// 写一条**画面**帧：大帧按 [`pacing_plan`] 分块 pacing，其余与 [`write_ordinary`] 相同。
+///
+/// 只有 `VideoPacket` 可能达到 [`PACING_MIN_FRAME_BYTES`]（`RegionUpdate` 单条上限 32 KiB、
+/// `ScreenConfig` 是几十字节），所以判据用载荷长度即可，不必先编码一遍再判断。
+///
+/// 返回值语义与 [`write_ordinary`] 一致：`false` = 写侧出错、写任务结束。
+async fn write_screen(
+    writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
+    cancel: &CancellationToken,
+    frame: SessionFrame,
+    cancelled: &mut bool,
+    pacing_kbps: u32,
+) -> bool {
+    let payload_len = match &frame.message {
+        SessionMessage::VideoPacket { data, .. } => data.len(),
+        _ => 0,
+    };
+    let Some((chunk, gap)) = pacing_plan(payload_len, pacing_kbps) else {
+        return write_ordinary(writer, cancel, frame, cancelled).await;
+    };
+    // 按值编码（不 clone 帧）：大帧每帧数 MB 级拷贝在这里是纯浪费。
+    let bytes = match writer.encoder_mut().encode_frame_owned(frame) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            // 与 `FramedWrite::send` 的编码失败同义：这条帧永远写不出去，写任务收场。
+            debug!(error = %err, "画面帧编码失败，写任务结束");
+            return false;
+        }
+    };
+    write_paced(writer, cancel, &bytes, chunk, gap, cancelled).await
+}
+
+/// 把已经编码好的线上字节按 `chunk` 分块写，块间 `sleep(gap)`（可取消）。
+///
+/// # 前提：`FramedWrite` 的内部缓冲是空的
+///
+/// 本函数绕开 `FramedWrite::send` 直接写底层 `WriteHalf`。`send` 成功返回即代表内部
+/// 编码缓冲已经 flush 干净（`SinkExt::send` = `start_send` + `poll_flush`），而本函数只由
+/// [`writer_loop`] 在一帧接一帧写出时调用，所以进入时缓冲必为空——否则这里写下的字节会插到
+/// 上一帧的**内部缓冲之前**，线上顺序被破坏。**不要**在别处调用它。
+///
+/// 每块写完都 flush 一次底层 writer：TLS 会把小块攒在记录缓冲里，不 flush 就失去了 pacing
+/// 的意义（字节仍然迟一步才上线）。
+///
+/// 取消/IO 失败语义与 [`send_cancellable`] 相同：取消时可能留下**半截帧**，但此时会话正在
+/// 收尾（此后最多再尽力发一条 `Bye`），对端会按长度前缀/自校验把这条残帧判为坏帧并断开。
+async fn write_paced(
+    writer: &mut FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
+    cancel: &CancellationToken,
+    bytes: &[u8],
+    chunk: usize,
+    gap: Duration,
+    cancelled: &mut bool,
+) -> bool {
+    let chunk = chunk.max(1);
+    for (index, part) in bytes.chunks(chunk).enumerate() {
+        // 第一块立刻写，块间才等：等待代表「上一块占用的链路时间」。
+        if index > 0 && !gap.is_zero() {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    *cancelled = true;
+                    return true;
+                }
+                () = sleep(gap) => {}
+            }
+        }
+        let written = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(RemoteError::Cancelled),
+            res = async {
+                writer.get_mut().write_all(part).await?;
+                writer.get_mut().flush().await
+            } => res.map_err(RemoteError::Io),
+        };
+        match written {
+            Ok(()) => {}
+            Err(RemoteError::Cancelled) => {
+                *cancelled = true;
+                return true;
+            }
+            Err(err) => {
+                debug!(error = %err, "分块写失败，写任务结束");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 出站写任务已结束（链路断开）时的会话级错误。
@@ -3023,6 +3388,8 @@ async fn encode_loop(
     unchanged_resend: Duration,
     send_meter: Arc<ScreenSendMeter>,
     base_frame_sent: Arc<AtomicBool>,
+    // 最近一次真正编码出关键帧的时刻（微秒；0 = 还没有）。主循环据此做周期 IDR 兜底。
+    last_keyframe_us: Arc<AtomicU64>,
     // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
     // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。
     max_encode_width: u32,
@@ -3195,6 +3562,11 @@ async fn encode_loop(
                 }
                 seq = seq.wrapping_add(1);
                 let keyframe = packet.keyframe;
+                if keyframe {
+                    // 周期 IDR 兜底的水位（主循环读）。必须按**实际编码结果**写：`idr` 为真的
+                    // 那一拍可能被背压出口跳过，只有 packet 真的是关键帧才算数。
+                    last_keyframe_us.store(crate::clock::now_us(), Ordering::Relaxed);
+                }
                 if idr && keyframe {
                     // C3：因 `idr`（首帧/切显示器/切档位/关键帧请求/几何变化/降分辨率）而
                     // 真正产出的 IDR。`idr` 为真的那一拍可能被上面的背压出口跳过，
@@ -3449,7 +3821,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf, ReadHalf, WriteHalf};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
     use tokio::sync::mpsc;
     use tokio_util::codec::{FramedRead, FramedWrite};
     use tokio_util::sync::CancellationToken;
@@ -4230,6 +4602,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -4305,6 +4678,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -4434,6 +4808,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -4500,6 +4875,7 @@ mod tests {
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -4582,6 +4958,7 @@ mod tests {
             Duration::from_secs(3600),
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -4669,6 +5046,7 @@ mod tests {
             Duration::from_secs(3600),
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -4743,6 +5121,7 @@ mod tests {
             Duration::ZERO,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
         ));
@@ -5763,6 +6142,31 @@ mod tests {
         assert_eq!(mode.enter_streak, 0, "放弃后连续计数必须清零");
     }
 
+    /// 输入触发采集的提前量：最多提前到「上一拍之后半个周期」，且不早于当前时刻。
+    ///
+    /// 钉住三件事：① 还没采过时立刻采；② 刚采过时等半个周期（把相位等待从 `0..period`
+    /// 压到 `0..period/2`）；③ 距上一拍已超过半个周期时立刻采（不能把节拍推回过去）。
+    #[test]
+    fn input_capture_target_pulls_at_most_half_a_period_early() {
+        // 会话循环用的是 `tokio::time::Instant`（测试模块里的 `Instant` 是 std 的那个，
+        // 供其它用例直接构造 `PatchMode` 的时刻），这里必须用同一个类型。
+        let now = tokio::time::Instant::now();
+        let period = Duration::from_millis(33);
+        assert_eq!(input_capture_target(now, None, period), now, "首拍立刻采");
+
+        let last = now;
+        assert_eq!(
+            input_capture_target(now + Duration::from_millis(2), Some(last), period),
+            last + period / 2,
+            "刚采过 → 只等到半个周期"
+        );
+        assert_eq!(
+            input_capture_target(now + Duration::from_millis(20), Some(last), period),
+            now + Duration::from_millis(20),
+            "已超过半个周期 → 立刻采，不把目标时刻推到过去"
+        );
+    }
+
     /// 支持补丁的假采集源：视频/补丁采集各自报告一个可调的活跃度，补丁采集返回一块固定脏矩形。
     ///
     /// 活跃度做成原子变量是为了在会话**运行中**模拟「用户突然开始拖窗」：把它推到
@@ -6144,6 +6548,81 @@ mod tests {
                 other => panic!("期望 FileChunk，实得 {other:?}"),
             }
         }
+    }
+
+    /// 补丁投递必须**非阻塞**：画面队列满时 `try_enqueue_screen` 立即返回 `false`。
+    ///
+    /// 主循环的补丁路径只能用它（P1-1）：退化成 `.await` 的话，网络拥塞时输入注入、心跳、
+    /// 采集节拍会被一起卡住。
+    #[tokio::test]
+    async fn try_enqueue_screen_returns_false_when_full() {
+        let (queues, rx) = OutboundQueues::new();
+        let probe = || {
+            SessionFrame::screen(SessionMessage::ScreenConfig {
+                display: 0,
+                codec: CodecId::Vp9,
+                width: 16,
+                height: 16,
+            })
+        };
+        for index in 0..SCREEN_QUEUE {
+            assert!(
+                queues.try_enqueue_screen(probe()).expect("写任务仍在"),
+                "第 {index} 条应入队"
+            );
+        }
+        // 函数是同步的：满队列只可能立刻返回 `false`，不存在「等空位」这条路径。
+        assert!(
+            !queues.try_enqueue_screen(probe()).expect("满不是错误"),
+            "队列已满时应返回 false"
+        );
+        // 写任务结束（接收端全部丢弃）≠ 队列满：必须报链路关闭，否则调用方会把它当成
+        // 「只是忙」而无限循环。
+        drop(rx);
+        assert!(
+            queues.try_enqueue_screen(probe()).is_err(),
+            "写任务已结束时必须返回错误"
+        );
+
+        // pacing 默认关闭（控制器侧从不设置），设置后读写一致。
+        assert_eq!(queues.screen_pacing_kbps(), 0, "默认不 pace");
+        queues.set_screen_pacing_kbps(6000);
+        assert_eq!(queues.screen_pacing_kbps(), 6000);
+    }
+
+    /// pacing 方案的两条上界：关闭/小帧不 pace；大帧的块数与块间等待都受控。
+    #[test]
+    fn pacing_plan_bounds_chunk_and_gap() {
+        // 关闭（控制器侧）与小于门槛的帧：完全走原路径。
+        assert!(pacing_plan(300 * 1024, 0).is_none(), "0 kbps = 关闭");
+        assert!(
+            pacing_plan(PACING_MIN_FRAME_BYTES - 1, 6000).is_none(),
+            "小帧不 pace"
+        );
+        assert!(
+            pacing_plan(PACING_MIN_FRAME_BYTES, 6000).is_some(),
+            "门槛本身要 pace"
+        );
+
+        // 300 KiB @ 6 Mbps：32 KiB 一块（10 块），块间 ≈ 43.7 ms。
+        let (chunk, gap) = pacing_plan(300 * 1024, 6000).expect("大帧应 pace");
+        assert_eq!(chunk, PACING_CHUNK_BYTES, "块大小封顶 32 KiB");
+        assert!(
+            (Duration::from_millis(40)..=Duration::from_millis(50)).contains(&gap),
+            "6 Mbps 上一块 32 KiB 约 43.7 ms，实得 {gap:?}"
+        );
+        let gap_count =
+            u32::try_from((300 * 1024_usize).div_ceil(chunk) - 1).expect("块数很少");
+        let frame_natural = Duration::from_secs_f64((300.0 * 1024.0 * 8.0) / 6_000_000.0);
+        assert!(
+            gap * gap_count <= frame_natural * PACING_MAX_WAIT_FACTOR,
+            "总等待不得超过该帧自然串行时间的 2 倍"
+        );
+
+        // 低码率读数：单个间隙被 [`PACING_MAX_GAP`] 封顶（32 KiB @ 300 kbps 的自然时间约
+        // 874 ms），一帧绝不会因此被拖成秒级。
+        let (_, slow_gap) = pacing_plan(300 * 1024, 300).expect("大帧应 pace");
+        assert_eq!(slow_gap, PACING_MAX_GAP, "低码率下用单个间隙上限");
     }
 
     /// 暂存区保持 FIFO：`FileDone` 绝不能越过尚未投递的 `FileChunk`。

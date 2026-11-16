@@ -25,7 +25,6 @@ use crate::WinVideoError;
 use std::ffi::c_void;
 use std::ptr;
 use windows::core::Interface as _;
-use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
@@ -70,20 +69,9 @@ pub(super) fn create_device() -> Result<D3d11, WinVideoError> {
             WinVideoError::Decode("没有可用的硬件适配器（DXVA 需要 D3D11）".to_owned())
         })?;
     let device = d3d11::create(Some(chosen.index))?;
-    // D3D11_CREATE_DEVICE_VIDEO_SUPPORT 的文档要求开启多线程保护；解码器 MFT
-    // 可能在自己的工作线程上访问设备。开启失败不致命（单线程仍可用），只记日志。
-    match device.device.cast::<ID3D10Multithread>() {
-        Ok(multithread) => {
-            // SAFETY: `multithread` 是设备上的有效接口；设置是幂等的设备级开关。
-            let was_protected = unsafe { multithread.SetMultithreadProtected(true) };
-            if !was_protected.as_bool() {
-                tracing::debug!("D3D11 设备多线程保护已开启");
-            }
-        }
-        Err(err) => {
-            tracing::debug!(%err, "D3D11 设备不支持 ID3D10Multithread，跳过多线程保护");
-        }
-    }
+    // 多线程保护已由 `d3d11::create` 统一开启（`VIDEO_SUPPORT` 的要求）；这里再调一次
+    // 是幂等的，只为把「此前已开启 / 本次开启」写进日志，行为与之前完全一致。
+    d3d11::enable_multithread_protection(&device.device);
     tracing::debug!(adapter = %device.adapter.name, "DXVA 解码设备已创建");
     Ok(device)
 }
