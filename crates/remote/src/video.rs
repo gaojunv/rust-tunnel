@@ -349,6 +349,20 @@ impl std::fmt::Debug for VideoEncoder {
 }
 
 impl VideoEncoder {
+    /// 本编码器的平台信息：VP9 profile 1 4:4:4 **纯软件**（本 crate 没有硬件 VP9）。
+    ///
+    /// 后端恒为 `"libvpx"`、`gpu_input` 恒为 `false`（编码永远吃 CPU 上的 RGBA）。被控端把
+    /// 它塞进每秒的 `HostStats`，让控制器的统计角标能区分「软件 VP9」与「硬件 H.264」。
+    #[must_use]
+    pub fn info(&self) -> crate::screen::EncoderInfo {
+        crate::screen::EncoderInfo {
+            backend: "libvpx".to_owned(),
+            name: "VP9 4:4:4".to_owned(),
+            adapter: String::new(),
+            gpu_input: false,
+        }
+    }
+
     /// 构造一个编码 `width × height` 的 VP9 profile 1 编码器。
     ///
     /// # Errors
@@ -524,6 +538,19 @@ impl std::fmt::Debug for VideoDecoder {
 }
 
 impl VideoDecoder {
+    /// 本解码器的后端信息：VP9 纯软件解码（多线程 + row-mt，见 vendor 补丁 7）。
+    ///
+    /// 后端恒为 `"libvpx"`、`hardware == false`。控制器只在解码器变化时上报它（A3）。
+    #[must_use]
+    pub fn info(&self) -> crate::screen::DecoderInfo {
+        crate::screen::DecoderInfo {
+            backend: "libvpx".to_owned(),
+            name: "VP9 4:4:4".to_owned(),
+            adapter: String::new(),
+            hardware: false,
+        }
+    }
+
     /// 构造一个 VP9 解码器（**多线程 + row-mt**，见 vendor 补丁 7）。
     ///
     /// 解码是控制器侧的瓶颈：4K 单线程解码每帧十几到数十毫秒，跟不上被控端出帧。多线程 +

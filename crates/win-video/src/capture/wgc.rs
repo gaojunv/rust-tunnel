@@ -30,9 +30,9 @@
 //! 那张就是最新的一帧，无需逐帧比较时间戳。
 
 use super::{
-    create_device_for, texture_dimensions, BgraReader, CaptureBackend, CaptureSource,
-    CapturedFrame, CapturedTexture, ChangeReport, DirtyGrid, MonitorInfo, TexturePool,
-    FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
+    create_device_for, texture_dimensions, BgraReader, CaptureBackend, CaptureCounters,
+    CaptureSource, CapturedFrame, CapturedTexture, ChangeReport, DirtyGrid, MonitorInfo,
+    TexturePool, FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT, POLL_INTERVAL,
 };
 use crate::d3d11;
 use crate::WinVideoError;
@@ -86,6 +86,8 @@ struct WgcSource {
     change: super::change::TextureChangeTracker,
     /// 最近一次 GPU 采集结果（无新帧时返回它的克隆）。
     last_texture: Option<CapturedTexture>,
+    /// 「超时 / 无新帧 / 复用上一帧」的累计次数（[`CaptureCounters::no_new_frame`]）。
+    no_new_frame: u64,
 }
 
 impl CaptureSource for WgcSource {
@@ -109,7 +111,11 @@ impl CaptureSource for WgcSource {
             std::thread::sleep(POLL_INTERVAL);
         }
         match &self.last {
-            Some(frame) => Ok(frame.clone()),
+            Some(frame) => {
+                // 超时内没有新帧，复用上一帧：记一次「无新帧」（桌面静止的正常表现）。
+                self.no_new_frame = self.no_new_frame.saturating_add(1);
+                Ok(frame.clone())
+            }
             None => Err(WinVideoError::Capture(format!(
                 "WGC: {:?} 内没有收到首帧",
                 self.capture_timeout()
@@ -159,7 +165,10 @@ impl CaptureSource for WgcSource {
         match &self.last_texture {
             // 复用上一帧时**不能**给网格：它是上一拍的内容，补丁模式拿它去覆盖控制器
             // 画面会让两侧错位。返回 `None` 让上层走全帧。
-            Some(texture) => Ok((texture.clone(), ChangeReport::unchanged(), None)),
+            Some(texture) => {
+                self.no_new_frame = self.no_new_frame.saturating_add(1);
+                Ok((texture.clone(), ChangeReport::unchanged(), None))
+            }
             None => Err(WinVideoError::Capture(format!(
                 "WGC: {timeout:?} 内没有收到首帧（GPU 纹理）"
             ))),
@@ -168,6 +177,12 @@ impl CaptureSource for WgcSource {
 
     fn device(&self) -> Option<Arc<d3d11::D3d11>> {
         Some(self.d3d.clone())
+    }
+
+    fn stats(&self) -> CaptureCounters {
+        CaptureCounters {
+            no_new_frame: self.no_new_frame,
+        }
     }
 }
 
@@ -409,6 +424,7 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         textures: None,
         change: super::change::TextureChangeTracker::new(),
         last_texture: None,
+        no_new_frame: 0,
     }))
 }
 

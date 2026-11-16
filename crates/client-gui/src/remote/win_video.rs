@@ -19,22 +19,26 @@
 //! 采集安全桌面，本模块只服务用户会话里的 GUI 进程。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
-use rust_tunnel_remote::screen::{CapturedPatches, ScreenPatch};
+use rust_tunnel_remote::screen::{
+    CaptureInfo, CapturedPatches, DecoderInfo, EncoderInfo, ScreenPatch,
+};
 use rust_tunnel_remote::video::NATIVE_MAX_ENCODE_WIDTH;
 use rust_tunnel_remote::{
-    encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo, GpuFrame,
-    RawFrame, RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
+    encode_dimensions, CodecId, DecodedNv12, DecodedVideoFrame, DisplayInfo, EncodedVideo,
+    GpuFrame, RawFrame, RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
 };
 use rust_tunnel_win_video::capture::{self, BgraReadback, CaptureSource};
 use rust_tunnel_win_video::d3d11;
-use rust_tunnel_win_video::decode::{H264Decoder, H264HardwarePreference, H264OutputMode};
+use rust_tunnel_win_video::decode::{
+    H264DecodePath, H264Decoder, H264HardwarePreference, H264OutputMode,
+};
 use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
@@ -57,6 +61,11 @@ struct CachedSource {
     geometry: Geometry,
     /// 最近一次完成枚举/几何校验的时刻（缓存有效期从这里算）。
     checked_at: Instant,
+    /// 上次汇入 [`WinVideoScreen::no_new_frame`] 的源内计数。
+    ///
+    /// [`CaptureSource::stats`] 只反映**当前这个采集源实例**的累计值，采集源重建后
+    /// 会从 0 开始；这里记住已汇出的水位，只把增量加到进程级计数上，总量因此不会倒退。
+    reported_no_new_frame: u64,
 }
 
 /// 显示器的虚拟桌面几何（物理像素）。
@@ -87,6 +96,8 @@ struct GpuContext {
     device: Mutex<Option<Arc<d3d11::D3d11>>>,
     /// 是否已禁用 GPU 路径（进程级，单向）。
     disabled: AtomicBool,
+    /// 禁用原因（只在第一次禁用时写入；供被控端遥测上报）。
+    disable_reason: Mutex<Option<String>>,
     /// 是否已经打印过「GPU 路径已启用」日志（只打一次）。
     logged: AtomicBool,
 }
@@ -106,8 +117,15 @@ impl GpuContext {
     }
 
     /// 禁用 GPU 路径（幂等；只有第一次调用会 `warn!`）。
+    ///
+    /// **原因只在第一次写入**：`disabled` 是单向开关，第一个把路径关掉的原因才是
+    /// 用户需要看到的那一个；后续失败多半是它的连带后果。
     fn disable(&self, reason: &str) {
         if !self.disabled.swap(true, Ordering::SeqCst) {
+            *self
+                .disable_reason
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(reason.to_owned());
             warn!("GPU 采集/编码已禁用，回退 CPU 路径：{reason}");
         }
     }
@@ -115,6 +133,14 @@ impl GpuContext {
     /// GPU 路径是否已禁用。
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::SeqCst)
+    }
+
+    /// 禁用原因（未禁用时为 `None`）。
+    fn disable_reason(&self) -> Option<String> {
+        self.disable_reason
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// 首次成功 GPU 采集时打印一条启用日志。
@@ -140,6 +166,9 @@ fn gpu_context() -> &'static Arc<GpuContext> {
         Arc::new(GpuContext {
             device: Mutex::new(None),
             disabled: AtomicBool::new(env_disabled),
+            disable_reason: Mutex::new(
+                env_disabled.then(|| "RUST_TUNNEL_DISABLE_GPU_CAPTURE 已设置".to_owned()),
+            ),
             logged: AtomicBool::new(false),
         })
     })
@@ -175,6 +204,28 @@ pub struct WinVideoScreen {
     /// 本会话的编码宽度上限（像素）。引擎在会话开始、codec 协商完成后设定：
     /// 默认 1920，硬件 H.264 + 原生分辨率时 3840（见 [`clamp_encode_width`]）。
     max_encode_width: AtomicU32,
+    /// 最近一次采集/补丁请求的显示器 id（`u32::MAX` = 尚未采集过）。
+    ///
+    /// [`ScreenSource::capture_info`] 没有显示器参数，只能按「当前正在采的那台」
+    /// 回答后端口径。
+    last_display: AtomicU32,
+    /// 硬件采集失败、回退 xcap 的累计次数（`CaptureInfo::fallbacks`）。
+    xcap_fallbacks: AtomicU64,
+    /// 「无新帧」的累计次数（`CaptureInfo::no_new_frame`，跨采集源重建累加）。
+    no_new_frame: AtomicU64,
+    /// `open_best` 最终落到 DXGI 的累计次数（`CaptureInfo::open_fallbacks`）。
+    open_fallbacks: AtomicU64,
+    /// 最近一次采集是否真的走了 **GPU 纹理路径**（`capture_gpu`/`capture_patches`）。
+    ///
+    /// 不能只看 `gpu_context().is_disabled()`：VP9 会话/未协商 H.264 时引擎走 CPU 采集
+    /// （WGC 纹理回读到 BGRA），此时 GPU 能力可用但**没有零拷贝**，角标不能谎报 GPU。
+    last_capture_was_gpu: AtomicBool,
+    /// 最近一次采集的 `(后端, 适配器名)`。
+    ///
+    /// **独立于 `sources` 的一把小锁**：`sources` 在采集期间是**一直持有**的（`with_source`
+    /// 把整次采集包在锁里）。`capture_info()` 从 async 心跳里调用，若去读 `sources` 就会
+    /// 被一次 10ms 的采集阻塞；这里只在换显示器/重建采集源时更新，读侧永远不等采集。
+    identity: Mutex<(String, String)>,
 }
 
 impl WinVideoScreen {
@@ -184,7 +235,38 @@ impl WinVideoScreen {
         Self {
             sources: Mutex::new(HashMap::new()),
             max_encode_width: AtomicU32::new(MAX_ENCODE_WIDTH),
+            last_display: AtomicU32::new(u32::MAX),
+            xcap_fallbacks: AtomicU64::new(0),
+            no_new_frame: AtomicU64::new(0),
+            open_fallbacks: AtomicU64::new(0),
+            last_capture_was_gpu: AtomicBool::new(false),
+            identity: Mutex::new((String::new(), String::new())),
         }
+    }
+
+    /// 记录最近一次采集的后端与适配器（换显示器/重建采集源/xcap 回退时调用）。
+    fn set_identity(&self, backend: String, adapter: String) {
+        if let Ok(mut slot) = self.identity.lock() {
+            *slot = (backend, adapter);
+        }
+    }
+
+    /// 取最近一次采集的 `(后端, 适配器名)`；尚未采集时两者都是空串。
+    fn identity(&self) -> (String, String) {
+        self.identity
+            .lock()
+            .map_or_else(|e| e.into_inner().clone(), |slot| slot.clone())
+    }
+
+    /// 从采集源读一次后端/适配器并记进 [`Self::identity`]。
+    ///
+    /// 只在打开/切换采集源时调用，**不在每帧路径上**。
+    fn record_source_identity(&self, source: &dyn CaptureSource) {
+        let backend = source.backend().to_string();
+        let adapter = source
+            .device()
+            .map_or_else(String::new, |device| device.adapter.name.clone());
+        self.set_identity(backend, adapter);
     }
 
     /// 当前会话的编码宽度上限。
@@ -202,23 +284,53 @@ impl WinVideoScreen {
         display_id: u32,
         action: impl FnOnce(&mut dyn CaptureSource) -> RemoteResult<R>,
     ) -> RemoteResult<R> {
+        // 遥测口径是「当前正在采的显示器」：`capture_info()` 没有显示器参数。
+        let previous_display = self.last_display.swap(display_id, Ordering::Relaxed);
         let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
         let cache_fresh = sources
             .get(&display_id)
             .is_some_and(|cached| cached.checked_at.elapsed() < SOURCE_RECHECK_INTERVAL);
         if !cache_fresh {
-            refresh_cached_source(&mut sources, display_id)?;
+            self.refresh_cached_source(&mut sources, display_id)?;
+        }
+        // 切显示器时采集源可能直接命中缓存（refresh 不会跑），这里补一次身份更新。
+        // 只在 id 变化时做，正常采集不额外加锁/克隆。
+        if previous_display != display_id {
+            if let Some(cached) = sources.get(&display_id) {
+                self.record_source_identity(cached.source.as_ref());
+            }
         }
         let result = match sources.get_mut(&display_id) {
             Some(cached) => action(cached.source.as_mut()),
             None => Err(RemoteError::Platform("硬件采集源缓存丢失".to_owned())),
         };
+        // 先汇出采集源的增量再从缓存里删：错误路径丢掉缓存项时，这段计数不能跟着丢。
+        if let Some(cached) = sources.get_mut(&display_id) {
+            self.harvest_counters(cached);
+        }
         if result.is_err() {
             sources.remove(&display_id);
         }
         result
     }
 
+    /// 把采集源自上次汇出以来的「无新帧」增量加到进程级累计值上。
+    ///
+    /// 采集源的计数是**每个实例各自**从 0 开始的（[`CaptureSource::stats`]），
+    /// 重建会换一个新实例；靠水位求差才能让上报的累计值单调。
+    fn harvest_counters(&self, cached: &mut CachedSource) {
+        let total = cached.source.stats().no_new_frame;
+        let delta = total.saturating_sub(cached.reported_no_new_frame);
+        cached.reported_no_new_frame = total;
+        if delta > 0 {
+            self.no_new_frame.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    /// 当前采集源的「后端名 + 采集 D3D11 适配器名」。
+    ///
+    /// 缓存里没有采集源时（本拍之前从未采过帧、或最近一次硬件采集失败走了 xcap）
+    /// 只能给出回退结论：发生过 xcap 回退就报 `xcap` 且没有适配器可报。
     /// 尝试用硬件后端采集一帧 **CPU RGBA**；失败时由调用方回退 xcap。
     fn capture_hardware(&self, display_id: u32) -> RemoteResult<RawFrame> {
         let captured = self.with_source(display_id, |source| {
@@ -283,15 +395,13 @@ impl WinVideoScreen {
                 return self.capture(display_id);
             }
         };
+        // 这次确实走的是 GPU 纹理路径：角标据此显示「采集 GPU」，而不是仅凭「能力可用」。
+        self.last_capture_was_gpu.store(true, Ordering::Relaxed);
         let (source_width, source_height) = (captured.width, captured.height);
         gpu_context().set_device(Arc::clone(&captured.device));
         gpu_context().log_enabled_once(&captured.device.adapter.name);
-        let (width, height) = encode_dimensions(
-            source_width,
-            source_height,
-            1.0,
-            self.max_encode_width(),
-        );
+        let (width, height) =
+            encode_dimensions(source_width, source_height, 1.0, self.max_encode_width());
         Ok(RawFrame {
             display: display_id,
             width,
@@ -312,71 +422,88 @@ impl WinVideoScreen {
 ///
 /// 只有几何真的变化（或缓存缺失）时才枚举硬件目标并重开采集源——枚举本身
 /// 是这次优化的目标，不该在几何未变时白做。
-fn refresh_cached_source(
-    sources: &mut HashMap<u32, CachedSource>,
-    display_id: u32,
-) -> RemoteResult<()> {
-    let monitors = xcap::Monitor::all()
-        .map_err(|err| RemoteError::Platform(format!("枚举显示器失败: {err}")))?;
-    let (index, monitor) = monitors
-        .iter()
-        .enumerate()
-        .find(|(_, monitor)| monitor.id().ok() == Some(display_id))
-        .or_else(|| monitors.first().map(|monitor| (0, monitor)))
-        .ok_or_else(|| RemoteError::Platform("无可用显示器".to_owned()))?;
-    let geometry = Geometry {
-        left: monitor
-            .x()
-            .map_err(|err| RemoteError::Platform(format!("读取显示器 X 失败: {err}")))?,
-        top: monitor
-            .y()
-            .map_err(|err| RemoteError::Platform(format!("读取显示器 Y 失败: {err}")))?,
-        width: monitor
-            .width()
-            .map_err(|err| RemoteError::Platform(format!("读取显示器宽度失败: {err}")))?,
-        height: monitor
-            .height()
-            .map_err(|err| RemoteError::Platform(format!("读取显示器高度失败: {err}")))?,
-    };
+///
+/// **`open_best` 内部无法统计 WGC → DXGI 的回退**（它只返回最终 source），所以
+/// 回退次数在这里按「最终后端是不是 DXGI」累计：`open_best` 恒定优先 WGC，
+/// 落到 DXGI 就说明 WGC 打开失败过。
+impl WinVideoScreen {
+    /// 重新校验/重建指定显示器的采集源。
+    fn refresh_cached_source(
+        &self,
+        sources: &mut HashMap<u32, CachedSource>,
+        display_id: u32,
+    ) -> RemoteResult<()> {
+        let monitors = xcap::Monitor::all()
+            .map_err(|err| RemoteError::Platform(format!("枚举显示器失败: {err}")))?;
+        let (index, monitor) = monitors
+            .iter()
+            .enumerate()
+            .find(|(_, monitor)| monitor.id().ok() == Some(display_id))
+            .or_else(|| monitors.first().map(|monitor| (0, monitor)))
+            .ok_or_else(|| RemoteError::Platform("无可用显示器".to_owned()))?;
+        let geometry = Geometry {
+            left: monitor
+                .x()
+                .map_err(|err| RemoteError::Platform(format!("读取显示器 X 失败: {err}")))?,
+            top: monitor
+                .y()
+                .map_err(|err| RemoteError::Platform(format!("读取显示器 Y 失败: {err}")))?,
+            width: monitor
+                .width()
+                .map_err(|err| RemoteError::Platform(format!("读取显示器宽度失败: {err}")))?,
+            height: monitor
+                .height()
+                .map_err(|err| RemoteError::Platform(format!("读取显示器高度失败: {err}")))?,
+        };
 
-    // 缓存几何未变：采集源继续可用，只把有效期往后推。
-    if let Some(cached) = sources.get_mut(&display_id) {
-        if cached.geometry == geometry {
-            cached.checked_at = Instant::now();
-            return Ok(());
+        // 缓存几何未变：采集源继续可用，只把有效期往后推。
+        if let Some(cached) = sources.get_mut(&display_id) {
+            if cached.geometry == geometry {
+                cached.checked_at = Instant::now();
+                return Ok(());
+            }
         }
+
+        let hardware = capture::enumerate_monitors()
+            .map_err(|err| RemoteError::Platform(format!("枚举硬件显示器失败: {err}")))?;
+        // 两个枚举都来自 EnumDisplayMonitors，顺序一致；几何匹配优先，
+        // 顺序索引兜底（DPI 感知模式不同可能让坐标取整略有差异）。
+        let target = hardware
+            .iter()
+            .find(|candidate| {
+                candidate.left == geometry.left
+                    && candidate.top == geometry.top
+                    && candidate.width == geometry.width
+                    && candidate.height == geometry.height
+            })
+            .or_else(|| hardware.get(index))
+            .ok_or_else(|| {
+                RemoteError::Platform(format!("未找到与显示器 {display_id} 匹配的硬件采集目标"))
+            })?;
+
+        // 旧采集源在被替换前把剩余的「无新帧」增量汇出去，否则重建会把它吞掉。
+        if let Some(mut old) = sources.remove(&display_id) {
+            self.harvest_counters(&mut old);
+        }
+        let source = capture::open_best(target)
+            .map_err(|err| RemoteError::Platform(format!("打开硬件采集源失败: {err}")))?;
+        // `open_best` 恒定先试 WGC：最终是 DXGI 就说明这一轮发生了 WGC → DXGI 回退。
+        if source.backend() == capture::CaptureBackend::Dxgi {
+            self.open_fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_source_identity(source.as_ref());
+        debug!(display_id, backend = %source.backend(), "硬件采集源已打开");
+        sources.insert(
+            display_id,
+            CachedSource {
+                source,
+                geometry,
+                checked_at: Instant::now(),
+                reported_no_new_frame: 0,
+            },
+        );
+        Ok(())
     }
-
-    let hardware = capture::enumerate_monitors()
-        .map_err(|err| RemoteError::Platform(format!("枚举硬件显示器失败: {err}")))?;
-    // 两个枚举都来自 EnumDisplayMonitors，顺序一致；几何匹配优先，
-    // 顺序索引兜底（DPI 感知模式不同可能让坐标取整略有差异）。
-    let target = hardware
-        .iter()
-        .find(|candidate| {
-            candidate.left == geometry.left
-                && candidate.top == geometry.top
-                && candidate.width == geometry.width
-                && candidate.height == geometry.height
-        })
-        .or_else(|| hardware.get(index))
-        .ok_or_else(|| {
-            RemoteError::Platform(format!("未找到与显示器 {display_id} 匹配的硬件采集目标"))
-        })?;
-
-    sources.remove(&display_id);
-    let source = capture::open_best(target)
-        .map_err(|err| RemoteError::Platform(format!("打开硬件采集源失败: {err}")))?;
-    debug!(display_id, backend = %source.backend(), "硬件采集源已打开");
-    sources.insert(
-        display_id,
-        CachedSource {
-            source,
-            geometry,
-            checked_at: Instant::now(),
-        },
-    );
-    Ok(())
 }
 
 /// 把引擎给的编码宽度上限钳到 `[MAX_ENCODE_WIDTH, NATIVE_MAX_ENCODE_WIDTH]` 并对齐偶数。
@@ -402,12 +529,40 @@ impl ScreenSource for WinVideoScreen {
     }
 
     fn capture(&self, display_id: u32) -> RemoteResult<RawFrame> {
+        // CPU 采集（含 GPU 失败后的兜底）：本帧没有零拷贝，角标不能报「采集 GPU」。
+        self.last_capture_was_gpu.store(false, Ordering::Relaxed);
         match self.capture_hardware(display_id) {
             Ok(frame) => Ok(frame),
             Err(err) => {
+                self.xcap_fallbacks.fetch_add(1, Ordering::Relaxed);
+                self.set_identity("xcap".to_owned(), String::new());
                 warn!(display_id, error = %err, "硬件采集不可用，回退 xcap");
                 XcapScreen.capture(display_id)
             }
+        }
+    }
+
+    /// 被控端遥测用的采集口径（后端、适配器、GPU 零拷贝状态与三个累计计数）。
+    ///
+    /// 后端取自**最近一次采集的显示器**当前缓存着的采集源（WGC / DXGI），缓存里
+    /// 没有采集源但发生过 xcap 回退时如实报 `xcap`；适配器取该采集源的 D3D11 设备。
+    /// `gpu_capture` 与 `gpu_disabled` 同源（`disabled` 是单向开关），禁用原因只在
+    /// 第一次禁用时记录。
+    fn capture_info(&self) -> CaptureInfo {
+        let (backend, adapter) = self.identity();
+        let context = gpu_context();
+        CaptureInfo {
+            backend,
+            adapter,
+            // 「最近这一帧真的走了 GPU 纹理」而不是「GPU 能力可用」：VP9 会话走 CPU 回读，
+            // 此时后者会谎报 GPU（见 `last_capture_was_gpu` 的文档）。
+            gpu_capture: self.last_capture_was_gpu.load(Ordering::Relaxed)
+                && !context.is_disabled(),
+            gpu_disabled: context.is_disabled(),
+            gpu_disabled_reason: context.disable_reason().unwrap_or_default(),
+            fallbacks: self.xcap_fallbacks.load(Ordering::Relaxed),
+            no_new_frame: self.no_new_frame.load(Ordering::Relaxed),
+            open_fallbacks: self.open_fallbacks.load(Ordering::Relaxed),
         }
     }
 
@@ -460,13 +615,16 @@ impl ScreenSource for WinVideoScreen {
                 return Ok(None);
             }
         };
+        // 补丁模式只在 GPU 纹理路径上启用，成功取到纹理就是一次真正的 GPU 采集。
+        self.last_capture_was_gpu.store(true, Ordering::Relaxed);
         // 用**实际纹理尺寸**算目标编码尺寸：会话中途改分辨率也不会沿用陈旧尺寸。
         //
         // **必须与视频路径同一套双重换算**：`capture_gpu_frame` 先按 `max_width` 把源封顶
         // （`encode_dimensions(.., 1.0, ..)`），引擎随后再施加 `rates.scale`。若这里直接用
         // 原始纹理 × scale，4K + 非 1.0 缩放会得到 1920×1080，而视频路径得到 960×540 ——
         // 补丁尺寸就与控制端合成帧对不上（见 `controlled.rs` 的同名换算）。
-        let (cap_width, cap_height) = encode_dimensions(captured.width, captured.height, 1.0, max_width);
+        let (cap_width, cap_height) =
+            encode_dimensions(captured.width, captured.height, 1.0, max_width);
         let (width, height) = encode_dimensions(cap_width, cap_height, scale, max_width);
         let Some(grid) = grid else {
             // 两种「没有网格」必须分开：
@@ -864,6 +1022,21 @@ impl VideoEncoderApi for NvencAdapter {
         self.encoder.size()
     }
 
+    /// 被控端遥测用的编码器口径。
+    ///
+    /// 适配器名取自编码器**实际所在**的 D3D11 设备（采集设备是 NVIDIA 时就是采集
+    /// 那块，否则是 `create_nvidia` 新建的 NVIDIA 设备）。`gpu_input` 恒定 `true`：
+    /// 本适配器的主路径是 `nvEncRegisterResource` 纹理直通（零拷贝），回读上传只是
+    /// 跨设备 / 需要缩放时的降级，仍属 GPU 编码。
+    fn info(&self) -> EncoderInfo {
+        EncoderInfo {
+            backend: "NVENC".to_owned(),
+            name: "NVIDIA NVENC H.264".to_owned(),
+            adapter: self.encoder.device().adapter.name.clone(),
+            gpu_input: true,
+        }
+    }
+
     fn bitrate_kbps(&self) -> u32 {
         self.encoder.bitrate_bps() / 1000
     }
@@ -1063,19 +1236,16 @@ impl VideoEncoderFactory for MftEncoderFactory {
                 }
                 Err(err) => {
                     info!("MFT 复用采集设备失败，回退 CPU RGBA 输入：{err}");
-                    let encoder =
-                        MftH264Encoder::new(width, height, fps, target_bitrate_kbps).map_err(
-                            |err| {
-                                RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}"))
-                            },
-                        )?;
+                    let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
+                        .map_err(|err| {
+                            RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}"))
+                        })?;
                     (encoder, None)
                 }
             }
         } else {
-            let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps).map_err(
-                |err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")),
-            )?;
+            let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
+                .map_err(|err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")))?;
             (encoder, None)
         };
         Ok(Box::new(MftAdapter {
@@ -1102,9 +1272,40 @@ struct MftAdapter {
     device: Option<Arc<d3d11::D3d11>>,
 }
 
+/// 从硬件 MFT 的友好名称推断编码后端名（遥测用）。
+///
+/// MFT 的友好名称是厂商自由文本（例如 Intel 的 `Intel® Quick Sync Video H.264
+/// Encoder MFT`、AMD 的 `AMD H.264 Hardware MFT Encoder`），没有可靠的 GUID→厂商
+/// 映射可查，故按名称里的关键词归类；认不出时退回中性的 `MFT`。大小写不敏感。
+fn mft_backend_name(mft_name: &str) -> &'static str {
+    let lowered = mft_name.to_lowercase();
+    if lowered.contains("intel") || lowered.contains("quick sync") {
+        "Intel QSV"
+    } else if lowered.contains("amd") {
+        "AMD VCE"
+    } else {
+        "MFT"
+    }
+}
+
 impl VideoEncoderApi for MftAdapter {
     fn dimensions(&self) -> (u32, u32) {
         self.encoder.dimensions()
+    }
+
+    /// 被控端遥测用的编码器口径。
+    ///
+    /// `name`/`adapter` 直接来自编码器实例（实际选中的 MFT 与它绑定的 D3D11
+    /// 适配器），`gpu_input` 表示编码器是否复用采集设备走 `encode_texture`
+    /// （见 [`MftAdapter::gpu`]）。
+    fn info(&self) -> EncoderInfo {
+        let name = self.encoder.mft_name();
+        EncoderInfo {
+            backend: mft_backend_name(name).to_owned(),
+            name: name.to_owned(),
+            adapter: self.encoder.adapter_name().to_owned(),
+            gpu_input: self.gpu,
+        }
     }
 
     fn bitrate_kbps(&self) -> u32 {
@@ -1206,9 +1407,7 @@ impl VideoEncoderApi for MftAdapter {
         // 禁用 GPU**——返回错误让引擎重建编码器，工厂会从 GPU 上下文取新设备。
         if let Some(device) = &self.device {
             if !Arc::ptr_eq(device, &gpu_frame.texture.device) {
-                return Err(RemoteError::Encode(
-                    "采集设备已变化，重建编码器".to_owned(),
-                ));
+                return Err(RemoteError::Encode("采集设备已变化，重建编码器".to_owned()));
             }
         }
         let started = Instant::now();
@@ -1300,6 +1499,28 @@ struct H264DecoderAdapter {
 }
 
 impl VideoDecoderApi for H264DecoderAdapter {
+    /// 控制器遥测口径：解码后端、MFT 名称与硬件解码绑定的适配器。
+    ///
+    /// 还没 `configure`（没有解码器实例）时返回默认值——此时说任何话都是编的。
+    /// `hardware` 直接来自实际选中的通路（DXVA/D3D11 → 硬件），比「声明了硬件偏好」
+    /// 更可信：`Auto` 在 DXVA 初始化失败时会静默回退系统内存。
+    fn info(&self) -> DecoderInfo {
+        let Some(decoder) = self.decoder.as_ref() else {
+            return DecoderInfo::default();
+        };
+        let path = decoder.path();
+        DecoderInfo {
+            backend: match path {
+                H264DecodePath::Dxva => "MF DXVA",
+                H264DecodePath::Software => "MF Software",
+            }
+            .to_owned(),
+            name: "MSH264DecoderMFT".to_owned(),
+            adapter: decoder.adapter_name().unwrap_or_default().to_owned(),
+            hardware: path == H264DecodePath::Dxva,
+        }
+    }
+
     fn configure(&mut self, width: u32, height: u32) -> RemoteResult<()> {
         if self.decoder.is_some() && self.configured == Some((width, height)) {
             return Ok(());
@@ -1307,8 +1528,8 @@ impl VideoDecoderApi for H264DecoderAdapter {
         // 现场 A/B 开关：若解码细分日志显示 DXVA 回读（staging Map）比颜色转换
         // 还慢，置 `RUST_TUNNEL_DECODE_SOFTWARE=1` 可强制系统内存软件解码对照。
         // 默认行为不变（Auto → DXVA 优先）。
-        let software = std::env::var_os("RUST_TUNNEL_DECODE_SOFTWARE")
-            .is_some_and(|value| !value.is_empty());
+        let software =
+            std::env::var_os("RUST_TUNNEL_DECODE_SOFTWARE").is_some_and(|value| !value.is_empty());
         // 输出 **紧包 NV12**：CPU 侧的 NV12→RGBA 转换移到 GUI 线程（阶段 1b 会换成
         // GPU 着色器），解码线程只做 MFT 解码 + 可见区域拷贝。
         let created = if software {
@@ -1449,7 +1670,9 @@ mod tests {
     // 测试代码豁免 panic 风险 lint：断言失败即 panic 是测试的预期行为。
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{can_use_direct_texture, choose_backend, clamp_encode_width, Backend};
+    use super::{
+        can_use_direct_texture, choose_backend, clamp_encode_width, mft_backend_name, Backend,
+    };
     use rust_tunnel_win_video::d3d11::{VENDOR_AMD, VENDOR_INTEL, VENDOR_NVIDIA};
 
     /// 采集侧上限的钳制表：只接受 `[1920, 3840]`、结果恒为偶数。
@@ -1557,7 +1780,9 @@ mod tests {
     fn can_use_direct_texture_table() {
         const HD: (u32, u32) = (1920, 1080);
         const UHD: (u32, u32) = (3840, 2160);
-        let cases: [(bool, (u32, u32), (u32, u32), bool, bool); 8] = [
+        /// `(同设备, 采集尺寸, 编码尺寸, 已禁用, 期望可直通)`。
+        type Case = (bool, (u32, u32), (u32, u32), bool, bool);
+        let cases: [Case; 8] = [
             // 同设备 + 同尺寸 + 未禁用 → 直通。
             (true, HD, HD, false, true),
             // 4K 纹理 / 1080p 编码：要缩放，只能回读。
@@ -1597,5 +1822,27 @@ mod tests {
             (1920, 1080),
             true
         ));
+    }
+
+    /// MFT 后端名的推断表。
+    ///
+    /// 钉住两条易错点：① 判定必须**大小写不敏感**（MFT 友好名称原样保留厂商大小写）；
+    /// ② 认不出时退回 `MFT` 而不是空串——遥测上宁可笼统，也不该让角标显示空白。
+    #[test]
+    fn mft_backend_name_table() {
+        assert_eq!(
+            mft_backend_name("Intel® Quick Sync Video H.264 Encoder MFT"),
+            "Intel QSV"
+        );
+        assert_eq!(mft_backend_name("intel hardware encoder"), "Intel QSV");
+        assert_eq!(mft_backend_name("Quick Sync H264 Encoder"), "Intel QSV");
+        assert_eq!(
+            mft_backend_name("AMD H.264 Hardware MFT Encoder"),
+            "AMD VCE"
+        );
+        assert_eq!(mft_backend_name("amd encoder"), "AMD VCE");
+        // 认不出 → 中性名，绝不空串。
+        assert_eq!(mft_backend_name("（无名称）"), "MFT");
+        assert_eq!(mft_backend_name(""), "MFT");
     }
 }

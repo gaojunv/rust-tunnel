@@ -253,6 +253,7 @@ impl TransportEstablisher for OneShotEstablisher {
         Ok(EstablishedStream {
             stream: duplex,
             path: self.path,
+            reliable: None,
         })
     }
 }
@@ -657,6 +658,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         mode: RemoteMode::Control,
         stats: SessionStatsReporter::noop(),
         h264_decoder_factory: None,
+        reliable: None,
     };
 
     let (_input_tx, input_rx) = mpsc::channel(4);
@@ -744,6 +746,7 @@ async fn correct_token_completes_handshake_and_streams() {
             mode: RemoteMode::ViewOnly,
             stats: SessionStatsReporter::noop(),
             h264_decoder_factory: None,
+            reliable: None,
         },
         plan,
         input_rx,
@@ -859,6 +862,7 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
             mode: RemoteMode::Control,
             stats: SessionStatsReporter::noop(),
             h264_decoder_factory: None,
+            reliable: None,
         },
         plan,
         input_rx,

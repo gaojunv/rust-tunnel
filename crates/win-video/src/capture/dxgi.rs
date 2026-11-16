@@ -17,9 +17,9 @@
 //!   重试仍失败才把错误交给调用方。
 
 use super::{
-    find_output, texture_dimensions, BgraReader, CaptureBackend, CaptureSource, CapturedFrame,
-    CapturedTexture, ChangeReport, DirtyGrid, MonitorInfo, TexturePool, FIRST_FRAME_TIMEOUT,
-    NEXT_FRAME_POLL_TIMEOUT,
+    find_output, texture_dimensions, BgraReader, CaptureBackend, CaptureCounters, CaptureSource,
+    CapturedFrame, CapturedTexture, ChangeReport, DirtyGrid, MonitorInfo, TexturePool,
+    FIRST_FRAME_TIMEOUT, NEXT_FRAME_POLL_TIMEOUT,
 };
 use crate::d3d11;
 use crate::WinVideoError;
@@ -56,6 +56,8 @@ struct DxgiSource {
     change: super::change::TextureChangeTracker,
     /// 最近一次 GPU 采集结果（无新帧时返回它的克隆）。
     last_texture: Option<CapturedTexture>,
+    /// 「超时 / 无新帧 / 复用上一帧」的累计次数（[`CaptureCounters::no_new_frame`]）。
+    no_new_frame: u64,
 }
 
 /// `AcquireNextFrame` 的一次结果（把「超时/丢失」从错误路径里分出来）。
@@ -128,6 +130,12 @@ impl CaptureSource for DxgiSource {
 
     fn device(&self) -> Option<Arc<d3d11::D3d11>> {
         Some(self.d3d.clone())
+    }
+
+    fn stats(&self) -> CaptureCounters {
+        CaptureCounters {
+            no_new_frame: self.no_new_frame,
+        }
     }
 }
 
@@ -271,9 +279,15 @@ impl DxgiSource {
     }
 
     /// 复用上一帧；从未采到过帧时把原因报给调用方。
-    fn reuse(&self, reason: &str) -> Result<CapturedFrame, WinVideoError> {
+    ///
+    /// 真正走到「复用」时记一次 [`CaptureCounters::no_new_frame`]——桌面静止
+    /// （`AcquireNextFrame` 超时 / 只有指针更新）是正常现象，不是采集失败。
+    fn reuse(&mut self, reason: &str) -> Result<CapturedFrame, WinVideoError> {
         match &self.last {
-            Some(frame) => Ok(frame.clone()),
+            Some(frame) => {
+                self.no_new_frame = self.no_new_frame.saturating_add(1);
+                Ok(frame.clone())
+            }
             None => Err(WinVideoError::Capture(format!(
                 "DXGI: {reason}，且还没有任何已采集帧"
             ))),
@@ -281,9 +295,12 @@ impl DxgiSource {
     }
 
     /// 复用上一张 GPU 纹理；从未采到过帧时把原因报给调用方。
-    fn reuse_texture(&self, reason: &str) -> Result<CapturedTexture, WinVideoError> {
+    fn reuse_texture(&mut self, reason: &str) -> Result<CapturedTexture, WinVideoError> {
         match &self.last_texture {
-            Some(texture) => Ok(texture.clone()),
+            Some(texture) => {
+                self.no_new_frame = self.no_new_frame.saturating_add(1);
+                Ok(texture.clone())
+            }
             None => Err(WinVideoError::Capture(format!(
                 "DXGI: {reason}，且还没有任何已采集的 GPU 纹理"
             ))),
@@ -364,5 +381,6 @@ pub(super) fn open(monitor: &MonitorInfo) -> Result<Box<dyn CaptureSource>, WinV
         textures: None,
         change: super::change::TextureChangeTracker::new(),
         last_texture: None,
+        no_new_frame: 0,
     }))
 }

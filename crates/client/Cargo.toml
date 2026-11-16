@@ -8,7 +8,8 @@ name = "rust-tunnel-client"
 # 0.15.0 = 控制通道自更新（`ClientUpdate*` 变体）；新变体只在服务端确认客户端
 # ≥ `MIN_UPDATE_CLIENT_VERSION` 后下发，旧客户端不会因未知 bincode 变体断连。
 # 数据面协议仍是 v7，可与 0.14.0 互控。
-version = "0.15.0"
+# 0.16.0 = 数据面 v8（`HostStats` 遥测 + 心跳时间戳 + 采集时间戳/端到端），两端必须同为 0.16.0。
+version = "0.16.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"

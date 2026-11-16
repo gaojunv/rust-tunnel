@@ -660,6 +660,8 @@ impl TransportEstablisher for CuttableEstablisher {
             Ok(EstablishedStream {
                 stream: Box::new(local),
                 path: established.path,
+                // 桥接后的流不再暴露原可靠层：测试里没有 A7 断言，按「无句柄」处理。
+                reliable: None,
             })
         })
     }

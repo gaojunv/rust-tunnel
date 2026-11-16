@@ -23,8 +23,11 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, Ui};
 use rust_tunnel_common::protocol::RemoteMode;
+use rust_tunnel_remote::session::HostStats;
+use rust_tunnel_remote::stats::{KeyframeReason, TransportStats};
 use rust_tunnel_remote::{
-    ActiveSessionInfo, QualityPreset, RemoteManager, RemoteUiState, SessionRole, TransportPath,
+    ActiveSessionInfo, CodecId, QualityPreset, RemoteManager, RemoteUiState, SessionRole,
+    TransportPath,
 };
 
 use super::{theme, widgets};
@@ -514,7 +517,8 @@ fn toolbar_contents(
         ui.add_space(4.0);
         // 收起放最前：误触的后果只是工具条缩成一枚延迟胶囊，点一下就能回来；「断开」仍留在末尾，
         // 破坏性操作不该和常用按钮做邻居。
-        if widgets::toolbar_button(ui, "收起", "收起到只显示延迟（点延迟胶囊可展开）").clicked() {
+        if widgets::toolbar_button(ui, "收起", "收起到只显示延迟（点延迟胶囊可展开）").clicked()
+        {
             v.collapse_toolbar();
         }
         if widgets::toolbar_button(ui, "设置", "画质 / 帧率 / 显示器 / 缩放 / 窗口尺寸 / 交互")
@@ -755,6 +759,9 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
             ),
         );
         ui.checkbox(&mut v.stats_overlay, "显示统计角标");
+        // 详细档：三组指标（链路 / 被控端 / 画面）。这里只改**持久化镜像**，由父窗口的
+        // `sync_display_prefs` 回写 gui.toml；角标关闭时也可先勾选，打开角标即按详细档渲染。
+        ui.checkbox(&mut v.stats_detail, "统计角标显示详细指标");
     });
 }
 
@@ -887,98 +894,635 @@ fn paint_image(
     }
 }
 
-/// 统计角标（右上角悬浮）：延迟 / 路径 / 分辨率 / 帧率 / 会话时长。
+/// 统计角标（右上角悬浮）。简洁 / 详细两档，数据全部来自本端读数与被控端每秒上报的
+/// [`HostStats`]（协议 v8）。
+///
+/// # 为什么是 `egui::Area` + `interactable(false)`，而不是 `egui::Window`
+///
+/// 角标盖在画面上，但用户的点击必须**落到远桌面**（点角标附近不该变成「点了本地 UI」）。
+/// [`RemoteView::capture_input`] 判定「指针是否在画面上」用的是
+/// `ctx.layer_id_at(pos) == Some(画面面板层)`；egui 0.31 的 `Memory::layer_id_at` **只遍历
+/// `AreaState::interactable` 为真的层**（见 `egui::Memory::layer_id_at` 的实现）。`egui::Window`
+/// 永远是可交互层，会把角标下方一片区域吞掉；`Area` 调 `.interactable(false)` 后则被直接跳过，
+/// 点击自然穿透到画面。**不要**在角标里放任何按钮/拖动/滚动控件——它们会把层重新变成可交互。
 fn stats_overlay(
     ctx: &egui::Context,
     v: &RemoteView,
     active: &ActiveSessionInfo,
     state: &RemoteUiState,
 ) {
-    let (width, height) = v.frame_dims();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(active.started_at_ms, |d| {
             u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
         });
     let secs = now_ms.saturating_sub(active.started_at_ms) / 1000;
-    egui::Window::new("会话统计")
-        .id(egui::Id::new("session_stats_overlay"))
-        .title_bar(false)
-        .resizable(false)
-        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
-        .frame(theme::card_frame(&ctx.style()))
+    egui::Area::new(egui::Id::new("session_stats_overlay"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+        .interactable(false)
         .show(ctx, |ui| {
-            egui::Grid::new("session_stats_grid")
-                .num_columns(2)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("延迟").weak().small());
-                    match state.latency_ms {
-                        Some(ms) => ui.colored_label(latency_color(ms), format!("{ms} ms")),
-                        None => ui.label("—"),
-                    };
-                    ui.end_row();
-                    ui.label(RichText::new("路径").weak().small());
-                    ui.label(state.transport.map_or("—", transport_label));
-                    ui.end_row();
-                    ui.label(RichText::new("分辨率").weak().small());
-                    ui.label(format!("{width}×{height}"));
-                    ui.end_row();
-                    ui.label(RichText::new("帧率").weak().small());
-                    ui.label(format!("{} fps", v.fps));
-                    ui.end_row();
-                    // 解码耗时 / 收码率：控制器侧本地实测（阶段 3 QoS 观测量）。
-                    ui.label(RichText::new("解码").weak().small());
-                    ui.label(
-                        state
-                            .decode_ms
-                            .map_or("—".to_owned(), |ms| format!("{ms} ms")),
-                    );
-                    ui.end_row();
-                    ui.label(RichText::new("收码率").weak().small());
-                    ui.label(state.recv_kbps.map_or("—".to_owned(), format_kbps));
-                    ui.end_row();
-                    // 收包/丢包：用来区分「对端没出帧」与「本端解码队列在丢帧」——后者会触发
-                    // 关键帧请求，表现为画面卡顿而码率不低。
-                    ui.label(RichText::new("收包").weak().small());
-                    ui.label(
-                        state
-                            .decode_packets
-                            .map_or("—".to_owned(), |n| format!("{n}/s")),
-                    );
-                    ui.end_row();
-                    ui.label(RichText::new("丢包").weak().small());
-                    ui.label(
-                        state
-                            .decode_dropped
-                            .map_or("—".to_owned(), |n| format!("{n}/s")),
-                    );
-                    ui.end_row();
-                    // 补丁批数：协议 v6 的脏矩形增量通道。补丁模式下全帧几乎消失，这一项
-                    // 代替「收包」说明画面仍在更新（被控端/VP9 会话恒为 —）。
-                    ui.label(RichText::new("补丁").weak().small());
-                    ui.label(
-                        state
-                            .decode_patches
-                            .map_or("—".to_owned(), |n| format!("{n}/s")),
-                    );
-                    ui.end_row();
-                    // 关键帧请求速率：持续 >0 说明解码链在反复断裂（丢包/队列溢出/解码失败）。
-                    if v.keyframe_rate > 0 {
-                        ui.label(RichText::new("关键帧请求").weak().small());
-                        ui.label(format!("{}/s", v.keyframe_rate));
-                        ui.end_row();
-                    }
-                    // 输入速率：本端**捕获并注入**的事件数（不是远端是否响应）。用来一眼分辨
-                    // 「UI 压根没产生事件」与「事件已注入但远端没反应」。
-                    ui.label(RichText::new("输入").weak().small());
-                    ui.label(format!("{}/s", v.input_rate));
-                    ui.end_row();
-                    ui.label(RichText::new("时长").weak().small());
-                    ui.label(format!("{:02}:{:02}", secs / 60, secs % 60));
-                    ui.end_row();
-                });
+            theme::stats_frame(ui.style()).show(ui, |ui| {
+                if v.stats_detail {
+                    stats_detail(ui, v, active, state, secs);
+                } else {
+                    stats_compact(ui, state, secs);
+                }
+            });
         });
+}
+
+/// 简洁档：一眼要看的十行。未知项一律 `—`。
+fn stats_compact(ui: &mut Ui, state: &RemoteUiState, secs: u64) {
+    let host = state.host.as_ref();
+    egui::Grid::new("session_stats_compact")
+        .num_columns(2)
+        .spacing([14.0, 4.0])
+        .show(ui, |ui| {
+            stat_label(ui, "延迟");
+            latency_cell(ui, state.latency_ms);
+            ui.end_row();
+
+            stat_label(ui, "路径");
+            ui.label(state.transport.map_or(UNKNOWN, transport_label));
+            ui.end_row();
+
+            // 编码器 / 采集：后端 + GPU/CPU。被控端上报（B1/B6/B7）。
+            stat_label(ui, "编码器");
+            ui.label(host_field(host, |h| {
+                format!("{} · {}", dash(&h.encoder_backend), gpu_cpu(h.gpu_encode))
+            }));
+            ui.end_row();
+
+            stat_label(ui, "采集");
+            ui.label(host_field(host, |h| {
+                format!("{} · {}", dash(&h.capture_backend), gpu_cpu(h.gpu_capture))
+            }));
+            ui.end_row();
+
+            stat_label(ui, "采集耗时");
+            ui.label(host_field(host, |h| format_us(h.capture_us)));
+            ui.end_row();
+
+            stat_label(ui, "编码耗时");
+            ui.label(host_field(host, |h| format!("{} ms", h.encode_ms)));
+            ui.end_row();
+
+            stat_label(ui, "实测 fps");
+            ui.label(host_field(host, |h| format!("{} fps", h.fps)));
+            ui.end_row();
+
+            // 「实际出码」= 真正发出去的字节速率（`sent_kbps`），不是 QoS 的目标值。
+            stat_label(ui, "码率");
+            ui.label(host_field(host, |h| format_kbps(h.sent_kbps)));
+            ui.end_row();
+
+            // 端到端：被控端采集完成 → 本端解码完成（`SessionStats::Decode.e2e_ms`）。
+            stat_label(ui, "端到端");
+            ui.label(e2e_cell(state.e2e_ms));
+            ui.end_row();
+
+            stat_label(ui, "时长");
+            ui.label(format_duration(secs));
+            ui.end_row();
+        });
+}
+
+/// 详细档：链路 / 被控端 / 画面三组。第一行横排两组，第二行单独放「画面」，
+/// 这样窄窗口下也不会把三张表挤成不可读的一列。
+fn stats_detail(
+    ui: &mut Ui,
+    v: &RemoteView,
+    active: &ActiveSessionInfo,
+    state: &RemoteUiState,
+    secs: u64,
+) {
+    let host = state.host.as_ref();
+    ui.horizontal_top(|ui| {
+        stats_group(ui, "链路", |ui| link_grid(ui, v, state, secs));
+        ui.add_space(18.0);
+        stats_group(ui, "被控端", |ui| host_grid(ui, host));
+    });
+    ui.add_space(6.0);
+    stats_group(ui, "画面", |ui| local_grid(ui, v, active, state));
+}
+
+/// 一组指标：小标题 + 一张两列 Grid。
+fn stats_group(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(title).strong().small());
+        contents(ui);
+    });
+}
+
+/// 「链路」组：延迟 / 抖动 / 路径 / 可靠层重传与乱序 / 端到端 / 接收侧读数。
+fn link_grid(ui: &mut Ui, v: &RemoteView, state: &RemoteUiState, secs: u64) {
+    let ts = state.transport_stats.as_ref();
+    egui::Grid::new("session_stats_link")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            stat_label(ui, "延迟");
+            latency_cell(ui, state.latency_ms);
+            ui.end_row();
+
+            stat_label(ui, "抖动");
+            ui.label(opt_or_dash(state.jitter_ms.map(|ms| format!("{ms} ms"))));
+            ui.end_row();
+
+            stat_label(ui, "路径");
+            ui.label(state.transport.map_or(UNKNOWN, transport_label));
+            ui.end_row();
+
+            // 可靠层（只有 UDP 打洞路径有；直连/中继恒为 —）。
+            stat_label(ui, "重传");
+            ui.label(transport_field(ts, |t| {
+                format!("RTO {} · 快速 {}", t.rto, t.fast_retransmit)
+            }));
+            ui.end_row();
+
+            stat_label(ui, "乱序");
+            ui.label(transport_field(ts, |t| t.out_of_order.to_string()));
+            ui.end_row();
+
+            stat_label(ui, "重复 / 窗口外");
+            ui.label(transport_field(ts, |t| {
+                format!("{} / {}", t.duplicate, t.out_of_window)
+            }));
+            ui.end_row();
+
+            stat_label(ui, "端到端（到达）");
+            ui.label(e2e_cell(state.e2e_ms));
+            ui.end_row();
+
+            stat_label(ui, "端到端（上屏）");
+            ui.label(opt_or_dash(
+                screen_e2e_ms(v, state).map(|ms| format!("{ms} ms")),
+            ));
+            ui.end_row();
+
+            stat_label(ui, "收码率");
+            ui.label(opt_or_dash(state.recv_kbps.map(format_kbps)));
+            ui.end_row();
+
+            stat_label(ui, "收包");
+            ui.label(opt_or_dash(state.decode_packets.map(|n| format!("{n}/s"))));
+            ui.end_row();
+
+            stat_label(ui, "丢包");
+            ui.label(opt_or_dash(state.decode_dropped.map(|n| format!("{n}/s"))));
+            ui.end_row();
+
+            stat_label(ui, "补丁");
+            ui.label(opt_or_dash(state.decode_patches.map(|n| format!("{n}/s"))));
+            ui.end_row();
+
+            stat_label(ui, "关键帧请求");
+            ui.label(format!("{}/s", v.keyframe_rate));
+            ui.end_row();
+
+            // C3 的「原因」：控制器侧按原因累计（会话内），只列出非零项；全零时显示 —。
+            stat_label(ui, "关键帧原因");
+            ui.label(keyframe_reason_summary(&state.keyframe_requests));
+            ui.end_row();
+
+            stat_label(ui, "输入");
+            ui.label(format!("{}/s", v.input_rate));
+            ui.end_row();
+
+            stat_label(ui, "解码积压");
+            ui.label(opt_or_dash(state.decode_backlog.map(|n| format!("{n} 帧"))));
+            ui.end_row();
+
+            stat_label(ui, "时长");
+            ui.label(format_duration(secs));
+            ui.end_row();
+        });
+}
+
+/// 「被控端」组：身份、编码器/采集方式、每秒遥测与 C2/C3/C5 增量。
+#[expect(
+    clippy::too_many_lines,
+    reason = "一张平铺的遥测表：按字段拆函数只会让「漏了一项」更难发现"
+)]
+fn host_grid(ui: &mut Ui, host: Option<&HostStats>) {
+    egui::Grid::new("session_stats_host")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            stat_label(ui, "平台");
+            ui.label(host_field(host, |h| dash(&h.platform).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "编码器");
+            ui.label(host_field(host, |h| dash(&h.encoder_backend).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "编码器名称");
+            ui.label(host_field(host, |h| dash(&h.encoder_name).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "编码器适配器");
+            ui.label(host_field(host, |h| dash(&h.encoder_adapter).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "编码 GPU 输入");
+            ui.label(host_field(host, |h| gpu_cpu(h.gpu_encode).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "采集方式");
+            ui.label(host_field(host, |h| dash(&h.capture_backend).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "采集适配器");
+            ui.label(host_field(host, |h| dash(&h.capture_adapter).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "GPU 零拷贝（采集）");
+            ui.label(host_field(host, |h| gpu_cpu(h.gpu_capture).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "GPU 禁用");
+            ui.label(host_field(host, |h| {
+                if h.gpu_disabled {
+                    dash(&h.gpu_disabled_reason).to_owned()
+                } else {
+                    "否".to_owned()
+                }
+            }));
+            ui.end_row();
+
+            stat_label(ui, "原生分辨率");
+            ui.label(host_field(host, |h| yes_no(h.native_resolution).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "采集耗时");
+            ui.label(host_field(host, |h| format_us(h.capture_us)));
+            ui.end_row();
+
+            stat_label(ui, "编码耗时");
+            ui.label(host_field(host, |h| format!("{} ms", h.encode_ms)));
+            ui.end_row();
+
+            stat_label(ui, "实测 fps");
+            ui.label(host_field(host, |h| format!("{} fps", h.fps)));
+            ui.end_row();
+
+            stat_label(ui, "目标 / 实际码率");
+            ui.label(host_field(host, |h| {
+                format!(
+                    "{} / {}",
+                    format_kbps(h.bitrate_kbps),
+                    format_kbps(h.sent_kbps)
+                )
+            }));
+            ui.end_row();
+
+            stat_label(ui, "变化面积");
+            ui.label(host_field(host, |h| format_permille(h.changed_permille)));
+            ui.end_row();
+
+            stat_label(ui, "活跃档");
+            ui.label(host_field(host, |h| h.activity.label().to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "缩放");
+            ui.label(host_field(host, |h| {
+                format_permille(u32::from(h.scale_permille))
+            }));
+            ui.end_row();
+
+            stat_label(ui, "补丁模式");
+            ui.label(host_field(host, |h| yes_no(h.patch_mode).to_owned()));
+            ui.end_row();
+
+            stat_label(ui, "关键帧");
+            ui.label(host_field(host, |h| format!("{}/s", h.keyframes)));
+            ui.end_row();
+
+            stat_label(ui, "关键帧码率");
+            ui.label(host_field(host, |h| format_kbps(h.idr_kbps)));
+            ui.end_row();
+
+            stat_label(ui, "关键帧平均");
+            ui.label(host_field(host, |h| {
+                format_avg_keyframe(h.idr_bytes, h.keyframes)
+            }));
+            ui.end_row();
+
+            stat_label(ui, "普通帧码率");
+            ui.label(host_field(host, |h| format_kbps(h.p_kbps)));
+            ui.end_row();
+
+            stat_label(ui, "跳过");
+            ui.label(host_field(host, |h| format!("{}/s", h.skipped)));
+            ui.end_row();
+
+            stat_label(ui, "队列深度");
+            ui.label(host_field(host, |h| format!("{} 帧", h.out_queue_depth)));
+            ui.end_row();
+
+            stat_label(ui, "背压跳过");
+            ui.label(host_field(host, |h| format!("{}/s", h.out_queue_skips)));
+            ui.end_row();
+
+            stat_label(ui, "编码器重建");
+            ui.label(host_field(host, |h| format!("{}/s", h.encoder_rebuilds)));
+            ui.end_row();
+
+            stat_label(ui, "强制 IDR");
+            ui.label(host_field(host, |h| format!("{}/s", h.forced_idrs)));
+            ui.end_row();
+
+            stat_label(ui, "采集失败");
+            ui.label(host_field(host, |h| format!("{}/s", h.capture_failures)));
+            ui.end_row();
+
+            stat_label(ui, "采集回退");
+            ui.label(host_field(host, |h| format!("{}/s", h.capture_fallbacks)));
+            ui.end_row();
+
+            stat_label(ui, "打开回退（WGC→DXGI）");
+            ui.label(host_field(host, |h| {
+                format!("{}/s", h.capture_open_fallbacks)
+            }));
+            ui.end_row();
+
+            stat_label(ui, "无新帧");
+            ui.label(host_field(host, |h| format!("{}/s", h.no_new_frame)));
+            ui.end_row();
+        });
+}
+
+/// 「画面 / 本端」组：codec、尺寸、本端解码与渲染、显示帧率、模式与显示器。
+fn local_grid(ui: &mut Ui, v: &RemoteView, active: &ActiveSessionInfo, state: &RemoteUiState) {
+    let display = selected_display_info(v);
+    let display_count = v.displays().len();
+    egui::Grid::new("session_stats_local")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            stat_label(ui, "对端");
+            ui.label(dash(&active.peer_name));
+            ui.end_row();
+
+            stat_label(ui, "对端平台");
+            ui.label(dash(&active.peer_platform));
+            ui.end_row();
+
+            stat_label(ui, "对端 ID");
+            ui.label(dash(&active.peer_rd_id));
+            ui.end_row();
+
+            stat_label(ui, "模式");
+            ui.label(mode_short(active.mode));
+            ui.end_row();
+
+            stat_label(ui, "codec");
+            ui.label(codec_label(state.codec));
+            ui.end_row();
+
+            stat_label(ui, "编码尺寸");
+            ui.label(opt_or_dash(
+                state.encode_dims.map(|(w, h)| format!("{w}×{h}")),
+            ));
+            ui.end_row();
+
+            stat_label(ui, "显示尺寸");
+            ui.label(
+                display
+                    .as_ref()
+                    .map_or(UNKNOWN.to_owned(), |(w, h, _)| format!("{w}×{h}")),
+            );
+            ui.end_row();
+
+            stat_label(ui, "显示器");
+            ui.label(display.as_ref().map_or_else(
+                || UNKNOWN.to_owned(),
+                |(_, _, name)| format!("{} · 共 {display_count} 台", dash(name)),
+            ));
+            ui.end_row();
+
+            stat_label(ui, "显示 fps / 上限");
+            ui.label(format!("{} fps / {} fps", v.fps, v.frame_rate()));
+            ui.end_row();
+
+            stat_label(ui, "本端解码");
+            ui.label(dash_opt(state.decode_backend.as_deref()));
+            ui.end_row();
+
+            stat_label(ui, "解码适配器");
+            ui.label(dash_opt(state.decode_adapter.as_deref()));
+            ui.end_row();
+
+            stat_label(ui, "解码硬件");
+            ui.label(opt_yes_no(state.decode_hardware));
+            ui.end_row();
+
+            stat_label(ui, "解码耗时");
+            ui.label(opt_or_dash(state.decode_ms.map(|ms| format!("{ms} ms"))));
+            ui.end_row();
+
+            stat_label(ui, "渲染后端");
+            ui.label(v.render_backend());
+            ui.end_row();
+
+            stat_label(ui, "缩放档位");
+            ui.label(v.scale.label());
+            ui.end_row();
+        });
+}
+
+/// 角标行标签（弱化小字）。
+fn stat_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).weak().small());
+}
+
+/// 未知项占位符。
+const UNKNOWN: &str = "—";
+
+/// 空串 / 缺值都显示 `—`。
+fn dash(text: &str) -> &str {
+    if text.is_empty() {
+        UNKNOWN
+    } else {
+        text
+    }
+}
+
+/// `Option<&str>` 版的 [`dash`]（`None` 与空串一律 `—`）。
+fn dash_opt(text: Option<&str>) -> &str {
+    text.map_or(UNKNOWN, dash)
+}
+
+/// `Option<T>` 转字符串；`None` → `—`。
+fn opt_or_dash<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| UNKNOWN.to_owned(), |v| v.to_string())
+}
+
+/// 端到端延迟的单元格。
+///
+/// `SessionStats::Decode.e2e_ms` 用 `0` 表示「时钟偏差未估计 / 对端没带时间戳」（见
+/// `crates/remote/src/stats.rs`），所以这里把 `0` 一并当作未知——否则会话开头那一秒会显示
+/// 一个并不可信的「0 ms」。
+fn e2e_cell(ms: Option<u32>) -> String {
+    match ms {
+        Some(ms) if ms > 0 => format!("{ms} ms"),
+        _ => UNKNOWN.to_owned(),
+    }
+}
+
+/// 对被控端遥测取一个字段；`None`（尚未上报）→ `—`。
+fn host_field(host: Option<&HostStats>, f: impl FnOnce(&HostStats) -> String) -> String {
+    host.map_or_else(|| UNKNOWN.to_owned(), f)
+}
+
+/// 对可靠层快照取一个字段；直连/中继路径没有可靠层（`None`）→ `—`。
+fn transport_field(
+    ts: Option<&TransportStats>,
+    f: impl FnOnce(&TransportStats) -> String,
+) -> String {
+    ts.map_or_else(|| UNKNOWN.to_owned(), f)
+}
+
+/// 延迟单元格：已知时按档位着色，未知显示 `—`。
+fn latency_cell(ui: &mut Ui, latency: Option<u32>) {
+    match latency {
+        Some(ms) => {
+            ui.colored_label(latency_color(ms), format!("{ms} ms"));
+        }
+        None => {
+            ui.label(UNKNOWN);
+        }
+    }
+}
+
+/// 编码器 / 采集的 GPU/CPU 标记。
+fn gpu_cpu(gpu: bool) -> &'static str {
+    if gpu {
+        "GPU"
+    } else {
+        "CPU"
+    }
+}
+
+/// 是 / 否。
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "是"
+    } else {
+        "否"
+    }
+}
+
+/// 是 / 否 / 未知。
+fn opt_yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(v) => yes_no(v),
+        None => UNKNOWN,
+    }
+}
+
+/// codec 的展示名（A1）。
+fn codec_label(codec: Option<CodecId>) -> &'static str {
+    match codec {
+        Some(CodecId::H264) => "H.264 4:2:0",
+        Some(CodecId::Vp9) => "VP9 4:4:4",
+        None => UNKNOWN,
+    }
+}
+
+/// 会话模式短标签（详细档一行放得下；完整说明见 `ui::remote::mode_label`）。
+fn mode_short(mode: RemoteMode) -> &'static str {
+    match mode {
+        RemoteMode::Control => "完全控制",
+        RemoteMode::ViewOnly => "仅观看",
+        RemoteMode::FileTransfer => "仅文件传输",
+    }
+}
+
+/// 微秒转毫秒（一位小数）：GPU 采集常在 1 ms 以内，整数毫秒会恒显示 0。
+fn format_us(us: u32) -> String {
+    format!("{:.1} ms", f64::from(us) / 1000.0)
+}
+
+/// 千分比转百分数（一位小数）。
+fn format_permille(permille: u32) -> String {
+    format!("{:.1}%", f64::from(permille) / 10.0)
+}
+
+/// 关键帧平均大小（KB）：`idr_bytes / keyframes`，窗口内没有关键帧时 `—`。
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "字节数只用于展示平均 KB，f64 精度足够"
+)]
+fn format_avg_keyframe(idr_bytes: u64, keyframes: u32) -> String {
+    if keyframes == 0 {
+        UNKNOWN.to_owned()
+    } else {
+        format!("{:.1} KB", idr_bytes as f64 / 1024.0 / f64::from(keyframes))
+    }
+}
+
+/// 关键帧请求的**原因累计**摘要（C3）：只列非零原因，全零显示 `—`。
+///
+/// 计数来自 [`RemoteUiState::keyframe_requests`]，由管理器按
+/// [`KeyframeReason::index`] 累计；这里用 [`KeyframeReason::from_index`] 反查标签，
+/// 不依赖数组顺序。
+fn keyframe_reason_summary(counts: &[u32; KeyframeReason::COUNT]) -> String {
+    let mut parts = Vec::new();
+    for (index, count) in counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        if let Some(reason) = KeyframeReason::from_index(index) {
+            parts.push(format!("{} {}", reason.label(), count));
+        }
+    }
+    if parts.is_empty() {
+        UNKNOWN.to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// 会话时长 `分:秒`。
+fn format_duration(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+/// 当前所选显示器的 `(宽, 高, 名称)`；尚未下发显示器列表时为 `None`。
+fn selected_display_info(v: &RemoteView) -> Option<(u32, u32, String)> {
+    let selected = v.selected_display();
+    v.displays()
+        .into_iter()
+        .find(|d| Some(d.id) == selected)
+        .map(|d| (d.width, d.height, d.name))
+}
+
+/// 「采集 → 上屏」端到端延迟（毫秒）。
+///
+/// 采集时刻来自被控端单调时钟，必须用 `clock_offset_us` 换算到本端时钟；缺时间戳或缺
+/// 时钟偏移时返回 `None`。差值饱和到 0：时钟抖动可能让本地算出的「未来」时刻略早于采集，
+/// 负延迟没有意义。
+fn screen_e2e_ms(v: &RemoteView, state: &RemoteUiState) -> Option<u32> {
+    let capture_ts_us = v.last_capture_ts_us()?;
+    let offset_us = state.clock_offset_us?;
+    Some(e2e_ms_from(
+        rust_tunnel_remote::clock::now_us(),
+        offset_us,
+        capture_ts_us,
+    ))
+}
+
+/// 「采集 → 现在」的毫秒数（纯算术，便于单测）。
+///
+/// `offset_us` 是「对端时钟 − 本端时钟」，故 `now + offset - capture` 才是同一个时钟域里的差。
+/// 负值（时钟抖动 / 时间戳略超前）饱和到 0。
+fn e2e_ms_from(now_us: u64, offset_us: i64, capture_ts_us: u64) -> u32 {
+    let elapsed_us =
+        (i128::from(now_us) + i128::from(offset_us) - i128::from(capture_ts_us)).max(0);
+    u32::try_from(elapsed_us / 1000).unwrap_or(u32::MAX)
 }
 
 /// 右侧面板内容：剪贴板 + 文件传输（整体从旧「远程」Tab 迁来，逻辑不变）。
@@ -1326,5 +1870,41 @@ mod tests {
                 assert!(d.reset_activity, "弹层打开时应重置空闲计时");
             }
         }
+    }
+
+    /// 端到端换算：两端时钟经 offset 对齐后求差；负值饱和到 0（时钟抖动不该显示负延迟）。
+    #[test]
+    fn e2e_ms_aligns_clocks_and_saturates_to_zero() {
+        // 采集于对端 9.0s，本端此刻 10.0s，offset=0 → 1000 ms。
+        assert_eq!(e2e_ms_from(10_000_000, 0, 9_000_000), 1000);
+        // 对端时钟快 2s（offset=+2s）：采集时刻 11.0s 与本端 10.0s 是同一瞬间 → 约 1s。
+        assert_eq!(e2e_ms_from(10_000_000, 2_000_000, 11_000_000), 1000);
+        // 采集时间戳晚于「现在 + offset」→ 0，而不是下溢成一个巨大的数。
+        assert_eq!(e2e_ms_from(10_000_000, 0, 12_000_000), 0);
+        // 极值不 panic（饱和到 u32::MAX）。
+        assert_eq!(e2e_ms_from(u64::MAX, i64::MAX, 0), u32::MAX);
+        assert_eq!(e2e_ms_from(0, i64::MIN, u64::MAX), 0);
+    }
+
+    /// 角标里的固定文案：未知项必须是占位符，不能 panic、不能显示空串。
+    #[test]
+    fn stats_labels_cover_unknown_values() {
+        assert_eq!(dash(""), UNKNOWN);
+        assert_eq!(dash("xcap"), "xcap");
+        assert_eq!(dash_opt(None), UNKNOWN);
+        assert_eq!(dash_opt(Some("")), UNKNOWN);
+        assert_eq!(codec_label(None), UNKNOWN);
+        assert_eq!(codec_label(Some(CodecId::H264)), "H.264 4:2:0");
+        assert_eq!(codec_label(Some(CodecId::Vp9)), "VP9 4:4:4");
+        assert_eq!(opt_yes_no(None), UNKNOWN);
+        assert_eq!(opt_yes_no(Some(false)), "否");
+        // `e2e_ms == 0` 是「尚未估计」的哨兵，不能显示成一个真实的 0 ms。
+        assert_eq!(e2e_cell(None), UNKNOWN);
+        assert_eq!(e2e_cell(Some(0)), UNKNOWN);
+        assert_eq!(e2e_cell(Some(42)), "42 ms");
+        assert_eq!(format_us(500), "0.5 ms");
+        assert_eq!(format_permille(125), "12.5%");
+        assert_eq!(format_avg_keyframe(0, 0), UNKNOWN);
+        assert_eq!(format_duration(125), "02:05");
     }
 }

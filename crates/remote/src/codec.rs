@@ -92,6 +92,15 @@ pub trait VideoEncoderApi: Send {
     ) -> RemoteResult<EncodedVideo> {
         self.encode(&frame.rgba, frame.width, frame.height, force_keyframe)
     }
+
+    /// 本编码器的平台信息（后端/名称/适配器/是否零拷贝），进
+    /// [`crate::session::HostStats`]（B2）。
+    ///
+    /// 默认实现返回 [`EncoderInfo::default`]（全空/`false`）：不实现它只是让对端的统计角标
+    /// 少几行，编码路径本身不受影响。被控端在**每次创建编码器成功后**读一次。
+    fn info(&self) -> crate::screen::EncoderInfo {
+        crate::screen::EncoderInfo::default()
+    }
 }
 
 /// 解码器实例接口。
@@ -117,6 +126,15 @@ pub trait VideoDecoderApi: Send {
     /// # Errors
     /// 长度前缀不完整、码流非法或解码器失败时返回错误。
     fn decode(&mut self, data: &[u8]) -> RemoteResult<Option<DecodedVideoFrame>>;
+
+    /// 本解码器的后端信息（后端/名称/适配器/是否硬件），进
+    /// [`crate::stats::SessionStats::DecoderInfo`]（A3）。
+    ///
+    /// 默认实现返回 [`crate::screen::DecoderInfo::default`]：不实现它只是让本端角标少几行。
+    /// 控制器在解码器创建成功、以及每次 `configure` 成功后读一次，**只在变化时**上报。
+    fn info(&self) -> crate::screen::DecoderInfo {
+        crate::screen::DecoderInfo::default()
+    }
 }
 
 /// 编码器工厂：被控端按协商结果创建编码器实例。
@@ -183,11 +201,21 @@ impl VideoEncoderApi for VideoEncoder {
     ) -> RemoteResult<EncodedVideo> {
         VideoEncoder::encode(self, rgba, src_width, src_height, force_keyframe)
     }
+
+    /// VP9 4:4:4 纯软件编码（`backend = "libvpx"`、`gpu_input = false`）。
+    fn info(&self) -> crate::screen::EncoderInfo {
+        VideoEncoder::info(self)
+    }
 }
 
 impl VideoDecoderApi for VideoDecoder {
     fn decode(&mut self, data: &[u8]) -> RemoteResult<Option<DecodedVideoFrame>> {
         VideoDecoder::decode(self, data)
+    }
+
+    /// VP9 纯软件解码（`backend = "libvpx"`、`hardware = false`）。
+    fn info(&self) -> crate::screen::DecoderInfo {
+        VideoDecoder::info(self)
     }
 }
 

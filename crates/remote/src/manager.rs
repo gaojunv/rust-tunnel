@@ -40,8 +40,8 @@ use crate::input_buffer::InputBuffer;
 use crate::screen::{
     Clipboard, EncodeOptions, FileEntry, FrameSink, InputEvent, InputSink, NullFrameSink, QualityPreset, ScreenSource,
 };
-use crate::session::{plan_controller_handshake, SessionEnd};
-use crate::stats::{SessionStats, SessionStatsReporter};
+use crate::session::{plan_controller_handshake, CodecId, HostStats, SessionEnd};
+use crate::stats::{SessionStats, SessionStatsReporter, TransportStats};
 use crate::transfer::{TransferCommand, TransferEvent, TransferHub, TransferProgress};
 use crate::transport::{EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams, RemotePeerInfo};
@@ -101,6 +101,14 @@ pub struct ActiveSessionInfo {
     pub role: SessionRole,
     /// 对端展示名（控制器为被控端名，被控端为发起方名）。
     pub peer_name: String,
+    /// 对端平台标识（控制器侧来自 `RemoteConnectGrant.target_platform`）。
+    ///
+    /// 被控端侧拿不到（`RemoteSessionIncoming` 只带 `from_name`），故为空串——UI 见空串显示「—」，
+    /// 不要把它当成「未知平台」之外的语义。会话内被控端上报 `HostStats.platform` 后，
+    /// [`RemoteUiState::host`] 会给出真实值。
+    pub peer_platform: String,
+    /// 对端 RustDesk ID（控制器侧 = 被控端 rd_id；被控端侧未知，为空串）。
+    pub peer_rd_id: String,
     /// 会话模式。
     pub mode: RemoteMode,
     /// 生命周期状态。
@@ -216,6 +224,29 @@ pub struct RemoteUiState {
     pub decode_patches: Option<u32>,
     /// 本次会话的数据面路径（P2P 直连 / 中继）；会话未建立/已结束时为 `None`。
     pub transport: Option<TransportPath>,
+    /// 会话协商出的 codec（A1）。无会话或尚未协商时为 `None`。
+    pub codec: Option<CodecId>,
+    /// 当前**编码尺寸**（A2；`(宽, 高)`，可能小于显示尺寸）。
+    pub encode_dims: Option<(u32, u32)>,
+    /// 本端**解码后端**（A3，例如 `"MF DXVA"` / `"libvpx"`）。仅控制器填。
+    pub decode_backend: Option<String>,
+    /// 本端解码适配器名（硬件解码时的显卡名）。仅控制器填。
+    pub decode_adapter: Option<String>,
+    /// 本端是否**硬件解码**。仅控制器填。
+    pub decode_hardware: Option<bool>,
+    /// 被控端最近上报的**整机遥测**（B1–B14 / C2 / C3 / C5）。控制器侧填；被控端自己上报时
+    /// 也会收到同一份（同一份数据喂本机 UI）。
+    pub host: Option<HostStats>,
+    /// 可靠层每秒增量（A7；仅 UDP 打洞路径，直连/中继恒为 `None`）。
+    pub transport_stats: Option<TransportStats>,
+    /// 端到端延迟（采集完成 → 本端解码完成，毫秒；D2）。仅控制器填。
+    pub e2e_ms: Option<u32>,
+    /// 帧到达抖动（毫秒；A5）。仅控制器填。
+    pub jitter_ms: Option<u32>,
+    /// 解码队列当前积压（帧；A10）。仅控制器填。
+    pub decode_backlog: Option<u32>,
+    /// 估计出的对端时钟偏差（微秒，正值 = 对端更快；D2 的换算基准）。未知时为 `None`。
+    pub clock_offset_us: Option<i64>,
     /// 最近一次**由会话循环观测到**的会话结束信息（session_id + 结束原因），供 UI 提示与断线
     /// 自动重连判据。
     ///
@@ -267,6 +298,17 @@ impl RemoteUiState {
         self.decode_packets = None;
         self.decode_dropped = None;
         self.decode_patches = None;
+        self.codec = None;
+        self.encode_dims = None;
+        self.decode_backend = None;
+        self.decode_adapter = None;
+        self.decode_hardware = None;
+        self.host = None;
+        self.transport_stats = None;
+        self.e2e_ms = None;
+        self.jitter_ms = None;
+        self.decode_backlog = None;
+        self.clock_offset_us = None;
     }
 }
 
@@ -1296,6 +1338,9 @@ impl RemoteManager {
             session_id: session_id.to_owned(),
             role: SessionRole::Controller,
             peer_name,
+            // 控制器侧已知对端的平台与 rd_id（来自授权消息/目标选择）。
+            peer_platform: target_platform.to_owned(),
+            peer_rd_id: target_rd_id.clone(),
             mode,
             state: SessionState::Negotiating,
             started_at_ms: now_ms(),
@@ -1391,6 +1436,8 @@ impl RemoteManager {
         let established = self.establish_guarded(request, Role::Controller, &cancel).await?;
         // 记录实际路径（打洞 / 直连 / 中继），供 UI 展示。
         self.mark_active(&session_id, established.path);
+        // 可靠层指标句柄（仅打洞路径）：会话循环每秒与上一份快照求差，上报重传/乱序增量。
+        let reliable = established.reliable;
         let duplex = established.stream;
         // 落地目录可能还不存在（首次使用）；建不出来就让下载直接失败，别让它到 99% 才炸。
         if let Err(err) = tokio::fs::create_dir_all(&self.cfg.download_dir).await {
@@ -1404,6 +1451,7 @@ impl RemoteManager {
             mode,
             stats: self.build_stats_reporter(cancel.clone()),
             h264_decoder_factory: self.cfg.h264_decoder_factory.clone(),
+            reliable,
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
         let transfer = self.build_transfer_hub(None, self.cfg.download_dir.clone(), cancel.clone());
@@ -1543,6 +1591,9 @@ impl RemoteManager {
             session_id: req.session_id.clone(),
             role: SessionRole::Controlled,
             peer_name: req.from_name,
+            // 被控端拿不到对端身份：`RemoteSessionIncoming` 只带 `from_name`（没有 rd_id/平台）。
+            peer_platform: String::new(),
+            peer_rd_id: String::new(),
             mode: req.mode,
             state: SessionState::Connecting,
             started_at_ms: now_ms(),
@@ -2054,6 +2105,10 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
             packets,
             dropped,
             patches,
+            e2e_ms,
+            backlog,
+            jitter_ms,
+            clock_offset_us,
         } => {
             mgr.update_ui(|s| {
                 s.decode_ms = Some(decode_ms);
@@ -2061,7 +2116,38 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
                 s.decode_packets = Some(packets);
                 s.decode_dropped = Some(dropped);
                 s.decode_patches = Some(patches);
+                s.e2e_ms = Some(e2e_ms);
+                s.decode_backlog = Some(backlog);
+                s.jitter_ms = Some(jitter_ms);
+                // `UNKNOWN_OFFSET` 是「尚未估计」的哨兵：UI 要显示「—」，不能拿去算延迟。
+                s.clock_offset_us =
+                    (clock_offset_us != crate::clock::UNKNOWN_OFFSET).then_some(clock_offset_us);
             });
+        }
+        SessionStats::Codec { codec } => {
+            mgr.update_ui(|s| s.codec = Some(codec));
+        }
+        SessionStats::EncodeDims { width, height } => {
+            mgr.update_ui(|s| s.encode_dims = Some((width, height)));
+        }
+        SessionStats::DecoderInfo {
+            backend,
+            adapter,
+            hardware,
+        } => {
+            mgr.update_ui(|s| {
+                s.decode_backend = Some(backend);
+                s.decode_adapter = if adapter.is_empty() { None } else { Some(adapter) };
+                s.decode_hardware = Some(hardware);
+            });
+        }
+        SessionStats::Host(host) => {
+            // 整机遥测：直接覆盖（字段本身是 1s 窗口读数）。`Box` 在这里解引用，
+            // 旧值随 `update_ui` 的闭包被替换掉。
+            mgr.update_ui(move |s| s.host = Some(*host));
+        }
+        SessionStats::Transport(stats) => {
+            mgr.update_ui(|s| s.transport_stats = Some(stats));
         }
     }
 }
@@ -2857,6 +2943,8 @@ mod tests {
                     session_id: "s1".to_owned(),
                     role,
                     peer_name: "office-pc".to_owned(),
+                    peer_platform: "windows".to_owned(),
+                    peer_rd_id: "222222222".to_owned(),
                     mode: RemoteMode::Control,
                     state: SessionState::Active,
                     started_at_ms: 0,
@@ -2963,6 +3051,8 @@ mod tests {
                     session_id: "s1".to_owned(),
                     role: SessionRole::Controller,
                     peer_name: "peer".to_owned(),
+                    peer_platform: "windows".to_owned(),
+                    peer_rd_id: "222222222".to_owned(),
                     mode: RemoteMode::Control,
                     state: SessionState::Active,
                     started_at_ms: 0,
@@ -2983,6 +3073,18 @@ mod tests {
                 s.recv_kbps = Some(3800);
                 s.decode_packets = Some(400);
                 s.decode_dropped = Some(3);
+                // v8 新增的会话级读数同样必须被清（否则角标会显示上一场的「对端平台/编码器」）。
+                s.codec = Some(crate::session::CodecId::H264);
+                s.encode_dims = Some((1920, 1080));
+                s.decode_backend = Some("MF DXVA".to_owned());
+                s.decode_adapter = Some("NVIDIA".to_owned());
+                s.decode_hardware = Some(true);
+                s.host = Some(crate::session::HostStats::default());
+                s.transport_stats = Some(crate::stats::TransportStats::default());
+                s.e2e_ms = Some(42);
+                s.jitter_ms = Some(3);
+                s.decode_backlog = Some(2);
+                s.clock_offset_us = Some(1234);
             });
 
             mgr.finish_session("s1", input);
@@ -3004,6 +3106,17 @@ mod tests {
             assert_eq!(snap.recv_kbps, None, "收码率读数应清零");
             assert_eq!(snap.decode_packets, None, "收包数读数应清零");
             assert_eq!(snap.decode_dropped, None, "丢包数读数应清零");
+            assert_eq!(snap.codec, None, "codec 读数应清零");
+            assert_eq!(snap.encode_dims, None, "编码尺寸读数应清零");
+            assert_eq!(snap.decode_backend, None, "解码后端读数应清零");
+            assert_eq!(snap.decode_adapter, None, "解码适配器读数应清零");
+            assert_eq!(snap.decode_hardware, None, "硬件解码标志应清零");
+            assert_eq!(snap.host, None, "对端遥测应清零");
+            assert_eq!(snap.transport_stats, None, "可靠层读数应清零");
+            assert_eq!(snap.e2e_ms, None, "端到端读数应清零");
+            assert_eq!(snap.jitter_ms, None, "抖动读数应清零");
+            assert_eq!(snap.decode_backlog, None, "解码积压应清零");
+            assert_eq!(snap.clock_offset_us, None, "时钟偏差应清零");
             let (sid, end) = snap.session_end.expect("应写入 session_end");
             assert_eq!(sid, "s1");
             assert_eq!(

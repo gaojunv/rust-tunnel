@@ -340,7 +340,7 @@ impl GuiApp {
                 ui.add_space(2.0);
             });
     }
-    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标 / 剪贴板同步 / 工具条自动隐藏 / 帧率上限）回写 `gui.toml`。
+    /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标简洁或详细 / 剪贴板同步 / 工具条自动隐藏 / 帧率上限）回写 `gui.toml`。
     ///
     /// 这些字段在 [`remote::RemoteView`] 上是运行时镜像——改动发生在 deferred viewport 的回调里
     /// （与 `update` 不在同一时刻），只能靠每帧比对把差异落盘。`save` 只在确有变化时才写。
@@ -360,6 +360,10 @@ impl GuiApp {
         }
         if self.prefs.remote_stats_overlay != view.stats_overlay {
             self.prefs.remote_stats_overlay = view.stats_overlay;
+            changed = true;
+        }
+        if self.prefs.remote_stats_detail != view.stats_detail {
+            self.prefs.remote_stats_detail = view.stats_detail;
             changed = true;
         }
         if self.prefs.remote_clipboard_sync != view.clipboard_sync_enabled {

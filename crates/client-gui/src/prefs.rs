@@ -145,6 +145,12 @@ pub struct GuiPrefs {
     /// 会话窗口内的统计角标（延迟 / 路径 / 分辨率 / 帧率 / 时长）是否常显。
     #[serde(default)]
     pub remote_stats_overlay: bool,
+    /// 统计角标是否显示**详细指标**（链路 / 被控端 / 画面三组）。
+    ///
+    /// 默认关闭：简洁档只留一眼要看的十行（延迟 / 路径 / 编码器 / 采集 / 耗时 / 帧率 / 码率 /
+    /// 端到端 / 时长）；详细档字段多、占屏面积大，是排查问题时的显式选择。
+    #[serde(default)]
+    pub remote_stats_detail: bool,
     /// 远程控制帧率**上限**（30 / 60；默认 30）。
     ///
     /// 帧率是上限而非固定值：QoS 闭环仍可在其下降级（地板 15）。这里是控制端的偏好，
@@ -193,6 +199,7 @@ impl Default for GuiPrefs {
             // 实际默认关」，断线后不重连。
             remote_auto_reconnect: true,
             remote_stats_overlay: false,
+            remote_stats_detail: false,
             remote_frame_rate: default_remote_frame_rate(),
             remote_quality: QualityPreset::default(),
             remote_native_resolution: false,
@@ -524,6 +531,24 @@ mod tests {
             reparsed.remote_auto_lock_on_disconnect,
             "往返必须保留用户选择"
         );
+    }
+
+    /// 统计角标详细档默认关闭，旧配置缺键也落到简洁档，用户开启后跨重启保留。
+    #[test]
+    fn stats_detail_defaults_off_and_survives_roundtrip() {
+        assert!(
+            !GuiPrefs::default().remote_stats_detail,
+            "新配置默认简洁档（详细档占屏面积大）"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(!prefs.remote_stats_detail, "旧配置缺键也应落到简洁档");
+        let saved = toml::to_string(&GuiPrefs {
+            remote_stats_detail: true,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(reparsed.remote_stats_detail, "往返必须保留用户选择");
     }
 
     #[test]

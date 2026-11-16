@@ -8,7 +8,8 @@ name = "rust-tunnel-client-gui"
 # 0.14.0 = 数据面 v7（新增锁屏 `SessionMessage::LockScreen`），两端必须同为 0.14.0。
 # 0.15.0 = 控制通道自更新（`ClientUpdate*` 变体）；服务端按 `MIN_UPDATE_CLIENT_VERSION`
 # 门控，旧客户端不会收到未知变体。数据面协议仍是 v7，可与 0.14.0 互控。
-version = "0.15.0"
+# 0.16.0 = 数据面 v8（`HostStats` 遥测 + 心跳时间戳 + 采集时间戳/端到端），两端必须同为 0.16.0。
+version = "0.16.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"

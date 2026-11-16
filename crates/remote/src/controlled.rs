@@ -83,13 +83,13 @@ use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
-    native_bitrate_ceiling, CapturedPatches, Clipboard, DisplayInfo, EncodeOptions, EncodeRates,
-    InputSink, RawFrame, ScreenSource,
+    native_bitrate_ceiling, CaptureInfo, CapturedPatches, Clipboard, DisplayInfo, EncodeOptions,
+    EncodeRates, EncoderInfo, InputSink, RawFrame, ScreenSource,
 };
 use crate::session::{
-    trusted_rtt, CodecId, RegionRect, SessionCodec, SessionEnd, SessionFrame, SessionMessage,
-    HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS, REGION_FLAG_ZSTD, SESSION_PROTO_VERSION,
-    VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
+    trusted_rtt, CodecId, HostActivity, HostStats, RegionRect, SessionCodec, SessionEnd, SessionFrame,
+    SessionMessage, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS, REGION_FLAG_ZSTD,
+    SESSION_PROTO_VERSION, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
@@ -193,8 +193,8 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
         | SessionMessage::Clipboard { .. }
         | SessionMessage::ClipboardRequest
         | SessionMessage::DisplayList(_)
-        | SessionMessage::Heartbeat
-        | SessionMessage::HeartbeatAck
+        | SessionMessage::Heartbeat { .. }
+        | SessionMessage::HeartbeatAck { .. }
         | SessionMessage::FileListRequest { .. }
         | SessionMessage::FileList { .. }
         | SessionMessage::FileDownloadRequest { .. }
@@ -205,7 +205,10 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
         | SessionMessage::CodecOffer { .. }
         | SessionMessage::CodecSelect { .. }
         | SessionMessage::SetFrameRate { .. }
-        | SessionMessage::LockScreen => OutboundClass::Control,
+        | SessionMessage::LockScreen
+        // 被控端每秒一条的整机遥测：小结构、时延不敏感，但**绝不能丢**，否则控制器的角标
+        // 会停在旧读数上——与其它控制帧同档。
+        | SessionMessage::HostStats(_) => OutboundClass::Control,
     }
 }
 
@@ -712,10 +715,13 @@ fn exit_patch_mode(
 /// 每个矩形独立压缩：压缩后**确实更小**才用 [`REGION_FLAG_ZSTD`]，否则存原始 NV12（极小块
 /// 的 zstd 帧头开销比省下的字节还多）。总字节超过 [`PATCH_MAX_TOTAL_BYTES`] 或矩形数超过
 /// [`MAX_REGION_RECTS`] 时返回 `None`：调用方据此回到全帧。
+///
+/// `capture_ts_us` 是本批采集完成的时刻，原样写进消息供控制器算端到端延迟。
 fn build_region_update(
     compressor: &mut zstd::bulk::Compressor<'static>,
     display: u32,
     patches: &CapturedPatches,
+    capture_ts_us: u64,
 ) -> Option<SessionMessage> {
     if patches.rects.len() > MAX_REGION_RECTS {
         return None;
@@ -749,6 +755,7 @@ fn build_region_update(
         width: patches.width,
         height: patches.height,
         rects,
+        capture_ts_us,
     })
 }
 
@@ -887,9 +894,17 @@ async fn read_codec_offer(
                     SessionMessage::CodecOffer { h264, vp9 } => {
                         return Ok(CodecOfferOutcome::Offer { h264, vp9 });
                     }
-                    SessionMessage::Heartbeat => {
+                    SessionMessage::Heartbeat { .. } => {
+                        // t2 = 收到时刻、t3 = 发出时刻（都是本端单调时钟）。两者之间只隔一条
+                        // 入队，故差值通常只有微秒级——它反映的是本端处理时延。
                         queues
-                            .enqueue_ctrl(cancel, SessionFrame::control(SessionMessage::HeartbeatAck))
+                            .enqueue_ctrl(
+                                cancel,
+                                SessionFrame::control(SessionMessage::HeartbeatAck {
+                                    t2_us: crate::clock::now_us(),
+                                    t3_us: crate::clock::now_us(),
+                                }),
+                            )
                             .await?;
                     }
                     other => debug!(?other, "编解码协商阶段收到未处理消息，忽略"),
@@ -898,6 +913,112 @@ async fn read_codec_offer(
                 None => return Ok(CodecOfferOutcome::Closed),
             }
         }
+    }
+}
+
+/// 组装被控端每秒上报的整机遥测（[`HostStats`]）。
+///
+/// # 数据来源（**不要**在这里读任何会阻塞的东西）
+///
+/// - 身份：`std::env::consts::OS`（[`ControlledConfig`] 没有平台字段）+ 编码器快照 +
+///   [`ScreenSource::capture_info`]；
+/// - 遥测：编码任务每秒写入的 [`EncodeSnapshot`]；
+/// - 模式：`patch_mode`（补丁状态机）、`activity`（QoS 的内容档）、`scale`（当前生效缩放）；
+/// - C5：主循环累计的采集失败 + `CaptureInfo` 三个**累计计数**的每秒差分。
+///
+/// 上一份 [`CaptureInfo`] 由 `last_info` 持有，本函数会就地更新它——差分必须恰好每个上报周期
+/// 做一次，重复调用会丢事件。
+///
+/// `scale_permille` 的浮点→整数转换在这里是一处有意的截断：缩放比例恒在
+/// `[min_scale, 1.0]`，乘 1000 后远在 `u16` 范围内。
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "缩放比例由 QoS 决定且恒在 [min_scale, 1.0]，乘 1000 后落在 u16 内"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "组装的都是会话主循环已持有的本端状态（采集源/快照/速率/显示器/累计计数），\
+              打包成结构体反而要在每秒心跳拍多构造一次"
+)]
+fn build_host_stats(
+    screen: &Arc<dyn ScreenSource>,
+    snapshot: &std::sync::Mutex<Option<EncodeSnapshot>>,
+    encode: &EncodeRates,
+    rate: &RateController,
+    displays: &[DisplayInfo],
+    display_id: u32,
+    patch_mode: bool,
+    native_resolution: bool,
+    capture_failures: u32,
+    last_info: &mut Option<CaptureInfo>,
+) -> HostStats {
+    let snap = snapshot
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default();
+    let capture = screen.capture_info();
+    // 三个累计计数 → 每秒增量：首份快照（无上一份）没有基线，给 0 而不是「开机以来的全部」。
+    let (capture_fallbacks, capture_open_fallbacks, no_new_frame) =
+        last_info.replace(capture.clone()).map_or((0, 0, 0), |prev| {
+            (
+                u32::try_from(capture.fallbacks.saturating_sub(prev.fallbacks))
+                    .unwrap_or(u32::MAX),
+                u32::try_from(capture.open_fallbacks.saturating_sub(prev.open_fallbacks))
+                    .unwrap_or(u32::MAX),
+                u32::try_from(capture.no_new_frame.saturating_sub(prev.no_new_frame))
+                    .unwrap_or(u32::MAX),
+            )
+        });
+    let (display_width, display_height) = displays
+        .iter()
+        .find(|d| d.id == display_id)
+        .map_or((0, 0), |d| (d.width, d.height));
+    let (encode_width, encode_height) = snap.encode_dims.unwrap_or((0, 0));
+    let activity = match rate.activity() {
+        crate::qos::Activity::Ui => HostActivity::Ui,
+        crate::qos::Activity::Mixed => HostActivity::Mixed,
+        crate::qos::Activity::Active => HostActivity::Active,
+    };
+    HostStats {
+        platform: std::env::consts::OS.to_owned(),
+        encoder_backend: snap.encoder_info.backend.clone(),
+        encoder_name: snap.encoder_info.name.clone(),
+        encoder_adapter: snap.encoder_info.adapter.clone(),
+        capture_backend: capture.backend.clone(),
+        capture_adapter: capture.adapter.clone(),
+        gpu_capture: capture.gpu_capture,
+        gpu_encode: snap.encoder_info.gpu_input,
+        gpu_disabled: capture.gpu_disabled,
+        gpu_disabled_reason: capture.gpu_disabled_reason.clone(),
+        native_resolution,
+        encode_width,
+        encode_height,
+        display_width,
+        display_height,
+        capture_us: snap.capture_us,
+        encode_ms: snap.encode_ms,
+        fps: snap.fps,
+        bitrate_kbps: snap.bitrate_kbps,
+        sent_kbps: snap.sent_kbps,
+        skipped: snap.skipped,
+        keyframes: snap.keyframes,
+        idr_kbps: snap.idr_kbps,
+        idr_bytes: snap.idr_bytes,
+        p_kbps: snap.p_kbps,
+        changed_permille: snap.changed_permille,
+        scale_permille: (encode.scale * 1000.0).round().clamp(0.0, f32::from(u16::MAX)) as u16,
+        activity,
+        patch_mode,
+        out_queue_depth: snap.out_queue_depth,
+        out_queue_skips: snap.out_queue_skips,
+        encoder_rebuilds: snap.encoder_rebuilds,
+        forced_idrs: snap.forced_idrs,
+        capture_failures,
+        capture_fallbacks,
+        capture_open_fallbacks,
+        no_new_frame,
     }
 }
 
@@ -1065,6 +1186,11 @@ pub async fn run_controlled(
     // 会话循环只在看到它之后才切补丁模式（顺序不变量，见模块文档）。基准帧是 P 帧，
     // 所以信号不能只看 `keyframe`（见 [`encode_loop`]）。
     let base_frame_sent = Arc::new(AtomicBool::new(false));
+    // 编码任务每秒写入的完整快照（std `Mutex`，每秒只读/写一次）。主循环据此组装
+    // `HostStats`——编码侧的真实读数（耗时、fps、出码、队列深度、重建/强制 IDR 次数）只在
+    // 编码任务里，而 `SessionStats::Encode` 那条通道不带这些字段。
+    let encode_snapshot: Arc<std::sync::Mutex<Option<EncodeSnapshot>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let (encode_tx, encode_rx) = mpsc::channel::<EncodeJob>(1);
     let encode_task = tokio::spawn(encode_loop(
         encode_rx,
@@ -1077,6 +1203,7 @@ pub async fn run_controlled(
         Arc::clone(&sent_kbps),
         Arc::clone(&base_frame_sent),
         max_encode_width,
+        Arc::clone(&encode_snapshot),
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -1160,6 +1287,11 @@ pub async fn run_controlled(
     // （升档立刻生效），每秒再随 `QosFeedback` 喂 `observe_activity`（带迟滞的降档）。
     // 初值 1000 = 面积未知/满帧，保守地不收紧上限。
     let mut last_changed_permille: u16 = 1000;
+    // C5：采集调用返回错误（`CapturePayload::Frame(None)`）的每秒增量，由主循环累计、
+    // 心跳拍清零。
+    let mut capture_failures: u32 = 0;
+    // `CaptureInfo` 的三个计数是**累计值**，主循环保存上一份求差后才是每秒增量。
+    let mut last_capture_info: Option<CaptureInfo> = None;
     // 控制器显式选择的帧率上限（30 / 60）。`None` = 尚未下发，沿用画质档位默认。
     // 记住它是为了「换画质档位不覆盖用户选择」：`SetQuality` 换完档位后要重新应用它。
     let mut selected_fps: Option<u8> = None;
@@ -1202,11 +1334,42 @@ pub async fn run_controlled(
                 }
                 heartbeat_sent.push_back(Instant::now());
                 if let Err(err) = queues
-                    .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat))
+                    .enqueue_ctrl(
+                        &cancel,
+                        SessionFrame::control(SessionMessage::Heartbeat {
+                            t1_us: crate::clock::now_us(),
+                        }),
+                    )
                     .await
                 {
                     break Err(err);
                 }
+                // 同一拍（1s）向控制器上报整机遥测。这里也把同一份数据喂给本机 UI
+                // （被控端横幅/状态页要显示「采集 x ms · 编码 y ms」）。
+                //
+                // 读的都是共享槽/原子/本端变量，**不做任何阻塞调用**：`screen.capture_info()`
+                // 由平台实现保证常数时间（只读几个 `AtomicU64` 与已缓存的适配器名）。
+                let host = build_host_stats(
+                    &screen,
+                    &encode_snapshot,
+                    &encode,
+                    &rate,
+                    &displays,
+                    display_id,
+                    screen_mode.is_patches(),
+                    native_active,
+                    capture_failures,
+                    &mut last_capture_info,
+                );
+                config.stats.report(SessionStats::Host(Box::new(host.clone())));
+                if let Err(err) = queues
+                    .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::HostStats(host)))
+                    .await
+                {
+                    break Err(err);
+                }
+                // C5 的每秒增量上报完即清零，下一窗口重新累计。
+                capture_failures = 0;
             }
             outcome = capture_rx.recv(), if capture_deadline.is_some() => {
                 match outcome {
@@ -1215,7 +1378,7 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { generation, .. }) if generation != capture_generation => {
                         debug!(generation, "丢弃过期的采集结果");
                     }
-                    Some(CaptureOutcome { payload, capture_us, .. }) => {
+                    Some(CaptureOutcome { payload, capture_us, capture_ts_us, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
                         match payload {
@@ -1256,6 +1419,7 @@ pub async fn run_controlled(
                                         force_keyframe,
                                         force_encode,
                                         capture_us,
+                                        capture_ts_us,
                                         frame,
                                     };
                                     // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
@@ -1270,6 +1434,10 @@ pub async fn run_controlled(
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => break Err(link_closed()),
                                     }
+                                } else {
+                                    // C5：采集调用返回错误（`run_capture` 已记日志）。只计数——
+                                    // 会话继续，下一拍照常采集。
+                                    capture_failures = capture_failures.saturating_add(1);
                                 }
                             }
                             CapturePayload::Patches(patches) => {
@@ -1349,7 +1517,12 @@ pub async fn run_controlled(
                                             debug!(capture_us, "补丁无变化且未到保活间隔，跳过");
                                         } else {
                                             let built = patch_compressor.as_mut().and_then(|compressor| {
-                                                build_region_update(compressor, display_id, &patches)
+                                                build_region_update(
+                                                    compressor,
+                                                    display_id,
+                                                    &patches,
+                                                    capture_ts_us,
+                                                )
                                             });
                                             if let Some(msg) = built {
                                                 // 带宽兜底：补丁模式下 QoS 闭环暂停，若一个窗口的
@@ -1774,15 +1947,22 @@ pub async fn run_controlled(
                                 break Err(err);
                             }
                         }
-                        SessionMessage::Heartbeat => {
+                        SessionMessage::Heartbeat { .. } => {
+                            // t2 = 收到时刻、t3 = 发出时刻（本端单调时钟）。控制器用 t1/t2/t3/t4
+                            // 估计两端时钟偏差，进而算端到端延迟。
+                            let t2_us = crate::clock::now_us();
+                            let ack = SessionMessage::HeartbeatAck {
+                                t2_us,
+                                t3_us: crate::clock::now_us(),
+                            };
                             if let Err(err) = queues
-                                .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::HeartbeatAck))
+                                .enqueue_ctrl(&cancel, SessionFrame::control(ack))
                                 .await
                             {
                                 break Err(err);
                             }
                         }
-                        SessionMessage::HeartbeatAck => {
+                        SessionMessage::HeartbeatAck { .. } => {
                             let now = Instant::now();
                             last_ack_at = Some(now);
                             if let Some(sent) = heartbeat_sent.pop_front() {
@@ -1988,6 +2168,11 @@ struct CaptureOutcome {
     ///
     /// 用微秒而不是毫秒：GPU 采集常在 1 ms 以内，毫秒取整会恒为 0（现场看到的就是这个）。
     capture_us: u64,
+    /// 采集**完成**的时刻（本端单调时钟，微秒；[`crate::clock::now_us`]）。
+    ///
+    /// 它随画面帧一路上线（`VideoPacket` / `RegionUpdate` 的 `capture_ts_us`），控制器据此算
+    /// 「采集 → 解码完成」的端到端延迟（D2）。失败时仍填（该帧本来就不会上线，只求代码统一）。
+    capture_ts_us: u64,
 }
 
 /// 交给编码任务的一帧。
@@ -2008,6 +2193,8 @@ struct EncodeJob {
     force_encode: bool,
     /// 本帧的采集耗时（微秒），只进统计、不参与控制决策。
     capture_us: u64,
+    /// 本帧采集完成的时刻（本端单调时钟，微秒），原样写进 `VideoPacket.capture_ts_us`。
+    capture_ts_us: u64,
     /// 原始帧。
     frame: RawFrame,
 }
@@ -2054,17 +2241,65 @@ fn run_capture(
         }
     };
     let capture_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    // 采集**返回之后**立刻打时间戳：它是控制器的端到端延迟（采集→解码完成）的起点。
+    // 失败路径也打（结果不会上线，只是让所有分支形状一致）。
+    let capture_ts_us = crate::clock::now_us();
     // 接收端随会话循环存活；会话已结束时发送失败是正常的，忽略。
     let _ = tx.blocking_send(CaptureOutcome {
         generation,
         payload,
         capture_us,
+        capture_ts_us,
     });
+}
+
+/// 编码任务每秒写给会话循环的**完整快照**（C2/C3/C5 与遥测的唯一来源）。
+///
+/// `SessionStats::Encode` 只带一部分读数（且是进程内通道）；主循环组装 `HostStats` 还需要
+/// 出站队列深度、编码器重建/强制 IDR 次数、编码器平台信息。这些只在编码任务里，故每秒经
+/// 这个共享槽交出去一次。**不进线上结构**，只是进程内传递。
+#[derive(Debug, Clone, Default)]
+struct EncodeSnapshot {
+    /// 最近一秒平均单帧编码耗时（毫秒）。
+    encode_ms: u32,
+    /// 最近一秒平均单帧采集耗时（微秒）。
+    capture_us: u32,
+    /// 最近一秒实测编码帧率。
+    fps: u32,
+    /// 当前生效目标码率（kbps）。
+    bitrate_kbps: u32,
+    /// 最近一秒实测出码速率（kbps）。
+    sent_kbps: u32,
+    /// 最近一秒因无变化跳过的帧数。
+    skipped: u32,
+    /// 最近一秒关键帧数。
+    keyframes: u32,
+    /// 最近一秒关键帧出码码率（kbps）。
+    idr_kbps: u32,
+    /// 最近一秒关键帧出码字节数。
+    idr_bytes: u64,
+    /// 最近一秒普通帧出码码率（kbps）。
+    p_kbps: u32,
+    /// 最近一秒平均变化面积（千分比）。
+    changed_permille: u32,
+    /// 最近一秒编码器重建次数。
+    encoder_rebuilds: u32,
+    /// 最近一秒因 `idr` 产出的关键帧数。
+    forced_idrs: u32,
+    /// 最近一秒因出站队列满而跳过的帧数。
+    out_queue_skips: u32,
+    /// 采样时刻的出站画面队列深度（帧）。
+    out_queue_depth: u32,
+    /// 当前编码尺寸（宽, 高）。
+    encode_dims: Option<(u32, u32)>,
+    /// 当前编码器的平台信息（后端/名称/适配器/零拷贝）。
+    encoder_info: EncoderInfo,
 }
 
 /// 编码侧读数累加器：按 [`STATS_INTERVAL`] 汇总一次，经进程内 [`SessionStatsReporter`] 送到 UI。
 ///
-/// **不进热路径的锁**：只在编码任务里累加几个整数，到点发一条无界通道消息（接收端缺席即丢弃）。
+/// **不进热路径的锁**：只在编码任务里累加几个整数，到点发一条无界通道消息（接收端缺席即丢弃）
+/// 并往共享槽写一份完整快照（`std::sync::Mutex`，每秒一次）。
 struct EncodeStatsWindow {
     /// 本窗口起点。
     start: Instant,
@@ -2086,6 +2321,18 @@ struct EncodeStatsWindow {
     p_bytes: u64,
     /// 本窗口内各编码帧的 `changed_permille` 累加（用于算窗口平均变化面积）。
     changed_permille_sum: u64,
+    /// 本窗口编码器重建次数（C3）。
+    encoder_rebuilds: u32,
+    /// 本窗口因 `idr` 真正产出的关键帧数（C3）。
+    forced_idrs: u32,
+    /// 本窗口因出站队列满而跳过编码的次数（C2 背压）。
+    out_queue_skips: u32,
+    /// 最近一次采样到的出站队列深度（C2；瞬时量，不是窗口累计）。
+    out_queue_depth: u32,
+    /// 最近一次采样到的编码尺寸（几何；主循环据此填 `HostStats.encode_width/height`）。
+    encode_dims: Option<(u32, u32)>,
+    /// 当前编码器的平台信息（只在创建成功时更新）。
+    encoder_info: EncoderInfo,
 }
 
 impl EncodeStatsWindow {
@@ -2101,6 +2348,12 @@ impl EncodeStatsWindow {
             idr_bytes: 0,
             p_bytes: 0,
             changed_permille_sum: 0,
+            encoder_rebuilds: 0,
+            forced_idrs: 0,
+            out_queue_skips: 0,
+            out_queue_depth: 0,
+            encode_dims: None,
+            encoder_info: EncoderInfo::default(),
         }
     }
 
@@ -2136,13 +2389,23 @@ impl EncodeStatsWindow {
 
     /// 到点则上报一次并重置窗口。`bitrate_kbps` 是**当前生效的目标码率**（闭环值，非实测出码率）；
     /// `sent_kbps` 是共享的实测出码速率槽，供 QoS 闭环算投递率。
-    fn maybe_report(&mut self, stats: &SessionStatsReporter, bitrate_kbps: u32, sent_kbps: &AtomicU32) {
+    ///
+    /// **重置之前**先把完整快照写进共享槽（`snapshot`）：会话主循环在同一拍（心跳 tick）读它组
+    /// 装 `HostStats`。两者都在 ~1s 节拍上，读写顺序不影响正确性——最坏只是多显示/少显示一拍。
+    fn maybe_report(
+        &mut self,
+        stats: &SessionStatsReporter,
+        bitrate_kbps: u32,
+        sent_kbps: &AtomicU32,
+        snapshot: &std::sync::Mutex<Option<EncodeSnapshot>>,
+    ) {
         let elapsed = self.start.elapsed();
         if elapsed < STATS_INTERVAL {
             return;
         }
         // 实测出码速率：窗口字节数 / 窗口时长。先算再重置窗口。
-        sent_kbps.store(kbps_from_bytes(self.bytes, elapsed), Ordering::Relaxed);
+        let sent_kbps_value = kbps_from_bytes(self.bytes, elapsed);
+        sent_kbps.store(sent_kbps_value, Ordering::Relaxed);
         let secs = elapsed.as_secs_f64().max(f64::EPSILON);
         #[expect(
             clippy::cast_possible_truncation,
@@ -2182,6 +2445,28 @@ impl EncodeStatsWindow {
             p_kbps,
             changed_permille,
         });
+        // 完整快照（含只有编码任务知道的字段）：写进共享槽供主循环组装 `HostStats`。
+        if let Ok(mut slot) = snapshot.lock() {
+            *slot = Some(EncodeSnapshot {
+                encode_ms,
+                capture_us,
+                fps,
+                bitrate_kbps,
+                sent_kbps: sent_kbps_value,
+                skipped: self.skipped,
+                keyframes: self.keyframes,
+                idr_kbps,
+                idr_bytes: self.idr_bytes,
+                p_kbps,
+                changed_permille,
+                encoder_rebuilds: self.encoder_rebuilds,
+                forced_idrs: self.forced_idrs,
+                out_queue_skips: self.out_queue_skips,
+                out_queue_depth: self.out_queue_depth,
+                encode_dims: self.encode_dims,
+                encoder_info: self.encoder_info.clone(),
+            });
+        }
         self.start = Instant::now();
         self.frames = 0;
         self.bytes = 0;
@@ -2192,6 +2477,9 @@ impl EncodeStatsWindow {
         self.idr_bytes = 0;
         self.p_bytes = 0;
         self.changed_permille_sum = 0;
+        self.encoder_rebuilds = 0;
+        self.forced_idrs = 0;
+        self.out_queue_skips = 0;
     }
 }
 
@@ -2246,6 +2534,8 @@ async fn encode_loop(
     // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
     // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。
     max_encode_width: u32,
+    // 每秒写一次的完整快照槽（主循环组装 `HostStats` 用）。
+    encode_snapshot: Arc<std::sync::Mutex<Option<EncodeSnapshot>>>,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -2279,12 +2569,17 @@ async fn encode_loop(
             force_keyframe,
             force_encode,
             capture_us,
+            capture_ts_us,
             frame,
         } = job;
         // 本帧的变化面积（千分比）：进统计窗口的平均，并随每帧上报落进日志/UI。
         let changed_permille = frame.changed_permille;
+        // 出站队列当前深度（C2）：主循环的 `HostStats` 每秒读一次快照。
+        window.out_queue_depth = u32::try_from(out.max_capacity().saturating_sub(out.capacity()))
+            .unwrap_or(u32::MAX);
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
-        window.maybe_report(&stats, rates.bitrate_kbps, &sent_kbps);
+        // 快照写入发生在窗口重置**之前**，因此主循环读到的是刚刚结束的那一秒。
+        window.maybe_report(&stats, rates.bitrate_kbps, &sent_kbps, &encode_snapshot);
 
         // GPU 帧没有 CPU 像素：不能做 memcmp 去重（也绝不能拿空 `rgba` 去比较）。
         let is_gpu = frame.gpu.is_some();
@@ -2299,6 +2594,8 @@ async fn encode_loop(
         };
         let (width, height) =
             encode_dimensions(frame.width, frame.height, rates.scale, max_encode_width);
+        // 当前几何（供 `HostStats.encode_width/height`）。
+        window.encode_dims = Some((width, height));
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
         if geometry_changed {
@@ -2345,12 +2642,18 @@ async fn encode_loop(
         if out.capacity() == 0 {
             pending_keyframe |= idr;
             pending_encode |= force_encode && !idr;
+            window.out_queue_skips = window.out_queue_skips.saturating_add(1);
             debug!("出站队列已满，跳过本轮编码（编码前丢帧，不破坏参考链）");
             continue;
         }
         if encoder.is_none() {
             match encoder_factory.create(width, height, rates.bitrate_kbps, rates.fps) {
-                Ok(enc) => encoder = Some(enc),
+                Ok(enc) => {
+                    // C3：每次**成功创建**都算一次重建（含首建；几何未变时的首建也是从无到有）。
+                    window.encoder_rebuilds = window.encoder_rebuilds.saturating_add(1);
+                    window.encoder_info = enc.info();
+                    encoder = Some(enc);
+                }
                 Err(err) => {
                     warn!(error = %err, "编码器创建失败，跳过本帧");
                     pending_keyframe |= idr;
@@ -2400,6 +2703,12 @@ async fn encode_loop(
                 }
                 seq = seq.wrapping_add(1);
                 let keyframe = packet.keyframe;
+                if idr && keyframe {
+                    // C3：因 `idr`（首帧/切显示器/切档位/关键帧请求/几何变化/降分辨率）而
+                    // 真正产出的 IDR。`idr` 为真的那一拍可能被上面的背压出口跳过，
+                    // 所以必须以 packet 实际是不是关键帧为准。
+                    window.forced_idrs = window.forced_idrs.saturating_add(1);
+                }
                 window.record(
                     packet.data.len(),
                     encode_ms,
@@ -2422,6 +2731,7 @@ async fn encode_loop(
                     width,
                     height,
                     data: packet.data,
+                    capture_ts_us,
                 };
                 if !send_video(&out, &cancel, msg).await {
                     break;
@@ -2976,7 +3286,7 @@ mod tests {
 
         // 控制器：先一条心跳（协商窗口内要应答），再发 offer。
         peer_writer
-            .send(SessionFrame::control(SessionMessage::Heartbeat))
+            .send(SessionFrame::control(SessionMessage::Heartbeat { t1_us: 0 }))
             .await
             .expect("发心跳");
         peer_writer
@@ -3001,7 +3311,7 @@ mod tests {
             matches!(
                 rx.ctrl.recv().await,
                 Some(SessionFrame {
-                    message: SessionMessage::HeartbeatAck,
+                    message: SessionMessage::HeartbeatAck { .. },
                     ..
                 })
             ),
@@ -3122,9 +3432,12 @@ mod tests {
             loop {
                 match peer_reader.next().await {
                     Some(Ok(frame)) => match frame.message {
-                        SessionMessage::Heartbeat => {
+                        SessionMessage::Heartbeat { .. } => {
                             peer_writer
-                                .send(SessionFrame::control(SessionMessage::HeartbeatAck))
+                                .send(SessionFrame::control(SessionMessage::HeartbeatAck {
+                                    t2_us: 1,
+                                    t3_us: 2,
+                                }))
                                 .await
                                 .expect("回应心跳");
                         }
@@ -3404,6 +3717,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -3421,6 +3735,7 @@ mod tests {
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
+                capture_ts_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -3436,6 +3751,7 @@ mod tests {
                 force_keyframe: false,
                 force_encode: false,
                 capture_us: 0,
+                capture_ts_us: 0,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -3476,6 +3792,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -3489,6 +3806,7 @@ mod tests {
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
+                capture_ts_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -3503,6 +3821,7 @@ mod tests {
                 force_keyframe: false,
                 force_encode: false,
                 capture_us: 0,
+                capture_ts_us: 0,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -3602,6 +3921,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         job_tx
@@ -3611,6 +3931,7 @@ mod tests {
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
+                capture_ts_us: 0,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -3666,6 +3987,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -3674,9 +3996,10 @@ mod tests {
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
+            capture_ts_us: 0,
             frame,
         };
-        let placeholder = || SessionFrame::control(SessionMessage::Heartbeat);
+        let placeholder = || SessionFrame::control(SessionMessage::Heartbeat { t1_us: 0 });
 
         // 首帧：先下发 `ScreenConfig`，随后是关键帧。
         job_tx.send(job(shaded(0, 64, 48, 10), true)).await.expect("投递首帧");
@@ -3746,6 +4069,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -3754,6 +4078,7 @@ mod tests {
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
+            capture_ts_us: 0,
             frame: RawFrame {
                 display: 0,
                 width: 64,
@@ -3831,6 +4156,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force_keyframe: bool, force_encode: bool| EncodeJob {
@@ -3839,6 +4165,7 @@ mod tests {
             force_keyframe,
             force_encode,
             capture_us: 0,
+            capture_ts_us: 0,
             frame: RawFrame {
                 display: 0,
                 width: 64,
@@ -3903,6 +4230,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -3911,6 +4239,7 @@ mod tests {
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
+            capture_ts_us: 0,
             frame: RawFrame {
                 display: 0,
                 width: 64,
@@ -4265,7 +4594,7 @@ mod tests {
                 .expect("主循环应发出首帧")
                 .expect("流不应关闭")
                 .expect("帧应可解码");
-            if matches!(frame.message, SessionMessage::Heartbeat) {
+            if matches!(frame.message, SessionMessage::Heartbeat { .. }) {
                 return;
             }
         }
@@ -4439,17 +4768,19 @@ mod tests {
                 },
             ],
         };
-        let msg = build_region_update(&mut compressor, 3, &patches).expect("应在预算内");
+        let msg = build_region_update(&mut compressor, 3, &patches, 7_000).expect("应在预算内");
         let SessionMessage::RegionUpdate {
             display,
             width,
             height,
             rects,
+            capture_ts_us,
         } = msg
         else {
             panic!("应为 RegionUpdate，实得 {msg:?}");
         };
         assert_eq!((display, width, height), (3, 64, 48), "目标帧缓冲尺寸应原样带回");
+        assert_eq!(capture_ts_us, 7_000, "采集时刻应原样带回");
         assert_eq!(rects.len(), 2);
         // 坐标/尺寸原样保留（脏矩形坐标是编码尺寸坐标系）。
         assert_eq!(
@@ -4484,7 +4815,7 @@ mod tests {
             changed_permille: 0,
             rects: Vec::new(),
         };
-        match build_region_update(&mut compressor, 0, &patches).expect("空补丁也应构造") {
+        match build_region_update(&mut compressor, 0, &patches, 7_000).expect("空补丁也应构造") {
             SessionMessage::RegionUpdate {
                 width,
                 height,
@@ -4517,7 +4848,7 @@ mod tests {
             }],
         };
         assert!(
-            build_region_update(&mut compressor, 0, &patches).is_none(),
+            build_region_update(&mut compressor, 0, &patches, 7_000).is_none(),
             "超预算应放弃补丁（回到全帧）"
         );
     }
@@ -4543,7 +4874,7 @@ mod tests {
             rects,
         };
         assert!(
-            build_region_update(&mut compressor, 0, &patches).is_none(),
+            build_region_update(&mut compressor, 0, &patches, 7_000).is_none(),
             "矩形数超上限应放弃补丁（回到全帧）"
         );
     }
@@ -4956,12 +5287,14 @@ mod tests {
                 width: 2,
                 height: 2,
                 data: vec![0],
+                capture_ts_us: 0,
             },
             SessionMessage::RegionUpdate {
                 display: 0,
                 width: 2,
                 height: 2,
                 rects: Vec::new(),
+                capture_ts_us: 0,
             },
             SessionMessage::ScreenConfig {
                 display: 0,
@@ -4986,8 +5319,11 @@ mod tests {
             assert_eq!(outbound_class(&msg), OutboundClass::File, "{msg:?}");
         }
         for msg in [
-            SessionMessage::Heartbeat,
-            SessionMessage::HeartbeatAck,
+            SessionMessage::Heartbeat { t1_us: 1 },
+            SessionMessage::HeartbeatAck {
+                t2_us: 2,
+                t3_us: 3,
+            },
             SessionMessage::Input(InputEvent::MouseMove {
                 x: 1,
                 y: 2,
@@ -5010,6 +5346,9 @@ mod tests {
                 codec: CodecId::Vp9,
             },
             SessionMessage::LockScreen,
+            // v8：被控端每秒遥测。必须走控制队列：它小、时延不敏感，但**绝不能丢**——
+            // 落进画面队列会与帧抢带宽，落进 file 队列则会被暂存/丢弃。
+            SessionMessage::HostStats(HostStats::default()),
         ] {
             assert_eq!(outbound_class(&msg), OutboundClass::Control, "{msg:?}");
         }
@@ -5046,7 +5385,10 @@ mod tests {
         let cancel = CancellationToken::new();
         tokio::time::timeout(
             Duration::from_millis(50),
-            queues.enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Heartbeat)),
+            queues.enqueue_ctrl(
+                &cancel,
+                SessionFrame::control(SessionMessage::Heartbeat { t1_us: 0 }),
+            ),
         )
         .await
         .expect("控制帧投递不得被文件队列阻塞")

@@ -44,6 +44,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rust_tunnel_remote::screen::CaptureInfo;
 use rust_tunnel_remote::{
     Clipboard, DisplayInfo, InputEvent, InputSink, KeyEvent, MouseButton, RawFrame, RemoteError,
     RemoteResult, ScreenSource,
@@ -238,7 +239,9 @@ impl Shared {
     /// 请求一次采集并阻塞等结果（调用方在 `spawn_blocking` 里，允许阻塞）。
     fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
         let (reply, rx) = channel();
-        self.lock().captures.push_back(CaptureRequest { display, reply });
+        self.lock()
+            .captures
+            .push_back(CaptureRequest { display, reply });
         self.cv.notify_all();
         match rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(result) => result,
@@ -251,7 +254,9 @@ impl Shared {
     /// 请求一次剪贴板操作并阻塞等结果。
     fn clipboard(&self, op: ClipboardOp) -> RemoteResult<String> {
         let (reply, rx) = channel();
-        self.lock().clipboard.push_back(ClipboardRequest { op, reply });
+        self.lock()
+            .clipboard
+            .push_back(ClipboardRequest { op, reply });
         self.cv.notify_all();
         match rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(result) => result,
@@ -326,11 +331,7 @@ fn supervisor_loop(shared: &Arc<Shared>) {
                 // 桌面没变、只是 worker 死了：重建到当前目标。
                 FollowAction::NoChange => current.unwrap_or(FollowDesktop::Default),
             };
-            tracing::info!(
-                desktop = target.as_str(),
-                worker_died,
-                "重建采集/注入线程"
-            );
+            tracing::info!(desktop = target.as_str(), worker_died, "重建采集/注入线程");
             worker = spawn_worker(Arc::clone(shared), target);
             // 只在**确实起了线程**时才认下这个目标：起失败时保持 `None`，下一轮会重试。
             current = worker.as_ref().map(|_| target);
@@ -361,7 +362,8 @@ fn spawn_worker(shared: Arc<Shared>, target: FollowDesktop) -> Option<JoinHandle
 /// 挂载后必须重读 `GetThreadDesktop` 比对（见 `win-platform` 的 `desktop` 契约），
 /// 不相等就不许注入——在错误的桌面上做出来的成功读数毫无意义。
 fn try_attach(target: FollowDesktop) -> Result<InputDesktop, String> {
-    let mut desktop = InputDesktop::open().map_err(|err| format!("OpenInputDesktop 失败：{err}"))?;
+    let mut desktop =
+        InputDesktop::open().map_err(|err| format!("OpenInputDesktop 失败：{err}"))?;
     if desktop_follow::follow_of_name(desktop.name()) != target {
         return Err(format!(
             "当前输入桌面是 {}，不是目标 {}（桌面又变了）",
@@ -421,7 +423,10 @@ fn worker_loop(shared: &Shared, target: FollowDesktop) {
         tracing::info!(desktop = target.as_str(), "worker 未挂载即被要求停止");
         return;
     };
-    tracing::info!(desktop = target.as_str(), "采集/注入/剪贴板线程已挂到目标桌面");
+    tracing::info!(
+        desktop = target.as_str(),
+        "采集/注入/剪贴板线程已挂到目标桌面"
+    );
 
     // 显示器几何在这条线程上枚举一次（本线程挂的桌面上的几何）。
     let (monitors, vs) = enumerate_screen();
@@ -697,6 +702,15 @@ impl ScreenSource for WinScreen {
     fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
         self.io.capture(display)
     }
+
+    /// 被控端遥测口径：安全桌面/实例模式只有 GDI `BitBlt`，没有 GPU 采集也没有
+    /// 适配器可言，其余字段（计数、GPU 状态、禁用原因）保持默认。
+    fn capture_info(&self) -> CaptureInfo {
+        CaptureInfo {
+            backend: "BitBlt".to_owned(),
+            ..CaptureInfo::default()
+        }
+    }
 }
 
 /// 本地（不经过 worker）枚举显示器——只用于 `displays()` 的兜底。
@@ -793,7 +807,9 @@ impl Clipboard for WinClipboard {
     }
 
     fn set(&self, text: &str) -> RemoteResult<()> {
-        self.io.clipboard(ClipboardOp::Set(text.to_owned())).map(|_| ())
+        self.io
+            .clipboard(ClipboardOp::Set(text.to_owned()))
+            .map(|_| ())
     }
 }
 

@@ -41,7 +41,7 @@
 use crate::error::{RemoteError, RemoteResult};
 use crate::nat::{classify, NatCache, NatClass, NAT_PROBE_TIMEOUT};
 use crate::punch::{self, PunchRegistry, PUNCH_BUDGET};
-use crate::reliable::{self, DatagramRx};
+use crate::reliable::{self, DatagramRx, ReliableStream};
 use crate::transport::{EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -57,7 +57,7 @@ use rust_tunnel_rustdesk::proto::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -210,8 +210,8 @@ enum PunchSignal {
 
 /// 被控端三个建立候选的胜出者。
 enum Candidate {
-    /// UDP 打洞成功（已建立可靠层字节流）。
-    Punch(DuplexStream),
+    /// UDP 打洞成功（已建立可靠层字节流 + 指标句柄）。
+    Punch(ReliableStream),
     /// TCP 直连接入成功。
     Direct(TcpStream),
     /// 中继推送到达（后续再连 hbbr）。
@@ -561,7 +561,12 @@ impl RustDeskTransport {
     ///
     /// 打洞前先过 [`NatCache::should_punch`]：对称 NAT 直接回 `None`（**零额外等待**直接回中继），
     /// 该对端在 TTL 内刚失败过也回 `None`（省下一次白付的 [`PUNCH_BUDGET`]）。
-    async fn try_punch(&self, cookie: [u8; 8], peer_rd_id: &str, target: SocketAddr) -> Option<DuplexStream> {
+    async fn try_punch(
+        &self,
+        cookie: [u8; 8],
+        peer_rd_id: &str,
+        target: SocketAddr,
+    ) -> Option<ReliableStream> {
         if !self.nat_cache.should_punch(peer_rd_id, self.nat_class) {
             debug!(%peer_rd_id, "NAT 预判/失败缓存判定不打洞，直接回退中继");
             return None;
@@ -592,6 +597,7 @@ impl RustDeskTransport {
             return Ok(EstablishedStream {
                 stream: Box::new(stream),
                 path: TransportPath::Relay,
+                reliable: None,
             });
         }
 
@@ -649,14 +655,16 @@ impl RustDeskTransport {
 
         Ok(match candidate {
             Candidate::Punch(stream) => EstablishedStream {
-                stream: Box::new(stream),
+                stream: Box::new(stream.stream),
                 path: TransportPath::Punch,
+                reliable: Some(stream.metrics),
             },
             Candidate::Direct(stream) => {
                 let _ = stream.set_nodelay(true);
                 EstablishedStream {
                     stream: Box::new(stream),
                     path: TransportPath::Direct,
+                    reliable: None,
                 }
             }
             Candidate::Relay => {
@@ -664,6 +672,7 @@ impl RustDeskTransport {
                 EstablishedStream {
                     stream: Box::new(stream),
                     path: TransportPath::Relay,
+                    reliable: None,
                 }
             }
         })
@@ -688,20 +697,24 @@ impl TransportEstablisher for RustDeskTransport {
                                 return Ok(EstablishedStream {
                                     stream: Box::new(stream),
                                     path: TransportPath::Direct,
+                                    reliable: None,
                                 });
                             }
                         }
                         Some(PunchSignal::Punch(addr)) => {
-                            if let Some(mut stream) = self.try_punch(request.punch_cookie, &request.peer_rd_id, addr).await
+                            if let Some(mut punched) =
+                                self.try_punch(request.punch_cookie, &request.peer_rd_id, addr).await
                             {
-                                // 打洞路径同样没有中继帧可流水线，补写 Hello。
+                                // 打洞路径同样没有中继帧可流水线，补写 Hello（流在 `punched.stream`）。
                                 if !request.early.is_empty() {
-                                    stream.write_all(&request.early).await?;
-                                    stream.flush().await?;
+                                    punched.stream.write_all(&request.early).await?;
+                                    punched.stream.flush().await?;
                                 }
+                                let ReliableStream { stream, metrics } = punched;
                                 return Ok(EstablishedStream {
                                     stream: Box::new(stream),
                                     path: TransportPath::Punch,
+                                    reliable: Some(metrics),
                                 });
                             }
                         }
@@ -714,6 +727,7 @@ impl TransportEstablisher for RustDeskTransport {
                 Ok(EstablishedStream {
                     stream: Box::new(stream),
                     path: TransportPath::Relay,
+                    reliable: None,
                 })
             }
             Role::Controlled => self.establish_controlled(&request).await,
@@ -1384,7 +1398,9 @@ mod tests {
     }
 
     /// 假对端（被控端角色）：跑 `reliable::accept`。
-    async fn spawn_fake_acceptor(conn_id: u64) -> (SocketAddr, JoinHandle<RemoteResult<DuplexStream>>) {
+    async fn spawn_fake_acceptor(
+        conn_id: u64,
+    ) -> (SocketAddr, JoinHandle<RemoteResult<ReliableStream>>) {
         let (sock, addr, rx) = spawn_udp_endpoint(conn_id).await;
         let link: Arc<dyn DatagramSender> = sock;
         let handle = tokio::spawn(async move { reliable::accept(link, conn_id, rx, PUNCH_BUDGET).await });
@@ -1395,7 +1411,7 @@ mod tests {
     async fn spawn_fake_connector(
         conn_id: u64,
         peer: SocketAddr,
-    ) -> (SocketAddr, JoinHandle<RemoteResult<DuplexStream>>) {
+    ) -> (SocketAddr, JoinHandle<RemoteResult<ReliableStream>>) {
         let (sock, addr, rx) = spawn_udp_endpoint(conn_id).await;
         let link: Arc<dyn DatagramSender> = sock;
         let handle = tokio::spawn(async move { reliable::connect(link, conn_id, rx, peer, PUNCH_BUDGET).await });
@@ -1441,10 +1457,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(established.path, TransportPath::Punch, "应走 UDP 打洞路径");
+        assert!(
+            established.reliable.is_some(),
+            "打洞路径必须带可靠层指标句柄（A7 的唯一数据来源）"
+        );
         let mut stream = established.stream;
 
         // 对端应收到建立阶段补写的 early（打洞路径没有中继帧可流水线）。
-        let mut peer = peer_handle.await.unwrap().unwrap();
+        let mut peer = peer_handle.await.unwrap().unwrap().stream;
         let mut hello = [0u8; 5];
         peer.read_exact(&mut hello).await.unwrap();
         assert_eq!(&hello, b"HELLO", "打洞路径也要补写 early（Hello）");
@@ -1477,8 +1497,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(established.path, TransportPath::Punch, "被控端应走 UDP 打洞");
+        assert!(established.reliable.is_some(), "被动侧同样必须带指标句柄");
         let mut stream = established.stream;
-        let mut peer = peer_handle.await.unwrap().unwrap();
+        let mut peer = peer_handle.await.unwrap().unwrap().stream;
 
         stream.write_all(b"from-controlled").await.unwrap();
         let mut buf = [0u8; 15];

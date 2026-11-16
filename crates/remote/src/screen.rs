@@ -322,6 +322,11 @@ pub struct DecodedFrame {
     pub rgba: Vec<u8>,
     /// NV12 模式下的紧包 4:2:0 画面；VP9 / RGBA 模式下为 `None`。
     pub nv12: Option<DecodedNv12>,
+    /// 该帧**采集完成**的时刻（被控端单调时钟，微秒；`0` = 未知）。
+    ///
+    /// 控制器 UI 绘制时用 `rust_tunnel_remote::clock::elapsed_ms(now_us(), offset, 它)` 算
+    /// 「采集 → 上屏」的端到端延迟（A9/D2）。引擎自己不解码这一刻的时钟。
+    pub capture_ts_us: u64,
 }
 
 /// 鼠标按键。
@@ -422,6 +427,73 @@ pub struct DecodedPatch {
     pub height: u32,
     /// 脏矩形（已解压）。
     pub rects: Vec<ScreenPatch>,
+    /// 该批补丁**采集完成**的时刻（被控端单调时钟，微秒；`0` = 未知）。语义同
+    /// [`DecodedFrame::capture_ts_us`]。
+    pub capture_ts_us: u64,
+}
+
+/// 采集源的**平台信息**（被控端自报，A8/B2 用）。
+///
+/// 引擎把它塞进每秒钟的 [`crate::session::HostStats`] 上报给控制器，也留在本端 UI 上。
+/// 默认实现（[`ScreenSource::capture_info`]）返回全空/全 `false`：平台实现不填也不会说谎，
+/// UI 只需显示「—」。
+///
+/// `fallbacks` / `no_new_frame` / `open_fallbacks` 是**进程内累计值**（不是每秒增量）：
+/// 引擎保存上一份快照求差后，才变成 `HostStats` 里的每秒增量。做成累计值是因为采集源自己
+/// 只在事件发生点 `+1`，不需要为它引入每秒定时器。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureInfo {
+    /// 采集后端（`"WGC"` / `"DXGI"` / `"xcap"` / `"BitBlt"`；空串 = 未知）。
+    pub backend: String,
+    /// 采集适配器名（GPU 采集时的显卡名；CPU 采集为空）。
+    pub adapter: String,
+    /// **最近一帧**是否真的走了 GPU 纹理路径（零拷贝）。
+    ///
+    /// 不是「GPU 能力可用」：VP9 会话/未协商 H.264 时引擎走 CPU 回读，能力可用但没有
+    /// 零拷贝，此时必须为 `false`。平台实现据此如实上报，角标才能区分 GPU/CPU。
+    pub gpu_capture: bool,
+    /// GPU 路径是否已被**永久禁用**（任何一环失败后不再尝试）。
+    pub gpu_disabled: bool,
+    /// GPU 被禁用的原因（未禁用时为空串）。
+    pub gpu_disabled_reason: String,
+    /// 硬件采集失败、回退到 CPU 采集的累计次数（`WGC/DXGI → xcap`）。
+    pub fallbacks: u64,
+    /// 采集后端报告「没有新帧」（超时/无新合成帧）的累计次数。
+    pub no_new_frame: u64,
+    /// 打开采集源失败、回退到另一个后端的累计次数（如 `WGC 打开失败 → DXGI`）。
+    pub open_fallbacks: u64,
+}
+
+/// 编码器的**平台信息**（被控端自报，B2 用）。
+///
+/// 与 [`CaptureInfo`] 一样进每秒的 [`crate::session::HostStats`]。默认实现（
+/// [`crate::codec::VideoEncoderApi::info`]）全空，平台实现按实际填。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncoderInfo {
+    /// 编码器后端（`"NVENC"` / `"Intel QSV"` / `"AMD VCE"` / `"MFT"` / `"libvpx"`）。
+    pub backend: String,
+    /// 编码器名称（例如 `"NVIDIA NVENC H.264"`、`"VP9 4:4:4"`）。
+    pub name: String,
+    /// 编码器所在适配器名（显卡名；软件编码为空）。
+    pub adapter: String,
+    /// 编码器是否直接吃 GPU 纹理（零拷贝直通，不落 CPU）。
+    pub gpu_input: bool,
+}
+
+/// 解码器的**后端信息**（控制器自报，A3 用）。
+///
+/// 默认实现（[`crate::codec::VideoDecoderApi::info`]）全空/`false`。控制器在解码器创建/尺寸
+/// 配置成功后读一次，只在**变化时**经 [`crate::stats::SessionStats::DecoderInfo`] 报给 UI。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecoderInfo {
+    /// 解码后端（`"MF DXVA"` / `"MF Software"` / `"libvpx"`）。
+    pub backend: String,
+    /// 解码器名称（例如 `"MSH264DecoderMFT"`）。
+    pub name: String,
+    /// 解码适配器名（硬件解码时的显卡名；软件解码为空）。
+    pub adapter: String,
+    /// 是否硬件解码。
+    pub hardware: bool,
 }
 
 /// 一条输入事件（控制器 → 被控端）。
@@ -524,6 +596,15 @@ pub trait ScreenSource: Send + Sync + 'static {
     ) -> RemoteResult<Option<CapturedPatches>> {
         let _ = (display, scale, max_width);
         Ok(None)
+    }
+
+    /// 本采集源的平台信息（被控端自报，进 [`crate::session::HostStats`]）。
+    ///
+    /// 默认实现返回 [`CaptureInfo::default`]（全空/全 `false`）：不实现它只是让对端的统计角标
+    /// 少几行，会话本身不受影响。**实现可以在会话中途变化**（GPU 被禁用、后端回退），引擎每秒
+    /// 读一次。
+    fn capture_info(&self) -> CaptureInfo {
+        CaptureInfo::default()
     }
 }
 
