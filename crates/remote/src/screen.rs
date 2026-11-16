@@ -340,6 +340,51 @@ pub enum MouseButton {
     Middle,
 }
 
+/// 远端光标形状。
+///
+/// **判别式顺序就是线上契约**（[`crate::session::SessionMessage::CursorShape`] 的字段，
+/// bincode 按声明顺序编码），新值一律追加在末尾（机械锁见
+/// `cursor_shape_discriminants_are_stable`）。
+///
+/// 这是「形状枚举」而不是位图：第一阶段只覆盖 Windows 的系统光标（`IDC_*`），
+/// 平台读不到时用 [`CursorShape::Unknown`]（控制端显示默认箭头），远端隐藏光标时用
+/// [`CursorShape::Hidden`]（控制端同样保持默认箭头）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorShape {
+    /// 标准箭头。
+    Arrow,
+    /// 文本插入（I 形）。
+    IBeam,
+    /// 手型（链接）。
+    Hand,
+    /// 十字准星。
+    Crosshair,
+    /// 忙（沙漏/转圈）。
+    Wait,
+    /// 后台忙（箭头 + 沙漏/转圈）。
+    AppStarting,
+    /// 帮助（箭头 + 问号）。
+    Help,
+    /// 上下调整。
+    SizeNS,
+    /// 左右调整。
+    SizeWE,
+    /// 左上-右下调整。
+    SizeNWSE,
+    /// 右上-左下调整。
+    SizeNESW,
+    /// 四向移动。
+    SizeAll,
+    /// 禁止（圆圈斜杠）。
+    No,
+    /// 向上箭头。
+    UpArrow,
+    /// 平台读到了光标但形状不在已知表里（控制端显示默认箭头）。
+    Unknown,
+    /// 远端**隐藏**了光标（控制端也保持默认箭头）。
+    Hidden,
+}
+
 /// 一次键盘事件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {
@@ -606,6 +651,19 @@ pub trait ScreenSource: Send + Sync + 'static {
     fn capture_info(&self) -> CaptureInfo {
         CaptureInfo::default()
     }
+
+    /// 远端当前的光标形状（被控端自报，随采集结果每拍采样）。
+    ///
+    /// 返回 `None` 表示**平台不支持或读不到**（第一阶段只有 Windows 实现；macOS/Linux 走默认
+    /// 实现 → `None`）：引擎不会发送任何消息，控制端保持默认箭头。已读到但不在已知表里的形状
+    /// 用 [`CursorShape::Unknown`]；远端隐藏光标时用 [`CursorShape::Hidden`]（控制端同样保持
+    /// 默认箭头）。
+    ///
+    /// 它只走**进程内**通道（`CaptureOutcome::cursor`），真正上线的是
+    /// [`crate::session::SessionMessage::CursorShape`]。
+    fn cursor_shape(&self) -> Option<CursorShape> {
+        None
+    }
 }
 
 /// 输入注入目标（被控端实现）。
@@ -686,6 +744,13 @@ pub trait FrameSink: Send + Sync + 'static {
     /// 默认实现为空操作——忽略它只意味着不做剪贴板同步，不影响会话。
     fn on_clipboard(&self, text: String) {
         let _ = text;
+    }
+
+    /// 远端光标形状（被控端 → 控制器；形状变化时下发）。
+    ///
+    /// 默认实现为空操作——忽略它只意味着控制端不跟随远端光标，会话本身不受影响。
+    fn on_cursor(&self, shape: CursorShape) {
+        let _ = shape;
     }
 
     /// 会话关闭。
@@ -921,6 +986,42 @@ mod tests {
         assert_eq!(scaled_dimension(1920, 1.0), 1920);
         // 极小值不会塌到 0（0 尺寸会让后续网格/分配除零）。
         assert_eq!(scaled_dimension(1, 0.01), 1);
+    }
+
+    /// **`CursorShape` 判别式黄金测试**：变体按声明顺序从 0 连续递增，新值只能追加在末尾。
+    ///
+    /// 它是 [`crate::session::SessionMessage::CursorShape`] 的字段，bincode 用 u32 小端判别式。
+    /// 把任何变体插到中间都会让老端把一种形状解成另一种（例如 I 形光标被画成手型），
+    /// 且没有任何版本错误可查——故单独锁一条。
+    #[test]
+    fn cursor_shape_discriminants_are_stable() {
+        let all = [
+            CursorShape::Arrow,
+            CursorShape::IBeam,
+            CursorShape::Hand,
+            CursorShape::Crosshair,
+            CursorShape::Wait,
+            CursorShape::AppStarting,
+            CursorShape::Help,
+            CursorShape::SizeNS,
+            CursorShape::SizeWE,
+            CursorShape::SizeNWSE,
+            CursorShape::SizeNESW,
+            CursorShape::SizeAll,
+            CursorShape::No,
+            CursorShape::UpArrow,
+            CursorShape::Unknown,
+            CursorShape::Hidden,
+        ];
+        for (index, shape) in all.into_iter().enumerate() {
+            let bytes = bincode::serialize(&shape).unwrap();
+            let got = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(
+                got,
+                u32::try_from(index).unwrap(),
+                "变体 `{shape:?}` 的判别式错位（应连续递增）"
+            );
+        }
     }
 
     #[test]

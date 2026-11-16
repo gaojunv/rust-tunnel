@@ -94,9 +94,9 @@ pub use manager::{
 pub use qos::{Feedback, QosAction, QosDecision, QosParams, RateController};
 pub use reliable::{ReliableMetrics, ReliableSnapshot};
 pub use screen::{
-    CaptureInfo, Clipboard, DecodedFrame, DecodedNv12, DecoderInfo, DisplayInfo, EncodeOptions,
-    EncodeRates, EncoderInfo, FileEntry, FrameSink, GpuFrame, InputEvent, InputSink, KeyEvent,
-    MouseButton, QualityPreset, RawFrame, ScreenSource,
+    CaptureInfo, Clipboard, CursorShape, DecodedFrame, DecodedNv12, DecoderInfo, DisplayInfo,
+    EncodeOptions, EncodeRates, EncoderInfo, FileEntry, FrameSink, GpuFrame, InputEvent, InputSink,
+    KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource,
 };
 pub use session::{
     CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, HostActivity, HostStats, LIVENESS_TIMEOUT, Lane,

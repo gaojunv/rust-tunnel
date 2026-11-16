@@ -1016,6 +1016,9 @@ pub(crate) async fn run_controller_with_input(
                         SessionMessage::HostStats(host) => {
                             config.stats.report(SessionStats::Host(Box::new(host)));
                         }
+                        // 远端光标形状：交给 UI 决定是否跟随（只有完全控制模式会应用；
+                        // `Hidden` / `Unknown` 显示默认箭头）。不影响会话本身。
+                        SessionMessage::CursorShape { shape } => sink.on_cursor(shape),
                         SessionMessage::Bye { reason: r } => {
                             reason = r;
                             break Ok(SessionEnd { reason: reason.clone(), deliberate: true });

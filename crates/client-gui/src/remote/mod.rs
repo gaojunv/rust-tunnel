@@ -26,6 +26,10 @@ pub mod view_scale;
 // 私有模块：只有 `windows` 分派会调它的 `screen_and_input`，不对外暴露实现类型。
 #[cfg(target_os = "windows")]
 mod win_desktop;
+// 远端光标形状采样（`GetCursorInfo` + 系统 `IDC_*` 句柄比对）；Windows GUI 与实例的
+// `Default` 桌面共用，安全桌面不采样。
+#[cfg(target_os = "windows")]
+mod win_cursor;
 // 实例的混合采集：`Default` 桌面用 WGC/DXGI + GPU 零拷贝，安全桌面回退 BitBlt。
 // 依赖 win_desktop 的共享状态与 win_video 的硬件采集源，只在 Windows 编译。
 #[cfg(target_os = "windows")]
@@ -53,7 +57,7 @@ use rust_tunnel_remote::{
     ScreenSource, SessionRole, VideoDecoderFactory, VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 // 补丁相关类型未在 crate 根 re-export（`screen` 是公开模块），直接按模块路径引入。
-use rust_tunnel_remote::screen::{CaptureInfo, DecodedPatch};
+use rust_tunnel_remote::screen::{CaptureInfo, CursorShape, DecodedPatch};
 
 use nv12_renderer::CompositeFrame;
 
@@ -1409,6 +1413,11 @@ pub struct FrameState {
     /// UI 用它配合 [`RemoteUiState::clock_offset_us`] 与 `clock::now_us()` 算「采集 → 上屏」的
     /// 端到端延迟（协议 v8）。`None` = 还没有画面，或对端没带时间戳（旧协议/降级路径）。
     pub last_capture_ts_us: Option<u64>,
+    /// 远端当前的光标形状（协议 v9；`None` = 还没收到 / 对端平台不支持）。
+    ///
+    /// 只有**完全控制**模式会把它映射成 egui 光标图标（见 [`RemoteView::capture_input`]）；
+    /// [`CursorShape::Hidden`] 与 [`CursorShape::Unknown`] 都显示默认箭头。
+    pub cursor_shape: Option<CursorShape>,
 }
 
 /// 把线上的采集时刻转成「可信时间戳」：`0` 是对端未填的哨兵，按未知处理。
@@ -1523,6 +1532,17 @@ impl FrameSink for GuiFrameSink {
     fn on_clipboard(&self, text: String) {
         if let Ok(mut guard) = self.shared.lock() {
             guard.clipboard_in = Some(text);
+        }
+        self.ctx.request_repaint_of(self.viewport);
+    }
+
+    /// 远端光标形状变化。
+    ///
+    /// 与画面帧同一个共享槽 + 同一个 viewport 唤醒（**必须** `request_repaint_of`，理由同
+    /// [`Self::on_frame`]）：鼠标不动、只有远端光标形状变化时，UI 也要重绘才能立刻换图标。
+    fn on_cursor(&self, shape: CursorShape) {
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.cursor_shape = Some(shape);
         }
         self.ctx.request_repaint_of(self.viewport);
     }
@@ -1848,6 +1868,16 @@ impl RemoteView {
         )
     }
 
+    /// 远端当前的光标形状（协议 v9；`None` = 还没收到 / 对端平台不支持）。
+    ///
+    /// 只在**完全控制**模式的 [`Self::capture_input`] 里用于设置 egui 光标图标；仅观看 /
+    /// 仅文件传输不调用它，保持本机默认光标。
+    fn cursor_shape(&self) -> Option<CursorShape> {
+        self.shared
+            .lock()
+            .map_or_else(|e| e.into_inner().cursor_shape, |guard| guard.cursor_shape)
+    }
+
     /// 本端上屏渲染后端的中文标签（统计角标 A4）。
     ///
     /// `wgpu_target_format` 为 `Some` 表示 NV12 帧经 wgpu 着色器在 GPU 上完成 BT.709 转换与缩放；
@@ -1898,9 +1928,11 @@ impl RemoteView {
         self.quality_sent = false;
         self.settings_open = false;
         // 采集时刻属于**上一场会话**：不清掉的话，新会话首帧到达前角标会用旧时间戳
-        // 配新会话的时钟偏差，算出一个虚假的「采集→上屏」延迟。
+        // 配新会话的时钟偏差，算出一个虚假的「采集→上屏」延迟。远端光标形状同理：
+        // 新会话在收到第一条 `CursorShape` 之前必须是默认箭头，不能沿用上一场的形状。
         if let Ok(mut guard) = self.shared.lock() {
             guard.last_capture_ts_us = None;
+            guard.cursor_shape = None;
         }
         // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
         self.input_count = 0;
@@ -2152,6 +2184,9 @@ impl RemoteView {
             .input(|i| i.pointer.latest_pos())
             .filter(|pos| in_image(*pos))
         {
+            // 跟随远端光标形状（协议 v9）：**先**设置图标再走去重发送 MouseMove——鼠标不动、
+            // 只有远端形状变化时也要立刻换图标。`Hidden`/`Unknown` 映射回默认箭头。
+            ui.ctx().set_cursor_icon(cursor_icon(self.cursor_shape()));
             let x = scale_axis(pos.x - rect.min.x, rect.width(), target_w);
             let y = scale_axis(pos.y - rect.min.y, rect.height(), target_h);
             if self.last_mouse != Some((x, y)) {
@@ -2717,6 +2752,34 @@ fn scale_axis(offset: f32, extent: f32, max: u32) -> i32 {
 #[expect(clippy::cast_possible_truncation, reason = "滚动量为有界小整数")]
 fn round_i32(value: f32) -> i32 {
     value.round() as i32
+}
+
+/// 远端光标形状 → egui 光标图标（纯函数，单测覆盖全部变体）。
+///
+/// 语义由用户拍板：
+/// - `None`（对端平台不支持/还没收到）、[`CursorShape::Unknown`]（自定义光标）、
+///   [`CursorShape::UpArrow`] 与 [`CursorShape::Hidden`]（远端隐藏光标）**一律显示默认箭头**；
+/// - 其余形状按语义一一对应。
+fn cursor_icon(shape: Option<CursorShape>) -> egui::CursorIcon {
+    use egui::CursorIcon as Icon;
+    match shape {
+        None
+        | Some(
+            CursorShape::Arrow | CursorShape::Unknown | CursorShape::UpArrow | CursorShape::Hidden,
+        ) => Icon::Default,
+        Some(CursorShape::IBeam) => Icon::Text,
+        Some(CursorShape::Hand) => Icon::PointingHand,
+        Some(CursorShape::Crosshair) => Icon::Crosshair,
+        Some(CursorShape::Wait) => Icon::Wait,
+        Some(CursorShape::AppStarting) => Icon::Progress,
+        Some(CursorShape::Help) => Icon::Help,
+        Some(CursorShape::SizeNS) => Icon::ResizeVertical,
+        Some(CursorShape::SizeWE) => Icon::ResizeHorizontal,
+        Some(CursorShape::SizeNWSE) => Icon::ResizeNwSe,
+        Some(CursorShape::SizeNESW) => Icon::ResizeNeSw,
+        Some(CursorShape::SizeAll) => Icon::Move,
+        Some(CursorShape::No) => Icon::NotAllowed,
+    }
 }
 
 /// 独占键盘的退出组合键是否本帧按下：`Ctrl/Cmd + Alt + Shift + K`。
@@ -3395,6 +3458,60 @@ mod tests {
         assert_eq!(round_i32(f32::MIN), i32::MIN);
     }
 
+    /// 远端光标形状 → egui 图标：**每个变体**都覆盖。
+    ///
+    /// 关键语义（用户明确要求）：`Hidden`（远端隐藏光标）、`Unknown`（自定义光标）、
+    /// `UpArrow` 与 `None`（对端平台不支持）一律显示**默认箭头**——不要改成隐藏本机光标。
+    #[test]
+    fn cursor_icon_maps_every_shape() {
+        use egui::CursorIcon as Icon;
+        let cases = [
+            (None, Icon::Default),
+            (Some(CursorShape::Arrow), Icon::Default),
+            (Some(CursorShape::IBeam), Icon::Text),
+            (Some(CursorShape::Hand), Icon::PointingHand),
+            (Some(CursorShape::Crosshair), Icon::Crosshair),
+            (Some(CursorShape::Wait), Icon::Wait),
+            (Some(CursorShape::AppStarting), Icon::Progress),
+            (Some(CursorShape::Help), Icon::Help),
+            (Some(CursorShape::SizeNS), Icon::ResizeVertical),
+            (Some(CursorShape::SizeWE), Icon::ResizeHorizontal),
+            (Some(CursorShape::SizeNWSE), Icon::ResizeNwSe),
+            (Some(CursorShape::SizeNESW), Icon::ResizeNeSw),
+            (Some(CursorShape::SizeAll), Icon::Move),
+            (Some(CursorShape::No), Icon::NotAllowed),
+            (Some(CursorShape::UpArrow), Icon::Default),
+            (Some(CursorShape::Unknown), Icon::Default),
+            (Some(CursorShape::Hidden), Icon::Default),
+        ];
+        for (shape, want) in cases {
+            assert_eq!(cursor_icon(shape), want, "形状 {shape:?} 应映射为 {want:?}");
+        }
+    }
+
+    /// 引擎侧收到的光标形状必须写进共享槽（UI 每帧从那里读）。
+    #[test]
+    fn sink_records_cursor_shape() {
+        let shared: Arc<Mutex<FrameState>> = Arc::new(Mutex::new(FrameState::default()));
+        let sink = GuiFrameSink {
+            shared: Arc::clone(&shared),
+            ctx: egui::Context::default(),
+            viewport: egui::ViewportId::ROOT,
+        };
+        assert_eq!(shared.lock().unwrap().cursor_shape, None);
+        sink.on_cursor(CursorShape::IBeam);
+        assert_eq!(
+            shared.lock().unwrap().cursor_shape,
+            Some(CursorShape::IBeam)
+        );
+        // 隐藏光标也是一条有效形状（映射成默认箭头发生在 UI 侧，不在接收侧）。
+        sink.on_cursor(CursorShape::Hidden);
+        assert_eq!(
+            shared.lock().unwrap().cursor_shape,
+            Some(CursorShape::Hidden)
+        );
+    }
+
     #[test]
     fn valid_frame_dims_checks_length_and_nonzero_size() {
         let frame = DecodedFrame {
@@ -3679,8 +3796,14 @@ mod tests {
         if let Ok(mut guard) = view.clipboard_read.lock() {
             *guard = Some((stale_gen, Ok("上一会话".to_owned())));
         }
+        // 上一会话的光标形状同样不能带进下一场（否则新会话首条 CursorShape 到达前会显示旧图标）。
+        if let Ok(mut guard) = view.shared.lock() {
+            guard.cursor_shape = Some(CursorShape::IBeam);
+        }
+        assert_eq!(view.cursor_shape(), Some(CursorShape::IBeam));
         view.reset_session();
         assert_eq!(view.take_clipboard_read(), None);
+        assert_eq!(view.cursor_shape(), None);
 
         // 在途线程在复位之后才写回旧一代的结果：必须被丢弃，不能流入下一次取回。
         if let Ok(mut guard) = view.clipboard_read.lock() {

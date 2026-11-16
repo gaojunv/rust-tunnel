@@ -28,7 +28,7 @@ use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
 use rust_tunnel_remote::screen::{
-    CaptureInfo, CapturedPatches, DecoderInfo, EncoderInfo, ScreenPatch,
+    CaptureInfo, CapturedPatches, CursorShape, DecoderInfo, EncoderInfo, ScreenPatch,
 };
 use rust_tunnel_remote::video::NATIVE_MAX_ENCODE_WIDTH;
 use rust_tunnel_remote::{
@@ -637,6 +637,14 @@ impl ScreenSource for WinVideoScreen {
     fn set_max_encode_width(&self, width: u32) {
         self.max_encode_width
             .store(clamp_encode_width(width), Ordering::Relaxed);
+    }
+
+    /// 远端光标形状（Windows GUI 会话）。
+    ///
+    /// 采集帧本身**不含光标**（WGC 光标捕获已关闭，避免双光标），故形状单独采样：
+    /// `GetCursorInfo` 是常数时间调用，每拍采一次即可。读不到时返回 `None`。
+    fn cursor_shape(&self) -> Option<CursorShape> {
+        super::win_cursor::shape()
     }
 
     fn supports_gpu_capture(&self) -> bool {

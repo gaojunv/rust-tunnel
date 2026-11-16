@@ -27,7 +27,7 @@
 use crate::auth::handshake_mac;
 use crate::crypto::{random_nonce, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::screen::{DisplayInfo, FileEntry, InputEvent, QualityPreset};
+use crate::screen::{CursorShape, DisplayInfo, FileEntry, InputEvent, QualityPreset};
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -37,7 +37,18 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
-/// # 为什么是 8
+/// # 版本 9
+///
+/// 只在末尾追加了 [`SessionMessage::CursorShape`]（判别式 29，被控端 → 控制器，远端光标
+/// 形状跟随）。它没有任何新旧共存语义：老端在 bincode 解码到判别式 29 时会失败，故版本号
+/// 必须抬，且**两端必须同为 v9**——旧端（v8）会在握手阶段被 `Hello.proto_version` 的硬相等
+/// 校验干净拒绝（回 `HelloAck{accepted:false}`），不会退化成硬断链。`Hello` / `HelloAck` /
+/// `DisplayInfo` 的字节形状**一个字都没动**（两条机械锁守着），所以这条拒绝路径仍然成立。
+///
+/// 发布顺序同 v8：**先把携带 v9 的客户端铺开，再部署依赖它的服务端门控**（
+/// `MIN_REMOTE_CLIENT_VERSION`，见下）。
+///
+/// # 版本 8
 ///
 /// 版本 8 做了四件事，**都不向后兼容**：
 ///
@@ -88,7 +99,7 @@ use tokio_util::codec::{Decoder, Encoder};
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
 /// `MIN_REMOTE_CLIENT_VERSION`）。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 8;
+pub const SESSION_PROTO_VERSION: u16 = 9;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -516,6 +527,15 @@ pub enum SessionMessage {
     /// **只读观测面**：控制器收到后不据此做任何控制决策（QoS 闭环仍只看 `QosFeedback`），
     /// 也绝不回发。字段是 v8 的线上契约，新增一律追加在结构体末尾。
     HostStats(HostStats),
+    /// 远端光标形状（被控端 → 控制器；形状变化时下发）。
+    ///
+    /// 控制器只在**完全控制**模式把它映射成 egui 光标图标；[`CursorShape::Hidden`] 与
+    /// [`CursorShape::Unknown`] 都显示默认箭头。形状枚举的判别式顺序是线上契约（见
+    /// [`CursorShape`] 与 `cursor_shape_discriminants_are_stable`）。
+    CursorShape {
+        /// 当前形状。
+        shape: CursorShape,
+    },
 }
 
 /// 由**变化面积**推出的内容活跃等级（被控端本地 `qos` 的判断，随 [`HostStats`] 上报展示）。
@@ -881,7 +901,7 @@ pub fn plan_controller_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen::{FileEntry, KeyEvent, MouseButton, QualityPreset};
+    use crate::screen::{CursorShape, FileEntry, KeyEvent, MouseButton, QualityPreset};
 
     /// `Hello` / `HelloAck` 的固定线上字节（机械锁；见 `hello_and_helloack_wire_bytes_are_frozen`）。
     const FROZEN_HELLO_BYTES: &[u8] = &[
@@ -1380,6 +1400,16 @@ mod tests {
                 SessionMessage::HostStats(HostStats::default()),
                 Lane::Control,
             ),
+            // 远端光标形状（v9）。
+            (
+                SessionMessage::CursorShape { shape: CursorShape::IBeam },
+                Lane::Control,
+            ),
+            // 边界：远端隐藏光标（控制端保持默认箭头）。
+            (
+                SessionMessage::CursorShape { shape: CursorShape::Hidden },
+                Lane::Control,
+            ),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -1573,6 +1603,11 @@ mod tests {
                 "HostStats",
                 SessionMessage::HostStats(HostStats::default()),
                 28,
+            ),
+            (
+                "CursorShape",
+                SessionMessage::CursorShape { shape: CursorShape::IBeam },
+                29,
             ),
         ];
         for (name, msg, want) in &cases {

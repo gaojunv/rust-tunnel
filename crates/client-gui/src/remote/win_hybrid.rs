@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use rust_tunnel_remote::screen::{CaptureInfo, CapturedPatches};
+use rust_tunnel_remote::screen::{CaptureInfo, CapturedPatches, CursorShape};
 use rust_tunnel_remote::{DisplayInfo, RawFrame, RemoteError, RemoteResult, ScreenSource};
 
 use super::desktop_follow::FollowDesktop;
@@ -500,5 +500,24 @@ impl ScreenSource for HybridScreen {
         info.no_new_frame = gpu.no_new_frame;
         info.open_fallbacks = gpu.open_fallbacks;
         info
+    }
+
+    /// 远端光标形状：只在 `Default` 桌面采样，安全桌面返回 `None`。
+    ///
+    /// 安全桌面（`Winlogon` / `Screen-saver`）上的光标属于登录界面，既不该暴露给控制端，
+    /// `GetCursorInfo` 在本进程挂载到那个桌面之前也读不到有意义的值。因此这里先按当前
+    /// 桌面分类决定是否采样；**`GetCursorInfo` 在锁外调用**（`observe_desktop` 可能清
+    /// WGC/DXGI 采集源并等一次在途采集，持锁做系统调用会拖住 1 Hz 心搏）。
+    fn cursor_shape(&self) -> Option<CursorShape> {
+        let (kind, slot) = self.current();
+        {
+            let mut state = self.lock();
+            self.observe_desktop(&mut state, kind);
+        }
+        if slot == DesktopSlot::Default {
+            super::win_cursor::shape()
+        } else {
+            None
+        }
     }
 }

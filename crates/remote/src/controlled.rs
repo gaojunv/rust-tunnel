@@ -83,8 +83,8 @@ use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
-    native_bitrate_ceiling, CaptureInfo, CapturedPatches, Clipboard, DisplayInfo, EncodeOptions,
-    EncodeRates, EncoderInfo, InputSink, RawFrame, ScreenSource,
+    native_bitrate_ceiling, CaptureInfo, CapturedPatches, Clipboard, CursorShape, DisplayInfo,
+    EncodeOptions, EncodeRates, EncoderInfo, InputSink, RawFrame, ScreenSource,
 };
 use crate::session::{
     trusted_rtt, CodecId, HostActivity, HostStats, RegionRect, SessionCodec, SessionEnd, SessionFrame,
@@ -208,7 +208,10 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
         | SessionMessage::LockScreen
         // 被控端每秒一条的整机遥测：小结构、时延不敏感，但**绝不能丢**，否则控制器的角标
         // 会停在旧读数上——与其它控制帧同档。
-        | SessionMessage::HostStats(_) => OutboundClass::Control,
+        | SessionMessage::HostStats(_)
+        // 远端光标形状：极小、**时延敏感**（拖过链接/输入框时用户立刻能看出图标没跟上），
+        // 且丢一条就会让控制端一直显示旧光标直到下次变化——绝不能丢，与其它控制帧同档。
+        | SessionMessage::CursorShape { .. } => OutboundClass::Control,
     }
 }
 
@@ -1292,6 +1295,9 @@ pub async fn run_controlled(
     let mut capture_failures: u32 = 0;
     // `CaptureInfo` 的三个计数是**累计值**，主循环保存上一份求差后才是每秒增量。
     let mut last_capture_info: Option<CaptureInfo> = None;
+    // 上一次发给控制器的光标形状。只在**变化时**下发；`None`（平台读不到）时既不发也不清
+    // 它——一次读取失败不该让控制端的 I 形光标闪回箭头。
+    let mut last_cursor: Option<CursorShape> = None;
     // 控制器显式选择的帧率上限（30 / 60）。`None` = 尚未下发，沿用画质档位默认。
     // 记住它是为了「换画质档位不覆盖用户选择」：`SetQuality` 换完档位后要重新应用它。
     let mut selected_fps: Option<u8> = None;
@@ -1378,9 +1384,28 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { generation, .. }) if generation != capture_generation => {
                         debug!(generation, "丢弃过期的采集结果");
                     }
-                    Some(CaptureOutcome { payload, capture_us, capture_ts_us, .. }) => {
+                    Some(CaptureOutcome { payload, capture_us, capture_ts_us, cursor, .. }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
+                        // 远端光标形状：**只在变化时**发一条控制帧。`None` 表示平台不支持/读不到，
+                        // 此时不发消息、也**不清** `last_cursor`（一次读取失败不该让控制端的光标
+                        // 闪回箭头）。形状变化与鼠标是否移动无关，控制端据此更新图标。
+                        if let Some(shape) = cursor {
+                            if last_cursor != Some(shape) {
+                                last_cursor = Some(shape);
+                                if let Err(err) = queues
+                                    .enqueue_ctrl(
+                                        &cancel,
+                                        SessionFrame::control(SessionMessage::CursorShape {
+                                            shape,
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    break Err(err);
+                                }
+                            }
+                        }
                         match payload {
                             CapturePayload::Frame(frame) => {
                                 if let Some(frame) = frame {
@@ -2173,6 +2198,11 @@ struct CaptureOutcome {
     /// 它随画面帧一路上线（`VideoPacket` / `RegionUpdate` 的 `capture_ts_us`），控制器据此算
     /// 「采集 → 解码完成」的端到端延迟（D2）。失败时仍填（该帧本来就不会上线，只求代码统一）。
     capture_ts_us: u64,
+    /// 本拍采样到的远端光标形状（进程内传递，不上线）。
+    ///
+    /// `None` = 平台不支持/读取失败；`Some(Hidden)` 表示远端隐藏了光标。即使采集失败也采样，
+    /// 光标形状不依赖画面是否成功。
+    cursor: Option<CursorShape>,
 }
 
 /// 交给编码任务的一帧。
@@ -2244,12 +2274,16 @@ fn run_capture(
     // 采集**返回之后**立刻打时间戳：它是控制器的端到端延迟（采集→解码完成）的起点。
     // 失败路径也打（结果不会上线，只是让所有分支形状一致）。
     let capture_ts_us = crate::clock::now_us();
+    // 光标形状每拍采样一次（很便宜：`GetCursorInfo` 是常数时间）。**采集失败也采样**——
+    // 形状与画面无关，一次采集错误不该让控制端的光标停住。`None` = 平台读不到。
+    let cursor = screen.cursor_shape();
     // 接收端随会话循环存活；会话已结束时发送失败是正常的，忽略。
     let _ = tx.blocking_send(CaptureOutcome {
         generation,
         payload,
         capture_us,
         capture_ts_us,
+        cursor,
     });
 }
 
