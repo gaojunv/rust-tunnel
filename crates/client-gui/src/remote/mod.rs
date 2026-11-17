@@ -1641,6 +1641,11 @@ pub struct RemoteView {
     wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
     /// 上一帧画出来的画面；没有新帧时复用它（避免画面在静止时消失）。
     last_paint: Option<FramePaint>,
+    /// 画面**实际绘制比例**（千分比：1000 = 1 远端像素对 1 物理像素；0 = 还没有画面）。
+    ///
+    /// 只用于统计角标：这是判断「字糊是编码问题还是显示缩放问题」的关键读数——
+    /// 明显偏离 1000 就说明正在双线性放大/缩小（见 `view_scale` 的模块文档）。
+    pub view_scale_permille: u32,
     /// CPU 回退路径（Glow）上一次转换的 NV12 内容标识 `(generation, version)`。
     ///
     /// GPU 路径用不上（上传去重由 [`CompositeFrame`] 的脏区状态负责）；CPU 回退每次都要整帧
@@ -1773,6 +1778,7 @@ impl RemoteView {
             tex_size: (0, 0),
             wgpu_target_format: None,
             last_paint: None,
+            view_scale_permille: 0,
             nv12_key: None,
             sink_installed: false,
             selected_display: None,
@@ -1917,6 +1923,7 @@ impl RemoteView {
         self.texture = None;
         self.tex_size = (0, 0);
         self.last_paint = None;
+        self.view_scale_permille = 0;
         self.nv12_key = None;
         self.last_mouse = None;
         self.gate.reset();
@@ -2448,8 +2455,9 @@ impl RemoteView {
         self.keyframe_base = 0;
         self.keyframe_since = None;
         // 首帧到达前的初始窗口尺寸：远端分辨率这时还未知（`reset_session` 刚清空），先用一个
-        // 保守值占位；远端首帧一到，`ui::session_window::show` 会重算并锁定（见 `size_initialized`）。
-        self.inner_size = self.desired_inner(None);
+        // 保守值占位；远端首帧一到，`ui::session_window::show` 会**带着真实 DPI** 重算并锁定
+        // （见 `size_initialized`）。这里没有 `Context`，DPI 按 1.0 只影响占位那一帧。
+        self.inner_size = self.desired_inner(None, 1.0);
     }
 
     /// 会话结束：补发一次输入抬起、复位视图、关掉窗口（重连若需要会重新开窗）。
@@ -2487,8 +2495,11 @@ impl RemoteView {
     }
 
     /// 算当前档位下应下发给子窗口的内尺寸（`FitScreen` 用远端分辨率，未知时用占位分辨率）。
+    ///
+    /// `pixels_per_point` 必须传本机会话窗口的 DPI 缩放：远端尺寸是**物理像素**，窗口尺寸是
+    /// **逻辑点**，不折算会让默认窗比远端大一个 DPI 倍数，画面被双线性放大。
     #[must_use]
-    pub fn desired_inner(&self, monitor: Option<egui::Vec2>) -> egui::Vec2 {
+    pub fn desired_inner(&self, monitor: Option<egui::Vec2>, pixels_per_point: f32) -> egui::Vec2 {
         match self.window_size {
             WindowSize::FitScreen => {
                 let remote = match self.tex_size {
@@ -2500,11 +2511,11 @@ impl RemoteView {
                         .next()
                         .map_or((1280, 720), |display| (display.width, display.height)),
                 };
-                initial_window_size(remote, monitor)
+                initial_window_size(remote, monitor, pixels_per_point)
             }
             _ => self
                 .window_size
-                .inner_size()
+                .inner_size(pixels_per_point)
                 .map_or(MIN_INNER, |size| size.max(MIN_INNER)),
         }
     }

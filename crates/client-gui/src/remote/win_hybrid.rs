@@ -174,7 +174,7 @@ impl HybridScreen {
     fn blit(&self, display: u32) -> RemoteResult<RawFrame> {
         let result = self.bitblt.capture(display);
         self.lock().last_source = LastSource::BitBlt;
-        result
+        result.map(clamp_bitblt_frame)
     }
 
     /// 实例显示器 id → xcap id（带缓存）。
@@ -251,6 +251,37 @@ fn enumerate_xcap() -> Vec<(u32, Geometry)> {
             tracing::debug!(error = %err, "xcap 枚举显示器失败，实例 GPU 采集暂不可用");
             Vec::new()
         }
+    }
+}
+
+/// 安全桌面 / 回退路径的 BitBlt 帧按 [`MAX_ENCODE_WIDTH`] 做**盒式**缩放。
+///
+/// 实例会话在 `Default` 桌面上允许原生 4K（WGC/DXGI + GPU 零拷贝 + 硬件编码，全程不缩放）；
+/// 但 BitBlt 是纯 CPU 路径，4K 每帧 33 MB 的 RGBA 上传/转换/编码换不来任何画质收益
+/// （安全桌面是静止画面）。缩到 1920 既保住文字可读性，又让 CPU 侧成本回到 1080p 量级。
+///
+/// GPU 帧与已经不超过上限的帧原样返回；缩放失败时也原样返回（宁可慢，不可丢画面）。
+fn clamp_bitblt_frame(frame: RawFrame) -> RawFrame {
+    let max = rust_tunnel_remote::video::MAX_ENCODE_WIDTH;
+    if frame.gpu.is_some() || frame.rgba.is_empty() || frame.width <= max {
+        return frame;
+    }
+    let height = u32::try_from(
+        u64::from(frame.height).saturating_mul(u64::from(max)) / u64::from(frame.width.max(1)),
+    )
+    .unwrap_or(frame.height)
+    .max(2)
+    & !1;
+    let Ok(rgba) =
+        rust_tunnel_win_video::pixels::scale_rgba_box(&frame.rgba, frame.width, frame.height, max, height)
+    else {
+        return frame;
+    };
+    RawFrame {
+        width: max,
+        height,
+        rgba,
+        ..frame
     }
 }
 

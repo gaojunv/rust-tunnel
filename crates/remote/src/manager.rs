@@ -718,12 +718,18 @@ impl RemoteManager {
         self.send_command(ControllerCommand::SetFrameRate(fps));
     }
 
-    /// 设置被控端是否允许**原生分辨率（4K）**编码（默认关闭）。
+    /// 设置被控端是否允许**原生分辨率（4K）**编码（默认开启）。
     ///
     /// 只对**下一次**会话生效：编码宽度上限在会话开始、codec 协商完成后确定，运行中的会话
     /// 不重建编码器（重建会强制 IDR）。对端只支持 VP9 时该开关被忽略（仍按 1920 编码）。
     pub fn set_native_resolution(&self, on: bool) {
         self.native_resolution.store(on, Ordering::Relaxed);
+    }
+
+    /// 当前的原生分辨率偏好（UI 镜像；服务安装时把它写进 `host.toml`）。
+    #[must_use]
+    pub fn native_resolution(&self) -> bool {
+        self.native_resolution.load(Ordering::Relaxed)
     }
 
     /// 把本机剪贴板文本发给被控端。

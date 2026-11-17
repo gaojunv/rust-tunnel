@@ -45,7 +45,9 @@
 //!
 //! - H.264 High profile、**峰值受限 VBR**（均值 = 峰值 × 70%）、`frameIntervalP = 1`
 //!   （无 B 帧）、`gopLength = NVENC_INFINITE_GOPLENGTH`（无限 GOP）。
-//! - `NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY`。
+//! - `NV_ENC_TUNING_INFO_LOW_LATENCY` + **四分之一分辨率两遍编码** + **空间 AQ（强度 8）**：
+//!   桌面文本是「大片平坦背景 + 少量高频笔画」，单遍无 AQ 会把笔画一起量化糊
+//!   （旧的 `ULTRA_LOW_LATENCY` 预设正是这样）。
 //! - 只在调用方要求时用 `NV_ENC_PIC_FLAG_FORCEIDR` 产生 IDR（并同时
 //!   `OUTPUT_SPSPPS`，保证任何 IDR 都能独立解码）。
 //! - VUI 打 BT.709 + limited range 标签。
@@ -572,12 +574,15 @@ fn build_encode_config(
     preset.presetCfg.version = sys::NV_ENC_CONFIG_VER;
 
     // SAFETY: 会话句柄有效；preset 指向本栈帧，调用期间不会被移动。
+    // **LOW_LATENCY 而不是 ULTRA_LOW_LATENCY**：后者为了省下最后一点延迟会关掉 RDO 与
+    // 自适应量化，桌面文本（高频细节）最先被量化掉。LOW_LATENCY 仍是零 B 帧、无 lookahead
+    // 的实时路径，编码耗时差别在毫秒级，画质差距却肉眼可见。
     let status = unsafe {
         get_preset(
             session.handle(),
             sys::NV_ENC_CODEC_H264_GUID,
             sys::NV_ENC_PRESET_P4_GUID,
-            sys::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            sys::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY,
             &raw mut preset,
         )
     };
@@ -598,7 +603,17 @@ fn build_encode_config(
     config.rcParams.maxBitRate = bitrate_bps;
     config.rcParams.vbvBufferSize = vbv_size(bitrate_bps, fps);
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
-    config.rcParams.multiPass = sys::_NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
+    // **两遍编码（四分之一分辨率）**：第一遍在低分辨率上预分析场景复杂度，第二遍据此
+    // 分配比特。桌面文本的比特分配极不均匀（大片纯色 + 少量高频笔画），单遍 VBR 会把
+    // 笔画一起量化掉。四分之一分辨率是延迟/画质的最佳折衷（增益接近全分辨率两遍，
+    // 开销小一个量级）。
+    config.rcParams.multiPass =
+        sys::_NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+    // **空间自适应量化**：把比特从平坦背景挪到文字/控件边缘。旧实现完全依赖预设，
+    // 而 LOW_LATENCY 预设默认不开 AQ——这正是「同码率下字发糊」的编码器侧主因之一。
+    // 强度取 8（0..15 的中上档）：再高会在纯色背景上产生可见的块状纹理。
+    config.rcParams.set_enableAQ(1);
+    config.rcParams.set_aqStrength(8);
 
     // SAFETY: `encodeCodecConfig` 是 union；本会话固定走 H.264 分支，且 union
     // 已由 preset 配置按 H.264 初始化。
@@ -730,7 +745,7 @@ impl<'a> NvencEncoder<'a> {
         init.encodeConfig = &raw mut stored_config;
         init.maxEncodeWidth = config.width;
         init.maxEncodeHeight = config.height;
-        init.tuningInfo = sys::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+        init.tuningInfo = sys::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY;
         init.bufferFormat = config.input_format.buffer_format();
 
         // 顺序与 NVIDIA 示例一致：先初始化编码器，再注册/映射输入、创建码流缓冲。

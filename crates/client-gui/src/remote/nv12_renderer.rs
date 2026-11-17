@@ -75,10 +75,30 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
     return out;
 }
 
+fn sample_y(uv: vec2<f32>) -> f32 {
+    return (textureSample(tex_y, samp, uv).r * 255.0 - 16.0) / 219.0;
+}
+
+// 一个输出像素在纹理上覆盖多少纹素（放大时 < 1）。
+fn footprint(uv: vec2<f32>) -> f32 {
+    let dims = vec2<f32>(textureDimensions(tex_y));
+    return max(length(dpdx(uv) * dims), length(dpdy(uv) * dims));
+}
+
 // 采样 NV12 并按 BT.709 limited range 转成 gamma 编码的 R'G'B'。
-fn sample_rgb(uv: vec2<f32>) -> vec3<f32> {
-    // 两张纹理都是**非 sRGB** 格式，采样值就是原始字节的归一化值。
-    let yv = (textureSample(tex_y, samp, uv).r * 255.0 - 16.0) / 219.0;
+//
+// **缩小时的亮度预滤波**：单个双线性 tap 只覆盖 4 个纹素，而缩小（远端 4K 画进小窗口）
+// 时一个输出像素实际覆盖更多，欠采样会让文字发虚且随缩放比闪烁。这里按导数估算覆盖
+// 面积，缩小时额外做 4 个对角 tap 的近似盒式平均；放大时保持原来的单 tap。
+// 色度保持单 tap：它本来就是半分辨率，多 tap 的收益远小于代价。
+fn sample_rgb(uv: vec2<f32>, foot: f32) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(tex_y));
+    let step = foot * 0.25 / dims;
+    let boxed = (sample_y(uv + vec2<f32>(-step.x, -step.y))
+        + sample_y(uv + vec2<f32>(step.x, -step.y))
+        + sample_y(uv + vec2<f32>(-step.x, step.y))
+        + sample_y(uv + vec2<f32>(step.x, step.y))) * 0.25;
+    let yv = mix(sample_y(uv), boxed, smoothstep(1.2, 2.0, foot));
     let chroma = textureSample(tex_uv, samp, uv).rg;
     let u = (chroma.x * 255.0 - 128.0) / 224.0;
     let v = (chroma.y * 255.0 - 128.0) / 224.0;
@@ -99,13 +119,13 @@ fn linear_from_gamma_rgb(gamma: vec3<f32>) -> vec3<f32> {
 // sRGB 目标：片元输出线性值，由硬件编码。
 @fragment
 fn fs_linear_target(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(linear_from_gamma_rgb(sample_rgb(in.uv)), 1.0);
+    return vec4<f32>(linear_from_gamma_rgb(sample_rgb(in.uv, footprint(in.uv))), 1.0);
 }
 
 // 非 sRGB 目标：片元输出 gamma 编码值（egui 的约定）。
 @fragment
 fn fs_gamma_target(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(sample_rgb(in.uv), 1.0);
+    return vec4<f32>(sample_rgb(in.uv, footprint(in.uv)), 1.0);
 }
 ";
 
@@ -782,10 +802,27 @@ impl egui_wgpu::CallbackTrait for Nv12Callback {
 
 #[cfg(test)]
 mod tests {
-    //! 只覆盖**纯逻辑**：脏矩形几何、按行 staging 拷贝、合成缓冲的原子应用与脏区合并。
-    //! 不需要 GPU（`take_upload` 只做 CPU 侧拷贝）。
+    //! 只覆盖**纯逻辑**：脏矩形几何、按行 staging 拷贝、合成缓冲的原子应用与脏区合并，
+    //! 以及内联 WGSL 的语义校验。不需要 GPU（`take_upload` 只做 CPU 侧拷贝）。
 
     use super::*;
+
+    /// 内联着色器必须能通过 naga 的解析与语义校验。
+    ///
+    /// wgpu 只在**运行期**创建管线时校验 WGSL：写错一个函数重载（例如 `mix`/`smoothstep`
+    /// 的标量重载）不会有编译错误，而是用户一开会话就 panic。这条把它提前到测试里。
+    #[test]
+    fn nv12_shader_is_valid_wgsl() {
+        let module = naga::front::wgsl::parse_str(NV12_SHADER)
+            .expect("NV12 着色器应能通过 WGSL 解析");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .expect("NV12 着色器应通过语义校验");
+    }
 
     /// 8×8 的紧包 NV12：Y = `0..64`、UV = `100..132`（取值便于手算期望字节）。
     fn frame_8x8() -> DecodedNv12 {

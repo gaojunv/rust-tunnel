@@ -54,7 +54,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
     CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
+    CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMaxFrameRate,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoOutputFrameRate, ICodecAPI, IMFActivate,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformHaveOutput,
@@ -1061,7 +1062,11 @@ fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) {
     if let Err(err) = apply_rate_control(codec, bitrate_bps, fps) {
         tracing::debug!(%err, "编码器拒绝码率控制参数，按 MFT 默认值继续");
     }
+    // `AVEncCommonQuality` 是 0..100 的**质量优先**提示（越高越照顾画质）。硬件 MFT 默认
+    // 往往落在「速度优先」一侧，桌面文本的高频细节（笔画边缘）会先被量化掉。取 70：
+    // 明确偏向画质，又不到 100 那种可能明显增加编码耗时的程度。驱动不支持时只记 debug。
     let settings = [
+        (&CODECAPI_AVEncCommonQuality, 70),
         (&CODECAPI_AVEncCommonLowLatency, 1),
         (&CODECAPI_AVEncMPVDefaultBPictureCount, 0),
     ];
