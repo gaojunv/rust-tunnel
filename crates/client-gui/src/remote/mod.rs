@@ -16,8 +16,8 @@
 pub mod clipboard_sync;
 pub mod desktop_follow;
 // 实例 GPU 采集的纯逻辑策略（会话锁存 + 显示器 id 映射）。全平台编译，便于单测。
-mod instance_gpu;
 pub mod input_queue;
+mod instance_gpu;
 pub mod nv12_renderer;
 pub mod reconnect;
 pub mod view_scale;
@@ -1410,6 +1410,12 @@ pub struct FrameState {
     /// 放在这里而不是引擎另开计数：帧到达本就要进这把锁，顺手自增是零成本；另开结构反而要再
     /// 同步一次。计数器会回绕（`u32`），UI 用 `wrapping_sub` 取差。
     pub frame_count: u32,
+    /// 最近一次画面**到达**（[`GuiFrameSink::on_frame`] / [`GuiFrameSink::on_patch`] 写入共享槽）
+    /// 的时刻。
+    ///
+    /// 诊断用：`upload()` 在下一帧重绘时用它算「到达 → 上屏」的调度延迟（见
+    /// [`rust_tunnel_remote::latency`] 的 `Stage::Present`）。`None` = 本次会话还没有画面。
+    pub arrived_at: Option<std::time::Instant>,
     /// 本会话累计**上屏**的补丁批数（与 `frame_count` 同款：UI 按秒差分即得到补丁速率）。
     ///
     /// 只有成功应用到合成帧的批次才计数；因无基底/尺寸不符/矩形非法被整批丢弃的不算。
@@ -1484,6 +1490,7 @@ impl FrameSink for GuiFrameSink {
                 guard.last_capture_ts_us = capture_ts;
             }
             guard.frame_count = guard.frame_count.wrapping_add(1);
+            guard.arrived_at = Some(std::time::Instant::now());
         }
         self.ctx.request_repaint_of(self.viewport);
     }
@@ -1530,6 +1537,7 @@ impl FrameSink for GuiFrameSink {
             return;
         }
         guard.patch_count = guard.patch_count.wrapping_add(1);
+        guard.arrived_at = Some(std::time::Instant::now());
         guard.last_capture_ts_us = capture_timestamp(patch.capture_ts_us);
         drop(guard);
         self.ctx.request_repaint_of(self.viewport);
@@ -1652,6 +1660,14 @@ pub struct RemoteView {
     /// 只用于统计角标：这是判断「字糊是编码问题还是显示缩放问题」的关键读数——
     /// 明显偏离 1000 就说明正在双线性放大/缩小（见 `view_scale` 的模块文档）。
     pub view_scale_permille: u32,
+    /// 诊断：上一次 `upload()` 时已经描过的 `FrameState::frame_count`（判断有没有新画面）。
+    ///
+    /// 与 `frame_count` 同为 `u32` 回绕语义；[`Self::reset_session`] 清零。
+    last_presented_frames: u32,
+    /// 诊断：「到达 → 上屏」窗口（每秒汇总一次，见 [`rust_tunnel_remote::latency`]）。
+    present_window: rust_tunnel_remote::latency::LatencyWindow,
+    /// 诊断：上一次输出上屏汇总的时刻。
+    present_window_at: Instant,
     /// CPU 回退路径（Glow）上一次转换的 NV12 内容标识 `(generation, version)`。
     ///
     /// GPU 路径用不上（上传去重由 [`CompositeFrame`] 的脏区状态负责）；CPU 回退每次都要整帧
@@ -1791,6 +1807,9 @@ impl RemoteView {
             wgpu_target_format: None,
             last_paint: None,
             view_scale_permille: 0,
+            last_presented_frames: 0,
+            present_window: rust_tunnel_remote::latency::LatencyWindow::new(),
+            present_window_at: Instant::now(),
             nv12_key: None,
             sink_installed: false,
             selected_display: None,
@@ -1955,7 +1974,13 @@ impl RemoteView {
         if let Ok(mut guard) = self.shared.lock() {
             guard.last_capture_ts_us = None;
             guard.cursor_shape = None;
+            // 诊断：`frame_count` 跨会话累计，把上屏基线对齐到当前值，并清掉上一场的到达时刻——
+            // 否则新会话首帧会用旧时刻算出一个虚假的「到达 → 上屏」。
+            guard.arrived_at = None;
+            self.last_presented_frames = guard.frame_count;
         }
+        self.present_window.clear();
+        self.present_window_at = Instant::now();
         // 输入计数一并归零（与 `fps` 同属「本会话」的读数，见 `begin_session` / `end_session`）。
         self.input_count = 0;
         self.input_base = 0;
@@ -2076,12 +2101,54 @@ impl RemoteView {
     /// 这里只做一次指针级 `Arc` 克隆，**不复制像素**，补丁的脏矩形由渲染线程 `prepare` 取走；
     /// 没有 wgpu（Glow / 无 render state）时保留 CPU 回退，整帧转成 RGBA——只在内容变化时重转。
     pub fn upload(&mut self, ctx: &egui::Context) -> Option<FramePaint> {
-        // 1) RGBA（VP9）整帧：取走即清（NV12 帧不再进这里，见 `FrameState::latest`）。
-        let frame = self
-            .shared
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.latest.take());
+        // 一次取锁拿齐本帧要用的东西（`latest` / `composite` / 诊断计数）——原来分两次加锁，
+        // 两次之间到达的新帧会让两条路径看到不同代的内容。
+        let (frame, composite, frame_count, arrived_at) = match self.shared.lock() {
+            Ok(mut guard) => (
+                guard.latest.take(),
+                guard.composite.clone(),
+                guard.frame_count,
+                guard.arrived_at,
+            ),
+            Err(_) => (None, None, 0, None),
+        };
+        // 诊断：到达 → 本次重绘的上屏调度延迟（见 `rust_tunnel_remote::latency` 的
+        // `Stage::Present`）。只在有新画面时采样；每秒一行汇总。
+        if frame_count != self.last_presented_frames {
+            self.last_presented_frames = frame_count;
+            if let Some(arrived_at) = arrived_at {
+                let present_us =
+                    u64::try_from(arrived_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if rust_tunnel_remote::latency::enabled() {
+                    self.present_window
+                        .record(rust_tunnel_remote::latency::Stage::Present, present_us);
+                    if rust_tunnel_remote::latency::frame_logs()
+                        || present_us > rust_tunnel_remote::latency::slow_threshold_us()
+                    {
+                        tracing::info!(
+                            target: "latency",
+                            side = "present",
+                            frames = frame_count,
+                            present_us,
+                            "上屏阶段延迟"
+                        );
+                    }
+                    if self.present_window_at.elapsed() >= Duration::from_secs(1) {
+                        let summary = self.present_window.summary();
+                        self.present_window.clear();
+                        self.present_window_at = Instant::now();
+                        if !summary.is_empty() {
+                            tracing::info!(
+                                target: "latency",
+                                side = "present",
+                                %summary,
+                                "上屏每秒阶段延迟"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Some(frame) = frame {
             if let Some((pixel_w, pixel_h)) = valid_frame_dims(&frame) {
                 if let Some(image) = frame_to_image(&frame, pixel_w, pixel_h) {
@@ -2091,11 +2158,6 @@ impl RemoteView {
         }
 
         // 2) NV12 共享合成帧（全帧 + 补丁）。
-        let composite = self
-            .shared
-            .lock()
-            .ok()
-            .and_then(|guard| guard.composite.clone());
         let Some(frame) = composite else {
             return self.last_paint.clone();
         };

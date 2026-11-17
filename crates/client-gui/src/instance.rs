@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rust_tunnel_client::ClientConfig;
 use rust_tunnel_client::config::ClientCli;
+use rust_tunnel_client::ClientConfig;
 use rust_tunnel_remote::{ApprovalPolicy, RemoteManager, APPROVAL_TIMEOUT};
 
 use crate::remote::{PlatformMode, SessionRelease};
@@ -114,20 +114,39 @@ pub fn default_download_dir() -> PathBuf {
     program_data_dir().join("download")
 }
 
+/// [`load_host_config`] 的返回值：配置本体 + 实例专用开关。
+///
+/// 不用元组：`approval` / `auto_lock` / `native_resolution` / 延迟日志两个开关都是「文件名 →
+/// 语义」的映射，位置元组一长就会在调用点摆错顺序。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "字段与 host.toml 的键一一对应，按配置文件形状建模"
+)]
+pub struct HostSettings {
+    /// 客户端配置（`server`/`password`/`name`/`tls*`/`log`）。
+    pub config: ClientConfig,
+    /// 接入确认策略。
+    pub approval: ApprovalPolicy,
+    /// 会话结束后是否自动锁定屏幕。
+    pub auto_lock: bool,
+    /// 是否允许原生分辨率（4K）编码。
+    pub native_resolution: bool,
+    /// 是否输出分阶段延迟诊断日志（默认关闭）。
+    pub latency_log: bool,
+    /// 延迟诊断日志是否每帧一行（量大；默认只打每秒汇总 + 慢帧）。
+    pub latency_log_frames: bool,
+}
+
 /// 读 `host.toml`：复用 `client` 的 [`ClientConfig`]（同一套 `server`/`password`/`name`/
 /// `tls*` 字段），审批策略与「会话结束后自动锁屏」取同文件里的 `approval` / `auto_lock`
 /// 键（[`ClientConfigFile`] 不认识它们，故单独解析一次）。
-///
-/// 返回 `(配置, 审批策略, 会话结束后自动锁屏, 是否允许原生分辨率编码)`。
 ///
 /// [`ClientConfigFile`]: rust_tunnel_client::config::ClientConfigFile
 ///
 /// # Errors
 ///
 /// 文件不存在（给出期望路径与「应由服务安装时创建」的说明）或字段不合法时返回 `Err`。
-pub fn load_host_config(
-    path: &Path,
-) -> anyhow::Result<(ClientConfig, ApprovalPolicy, bool, bool)> {
+pub fn load_host_config(path: &Path) -> anyhow::Result<HostSettings> {
     if !path.exists() {
         anyhow::bail!(
             "找不到实例配置 {}。\n\
@@ -159,12 +178,14 @@ pub fn load_host_config(
     let config = ClientConfig::from_cli(cli)
         .map_err(|err| anyhow::anyhow!("实例配置无效（{}）：{err}", path.display()))?;
     let extras = read_host_extras(path);
-    Ok((
+    Ok(HostSettings {
         config,
-        extras.approval.unwrap_or_default(),
-        extras.auto_lock,
-        extras.native_resolution.unwrap_or(true),
-    ))
+        approval: extras.approval.unwrap_or_default(),
+        auto_lock: extras.auto_lock,
+        native_resolution: extras.native_resolution.unwrap_or(true),
+        latency_log: extras.latency_log,
+        latency_log_frames: extras.latency_log_frames,
+    })
 }
 
 /// `host.toml` 里与实例有关、但 [`ClientConfig`] 不认识的字段。
@@ -184,6 +205,12 @@ struct HostExtras {
     /// BitBlt 帧仍按 1920 封顶。要回到旧行为写 `native_resolution = false` 即可。
     #[serde(default)]
     native_resolution: Option<bool>,
+    /// 分阶段延迟诊断日志；缺省 `false`。由 GUI「安装并启用」写入当前选择。
+    #[serde(default)]
+    latency_log: bool,
+    /// 延迟诊断日志是否每帧一行；缺省 `false`（只打每秒汇总 + 慢帧）。
+    #[serde(default)]
+    latency_log_frames: bool,
 }
 
 /// 从 `host.toml` 里单独解析 `approval` / `auto_lock`（解析失败按缺省处理并告警）。
@@ -254,9 +281,7 @@ fn init_logging(level: &str, config_path: &Path) {
         .open(&log_path)
     {
         Ok(file) => {
-            let _ = builder
-                .with_writer(std::sync::Mutex::new(file))
-                .try_init();
+            let _ = builder.with_writer(std::sync::Mutex::new(file)).try_init();
         }
         Err(err) => {
             eprintln!("实例日志文件打不开（{}）：{err}", log_path.display());
@@ -315,15 +340,31 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
 
     // 配置读不出来时，日志还没起来（级别来自配置），而服务把本进程的 stderr 丢弃了——
     // 直接落文件，否则这条失败对任何人都不可见（见 `log_config_failure` 的文档）。
-    let (config, approval, auto_lock, native_resolution) =
-        match load_host_config(&opts.config_path) {
+    let host = match load_host_config(&opts.config_path) {
         Ok(loaded) => loaded,
         Err(err) => {
             log_config_failure(&opts.config_path, &err);
             return Err(err);
         }
     };
+    let HostSettings {
+        config,
+        approval,
+        auto_lock,
+        native_resolution,
+        latency_log,
+        latency_log_frames,
+    } = host;
     init_logging(&config.log, &opts.config_path);
+    // 延迟诊断日志：`host.toml` 是实例的唯一来源（GUI 的「安装并启用」会把当前选择带进来）。
+    // 环境变量仍可作为兜底——这里只在显式打开时覆盖，未打开时保留 env 的默认值。
+    if latency_log {
+        rust_tunnel_remote::latency::set_mode(if latency_log_frames {
+            rust_tunnel_remote::latency::Mode::Frames
+        } else {
+            rust_tunnel_remote::latency::Mode::Summary
+        });
+    }
     warn_unattended(approval, &opts.config_path);
     tracing::info!(
         server = %config.server,
@@ -332,6 +373,8 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         download = %opts.download_dir.display(),
         auto_lock,
         native_resolution,
+        latency_log,
+        latency_log_frames,
         "无头实例启动"
     );
 
@@ -452,10 +495,8 @@ mod tests {
 
     /// 造一个进程内唯一的临时目录（沿用 `service_ui` 的做法）。
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rust-tunnel-instance-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rust-tunnel-instance-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

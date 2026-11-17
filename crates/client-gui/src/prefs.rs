@@ -175,6 +175,16 @@ pub struct GuiPrefs {
     /// [`GuiPrefs::remote_native_resolution`] 的默认值迁移标记（只跑一次）。
     #[serde(default)]
     pub remote_native_resolution_migrated: bool,
+    /// 远程控制**分阶段延迟诊断日志**开关（默认关闭）。
+    ///
+    /// 打开后引擎每秒输出一行阶段汇总（采集/编码/发送/网络/解码/上屏），慢帧另打明细，
+    /// 用于定位「切标签/切文件夹为什么慢」。日志走 GUI 的「日志」页；**需在两端分别打开**。
+    /// 运行中切换立即生效（[`rust_tunnel_remote::latency::set_mode`]），无需重启。
+    #[serde(default)]
+    pub remote_latency_log: bool,
+    /// 延迟诊断日志是否**每帧一行**（量大；默认关闭 = 只打每秒汇总 + 慢帧）。
+    #[serde(default)]
+    pub remote_latency_log_frames: bool,
     /// 自动检查客户端更新。**默认开启**：服务端在注册时也会主动推送一次，此项控制的是
     /// 长连接期间的 6 小时轮询。关掉后仍可在设置页手动检查。
     #[serde(default = "default_true")]
@@ -211,6 +221,8 @@ impl Default for GuiPrefs {
             // 与字段上的 `#[serde(default = "default_true")]` 保持一致（理由见那里）。
             remote_native_resolution: true,
             remote_native_resolution_migrated: false,
+            remote_latency_log: false,
+            remote_latency_log_frames: false,
             update_auto_check: true,
             update_skipped_version: None,
         }
@@ -352,6 +364,25 @@ fn save_unlocked(prefs: &GuiPrefs) -> Result<(), config_store::StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 延迟诊断日志开关能 TOML 往返（缺键时落到关闭）。
+    #[test]
+    fn latency_log_prefs_round_trip() {
+        let prefs = GuiPrefs {
+            remote_latency_log: true,
+            remote_latency_log_frames: true,
+            ..GuiPrefs::default()
+        };
+        let text = toml::to_string(&prefs).expect("序列化");
+        let parsed: GuiPrefs = toml::from_str(&text).expect("反序列化");
+        assert!(parsed.remote_latency_log);
+        assert!(parsed.remote_latency_log_frames);
+
+        // 旧配置缺键：默认关闭，不得因反序列化失败丢掉整份偏好。
+        let legacy: GuiPrefs = toml::from_str("theme = \"dark\"\n").expect("旧配置应能解析");
+        assert!(!legacy.remote_latency_log);
+        assert!(!legacy.remote_latency_log_frames);
+    }
 
     /// 旧配置（未迁移 + 旧默认 true）→ 迁移后标志置位、自动隐藏强制关闭。
     #[test]

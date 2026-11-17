@@ -719,7 +719,9 @@ fn spawn_runtime(
         // GUI 全局日志初始化：立即可见（否则日志面板在首次连接前为空）
         {
             use rust_tunnel_client::log_buffer::LogBuffer as LB;
-            use rust_tunnel_common::init_logging_with_layer;
+            use rust_tunnel_common::init_logging_with_layers;
+            use tracing_subscriber::filter::filter_fn;
+            use tracing_subscriber::Layer as _;
             let lb: Arc<LB> = log_buffer.clone();
             // 必须用进程级共享 layer 注册：run_client_inner 内部复用同一实例做
             // sender 热替换（日志上报服务端）；另建实例会导致其收不到事件、
@@ -728,7 +730,16 @@ fn spawn_runtime(
             layer.set_log_buffer(lb);
             // 用当前 log 级别（若有配置否则 info）初始化；重复 init 内部 try_init 会静默忽略
             let lvl = bootstrap.as_ref().map(|c| c.log.as_str()).unwrap_or("info");
-            init_logging_with_layer(lvl, layer);
+            // 延迟诊断专用文件 sink：普通 GUI 只有 stdout + 500 条环形缓冲（会被正常日志滚掉），
+            // 故把 `target == "latency"` 的行另存一份。**首次写入才创建文件**——没开延迟日志
+            // 时不会留下一个空文件。
+            let latency_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(LatencyFileWriter::new(
+                    latency_log_path(),
+                )))
+                .with_filter(filter_fn(|meta| meta.target() == "latency"));
+            init_logging_with_layers(lvl, layer, latency_layer);
             tracing::info!("GUI 已启动");
             tracing::info!("配置路径: {}", config_store::default_path().display());
         }
@@ -1165,6 +1176,76 @@ fn install_startup_diagnostics() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// 普通 GUI 的延迟诊断日志路径：`%LOCALAPPDATA%\rust-tunnel\latency.log`。
+///
+/// 与 [`install_startup_diagnostics`] 用同一个目录（`data_local_dir()/rust-tunnel`）。
+fn latency_log_path() -> std::path::PathBuf {
+    let dir = directories::BaseDirs::new().map_or_else(std::env::temp_dir, |base| {
+        base.data_local_dir().join("rust-tunnel")
+    });
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("latency.log")
+}
+
+/// 只收 `target == "latency"` 的追加文件 sink（**首次写入时才打开文件**）。
+///
+/// 普通 GUI 没有日志文件：stdout 在窗口程序里丢失，日志面板只有 500 条环形缓冲，而延迟诊断
+/// 每秒会写若干行、很容易被正常日志冲掉。这个 writer 让现场可以直接把文件发给开发者。
+/// 没开延迟日志时不会有任何事件写进来，也就不会创建空文件。
+struct LatencyFileWriter {
+    /// 目标路径。
+    path: std::path::PathBuf,
+    /// 惰性打开的文件句柄（首次 `write` 才 `create + append`）。
+    file: Mutex<Option<std::fs::File>>,
+}
+
+impl LatencyFileWriter {
+    /// 建一个惰性 writer（此刻不碰磁盘）。
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            file: Mutex::new(None),
+        }
+    }
+}
+
+impl std::io::Write for LatencyFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            *guard = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        if let Some(file) = guard.as_mut() {
+            file.write_all(buf)?;
+            // 逐行落盘：诊断日志的价值在「进程被杀/断电后还在」，缓冲没有意义。
+            file.flush()?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut guard = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(file) = guard.as_mut() {
+            std::io::Write::flush(file)?;
+        }
+        Ok(())
+    }
+}
+
 /// 追加一段文本到启动日志（失败静默，诊断本身不能影响启动）。
 fn append_startup_log(path: &std::path::Path, text: &str) {
     use std::io::Write as _;
@@ -1360,6 +1441,15 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // 偏好须在构建托盘与运行时之前加载：托盘的「允许被远程控制」勾选项要以持久化值为初态，
     // 且远程引擎的初始开关态取自该偏好（否则重启后菜单显示未勾选、而实际仍在被控状态）。
     let prefs = prefs::load();
+    // 延迟诊断日志：环境变量只作默认值；偏好在启动时显式打开则覆盖它（运行中可在
+    // 设置页随时切换，见 `rust_tunnel_remote::latency::set_mode`）。
+    if prefs.remote_latency_log {
+        rust_tunnel_remote::latency::set_mode(if prefs.remote_latency_log_frames {
+            rust_tunnel_remote::latency::Mode::Frames
+        } else {
+            rust_tunnel_remote::latency::Mode::Summary
+        });
+    }
     // 「跳过此版本」镜像必须在**控制通道启动前**就位：托盘线程 50 ms 一轮，
     // 可能在 `GuiApp` 构造前就看到服务端推送的可用更新。
     app_state

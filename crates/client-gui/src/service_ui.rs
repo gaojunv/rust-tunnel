@@ -145,16 +145,26 @@ pub struct HostSeed {
     /// 是否允许原生分辨率（4K）编码。**不写进 host.toml 时缺省也是 true**；这里落盘是为了
     /// 让「GUI 里的选择」原样带到服务实例（用户在设置里关掉，装完的实例也不该偷偷开着）。
     native_resolution: bool,
+    /// 分阶段延迟诊断日志（安装时把 GUI 当前开关原样带进 `host.toml`）。
+    latency_log: bool,
+    /// 延迟诊断日志是否每帧一行。
+    latency_log_frames: bool,
 }
 
 impl HostSeed {
     /// 从当前客户端配置构造（不改配置本身，只做一次快照）。
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "参数就是 host.toml 里那几组开关，打包成结构体只会让调用点多一层样板"
+    )]
     #[must_use]
     pub fn from_config(
         config: &rust_tunnel_client::ClientConfig,
         approval: ApprovalPolicy,
         auto_lock: bool,
         native_resolution: bool,
+        latency_log: bool,
+        latency_log_frames: bool,
     ) -> Self {
         Self {
             server: config.server.clone(),
@@ -167,6 +177,8 @@ impl HostSeed {
             approval,
             auto_lock,
             native_resolution,
+            latency_log,
+            latency_log_frames,
         }
     }
 
@@ -204,6 +216,8 @@ impl HostSeed {
             approval: ApprovalPolicy,
             auto_lock: bool,
             native_resolution: bool,
+            latency_log: bool,
+            latency_log_frames: bool,
         }
         let file = File {
             server: &self.server,
@@ -216,6 +230,8 @@ impl HostSeed {
             approval: self.approval,
             auto_lock: self.auto_lock,
             native_resolution: self.native_resolution,
+            latency_log: self.latency_log,
+            latency_log_frames: self.latency_log_frames,
         };
         toml::to_string(&file).map_err(|err| format!("生成 host.toml 失败：{err}"))
     }
@@ -805,7 +821,7 @@ mod tests {
             ..Default::default()
         };
 
-        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto, true, true);
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto, true, true, true, false);
         assert_eq!(seed.approval(), ApprovalPolicy::Auto);
         let text = seed.to_toml().unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -827,6 +843,12 @@ mod tests {
             Some(true),
             "原生分辨率偏好应原样写进 host.toml（实例据此决定编码宽度）"
         );
+        assert_eq!(
+            parsed["latency_log"].as_bool(),
+            Some(true),
+            "延迟诊断日志开关应原样写进 host.toml"
+        );
+        assert_eq!(parsed["latency_log_frames"].as_bool(), Some(false));
         // 没有 SNI 时不该写一个空字符串键（实例侧会把它当成真的 SNI）。
         assert!(parsed.get("tls_server_name").is_none());
     }
@@ -840,7 +862,8 @@ mod tests {
             password: "token".to_owned(),
             ..Default::default()
         };
-        let seed = HostSeed::from_config(&config, ApprovalPolicy::Confirm, false, false);
+        let seed =
+            HostSeed::from_config(&config, ApprovalPolicy::Confirm, false, false, false, false);
         let path = write_temp_host_toml(&seed).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("server = \"127.0.0.1:8080\""), "{text}");

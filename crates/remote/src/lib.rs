@@ -63,6 +63,7 @@ pub mod crypto;
 pub mod error;
 pub mod file;
 pub(crate) mod input_buffer;
+pub mod latency;
 pub mod manager;
 pub(crate) mod nat;
 pub(crate) mod punch;

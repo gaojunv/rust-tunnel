@@ -17,6 +17,31 @@ pub fn init_logging_with_level(default_level: &str) {
         .ok();
 }
 
+/// 与 [`init_logging_with_layer`] 相同，但接受**两个**额外 layer。
+///
+/// GUI 需要同时注册「日志缓冲（面板）」与「延迟诊断专用文件 sink」两层；`tracing_subscriber`
+/// 没有为元组实现 `Layer`，故这里显式串两次 `.with()`。
+pub fn init_logging_with_layers<L, M>(default_level: &str, first: L, second: M)
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+    M: tracing_subscriber::Layer<
+            tracing_subscriber::layer::Layered<L, tracing_subscriber::Registry>,
+        > + Send
+        + Sync
+        + 'static,
+{
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    tracing_subscriber::registry()
+        .with(first)
+        .with(second)
+        .with(tracing_subscriber::fmt::layer().with_target(true))
+        .with(filter)
+        .try_init()
+        .ok();
+}
+
 /// Initialize logging with an additional custom layer (e.g., LogLayer for log capture).
 /// The extra_layer is registered alongside the default fmt layer and EnvFilter.
 /// The extra_layer is subscribed directly to [`tracing_subscriber::Registry`] so the function bound
