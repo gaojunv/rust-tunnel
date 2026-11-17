@@ -823,6 +823,12 @@ const MODIFIER_CODES: [(u8, u32); 4] = [
     (modifier::META, keycode::META),
 ];
 
+/// 中键「点按」与「拖拽平移」的分界（逻辑点）：按下到抬起的位移不超过它，就当成一次中键点按。
+///
+/// 画面溢出滚动区时中键是**本地平移手势**（见 [`RemoteView::pan_anchor`]）。原地松手仍要
+/// 把这次中键点击送给远端，否则「平移可用」就顺带废掉了远端的中键（浏览器自动滚动、CAD 等）。
+const PAN_CLICK_SLOP: f32 = 4.0;
+
 /// 鼠标键顺序（下标与 `mouse_forwarded` 对应）。
 const MOUSE_BUTTONS: [MouseButton; 3] =
     [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
@@ -1660,6 +1666,12 @@ pub struct RemoteView {
     inputs: SessionInputs,
     /// 上一次发出的鼠标位置（去重）。
     last_mouse: Option<(i32, i32)>,
+    /// 中键拖拽平移的锚点：中键按下时指针在画面内的位置（只有画面溢出视口时才登记）。
+    ///
+    /// 画面在固定比例档溢出滚动区时，中键拖拽是**本地平移手势**：按下不转达远端（[`Self::capture_input`]
+    /// 拦截），由 UI 侧 `pan_with_middle` 把指针位移换算成滚动偏移；抬起时若位移不超过
+    /// [`PAN_CLICK_SLOP`] 才补发一次中键点按，否则只结束平移。`None` = 当前没有平移中的中键。
+    pub(crate) pan_anchor: Option<egui::Pos2>,
     /// 输入门控状态机（按下需门控、抬起按「是否转达过」处理）。
     gate: InputGate,
     /// 后台读取本机剪贴板的结果槽（非阻塞）；携带发起请求时的「代」编号（见
@@ -1784,6 +1796,7 @@ impl RemoteView {
             selected_display: None,
             inputs: SessionInputs::default(),
             last_mouse: None,
+            pan_anchor: None,
             gate: InputGate::default(),
             clipboard_read: Arc::new(Mutex::new(None)),
             clipboard_read_gen: 0,
@@ -1926,6 +1939,8 @@ impl RemoteView {
         self.view_scale_permille = 0;
         self.nv12_key = None;
         self.last_mouse = None;
+        // 平移手势属于上一场会话：锚点留着的话，下一场第一次中键拖动会在没有任何按下时平移。
+        self.pan_anchor = None;
         self.gate.reset();
         self.capture_this_frame = false;
         self.selected_display = None;
@@ -2162,11 +2177,13 @@ impl RemoteView {
         // 不置 `capture_this_frame`，让窗口回调在本帧补发一次抬起——刚改了键盘语义，先松开最安全。
         if self.exclusive_keyboard && exit_combo_pressed(ui.ctx()) {
             self.exclusive_keyboard = false;
+            self.pan_anchor = None;
             return;
         }
         // 设置弹窗打开期间不转发任何输入：弹窗悬浮在画面之上，点击/按键都只属于本地 UI。
         // 本帧不置 `capture_this_frame`，窗口回调会据此补发一次按键抬起。
         if self.settings_open {
+            self.pan_anchor = None;
             return;
         }
         // 记录「本帧已捕获」：窗口回调结尾据它决定是否补发抬起（见 [`RemoteView::capture_this_frame`]）。
@@ -2182,6 +2199,15 @@ impl RemoteView {
         let panel_layer = ui.layer_id();
         let in_image =
             |pos: egui::Pos2| clip.contains(pos) && ui.ctx().layer_id_at(pos) == Some(panel_layer);
+        // 画面溢出滚动区（固定比例档）时，中键拖拽是**本地平移手势**：按下不转达远端，
+        // 由 UI 侧 `pan_with_middle` 把指针位移换算成滚动偏移；原地松开才补发一次中键点按。
+        // 「溢出」按画面矩形与视口裁剪矩形比：`Fit` 两档永远不溢出，中键照常转达。
+        let pannable = rect.width() > ui.clip_rect().width() + 0.5
+            || rect.height() > ui.clip_rect().height() + 0.5;
+        if !pannable {
+            // 不溢出（两个 fit 档 / 换回小窗口）：没有可平移的内容，锚点不该跨模式存活。
+            self.pan_anchor = None;
+        }
 
         // 1) 鼠标移动（去重后发送）。取**原始**指针位置而不是 `response.hover_pos()`——`hovered()`
         //    会被 egui 的交互簿记影响（任何别的控件被拖动、或画面上方有别的 layer 覆盖时它为
@@ -2232,6 +2258,24 @@ impl RemoteView {
                 let Some(button) = mouse_button_of(*button) else {
                     continue;
                 }; // 只认左/右/中键
+                   // 中键在画面溢出视口时是**本地平移手势**：按下不转达（只登记锚点，UI 侧据此
+                   // 平移），抬起时没拖动过才补发一次中键点按。指针不在画面上（工具条/留白）时
+                   // 不算平移，锚点清空——那种按下本来也不会被门控转达。
+                if button == MouseButton::Middle && pannable {
+                    if *pressed {
+                        self.pan_anchor = in_image(*pos).then_some(*pos);
+                    } else if let Some(anchor) = self.pan_anchor.take() {
+                        if anchor.distance(*pos) <= PAN_CLICK_SLOP {
+                            // 原地松开：把这次中键点击补发出去（按下+抬起配对，一次发完）。
+                            for pressed in [true, false] {
+                                if let Some(event) = self.gate.mouse_button(button, pressed, true) {
+                                    self.forward_input(manager, event);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(event) = self.gate.mouse_button(button, *pressed, in_image(*pos)) {
                     self.forward_input(manager, event);
                 }
@@ -2492,6 +2536,9 @@ impl RemoteView {
         for event in self.gate.release_all() {
             manager.send_input(event);
         }
+        // 中键平移 Anchor 不能跨「本帧没捕获输入 / 窗口失焦」存活：那时抬起事件可能已经丢失，
+        // 留着它会让下一次中键在画面上按下时被误认成「继续平移」（多滚一段）。
+        self.pan_anchor = None;
     }
 
     /// 算当前档位下应下发给子窗口的内尺寸（`FitScreen` 用远端分辨率，未知时用占位分辨率）。

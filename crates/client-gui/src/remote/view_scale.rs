@@ -16,8 +16,9 @@
 //! 本模块的输入是远端**像素**，输出是 egui **逻辑点**，两者相差 `pixels_per_point`。
 //! 早期实现把它当成 1.0，于是 150% 缩放的屏幕上「100%」档实际是 1.5 倍的双线性放大，
 //! 「适应窗口」也整体偏大——这是「所有字都发虚」的一层独立原因（与码率无关）。
-//! 现在所有比例都以**物理像素**为基准：`Fit` 仍是「铺满窗口」（可放大可缩小），但比例
-//! 不再被 DPI 二次放大；要严格 1:1 用 `100%` 档。
+//! 现在所有比例都以**物理像素**为基准：`Fit` 是「铺满窗口」（可放大可缩小），
+//! `FitNoUpscale` 是「只缩不放、1:1 居中留白」，两者都不被 DPI 二次放大；
+//! 要严格 1:1 用 `100%` 档。
 //!
 //! 本模块只做**纯几何换算与档位定义**（可单测），不碰 egui 上下文。
 
@@ -34,6 +35,10 @@ pub enum ViewScale {
     #[default]
     #[serde(rename = "fit")]
     Fit,
+    /// 适应窗口（不放大）：等比缩到可用区域，但比例封顶 1:1——窗口比远端大时居中留白，
+    /// 文字不会被双线性放大糊掉。
+    #[serde(rename = "fit_no_upscale")]
+    FitNoUpscale,
     /// 固定 50%。
     #[serde(rename = "p50")]
     P50,
@@ -53,8 +58,9 @@ pub enum ViewScale {
 
 impl ViewScale {
     /// 全部档位（UI 展示顺序）。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Fit,
+        Self::FitNoUpscale,
         Self::P50,
         Self::P75,
         Self::P100,
@@ -67,6 +73,7 @@ impl ViewScale {
     pub fn label(self) -> &'static str {
         match self {
             Self::Fit => "适应窗口",
+            Self::FitNoUpscale => "适应窗口（不放大）",
             Self::P50 => "50%",
             Self::P75 => "75%",
             Self::P100 => "100%",
@@ -75,11 +82,20 @@ impl ViewScale {
         }
     }
 
-    /// 固定缩放比；`Fit` 返回 `None`（比例由可用区域决定，见 [`fit_size`]）。
+    /// 是否为「适应窗口」类档位（比例由可用区域决定，绘制区不留滚动条）。
+    ///
+    /// 两个 fit 档都按可用区域算比例，只是 [`Self::FitNoUpscale`] 把比例封顶在 1:1。
+    #[must_use]
+    pub fn is_fit(self) -> bool {
+        matches!(self, Self::Fit | Self::FitNoUpscale)
+    }
+
+    /// 固定缩放比；两个 fit 档返回 `None`（比例由可用区域决定，见 [`fit_size`] /
+    /// [`fit_size_no_upscale`]）。
     #[must_use]
     pub fn factor(self) -> Option<f32> {
         match self {
-            Self::Fit => None,
+            Self::Fit | Self::FitNoUpscale => None,
             Self::P50 => Some(0.5),
             Self::P75 => Some(0.75),
             Self::P100 => Some(1.0),
@@ -174,13 +190,28 @@ fn dpi(pixels_per_point: f32) -> f32 {
     }
 }
 
+/// 适应窗口的**物理像素比例**：远端画面最多按 `scale` 缩放到可用区域内。
+///
+/// 可用区域是逻辑点，先乘 `pixels_per_point` 换成物理像素再与远端像素比较——否则 150% 屏幕上
+/// 算出来的比例整体偏大，画面被 DPI 二次放大。
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "画面像素尺寸有界（远小于 f32 精度上限）"
+)]
+fn fit_scale(avail: Vec2, image: (u32, u32), pixels_per_point: f32) -> f32 {
+    let ppp = dpi(pixels_per_point);
+    let (w, h) = (image.0.max(1) as f32, image.1.max(1) as f32);
+    (avail.x * ppp / w).min(avail.y * ppp / h)
+}
+
 /// 适应窗口：在可用区域内**等比铺满**（可放大也可缩小），返回绘制尺寸（至少 1×1）。
 ///
 /// **以物理像素为基准**：`image` 是远端像素，`avail` 是逻辑点，比较前先把 `avail` 换算成
 /// 物理像素——否则 150% 屏幕上算出来的比例整体偏大，画面被 DPI 二次放大。
 ///
 /// 放大/缩小都由 GPU 采样完成：缩小走着色器的足迹预滤波（避免欠采样闪烁），放大是双线性
-/// 插值（不会创造新细节，但窗口大小连续变化时最顺滑）。要严格 1:1 请显式选 `100%`。
+/// 插值（不会创造新细节，但窗口大小连续变化时最顺滑）。要严格 1:1 请显式选 `100%`，
+/// 要「只缩不放」请选 [`ViewScale::FitNoUpscale`]。
 #[must_use]
 #[expect(
     clippy::cast_precision_loss,
@@ -189,9 +220,24 @@ fn dpi(pixels_per_point: f32) -> f32 {
 pub fn fit_size(avail: Vec2, image: (u32, u32), pixels_per_point: f32) -> Vec2 {
     let ppp = dpi(pixels_per_point);
     let (w, h) = (image.0.max(1) as f32, image.1.max(1) as f32);
-    let avail_px = avail * ppp;
     // 下界 0.01：可用区域退化为 0（窗口刚创建、面板还没布局）时仍给出一个可绘制的尺寸。
-    let scale = (avail_px.x / w).min(avail_px.y / h).max(0.01);
+    let scale = fit_scale(avail, image, ppp).max(0.01);
+    Vec2::new((w * scale / ppp).max(1.0), (h * scale / ppp).max(1.0))
+}
+
+/// 适应窗口（不放大）：等比缩到可用区域，**比例封顶 1.0**（1 远端像素 : 1 物理像素）。
+///
+/// 与 [`fit_size`] 的唯一差别是不做放大：窗口比远端大时按 1:1 绘制、由调用方居中留白。
+/// 放大不会带来任何新细节，只会把边缘插值糊——需要放大时显式选 `125%` / `150%`。
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "画面像素尺寸有界（远小于 f32 精度上限）"
+)]
+pub fn fit_size_no_upscale(avail: Vec2, image: (u32, u32), pixels_per_point: f32) -> Vec2 {
+    let ppp = dpi(pixels_per_point);
+    let (w, h) = (image.0.max(1) as f32, image.1.max(1) as f32);
+    let scale = fit_scale(avail, image, ppp).clamp(0.01, 1.0);
     Vec2::new((w * scale / ppp).max(1.0), (h * scale / ppp).max(1.0))
 }
 
@@ -218,10 +264,12 @@ pub fn display_size(
     image: (u32, u32),
     pixels_per_point: f32,
 ) -> Vec2 {
-    scale.factor().map_or_else(
-        || fit_size(avail, image, pixels_per_point),
-        |factor| scaled_size(factor, image, pixels_per_point),
-    )
+    match scale {
+        ViewScale::Fit => fit_size(avail, image, pixels_per_point),
+        ViewScale::FitNoUpscale => fit_size_no_upscale(avail, image, pixels_per_point),
+        // 固定档：`factor()` 对两个 fit 档返回 `None`，这里已由上面的分支接走。
+        _ => scaled_size(scale.factor().unwrap_or(1.0), image, pixels_per_point),
+    }
 }
 
 /// 自适应档的初始窗口尺寸：取「远端显示器尺寸」与「本机屏幕 × [`SCREEN_FRACTION`]」的较小者。
@@ -336,6 +384,34 @@ mod tests {
         assert!((fixed.x - 1920.0).abs() < 1e-3);
     }
 
+    /// 「适应窗口（不放大）」：窗口比远端大时按 1:1 画，比例封顶在 1000‰。
+    #[test]
+    fn fit_no_upscale_caps_at_one_to_one() {
+        // 窗口 1920×1080 逻辑点、100% DPI，远端只有 1280×720：不放大。
+        let size = fit_size_no_upscale(Vec2::new(1920.0, 1080.0), (1280, 720), 1.0);
+        assert!((size.x - 1280.0).abs() < 1e-3, "{size:?}");
+        assert!((size.y - 720.0).abs() < 1e-3, "{size:?}");
+        // 窗口比远端小时照常缩小（与铺满档一致）。
+        let small = fit_size_no_upscale(Vec2::new(640.0, 640.0), (1280, 720), 1.0);
+        assert!((small.x - 640.0).abs() < 1e-3, "{small:?}");
+        assert!((small.y - 360.0).abs() < 1e-3, "{small:?}");
+        // 150% DPI 下封顶仍是「1 远端像素 : 1 物理像素」：1280 宽只占 853.33 逻辑点。
+        let hidpi = fit_size_no_upscale(Vec2::new(2000.0, 2000.0), (1280, 720), 1.5);
+        assert!((hidpi.x - 1280.0 / 1.5).abs() < 1e-3, "{hidpi:?}");
+    }
+
+    #[test]
+    fn display_size_dispatches_fit_no_upscale() {
+        let avail = Vec2::new(1920.0, 1080.0);
+        let image = (1280, 720);
+        assert_eq!(
+            display_size(ViewScale::FitNoUpscale, avail, image, 1.0),
+            fit_size_no_upscale(avail, image, 1.0)
+        );
+        // 与铺满档的差别正在于此：铺满会放大到 1920 宽。
+        assert!((display_size(ViewScale::Fit, avail, image, 1.0).x - 1920.0).abs() < 1e-3);
+    }
+
     #[test]
     fn initial_window_size_is_capped_by_screen() {
         let size = initial_window_size((3840, 2160), Some(Vec2::new(1440.0, 900.0)), 1.0);
@@ -374,9 +450,11 @@ mod tests {
     #[test]
     fn only_fit_has_no_fixed_factor() {
         assert!(ViewScale::Fit.factor().is_none());
+        assert!(ViewScale::FitNoUpscale.factor().is_none());
+        assert!(ViewScale::Fit.is_fit() && ViewScale::FitNoUpscale.is_fit());
         assert!(ViewScale::ALL
             .iter()
-            .filter(|s| **s != ViewScale::Fit)
+            .filter(|s| !s.is_fit())
             .all(|s| s.factor().is_some_and(|f| f > 0.0)));
         assert!(WindowSize::FitScreen.inner_size(1.0).is_none());
         assert!(WindowSize::ALL
@@ -420,5 +498,9 @@ mod tests {
         let defaulted: Holder = toml::from_str("window = \"1920x1080\"").expect("缺字段的配置");
         assert_eq!(defaulted.scale, ViewScale::Fit);
         assert_eq!(defaulted.window, WindowSize::W1920x1080);
+        // 新增的「适应窗口（不放大）」也必须能原样往返。
+        let no_upscale: Holder =
+            toml::from_str("scale = \"fit_no_upscale\"\nwindow = \"fit\"").expect("新档位");
+        assert_eq!(no_upscale.scale, ViewScale::FitNoUpscale);
     }
 }
