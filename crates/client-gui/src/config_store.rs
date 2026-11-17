@@ -16,9 +16,44 @@ pub enum StoreError {
 }
 
 /// 默认配置文件路径（与 `rust_tunnel_client::config::default_config_path` 一致，供 GUI 设置面板展示）。
+///
+/// `RUST_TUNNEL_GUI_CONFIG_DIR` 可把配置目录重定向到别处：截图评审/自动化要能在**不碰用户
+/// 真实配置**、不注册到真实服务端的前提下跑起界面（否则同名客户端会与用户正在用的实例互相踢）。
+/// 只在确实设置了非空值时才改写，正常运行完全不受影响。
 #[must_use]
 pub fn default_path() -> PathBuf {
+    if let Some(dir) = config_dir_override() {
+        return dir.join("client.toml");
+    }
     rust_tunnel_client::config::default_config_path()
+}
+
+/// 配置目录覆盖（`RUST_TUNNEL_GUI_CONFIG_DIR`）。
+#[must_use]
+pub fn config_dir_override() -> Option<PathBuf> {
+    std::env::var_os("RUST_TUNNEL_GUI_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// CLI/环境变量来源的配置回退。
+///
+/// 设置 `RUST_TUNNEL_GUI_CONFIG_DIR` 时返回 `None`：隔离运行（截图评审/自动化）绝不能
+/// 通过这条回退读到用户真实配置并注册到真实服务端。
+#[must_use]
+pub fn load_cli_fallback() -> Option<ClientConfig> {
+    if config_dir_override().is_some() {
+        None
+    } else {
+        ClientConfig::load().ok()
+    }
+}
+
+/// 加载生效配置：默认路径优先；**设置覆盖时不再回退**到客户端库的默认路径
+/// （那会绕开隔离，读到用户真实配置）。
+#[must_use]
+pub fn load_effective() -> Option<ClientConfig> {
+    load_from_default_path().or_else(load_cli_fallback)
 }
 
 /// 从默认路径加载配置；文件不存在时返回 `Ok(None)`。

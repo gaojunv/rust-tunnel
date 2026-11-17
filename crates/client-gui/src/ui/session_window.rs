@@ -30,7 +30,7 @@ use rust_tunnel_remote::{
     TransportPath,
 };
 
-use super::{theme, widgets};
+use super::{icons::Icon, theme, widgets};
 use crate::remote::nv12_renderer::Nv12Callback;
 use crate::remote::{display_size, FramePaint, RemoteView, ViewScale, WindowSize, MIN_INNER};
 use crate::ui::remote::state_label;
@@ -441,7 +441,7 @@ fn render(
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("文件与剪贴板").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    widgets::right_row_sized(ui, 26.0, |ui| {
                         if ui.button("关闭").clicked() {
                             v.side_panel_open = false;
                         }
@@ -470,7 +470,7 @@ fn render(
 
 /// 浮动工具条的内容（`ui` 位于 `theme::toolbar_frame` 之内）。
 ///
-/// 只放**一眼要看**的东西与六个动作；所有「进去改一次」的设置都搬到 [`settings_modal`]——
+/// 只放**一眼要看**的东西与七个动作；所有「进去改一次」的设置都搬到 [`settings_modal`]——
 /// 工具条曾经塞满选择器，窄窗口下折行成三排，把画面压掉一大块。
 fn toolbar_contents(
     ui: &mut Ui,
@@ -488,11 +488,15 @@ fn toolbar_contents(
         match state.latency_ms {
             Some(ms) => widgets::pill(ui, &format!("{ms} ms"), latency_color(ms), p.accent_dim),
             None => {
-                ui.label(RichText::new("延迟 —").weak().small());
+                ui.label(RichText::new("延迟 —").color(p.text_weak).small());
             }
         }
         if let Some(path) = state.transport {
-            ui.label(RichText::new(transport_label(path)).weak().small());
+            ui.label(
+                RichText::new(transport_label(path))
+                    .color(p.text_weak)
+                    .small(),
+            );
         }
 
         ui.separator();
@@ -511,68 +515,90 @@ fn toolbar_contents(
             v.settings_open = true;
         }
 
-        // 动作区**从左到右**排：`egui::Area` 按内容自适应宽度，`right_to_left` 会把第一个控件
-        // 推到「可用宽度」的右缘（Area 的可用宽度是整个视口），整张卡片会被撑到全屏宽。
-        // 断开放在最后：破坏性操作不该是手指落下的第一站。
-        ui.add_space(4.0);
-        // 收起放最前：误触的后果只是工具条缩成一枚延迟胶囊，点一下就能回来；「断开」仍留在末尾，
-        // 破坏性操作不该和常用按钮做邻居。
-        if widgets::toolbar_button(ui, "收起", "收起到只显示延迟（点延迟胶囊可展开）").clicked()
-        {
-            v.collapse_toolbar();
-        }
-        if widgets::toolbar_button(ui, "设置", "画质 / 帧率 / 显示器 / 缩放 / 窗口尺寸 / 交互")
-            .clicked()
-        {
-            v.settings_open = true;
-        }
-        if ui
-            .selectable_label(v.side_panel_open, "文件")
-            .on_hover_text("文件传输与剪贴板")
-            .clicked()
-        {
-            v.side_panel_open = !v.side_panel_open;
-        }
-        // 锁屏只在「完全控制」模式可用：仅观看/仅文件传输不该改变远端机器状态。
-        let can_lock = active.mode == RemoteMode::Control;
-        let lock = ui
-            .add_enabled_ui(can_lock, |ui| {
-                widgets::toolbar_button(
-                    ui,
-                    "锁屏",
-                    "锁定远端屏幕（会话保持连接；锁屏后画面可能无法继续采集）",
-                )
-            })
-            .inner;
-        let lock = if can_lock {
-            lock
-        } else {
-            lock.on_disabled_hover_text("仅『完全控制』模式可锁定远端屏幕")
-        };
-        if lock.clicked() {
-            manager.lock_screen();
-        }
-        if ui
-            .selectable_label(v.fullscreen, "全屏")
-            .on_hover_text("切换全屏（F11；全屏时 Esc 退出）")
-            .clicked()
-        {
-            v.fullscreen = !v.fullscreen;
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(v.fullscreen));
-        }
-        if widgets::toolbar_button(ui, "最小化", "关闭窗口但保留会话；在「远程」Tab 可召回")
-            .clicked()
-        {
-            // 置 false 后父窗口就不再注册这个 viewport，回调从此不再跑——必须**当场**补发一次
-            // 输入抬起，否则用户此刻按住的键会在远端一直按着（会话仍在，没人替它收尾）。
-            v.release_input(manager);
-            v.window_open = false;
-        }
-        if widgets::danger_button(ui, "断开", "结束本次远程会话").clicked() {
-            manager.abort_active();
-        }
+        toolbar_actions(ui, v, manager, active, &p);
     });
+}
+
+/// 工具条右侧的动作区：一律用图标按钮（文字按钮在窄窗口下会把工具条撑成两三行）。
+///
+/// 仍按**从左到右**排：`egui::Area` 按内容自适应宽度，`right_to_left` 会把第一个控件推到
+/// 「可用宽度」的右缘（Area 的可用宽度是整个视口），整张卡片会被撑到全屏宽。
+/// 收起放最前（误触的后果只是缩成一枚延迟胶囊，点一下就能回来），「断开」留在末尾
+/// （破坏性操作不该和常用按钮做邻居）。
+fn toolbar_actions(
+    ui: &mut Ui,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    active: &ActiveSessionInfo,
+    p: &theme::Palette,
+) {
+    ui.add_space(4.0);
+    if widgets::toolbar_icon(ui, Icon::ChevronUp, "收起到只显示延迟（点延迟胶囊可展开）").clicked()
+    {
+        v.collapse_toolbar();
+    }
+    if widgets::toolbar_icon(
+        ui,
+        Icon::Settings,
+        "画质 / 帧率 / 显示器 / 缩放 / 窗口尺寸 / 交互",
+    )
+    .clicked()
+    {
+        v.settings_open = true;
+    }
+    if widgets::toolbar_toggle(ui, Icon::Download, v.side_panel_open, "文件传输与剪贴板").clicked()
+    {
+        v.side_panel_open = !v.side_panel_open;
+    }
+    // 锁屏只在「完全控制」模式可用：仅观看/仅文件传输不该改变远端机器状态。
+    let can_lock = active.mode == RemoteMode::Control;
+    let lock = ui
+        .add_enabled_ui(can_lock, |ui| {
+            let color = (!can_lock).then_some(p.text_disabled);
+            widgets::toolbar_icon_colored(
+                ui,
+                Icon::Lock,
+                "锁定远端屏幕（会话保持连接；锁屏后画面可能无法继续采集）",
+                color,
+            )
+        })
+        .inner;
+    let lock = if can_lock {
+        lock
+    } else {
+        lock.on_disabled_hover_text("仅『完全控制』模式可锁定远端屏幕")
+    };
+    if lock.clicked() {
+        manager.lock_screen();
+    }
+    if widgets::toolbar_toggle(
+        ui,
+        Icon::Monitor,
+        v.fullscreen,
+        "切换全屏（F11；全屏时 Esc 退出）",
+    )
+    .clicked()
+    {
+        v.fullscreen = !v.fullscreen;
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(v.fullscreen));
+    }
+    if widgets::toolbar_icon(
+        ui,
+        Icon::ChevronDown,
+        "关闭窗口但保留会话；在「远程」Tab 可召回",
+    )
+    .clicked()
+    {
+        // 置 false 后父窗口就不再注册这个 viewport，回调从此不再跑——必须**当场**补发一次
+        // 输入抬起，否则用户此刻按住的键会在远端一直按着（会话仍在，没人替它收尾）。
+        v.release_input(manager);
+        v.window_open = false;
+    }
+    if widgets::toolbar_icon_colored(ui, Icon::Close, "结束本次远程会话", Some(p.err)).clicked()
+    {
+        manager.abort_active();
+    }
 }
 
 /// 收起态的唯一内容：一枚延迟胶囊，点它展开工具条。
@@ -635,12 +661,11 @@ fn settings_modal(
         }
         ui.label(RichText::new(parts.join(" · ")).weak().small());
         ui.add_space(4.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("关闭").clicked() {
+        widgets::right_row(ui, |ui| {
+            if widgets::primary_button(ui, "关闭").clicked() {
                 close = true;
             }
-            if ui
-                .button("测延迟")
+            if widgets::secondary_button(ui, "测延迟")
                 .on_hover_text("立刻探测一次往返延迟")
                 .clicked()
             {
@@ -724,18 +749,18 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
     });
 
     widgets::section(ui, "交互", |ui| {
-        if ui
-            .checkbox(&mut v.clipboard_sync_enabled, "剪贴板自动同步")
-            .changed()
+        // 关同步就丢弃去重基线：下次开启会以当时的剪贴板重新开始，而不是补发
+        // 关闭期间积压的变化。
+        if widgets::switch_row(ui, "剪贴板自动同步", None, &mut v.clipboard_sync_enabled)
             && !v.clipboard_sync_enabled
         {
-            // 关同步就丢弃去重基线：下次开启会以当时的剪贴板重新开始，而不是补发
-            // 关闭期间积压的变化。
             v.clipboard_sync = None;
         }
-        ui.checkbox(
+        widgets::switch_row(
+            ui,
+            "独占键盘",
+            Some("键盘事件全部发给远端；Ctrl/Cmd+Alt+Shift+K 退出"),
             &mut v.exclusive_keyboard,
-            "独占键盘（Ctrl/Cmd+Alt+Shift+K 退出）",
         );
     });
 
@@ -744,31 +769,35 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
         // 这里是同一状态的第二个入口：收起后工具条虽然不见了，设置里仍看得到、也改得回来。
         // 走一对方法而不是裸改字段：展开时还要置可见并重置自动隐藏计时，否则开启自动隐藏的
         // 用户一取消勾选，工具条会停在「隐藏」状态，非得再挪一下鼠标才出来。
-        if ui
-            .checkbox(&mut v.toolbar_collapsed, "收起工具条（只显示延迟）")
-            .changed()
-        {
+        if widgets::switch_row(
+            ui,
+            "收起工具条",
+            Some("只显示延迟胶囊；点它可展开"),
+            &mut v.toolbar_collapsed,
+        ) {
             if v.toolbar_collapsed {
                 v.collapse_toolbar();
             } else {
                 v.expand_toolbar();
             }
         }
-        // 自动隐藏只作用于展开态（收起态本来就不参与），因此在收起期间灰掉，免得用户以为
+        // 自动隐藏只作用于展开态（收起态本来就不参与），因此在收起期间禁用，免得用户以为
         // 两个开关在打架。
         // 自动隐藏开关：这是**唯一**能让用户关掉「工具条偶尔消失」的入口。改动写进
         // 运行时镜像，由父窗口的 `sync_display_prefs` 回写 gui.toml。
-        ui.add_enabled(
-            !v.toolbar_collapsed,
-            egui::Checkbox::new(
-                &mut v.toolbar_autohide,
-                "工具条自动隐藏（移到窗口上缘召回）",
-            ),
-        );
-        ui.checkbox(&mut v.stats_overlay, "显示统计角标");
+        // `switch_row` 不感知 `Ui` 的 enabled 状态，故收起时用副标题说明「为什么不生效」。
+        let hint = if v.toolbar_collapsed {
+            "收起工具条时不生效"
+        } else {
+            "静止后淡出；移到窗口上缘召回"
+        };
+        ui.add_enabled_ui(!v.toolbar_collapsed, |ui| {
+            widgets::switch_row(ui, "工具条自动隐藏", Some(hint), &mut v.toolbar_autohide);
+        });
+        widgets::switch_row(ui, "显示统计角标", None, &mut v.stats_overlay);
         // 详细档：三组指标（链路 / 被控端 / 画面）。这里只改**持久化镜像**，由父窗口的
         // `sync_display_prefs` 回写 gui.toml；角标关闭时也可先勾选，打开角标即按详细档渲染。
-        ui.checkbox(&mut v.stats_detail, "统计角标显示详细指标");
+        widgets::switch_row(ui, "统计角标显示详细指标", None, &mut v.stats_detail);
     });
 }
 
@@ -1120,8 +1149,9 @@ fn stats_detail(
 
 /// 一组指标：小标题 + 一张两列 Grid。
 fn stats_group(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
+    let p = theme::palette(ui.style());
     ui.vertical(|ui| {
-        ui.label(RichText::new(title).strong().small());
+        ui.label(RichText::new(title).strong().small().color(p.text));
         contents(ui);
     });
 }
@@ -1458,7 +1488,8 @@ fn local_grid(ui: &mut Ui, v: &RemoteView, active: &ActiveSessionInfo, state: &R
 
 /// 角标行标签（弱化小字）。
 fn stat_label(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).weak().small());
+    let p = theme::palette(ui.style());
+    ui.label(RichText::new(text).small().color(p.text_weak));
 }
 
 /// 未知项占位符。

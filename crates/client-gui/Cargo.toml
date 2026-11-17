@@ -10,7 +10,9 @@ name = "rust-tunnel-client-gui"
 # 门控，旧客户端不会收到未知变体。数据面协议仍是 v7，可与 0.14.0 互控。
 # 0.16.0 = 数据面 v8（`HostStats` 遥测 + 心跳时间戳 + 采集时间戳/端到端），两端必须同为 0.16.0。
 # 0.17.0 = 数据面 v9（`CursorShape` 远端光标形状跟随），两端必须同为 0.17.0。
-version = "0.18.6"
+# 0.19.0 = 仅 GUI 外观现代化（Win11 Fluent：左侧导航、卡片、趋势线、日志过滤）。
+#          控制通道与数据面协议均未改动，可与 0.18.x 客户端互连。
+version = "0.19.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -109,6 +111,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Media",
     # `LockWorkStation`（协议 v7 的锁屏；见 remote/mod.rs 的 lock_platform_screen）。
     "Win32_System_Shutdown",
+    # 读取系统强调色（HKCU\...\DWM\AccentColor；见 ui/accent.rs）。
+    "Win32_System_Registry",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

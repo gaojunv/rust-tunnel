@@ -72,16 +72,6 @@ impl ThemePref {
             Self::Dark => "深色",
         }
     }
-
-    /// 按钮图标。
-    #[must_use]
-    pub fn icon(self) -> &'static str {
-        match self {
-            Self::System => "💻",
-            Self::Light => "☀",
-            Self::Dark => "🌙",
-        }
-    }
 }
 
 /// GUI 偏好根结构（serde(default) 保证前向兼容）。

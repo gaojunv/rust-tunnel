@@ -5,6 +5,8 @@
 
 use egui::{RichText, Ui};
 
+use super::theme::palette;
+use super::widgets::{self, Tone};
 use crate::prefs::GuiPrefs;
 use crate::update::UpdateBridge;
 
@@ -45,44 +47,51 @@ pub fn modal(
         return None;
     }
 
+    let p = palette(&ctx.style());
     let mut action = None;
     egui::Modal::new(egui::Id::new("client_update")).show(ctx, |ui| {
         ui.set_width(380.0);
-        ui.heading("客户端更新");
-        ui.add_space(6.0);
+        let close = widgets::modal_title(ui, "客户端更新");
+        ui.add_space(4.0);
 
         if let Some(progress) = snap.download.as_ref() {
             ui.label(RichText::new(format!("正在下载 {}", progress.version)).strong());
             ui.add_space(4.0);
             let fraction = fraction(progress.received, progress.total);
-            ui.add(
-                egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                    .desired_width(340.0)
-                    .text(format!(
-                        "{} / {}",
-                        human_bytes(progress.received),
-                        human_bytes(progress.total)
-                    )),
+            progress_bar(
+                ui,
+                fraction,
+                &format!(
+                    "{} / {}",
+                    human_bytes(progress.received),
+                    human_bytes(progress.total)
+                ),
             );
             ui.label(
                 RichText::new("下载完成后会自动校验并重启应用。")
-                    .weak()
-                    .small(),
+                    .size(12.0)
+                    .color(p.text_weak),
             );
+            // 下载期间弹窗由 `download` 保持可见（进度必须能被看到），「关闭」与「稍后」同语义。
+            if close {
+                action = Some(UpdateAction::Dismiss);
+            }
             return;
         }
 
         if let Some(err) = snap.error.as_ref() {
-            ui.colored_label(ui.visuals().error_fg_color, RichText::new(err).strong());
-            ui.add_space(6.0);
-            if snap.available.is_some() && ui.button("重试").clicked() {
-                action = Some(UpdateAction::Download);
-            }
+            widgets::info_bar(ui, Tone::Err, None, err);
             ui.horizontal(|ui| {
-                if ui.button("关闭").clicked() {
+                if snap.available.is_some() && widgets::primary_button(ui, "重试").clicked() {
+                    action = Some(UpdateAction::Download);
+                }
+                if widgets::secondary_button(ui, "关闭").clicked() {
                     action = Some(UpdateAction::ClearError);
                 }
             });
+            if close {
+                action = Some(UpdateAction::ClearError);
+            }
             return;
         }
 
@@ -104,35 +113,35 @@ pub fn modal(
                 human_bytes(available.file.size),
                 available.file.name
             ))
-            .small()
-            .weak(),
+            .size(12.0)
+            .color(p.text_weak),
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(RichText::new("立即更新").strong()))
-                .clicked()
-            {
+            if widgets::primary_button(ui, "立即更新").clicked() {
                 action = Some(UpdateAction::Download);
             }
-            if ui.button("稍后").clicked() {
+            if widgets::secondary_button(ui, "稍后").clicked() {
                 action = Some(UpdateAction::Dismiss);
             }
-            if ui.button("跳过此版本").clicked() {
+            if widgets::secondary_button(ui, "跳过此版本").clicked() {
                 action = Some(UpdateAction::Skip(available.version.clone()));
             }
         });
         ui.add_space(4.0);
         ui.label(
             RichText::new("更新通过已加密的控制通道下载，并校验 SHA-256 后才替换本机程序。")
-                .weak()
-                .small(),
+                .size(12.0)
+                .color(p.text_weak),
         );
+        if close {
+            action = Some(UpdateAction::Dismiss);
+        }
     });
     action
 }
 
-/// 设置页的「软件更新」一节。
+/// 设置页的「软件更新」一节（Fluent 卡片）。
 ///
 /// 返回 `(偏好是否变化, 用户动作)`；调用方负责落盘偏好并执行动作。
 #[must_use]
@@ -148,30 +157,24 @@ pub fn settings_section(
     let mut action = None;
     let mut changed = false;
     let snap = update.snapshot();
+    let p = palette(ui.style());
 
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .show(ui, |ui| {
-            ui.heading("软件更新");
+    widgets::card_titled(
+        ui,
+        "软件更新",
+        Some("通过已加密的控制通道下载，并校验 SHA-256 后替换本机程序"),
+        |ui| {
+            widgets::key_value(ui, "当前版本", env!("CARGO_PKG_VERSION"), false);
+            if let Some(version) = snap.up_to_date.as_ref() {
+                widgets::key_value(ui, "最新版本", version.as_str(), false);
+            }
             ui.add_space(4.0);
-            egui::Grid::new("update_grid")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("当前版本").weak().small());
-                    ui.label(env!("CARGO_PKG_VERSION"));
-                    ui.end_row();
-                    if let Some(version) = snap.up_to_date.as_ref() {
-                        ui.label(RichText::new("最新版本").weak().small());
-                        ui.label(version.as_str());
-                        ui.end_row();
-                    }
-                });
-            ui.add_space(4.0);
-            if ui
-                .checkbox(&mut prefs.update_auto_check, "自动检查更新")
-                .changed()
-            {
+            if widgets::switch_row(
+                ui,
+                "自动检查更新",
+                Some("每 6 小时轮询一次；服务端在注册时也会主动推送"),
+                &mut prefs.update_auto_check,
+            ) {
                 changed = true;
                 tracing::info!(
                     "自动检查更新：{}",
@@ -187,50 +190,55 @@ pub fn settings_section(
                 ui.add_space(4.0);
                 ui.label(format!("正在下载 {}…", progress.version));
                 let fraction = fraction(progress.received, progress.total);
-                ui.add(
-                    egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                        .desired_width(320.0)
-                        .text(format!(
-                            "{} / {}",
-                            human_bytes(progress.received),
-                            human_bytes(progress.total)
-                        )),
+                progress_bar(
+                    ui,
+                    fraction,
+                    &format!(
+                        "{} / {}",
+                        human_bytes(progress.received),
+                        human_bytes(progress.total)
+                    ),
                 );
                 return;
             }
 
             if let Some(err) = snap.error.as_ref() {
                 ui.add_space(4.0);
-                ui.colored_label(ui.visuals().error_fg_color, RichText::new(err).small());
-                if ui.button("清除").clicked() {
+                widgets::info_bar(ui, Tone::Err, None, err);
+                if widgets::secondary_button(ui, "清除").clicked() {
                     action = Some(UpdateAction::ClearError);
                 }
                 return;
             }
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
                 let supported = snap.supported;
-                if ui
-                    .add_enabled(supported, egui::Button::new("检查更新"))
-                    .clicked()
-                {
+                let check = ui
+                    .add_enabled_ui(supported, |ui| {
+                        if !supported {
+                            ui.set_opacity(0.45);
+                        }
+                        widgets::secondary_button(ui, "检查更新")
+                    })
+                    .inner;
+                if check.clicked() {
                     action = Some(UpdateAction::CheckNow);
                 }
                 if !supported {
                     ui.label(
                         RichText::new("连接服务器后可用；Windows 服务接管身份期间不可用")
-                            .weak()
-                            .small(),
+                            .size(12.0)
+                            .color(p.text_weak),
                     );
                 }
             });
 
             if let Some(available) = snap.available.as_ref() {
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 let skipped =
                     prefs.update_skipped_version.as_deref() == Some(available.version.as_str());
-                ui.horizontal(|ui| {
+                widgets::card(ui, |ui| {
                     ui.label(
                         RichText::new(if skipped {
                             format!("新版本 {} 已跳过", available.version)
@@ -243,30 +251,53 @@ pub fn settings_section(
                         })
                         .strong(),
                     );
-                });
-                ui.horizontal(|ui| {
-                    if skipped {
-                        if ui.button("取消跳过").clicked() {
-                            action = Some(UpdateAction::CancelSkip);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if skipped {
+                            if widgets::secondary_button(ui, "取消跳过").clicked() {
+                                action = Some(UpdateAction::CancelSkip);
+                            }
+                        } else {
+                            if widgets::primary_button(ui, "立即更新").clicked() {
+                                action = Some(UpdateAction::Download);
+                            }
+                            if widgets::secondary_button(ui, "跳过此版本").clicked() {
+                                action = Some(UpdateAction::Skip(available.version.clone()));
+                            }
                         }
-                    } else {
-                        if ui
-                            .add(egui::Button::new(RichText::new("立即更新").strong()))
-                            .clicked()
-                        {
-                            action = Some(UpdateAction::Download);
-                        }
-                        if ui.button("跳过此版本").clicked() {
-                            action = Some(UpdateAction::Skip(available.version.clone()));
-                        }
-                    }
+                    });
                 });
             } else if let Some(version) = snap.up_to_date.as_ref() {
-                ui.add_space(4.0);
-                ui.label(RichText::new(format!("已是最新版本（{version}）")).weak());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("已是最新版本（{version}）"))
+                        .size(12.0)
+                        .color(p.text_weak),
+                );
             }
-        });
+        },
+    );
     (changed, action)
+}
+
+/// Fluent 风格的下载进度条：轨道 + 强调色填充 + 下方一行字节数。
+///
+/// `egui::ProgressBar` 用的是全局 `widgets` 配色，与 Fluent 的圆角/强调色不一致，故自绘。
+fn progress_bar(ui: &mut Ui, fraction: f32, text: &str) {
+    let p = palette(ui.style());
+    let width = ui.available_width().max(140.0);
+    let (track, _) = ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+    let radius = egui::CornerRadius::same(4);
+    ui.painter().rect_filled(track, radius, p.surface_alt);
+    let filled = egui::Rect::from_min_size(
+        track.min,
+        egui::vec2(track.width() * fraction.clamp(0.0, 1.0), track.height()),
+    );
+    if filled.width() > 0.5 {
+        ui.painter().rect_filled(filled, radius, p.accent);
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new(text).size(12.0).color(p.text_weak));
 }
 
 /// 下载进度比例（0.0–1.0）。
