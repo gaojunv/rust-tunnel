@@ -48,6 +48,10 @@
 //! - `NV_ENC_TUNING_INFO_LOW_LATENCY` + **四分之一分辨率两遍编码** + **空间 AQ（强度 8）**：
 //!   桌面文本是「大片平坦背景 + 少量高频笔画」，单遍无 AQ 会把笔画一起量化糊
 //!   （旧的 `ULTRA_LOW_LATENCY` 预设正是这样）。
+//! - **QP 上限 `MAX_QP`（26）**：按质量下限编码、码率当预算（RDP RemoteFX/Parsec 的
+//!   做法）。只给码率时编码器会把预算摊到整幅画面，文字被平均掉。
+//! - **intra refresh（GDR，周期 `INTRA_REFRESH_SECONDS` 秒）**：参考帧持续自愈且没有
+//!   关键帧尖峰（驱动不支持时自动退回周期 IDR）。
 //! - 只在调用方要求时用 `NV_ENC_PIC_FLAG_FORCEIDR` 产生 IDR（并同时
 //!   `OUTPUT_SPSPPS`，保证任何 IDR 都能独立解码）。
 //! - VUI 打 BT.709 + limited range 标签。
@@ -276,6 +280,20 @@ const VBV_FRAMES: u32 = 6;
 /// `fps == 0` 按 1 处理（避免除零；正常构造路径已拒绝 0 帧率）。
 fn vbv_size(bps: u32, fps: u32) -> u32 {
     (bps / fps.max(1)).saturating_mul(VBV_FRAMES).max(1)
+}
+
+/// 一轮 **intra refresh（GDR）** 覆盖的时间（秒）：约 2 秒内把整屏刷成 intra。
+///
+/// 太短（< 1 秒）每帧的 intra 条带占比高，码率开销明显；太长（> 5 秒）参考帧自愈
+/// 变慢，用户看到的糊会持续更久。2 秒在 30/60 fps 下分别是 60/120 帧。
+const INTRA_REFRESH_SECONDS: u32 = 2;
+
+/// 一轮 intra refresh 的帧数（`fps × INTRA_REFRESH_SECONDS`，至少 1）。
+///
+/// NVENC 要求 `intraRefreshCnt <= intraRefreshPeriod`；两者取同一个值 = 每帧均匀刷新
+/// `1/period` 的宏块。
+fn intra_refresh_frames(fps: u32) -> u32 {
+    fps.max(1).saturating_mul(INTRA_REFRESH_SECONDS)
 }
 
 /// 峰值受限 VBR 的均值码率（峰值的 70%，与 MFT 路径保持一致）。
@@ -614,10 +632,45 @@ fn build_encode_config(
     // 强度取 8（0..15 的中上档）：再高会在纯色背景上产生可见的块状纹理。
     config.rcParams.set_enableAQ(1);
     config.rcParams.set_aqStrength(8);
+    // **QP 上限（画质地板）**：只给「最多多少 Mbps」是不够的——码率控制会把预算摊到
+    // 整幅画面上，文字被平均掉。给 QP 设上限等于告诉编码器「质量不许低于这条线，
+    // 需要的比特你自己拿」，这是 RDP RemoteFX/Parsec 这类实现的共同做法（按质量目标
+    // 编码，码率当预算）。需要更多比特时仍受上面的 VBV 约束，不会无限放大。
+    // 关键帧（I）再低 2 档：它是整幅参考，后续 P 帧都靠它。
+    let max_qp = crate::max_qp();
+    config.rcParams.set_enableMaxQP(1);
+    config.rcParams.maxQP = sys::NV_ENC_QP {
+        qpInterP: max_qp,
+        qpInterB: max_qp,
+        qpIntra: max_qp.saturating_sub(2).max(1),
+    };
 
     // SAFETY: `encodeCodecConfig` 是 union；本会话固定走 H.264 分支，且 union
     // 已由 preset 配置按 H.264 初始化。
     let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
+    // **渐进式刷新（intra refresh / GDR）**：每帧把一小条宏块编成 intra，约
+    // [`INTRA_REFRESH_SECONDS`] 秒刷完一整屏。替代「周期性 IDR」的刷新职责——参考帧
+    // 持续自我修复，且**没有关键帧尖峰**（Moonlight/Sunshine 与 RDP 都这么做）。
+    // 显式 FORCEIDR（新控制端接入、序号断层、几何变化）仍然生效，语义不变。
+    //
+    // 只在驱动声明支持时开：能力查询失败/为 0 就保持关闭，退回到引擎侧的周期 IDR
+    // （见 `controlled.rs` 的 `PERIODIC_KEYFRAME_INTERVAL`），绝不因为一个可选特性
+    // 让整个编码会话初始化失败。
+    let intra_refresh_supported = session
+        .api()
+        .cap(
+            session,
+            sys::NV_ENC_CODEC_H264_GUID,
+            sys::_NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_INTRA_REFRESH,
+        )
+        .is_ok_and(|value| value > 0);
+    if intra_refresh_supported {
+        h264.set_enableIntraRefresh(1);
+        h264.intraRefreshPeriod = intra_refresh_frames(fps);
+        h264.intraRefreshCnt = intra_refresh_frames(fps);
+    } else {
+        tracing::debug!("NVENC 未声明支持 intra refresh，参考帧刷新退回周期 IDR");
+    }
     // 0 == NV_ENC_LEVEL_AUTOSELECT（该字段在绑定里是裸 u32）。
     h264.level = 0;
     h264.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
@@ -1263,7 +1316,19 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{vbr_average, vbv_size, LruCache, VBV_FRAMES};
+    use super::{
+        intra_refresh_frames, vbr_average, vbv_size, LruCache, INTRA_REFRESH_SECONDS, VBV_FRAMES,
+    };
+
+    /// Intra refresh 的周期按「秒 × fps」算；刷新跨度的帧数必须 ≥1 且不除零。
+    #[test]
+    fn intra_refresh_period_covers_seconds_at_any_fps() {
+        assert_eq!(intra_refresh_frames(60), 60 * INTRA_REFRESH_SECONDS);
+        assert_eq!(intra_refresh_frames(30), 30 * INTRA_REFRESH_SECONDS);
+        assert_eq!(intra_refresh_frames(0), INTRA_REFRESH_SECONDS, "fps=0 按 1 处理");
+        // 极大 fps 走饱和乘法，不溢出。
+        assert!(intra_refresh_frames(u32::MAX) > 0);
+    }
 
     /// VBV 额度是「约六帧的码率」：既给关键帧足够的整帧比特，又不至于让单帧吃掉半秒预算。
     #[test]

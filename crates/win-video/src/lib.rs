@@ -73,6 +73,29 @@ pub(crate) fn worker_count(pixels: usize, rows: usize) -> usize {
     cpus.min((rows / MIN_ROWS_PER_WORKER).max(1))
 }
 
+/// 桌面文字编码的 **QP 上限**（画质地板），H.264 4:2:0 的取值范围 `0..=51`。
+///
+/// 26 是「文字清晰 / 码率可控」的分界：低于它，平坦背景与细笔画都要更多比特才能满足；
+/// 高于它，编码器会把文字笔画和背景一起量化，字发虚。**这是画质的下限**——同分辨率下
+/// 编码器可以为了守住它临时超出目标码率（上限仍由 VBV 约束），这正是 RDP RemoteFX
+/// 那类成熟实现的做法：按 QP 保证质量，码率只当预算。
+pub(crate) const MAX_QP: u32 = 26;
+
+/// QP 上限的环境变量覆盖名（真机 A/B 用，改完重启 GUI 即可，不需要重新编译）。
+pub(crate) const MAX_QP_ENV: &str = "RUST_TUNNEL_MAX_QP";
+
+/// 本次进程使用的 QP 上限（见 [`MAX_QP`]）。
+pub(crate) fn max_qp() -> u32 {
+    parse_max_qp(std::env::var(MAX_QP_ENV).ok().as_deref())
+}
+
+/// 解析 QP 上限：缺省/非法/越界（`1..=51` 之外）一律回落到 [`MAX_QP`]。
+pub(crate) fn parse_max_qp(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|qp| (1..=51).contains(qp))
+        .unwrap_or(MAX_QP)
+}
+
 /// 本 crate 的错误类型。
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]
@@ -95,4 +118,21 @@ pub enum WinVideoError {
     /// Win32/WinRT 错误。
     #[error("Windows API: {0}")]
     Windows(#[from] windows::core::Error),
+}
+
+#[cfg(all(windows, test))]
+mod tests {
+    use super::{parse_max_qp, MAX_QP};
+
+    /// QP 上限的环境变量解析：缺省/非法/越界都回落到 [`MAX_QP`]，合法值原样采用。
+    #[test]
+    fn max_qp_parsing_is_bounded() {
+        assert_eq!(parse_max_qp(None), MAX_QP);
+        assert_eq!(parse_max_qp(Some("")), MAX_QP);
+        assert_eq!(parse_max_qp(Some("abc")), MAX_QP);
+        assert_eq!(parse_max_qp(Some("0")), MAX_QP, "0 不是合法 QP");
+        assert_eq!(parse_max_qp(Some("52")), MAX_QP, "H.264 QP 上限是 51");
+        assert_eq!(parse_max_qp(Some(" 20 ")), 20);
+        assert_eq!(parse_max_qp(Some("51")), 51);
+    }
 }

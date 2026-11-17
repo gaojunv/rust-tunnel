@@ -76,11 +76,13 @@
 //!   （**非阻塞**：主循环绝不能在补丁投递上 `.await`，否则网络拥塞时输入/心跳一并被卡住）。
 //!   队列满时退出补丁模式并强制一帧全帧 IDR——可能已发出同一批的**部分**横条，控制端那块
 //!   合成缓冲只有一帧完整 IDR 才能修复。
-//! - **进/出补丁模式都用 P 帧**：补丁只改控制器侧的合成帧缓冲，**不碰 H.264 参考链**
-//!   （补丁模式期间编码器根本不编码），所以基准帧与退出后的第一帧都只需一帧普通 P 帧。
-//!   只有真正让参考链/几何失效的事件才 IDR：会话首帧、`RequestKeyframe`、`SelectDisplay` /
-//!   `SetQuality`、显示器分辨率变化、QoS 降分辨率、编码器重建。无条件插 IDR 会让每次切窗口/
-//!   开文件夹都付出一个 150–400 KB 的带宽尖峰。
+//! - **进补丁模式用 IDR，退出用 P 帧**：补丁只改控制器侧的合成帧缓冲，**不碰 H.264 参考链**
+//!   （补丁模式期间编码器根本不编码），退出后的第一帧只需普通 P 帧。但**基准帧必须是 IDR**：
+//!   补丁只覆盖变化矩形，静态区域会长期沿用这一帧，若它继承了一张糊的参考（典型场景：
+//!   切浏览器标签导致整页重绘，那一帧被单帧预算压过），整页就再也不会自愈——补丁模式里
+//!   编码器不跑，intra refresh 也停了。这里付一个关键帧换「基底一定是整幅重编的」。
+//!   其余让参考链/几何失效的事件同样 IDR：会话首帧、`RequestKeyframe`、`SelectDisplay` /
+//!   `SetQuality`、显示器分辨率变化、QoS 降分辨率、编码器重建。
 //! - **超预算先拆批，不退出**：单条 `RegionUpdate` 的上限是 32 KiB，单个脏矩形编码后超限时
 //!   按行拆成若干横条分多条消息发出（同一拍总量 256 KiB / 最多 8 条）。只有**真的装不下**
 //!   （矩形数、单拍总量或条数超限）才回全帧。
@@ -682,8 +684,13 @@ impl PatchMode {
 
     /// 用一次**视频**采集的变化面积推进进入判据。
     ///
-    /// 返回 `true` 表示本帧必须作为**基准全帧**：调用方据此置 `force_encode`（只需 P 帧，
-    /// 补丁不碰参考链）并清 `base_frame_sent`（见模块文档的「顺序」约束）。
+    /// 返回 `true` 表示本帧必须作为**基准全帧**：调用方据此置 `force_keyframe` / `force_encode`
+    /// 并清 `base_frame_sent`（见模块文档的「顺序」约束）。
+    ///
+    /// 基准帧是 **IDR** 而不是 P 帧：补丁模式只覆盖变化矩形，剩下的静态区域会被长期沿用，
+    /// 所以基底一旦是糊的（例如刚切过浏览器标签、整页重绘那帧被单帧预算压过），整页就会
+    /// **一直**糊着不再自愈——补丁模式期间编码器根本不跑，intra refresh 也停了。进补丁模式
+    /// 时付一个关键帧（RDP 换桌面时也是这么做的）换「基底一定是整幅重编的」，是这里的取舍。
     fn observe_video(&mut self, changed_permille: u16, now: std::time::Instant) -> bool {
         // 重入冷却：刚退出补丁模式的一段时间内连续安静也**不**重新进入。冷却期内把连续计数
         // 清零，冷却结束后重新从 0 开始累计（见 [`PATCH_REENTRY_HOLDOFF`]）。
@@ -2007,8 +2014,11 @@ pub async fn run_controlled(
                                             std::time::Instant::now(),
                                         )
                                     {
-                                        // 基准帧只需 P 帧：补丁不碰 H.264 参考链，编码器/解码器的
-                                        // 参考仍是上一全帧。
+                                        // 基准帧必须是 **IDR**：补丁只覆盖变化矩形，静态区域
+                                        // 沿用这一帧。若它继承了一张糊的参考（切标签/整页重绘
+                                        // 那一帧被单帧预算压过），整页会长期糊住——补丁模式里
+                                        // 编码器不跑，intra refresh 也停了，没有别的自愈路径。
+                                        force_keyframe = true;
                                         force_encode = true;
                                         base_frame_sent.store(false, Ordering::Relaxed);
                                     }
@@ -6631,12 +6641,14 @@ mod tests {
         let _ = tokio::time::timeout(WAIT, ctld).await.expect("被控端应结束");
     }
 
-    /// 根因 B 的回归锁：补丁模式的**基准帧**与「活跃度回升」退出后的**第一帧**都必须是 P 帧。
+    /// 补丁模式的**基准帧必须是 IDR**，而「活跃度回升」退出后的**第一帧仍是 P 帧**。
     ///
-    /// 补丁只改控制器侧的合成帧缓冲，不碰 H.264 参考链（补丁模式期间编码器根本不编码），
-    /// 所以这两处插 IDR 只是给每次切窗口/开文件夹加一个 150–400 KB 的带宽尖峰。
+    /// 基准帧不碰参考链，但它会成为补丁模式下静态区域的**长期基底**：若它继承了一张糊的
+    /// 参考（切浏览器标签 → 整页重绘那帧被单帧预算压过），整页就再也不会自愈——补丁模式里
+    /// 编码器不跑、intra refresh 也停了。所以进模式时付一个关键帧（RDP 换桌面时同样这么做），
+    /// 退出时仍用 P 帧（参考链没断，插 IDR 只是白加一个带宽尖峰）。
     #[tokio::test]
-    async fn patch_mode_base_and_activity_exit_use_p_frames() {
+    async fn patch_mode_base_is_an_idr_and_activity_exit_uses_a_p_frame() {
         let (a, b) = tokio::io::duplex(256 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
         let screen = Arc::new(PatchyScreen::quiet());
@@ -6659,7 +6671,7 @@ mod tests {
         let (mut peer_reader, _peer_writer) =
             controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", Some((true, true))).await;
 
-        // 读到第一块补丁为止：在此之前只应有**会话首帧**一个 IDR（进入基准帧是 P 帧）。
+        // 读到第一块补丁为止：会话首帧一个 IDR + 进入基准帧一个 IDR（共 2 个）。
         let keyframes = tokio::time::timeout(WAIT, async {
             let mut keyframes = 0u32;
             loop {
@@ -6677,8 +6689,8 @@ mod tests {
         .await
         .expect("低活跃画面应进入补丁模式并发出 RegionUpdate");
         assert_eq!(
-            keyframes, 1,
-            "补丁之前只该有会话首帧一个 IDR；进入基准帧必须是 P 帧（实得 {keyframes}）"
+            keyframes, 2,
+            "补丁之前应有会话首帧 + 进入基准帧两个 IDR（实得 {keyframes}）"
         );
 
         // 模拟用户开始拖窗：下一次补丁采集报高活跃 → 退出补丁模式并立刻抓一帧全帧。
