@@ -275,37 +275,37 @@ fn kbps_to_bps(kbps: u32) -> u32 {
 /// 配合发送侧 32 KiB 分块 pacing（单间隙 ≤100 ms）不会再整段堵住后续帧。
 const VBV_FRAMES: u32 = 6;
 
-/// 单帧比特预算的**每像素下限**（0.5 bit/px，用 `pixels / 2` 表达）。
+/// 单帧比特预算的**每像素上限**（2 bit/px）：整页重绘（切标签、最大化窗口）的清晰度下限。
 ///
-/// 「6 帧码率」这条口径有一个隐蔽的坑：VBV 同时是**单帧比特上限**，而码率会被内容上限
-/// 压到很低（4K 的 UI 档 4.8 Mbps → 60 fps 下每帧 10 KB、六帧 60 KB）。于是只要画面
-/// 真的变了一块（弹窗、菜单、网页局部刷新），这点预算只够约 **0.2 bit/像素**，编码器
-/// 只能把那一块量化成一团——现场表现就是「动不动糊成一块」。QP 地板救不了它：QP 只能
-/// 在预算内挑质量，预算本身被 VBV 卡死。
-///
-/// 因此 VBV 必须按**几何**兜底，而不是跟随时变的（被内容上限压低的）码率：
-/// 0.5 bit/px = 1080p ≈ 130 KB、4K ≈ 520 KB 的单帧上限。平均码率仍由内容上限/AIMD
-/// 控制（VBR 只在真需要时花），大帧由发送侧 32 KiB 分块 pacing 摊开。
-const VBV_BITS_PER_PIXEL_TIMES_2: u32 = 1;
+/// 一帧整页变化想接近无损（QP ≈ 20 的 H.264 文本），需要 **1–2 bit/像素**。而「6 帧码率」
+/// 这条口径在 4K/60 fps/40 Mbps 下只有 4 Mbit（≈0.5 bit/px），整页一换就被量化成一团；
+/// 更糟的是它跟随**时变码率**——内容上限一压，预算还会再塌一截。所以这里按几何给足
+/// 2 bit/px（1080p ≈520 KB、4K ≈2 MB），再用「不超过 1 秒码率」兜住低带宽场景
+/// （见 [`vbv_size`]），避免一帧吃掉整条链路。
+const VBV_BITS_PER_PIXEL: u32 = 2;
 
-/// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小：
-/// `max(`[`VBV_FRAMES`] 帧的码率, 每像素 0.5 位 × 像素数`)`，至少 1 位。
+/// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小（位）：
+/// `max(`[`VBV_FRAMES`] 帧的码率, min(每像素 [`VBV_BITS_PER_PIXEL`], 1 秒码率)`)`，至少 1 位。
 ///
 /// `fps == 0` 按 1 处理（避免除零；正常构造路径已拒绝 0 帧率）。
 fn vbv_size(bps: u32, fps: u32, width: u32, height: u32) -> u32 {
     let frames = (bps / fps.max(1)).saturating_mul(VBV_FRAMES);
     let pixels = width
         .saturating_mul(height)
-        .saturating_mul(VBV_BITS_PER_PIXEL_TIMES_2)
-        / 2;
-    frames.max(pixels).max(1)
+        .saturating_mul(VBV_BITS_PER_PIXEL);
+    // 「不超过 1 秒码率」：低带宽（或 Smooth 档）下不允许单帧吃掉整条链路；
+    // 高带宽下每像素额度才有意义。
+    let burst_cap = bps.max(1);
+    frames.max(pixels.min(burst_cap)).max(1)
 }
 
-/// 一轮 **intra refresh（GDR）** 覆盖的时间（秒）：约 2 秒内把整屏刷成 intra。
+/// 一轮 **intra refresh（GDR）** 覆盖的时间（秒）：约 1 秒内把整屏刷成 intra。
 ///
-/// 太短（< 1 秒）每帧的 intra 条带占比高，码率开销明显；太长（> 5 秒）参考帧自愈
-/// 变慢，用户看到的糊会持续更久。2 秒在 30/60 fps 下分别是 60/120 帧。
-const INTRA_REFRESH_SECONDS: u32 = 2;
+/// 太短（< 0.5 秒）每帧的 intra 条带占比高，码率开销明显；太长参考帧自愈变慢，用户
+/// 看到的糊会持续更久。注意周期是**按配置 fps 算的帧数**：实际编码帧率若只有一半
+/// （静止画面只发保活帧），一轮刷新就要 2 秒——这就是现场「糊 4–5 秒才恢复」的量级
+/// （旧值 2 秒 × 实际帧率减半 ≈ 4 秒）。
+const INTRA_REFRESH_SECONDS: u32 = 1;
 
 /// 一轮 intra refresh 的帧数（`fps × INTRA_REFRESH_SECONDS`，至少 1）。
 ///
@@ -717,11 +717,12 @@ fn build_encode_config(
     // 真机排障要能确认这两个「画质旋钮」真的生效（每次编码器创建只打一行）。
     tracing::info!(
         max_qp,
+        vbv_bits = config.rcParams.vbvBufferSize,
         intra_refresh = intra_refresh_supported,
         intra_refresh_frames = intra_refresh_frames(fps),
         fps,
         bitrate_bps,
-        "NVENC 编码配置就绪（QP 地板 / 渐进刷新）"
+        "NVENC 编码配置就绪（QP 地板 / 单帧预算 / 渐进刷新）"
     );
 
     Ok(config)
@@ -1356,7 +1357,7 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 mod tests {
     use super::{
         intra_refresh_frames, vbr_average, vbv_size, LruCache, INTRA_REFRESH_SECONDS,
-        VBV_BITS_PER_PIXEL_TIMES_2, VBV_FRAMES,
+        VBV_BITS_PER_PIXEL, VBV_FRAMES,
     };
 
     /// Intra refresh 的周期按「秒 × fps」算；刷新跨度的帧数必须 ≥1 且不除零。
@@ -1369,33 +1370,35 @@ mod tests {
         assert!(intra_refresh_frames(u32::MAX) > 0);
     }
 
-    /// VBV 取「六帧码率」与「每像素 0.5 位」的较大者。
+    /// VBV 取「六帧码率」与 `min(每像素 2 位, 1 秒码率)` 的较大者。
     #[test]
     fn vbv_size_gives_keyframes_headroom() {
-        // 10 Mbps @ 30fps、640×360：六帧 1_999_998 位 > 每像素下限 115_200 位。
+        // 10 Mbps @ 30fps、640×360：六帧 1_999_998 位 > 每像素额度 460_800 位。
         assert_eq!(vbv_size(10_000_000, 30, 640, 360), 1_999_998);
-        // 2 Mbps @ 15fps、640×360：六帧 799_998 位 > 115_200 位。
+        // 2 Mbps @ 15fps、640×360：六帧 799_998 位 > 460_800 位。
         assert_eq!(vbv_size(2_000_000, 15, 640, 360), 799_998);
-        // 1080p 的每像素下限 = 1920×1080/2 = 1_036_800 位（≈130 KB）。
-        assert_eq!(vbv_size(2_000_000, 15, 1920, 1080), 1_036_800);
-        // 4K = 3840×2160/2 = 4_147_200 位（≈520 KB）。
-        assert_eq!(vbv_size(40_000_000, 60, 3840, 2160), 4_147_200);
+        // 1080p、2 Mbps：每像素额度 4_147_200 位被「1 秒码率」2_000_000 位封顶。
+        assert_eq!(vbv_size(2_000_000, 15, 1920, 1080), 2_000_000);
+        // 4K、40 Mbps：每像素额度 16_588_800 位（≈2 MB）生效。
+        assert_eq!(vbv_size(40_000_000, 60, 3840, 2160), 16_588_800);
         assert_eq!(VBV_FRAMES, 6);
-        assert_eq!(VBV_BITS_PER_PIXEL_TIMES_2, 1);
+        assert_eq!(VBV_BITS_PER_PIXEL, 2);
     }
 
-    /// 关键回归：内容上限把码率压到 UI 档（4K 4.8 Mbps）时，单帧预算不能跟着塌到几十 KB。
+    /// 关键回归：整页重绘（切浏览器标签）时，4K 单帧必须拿到接近无损的预算。
     ///
-    /// 旧口径 `6 × bps/fps` 在这个组合下只有 60 KB（≈0.06 bit/px），任何一块画面变化都会被
-    /// 量化成一团——现场就是「动不动糊成一块」。geometry 兜底后是 520 KB（≈0.5 bit/px）。
+    /// 旧口径 `6 × bps/fps` 在 4K/60fps/40 Mbps 下只有 4 Mbit（≈0.5 bit/px），整页一换就被
+    /// 量化成一团——现场「切标签整页糊、过几秒才靠 GDR 恢复」。现在 2 bit/px（≈2 MB），
+    /// 且低带宽时用「1 秒码率」封顶，不会让一帧吃掉整条链路。
     #[test]
-    fn vbv_size_survives_the_content_cap_at_four_k() {
-        let capped = vbv_size(4_800_000, 60, 3840, 2160);
-        assert_eq!(capped, 4_147_200, "应按几何兜底，而不是按被压低的码率");
-        // 换算成字节：≈506 KB / 帧。
-        assert!(capped / 8 > 500_000);
-        // 1080p 的 UI 档（1.2 Mbps）同理。
-        assert_eq!(vbv_size(1_200_000, 60, 1920, 1080), 1_036_800);
+    fn vbv_size_covers_a_full_page_repaint() {
+        // 40 Mbps @ 60fps、4K：16_588_800 位 = 2_073_600 字节（≈2 MB，2 bit/px）。
+        let budget = vbv_size(40_000_000, 60, 3840, 2160);
+        assert_eq!(budget / 8, 2_073_600);
+        // 低带宽（4.8 Mbps，4K）：被 1 秒码率封顶 → 600 KB（仍远高于旧的 60 KB）。
+        assert_eq!(vbv_size(4_800_000, 60, 3840, 2160), 4_800_000);
+        // 1080p/10 Mbps：每像素额度 4.1 Mbit 生效 → ≈520 KB。
+        assert_eq!(vbv_size(10_000_000, 60, 1920, 1080), 4_147_200);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
