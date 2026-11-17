@@ -842,8 +842,8 @@ fn scene(
     // 150% 屏幕上「100%」会被画成 1.5 倍的双线性放大，「适应窗口」也会整体偏大。
     let want = display_size(v.scale, avail, (width, height), ui.ctx().pixels_per_point());
     if v.scale == ViewScale::Fit {
-        // 「适应窗口」**不再放大**：远端比窗口小时按 1:1 物理像素居中绘制，多出来的
-        // 区域留白（放大只是双线性插值，没有任何新细节）。
+        // 「适应窗口」等比铺满可用区域（可放大/缩小）。比例按**物理像素**算，绘制矩形
+        // 再对齐到整物理像素（见 `paint_image`）。
         let (_id, outer) = ui.allocate_space(avail);
         let rect = egui::Rect::from_center_size(outer.center(), want.min(avail));
         paint_image(ui, v, manager, active, &paint, rect);
