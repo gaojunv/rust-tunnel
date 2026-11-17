@@ -14,6 +14,7 @@ mod fonts;
 mod instance;
 mod notify;
 mod prefs;
+mod preview;
 mod remote;
 mod service_ui;
 mod service_watch;
@@ -47,6 +48,37 @@ pub(crate) fn load_window_icon() -> Option<std::sync::Arc<egui::IconData>> {
         height: h,
     }))
 }
+/// 启动时选中的 Tab。`RUST_TUNNEL_GUI_START_TAB=0..4` 仅供截图评审/自动化使用，
+/// 正常启动恒为 0（状态页）。
+fn initial_tab() -> usize {
+    std::env::var("RUST_TUNNEL_GUI_START_TAB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(0, |tab| tab.min(4))
+}
+
+/// 映射页初始状态：演示数据下展开第一条规则，截图评审能一次看到「监听 → 路径 → 后端」链路。
+fn initial_map_state() -> ui::mappings::MapState {
+    let mut state = ui::mappings::MapState::default();
+    if preview::enabled() {
+        state.expanded.insert("rule_7f3a".to_owned());
+    }
+    state
+}
+
+/// 设置页初始分组；`RUST_TUNNEL_GUI_SETTINGS_PAGE=remote|service|update` 仅供截图评审。
+fn initial_settings_page() -> ui::settings::SettingsPage {
+    match std::env::var("RUST_TUNNEL_GUI_SETTINGS_PAGE")
+        .ok()
+        .as_deref()
+    {
+        Some("remote") => ui::settings::SettingsPage::Remote,
+        Some("service") => ui::settings::SettingsPage::Service,
+        Some("update") => ui::settings::SettingsPage::Update,
+        _ => ui::settings::SettingsPage::default(),
+    }
+}
+
 struct GuiApp {
     app_state: Arc<app::AppState>,
     settings: ui::settings::SettingsState,
@@ -74,6 +106,14 @@ struct GuiApp {
     /// 上一帧看到的「可用更新版本」。用于检测新版本首次出现时强制显示并聚焦窗口
     /// （窗口可能已隐藏到托盘，更新提示不能只在后台）。
     last_update_version: Option<String>,
+    /// 日志页的本地筛选状态（等级/关键词/暂停自动滚动）。
+    logs_state: ui::logs::LogsState,
+    /// 映射页的本地状态（搜索词 + 已展开规则）。
+    map_state: ui::mappings::MapState,
+    /// 状态页的秒级趋势采样（RTT / 活跃隧道）。
+    status_history: ui::status::StatusHistory,
+    /// 设置页当前选中的二级分组。
+    settings_page: ui::settings::SettingsPage,
 }
 
 impl GuiApp {
@@ -96,7 +136,7 @@ impl GuiApp {
         Self {
             app_state,
             settings,
-            selected_tab: 0,
+            selected_tab: initial_tab(),
             tray,
             tray_bridge,
             last_tray_texts: None,
@@ -106,6 +146,10 @@ impl GuiApp {
             last_pending_approval: None,
             service_ui: service_ui::ServiceOps::default(),
             last_update_version: None,
+            logs_state: ui::logs::LogsState::default(),
+            map_state: initial_map_state(),
+            status_history: ui::status::StatusHistory::default(),
+            settings_page: initial_settings_page(),
         }
     }
 
@@ -198,6 +242,9 @@ impl GuiApp {
 }
 
 /// 应用主题偏好：egui 绘制 + 原生标题栏外观。
+///
+/// 主题切换后必须**重新落一遍 Fluent 样式**：`set_theme` 只切主题，不会把自定义令牌
+/// 带过去；`all_styles_mut` 会把浅色/深色两份都按当前偏好重算。
 fn apply_theme(ctx: &egui::Context, pref: prefs::ThemePref) {
     ctx.set_theme(pref.to_egui());
     let native = match pref {
@@ -206,6 +253,7 @@ fn apply_theme(ctx: &egui::Context, pref: prefs::ThemePref) {
         prefs::ThemePref::Dark => egui::SystemTheme::Dark,
     };
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(native));
+    ui::theme::apply_global_style(ctx);
 }
 
 impl GuiApp {
@@ -295,49 +343,85 @@ impl GuiApp {
         self.last_tray_texts = Some(sig);
     }
 
-    /// Tab 栏右侧的主题切换按钮（循环三态，落盘 gui.toml）。
+    /// 导航栏底部的主题切换按钮（循环三态，落盘 gui.toml）。
     fn show_theme_button(&mut self, ui: &mut egui::Ui) {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let cur = self.prefs.theme;
-            let effective = match ui.ctx().theme() {
-                egui::Theme::Dark => "深色",
-                egui::Theme::Light => "浅色",
-            };
-            let btn = ui
-                .small_button(format!("{} {}", cur.icon(), cur.label()))
-                .on_hover_text(format!(
-                    "切换主题（当前生效：{effective}，偏好：{}）",
-                    cur.label()
-                ));
-            if btn.clicked() {
-                let next = cur.next();
-                self.prefs.theme = next;
-                apply_theme(ui.ctx(), next);
-                if let Err(e) = prefs::save(&self.prefs) {
-                    tracing::warn!("GUI 偏好保存失败：{e}");
-                }
+        let cur = self.prefs.theme;
+        let effective = match ui.ctx().theme() {
+            egui::Theme::Dark => "深色",
+            egui::Theme::Light => "浅色",
+        };
+        let icon = match cur {
+            prefs::ThemePref::System => ui::icons::Icon::Monitor,
+            prefs::ThemePref::Light => ui::icons::Icon::Sun,
+            prefs::ThemePref::Dark => ui::icons::Icon::Moon,
+        };
+        let btn = ui::widgets::nav_theme_button(
+            ui,
+            icon,
+            cur.label(),
+            &format!("切换主题（当前生效：{effective}，偏好：{}）", cur.label()),
+        );
+        if btn.clicked() {
+            let next = cur.next();
+            self.prefs.theme = next;
+            apply_theme(ui.ctx(), next);
+            if let Err(e) = prefs::save(&self.prefs) {
+                tracing::warn!("GUI 偏好保存失败：{e}");
             }
-        });
+        }
     }
 
-    /// 顶部 Tab 栏（含右侧主题按钮）。
-    fn show_tabs(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("tabs")
-            .show_separator_line(false)
+    /// 左侧导航栏：品牌区 + 五个导航项 + 底部主题切换。
+    ///
+    /// 窗口加宽到 760×600 后，左侧导航比顶部 Tab 更符合 Fluent 的桌面应用习惯，也让
+    /// 内容区能放下统计块、规则卡片与日志表格。`selected_tab` 的 0..=4 语义保持不变
+    /// （托盘菜单与 `apply_pending_tray_tab` 都依赖它）。
+    fn show_nav(&mut self, ctx: &egui::Context) {
+        let items = [
+            (ui::icons::Icon::Pulse, "状态"),
+            (ui::icons::Icon::Route, "映射"),
+            (ui::icons::Icon::Monitor, "远程"),
+            (ui::icons::Icon::Settings, "设置"),
+            (ui::icons::Icon::List, "日志"),
+        ];
+        egui::SidePanel::left("app_nav")
+            .resizable(false)
+            .exact_width(196.0)
+            .frame(ui::theme::nav_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
-                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    for (idx, label) in ["状态", "映射", "远程", "设置", "日志"].iter().enumerate()
-                    {
-                        let sel = self.selected_tab == idx;
-                        if ui.selectable_label(sel, *label).clicked() {
-                            self.selected_tab = idx;
-                        }
-                    }
-                    self.show_theme_button(ui);
+                    ui::icons::app_mark(ui, 26.0);
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("rust-tunnel")
+                                .font(ui::icons::heading_font(15.0))
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(11.0)
+                                .weak(),
+                        );
+                    });
                 });
-                ui.add_space(2.0);
+                ui.add_space(16.0);
+                for (idx, (icon, label)) in items.iter().enumerate() {
+                    if ui::widgets::nav_item(ui, *icon, label, self.selected_tab == idx).clicked() {
+                        self.selected_tab = idx;
+                    }
+                    ui.add_space(2.0);
+                }
+                // 主题按钮贴底：`bottom_up` 在 SidePanel 里拿到的可用高度会被前面的
+                // 水平布局吃掉，改成显式留白更可靠（窗口再矮也只会贴底而不是消失）。
+                let remaining = ui.available_height() - 48.0;
+                if remaining > 0.0 {
+                    ui.add_space(remaining);
+                }
+                ui::widgets::divider(ui);
+                ui.add_space(6.0);
+                self.show_theme_button(ui);
             });
     }
     /// 把工具条里改过的展示档位（缩放 / 窗口尺寸 / 角标简洁或详细 / 剪贴板同步 / 工具条自动隐藏 / 帧率上限）回写 `gui.toml`。
@@ -431,6 +515,8 @@ impl eframe::App for GuiApp {
         }
 
         let status = self.app_state.status_rx.borrow().clone();
+        // 趋势线每秒采样一次（页面只读采样结果，不自己计时）。
+        self.status_history.sample(&status, Instant::now());
 
         // 远程引擎就绪后安装帧通道（幂等）；引擎由后台运行时线程注入 AppState。
         let remote_manager = self.app_state.remote();
@@ -440,7 +526,7 @@ impl eframe::App for GuiApp {
             .as_ref()
             .and_then(|s| s.pending_approval.as_ref().map(|p| p.session_id.clone()));
         self.refresh_tray(&status, pending_id.is_some());
-        self.show_tabs(ctx);
+        self.show_nav(ctx);
 
         // 待确认请求首次出现：窗口可能已隐藏到托盘（见 `intercept_close`），安全提示绝不能
         // 静默超时，故强制显示并聚焦。仅在 None→Some 跳变时做，避免每帧与用户抢焦点。
@@ -491,57 +577,50 @@ impl eframe::App for GuiApp {
         let mut update_action: Option<ui::update::UpdateAction> = None;
         let settings = &mut self.settings;
         let service_ui = &mut self.service_ui;
+        let logs_state = &mut self.logs_state;
+        let map_state = &mut self.map_state;
+        let settings_page = &mut self.settings_page;
+        let prefs_mut = &mut self.prefs;
+        let status_history = &self.status_history;
         let remote_view = Arc::clone(&self.remote_view);
         let app_state = &self.app_state;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(10.0);
-            // 被控横幅常驻所有 Tab 顶部：无论用户切到哪个页都能看到并随时中断。
-            ui::remote::controlled_banner(ui, remote_manager.as_ref());
-            match self.selected_tab {
-                0 => ui::status::show(ui, &status, app_state.service_owner()),
-                1 => ui::mappings::show(ui, &status),
-                2 => {
-                    remote_actions =
-                        ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
+        egui::CentralPanel::default()
+            .frame(ui::theme::page_frame(ctx.style().as_ref()))
+            .show(ctx, |ui| {
+                // 被控横幅常驻所有 Tab 顶部：无论用户切到哪个页都能看到并随时中断。
+                ui::remote::controlled_banner(ui, remote_manager.as_ref());
+                match self.selected_tab {
+                    0 => ui::status::show(ui, &status, app_state.service_owner(), status_history),
+                    1 => ui::mappings::show(ui, &status, map_state),
+                    2 => {
+                        remote_actions =
+                            ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
+                    }
+                    3 => {
+                        // 设置页自带「页头 + 二级导航 + 右侧滚动内容」，调用方不再包 ScrollArea。
+                        let (prefs_changed, action) = ui::settings::show(
+                            ui,
+                            settings_page,
+                            settings,
+                            app_state,
+                            prefs_mut,
+                            remote_manager.as_ref(),
+                            service_ui,
+                            app_state.update.as_ref(),
+                        );
+                        if prefs_changed {
+                            if let Err(e) = prefs::save(prefs_mut) {
+                                tracing::warn!("GUI 偏好保存失败：{e}");
+                            }
+                        }
+                        if action.is_some() {
+                            update_action = action;
+                        }
+                    }
+                    4 => ui::logs::show(ui, &app_state.log_buffer, logs_state),
+                    _ => {}
                 }
-                3 => {
-                    // 设置页内容已超过窗口高度（尤其 Windows 的「无人值守被控端」风险说明
-                    // 很长），必须可滚动，否则新增的「软件更新」一节会被裁在窗口下方。
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui::settings::show(ui, settings, app_state);
-                            if ui::settings::show_remote_section(
-                                ui,
-                                &mut self.prefs,
-                                remote_manager.as_ref(),
-                            ) {
-                                if let Err(e) = prefs::save(&self.prefs) {
-                                    tracing::warn!("GUI 偏好保存失败：{e}");
-                                }
-                            }
-                            // 「无人值守被控端」一节独立于 `show`（那已背着 too_many_lines 豁免）。
-                            ui::settings::show_service_section(ui, app_state, service_ui);
-                            // 「软件更新」一节：当前版本 / 自动检查 / 手动检查 / 可用更新。
-                            let (prefs_changed, action) = ui::update::settings_section(
-                                ui,
-                                app_state.update.as_ref(),
-                                &mut self.prefs,
-                            );
-                            if prefs_changed {
-                                if let Err(e) = prefs::save(&self.prefs) {
-                                    tracing::warn!("GUI 偏好保存失败：{e}");
-                                }
-                            }
-                            if action.is_some() {
-                                update_action = action;
-                            }
-                        });
-                }
-                4 => ui::logs::show(ui, &app_state.log_buffer),
-                _ => {}
-            }
-        });
+            });
         if let Some(on) = remote_actions.allow_remote {
             self.apply_allow_remote(on);
         }
@@ -705,8 +784,7 @@ fn spawn_runtime(
                 }
             }
         }
-        let mut bootstrap =
-            config_store::load_from_default_path().or_else(|| ClientConfig::load().ok());
+        let mut bootstrap = config_store::load_effective();
         if let Some(ref mut c) = bootstrap {
             fill_keyring(c);
             app_state.set_config(Some(c.clone()));
@@ -738,23 +816,20 @@ fn spawn_runtime(
             // 初始配置：优先 GUI 默认路径，其次 CLI env/TOML
             let mut config = if let Some(c) = config_store::load_from_default_path() {
                 c
+            } else if let Some(c) = config_store::load_cli_fallback() {
+                c
             } else {
-                match ClientConfig::load() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("no config: {e}; waiting for settings");
-                        // 无配置时保持离线，等待用户在设置 Tab 保存
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            if reconnect_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                reconnect_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                                if let Some(c) = config_store::load_from_default_path() {
-                                    break c;
-                                }
-                                if let Ok(c) = ClientConfig::load() {
-                                    break c;
-                                }
-                            }
+                tracing::warn!("no config: waiting for settings");
+                // 无配置时保持离线，等待用户在设置 Tab 保存
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if reconnect_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        reconnect_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(c) = config_store::load_from_default_path() {
+                            break c;
+                        }
+                        if let Some(c) = config_store::load_cli_fallback() {
+                            break c;
                         }
                     }
                 }
@@ -1004,9 +1079,7 @@ async fn run_client_loop(
             };
             if flag.load(std::sync::atomic::Ordering::SeqCst) {
                 flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                if let Some(c) =
-                    config_store::load_from_default_path().or_else(|| ClientConfig::load().ok())
-                {
+                if let Some(c) = config_store::load_effective() {
                     // 钥匙串回填
                     let mut c2 = c;
                     if c2.password.is_empty() {
@@ -1359,24 +1432,39 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
 
     // 偏好须在构建托盘与运行时之前加载：托盘的「允许被远程控制」勾选项要以持久化值为初态，
     // 且远程引擎的初始开关态取自该偏好（否则重启后菜单显示未勾选、而实际仍在被控状态）。
-    let prefs = prefs::load();
+    let mut prefs = prefs::load();
+    // 截图评审/自动化：RUST_TUNNEL_GUI_THEME=system|light|dark 覆盖本次运行的主题偏好
+    // （不落盘；正常启动不设置该变量）。
+    if let Ok(value) = std::env::var("RUST_TUNNEL_GUI_THEME") {
+        prefs.theme = match value.to_ascii_lowercase().as_str() {
+            "light" => prefs::ThemePref::Light,
+            "dark" => prefs::ThemePref::Dark,
+            _ => prefs::ThemePref::System,
+        };
+    }
     // 「跳过此版本」镜像必须在**控制通道启动前**就位：托盘线程 50 ms 一轮，
     // 可能在 `GuiApp` 构造前就看到服务端推送的可用更新。
     app_state
         .update
         .set_skipped(prefs.update_skipped_version.clone());
 
-    // 后台 tokio 运行时（控制通道/隧道 + 远程控制引擎）
-    spawn_runtime(
-        app_state.clone(),
-        status_tx,
-        log_buffer,
-        reconnect_flag,
-        prefs.allow_remote,
-        prefs.remote_approval,
-        prefs.remote_auto_lock_on_disconnect,
-        prefs.remote_native_resolution,
-    );
+    // 后台 tokio 运行时（控制通道/隧道 + 远程控制引擎）。
+    // 截图评审模式（`RUST_TUNNEL_GUI_DEMO=1`）**不启动运行时**：不连服务端、不注册身份，
+    // 只把一份合成状态塞进 `AppState`，避免与用户真实在跑的客户端抢同一个客户端名。
+    if preview::enabled() {
+        preview::seed(&app_state);
+    } else {
+        spawn_runtime(
+            app_state.clone(),
+            status_tx,
+            log_buffer,
+            reconnect_flag,
+            prefs.allow_remote,
+            prefs.remote_approval,
+            prefs.remote_auto_lock_on_disconnect,
+            prefs.remote_native_resolution,
+        );
+    }
 
     // 托盘在 eframe 初始化前需有事件循环；tray-icon 内部自行处理跨平台事件循环差异，
     // 此处先构建托盘（句柄随 GuiApp 持有生命周期），再起 eframe。
@@ -1400,8 +1488,8 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
 
     let viewport = {
         let mut vp = egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 520.0])
-            .with_min_inner_size([380.0, 400.0])
+            .with_inner_size([760.0, 600.0])
+            .with_min_inner_size([480.0, 430.0])
             .with_visible(true);
         if let Some(icon) = load_window_icon() {
             vp = vp.with_icon(icon);
