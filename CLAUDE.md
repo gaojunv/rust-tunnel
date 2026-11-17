@@ -328,7 +328,7 @@ GitHub Actions 工作流：
   （`--features rag,embed-frontend`）→ 从 `contrib/config.toml.template` 渲染配置（占位符替换后校验）
   → SCP 二进制 + systemd 服务 + 配置 → SSH 重启服务
 - `release-client.yml`（tag `v*` / 手动）— **只负责 CLI 客户端**：四平台矩阵（Linux musl、
-  macOS x86_64/aarch64、Windows MSVC），各 runner 直接 SCP 到 `${DEPLOY_PATH}/client/<tag>/`，
+  macOS x86_64/aarch64、Windows MSVC），各 runner 直接 SCP 到 `${DEPLOY_PATH}/client/<version>/`，
   `finalize-client` 在服务端**合并** `SHA256SUMS`（只负责 CLI 那几个文件名，保留 GUI 流程写下的
   其余行）并更新 `latest` 软链。`latest` 由本流程独占维护，代表「包含完整 CLI 产物的最新版本」
 - `release-client-gui.yml`（tag `gui-v*` / 手动）— **只负责 GUI 客户端**：Windows（GNU）GUI exe +
@@ -350,12 +350,15 @@ GitHub Actions 工作流：
   `finalize-gui` 用同一套合并规则写 `SHA256SUMS`（只负责 gui/service/dmg 那几个文件名），
   且**不碰 `latest`**——GUI-only 版本仍是独立版本目录，会出现在下载页的版本列表里，但不会成为 `latest`。
   协议不兼容的版本必须让 `v*` 与 `gui-v*` 两个 tag 指向同一版本一起发；
-  `crates/client`/`crates/client-gui` 的 `CARGO_PKG_VERSION` 仍要手工同步抬版（workflow 不写回 `Cargo.toml`）
+  `crates/client`/`crates/client-gui` 的 `CARGO_PKG_VERSION` 仍要手工抬高（workflow 不写回 `Cargo.toml`），
+  但**tag 与清单版本不一致会直接让发布失败**（见下面的版本解析小节），不会再悄悄发出一个版本自述错误的产物
 - `release-wiki-client.yml`（tag `wiki-v*` / 手动）— wiki 桌面端（Tauri 2）安装包：macOS
   aarch64/x86_64 `.dmg` + Windows `.msi`/NSIS `.exe`，产物重命名为
   `wiki-desktop-<os>-<arch>[-setup].<ext>` 后 SCP 到 `${DEPLOY_PATH}/wiki/<version>/`（版本目录名 =
   tag 去掉 `wiki-` 前缀），`finalize-wiki` 生成校验和与 `latest` 软链。触发用独立 tag 前缀与
   客户端发布（`release-client.yml` / `release-client-gui.yml`）解耦（Tauri 打包耗时远高于单文件二进制）
+
+**版本目录名由清单自动解析（`scripts/resolve-release-version.sh`，三个客户端 workflow 共用）**：手动触发**不再需要手填版本**，默认取对应 crate 的 `Cargo.toml` 里 `[package] version`（CLI → `crates/client`、GUI → `crates/client-gui`、wiki → `crates/wiki-serve`）拼成 `v<版本>`；tag 触发仍以 tag 为准（`v*` / `gui-v*` / `wiki-v*`，去掉 `gui-`/`wiki-` 前缀），但会校验它**必须等于** `v<清单版本>`，不一致就 `::error::` 硬失败——客户端上报给服务端的版本号就是 `CARGO_PKG_VERSION`，tag 与之不符会让版本门控（`MIN_REMOTE_CLIENT_VERSION` / `MIN_UPDATE_CLIENT_VERSION` / 数据面 `SESSION_PROTO_VERSION`）判断错对象。`version` 输入保留为显式覆盖（发 `dev-<sha7>` 之类的试验目录），覆盖时只告警。wiki 额外用 `--cross-check` 校验 `tauri.conf.json` 的 `version`（Tauri 打包器以它为准）与 `Cargo.toml` 一致。目录名仍按服务端 `is_safe_segment` 的字符集校验。
 
 部署使用 systemd（`contrib/rust-tunnel-server.service`），配置模板 `contrib/config.toml.template`。
 两个归档目录经 `client_dist_dir` / `wiki_dist_dir` 交给服务端只读，Web「下载」页分两个分区展示。

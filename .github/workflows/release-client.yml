@@ -10,18 +10,45 @@ name: Release Client (CLI)
 # `latest` 只由本 workflow 维护（它代表「包含完整 CLI 产物的最新版本」），
 # GUI 流程刻意不碰它——见 release-client-gui.yml。
 # 行为对齐 release-server.yml（SCP 直传，不依赖 Releases/Artifacts 分发）
+#
+# 版本目录名不需要任何人手填（见 scripts/resolve-release-version.sh）：tag 触发时取 tag，
+# 手动触发时取 `crates/client/Cargo.toml` 的 version —— 客户端上报给服务端做版本门控的
+# `CARGO_PKG_VERSION` 就是它，发布目录名照它推出来才不会自相矛盾。
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: '归档目录名（留空 = 取 crates/client/Cargo.toml 的版本，如 v0.17.0）'
+        required: false
+        type: string
 
 # 最小权限：仅需 checkout 拉代码；缓存用 runtime token，上传走 SCP/SSH 密钥，均不依赖 GITHUB_TOKEN
 permissions:
   contents: read
 
 jobs:
+  # 版本目录名只算一次，build 与 finalize 共用 —— 两处各算一遍迟早会算出不一样的结果。
+  # 解析规则（含「tag 与清单版本不一致就拒绝发布」的理由）见 scripts/resolve-release-version.sh。
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      dir: ${{ steps.resolve.outputs.dir }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve archive version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          bash scripts/resolve-release-version.sh \
+            --manifest crates/client/Cargo.toml \
+            --input "${INPUT_VERSION}"
+
   build-client:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +107,7 @@ jobs:
       - name: Upload binary to remote server
         shell: bash
         env:
+          VER: ${{ needs.version.outputs.dir }}
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SSH_HOST: ${{ secrets.SERVER_HOST }}
           SSH_USER: ${{ secrets.SERVER_USER }}
@@ -92,7 +120,7 @@ jobs:
           printf '%s\n' "${SSH_KEY}" > "${KEY}"
           chmod 600 "${KEY}"
           PORT="${SSH_PORT:-22}"
-          DEST="${DEPLOY_PATH}/client/${GITHUB_REF_NAME}"
+          DEST="${DEPLOY_PATH}/client/${VER}"
           SSH_OPTS=(-i "${KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
           echo "Uploading ${{ matrix.asset }} -> ${DEST}/"
           ssh "${SSH_OPTS[@]}" -p "${PORT}" "${SSH_USER}@${SSH_HOST}" "mkdir -p '${DEST}'"
@@ -102,7 +130,7 @@ jobs:
           rm -f "${KEY}"
 
   finalize-client:
-    needs: [build-client]
+    needs: [version, build-client]
     runs-on: ubuntu-latest
     steps:
       - name: Checksum, permissions and latest symlink
@@ -115,7 +143,7 @@ jobs:
           script: |
             set -e
             BASE="${{ secrets.DEPLOY_PATH }}/client"
-            TAG="${{ github.ref_name }}"
+            TAG="${{ needs.version.outputs.dir }}"
             cd "${BASE}/${TAG}"
 
             # 合并式清单：CLI 与 GUI 是两个独立 workflow，可能同时发布同一个版本目录

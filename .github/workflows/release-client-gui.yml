@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本目录名（如 v0.13.2）；手动触发时必填，tag 触发时忽略'
+        description: '归档目录名（留空 = 取 crates/client-gui/Cargo.toml 的版本，如 v0.18.6）'
         required: false
         default: ''
 
@@ -28,6 +28,10 @@ permissions:
 
 jobs:
   # 版本目录名只算一次，build 与 finalize 共用 —— 各 job 各算一遍迟早会算出不一样的结果。
+  # 手动触发不再需要手填版本：默认取 `crates/client-gui/Cargo.toml` 的 version
+  # （客户端上报的 `CARGO_PKG_VERSION` 就是它），拼成 `v0.18.6`；tag 触发仍以 tag 为准，
+  # 但会校验它与清单版本一致。解析规则见 scripts/resolve-release-version.sh。
+  #
   # **必须去掉 `gui-` 前缀**：CLI 与 GUI 两个 workflow 把产物发进同一个
   # ${DEPLOY_PATH}/client/<version>/，下载页按版本目录聚合文件；若目录名保留
   # `gui-v0.13.2`，服务端 semver_key 解析失败，该版本会作为「怪版本」排在列表末尾，
@@ -35,33 +39,18 @@ jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
-      value: ${{ steps.resolve.outputs.value }}
+      dir: ${{ steps.resolve.outputs.dir }}
     steps:
+      - uses: actions/checkout@v7
       - name: Resolve archive version
         id: resolve
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          set -euo pipefail
-          if [ -n "${INPUT_VERSION}" ]; then
-            VER="${INPUT_VERSION}"
-          elif [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" == gui-v* ]]; then
-            # gui-v0.13.2 -> v0.13.2（理由见上面 job 注释）
-            VER="${GITHUB_REF_NAME#gui-}"
-          else
-            # 手动触发却没填 version：拒绝落到 client/main 这类非版本目录
-            echo "::error::manual dispatch requires the 'version' input (e.g. v0.13.2)"
-            exit 1
-          fi
-          # 与服务端 is_safe_segment 同一把尺子（只放行 A-Za-z0-9._+-）；非法目录名
-          # 会被下载页静默过滤，表现为「上传成功但页面看不见」，所以在这里就挡住。
-          if ! printf '%s' "${VER}" | grep -Eq '^[A-Za-z0-9._+-]{1,128}$' \
-            || [ "${VER}" = "." ] || [ "${VER}" = ".." ]; then
-            echo "::error::invalid archive version: '${VER}' (allowed charset: A-Za-z0-9._+-)"
-            exit 1
-          fi
-          echo "value=${VER}" >> "$GITHUB_OUTPUT"
-          echo "Archive directory: client/${VER}"
+          bash scripts/resolve-release-version.sh \
+            --manifest crates/client-gui/Cargo.toml \
+            --tag-prefix gui- \
+            --input "${INPUT_VERSION}"
 
   build-gui:
     needs: version
@@ -161,7 +150,7 @@ jobs:
       - name: Upload GUI to remote
         shell: bash
         env:
-          VER: ${{ needs.version.outputs.value }}
+          VER: ${{ needs.version.outputs.dir }}
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SSH_HOST: ${{ secrets.SERVER_HOST }}
           SSH_USER: ${{ secrets.SERVER_USER }}
@@ -204,7 +193,7 @@ jobs:
       # 泄漏进文件名。
       - name: Bundle .app and dmg
         env:
-          VERSION: ${{ needs.version.outputs.value }}
+          VERSION: ${{ needs.version.outputs.dir }}
           GUI_BIN: target/aarch64-apple-darwin/release/rust-tunnel-client-gui
         run: |
           bash scripts/bundle-macos.sh
@@ -212,7 +201,7 @@ jobs:
       - name: Upload dmg and raw binary
         shell: bash
         env:
-          VER: ${{ needs.version.outputs.value }}
+          VER: ${{ needs.version.outputs.dir }}
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SSH_HOST: ${{ secrets.SERVER_HOST }}
           SSH_USER: ${{ secrets.SERVER_USER }}
@@ -279,7 +268,7 @@ jobs:
         shell: bash
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-          VER: ${{ needs.version.outputs.value }}
+          VER: ${{ needs.version.outputs.dir }}
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SSH_HOST: ${{ secrets.SERVER_HOST }}
           SSH_USER: ${{ secrets.SERVER_USER }}
@@ -325,7 +314,7 @@ jobs:
       - name: Bundle Windows GUI + service into one zip
         shell: bash
         env:
-          VER: ${{ needs.version.outputs.value }}
+          VER: ${{ needs.version.outputs.dir }}
           SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SSH_HOST: ${{ secrets.SERVER_HOST }}
           SSH_USER: ${{ secrets.SERVER_USER }}
@@ -389,7 +378,7 @@ jobs:
           script: |
             set -e
             BASE="${{ secrets.DEPLOY_PATH }}/client"
-            VER="${{ needs.version.outputs.value }}"
+            VER="${{ needs.version.outputs.dir }}"
             cd "${BASE}/${VER}"
 
             # 合并式清单：CLI 与 GUI 是两个独立 workflow，可能同时发布同一个版本目录
