@@ -528,6 +528,21 @@ impl RateController {
         self.content_cap_fps
     }
 
+    /// **关键帧**应使用的目标码率（kbps）：AIMD 值，**不受内容面积上限钳制**。
+    ///
+    /// 面积上限的语义是「只改了一小块，别为整帧花光预算」，这只对 **P 帧**成立：
+    /// 关键帧要编码整幅画面，按 UI 档的 1.2 Mbps 编 1080p 时，VBV 只允许几 KB，
+    /// 文本必然糊成一团。更糟的是静态画面的 P 帧几乎没有残差，关键帧糊掉的细节**永远
+    /// 补不回来**，只能等下一次内容变化——用户看到的就是「静止一会儿字突然完全看不清」。
+    ///
+    /// 因此关键帧取 AIMD 的 `bitrate_kbps`：它仍 ≤ 档位上限、仍随真实拥塞下调，只跳过
+    /// `content_cap_kbps` 这一层。发送侧的大帧 pacing 也用这个值——pacing 描述的是**链路
+    /// 速率**，按 1.2 Mbps 摊开一个关键帧只会白加延迟。
+    #[must_use]
+    pub fn keyframe_bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
+    }
+
     /// 当前生效的内容活跃等级（[`Self::observe_activity`] 的结果，含迟滞）。
     ///
     /// 被控端每秒把它映射成 [`crate::session::HostActivity`] 上报给控制器（统计角标
@@ -1426,6 +1441,47 @@ mod tests {
         c.observe_activity(1000);
         assert_eq!(c.current().bitrate_kbps, 6000);
         assert_eq!(c.current().fps, 30);
+    }
+
+    /// 关键帧码率**不受内容上限钳制**：UI 档 1.2 Mbps 只压 P 帧，关键帧仍按 AIMD 的
+    /// 档位码率编码。
+    ///
+    /// 这条锁住的真实回归：1080p 关键帧在 1.2 Mbps 下只有几 KB，整屏文本必然糊；而静止
+    /// 画面的 P 帧没有残差，糊掉的参考帧不会自行恢复。
+    #[test]
+    fn keyframe_bitrate_ignores_content_cap() {
+        let mut c = activity_controller(); // Balanced：6000 kbps / 30 fps
+        prime(&mut c);
+        c.promote_activity(0);
+        lo_activity_twice(&mut c);
+        assert_eq!(c.current().bitrate_kbps, 1200, "P 帧按内容上限收紧");
+        assert_eq!(
+            c.keyframe_bitrate_kbps(),
+            6000,
+            "关键帧必须用 AIMD 码率（不受面积上限钳制）"
+        );
+    }
+
+    /// 关键帧码率跟随 AIMD 的拥塞下调，且绝不越过档位上限。
+    #[test]
+    fn keyframe_bitrate_follows_congestion_and_ceiling() {
+        let mut c = RateController::new(QualityPreset::Hd.options()); // 10000 kbps / 60 fps
+        prime(&mut c);
+        // 网络拥塞：码率乘性下降。
+        for _ in 0..3 {
+            c.on_feedback(fb(400, 10, 0), 2, None);
+        }
+        let aimd = c.current().bitrate_kbps;
+        assert!(aimd < 10_000, "拥塞应已下调 AIMD 码率（实际 {aimd}）");
+        assert!(
+            c.keyframe_bitrate_kbps() <= 10_000,
+            "关键帧码率不得越过档位上限"
+        );
+        assert_eq!(
+            c.keyframe_bitrate_kbps(),
+            aimd,
+            "关键帧码率就是 AIMD 值（不额外抬升，也不被面积上限压低）"
+        );
     }
 
     // ───────────────── 解码瓶颈 vs 网络拥塞（阶段 4） ─────────────────

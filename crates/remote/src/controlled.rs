@@ -894,8 +894,9 @@ fn refresh_activity(
         );
     }
     *encode = next;
-    // 面积驱动的升档会抬高生效码率：pacing 必须跟着走，否则大帧按旧码率摊开、比目标更快或更慢。
-    queues.set_screen_pacing_kbps(next.bitrate_kbps);
+    // pacing 描述的是**链路速率**，取 AIMD 值而不是内容上限钳制后的生效码率：小面积变化的
+    // P 帧本来就只有几 KB，按 1.2 Mbps 摊开没有任何带宽收益，只会给大帧（关键帧）白加延迟。
+    queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
 }
 
 /// 退出补丁模式：回到全帧视频，并让采集节拍**立刻**到期（先把用户操作的那一帧抓上来）。
@@ -1659,8 +1660,9 @@ pub async fn run_controlled(
     // 只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
     let mut rate = RateController::new(session_encode_options(config.encode, native_active));
     let mut encode = rate.current();
-    // pacing 与编码器的在线码率保持同一个值（见 [`pacing_plan`]）。
-    queues.set_screen_pacing_kbps(encode.bitrate_kbps);
+    // pacing 按**链路**码率（AIMD）摊开：内容上限压的是「这一帧值多少比特」，不是链路速率
+    // （见 [`RateController::keyframe_bitrate_kbps`]）。
+    queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
     let mut display_id = displays
         .iter()
         .find(|d| d.primary)
@@ -1982,6 +1984,7 @@ pub async fn run_controlled(
                                     let job = EncodeJob {
                                         display: display_id,
                                         rates: encode,
+                                        keyframe_bitrate_kbps: rate.keyframe_bitrate_kbps(),
                                         force_keyframe,
                                         force_encode,
                                         capture_us,
@@ -2491,8 +2494,8 @@ pub async fn run_controlled(
                                 rate.set_frame_rate_ceiling(fps);
                             }
                             encode = rate.current();
-                            // pacing 跟随生效码率（大帧摊开的时间按它算）。
-                            queues.set_screen_pacing_kbps(encode.bitrate_kbps);
+                            // pacing 跟随 AIMD 链路码率（大帧摊开的时间按它算）。
+                            queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
                             // 档位可能改缩放 → 几何可能变化：补丁模式的持久缓冲尺寸随之作废，
                             // 必须退出（并靠下面的 `force_keyframe` 重发基准）。
                             screen_mode.exit(std::time::Instant::now());
@@ -2505,7 +2508,7 @@ pub async fn run_controlled(
                             selected_fps = Some(fps);
                             rate.set_frame_rate_ceiling(fps);
                             encode = rate.current();
-                            queues.set_screen_pacing_kbps(encode.bitrate_kbps);
+                            queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
                             // 补丁模式可以留着（帧率只影响空补丁的保活节拍），但节拍要按新值重排。
                             let at = Instant::now() + capture_tick_period(screen_mode.mode, &encode);
                             schedule_capture(&mut capture_tick, &mut next_capture_at, at);
@@ -2560,7 +2563,7 @@ pub async fn run_controlled(
                                 schedule_capture(&mut capture_tick, &mut next_capture_at, at);
                             }
                             encode = decision.rates;
-                            queues.set_screen_pacing_kbps(encode.bitrate_kbps);
+                            queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
                             if decision.force_keyframe {
                                 force_keyframe = true;
                             }
@@ -3057,8 +3060,15 @@ struct CaptureOutcome {
 struct EncodeJob {
     /// 来源显示器编号。
     display: u32,
-    /// 当前**生效**编码参数（≤ 档位上限）。
+    /// 当前**生效**编码参数（≤ 档位上限）；P 帧用它。
     rates: EncodeRates,
+    /// 关键帧（IDR）该用的目标码率（kbps）：AIMD 值，**不受内容面积上限钳制**
+    /// （见 [`RateController::keyframe_bitrate_kbps`]）。
+    ///
+    /// 关键帧要编码整幅画面，面积上限那套「小改动用小预算」的逻辑会把它压到 1.2 Mbps
+    /// （1080p 只剩几 KB），整屏文本直接糊掉；而静态画面没有残差，糊掉的
+    /// 参考帧**永远不会自行恢复**。必须把这条与 P 帧的预算分开。
+    keyframe_bitrate_kbps: u32,
     /// 本帧必须是 IDR（首帧/切显示器/切档位/`RequestKeyframe`/降分辨率/编码器重建）。
     force_keyframe: bool,
     /// 本帧必须真正编码一次（即使与上一帧相同），但**不要求** IDR。
@@ -3486,6 +3496,7 @@ async fn encode_loop(
         let EncodeJob {
             display,
             rates,
+            keyframe_bitrate_kbps,
             force_keyframe,
             force_encode,
             capture_us,
@@ -3566,8 +3577,28 @@ async fn encode_loop(
             debug!("出站队列已满，跳过本轮编码（编码前丢帧，不破坏参考链）");
             continue;
         }
+        // 本帧真正的编码码率：关键帧用 AIMD 值（不被内容面积上限钳制），P 帧用生效值。
+        //
+        // 关键帧是**整幅画面**，用 1.2 Mbps 编 1080p 只有几 KB，文本必然糊；
+        // 而静止画面的 P 帧没有残差，糊掉的参考帧不会自行恢复。见
+        // [`RateController::keyframe_bitrate_kbps`]。
+        let frame_rates = if idr {
+            EncodeRates {
+                bitrate_kbps: keyframe_bitrate_kbps.max(rates.bitrate_kbps),
+                ..rates
+            }
+        } else {
+            rates
+        };
         if encoder.is_none() {
-            match encoder_factory.create(width, height, rates.bitrate_kbps, rates.fps) {
+            // **创建时也用关键帧码率**：MFT 的峰值与 VBV 缓冲只在创建时设定（运行期改会
+            // 插 IDR），用一个被面积上限压低的码率创建会把整场会话的峰值永久锁死。
+            match encoder_factory.create(
+                width,
+                height,
+                keyframe_bitrate_kbps.max(rates.bitrate_kbps),
+                rates.fps,
+            ) {
                 Ok(enc) => {
                     // C3：每次**成功创建**都算一次重建（含首建；几何未变时的首建也是从无到有）。
                     window.encoder_rebuilds = window.encoder_rebuilds.saturating_add(1);
@@ -3591,7 +3622,7 @@ async fn encode_loop(
         // （`reconfig_and_encode`），与编码同一次阻塞调用。
         let joined = tokio::task::spawn_blocking(move || {
             let mut enc = enc;
-            let result = reconfig_and_encode(enc.as_mut(), &rates, &frame, idr);
+            let result = reconfig_and_encode(enc.as_mut(), &frame_rates, &frame, idr);
             (enc, result, frame)
         })
         .await;
@@ -4680,6 +4711,7 @@ mod tests {
             .send(EncodeJob {
                 display: 0,
                 rates: hi,
+                keyframe_bitrate_kbps: hi.bitrate_kbps,
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
@@ -4696,6 +4728,7 @@ mod tests {
             .send(EncodeJob {
                 display: 0,
                 rates: lo,
+                keyframe_bitrate_kbps: hi.bitrate_kbps,
                 force_keyframe: false,
                 force_encode: false,
                 capture_us: 0,
@@ -4752,6 +4785,7 @@ mod tests {
             .send(EncodeJob {
                 display: 0,
                 rates: hi,
+                keyframe_bitrate_kbps: hi.bitrate_kbps,
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
@@ -4767,6 +4801,7 @@ mod tests {
             .send(EncodeJob {
                 display: 0,
                 rates: half,
+                keyframe_bitrate_kbps: hi.bitrate_kbps,
                 force_keyframe: false,
                 force_encode: false,
                 capture_us: 0,
@@ -4787,9 +4822,15 @@ mod tests {
         let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
     }
 
+    /// 假的编码记录：每次 `encode` 压入 `(当时的编码码率, 是否关键帧)`。
+    type EncodeLog = Arc<std::sync::Mutex<Vec<(u32, bool)>>>;
+
     /// 假 H.264 编码器工厂：不产出真码流，只用于锁定「按协商 codec 建编码器」的接线。
     #[derive(Debug, Default)]
-    struct FakeH264EncoderFactory;
+    struct FakeH264EncoderFactory {
+        /// 可选记录器。`None` = 不记录（大多数用例只关心产物形状）。
+        log: Option<EncodeLog>,
+    }
 
     impl VideoEncoderFactory for FakeH264EncoderFactory {
         fn codec(&self) -> CodecId {
@@ -4808,6 +4849,7 @@ mod tests {
                 height,
                 bitrate: target_bitrate_kbps,
                 fps: u32::from(max_fps),
+                log: self.log.clone(),
             }))
         }
     }
@@ -4818,6 +4860,7 @@ mod tests {
         height: u32,
         bitrate: u32,
         fps: u32,
+        log: Option<EncodeLog>,
     }
 
     impl VideoEncoderApi for FakeH264Encoder {
@@ -4845,11 +4888,95 @@ mod tests {
             _src_height: u32,
             force_keyframe: bool,
         ) -> RemoteResult<EncodedVideo> {
+            if let Some(log) = &self.log {
+                log.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((self.bitrate, force_keyframe));
+            }
             Ok(EncodedVideo {
                 data: vec![0, 0, 0, 1, 0x42],
                 keyframe: force_keyframe,
             })
         }
+    }
+
+    /// **关键帧码率不随内容上限收紧**（回归锁）。
+    ///
+    /// 被控端在 UI 档会把 P 帧的生效码率压到 1.2 Mbps；关键帧必须改用作业携带的 AIMD
+    /// 码率（这里 6 Mbps），否则 1080p 的 IDR 只有几 KB，整屏文本糊掉且静态画面不会自愈。
+    /// 编码器的**创建**码率也必须是关键帧码率：MFT 的峰值与 VBV 只在创建时设定。
+    #[tokio::test]
+    async fn encode_loop_uses_keyframe_bitrate_for_idr() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory = FakeH264EncoderFactory {
+            log: Some(Arc::clone(&log)),
+        };
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+            CodecId::H264,
+            Arc::new(factory),
+            UNCHANGED_RESEND_INTERVAL,
+            Arc::new(ScreenSendMeter::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        // 内容上限把 P 帧压到 1.2 Mbps；关键帧仍应按 6 Mbps 编码。
+        let capped = EncodeRates {
+            bitrate_kbps: 1200,
+            fps: 30,
+            scale: 1.0,
+        };
+        let job = |force_keyframe: bool, salt: u8| EncodeJob {
+            display: 0,
+            rates: capped,
+            keyframe_bitrate_kbps: 6000,
+            force_keyframe,
+            force_encode: false,
+            capture_us: 0,
+            capture_ts_us: 0,
+            frame: shaded(0, 64, 48, salt),
+        };
+
+        job_tx
+            .send(job(true, 10))
+            .await
+            .expect("投递关键帧");
+        let (flags, _, _) = next_video(&mut out_rx).await;
+        assert!(flags & VIDEO_FLAG_KEYFRAME != 0);
+        job_tx
+            .send(job(false, 40))
+            .await
+            .expect("投递 P 帧");
+        let (flags, _, _) = next_video(&mut out_rx).await;
+        assert_eq!(flags & VIDEO_FLAG_KEYFRAME, 0);
+
+        // 守卫的作用域必须结束在后面的 `await` 之前（clippy::await_holding_lock）。
+        {
+            let recorded = log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                recorded.first().copied(),
+                Some((6000, true)),
+                "关键帧必须用 AIMD 码率编码（不是内容上限的 1200）"
+            );
+            assert_eq!(
+                recorded.get(1).copied(),
+                Some((1200, false)),
+                "P 帧仍用内容上限收紧后的生效码率"
+            );
+        }
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
     }
 
     /// **协商不变量**：编码任务必须用协商选定的 codec 工厂，并在 `ScreenConfig` /
@@ -4865,7 +4992,7 @@ mod tests {
             cancel.clone(),
             SessionStatsReporter::noop(),
             CodecId::H264,
-            Arc::new(FakeH264EncoderFactory),
+            Arc::new(FakeH264EncoderFactory::default()),
             UNCHANGED_RESEND_INTERVAL,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
@@ -4878,6 +5005,7 @@ mod tests {
             .send(EncodeJob {
                 display: 0,
                 rates: EncodeRates::ceiling(EncodeOptions::default()),
+                keyframe_bitrate_kbps: EncodeOptions::default().target_bitrate_kbps,
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
@@ -4944,6 +5072,7 @@ mod tests {
         let job = |frame: RawFrame, force: bool| EncodeJob {
             display: 0,
             rates: opts,
+            keyframe_bitrate_kbps: opts.bitrate_kbps,
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
@@ -5014,7 +5143,7 @@ mod tests {
             cancel.clone(),
             SessionStatsReporter::noop(),
             CodecId::H264,
-            Arc::new(FakeH264EncoderFactory),
+            Arc::new(FakeH264EncoderFactory::default()),
             // 语义锁：间隔足够大时「无变化就跳过」必须保持原语义（本用例不断言保活）。
             Duration::from_secs(3600),
             Arc::new(ScreenSendMeter::new()),
@@ -5027,6 +5156,7 @@ mod tests {
         let gpu_job = |changed: bool, force: bool| EncodeJob {
             display: 0,
             rates,
+            keyframe_bitrate_kbps: rates.bitrate_kbps,
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
@@ -5102,7 +5232,7 @@ mod tests {
             cancel.clone(),
             SessionStatsReporter::noop(),
             CodecId::H264,
-            Arc::new(FakeH264EncoderFactory),
+            Arc::new(FakeH264EncoderFactory::default()),
             // 保活间隔足够大：本用例只验证 `force_encode` 单独绕过无变化闸门。
             Duration::from_secs(3600),
             Arc::new(ScreenSendMeter::new()),
@@ -5115,6 +5245,7 @@ mod tests {
         let gpu_job = |changed: bool, force_keyframe: bool, force_encode: bool| EncodeJob {
             display: 0,
             rates,
+            keyframe_bitrate_kbps: rates.bitrate_kbps,
             force_keyframe,
             force_encode,
             capture_us: 0,
@@ -5178,7 +5309,7 @@ mod tests {
             cancel.clone(),
             SessionStatsReporter::noop(),
             CodecId::H264,
-            Arc::new(FakeH264EncoderFactory),
+            Arc::new(FakeH264EncoderFactory::default()),
             Duration::ZERO,
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
@@ -5190,6 +5321,7 @@ mod tests {
         let gpu_job = |changed: bool, force: bool| EncodeJob {
             display: 0,
             rates,
+            keyframe_bitrate_kbps: rates.bitrate_kbps,
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
@@ -6344,7 +6476,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let mut cfg = config(pending_with("TOK"), RemoteMode::Control);
-        cfg.h264_encoder_factory = Some(Arc::new(FakeH264EncoderFactory));
+        cfg.h264_encoder_factory = Some(Arc::new(FakeH264EncoderFactory::default()));
         let ctld = tokio::spawn(run_controlled(
             Box::new(b),
             cfg,
@@ -6435,7 +6567,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let mut cfg = config(pending_with("TOK"), RemoteMode::Control);
-        cfg.h264_encoder_factory = Some(Arc::new(FakeH264EncoderFactory));
+        cfg.h264_encoder_factory = Some(Arc::new(FakeH264EncoderFactory::default()));
         let ctld = tokio::spawn(run_controlled(
             Box::new(b),
             cfg,

@@ -98,12 +98,13 @@ pub fn show_remote_section(
             ui.add_space(4.0);
             let mut on = prefs.remote_native_resolution;
             let changed = ui
-                .checkbox(&mut on, "原生分辨率（4K，仅硬件 H.264）")
+                .checkbox(&mut on, "原生分辨率（不缩放到 1080p，仅硬件 H.264）")
                 .changed();
             ui.label(
                 egui::RichText::new(
-                    "仅 4K 屏 + 硬件 H.264 生效：码率上限翻倍（封顶 30 Mbps）；\
-                     控制器解码/上屏压力更大。对端只支持 VP9 时仍按 1080p 编码。\
+                    "本机作为被控端时生效：显示宽度 >1920 时按原生像素编码（≤1920 无变化），\
+                     码率上限翻倍（封顶 30 Mbps）。关掉会把 4K/2K 桌面缩到 1920——文字细节在\
+                     编码前就丢了，之后再高的码率也补不回来。对端只支持 VP9 时仍按 1080p。\
                      运行中修改在下次会话生效。",
                 )
                 .small()

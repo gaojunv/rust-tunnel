@@ -260,9 +260,14 @@ fn kbps_to_bps(kbps: u32) -> u32 {
 /// VBV 缓冲涵盖的帧数。
 ///
 /// 旧实现是「半秒码率」：10 Mbps 档允许单帧吃掉 625 KB，在 2 Mbps 链路上要走
-/// 500 ms，期间后续帧全被堵住（实测帧到达抖动 400–500 ms）。改成约两帧的额度，
-/// 把单帧突发压到「帧间隔量级」，同时仍给码率控制器留一点缓冲空间。
-const VBV_FRAMES: u32 = 2;
+/// 500 ms，期间后续帧全被堵住（实测帧到达抖动 400–500 ms）。
+///
+/// **但也不能压到两帧**：VBV 同时是**单帧比特上限**，而关键帧要编码整幅画面。两帧在
+/// 60 fps 下只有 33 ms 的预算——10 Mbps 档约 41 KB，内容上限收紧到 1.2 Mbps 时只剩
+/// 5 KB，1080p 文本必然糊；而静态画面的 P 帧没有残差，糊掉的参考帧不会自愈（现场表现
+/// 就是「静止一会儿字突然完全看不清」）。6 帧在 60 fps 下是 100 ms、30 fps 下 200 ms，
+/// 配合发送侧 32 KiB 分块 pacing（单间隙 ≤100 ms）不会再整段堵住后续帧。
+const VBV_FRAMES: u32 = 6;
 
 /// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小：约 [`VBV_FRAMES`] 帧的码率，至少 1 位。
 ///
@@ -1245,23 +1250,23 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 mod tests {
     use super::{vbr_average, vbv_size, LruCache, VBV_FRAMES};
 
-    /// VBV 额度是「约两帧的码率」：单帧不再能吃掉半秒预算（那会把后续帧全堵住）。
+    /// VBV 额度是「约六帧的码率」：既给关键帧足够的整帧比特，又不至于让单帧吃掉半秒预算。
     #[test]
-    fn vbv_size_is_about_two_frames() {
-        // 10 Mbps @ 30fps：每帧 333_333 位，两帧 666_666 位。
-        assert_eq!(vbv_size(10_000_000, 30), 666_666);
-        // 6 Mbps @ 30fps：每帧 200_000 位，两帧 400_000 位。
-        assert_eq!(vbv_size(6_000_000, 30), 400_000);
-        // 2 Mbps @ 15fps：每帧 133_333 位，两帧 266_666 位。
-        assert_eq!(vbv_size(2_000_000, 15), 266_666);
+    fn vbv_size_gives_keyframes_headroom() {
+        // 10 Mbps @ 30fps：每帧 333_333 位，六帧 1_999_998 位（≈250 KB）。
+        assert_eq!(vbv_size(10_000_000, 30), 1_999_998);
+        // 6 Mbps @ 30fps：每帧 200_000 位，六帧 1_200_000 位（≈150 KB）。
+        assert_eq!(vbv_size(6_000_000, 30), 1_200_000);
+        // 2 Mbps @ 15fps：每帧 133_333 位，六帧 799_998 位（≈100 KB）。
+        assert_eq!(vbv_size(2_000_000, 15), 799_998);
         // 与帧数常量的口径一致（不是零散的魔数）。
-        assert_eq!(VBV_FRAMES, 2);
+        assert_eq!(VBV_FRAMES, 6);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
     #[test]
     fn vbv_size_guards_zero() {
-        assert_eq!(vbv_size(1, 0), 2);
+        assert_eq!(vbv_size(1, 0), 6);
         assert_eq!(vbv_size(0, 30), 1);
         // 极大值走饱和乘法，不 panic。
         assert!(vbv_size(u32::MAX, 1) > 0);

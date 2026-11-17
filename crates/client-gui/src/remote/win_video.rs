@@ -1234,14 +1234,9 @@ impl VideoEncoderApi for NvencAdapter {
         if same_device && source != target && !self.zero_copy_disabled {
             // 先把缩放结果拿出来，结束对 `self.scaler` 的借用，再动编码器。
             // `None` = 缩放器构造失败（已在 `scaler()` 里打过一次日志）。
-            let scaled = match self.scaler() {
-                Some(scaler) => Some(scaler.scale(
-                    &gpu_frame.texture.texture,
-                    source,
-                    target,
-                )),
-                None => None,
-            };
+            let scaled = self
+                .scaler()
+                .map(|scaler| scaler.scale(&gpu_frame.texture.texture, source, target));
             match scaled {
                 Some(Ok(texture)) => match self.encoder.encode_texture(&texture, force_keyframe) {
                     Ok(packet) => {
