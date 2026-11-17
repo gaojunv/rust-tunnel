@@ -697,7 +697,12 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
                         ui.selectable_value(&mut v.scale, scale, scale.label());
                     }
                 });
-            ui.label(RichText::new("按物理像素，100% = 不缩放").weak().small());
+            let hint = match v.scale {
+                ViewScale::Fit => "等比铺满窗口（可放大可缩小）",
+                ViewScale::FitNoUpscale => "只缩不放：窗口更大时按 1:1 居中留白",
+                _ => "按物理像素，100% = 不缩放；超出窗口时中键拖拽平移",
+            };
+            ui.label(RichText::new(hint).weak().small());
         });
         widgets::labeled_row(ui, "窗口尺寸", |ui| {
             let mut picked = v.window_size;
@@ -821,7 +826,8 @@ fn reconnect_strip(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>
     });
 }
 
-/// 画面区域：按缩放档位决定绘制尺寸。`Fit` 等比铺满可用区域；固定档位用滚动区承载溢出。
+/// 画面区域：按缩放档位决定绘制尺寸。两个「适应窗口」档都等比适配可用区域
+/// （`Fit` 铺满、`FitNoUpscale` 只缩不放）；固定档位用滚动区承载溢出，并支持中键拖拽平移。
 fn scene(
     ui: &mut Ui,
     v: &mut RemoteView,
@@ -841,9 +847,9 @@ fn scene(
     // 缩放比例以**物理像素**为基准（见 `view_scale` 的模块文档）：不传 DPI 的话，
     // 150% 屏幕上「100%」会被画成 1.5 倍的双线性放大，「适应窗口」也会整体偏大。
     let want = display_size(v.scale, avail, (width, height), ui.ctx().pixels_per_point());
-    if v.scale == ViewScale::Fit {
-        // 「适应窗口」等比铺满可用区域（可放大/缩小）。比例按**物理像素**算，绘制矩形
-        // 再对齐到整物理像素（见 `paint_image`）。
+    if v.scale.is_fit() {
+        // 「适应窗口」等比适配可用区域（`Fit` 可放大/缩小，`FitNoUpscale` 只缩不放）。
+        // 比例按**物理像素**算，绘制矩形再对齐到整物理像素（见 `paint_image`）。
         let (_id, outer) = ui.allocate_space(avail);
         let rect = egui::Rect::from_center_size(outer.center(), want.min(avail));
         paint_image(ui, v, manager, active, &paint, rect);
@@ -851,10 +857,68 @@ fn scene(
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let (rect, _) = ui.allocate_exact_size(want, egui::Sense::click_and_drag());
+                // 内容**至少铺满视口**：画面比窗口小时才能居中（ScrollArea 的内容默认左上对齐），
+                // 比窗口大时内容就是画面本身，溢出交给滚动条。
+                let viewport = ui.available_size();
+                let content = want.max(viewport);
+                let (outer, _) = ui.allocate_exact_size(content, egui::Sense::click_and_drag());
+                let rect = egui::Rect::from_center_size(outer.center(), want.min(content));
                 paint_image(ui, v, manager, active, &paint, rect);
+                // 平移放在绘制之后：`capture_input` 会按远端光标形状设置图标，这里再把
+                // 「抓手」盖上去。只有内容真的溢出时才有得平移。
+                pan_with_middle(
+                    ui,
+                    v,
+                    rect,
+                    content - viewport,
+                    active.mode == RemoteMode::Control,
+                );
             });
     }
+}
+
+/// 中键拖拽平移（仅当画面溢出视口）。
+///
+/// 完全控制模式下，中键**按下**由 [`RemoteView::capture_input`] 门控：它不把这次按下转达
+/// 远端，而是登记 `pan_anchor`（拖动过就只平移，原地松开才补发一次中键点按）。这里只负责把
+/// 指针位移换算成滚动区偏移。
+///
+/// 仅观看 / 仅文件传输模式不注入远端输入，没有「中键该不该转达」的问题，故直接按「指针在
+/// 画面上」判定——否则这两种模式下中键平移会整个失效。用 `ScrollAnimation::none()` 而不是
+/// 缓动：拖拽必须跟手，缓动会有橡皮筋感。
+fn pan_with_middle(
+    ui: &Ui,
+    v: &RemoteView,
+    rect: egui::Rect,
+    overflow: egui::Vec2,
+    injecting: bool,
+) {
+    if overflow.x <= 0.5 && overflow.y <= 0.5 {
+        return;
+    }
+    let (down, delta, pos) = ui.input(|i| {
+        (
+            i.pointer.button_down(egui::PointerButton::Middle),
+            i.pointer.delta(),
+            i.pointer.latest_pos(),
+        )
+    });
+    if !down || delta == egui::Vec2::ZERO {
+        return;
+    }
+    // 注入模式下只认锚点（工具条上按下中键不该平移）；非注入模式看指针是否在画面最上层。
+    let engaged = if injecting {
+        v.pan_anchor.is_some()
+    } else {
+        pos.is_some_and(|p| rect.contains(p) && ui.ctx().layer_id_at(p) == Some(ui.layer_id()))
+    };
+    if !engaged {
+        return;
+    }
+    // `scroll_with_delta(d)` 让滚动偏移减少 `d`（见 egui `ScrollArea` 的实现），
+    // 所以直接传指针位移就是「内容跟着指针一起走」。
+    ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
 }
 
 /// 画一张画面并（完全控制模式时）在其上捕获输入。
