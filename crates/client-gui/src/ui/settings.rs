@@ -117,15 +117,46 @@ pub fn show_remote_section(
                 }
                 tracing::info!("原生分辨率（4K）：{}", if on { "开" } else { "关" });
             }
-            changed
+            ui.add_space(8.0);
+            // 延迟诊断日志：进程内可变，勾选立即生效（见 `rust_tunnel_remote::latency`）。
+            let mut latency_on = prefs.remote_latency_log;
+            let mut latency_frames = prefs.remote_latency_log_frames;
+            let mut latency_changed = ui
+                .checkbox(&mut latency_on, "延迟诊断日志（分阶段耗时）")
+                .changed();
+            ui.add_enabled_ui(latency_on, |ui| {
+                latency_changed |= ui
+                    .checkbox(&mut latency_frames, "详细：每帧一行（量大）")
+                    .changed();
+            });
+            ui.label(
+                egui::RichText::new(
+                    "在两台机器上分别打开；运行中切换立即生效，无需重启。日志级别需 ≥ info。\
+                     GUI 模式写入 %LOCALAPPDATA%\\rust-tunnel\\latency.log，无人值守实例写入 \
+                     %ProgramData%\\rust-tunnel\\instance.log。",
+                )
+                .small()
+                .weak(),
+            );
+            if latency_changed {
+                prefs.remote_latency_log = latency_on;
+                prefs.remote_latency_log_frames = latency_frames;
+                let mode = if !latency_on {
+                    rust_tunnel_remote::latency::Mode::Off
+                } else if latency_frames {
+                    rust_tunnel_remote::latency::Mode::Frames
+                } else {
+                    rust_tunnel_remote::latency::Mode::Summary
+                };
+                rust_tunnel_remote::latency::set_mode(mode);
+                tracing::info!("延迟诊断日志：{mode:?}");
+            }
+            changed || latency_changed
         })
         .inner
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "设置面板单屏表单，拆分会割裂布局"
-)]
+#[allow(clippy::too_many_lines, reason = "设置面板单屏表单，拆分会割裂布局")]
 pub fn show(ui: &mut Ui, state: &mut SettingsState, app_state: &Arc<AppState>) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(14, 12))
@@ -332,7 +363,16 @@ pub fn show_service_section(ui: &mut Ui, app_state: &Arc<AppState>, service: &mu
                     let native = app_state
                         .remote()
                         .is_some_and(|manager| manager.native_resolution());
-                    HostSeed::from_config(&config, approval, auto_lock, native)
+                    // 延迟诊断日志是**进程内**开关：取当前实际生效的模式，装完的实例也照它开。
+                    let latency_mode = rust_tunnel_remote::latency::mode();
+                    HostSeed::from_config(
+                        &config,
+                        approval,
+                        auto_lock,
+                        native,
+                        latency_mode != rust_tunnel_remote::latency::Mode::Off,
+                        latency_mode == rust_tunnel_remote::latency::Mode::Frames,
+                    )
                 });
             // `Absent` = 确定没装；其余（含 `Unknown`）按「已装」处理，多给几个按钮总比
             // 在查询偶发失败时把「卸载」藏起来强。
@@ -431,7 +471,10 @@ pub fn show_service_section(ui: &mut Ui, app_state: &Arc<AppState>, service: &mu
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("正在{}…（界面保持可用，完成后结果显示在这里）", op.label()));
+                    ui.label(format!(
+                        "正在{}…（界面保持可用，完成后结果显示在这里）",
+                        op.label()
+                    ));
                 });
             }
             if let Some(message) = service.last_message() {

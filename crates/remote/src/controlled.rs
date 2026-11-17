@@ -97,6 +97,7 @@ use crate::auth::{ack_mac, PendingSessions};
 use crate::codec::{vp9_encoder_factory, VideoEncoderApi, VideoEncoderFactory};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
+use crate::latency::{self, LatencyWindow, Stage};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
     bitrate_permille_for_pixels, scale_bitrate, CaptureInfo, CapturedPatches, Clipboard,
@@ -104,9 +105,9 @@ use crate::screen::{
     ScreenPatch, ScreenSource, NATIVE_BITRATE_FACTOR,
 };
 use crate::session::{
-    trusted_rtt, CodecId, HostActivity, HostStats, RegionRect, SessionCodec, SessionEnd, SessionFrame,
-    SessionMessage, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS, REGION_FLAG_ZSTD,
-    SESSION_PROTO_VERSION, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
+    trusted_rtt, CodecId, HostActivity, HostStats, RegionRect, SessionCodec, SessionEnd,
+    SessionFrame, SessionMessage, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MAX_REGION_RECTS,
+    REGION_FLAG_ZSTD, SESSION_PROTO_VERSION, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME,
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
@@ -654,12 +655,7 @@ impl PatchMode {
     /// 返回 `false` 表示这一批不该发：要么上一窗口的补丁码率超过 `budget_kbps`，要么单批
     /// 本身就超过一个窗口的预算（后者防止一个巨大的补丁批把链路瞬时打满）。补丁模式下
     /// QoS 闭环是暂停的，这里是唯一的带宽兜底。
-    fn admit_patch_bytes(
-        &mut self,
-        bytes: u64,
-        now: std::time::Instant,
-        budget_kbps: u32,
-    ) -> bool {
+    fn admit_patch_bytes(&mut self, bytes: u64, now: std::time::Instant, budget_kbps: u32) -> bool {
         let elapsed = now.duration_since(self.patch_window_start);
         if elapsed >= PATCH_BANDWIDTH_WINDOW {
             let kbps = kbps_from_bytes(self.patch_window_bytes, elapsed);
@@ -1116,7 +1112,14 @@ fn build_region_updates_with_cap(
         {
             return None;
         }
-        encode_region_range(compressor, rect, 0, rect.height, message_max_bytes, &mut encoded)?;
+        encode_region_range(
+            compressor,
+            rect,
+            0,
+            rect.height,
+            message_max_bytes,
+            &mut encoded,
+        )?;
     }
 
     // 2) 按顺序装箱：尽量把条块塞进同一条消息，装不下就开下一条。
@@ -1416,11 +1419,11 @@ fn build_host_stats(
         .unwrap_or_default();
     let capture = screen.capture_info();
     // 三个累计计数 → 每秒增量：首份快照（无上一份）没有基线，给 0 而不是「开机以来的全部」。
-    let (capture_fallbacks, capture_open_fallbacks, no_new_frame) =
-        last_info.replace(capture.clone()).map_or((0, 0, 0), |prev| {
+    let (capture_fallbacks, capture_open_fallbacks, no_new_frame) = last_info
+        .replace(capture.clone())
+        .map_or((0, 0, 0), |prev| {
             (
-                u32::try_from(capture.fallbacks.saturating_sub(prev.fallbacks))
-                    .unwrap_or(u32::MAX),
+                u32::try_from(capture.fallbacks.saturating_sub(prev.fallbacks)).unwrap_or(u32::MAX),
                 u32::try_from(capture.open_fallbacks.saturating_sub(prev.open_fallbacks))
                     .unwrap_or(u32::MAX),
                 u32::try_from(capture.no_new_frame.saturating_sub(prev.no_new_frame))
@@ -1464,7 +1467,9 @@ fn build_host_stats(
         idr_bytes: snap.idr_bytes,
         p_kbps: snap.p_kbps,
         changed_permille: snap.changed_permille,
-        scale_permille: (encode.scale * 1000.0).round().clamp(0.0, f32::from(u16::MAX)) as u16,
+        scale_permille: (encode.scale * 1000.0)
+            .round()
+            .clamp(0.0, f32::from(u16::MAX)) as u16,
         activity,
         patch_mode,
         out_queue_depth: snap.out_queue_depth,
@@ -1519,7 +1524,10 @@ pub async fn run_controlled(
         x25519_pub,
     } = hello.message
     else {
-        return Err(RemoteError::Handshake(format!("期望 Hello，实得 {:?}", hello.message)));
+        return Err(RemoteError::Handshake(format!(
+            "期望 Hello，实得 {:?}",
+            hello.message
+        )));
     };
 
     // 版本与 session 一致性检查；不通过则明文拒绝。
@@ -1531,24 +1539,30 @@ pub async fn run_controlled(
 
     // 鉴权：常数时间比对 HMAC；失败/过期/重放一律拒绝并记原因。
     // 拿住返回的 `PendingSession`——它的 token 还要进 KDF 做密钥交换认证。
-    let pending = match config
-        .pending
-        .authorize(&session_id, &controller_rd_id, &nonce, &x25519_pub, &hmac)
-    {
-        Ok(pending) => pending,
-        Err(err) => {
-            let reason = format!("鉴权失败: {err}");
-            warn!(session = %session_id, %reason, "被控端拒绝会话");
-            reject_handshake(&mut writer, &reason).await;
-            return Err(RemoteError::Auth(reason));
-        }
-    };
+    let pending =
+        match config
+            .pending
+            .authorize(&session_id, &controller_rd_id, &nonce, &x25519_pub, &hmac)
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                let reason = format!("鉴权失败: {err}");
+                warn!(session = %session_id, %reason, "被控端拒绝会话");
+                reject_handshake(&mut writer, &reason).await;
+                return Err(RemoteError::Auth(reason));
+            }
+        };
 
     // 2) 生成临时密钥并回 HelloAck（明文），随后装上加密。
     let keypair = EphemeralKeyPair::generate();
     let responder_pub = keypair.public_bytes().to_vec();
     // 用 token 对自己的临时公钥做 MAC：控制器据此拒绝被中继方替换过的 `x25519_pub`。
-    let hmac_ack = ack_mac(&pending.token, &config.session_id, &responder_pub, &x25519_pub);
+    let hmac_ack = ack_mac(
+        &pending.token,
+        &config.session_id,
+        &responder_pub,
+        &x25519_pub,
+    );
     let ack = SessionFrame::control(SessionMessage::HelloAck {
         accepted: true,
         reason: None,
@@ -1579,7 +1593,16 @@ pub async fn run_controlled(
     // ——否则写侧被背压卡住时（对端停读、中继停走），输入/心跳分支完全得不到轮询，形成队头阻塞。
     // 协商阶段的 `HeartbeatAck` / `CodecSelect` 也走这些队列，故先把它起来。
     let (mut queues, receivers) = OutboundQueues::new();
-    let writer_task = tokio::spawn(writer_loop(writer, receivers, cancel.clone()));
+    // 诊断：主循环 / 编码任务 / 写任务共写一份延迟窗口，由主循环每秒取走并打一行汇总
+    // （见 `crate::latency`）。未开延迟诊断时只有一次 `enabled()` 判断。
+    let latency_window: Arc<std::sync::Mutex<LatencyWindow>> =
+        Arc::new(std::sync::Mutex::new(LatencyWindow::new()));
+    let writer_task = tokio::spawn(writer_loop(
+        writer,
+        receivers,
+        cancel.clone(),
+        Some(Arc::clone(&latency_window)),
+    ));
 
     // 2.5) 编解码协商：**必须先拿到 `CodecOffer` 才能开始采集/编码**——否则首帧可能用了控制器
     // 解不了的 codec，只能靠后来请求关键帧重来。控制器在握手后立刻发它；超时回退 VP9（
@@ -1620,7 +1643,10 @@ pub async fn run_controlled(
         vp9_encoder_factory()
     };
     queues
-        .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::CodecSelect { codec }))
+        .enqueue_ctrl(
+            &cancel,
+            SessionFrame::control(SessionMessage::CodecSelect { codec }),
+        )
         .await?;
     info!("编解码协商完成（被控端） codec={codec:?}");
 
@@ -1671,6 +1697,7 @@ pub async fn run_controlled(
         Arc::clone(&last_keyframe_us),
         max_encode_width,
         Arc::clone(&encode_snapshot),
+        Arc::clone(&latency_window),
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -1696,7 +1723,10 @@ pub async fn run_controlled(
     // 原生分辨率会话按**显示器面积**放大上限（4K = 4×，封顶 60 Mbps）：4K 桌面文字在
     // 10 Mbps 下明显不够。只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
     // 用实际显示器像素而非开关状态：1080p 显示器拿不到任何放大。
-    let initial_display = displays.iter().find(|d| d.primary).or_else(|| displays.first());
+    let initial_display = displays
+        .iter()
+        .find(|d| d.primary)
+        .or_else(|| displays.first());
     let mut rate = RateController::new(session_encode_options(
         config.encode,
         native_bitrate_permille(initial_display, native_active),
@@ -1748,6 +1778,14 @@ pub async fn run_controlled(
     let mut cap_wait_max_ms = 0_u64;
     let mut input_events = 0_u32;
     let mut display_max_ms = 0_u64;
+    // 诊断（见 [`crate::latency`]）：最近一次**成功注入**输入的时刻（微秒）。每次注入覆盖，
+    // 直到某一拍采集的变化面积 ≥ [`INPUT_CHANGE_PERMILLE`] 才清掉——它量的是「用户点了，
+    // 画面多久才真的开始变」（远端应用重绘 + 我们的采集），不是「下一拍采集多久到」。
+    let mut last_input_us: Option<u64> = None;
+    // 诊断：尚未被采集消费的输入时刻（`InputToCapture` 用）。与 `last_input_us` **分开**：
+    // 后者要留到「有明显变化」才清，前者只被第一拍采集消费。
+    let mut pending_input_capture_us: Option<u64> = None;
+    // 诊断开关**每帧读一次**（Relaxed 原子）：设置页运行中切换要立即生效，不能缓存成局部量。
     // 在途采集的结果经通道回传。`capture_deadline` 非空即代表有一次采集在途，保证同一时刻最多
     // 一次采集（并发两次会把阻塞线程池堆满）。循环自己保留 `capture_tx`，故 `recv()` 永不返回
     // `None`。
@@ -1920,6 +1958,22 @@ pub async fn run_controlled(
                     display_max_ms,
                     "被控端每秒遥测"
                 );
+                // 诊断：每秒一行分阶段延迟汇总（**只在延迟诊断打开时**）。
+                // 与上面的 `debug!` 分开：那条是既有遥测（debug 级），这条是给「切标签为什么
+                // 慢」用的拆解（info 级、默认完全静默）。窗口由主循环/编码任务/写任务共写。
+                if latency::enabled() {
+                    if let Some(summary) = latency::take_summary(&latency_window) {
+                        // 全部信息塞进 message：GUI 的日志面板 / 服务端日志只保留 `message`
+                        // 字段（结构化字段会被丢掉），文件与 stdout 则两种都完整。
+                        info!(
+                            target: "latency",
+                            "controlled fps={} patches={} {}",
+                            host.fps,
+                            host.patch_mode,
+                            summary
+                        );
+                    }
+                }
                 // 本秒诊断计数已上报，清零后重新累计。
                 tick_dt_sum_ms = 0;
                 tick_dt_count = 0;
@@ -1947,7 +2001,14 @@ pub async fn run_controlled(
                     Some(CaptureOutcome { generation, .. }) if generation != capture_generation => {
                         debug!(generation, "丢弃过期的采集结果");
                     }
-                    Some(CaptureOutcome { payload, capture_us, capture_ts_us, cursor, .. }) => {
+                    Some(CaptureOutcome {
+                        payload,
+                        started_us,
+                        capture_us,
+                        capture_ts_us,
+                        cursor,
+                        ..
+                    }) => {
                         capture_deadline = None;
                         capture_timeouts = 0;
                         // 采集在途期间有输入到达：结果一回来就立刻安排下一拍，不再等满一个
@@ -1983,11 +2044,53 @@ pub async fn run_controlled(
                                 }
                             }
                         }
+                        let mut capture_wait_us: Option<u64> = None;
                         if let Some(request_us) = capture_request_us.take() {
                             let wait_ms = capture_ts_us.saturating_sub(request_us) / 1000;
                             cap_wait_sum_ms = cap_wait_sum_ms.saturating_add(wait_ms);
                             cap_wait_count = cap_wait_count.saturating_add(1);
                             cap_wait_max_ms = cap_wait_max_ms.max(wait_ms);
+                            let startup_us = started_us.saturating_sub(request_us);
+                            capture_wait_us = Some(startup_us);
+                            if latency::enabled() {
+                                // 诊断拆分：派发 → 采集任务真正开始（阻塞线程池/调度等待）
+                                // 与采集本身。两者之和就是上面的 `cap_wait`/`capture_us`。
+                                latency::record(
+                                    &latency_window,
+                                    Stage::CaptureWait,
+                                    startup_us,
+                                );
+                                latency::record(&latency_window, Stage::Capture, capture_us);
+                            }
+                        }
+                        // 诊断：两条输入交互延迟（见 [`Stage::InputToCapture`] /
+                        // [`Stage::InputToChange`]）。必须在 `match payload` 消费它之前算。
+                        let mut input_to_capture_us = None;
+                        let mut input_to_change_us = None;
+                        if latency::enabled() {
+                            let changed = match &payload {
+                                CapturePayload::Frame(Some(frame)) => frame.changed_permille,
+                                CapturePayload::Patches(Some(batch)) => batch.changed_permille,
+                                _ => 0,
+                            };
+                            if let Some(input_us) = pending_input_capture_us {
+                                if capture_ts_us >= input_us {
+                                    let us = capture_ts_us.saturating_sub(input_us);
+                                    latency::record(&latency_window, Stage::InputToCapture, us);
+                                    input_to_capture_us = Some(us);
+                                    pending_input_capture_us = None;
+                                }
+                            }
+                            if let Some(input_us) = last_input_us {
+                                // 只有**用户看得出来变了**的那一帧才算「画面开始变」；
+                                // 悬停高亮之类的小重绘不消耗这个起点。
+                                if changed >= INPUT_CHANGE_PERMILLE && capture_ts_us >= input_us {
+                                    let us = capture_ts_us.saturating_sub(input_us);
+                                    latency::record(&latency_window, Stage::InputToChange, us);
+                                    input_to_change_us = Some(us);
+                                    last_input_us = None;
+                                }
+                            }
                         }
                         match payload {
                             CapturePayload::Frame(frame) => {
@@ -2043,7 +2146,10 @@ pub async fn run_controlled(
                                         force_keyframe,
                                         force_encode,
                                         capture_us,
+                                        capture_wait_us,
                                         capture_ts_us,
+                                        input_to_capture_us,
+                                        input_to_change_us,
                                         frame,
                                     };
                                     // 有界(1) 队列满 = 编码/发送侧还没消化完上一帧 → **编码之前**跳过这一
@@ -2484,8 +2590,23 @@ pub async fn run_controlled(
                             // `InputSink::apply` 是 enigo 注入，快操作（微秒级），留在 async worker
                             // 上即可——为它付一次 `spawn_blocking` 的调度开销并不划算。
                             if inject {
-                                if let Err(err) = input.apply(event) {
-                                    warn!(error = %err, "输入注入失败");
+                                // 诊断：注入本身的耗时，以及「输入已生效」的时刻（两条输入
+                                // 交互延迟测量的起点，见 [`crate::latency`]）。
+                                let inject_started = std::time::Instant::now();
+                                match input.apply(event) {
+                                    Ok(()) if latency::enabled() => {
+                                        let now = crate::clock::now_us();
+                                        latency::record(
+                                            &latency_window,
+                                            Stage::Inject,
+                                            u64::try_from(inject_started.elapsed().as_micros())
+                                                .unwrap_or(u64::MAX),
+                                        );
+                                        last_input_us = Some(now);
+                                        pending_input_capture_us = Some(now);
+                                    }
+                                    Ok(()) => {}
+                                    Err(err) => warn!(error = %err, "输入注入失败"),
                                 }
                             }
                             // 输入**会改变远端画面**（拖窗/悬停/滚动/打字）：主动把下一拍采集
@@ -2862,9 +2983,7 @@ fn pacing_plan(len: usize, kbps: u32) -> Option<(usize, Duration)> {
     let total_cap = frame_natural
         .checked_mul(PACING_MAX_WAIT_FACTOR)
         .unwrap_or(Duration::MAX);
-    let sleep = chunk_natural
-        .min(PACING_MAX_GAP)
-        .min(total_cap / gap_count);
+    let sleep = chunk_natural.min(PACING_MAX_GAP).min(total_cap / gap_count);
     Some((chunk, sleep))
 }
 
@@ -2887,6 +3006,8 @@ pub(crate) async fn writer_loop(
     mut writer: FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
     mut rx: OutboundReceivers,
     cancel: CancellationToken,
+    // 诊断：与主循环/编码任务共享的延迟窗口；控制器侧传 `None`（它不写画面帧）。
+    latency_window: Option<Arc<std::sync::Mutex<LatencyWindow>>>,
 ) {
     // 取消后不再写普通帧，只等收尾帧。
     let mut cancelled = false;
@@ -2906,8 +3027,43 @@ pub(crate) async fn writer_loop(
             }
             Some(frame) = rx.screen.recv(), if !cancelled => {
                 let pacing_kbps = rx.screen_pacing_kbps.load(Ordering::Relaxed);
+                // 诊断：`write` 阶段（含大帧 pacing 的分块 sleep）+ 采集完成 → 写任务取走。
+                // 关闭时 `meta` 为 `None`，不多做任何工作。
+                let trace = latency_window.is_some() && latency::enabled();
+                let dequeued_us = if trace { crate::clock::now_us() } else { 0 };
+                let meta = if trace { screen_frame_meta(&frame) } else { None };
                 if !write_screen(&mut writer, &cancel, frame, &mut cancelled, pacing_kbps).await {
                     break;
+                }
+                if let (Some(window), Some((seq, capture_ts_us, bytes, keyframe))) =
+                    (latency_window.as_ref(), meta)
+                {
+                    let done_us = crate::clock::now_us();
+                    latency::record(window, Stage::Write, done_us.saturating_sub(dequeued_us));
+                    if capture_ts_us != 0 {
+                        let send_q_us = dequeued_us.saturating_sub(capture_ts_us);
+                        latency::record(window, Stage::SendQueue, send_q_us);
+                        // 只有全帧有 `seq`：补丁批不逐帧打日志（一拍可能多条消息），
+                        // 但它的 `write`/`send_q` 仍计入每秒汇总。
+                        if seq != 0 {
+                            let capture_to_write_done_us =
+                                done_us.saturating_sub(capture_ts_us);
+                            if latency::frame_logs()
+                                || capture_to_write_done_us > latency::slow_threshold_us()
+                            {
+                                info!(
+                                    target: "latency",
+                                    "controlled_wire seq={} bytes={} idr={} send_q_us={} write_us={} capture_to_write_done_us={}",
+                                    seq,
+                                    bytes,
+                                    keyframe,
+                                    send_q_us,
+                                    done_us.saturating_sub(dequeued_us),
+                                    capture_to_write_done_us
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Some(frame) = rx.file.recv(), if !cancelled => {
@@ -2940,6 +3096,40 @@ async fn write_ordinary(
             debug!(error = %err, "出站写失败，写任务结束");
             false
         }
+    }
+}
+
+/// 诊断：从一条画面帧里取出 `(seq, capture_ts_us, 字节数, 是否关键帧)`。
+///
+/// 补丁批没有视频序号（记 `0`），但同样带采集时刻与总字节数——它也要计入每秒汇总。
+/// 非画面帧返回 `None`。
+fn screen_frame_meta(frame: &SessionFrame) -> Option<(u64, u64, u64, bool)> {
+    match &frame.message {
+        SessionMessage::VideoPacket {
+            seq,
+            capture_ts_us,
+            data,
+            flags,
+            ..
+        } => Some((
+            *seq,
+            *capture_ts_us,
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+            flags & VIDEO_FLAG_KEYFRAME != 0,
+        )),
+        SessionMessage::RegionUpdate {
+            capture_ts_us,
+            rects,
+            ..
+        } => Some((
+            0,
+            *capture_ts_us,
+            rects.iter().fold(0_u64, |acc, rect| {
+                acc.saturating_add(u64::try_from(rect.data.len()).unwrap_or(u64::MAX))
+            }),
+            false,
+        )),
+        _ => None,
     }
 }
 
@@ -3093,6 +3283,11 @@ struct CaptureOutcome {
     generation: u64,
     /// 采集产物（全帧或补丁）。
     payload: CapturePayload,
+    /// 阻塞采集任务**真正开始**的时刻（本端单调时钟，微秒）。
+    ///
+    /// 与 `capture_ts_us` 相减得采集本身耗时；与派发时刻相减得阻塞线程池/运行时调度等待
+    /// （诊断用，见 [`crate::latency`]）。
+    started_us: u64,
     /// 本次采集耗时（微秒；采集失败时也记实际耗时）。**测量**用，不参与控制决策。
     ///
     /// 用微秒而不是毫秒：GPU 采集常在 1 ms 以内，毫秒取整会恒为 0（现场看到的就是这个）。
@@ -3134,11 +3329,26 @@ struct EncodeJob {
     force_encode: bool,
     /// 本帧的采集耗时（微秒），只进统计、不参与控制决策。
     capture_us: u64,
+    /// 诊断：采集派发（tick）→ 采集任务真正开始的等待（微秒）；未测量时 `None`。
+    /// **只进延迟日志**（见 [`crate::latency`]），不参与控制决策。
+    capture_wait_us: Option<u64>,
     /// 本帧采集完成的时刻（本端单调时钟，微秒），原样写进 `VideoPacket.capture_ts_us`。
     capture_ts_us: u64,
+    /// 诊断：本帧是「输入注入之后的第一拍采集」时，注入到采集完成的耗时（微秒）；
+    /// 否则 `None`。**只进延迟日志**（见 [`crate::latency`]），不参与控制决策。
+    input_to_capture_us: Option<u64>,
+    /// 诊断：本帧是第一帧变化面积 ≥ [`INPUT_CHANGE_PERMILLE`] 的采集时，
+    /// 最近一次输入注入到本帧采集完成的耗时（微秒）；否则 `None`。
+    input_to_change_us: Option<u64>,
     /// 原始帧。
     frame: RawFrame,
 }
+
+/// 诊断：「输入 → 画面开始变」判据的变化面积门限（千分比）。
+///
+/// 50‰ 是「用户看得出来画面动了」的量级：悬停高亮、光标附近重绘通常低于它，
+/// 点击标签/展开文件夹这种整块重绘远高于它。只用于 [`Stage::InputToChange`] 的采样。
+const INPUT_CHANGE_PERMILLE: u16 = 50;
 
 /// 在阻塞线程里采集一帧（全帧视频或脏矩形补丁）。
 ///
@@ -3156,6 +3366,8 @@ fn run_capture(
     tx: &mpsc::Sender<CaptureOutcome>,
 ) {
     let started = Instant::now();
+    // 诊断：采集任务真正开始的时刻（与派发时刻的差 = 阻塞线程池/运行时调度等待）。
+    let started_us = crate::clock::now_us();
     let (payload, capture_us, capture_ts_us) = match request {
         CaptureRequest::Frame { gpu } => {
             let captured = if gpu {
@@ -3198,6 +3410,7 @@ fn run_capture(
     let _ = tx.blocking_send(CaptureOutcome {
         generation,
         payload,
+        started_us,
         capture_us,
         capture_ts_us,
         cursor,
@@ -3224,9 +3437,9 @@ fn build_patch_batch(display: u32, patches: &CapturedPatches, capture_ts_us: u64
         .as_mut()
         .and_then(|compressor| build_region_updates(compressor, display, patches, capture_ts_us));
     let bytes = messages.as_ref().map_or(0, |messages| {
-        messages
-            .iter()
-            .fold(0_u64, |acc, msg| acc.saturating_add(region_update_bytes(msg)))
+        messages.iter().fold(0_u64, |acc, msg| {
+            acc.saturating_add(region_update_bytes(msg))
+        })
     });
     PatchBatch {
         width: patches.width,
@@ -3416,8 +3629,7 @@ impl EncodeStatsWindow {
         let changed_permille = if self.frames == 0 {
             0
         } else {
-            u32::try_from(self.changed_permille_sum / u64::from(self.frames))
-                .unwrap_or(u32::MAX)
+            u32::try_from(self.changed_permille_sum / u64::from(self.frames)).unwrap_or(u32::MAX)
         };
         stats.report(SessionStats::Encode {
             encode_ms,
@@ -3524,6 +3736,8 @@ async fn encode_loop(
     max_encode_width: u32,
     // 每秒写一次的完整快照槽（主循环组装 `HostStats` 用）。
     encode_snapshot: Arc<std::sync::Mutex<Option<EncodeSnapshot>>>,
+    // 诊断：与主循环/写任务共享的延迟窗口（见 [`crate::latency`]）。
+    latency_window: Arc<std::sync::Mutex<LatencyWindow>>,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -3558,14 +3772,25 @@ async fn encode_loop(
             force_keyframe,
             force_encode,
             capture_us,
+            capture_wait_us,
             capture_ts_us,
+            input_to_capture_us,
+            input_to_change_us,
             frame,
         } = job;
+        // 诊断：采集完成 → 编码任务取走（编码队列深度 1 + 会话循环调度）。
+        let enc_q_us = if latency::enabled() && capture_ts_us != 0 {
+            let us = crate::clock::now_us().saturating_sub(capture_ts_us);
+            latency::record(&latency_window, Stage::EncodeQueue, us);
+            us
+        } else {
+            0
+        };
         // 本帧的变化面积（千分比）：进统计窗口的平均，并随每帧上报落进日志/UI。
         let changed_permille = frame.changed_permille;
         // 出站队列当前深度（C2）：主循环的 `HostStats` 每秒读一次快照。
-        window.out_queue_depth = u32::try_from(out.max_capacity().saturating_sub(out.capacity()))
-            .unwrap_or(u32::MAX);
+        window.out_queue_depth =
+            u32::try_from(out.max_capacity().saturating_sub(out.capacity())).unwrap_or(u32::MAX);
         // 每秒上报一次编码侧读数（静止画面也会经过这里——采集每拍都投递任务，只是被去重跳过）。
         // 快照写入发生在窗口重置**之前**，因此主循环读到的是刚刚结束的那一秒。
         window.maybe_report(&stats, rates.bitrate_kbps, &encode_snapshot);
@@ -3695,7 +3920,12 @@ async fn encode_loop(
                 continue;
             }
         };
-        let encode_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let encode_elapsed = started.elapsed();
+        let encode_ms = u64::try_from(encode_elapsed.as_millis()).unwrap_or(u64::MAX);
+        let encode_micros = u64::try_from(encode_elapsed.as_micros()).unwrap_or(u64::MAX);
+        if latency::enabled() {
+            latency::record(&latency_window, Stage::Encode, encode_micros);
+        }
         match result {
             Ok(packet) => {
                 encoder = Some(enc);
@@ -3748,8 +3978,39 @@ async fn encode_loop(
                     data: packet.data,
                     capture_ts_us,
                 };
+                let out_started = Instant::now();
                 if !send_video(&out, &cancel, msg).await {
                     break;
+                }
+                let out_q_us = u64::try_from(out_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                if latency::enabled() {
+                    latency::record(&latency_window, Stage::OutQueue, out_q_us);
+                    // 逐帧明细：`frame_logs()`（=2）下每帧一行；`Summary`（=1）下只打慢帧。
+                    // 总耗时是**采集派发到进队列**这一段，不含写任务与网络（那两段由
+                    // `controlled_wire` 与控制器侧的 `controller` 行给出）。
+                    let total_us = capture_wait_us
+                        .unwrap_or(0)
+                        .saturating_add(capture_us)
+                        .saturating_add(enc_q_us)
+                        .saturating_add(encode_micros)
+                        .saturating_add(out_q_us);
+                    if latency::frame_logs() || total_us > latency::slow_threshold_us() {
+                        info!(
+                            target: "latency",
+                            "controlled seq={} idr={} bytes={} changed_permille={} cap_wait_us={:?} cap_us={} enc_q_us={} enc_us={} out_q_us={} input_to_cap_us={:?} input_to_change_us={:?}",
+                            seq,
+                            keyframe,
+                            payload_bytes,
+                            changed_permille,
+                            capture_wait_us,
+                            capture_us,
+                            enc_q_us,
+                            encode_micros,
+                            out_q_us,
+                            input_to_capture_us,
+                            input_to_change_us
+                        );
+                    }
                 }
                 // 真正进入画面队列之后才计入出码（QoS 投递率口径，见 [`ScreenSendMeter`]）。
                 // 被背压挡下/取消的帧没有交付，绝不能计入。
@@ -3825,7 +4086,11 @@ fn reconfig_and_encode(
 /// 画面帧一旦编码就不能丢（参考链），故这里 `send().await` 直到画面队列腾空；背压由编码任务
 /// 之前的「跳过采集」出口消化（见 [`encode_loop`]）。返回 `false` 表示会话正在收尾
 /// （取消触发或写任务已结束），编码任务据此退出。
-async fn send_video(out: &mpsc::Sender<SessionFrame>, cancel: &CancellationToken, msg: SessionMessage) -> bool {
+async fn send_video(
+    out: &mpsc::Sender<SessionFrame>,
+    cancel: &CancellationToken,
+    msg: SessionMessage,
+) -> bool {
     tokio::select! {
         biased;
         () = cancel.cancelled() => false,
@@ -3938,7 +4203,11 @@ impl InputSink for NullInputSink {
     fn mouse_move(&self, _x: i32, _y: i32, _display: u32) -> RemoteResult<()> {
         Ok(())
     }
-    fn mouse_button(&self, _button: crate::screen::MouseButton, _pressed: bool) -> RemoteResult<()> {
+    fn mouse_button(
+        &self,
+        _button: crate::screen::MouseButton,
+        _pressed: bool,
+    ) -> RemoteResult<()> {
         Ok(())
     }
     fn wheel(&self, _dx: i32, _dy: i32) -> RemoteResult<()> {
@@ -3966,11 +4235,11 @@ mod tests {
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
     use rust_tunnel_common::protocol::RemoteMode;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-    use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
     use tokio::sync::mpsc;
     use tokio_util::codec::{FramedRead, FramedWrite};
@@ -4322,7 +4591,9 @@ mod tests {
 
         // 控制器：先一条心跳（协商窗口内要应答），再发 offer。
         peer_writer
-            .send(SessionFrame::control(SessionMessage::Heartbeat { t1_us: 0 }))
+            .send(SessionFrame::control(SessionMessage::Heartbeat {
+                t1_us: 0,
+            }))
             .await
             .expect("发心跳");
         peer_writer
@@ -4368,7 +4639,10 @@ mod tests {
         let outcome = read_codec_offer(&mut reader, &queues, &cancel, Duration::from_millis(30))
             .await
             .expect("超时不是错误");
-        assert!(matches!(outcome, CodecOfferOutcome::Timeout), "应为 Timeout");
+        assert!(
+            matches!(outcome, CodecOfferOutcome::Timeout),
+            "应为 Timeout"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "超时路径应立即返回，实得 {:?}",
@@ -4574,16 +4848,33 @@ mod tests {
             .expect("写 Hello 应成功");
         writer.get_mut().flush().await.expect("flush Hello 应成功");
 
-        let ack = reader.next().await.expect("应有 HelloAck").expect("HelloAck 可解码");
+        let ack = reader
+            .next()
+            .await
+            .expect("应有 HelloAck")
+            .expect("HelloAck 可解码");
         let responder_pub = match ack.message {
             SessionMessage::HelloAck { x25519_pub, .. } => x25519_pub,
             other => panic!("期望 HelloAck，实得 {other:?}"),
         };
         let initiator_pub = plan.keypair.public_bytes();
-        let responder_arr: [u8; 32] = responder_pub.as_slice().try_into().expect("公钥应为 32 字节");
-        let shared = plan.keypair.diffie_hellman(&responder_pub).expect("ECDH 应成功");
+        let responder_arr: [u8; 32] = responder_pub
+            .as_slice()
+            .try_into()
+            .expect("公钥应为 32 字节");
+        let shared = plan
+            .keypair
+            .diffie_hellman(&responder_pub)
+            .expect("ECDH 应成功");
         // 本端扮演控制器（发起方）：`initiator=true`。
-        let keys = derive_session_keys(token, &shared, session_id, &initiator_pub, &responder_arr, true);
+        let keys = derive_session_keys(
+            token,
+            &shared,
+            session_id,
+            &initiator_pub,
+            &responder_arr,
+            true,
+        );
         reader
             .decoder_mut()
             .set_cipher(Cipher::new(keys.recv).expect("密钥长度合法"));
@@ -4594,7 +4885,10 @@ mod tests {
         // 默认声明「只支持 VP9」，需要测 H.264 的用例自行发能力更全的 offer。
         if let Some((h264, vp9)) = offer {
             writer
-                .send(SessionFrame::control(SessionMessage::CodecOffer { h264, vp9 }))
+                .send(SessionFrame::control(SessionMessage::CodecOffer {
+                    h264,
+                    vp9,
+                }))
                 .await
                 .expect("发送 CodecOffer 应成功");
         }
@@ -4651,7 +4945,11 @@ mod tests {
         let hello_bytes = codec
             .encode_frame_bytes(&SessionFrame::control(bad_hello))
             .expect("编码 Hello");
-        writer.get_mut().write_all(&hello_bytes).await.expect("写 Hello");
+        writer
+            .get_mut()
+            .write_all(&hello_bytes)
+            .await
+            .expect("写 Hello");
         writer.get_mut().flush().await.expect("flush Hello");
 
         // 关键断言①：对端回的是一个**明文可解**的 HelloAck（干净拒绝），不是解码失败。
@@ -4661,10 +4959,15 @@ mod tests {
             .expect("HelloAck 必须能明文解码")
             .expect("HelloAck 解码不应出错");
         match ack.message {
-            SessionMessage::HelloAck { accepted, reason, .. } => {
+            SessionMessage::HelloAck {
+                accepted, reason, ..
+            } => {
                 assert!(!accepted, "版本不匹配必须拒绝");
                 let reason = reason.unwrap_or_default();
-                assert!(reason.contains("proto"), "拒绝原因应点名版本，实得 {reason}");
+                assert!(
+                    reason.contains("proto"),
+                    "拒绝原因应点名版本，实得 {reason}"
+                );
             }
             other => panic!("期望 HelloAck，实得 {other:?}"),
         }
@@ -4724,7 +5027,13 @@ mod tests {
         loop {
             match out_rx.recv().await {
                 Some(SessionFrame {
-                    message: SessionMessage::VideoPacket { flags, width, height, .. },
+                    message:
+                        SessionMessage::VideoPacket {
+                            flags,
+                            width,
+                            height,
+                            ..
+                        },
                     ..
                 }) => return (flags, width, height),
                 Some(_) => {}
@@ -4755,6 +5064,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -4773,7 +5083,10 @@ mod tests {
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
+                capture_wait_us: None,
                 capture_ts_us: 0,
+                input_to_capture_us: None,
+                input_to_change_us: None,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -4790,7 +5103,10 @@ mod tests {
                 force_keyframe: false,
                 force_encode: false,
                 capture_us: 0,
+                capture_wait_us: None,
                 capture_ts_us: 0,
+                input_to_capture_us: None,
+                input_to_change_us: None,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -4809,7 +5125,9 @@ mod tests {
         assert_eq!((w1, h1), (w0, h0), "码率变化不应改变编码尺寸");
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// **阶段 3 关键不变量**：降编码分辨率（几何变化）必须**重建 + 重发 ScreenConfig + 强制 IDR**。
@@ -4833,6 +5151,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -4847,7 +5166,10 @@ mod tests {
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
+                capture_wait_us: None,
                 capture_ts_us: 0,
+                input_to_capture_us: None,
+                input_to_change_us: None,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -4863,7 +5185,10 @@ mod tests {
                 force_keyframe: false,
                 force_encode: false,
                 capture_us: 0,
+                capture_wait_us: None,
                 capture_ts_us: 0,
+                input_to_capture_us: None,
+                input_to_change_us: None,
                 frame: shaded(0, 64, 48, 40),
             })
             .await
@@ -4877,7 +5202,9 @@ mod tests {
         );
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// 假的编码记录：每次 `encode` 压入 `(当时的编码码率, 是否关键帧)`。
@@ -4985,6 +5312,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
         // 内容上限把 P 帧压到 1.2 Mbps；关键帧仍应按 6 Mbps 编码。
         let capped = EncodeRates {
@@ -4999,20 +5327,17 @@ mod tests {
             force_keyframe,
             force_encode: false,
             capture_us: 0,
+            capture_wait_us: None,
             capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
             frame: shaded(0, 64, 48, salt),
         };
 
-        job_tx
-            .send(job(true, 10))
-            .await
-            .expect("投递关键帧");
+        job_tx.send(job(true, 10)).await.expect("投递关键帧");
         let (flags, _, _) = next_video(&mut out_rx).await;
         assert!(flags & VIDEO_FLAG_KEYFRAME != 0);
-        job_tx
-            .send(job(false, 40))
-            .await
-            .expect("投递 P 帧");
+        job_tx.send(job(false, 40)).await.expect("投递 P 帧");
         let (flags, _, _) = next_video(&mut out_rx).await;
         assert_eq!(flags & VIDEO_FLAG_KEYFRAME, 0);
 
@@ -5034,7 +5359,9 @@ mod tests {
         }
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// **协商不变量**：编码任务必须用协商选定的 codec 工厂，并在 `ScreenConfig` /
@@ -5057,6 +5384,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
 
         job_tx
@@ -5067,7 +5395,10 @@ mod tests {
                 force_keyframe: true,
                 force_encode: false,
                 capture_us: 0,
+                capture_wait_us: None,
                 capture_ts_us: 0,
+                input_to_capture_us: None,
+                input_to_change_us: None,
                 frame: shaded(0, 64, 48, 10),
             })
             .await
@@ -5093,7 +5424,9 @@ mod tests {
         }
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// 被背压跳过的那一帧若曾要求关键帧，请求**不能蒸发**：下一帧必须补上 IDR。
@@ -5125,6 +5458,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -5134,17 +5468,26 @@ mod tests {
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
+            capture_wait_us: None,
             capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
             frame,
         };
         let placeholder = || SessionFrame::control(SessionMessage::Heartbeat { t1_us: 0 });
 
         // 首帧：先下发 `ScreenConfig`，随后是关键帧。
-        job_tx.send(job(shaded(0, 64, 48, 10), true)).await.expect("投递首帧");
+        job_tx
+            .send(job(shaded(0, 64, 48, 10), true))
+            .await
+            .expect("投递首帧");
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
+                Some(SessionFrame {
+                    message: SessionMessage::ScreenConfig { .. },
+                    ..
+                })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -5157,14 +5500,20 @@ mod tests {
         assert_eq!(out_rx.len(), 2, "队列应已满");
 
         // 队列已满时投递一个**要求关键帧**的任务 → 编码任务只能在编码前跳过它。
-        job_tx.send(job(shaded(0, 64, 48, 30), true)).await.expect("投递被跳过的帧");
+        job_tx
+            .send(job(shaded(0, 64, 48, 30), true))
+            .await
+            .expect("投递被跳过的帧");
         // 任务取走该任务并回到等待（跳过后立即 `continue` 到下一次 `recv`）→ 跳过已发生。
         wait_for(|| job_tx.capacity() == JOB_CAP).await;
 
         // 腾出位置后投递一个**不要求**关键帧的任务：它必须补上被跳过的那个 IDR。
         assert!(out_rx.recv().await.is_some(), "腾出一格");
         assert!(out_rx.recv().await.is_some(), "腾出另一格");
-        job_tx.send(job(shaded(0, 64, 48, 40), false)).await.expect("投递下一帧");
+        job_tx
+            .send(job(shaded(0, 64, 48, 40), false))
+            .await
+            .expect("投递下一帧");
         let retried = out_rx.recv().await.expect("应收到补发帧");
         assert!(
             is_keyframe(&retried),
@@ -5173,7 +5522,9 @@ mod tests {
 
         // 关掉任务队列让编码任务自然退出（不必等满 `WAIT`）。
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// GPU 帧的假平台载体（测试只关心「是不是 GPU 帧」，不关心纹理）。
@@ -5209,6 +5560,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -5218,7 +5570,10 @@ mod tests {
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
+            capture_wait_us: None,
             capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
             frame: RawFrame {
                 display: 0,
                 width: 64,
@@ -5235,7 +5590,10 @@ mod tests {
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
+                Some(SessionFrame {
+                    message: SessionMessage::ScreenConfig { .. },
+                    ..
+                })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -5271,7 +5629,9 @@ mod tests {
         );
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// **`force_encode` 语义锁**：补丁模式的基准帧要求「必须编码一次」但**不是** IDR。
@@ -5298,6 +5658,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force_keyframe: bool, force_encode: bool| EncodeJob {
@@ -5307,7 +5668,10 @@ mod tests {
             force_keyframe,
             force_encode,
             capture_us: 0,
+            capture_wait_us: None,
             capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
             frame: RawFrame {
                 display: 0,
                 width: 64,
@@ -5327,7 +5691,10 @@ mod tests {
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
+                Some(SessionFrame {
+                    message: SessionMessage::ScreenConfig { .. },
+                    ..
+                })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -5347,7 +5714,9 @@ mod tests {
         );
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// **保活不变量**：`unchanged_resend = 0` 时，连续多帧 `changed == false` 也必须每帧
@@ -5374,6 +5743,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -5383,7 +5753,10 @@ mod tests {
             force_keyframe: force,
             force_encode: false,
             capture_us: 0,
+            capture_wait_us: None,
             capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
             frame: RawFrame {
                 display: 0,
                 width: 64,
@@ -5400,7 +5773,10 @@ mod tests {
         assert!(
             matches!(
                 out_rx.recv().await,
-                Some(SessionFrame { message: SessionMessage::ScreenConfig { .. }, .. })
+                Some(SessionFrame {
+                    message: SessionMessage::ScreenConfig { .. },
+                    ..
+                })
             ),
             "首帧前应先下发 ScreenConfig"
         );
@@ -5421,7 +5797,9 @@ mod tests {
         }
 
         drop(job_tx);
-        let _ = tokio::time::timeout(WAIT, task).await.expect("编码任务应结束");
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
     }
 
     /// 慢采集不得饿死入站处理：采集在阻塞线程里跑，循环仍应及时处理控制器的输入。
@@ -5451,7 +5829,8 @@ mod tests {
             cancel.clone(),
         ));
 
-        let (mut peer_reader, mut peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        let (mut peer_reader, mut peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
 
         // 等一次采集开始（它随即在阻塞线程里 sleep 400ms）。
         tokio::time::timeout(WAIT, started_rx.recv())
@@ -5461,11 +5840,13 @@ mod tests {
 
         // 采集正阻塞：此刻发一条输入，它应在采集结束前（200ms 窗口内）被处理。
         peer_writer
-            .send(SessionFrame::control(SessionMessage::Input(InputEvent::MouseMove {
-                x: 1,
-                y: 2,
-                display: 0,
-            })))
+            .send(SessionFrame::control(SessionMessage::Input(
+                InputEvent::MouseMove {
+                    x: 1,
+                    y: 2,
+                    display: 0,
+                },
+            )))
             .await
             .expect("发送输入应成功");
         let applied = tokio::time::timeout(Duration::from_millis(200), input_rx.recv()).await;
@@ -5476,7 +5857,9 @@ mod tests {
 
         cancel.cancel();
         let drain = tokio::spawn(async move { while peer_reader.next().await.is_some() {} });
-        let _ = tokio::time::timeout(WAIT, ctld).await.expect("被控端应结束");
+        let _ = tokio::time::timeout(WAIT, ctld)
+            .await
+            .expect("被控端应结束");
         let _ = drain.await;
         drop(peer_writer);
     }
@@ -5502,7 +5885,11 @@ mod tests {
     }
 
     impl AsyncWrite for BackpressureProbe {
-        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
             if poll.is_pending() {
@@ -5558,7 +5945,8 @@ mod tests {
             cancel.clone(),
         ));
 
-        let (_peer_reader, _peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        let (_peer_reader, _peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
 
         // 机械验证「发送确实被阻塞」：等写侧撞上背压。若帧填不满 1024 字节缓冲，这里会超时失败。
         tokio::time::timeout(WAIT, async {
@@ -5596,7 +5984,11 @@ mod tests {
 
         let ctld = tokio::spawn(run_controlled(
             Box::new(b),
-            config_with(pending_with("TOK"), RemoteMode::Control, Duration::from_millis(100)),
+            config_with(
+                pending_with("TOK"),
+                RemoteMode::Control,
+                Duration::from_millis(100),
+            ),
             run_screen,
             input,
             None,
@@ -5604,7 +5996,8 @@ mod tests {
             cancel.clone(),
         ));
         // 对端读半边必须活着（`_` 前缀的具名绑定不会被立即丢弃）：它一断，写失败会让会话先结束。
-        let (_peer_reader, _peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        let (_peer_reader, _peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
 
         // panic 那次之后再有一次采集调用，即说明看门狗已解除在途状态、循环继续跑。
         let recovered = tokio::time::timeout(WAIT, async {
@@ -5643,21 +6036,29 @@ mod tests {
 
         let ctld = tokio::spawn(run_controlled(
             Box::new(b),
-            config_with(pending_with("TOK"), RemoteMode::Control, Duration::from_millis(50)),
+            config_with(
+                pending_with("TOK"),
+                RemoteMode::Control,
+                Duration::from_millis(50),
+            ),
             run_screen,
             input,
             None,
             transfer_hub().0,
             cancel.clone(),
         ));
-        let (_peer_reader, _peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        let (_peer_reader, _peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
 
         let result = tokio::time::timeout(WAIT, ctld)
             .await
             .expect("挂死的采集应被看门狗终止（不得无限重试）")
             .expect("任务不应 panic");
         let err = result.expect_err("连续超时后应结束会话");
-        assert!(err.to_string().contains("超时"), "错误应说明采集超时，实得 {err}");
+        assert!(
+            err.to_string().contains("超时"),
+            "错误应说明采集超时，实得 {err}"
+        );
         assert!(
             screen.calls() >= MAX_CAPTURE_TIMEOUTS as usize,
             "应重试到上限为止（实得 {} 次）",
@@ -5688,7 +6089,8 @@ mod tests {
             transfer_hub().0,
             cancel.clone(),
         ));
-        let (_peer_reader, mut peer_writer) = controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
+        let (_peer_reader, mut peer_writer) =
+            controller_peer_handshake(Box::new(a), &plan, "TOK", "sess-1").await;
 
         peer_writer
             .send(SessionFrame::control(SessionMessage::ClipboardRequest))
@@ -5912,7 +6314,8 @@ mod tests {
                 },
             ],
         };
-        let messages = build_region_updates(&mut compressor, 3, &patches, 7_000).expect("应在预算内");
+        let messages =
+            build_region_updates(&mut compressor, 3, &patches, 7_000).expect("应在预算内");
         assert_eq!(messages.len(), 1, "小补丁应装进同一条消息");
         let msg = messages.into_iter().next().expect("一条消息");
         let SessionMessage::RegionUpdate {
@@ -5925,7 +6328,11 @@ mod tests {
         else {
             panic!("应为 RegionUpdate，实得 {msg:?}");
         };
-        assert_eq!((display, width, height), (3, 64, 48), "目标帧缓冲尺寸应原样带回");
+        assert_eq!(
+            (display, width, height),
+            (3, 64, 48),
+            "目标帧缓冲尺寸应原样带回"
+        );
         assert_eq!(capture_ts_us, 7_000, "采集时刻应原样带回");
         assert_eq!(rects.len(), 2);
         // 坐标/尺寸原样保留（脏矩形坐标是编码尺寸坐标系）。
@@ -5961,7 +6368,8 @@ mod tests {
             changed_permille: 0,
             rects: Vec::new(),
         };
-        let messages = build_region_updates(&mut compressor, 0, &patches, 7_000).expect("空补丁也应构造");
+        let messages =
+            build_region_updates(&mut compressor, 0, &patches, 7_000).expect("空补丁也应构造");
         assert_eq!(messages.len(), 1, "空补丁只产出一条保活消息");
         match &messages[0] {
             SessionMessage::RegionUpdate {
@@ -6109,7 +6517,11 @@ mod tests {
         // 很小的单条上限：16×16 的 384 B 载荷必然被拆成多条横条。
         let messages =
             build_region_updates_with_cap(&mut compressor, 0, &patches, 0, 100).expect("应能拆批");
-        assert!(messages.len() >= 2, "小上限下必须拆成多条消息，实得 {}", messages.len());
+        assert!(
+            messages.len() >= 2,
+            "小上限下必须拆成多条消息，实得 {}",
+            messages.len()
+        );
         let rebuilt = reassemble_rect(&messages, 64, 64, 4, 6, 16, 16);
         assert_eq!(rebuilt, original, "横条拼回后必须与原矩形逐字节相等");
     }
@@ -6193,7 +6605,11 @@ mod tests {
         for band in &bands {
             assert_eq!(band.x, x, "横条的 x 必须与原矩形一致");
             assert_eq!(band.width, width, "横条的 width 必须与原矩形一致");
-            assert!(band.y.is_multiple_of(2), "横条 y 必须是偶数，实得 {}", band.y);
+            assert!(
+                band.y.is_multiple_of(2),
+                "横条 y 必须是偶数，实得 {}",
+                band.y
+            );
             assert!(
                 band.height.is_multiple_of(2),
                 "横条 height 必须是偶数，实得 {}",
@@ -6257,7 +6673,10 @@ mod tests {
         // 1 秒内多出 125 000 B → 1000 kbps（125000 × 8 / 1000 ms）。
         assert_eq!(window_kbps(0, 125_000, Duration::from_secs(1)), 1000);
         // 500 ms 内多出 62 500 B → 同样 1000 kbps（按实际间隔归一，不是按固定 1 s）。
-        assert_eq!(window_kbps(10_000, 72_500, Duration::from_millis(500)), 1000);
+        assert_eq!(
+            window_kbps(10_000, 72_500, Duration::from_millis(500)),
+            1000
+        );
         // 计数未增长 → 0。
         assert_eq!(window_kbps(4096, 4096, Duration::from_secs(1)), 0);
         // 极端：间隔为 0 不得 panic/除零（`kbps_from_bytes` 以 max(1 ms) 兜底）。
@@ -6305,8 +6724,14 @@ mod tests {
     /// 1920×1080，而视频路径得到 960×540，控制端会因尺寸不符拒绝所有补丁。
     #[test]
     fn encode_target_dims_matches_the_video_path_double_step() {
-        assert_eq!(encode_target_dims(1920, 1080, 1.0, MAX_ENCODE_WIDTH), (1920, 1080));
-        assert_eq!(encode_target_dims(1920, 1080, 0.5, MAX_ENCODE_WIDTH), (960, 540));
+        assert_eq!(
+            encode_target_dims(1920, 1080, 1.0, MAX_ENCODE_WIDTH),
+            (1920, 1080)
+        );
+        assert_eq!(
+            encode_target_dims(1920, 1080, 0.5, MAX_ENCODE_WIDTH),
+            (960, 540)
+        );
         // 4K：先封顶到 1920×1080，再乘 scale。
         assert_eq!(
             encode_target_dims(3840, 2160, 1.0, MAX_ENCODE_WIDTH),
@@ -6342,9 +6767,18 @@ mod tests {
     #[test]
     fn effective_max_encode_width_table() {
         assert_eq!(effective_max_encode_width(CodecId::H264, true), 3840);
-        assert_eq!(effective_max_encode_width(CodecId::Vp9, true), MAX_ENCODE_WIDTH);
-        assert_eq!(effective_max_encode_width(CodecId::H264, false), MAX_ENCODE_WIDTH);
-        assert_eq!(effective_max_encode_width(CodecId::Vp9, false), MAX_ENCODE_WIDTH);
+        assert_eq!(
+            effective_max_encode_width(CodecId::Vp9, true),
+            MAX_ENCODE_WIDTH
+        );
+        assert_eq!(
+            effective_max_encode_width(CodecId::H264, false),
+            MAX_ENCODE_WIDTH
+        );
+        assert_eq!(
+            effective_max_encode_width(CodecId::Vp9, false),
+            MAX_ENCODE_WIDTH
+        );
         assert_eq!(NATIVE_MAX_ENCODE_WIDTH, 3840);
     }
 
@@ -6413,7 +6847,10 @@ mod tests {
         }
         assert_eq!(mode.poll_entry(false, t0 + Duration::from_millis(1)), None);
         assert_eq!(mode.mode, ScreenMode::Video, "基准未发出前不得切模式");
-        assert_eq!(mode.poll_entry(true, t0 + Duration::from_millis(2)), Some(true));
+        assert_eq!(
+            mode.poll_entry(true, t0 + Duration::from_millis(2)),
+            Some(true)
+        );
         assert_eq!(mode.mode, ScreenMode::Patches);
         assert!(mode.last_patch_sent.is_some(), "进入时保活计时从此刻起算");
 
@@ -6580,7 +7017,8 @@ mod tests {
         ));
         // 声明支持 H.264，协商结果才会是 H.264（补丁模式的前提）。
         let (mut peer_reader, mut peer_writer) =
-            controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", Some((true, true))).await;
+            controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", Some((true, true)))
+                .await;
 
         // 读到第一块补丁为止，沿途统计关键帧：补丁之前必须已经有两个 IDR（会话首帧 + 进入基准）。
         let mut keyframes = 0u32;
@@ -6642,7 +7080,9 @@ mod tests {
         );
 
         cancel.cancel();
-        let _ = tokio::time::timeout(WAIT, ctld).await.expect("被控端应结束");
+        let _ = tokio::time::timeout(WAIT, ctld)
+            .await
+            .expect("被控端应结束");
     }
 
     /// 补丁模式的**基准帧必须是 IDR**，而「活跃度回升」退出后的**第一帧仍是 P 帧**。
@@ -6673,7 +7113,8 @@ mod tests {
         ));
         // 声明支持 H.264：补丁模式的前提（VP9 的解码输出不维护持久 NV12 帧缓冲）。
         let (mut peer_reader, _peer_writer) =
-            controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", Some((true, true))).await;
+            controller_peer_handshake_with(Box::new(a), &plan, "TOK", "sess-1", Some((true, true)))
+                .await;
 
         // 读到第一块补丁为止：会话首帧一个 IDR + 进入基准帧一个 IDR（共 2 个）。
         let keyframes = tokio::time::timeout(WAIT, async {
@@ -6718,7 +7159,9 @@ mod tests {
         );
 
         cancel.cancel();
-        let _ = tokio::time::timeout(WAIT, ctld).await.expect("被控端应结束");
+        let _ = tokio::time::timeout(WAIT, ctld)
+            .await
+            .expect("被控端应结束");
     }
 
     // ───────────────── 出站分档队列（阶段 10） ─────────────────
@@ -6779,10 +7222,7 @@ mod tests {
         }
         for msg in [
             SessionMessage::Heartbeat { t1_us: 1 },
-            SessionMessage::HeartbeatAck {
-                t2_us: 2,
-                t3_us: 3,
-            },
+            SessionMessage::HeartbeatAck { t2_us: 2, t3_us: 3 },
             SessionMessage::Input(InputEvent::MouseMove {
                 x: 1,
                 y: 2,
@@ -6924,8 +7364,7 @@ mod tests {
             (Duration::from_millis(40)..=Duration::from_millis(50)).contains(&gap),
             "6 Mbps 上一块 32 KiB 约 43.7 ms，实得 {gap:?}"
         );
-        let gap_count =
-            u32::try_from((300 * 1024_usize).div_ceil(chunk) - 1).expect("块数很少");
+        let gap_count = u32::try_from((300 * 1024_usize).div_ceil(chunk) - 1).expect("块数很少");
         let frame_natural = Duration::from_secs_f64((300.0 * 1024.0 * 8.0) / 6_000_000.0);
         assert!(
             gap * gap_count <= frame_natural * PACING_MAX_WAIT_FACTOR,

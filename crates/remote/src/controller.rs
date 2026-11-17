@@ -11,6 +11,7 @@ use crate::controlled::{send_cancellable, writer_loop, OutboundQueues};
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
 use crate::input_buffer::InputBuffer;
+use crate::latency::{self, LatencyWindow, Stage};
 use crate::reliable::{ReliableMetrics, ReliableSnapshot};
 use crate::screen::{
     DecodedFrame, DecodedPatch, DecoderInfo, FrameSink, InputEvent, QualityPreset, ScreenPatch,
@@ -116,6 +117,8 @@ enum DecodeJob {
         data: Vec<u8>,
         /// 该帧采集完成的时刻（被控端单调时钟，微秒；`0` = 未知）。端到端延迟用。
         capture_ts_us: u64,
+        /// 本端收到该包的时刻（本端单调时钟，微秒）。诊断用：解码队列等待 = 解码开始 - 它。
+        recv_us: u64,
     },
     /// 一批脏矩形补丁（协议 v5 `RegionUpdate`，仅 H.264 补丁模式）。
     ///
@@ -133,6 +136,8 @@ enum DecodeJob {
         rects: Vec<RegionRect>,
         /// 该批补丁采集完成的时刻（被控端单调时钟，微秒；`0` = 未知）。端到端延迟用。
         capture_ts_us: u64,
+        /// 本端收到该批补丁的时刻（本端单调时钟，微秒）。诊断用。
+        recv_us: u64,
     },
 }
 
@@ -159,6 +164,8 @@ struct DecodeShared {
     clock_offset_us: Arc<AtomicI64>,
     /// 解码任务最近一次算出的端到端延迟（毫秒；采集完成 → 解码完成）。
     e2e_ms: Arc<AtomicU32>,
+    /// 诊断：主循环与解码任务共享的分阶段延迟窗口（见 [`crate::latency`]）。
+    latency: Arc<std::sync::Mutex<LatencyWindow>>,
 }
 
 impl DecodeShared {
@@ -170,6 +177,7 @@ impl DecodeShared {
             applied_patches: Arc::new(AtomicU32::new(0)),
             clock_offset_us: Arc::new(AtomicI64::new(UNKNOWN_OFFSET)),
             e2e_ms: Arc::new(AtomicU32::new(0)),
+            latency: Arc::new(std::sync::Mutex::new(LatencyWindow::new())),
         }
     }
 }
@@ -306,7 +314,10 @@ pub(crate) async fn run_controller_with_input(
         hmac_ack,
     } = ack.message
     else {
-        return Err(RemoteError::Handshake(format!("期望 HelloAck，实得 {:?}", ack.message)));
+        return Err(RemoteError::Handshake(format!(
+            "期望 HelloAck，实得 {:?}",
+            ack.message
+        )));
     };
     if !accepted {
         return Err(RemoteError::Handshake(
@@ -371,7 +382,7 @@ pub(crate) async fn run_controller_with_input(
     // 不会在任何一次网络写上阻塞——对端停读/中继停走时，读画面、心跳、输入仍能继续轮询。
     // `queues` 与写任务共享同一组通道；`file_staging` 保证文件块在队列满时不丢字节。
     let (mut queues, receivers) = OutboundQueues::new();
-    let writer_task = tokio::spawn(writer_loop(writer, receivers, cancel.clone()));
+    let writer_task = tokio::spawn(writer_loop(writer, receivers, cancel.clone(), None));
 
     // 解码任务：解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
     // 被它占住。故把解码挪到独立任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
@@ -483,7 +494,19 @@ pub(crate) async fn run_controller_with_input(
             // `drain` 一次性取走整批并按入队顺序写出，因此「先移动、再按下」的先后关系不变；
             // 输入走控制队列（写任务里优先级最高的一档），可取消地等空位、绝不丢弃。
             () = input.notified(), if input.has_pending() => {
-                for event in input.drain() {
+                // 诊断：最老一条事件在本地缓冲里等了多久（UI 线程 → 会话循环）。
+                // 正常应接近 0；持续偏大说明会话循环被别的分支占住。
+                let (events, oldest_wait) = input.drain_with_oldest_age();
+                if latency::enabled() {
+                    if let Some(wait) = oldest_wait {
+                        latency::record(
+                            &decode_shared.latency,
+                            Stage::InputQueue,
+                            u64::try_from(wait.as_micros()).unwrap_or(u64::MAX),
+                        );
+                    }
+                }
+                for event in events {
                     if let Err(err) = queues
                         .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::Input(event)))
                         .await
@@ -566,6 +589,21 @@ pub(crate) async fn run_controller_with_input(
                     jitter_ms,
                     clock_offset_us: decode_shared.clock_offset_us.load(Ordering::Relaxed),
                 });
+                // 诊断：每秒一行分阶段延迟汇总（**只在延迟诊断打开时**）。
+                // 与上面的 `SessionStats::Decode` 分开：那条是 UI 角标读数，这条是逐段拆解。
+                if latency::enabled() {
+                    if let Some(summary) = latency::take_summary(&decode_shared.latency) {
+                        // 全部信息塞进 message：GUI 日志面板 / 服务端日志只保留 `message` 字段。
+                        info!(
+                            target: "latency",
+                            "controller packets={} dropped={} rtt_ms={} {}",
+                            window_packets,
+                            window_dropped,
+                            last_rtt_ms.unwrap_or(0),
+                            summary
+                        );
+                    }
+                }
                 // 可靠层每秒增量（A7）。只有打洞路径有句柄；直连/中继不发（见 `ControllerConfig`）。
                 if let Some(metrics) = &config.reliable {
                     let now_snapshot = metrics.snapshot();
@@ -890,6 +928,7 @@ pub(crate) async fn run_controller_with_input(
                                 height,
                                 data,
                                 capture_ts_us,
+                                recv_us: now_us(),
                             }) {
                                 DecodeEnqueue::Queued => {}
                                 // 第二道兜底：队列满时推进 epoch，让队列里的陈旧 P 帧
@@ -964,6 +1003,7 @@ pub(crate) async fn run_controller_with_input(
                                     height,
                                     rects,
                                     capture_ts_us,
+                                    recv_us: now_us(),
                                 },
                             ) {
                                 DecodeEnqueue::Queued => {}
@@ -1274,6 +1314,7 @@ async fn decode_loop(
     // 关键帧请求限频状态：上次真正发出的时刻、被限频挂起的显示器。
     let mut last_kf_request: Option<Instant> = None;
     let mut kf_pending: Option<(u32, KeyframeReason)> = None;
+    // 诊断开关**每帧读一次**（Relaxed 原子）：设置页运行中切换立即生效（见 [`crate::latency`]）。
     // 定期检查挂起的请求：距上次请求已满一个窗口就发出去，保证不会永久等 IDR。
     let mut kf_tick = tokio::time::interval_at(
         Instant::now() + KEYFRAME_REQUEST_INTERVAL,
@@ -1302,146 +1343,205 @@ async fn decode_loop(
             },
         };
         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
-        let (monitor, seq, epoch, packet_codec, flags, width, height, data, capture_ts_us) = match job {
-            DecodeJob::SelectCodec(selected) => {
-                // 换 codec：旧解码器的参考帧不可用，重置并等新 codec 的关键帧。
-                if codec != Some(selected) {
-                    debug!(?selected, "切换解码器 codec");
-                    codec = Some(selected);
-                    decoder = None;
-                    // **只建解码器、不 configure**：尺寸由首个 `VideoPacket` 给出。
-                    configured_dims = None;
-                    awaiting_keyframe = true;
-                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
-                    expected_seq = None;
-                    if let Some(factory) =
-                        decoder_factory_for(selected, h264_decoder_factory.as_ref())
-                    {
-                        match factory.create() {
-                            Ok(dec) => {
-                                report_decoder_info(&stats, &mut last_decoder_info, dec.as_ref());
-                                decoder = Some(dec);
+        let (monitor, seq, epoch, packet_codec, flags, width, height, data, capture_ts_us, recv_us) =
+            match job {
+                DecodeJob::SelectCodec(selected) => {
+                    // 换 codec：旧解码器的参考帧不可用，重置并等新 codec 的关键帧。
+                    if codec != Some(selected) {
+                        debug!(?selected, "切换解码器 codec");
+                        codec = Some(selected);
+                        decoder = None;
+                        // **只建解码器、不 configure**：尺寸由首个 `VideoPacket` 给出。
+                        configured_dims = None;
+                        awaiting_keyframe = true;
+                        decode_shared
+                            .awaiting_keyframe
+                            .store(true, Ordering::Relaxed);
+                        expected_seq = None;
+                        if let Some(factory) =
+                            decoder_factory_for(selected, h264_decoder_factory.as_ref())
+                        {
+                            match factory.create() {
+                                Ok(dec) => {
+                                    report_decoder_info(
+                                        &stats,
+                                        &mut last_decoder_info,
+                                        dec.as_ref(),
+                                    );
+                                    decoder = Some(dec);
+                                }
+                                // 创建失败不必终止：首个关键帧到达时会再试一次（下方 `is_none` 分支）。
+                                Err(err) => warn!(error = %err, "解码器创建失败"),
                             }
-                            // 创建失败不必终止：首个关键帧到达时会再试一次（下方 `is_none` 分支）。
-                            Err(err) => warn!(error = %err, "解码器创建失败"),
+                        } else {
+                            warn!(?selected, "没有对应 codec 的解码器工厂");
                         }
-                    } else {
-                        warn!(?selected, "没有对应 codec 的解码器工厂");
                     }
-                }
-                continue;
-            }
-            // 补丁批：校验/解压后交给 `FrameSink::on_patch`。
-            //
-            // **顺序保证**：补丁与全帧都从本函数出队，所以 `on_patch` 必然排在前一个
-            // `on_frame`（或前一批补丁）之后——UI 侧的持久合成帧因此可以盲目按矩形覆写。
-            // 补丁**不占用** `expected_seq`（被控端在补丁模式下不产全帧，视频序号不前进），
-            // 退出补丁模式后的第一个全帧仍与解码端的期望值连续。
-            DecodeJob::Region {
-                display: monitor,
-                width,
-                height,
-                rects,
-                capture_ts_us,
-            } => {
-                // 空批 = 保活（主循环已过滤；这里兜底，避免未来的调用方把空批当一帧上屏）。
-                if rects.is_empty() {
                     continue;
                 }
-                // 丢弃分两类，**只有一类可以静默**：正在等 IDR 时关键帧请求已经在途，再请
-                // 一次只会浪费限频窗口；其余任何丢弃都必须换回一个关键帧（补丁丢一个，
-                // 画面就永久缺一块）。
+                // 补丁批：校验/解压后交给 `FrameSink::on_patch`。
                 //
-                // 因此 codec / 几何检查排在 `awaiting_keyframe` **之前**：几何不符意味着
-                // 我们的合成帧基底与对端以为的不是同一块缓冲，这正是必须换回全帧的理由，
-                // 即使此刻已经在等 IDR。
-                if codec != Some(CodecId::H264) {
-                    debug!(monitor, ?codec, "非 H.264 会话收到补丁，丢弃并请求关键帧");
-                    request_keyframe(
-                        &keyframe_tx,
-                        &mut last_kf_request,
-                        &mut kf_pending,
-                        monitor,
-                        KeyframeReason::DecodeError,
-                    );
-                    continue;
-                }
-                if configured_dims != Some((width, height)) {
-                    debug!(
-                        monitor,
-                        width,
-                        height,
-                        ?configured_dims,
-                        "补丁尺寸与当前合成帧不符，丢弃并请求关键帧"
-                    );
-                    awaiting_keyframe = true;
-                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
-                    request_keyframe(
-                        &keyframe_tx,
-                        &mut last_kf_request,
-                        &mut kf_pending,
-                        monitor,
-                        KeyframeReason::DecodeError,
-                    );
-                    continue;
-                }
-                if awaiting_keyframe {
-                    // 还没有可应用的全帧基底；关键帧请求已经在途（见上）。
-                    continue;
-                }
-                let mut patches = Vec::with_capacity(rects.len());
-                let mut failed = false;
-                for rect in &rects {
-                    let Some(patch) = decode_region_rect(width, height, rect) else {
-                        failed = true;
-                        break;
-                    };
-                    patches.push(patch);
-                }
-                if failed {
-                    // 整批丢弃：解压/校验只做了一半也没有可应用的部分，半批补丁同样会让
-                    // 画面缺块。
-                    debug!(monitor, width, height, "补丁矩形非法或解压失败，丢弃整批并请求关键帧");
-                    awaiting_keyframe = true;
-                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
-                    request_keyframe(
-                        &keyframe_tx,
-                        &mut last_kf_request,
-                        &mut kf_pending,
-                        monitor,
-                        KeyframeReason::DecodeError,
-                    );
-                    continue;
-                }
-                sink.on_patch(DecodedPatch {
+                // **顺序保证**：补丁与全帧都从本函数出队，所以 `on_patch` 必然排在前一个
+                // `on_frame`（或前一批补丁）之后——UI 侧的持久合成帧因此可以盲目按矩形覆写。
+                // 补丁**不占用** `expected_seq`（被控端在补丁模式下不产全帧，视频序号不前进），
+                // 退出补丁模式后的第一个全帧仍与解码端的期望值连续。
+                DecodeJob::Region {
                     display: monitor,
                     width,
                     height,
-                    rects: patches,
+                    rects,
                     capture_ts_us,
-                });
-                decode_shared
-                    .applied_patches
-                    .fetch_add(1, Ordering::Relaxed);
-                // 补丁的端到端：采集完成 → 本端应用完成（与全帧同一套公式）。
-                let offset = decode_shared.clock_offset_us.load(Ordering::Relaxed);
-                decode_shared
-                    .e2e_ms
-                    .store(elapsed_ms(now_us(), offset, capture_ts_us), Ordering::Relaxed);
-                continue;
-            }
-            DecodeJob::Packet {
-                display,
-                seq,
-                epoch,
-                codec,
-                flags,
-                width,
-                height,
-                data,
-                capture_ts_us,
-            } => (display, seq, epoch, codec, flags, width, height, data, capture_ts_us),
+                    recv_us,
+                } => {
+                    // 诊断：包到达 → 本批被取走的队列等待（补丁没有解码耗时）。
+                    let recv_q_us = now_us().saturating_sub(recv_us);
+                    if latency::enabled() {
+                        latency::record(&decode_shared.latency, Stage::RecvQueue, recv_q_us);
+                    }
+                    // 空批 = 保活（主循环已过滤；这里兜底，避免未来的调用方把空批当一帧上屏）。
+                    if rects.is_empty() {
+                        continue;
+                    }
+                    // 丢弃分两类，**只有一类可以静默**：正在等 IDR 时关键帧请求已经在途，再请
+                    // 一次只会浪费限频窗口；其余任何丢弃都必须换回一个关键帧（补丁丢一个，
+                    // 画面就永久缺一块）。
+                    //
+                    // 因此 codec / 几何检查排在 `awaiting_keyframe` **之前**：几何不符意味着
+                    // 我们的合成帧基底与对端以为的不是同一块缓冲，这正是必须换回全帧的理由，
+                    // 即使此刻已经在等 IDR。
+                    if codec != Some(CodecId::H264) {
+                        debug!(monitor, ?codec, "非 H.264 会话收到补丁，丢弃并请求关键帧");
+                        request_keyframe(
+                            &keyframe_tx,
+                            &mut last_kf_request,
+                            &mut kf_pending,
+                            monitor,
+                            KeyframeReason::DecodeError,
+                        );
+                        continue;
+                    }
+                    if configured_dims != Some((width, height)) {
+                        debug!(
+                            monitor,
+                            width,
+                            height,
+                            ?configured_dims,
+                            "补丁尺寸与当前合成帧不符，丢弃并请求关键帧"
+                        );
+                        awaiting_keyframe = true;
+                        decode_shared
+                            .awaiting_keyframe
+                            .store(true, Ordering::Relaxed);
+                        request_keyframe(
+                            &keyframe_tx,
+                            &mut last_kf_request,
+                            &mut kf_pending,
+                            monitor,
+                            KeyframeReason::DecodeError,
+                        );
+                        continue;
+                    }
+                    if awaiting_keyframe {
+                        // 还没有可应用的全帧基底；关键帧请求已经在途（见上）。
+                        continue;
+                    }
+                    let mut patches = Vec::with_capacity(rects.len());
+                    let mut failed = false;
+                    for rect in &rects {
+                        let Some(patch) = decode_region_rect(width, height, rect) else {
+                            failed = true;
+                            break;
+                        };
+                        patches.push(patch);
+                    }
+                    if failed {
+                        // 整批丢弃：解压/校验只做了一半也没有可应用的部分，半批补丁同样会让
+                        // 画面缺块。
+                        debug!(
+                            monitor,
+                            width, height, "补丁矩形非法或解压失败，丢弃整批并请求关键帧"
+                        );
+                        awaiting_keyframe = true;
+                        decode_shared
+                            .awaiting_keyframe
+                            .store(true, Ordering::Relaxed);
+                        request_keyframe(
+                            &keyframe_tx,
+                            &mut last_kf_request,
+                            &mut kf_pending,
+                            monitor,
+                            KeyframeReason::DecodeError,
+                        );
+                        continue;
+                    }
+                    let patch_bytes = patches.iter().fold(0_u64, |acc, rect| {
+                        acc.saturating_add(u64::try_from(rect.nv12.len()).unwrap_or(u64::MAX))
+                    });
+                    sink.on_patch(DecodedPatch {
+                        display: monitor,
+                        width,
+                        height,
+                        rects: patches,
+                        capture_ts_us,
+                    });
+                    decode_shared
+                        .applied_patches
+                        .fetch_add(1, Ordering::Relaxed);
+                    // 补丁的端到端：采集完成 → 本端应用完成（与全帧同一套公式）。
+                    let offset = decode_shared.clock_offset_us.load(Ordering::Relaxed);
+                    let e2e_ms = elapsed_ms(now_us(), offset, capture_ts_us);
+                    decode_shared.e2e_ms.store(e2e_ms, Ordering::Relaxed);
+                    if latency::enabled() {
+                        let e2e_micros = u64::from(e2e_ms).saturating_mul(1000);
+                        latency::record(&decode_shared.latency, Stage::CaptureToDecode, e2e_micros);
+                        if latency::frame_logs() || e2e_micros > latency::slow_threshold_us() {
+                            info!(
+                                target: "latency",
+                                "controller_patch bytes={} recv_q_us={} capture_to_recv_ms={} e2e_ms={}",
+                                patch_bytes,
+                                recv_q_us,
+                                elapsed_ms(recv_us, offset, capture_ts_us),
+                                e2e_ms
+                            );
+                        }
+                    }
+                    continue;
+                }
+                DecodeJob::Packet {
+                    display,
+                    seq,
+                    epoch,
+                    codec,
+                    flags,
+                    width,
+                    height,
+                    data,
+                    capture_ts_us,
+                    recv_us,
+                } => (
+                    display,
+                    seq,
+                    epoch,
+                    codec,
+                    flags,
+                    width,
+                    height,
+                    data,
+                    capture_ts_us,
+                    recv_us,
+                ),
+            };
+        // 诊断：包到达 → 解码任务取走（解码队列等待）。`recv_us == 0` 是测试构造的哨兵，
+        // 不能拿「进程启动至今」去减，否则汇总会被一个巨大值污染。
+        let recv_q_us = if latency::enabled() && recv_us != 0 {
+            let us = now_us().saturating_sub(recv_us);
+            latency::record(&decode_shared.latency, Stage::RecvQueue, us);
+            us
+        } else {
+            0
         };
+        // 诊断：载荷字节数（`data` 稍后会被 move 进 `spawn_blocking`）。
+        let packet_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
         // 队列曾溢出（主循环推进了 epoch）：本包已被更新的包取代。丢掉它并重置参考链，
         // `expected_seq = None` 避免紧接着的下一个包再触发一次「断层」重置。
         if epoch < decode_shared.drop_epoch.load(Ordering::Relaxed) {
@@ -1449,7 +1549,9 @@ async fn decode_loop(
             decoder = None;
             configured_dims = None;
             awaiting_keyframe = true;
-            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            decode_shared
+                .awaiting_keyframe
+                .store(true, Ordering::Relaxed);
             expected_seq = None;
             request_keyframe(
                 &keyframe_tx,
@@ -1466,7 +1568,9 @@ async fn decode_loop(
             decoder = None;
             configured_dims = None;
             awaiting_keyframe = true;
-            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            decode_shared
+                .awaiting_keyframe
+                .store(true, Ordering::Relaxed);
         }
 
         // 声明尺寸的纵深防御：真正的解码尺寸由码流决定（下方解码后还会再校验一次），但先挡掉
@@ -1483,7 +1587,9 @@ async fn decode_loop(
             decoder = None;
             configured_dims = None;
             awaiting_keyframe = true;
-            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            decode_shared
+                .awaiting_keyframe
+                .store(true, Ordering::Relaxed);
             request_keyframe(
                 &keyframe_tx,
                 &mut last_kf_request,
@@ -1500,7 +1606,9 @@ async fn decode_loop(
         // 尚无解码器时必须从关键帧起步，否则 P 帧无从参考。
         if decoder.is_none() && !keyframe {
             awaiting_keyframe = true;
-            decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+            decode_shared
+                .awaiting_keyframe
+                .store(true, Ordering::Relaxed);
             request_keyframe(
                 &keyframe_tx,
                 &mut last_kf_request,
@@ -1511,12 +1619,14 @@ async fn decode_loop(
             continue;
         }
         if decoder.is_none() {
-            let factory = codec
-                .and_then(|codec| decoder_factory_for(codec, h264_decoder_factory.as_ref()));
+            let factory =
+                codec.and_then(|codec| decoder_factory_for(codec, h264_decoder_factory.as_ref()));
             let Some(factory) = factory else {
                 warn!(?codec, "没有对应 codec 的解码器工厂，丢弃本帧并等待关键帧");
                 awaiting_keyframe = true;
-                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                decode_shared
+                    .awaiting_keyframe
+                    .store(true, Ordering::Relaxed);
                 request_keyframe(
                     &keyframe_tx,
                     &mut last_kf_request,
@@ -1560,7 +1670,9 @@ async fn decode_loop(
                     decoder = None;
                     configured_dims = None;
                     awaiting_keyframe = true;
-                    decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                    decode_shared
+                        .awaiting_keyframe
+                        .store(true, Ordering::Relaxed);
                     request_keyframe(
                         &keyframe_tx,
                         &mut last_kf_request,
@@ -1597,15 +1709,36 @@ async fn decode_loop(
                 let decode_ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
                 decode_shared.decode_ms.store(decode_ms, Ordering::Relaxed);
                 awaiting_keyframe = false;
-                decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
+                decode_shared
+                    .awaiting_keyframe
+                    .store(false, Ordering::Relaxed);
                 // IDR 已解出：被限频挂起的请求没有意义了。
                 kf_pending = None;
                 // 端到端（D2）：采集完成 → 本端解码完成。偏差未知/时间戳缺失时给 0
                 // （见 [`crate::clock::elapsed_ms`]）。
                 let offset = decode_shared.clock_offset_us.load(Ordering::Relaxed);
-                decode_shared
-                    .e2e_ms
-                    .store(elapsed_ms(now_us(), offset, capture_ts_us), Ordering::Relaxed);
+                let e2e_ms = elapsed_ms(now_us(), offset, capture_ts_us);
+                decode_shared.e2e_ms.store(e2e_ms, Ordering::Relaxed);
+                if latency::enabled() {
+                    let decode_micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+                    let e2e_micros = u64::from(e2e_ms).saturating_mul(1000);
+                    latency::record(&decode_shared.latency, Stage::Decode, decode_micros);
+                    latency::record(&decode_shared.latency, Stage::CaptureToDecode, e2e_micros);
+                    if latency::frame_logs() || e2e_micros > latency::slow_threshold_us() {
+                        info!(
+                            target: "latency",
+                            "controller seq={} idr={} bytes={} recv_q_us={} dec_us={} capture_to_recv_ms={} e2e_ms={} backlog={}",
+                            seq,
+                            flags & VIDEO_FLAG_KEYFRAME != 0,
+                            packet_bytes,
+                            recv_q_us,
+                            decode_micros,
+                            elapsed_ms(recv_us, offset, capture_ts_us),
+                            e2e_ms,
+                            u32::try_from(rx.len()).unwrap_or(u32::MAX)
+                        );
+                    }
+                }
                 sink.on_frame(DecodedFrame {
                     display: monitor,
                     width: frame.width,
@@ -1620,7 +1753,9 @@ async fn decode_loop(
             Ok((dec, Ok(None), _elapsed)) => {
                 decoder = Some(dec);
                 awaiting_keyframe = false;
-                decode_shared.awaiting_keyframe.store(false, Ordering::Relaxed);
+                decode_shared
+                    .awaiting_keyframe
+                    .store(false, Ordering::Relaxed);
                 kf_pending = None;
             }
             Ok((dec, Err(err), _elapsed)) => {
@@ -1630,7 +1765,9 @@ async fn decode_loop(
                 decoder = None;
                 configured_dims = None;
                 awaiting_keyframe = true;
-                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                decode_shared
+                    .awaiting_keyframe
+                    .store(true, Ordering::Relaxed);
                 request_keyframe(
                     &keyframe_tx,
                     &mut last_kf_request,
@@ -1651,7 +1788,9 @@ async fn decode_loop(
                 decoder = None;
                 configured_dims = None;
                 awaiting_keyframe = true;
-                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
+                decode_shared
+                    .awaiting_keyframe
+                    .store(true, Ordering::Relaxed);
                 request_keyframe(
                     &keyframe_tx,
                     &mut last_kf_request,
@@ -1930,9 +2069,18 @@ mod tests {
             .await
             .expect("回 HelloAck 应成功");
 
-        let shared = responder.diffie_hellman(&initiator_pub).expect("ECDH 应成功");
+        let shared = responder
+            .diffie_hellman(&initiator_pub)
+            .expect("ECDH 应成功");
         // 本端扮演被控端（响应方）：`initiator=false`。
-        let keys = derive_session_keys(token, &shared, session_id, &initiator_pub, &responder_pub, false);
+        let keys = derive_session_keys(
+            token,
+            &shared,
+            session_id,
+            &initiator_pub,
+            &responder_pub,
+            false,
+        );
         reader
             .decoder_mut()
             .set_cipher(Cipher::new(keys.recv).expect("密钥长度合法"));
@@ -1998,7 +2146,8 @@ mod tests {
         let (a, b) = tokio::io::duplex(16 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
         // 对端**完全不读**：读半边攥着不放（drop 掉会让控制器写拿到 broken pipe，就测不到阻塞了）。
-        let (_peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+        let (_peer_reader, _peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
 
         let sink = Arc::new(FakeSink::default());
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -2028,7 +2177,8 @@ mod tests {
     async fn cancel_does_not_block_teardown() {
         let (a, b) = tokio::io::duplex(16 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
-        let (_peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+        let (_peer_reader, _peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
 
         let sink = Arc::new(FakeSink::default());
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -2062,7 +2212,8 @@ mod tests {
     async fn closed_command_channel_exits_loop() {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
-        let (peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+        let (peer_reader, _peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
         let _drain = spawn_drain(peer_reader);
 
         let sink = Arc::new(FakeSink::default());
@@ -2078,7 +2229,10 @@ mod tests {
             .await
             .expect("命令通道关闭后循环应立即退出，而不是空转")
             .expect("任务不应 panic");
-        assert!(result.is_ok(), "命令通道关闭应按正常结束处理，实得 {result:?}");
+        assert!(
+            result.is_ok(),
+            "命令通道关闭应按正常结束处理，实得 {result:?}"
+        );
         assert_eq!(
             sink.closed.lock().unwrap().as_deref(),
             Some("会话命令通道已关闭"),
@@ -2095,7 +2249,8 @@ mod tests {
     async fn session_start_reports_rtt_immediately() {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
-        let (mut peer_reader, mut peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+        let (mut peer_reader, mut peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
 
         // 被控端：把收到的 `Heartbeat` 回一个 `HeartbeatAck`（其余帧不管）。
         let peer = tokio::spawn(async move {
@@ -2145,7 +2300,10 @@ mod tests {
         })
         .await
         .expect("会话建立后 300ms 内就该有延迟样本（首个 tick 立即到期）");
-        assert!(rtt < Duration::from_millis(300), "内存管道 RTT 不该是 {rtt:?}");
+        assert!(
+            rtt < Duration::from_millis(300),
+            "内存管道 RTT 不该是 {rtt:?}"
+        );
 
         cancel.cancel();
         let _ = tokio::time::timeout(WAIT, task).await;
@@ -2159,7 +2317,8 @@ mod tests {
     async fn controller_sends_qos_feedback_periodically() {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
-        let (mut peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+        let (mut peer_reader, _peer_writer) =
+            controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
 
         let sink = Arc::new(FakeSink::default());
         let (_cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -2337,7 +2496,8 @@ mod tests {
         for round in 0..RACE_ROUNDS {
             let (a, b) = tokio::io::duplex(64 * 1024);
             let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
-            let (mut peer_reader, _peer_writer) = controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
+            let (mut peer_reader, _peer_writer) =
+                controlled_peer_handshake(Box::new(b), &plan, "TOK", "sess-1").await;
 
             // 被控端只观察首个心跳并继续排空（让收尾的 `Bye` 能落地）。
             let ready = Arc::new(Notify::new());
@@ -2368,8 +2528,14 @@ mod tests {
                 .expect("取消后循环必须退出")
                 .expect("任务不应 panic")
                 .expect("取消属正常收尾");
-            assert_eq!(end.reason, "用户中断", "第 {round} 轮：取消应压过命令通道关闭");
-            assert!(end.deliberate, "第 {round} 轮：用户主动中断必须是 deliberate，否则会触发自动重连");
+            assert_eq!(
+                end.reason, "用户中断",
+                "第 {round} 轮：取消应压过命令通道关闭"
+            );
+            assert!(
+                end.deliberate,
+                "第 {round} 轮：用户主动中断必须是 deliberate，否则会触发自动重连"
+            );
             assert_eq!(
                 sink.closed.lock().unwrap().as_deref(),
                 Some("用户中断"),
@@ -2422,7 +2588,10 @@ mod tests {
             Ok(())
         }
 
-        fn decode(&mut self, _data: &[u8]) -> RemoteResult<Option<crate::video::DecodedVideoFrame>> {
+        fn decode(
+            &mut self,
+            _data: &[u8],
+        ) -> RemoteResult<Option<crate::video::DecodedVideoFrame>> {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2492,6 +2661,7 @@ mod tests {
                 height: 2,
                 data: vec![1, 2, 3],
                 capture_ts_us: 0,
+                recv_us: 0,
             })
             .await
             .expect("投递关键帧");
@@ -2519,10 +2689,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_slice(),
-            &[
-                DecoderCall::Configure(2, 2),
-                DecoderCall::Decode
-            ],
+            &[DecoderCall::Configure(2, 2), DecoderCall::Decode],
             "首个包必须先 configure 编码尺寸再 decode"
         );
 
@@ -2573,6 +2740,7 @@ mod tests {
             height,
             data: vec![1, 2, 3],
             capture_ts_us: 0,
+            recv_us: 0,
         };
         // 首包（关键帧）→ configure + decode。
         job_tx
@@ -2748,6 +2916,7 @@ mod tests {
                     height,
                     data: vec![1, 2, 3],
                     capture_ts_us: 0,
+                    recv_us: 0,
                 })
                 .await
                 .expect("投递关键帧");
@@ -2773,6 +2942,7 @@ mod tests {
                     height,
                     rects,
                     capture_ts_us: 0,
+                    recv_us: 0,
                 })
                 .await
                 .expect("投递补丁批");

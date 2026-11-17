@@ -28,6 +28,7 @@
 use crate::screen::InputEvent;
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// 队列容量上限（对**全部**事件计数；满时只挤掉鼠标移动）。
@@ -42,12 +43,20 @@ fn droppable(event: &InputEvent) -> bool {
     matches!(event, InputEvent::MouseMove { .. })
 }
 
+/// 队列里的一个事件 + 入队时刻（入队时刻只用于诊断：本地缓冲等待时长）。
+struct Queued {
+    /// 入队时刻（`Instant`，本进程单调）。
+    at: Instant,
+    /// 输入事件本身。
+    event: InputEvent,
+}
+
 /// 控制器侧输入缓冲（`Send + Sync`，UI 线程与会话循环共享）。
 pub(crate) struct InputBuffer {
     /// 容量上限（至少为 1，避免 0 容量把每条事件都判成「满」）。
     cap: usize,
     /// 待发事件（保持到达顺序）。
-    events: Mutex<VecDeque<InputEvent>>,
+    events: Mutex<VecDeque<Queued>>,
     /// 有新事件时唤醒会话循环。
     notify: Notify,
 }
@@ -73,12 +82,14 @@ impl InputBuffer {
     ///
     /// 满时只会挤掉 `MouseMove`（见模块文档）：**抬起事件绝不丢**，否则远端会永久卡键。
     pub(crate) fn push(&self, event: InputEvent) {
+        let now = Instant::now();
         let mut queue = self.lock();
         // 连续两条移动合并成一条（last-wins）：移动无状态，中间的落点没有意义。
         if droppable(&event) {
             if let Some(back) = queue.back_mut() {
-                if matches!(back, InputEvent::MouseMove { .. }) {
-                    *back = event;
+                if matches!(back.event, InputEvent::MouseMove { .. }) {
+                    back.event = event;
+                    back.at = now;
                     drop(queue);
                     self.notify.notify_one();
                     return;
@@ -86,28 +97,43 @@ impl InputBuffer {
             }
         }
         if queue.len() < self.cap {
-            queue.push_back(event);
-        } else if let Some(index) = queue.iter().position(droppable) {
+            queue.push_back(Queued { at: now, event });
+        } else if let Some(index) = queue.iter().position(|queued| droppable(&queued.event)) {
             // 满：挤掉**最旧**的一条移动腾位置。挤最旧（而不是最新）是为了让光标尽快追上
             // 用户当下的位置。
             queue.remove(index);
-            queue.push_back(event);
+            queue.push_back(Queued { at: now, event });
         } else if droppable(&event) {
             // 满、队列里一条移动都没有，来的也是可丢的移动：丢它，保留队列现状。
             return;
         } else {
             // 满、全是不可丢事件：为「抬起绝不丢」破例超界一条。现实中不该发生（队列只可能
             // 被鼠标移动填满），真发生了说明写侧长时间卡住，超界一条也好过丢一条抬起。
-            queue.push_back(event);
+            queue.push_back(Queued { at: now, event });
         }
         drop(queue);
         self.notify.notify_one();
     }
 
     /// 取走全部待发事件（保持入队顺序）。
+    ///
+    /// 生产路径已改用 [`Self::drain_with_oldest_age`]（需要诊断读数）；本方法保留给单测，
+    /// 避免测试为「不需要的等待时长」写样板。
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn drain(&self) -> Vec<InputEvent> {
-        self.lock().drain(..).collect()
+        self.lock().drain(..).map(|queued| queued.event).collect()
+    }
+
+    /// 取走全部待发事件，并给出**最老一条**在本地缓冲里等了多久（诊断用）。
+    ///
+    /// 空队列时等待时长为 `None`。等待时长只进延迟日志（见 [`crate::latency`] 的
+    /// `Stage::InputQueue`），不影响投递语义——与 [`Self::drain`] 完全同序、同内容。
+    #[must_use]
+    pub(crate) fn drain_with_oldest_age(&self) -> (Vec<InputEvent>, Option<Duration>) {
+        let mut queue = self.lock();
+        let oldest = queue.front().map(|queued| queued.at.elapsed());
+        (queue.drain(..).map(|queued| queued.event).collect(), oldest)
     }
 
     /// 是否有待发事件（`select!` 分支的启用条件）。
@@ -127,7 +153,7 @@ impl InputBuffer {
     }
 
     /// 取队列锁；中毒时恢复内部数据（本模块不 panic，中毒只可能来自外部）。
-    fn lock(&self) -> MutexGuard<'_, VecDeque<InputEvent>> {
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Queued>> {
         self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
