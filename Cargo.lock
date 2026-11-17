@@ -8458,6 +8458,7 @@ dependencies = [
  "image",
  "keyring",
  "muda 0.15.3",
+ "naga",
  "notify-rust",
  "raw-window-handle",
  "rust-tunnel-client",

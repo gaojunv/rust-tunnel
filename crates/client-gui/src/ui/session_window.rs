@@ -94,7 +94,7 @@ pub fn show(ctx: &egui::Context, view: &Arc<Mutex<RemoteView>>, manager: &Arc<Re
         // 初始尺寸只在远端首帧到达前反复重算，之后锁死——否则会每帧和用户拖拽抢窗口。
         if !v.size_initialized {
             let monitor = ctx.input(|i| i.viewport().monitor_size);
-            v.inner_size = v.desired_inner(monitor);
+            v.inner_size = v.desired_inner(monitor, ctx.pixels_per_point());
             if v.frame_dims().0 > 0 {
                 v.size_initialized = true;
             }
@@ -688,7 +688,8 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
             display_selector(ui, v, manager);
         });
         widgets::labeled_row(ui, "缩放", |ui| {
-            // 固定档忽略可用区域、溢出交给滚动区（见 `ViewScale`）。
+            // 固定档忽略可用区域、溢出交给滚动区（见 `ViewScale`）。比例是**远端像素 :
+            // 物理像素**：「100%」在任何 DPI 下都不会被放大（其余档位同理）。
             egui::ComboBox::from_id_salt("session_scale")
                 .selected_text(v.scale.label())
                 .show_ui(ui, |ui| {
@@ -696,6 +697,7 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
                         ui.selectable_value(&mut v.scale, scale, scale.label());
                     }
                 });
+            ui.label(RichText::new("按物理像素，100% = 不缩放").weak().small());
         });
         widgets::labeled_row(ui, "窗口尺寸", |ui| {
             let mut picked = v.window_size;
@@ -710,7 +712,7 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
                 // 改档即重算内尺寸并锁死（`size_initialized`），下一帧 `patch` 会下发。
                 v.window_size = picked;
                 let monitor = ui.ctx().input(|i| i.viewport().monitor_size);
-                v.inner_size = v.desired_inner(monitor);
+                v.inner_size = v.desired_inner(monitor, ui.ctx().pixels_per_point());
                 v.size_initialized = true;
             }
         });
@@ -836,14 +838,21 @@ fn scene(
     };
     let (width, height) = paint.size();
     let avail = ui.available_size();
-    let want = display_size(v.scale, avail, (width, height));
+    // 缩放比例以**物理像素**为基准（见 `view_scale` 的模块文档）：不传 DPI 的话，
+    // 150% 屏幕上「100%」会被画成 1.5 倍的双线性放大，「适应窗口」也会整体偏大。
+    let want = display_size(v.scale, avail, (width, height), ui.ctx().pixels_per_point());
     if v.scale == ViewScale::Fit {
-        paint_image(ui, v, manager, active, &paint, want);
+        // 「适应窗口」**不再放大**：远端比窗口小时按 1:1 物理像素居中绘制，多出来的
+        // 区域留白（放大只是双线性插值，没有任何新细节）。
+        let (_id, outer) = ui.allocate_space(avail);
+        let rect = egui::Rect::from_center_size(outer.center(), want.min(avail));
+        paint_image(ui, v, manager, active, &paint, rect);
     } else {
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                paint_image(ui, v, manager, active, &paint, want);
+                let (rect, _) = ui.allocate_exact_size(want, egui::Sense::click_and_drag());
+                paint_image(ui, v, manager, active, &paint, rect);
             });
     }
 }
@@ -859,11 +868,11 @@ fn paint_image(
     manager: &Arc<RemoteManager>,
     active: &ActiveSessionInfo,
     image: &FramePaint,
-    size: egui::Vec2,
+    rect: egui::Rect,
 ) {
-    // 仍然要占位分配这个区域（布局与可交互性不能变），但输入捕获不再依赖 `response`
-    // （见 `RemoteView::capture_input`：`hovered()` 会被 egui 的交互簿记影响）。
-    let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    // 绘制矩形对齐到物理像素网格：起点/尺寸是小数时，双线性采样的相位落在纹素之间，
+    // 整幅画面（尤其文字）会各向异性发虚。
+    let rect = snap_to_physical(rect, ui.ctx().pixels_per_point());
     match image {
         FramePaint::Texture { id, .. } => {
             ui.painter().image(
@@ -887,11 +896,49 @@ fn paint_image(
             ));
         }
     }
+    v.view_scale_permille = view_scale_permille(rect, image.size(), ui.ctx().pixels_per_point());
     // 只有「完全控制」模式捕获输入：仅观看 / 仅文件传输不该注入键鼠。
     if active.mode == RemoteMode::Control {
         // 坐标按所选显示器的尺寸映射（由 `capture_input` 内部取），与纹理是否缩放无关。
         v.capture_input(ui, manager, rect);
     }
+}
+
+/// 画面绘制比例（千分比）：1 个远端像素实际占多少物理像素 ×1000。
+///
+/// 1000 = 严格 1:1（无重采样）；大于 1000 是放大（双线性，必然发虚）；小于 1000 是缩小
+/// （欠采样，文字会闪）。统计角标显示它，用来区分「编码糊」与「显示缩放糊」。
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "比例有界（画面尺寸远小于 i64/f32 精度上限），且只用于显示"
+)]
+fn view_scale_permille(rect: egui::Rect, image: (u32, u32), pixels_per_point: f32) -> u32 {
+    let (width, _) = image;
+    if width == 0 {
+        return 0;
+    }
+    let ratio = rect.width() * pixels_per_point / width as f32;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return 0;
+    }
+    u32::try_from((f64::from(ratio) * 1000.0).round() as i64).unwrap_or(0)
+}
+
+/// 把绘制矩形对齐到**物理像素**网格（起点与尺寸都取整到 1 物理像素的整数倍）。
+///
+/// 远端画面是逐像素内容：只要采样点不在纹素中心、或缩放比不是整数，双线性插值就会把
+/// 每个像素和邻居混一次——文字边缘首先受害。egui 的几何量是逻辑点，在 125%/150% 这类
+/// 非整数 DPI 下几乎必然带小数，故在真正绘制前对齐一次。
+fn snap_to_physical(rect: egui::Rect, pixels_per_point: f32) -> egui::Rect {
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let min_px = (rect.min.to_vec2() * ppp).round();
+    let size_px = (rect.size() * ppp).round().max(egui::Vec2::splat(1.0));
+    egui::Rect::from_min_size((min_px / ppp).to_pos2(), size_px / ppp)
 }
 
 /// 统计角标（右上角悬浮）。简洁 / 详细两档，数据全部来自本端读数与被控端每秒上报的
@@ -1294,6 +1341,18 @@ fn local_grid(ui: &mut Ui, v: &RemoteView, active: &ActiveSessionInfo, state: &R
                     .as_ref()
                     .map_or(UNKNOWN.to_owned(), |(w, h, _)| format!("{w}×{h}")),
             );
+            ui.end_row();
+
+            // 画面绘制比例：1:1 时是「编码糊」还是「显示缩放糊」一眼可分（见 `view_scale`）。
+            stat_label(ui, "显示缩放");
+            ui.label(match v.view_scale_permille {
+                0 => UNKNOWN.to_owned(),
+                1000 => "100%（1:1 物理像素）".to_owned(),
+                permille if permille > 1000 => {
+                    format!("{:.0}%（放大，双线性会发虚）", f64::from(permille) / 10.0)
+                }
+                permille => format!("{:.0}%（缩小）", f64::from(permille) / 10.0),
+            });
             ui.end_row();
 
             stat_label(ui, "显示器");
@@ -1747,6 +1806,41 @@ mod tests {
     //! 无法在无头环境验证，只能由这些单测锁住判定规则。
 
     use super::*;
+
+    /// 像素对齐：起点与尺寸都落在整物理像素上（否则双线性采样相位落在纹素之间，字发虚）。
+    #[test]
+    fn snap_to_physical_rounds_both_origin_and_size() {
+        // 150% 屏幕：1 物理像素 = 2/3 逻辑点。
+        let rect = egui::Rect::from_min_size(egui::pos2(10.3, 4.9), egui::vec2(801.2, 601.7));
+        let snapped = snap_to_physical(rect, 1.5);
+        for value in [
+            snapped.min.x * 1.5,
+            snapped.min.y * 1.5,
+            snapped.width() * 1.5,
+            snapped.height() * 1.5,
+        ] {
+            assert!(
+                (value - value.round()).abs() < 1e-3,
+                "应落在整物理像素上：{value}"
+            );
+        }
+        // 非法 DPI 按 1.0 处理，不产生 NaN。
+        let fallback = snap_to_physical(rect, f32::NAN);
+        assert!(fallback.min.x.is_finite() && fallback.width().is_finite());
+    }
+
+    /// 绘制比例读数：1:1 物理像素恰好是 1000‰，放大/缩小分别落在两侧。
+    #[test]
+    fn view_scale_permille_reports_physical_ratio() {
+        // 1920 宽的远端画成 1920 物理像素（1280 逻辑点 @150%）= 1:1。
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 720.0));
+        assert_eq!(view_scale_permille(rect, (1920, 1080), 1.5), 1000);
+        // 画成一半大小。
+        let half = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 360.0));
+        assert_eq!(view_scale_permille(half, (1920, 1080), 1.5), 500);
+        // 未知尺寸 → 0（UI 显示「—」）。
+        assert_eq!(view_scale_permille(rect, (0, 0), 1.5), 0);
+    }
 
     /// 三条路径的标签**必须互不相同**。
     ///

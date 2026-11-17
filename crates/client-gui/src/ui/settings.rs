@@ -327,7 +327,12 @@ pub fn show_service_section(ui: &mut Ui, app_state: &Arc<AppState>, service: &mu
                     let auto_lock = app_state
                         .remote()
                         .is_some_and(|manager| manager.auto_lock_on_disconnect());
-                    HostSeed::from_config(&config, approval, auto_lock)
+                    // 原生分辨率是**被控端本机**偏好：装服务时原样带进 host.toml，否则
+                    // 用户在设置里关掉它、装完的实例却仍然编 4K（或反过来）。
+                    let native = app_state
+                        .remote()
+                        .is_some_and(|manager| manager.native_resolution());
+                    HostSeed::from_config(&config, approval, auto_lock, native)
                 });
             // `Absent` = 确定没装；其余（含 `Unknown`）按「已装」处理，多给几个按钮总比
             // 在查询偶发失败时把「卸载」藏起来强。

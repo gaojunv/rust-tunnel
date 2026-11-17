@@ -391,6 +391,13 @@ pub struct RateController {
     content_cap_kbps: Option<u32>,
     /// 内容驱动的帧率上限；语义同 [`Self::content_cap_kbps`]。
     content_cap_fps: Option<u8>,
+    /// 内容上限的**面积倍数**（千分比，1080p = 1000）。
+    ///
+    /// 面积上限的语义是「只改了一小块，别为整帧花光预算」。但同样的**比例**面积在更高
+    /// 分辨率上是更多像素：1080p 的 1.2 Mbps 到 4K 只剩四分之一的每像素比特，文字会被
+    /// 量化糊。所以按编码像素数把上限等比放大（由被控端在几何变化时设置，见
+    /// [`crate::controlled`] 的 `content_area_permille`）。
+    content_area_permille: u32,
 }
 
 impl RateController {
@@ -422,6 +429,7 @@ impl RateController {
             quiet_streak: 0,
             content_cap_kbps: None,
             content_cap_fps: None,
+            content_area_permille: 1000,
         }
     }
 
@@ -480,9 +488,37 @@ impl RateController {
             }
         }
 
+        self.recompute_content_caps();
+    }
+
+    /// 按当前活跃等级 + 编码面积重算内容上限（两处调用点共用，避免口径漂移）。
+    fn recompute_content_caps(&mut self) {
         let (cap_kbps, cap_fps) = self.params.activity_caps(self.activity);
-        self.content_cap_kbps = cap_kbps;
+        self.content_cap_kbps = cap_kbps
+            .map(|kbps| kbps.saturating_mul(self.content_area_permille) / 1000);
+        // 帧率上限与分辨率无关，不按面积放大。
         self.content_cap_fps = cap_fps;
+    }
+
+    /// 设置编码**面积倍数**（千分比，1080p = 1000），把内容上限等比放大到该分辨率。
+    ///
+    /// 被控端在编码几何确定/变化时调用（`scale` 降级也会改变尺寸）。取值钳到
+    /// `[1000, 4000]`：小于 1080p 不需要放宽，大于 4K 的桌面已不在支持范围。
+    /// 面积变化会立刻按当前活跃等级重算上限——几何变化本来就要重建编码器并插关键帧，
+    /// 不存在「只改上限」的时机问题。
+    pub fn set_content_area_permille(&mut self, permille: u32) {
+        let permille = permille.clamp(1000, 4000);
+        if self.content_area_permille == permille {
+            return;
+        }
+        self.content_area_permille = permille;
+        self.recompute_content_caps();
+    }
+
+    /// 当前面积倍数（千分比）。仅用于日志/断言。
+    #[must_use]
+    pub fn content_area_permille(&self) -> u32 {
+        self.content_area_permille
     }
 
     /// 变化面积 → 活跃等级。三档边界见 [`QosParams::ui_ratio_permille`] /
@@ -510,9 +546,7 @@ impl RateController {
         if observed > self.activity {
             self.activity = observed;
             self.quiet_streak = 0;
-            let (cap_kbps, cap_fps) = self.params.activity_caps(observed);
-            self.content_cap_kbps = cap_kbps;
-            self.content_cap_fps = cap_fps;
+            self.recompute_content_caps();
         }
     }
 
@@ -1460,6 +1494,37 @@ mod tests {
             6000,
             "关键帧必须用 AIMD 码率（不受面积上限钳制）"
         );
+    }
+
+    /// 内容上限按**编码面积**等比放大：同样的变化比例在 4K 上是 4 倍像素。
+    ///
+    /// 钉住三条：① 4K（4000‰）下 UI/Mixed 上限都 ×4；② 面积变小/越界时钳回 `[1000, 4000]`；
+    /// ③ 面积变化**立刻**按当前活跃等级重算（几何变化本来就要重建 + 关键帧）。
+    #[test]
+    fn content_caps_scale_with_encode_area() {
+        let mut c = activity_controller(); // Balanced：6000 kbps / 30 fps
+        prime(&mut c);
+        lo_activity_twice(&mut c);
+        assert_eq!(c.content_cap_kbps(), Some(1200), "1080p = 基准");
+
+        c.set_content_area_permille(4000); // 4K
+        assert_eq!(c.content_cap_kbps(), Some(4800), "4K 的 UI 上限应 ×4");
+        assert_eq!(c.content_cap_fps(), Some(60), "帧率上限不随面积放大");
+
+        c.observe_activity(100); // Mixed
+        assert_eq!(c.content_cap_kbps(), Some(10_000), "4K 的 Mixed 上限应 ×4");
+
+        // 越界钳制：小于 1080p 不放宽，大于 4K 不再放大。
+        c.set_content_area_permille(1);
+        assert_eq!(c.content_area_permille(), 1000);
+        c.set_content_area_permille(999_999);
+        assert_eq!(c.content_area_permille(), 4000);
+
+        // 回到 1080p 后上限也回落。
+        c.observe_activity(0);
+        c.observe_activity(0);
+        c.set_content_area_permille(1000);
+        assert_eq!(c.content_cap_kbps(), Some(1200));
     }
 
     /// 关键帧码率跟随 AIMD 的拥塞下调，且绝不越过档位上限。

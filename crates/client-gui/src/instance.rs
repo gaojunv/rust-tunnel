@@ -118,14 +118,16 @@ pub fn default_download_dir() -> PathBuf {
 /// `tls*` 字段），审批策略与「会话结束后自动锁屏」取同文件里的 `approval` / `auto_lock`
 /// 键（[`ClientConfigFile`] 不认识它们，故单独解析一次）。
 ///
-/// 返回 `(配置, 审批策略, 会话结束后自动锁屏)`。
+/// 返回 `(配置, 审批策略, 会话结束后自动锁屏, 是否允许原生分辨率编码)`。
 ///
 /// [`ClientConfigFile`]: rust_tunnel_client::config::ClientConfigFile
 ///
 /// # Errors
 ///
 /// 文件不存在（给出期望路径与「应由服务安装时创建」的说明）或字段不合法时返回 `Err`。
-pub fn load_host_config(path: &Path) -> anyhow::Result<(ClientConfig, ApprovalPolicy, bool)> {
+pub fn load_host_config(
+    path: &Path,
+) -> anyhow::Result<(ClientConfig, ApprovalPolicy, bool, bool)> {
     if !path.exists() {
         anyhow::bail!(
             "找不到实例配置 {}。\n\
@@ -161,6 +163,7 @@ pub fn load_host_config(path: &Path) -> anyhow::Result<(ClientConfig, ApprovalPo
         config,
         extras.approval.unwrap_or_default(),
         extras.auto_lock,
+        extras.native_resolution.unwrap_or(true),
     ))
 }
 
@@ -173,6 +176,14 @@ struct HostExtras {
     /// 会话结束后是否自动锁定屏幕；缺省 `false`。
     #[serde(default)]
     auto_lock: bool,
+    /// 是否允许**原生分辨率**（4K）编码；缺省 **`true`**。
+    ///
+    /// 以前实例硬编码 `false`（编码宽度固定 1920），4K 桌面在采集层就被缩到 1080p，
+    /// 文字细节在编码前就丢了——这是无人值守会话「字永远糊」的根因。现在与 GUI 一致
+    /// 默认开启：只有协商到硬件 H.264 且 `Default` 桌面（WGC/DXGI）时才真的编 4K，
+    /// BitBlt 帧仍按 1920 封顶。要回到旧行为写 `native_resolution = false` 即可。
+    #[serde(default)]
+    native_resolution: Option<bool>,
 }
 
 /// 从 `host.toml` 里单独解析 `approval` / `auto_lock`（解析失败按缺省处理并告警）。
@@ -304,7 +315,8 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
 
     // 配置读不出来时，日志还没起来（级别来自配置），而服务把本进程的 stderr 丢弃了——
     // 直接落文件，否则这条失败对任何人都不可见（见 `log_config_failure` 的文档）。
-    let (config, approval, auto_lock) = match load_host_config(&opts.config_path) {
+    let (config, approval, auto_lock, native_resolution) =
+        match load_host_config(&opts.config_path) {
         Ok(loaded) => loaded,
         Err(err) => {
             log_config_failure(&opts.config_path, &err);
@@ -319,11 +331,19 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         share = %opts.share_dir.display(),
         download = %opts.download_dir.display(),
         auto_lock,
+        native_resolution,
         "无头实例启动"
     );
 
     let exit = Arc::new(AtomicBool::new(false));
-    spawn_instance_runtime(config, approval, auto_lock, opts, Arc::clone(&exit));
+    spawn_instance_runtime(
+        config,
+        approval,
+        auto_lock,
+        native_resolution,
+        opts,
+        Arc::clone(&exit),
+    );
     // 主线程 park：等运行时线程给出退出信号（注册被拒 / Ctrl+C）。
     wait_for_exit(&exit);
     tracing::info!("无头实例退出");
@@ -335,6 +355,7 @@ pub(crate) fn spawn_instance_runtime(
     config: ClientConfig,
     approval: ApprovalPolicy,
     auto_lock: bool,
+    native_resolution: bool,
     opts: &InstanceOptions,
     exit: Arc<AtomicBool>,
 ) {
@@ -358,9 +379,10 @@ pub(crate) fn spawn_instance_runtime(
                     enabled: true,
                     approval_policy: approval,
                     auto_lock_on_disconnect: auto_lock,
-                    // 实例不做 4K（编码宽度保持 1920）：`Default` 桌面走 WGC/DXGI，
-                    // 安全桌面回退 GDI/BitBlt；两条路径都用这个上限。
-                    native_resolution: false,
+                    // 与 GUI 一致：允许原生分辨率（缺省开，`host.toml` 可关）。只有
+                    // `Default` 桌面（WGC/DXGI + 硬件 H.264）时引擎才真的编 4K；安全桌面
+                    // 的 BitBlt 帧由 `win_hybrid::clamp_bitblt_frame` 先缩到 1920。
+                    native_resolution,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

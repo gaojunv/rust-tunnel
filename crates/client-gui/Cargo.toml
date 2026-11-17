@@ -74,6 +74,13 @@ arboard = "3"
 #
 # 注意：以下 [target.*] 段落必须留在文件末尾。Cargo 的段落归属是就近向下的，
 # 在它们之后追加的任何依赖都会被 platform 门控，导致其他平台 E0433。
+
+[dev-dependencies]
+# 内联 WGSL 的**编译期**校验（`nv12_shader_is_valid_wgsl`）：wgpu 只在运行期建管线时
+# 才校验着色器，写错一个重载就是「一开会话就 panic」。naga 与 wgpu 同版本（24），
+# 只开 `wgsl-in`（wgpu 本来就会把它编进来，这里不增加实际构建成本）。
+naga = { version = "24", default-features = false, features = ["wgsl-in"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 

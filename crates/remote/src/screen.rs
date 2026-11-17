@@ -774,22 +774,50 @@ pub trait Clipboard: Send + Sync + 'static {
 
 /// 原生分辨率（硬件 H.264 4K）会话的绝对码率上限（kbps）。
 ///
-/// 档位码率翻倍后再封顶到这里：10 Mbps 对 4K 桌面文字明显偏低，翻倍后均衡/高清档
-/// 分别是 12 / 20 Mbps。**只约束被控端的编码上限**，QoS 闭环仍可在其下下调。
-pub const NATIVE_MAX_BITRATE_KBPS: u32 = 30_000;
+/// 档位码率按像素数放大后再封顶到这里：4K 是 1080p 的 4 倍像素，同档位的「每像素比特」
+/// 需要 4 倍码率才对等。放大后均衡/高清档分别是 24 / 40 Mbps。**只约束被控端的编码
+/// 上限**，QoS 闭环仍可在其下下调（内容上限也按面积同步放大）。
+pub const NATIVE_MAX_BITRATE_KBPS: u32 = 60_000;
 
-/// 原生分辨率会话把档位码率上限**翻倍**（封顶 [`NATIVE_MAX_BITRATE_KBPS`]），帧率不变。
+/// 原生分辨率相对 1080p 的码率倍数上限（像素数之比：4K = 1080p 的 4 倍）。
+pub const NATIVE_BITRATE_FACTOR: u32 = 4;
+
+/// 1080p 的像素数：码率按面积放大的基准。
+pub const FULLHD_PIXELS: u64 = 1920 * 1080;
+
+/// 显示器像素数 → 码率倍数（千分比，钳在 `[1000, 4000]`）。
 ///
-/// 只有 `native_resolution == true` **且**协商到硬件 H.264 时才会用到；VP9 与默认
-/// 1920 宽会话原样返回档位值。
+/// 1080p 显示器的会话拿不到任何放大（原生与否都没有额外像素）；2.5K 约 1778‰；
+/// 4K 及以上封顶 4000‰。用**实际显示器**而不是「开关是否打开」算，避免 1080p
+/// 显示器在开了原生开关后凭空拿到 4 倍码率上限。
 #[must_use]
-pub const fn native_bitrate_ceiling(preset_kbps: u32) -> u32 {
-    let doubled = preset_kbps.saturating_mul(2);
-    if doubled > NATIVE_MAX_BITRATE_KBPS {
+pub fn bitrate_permille_for_pixels(pixels: u64) -> u32 {
+    let permille = pixels.saturating_mul(1000) / FULLHD_PIXELS;
+    let permille = permille.clamp(1000, u64::from(NATIVE_BITRATE_FACTOR) * 1000);
+    u32::try_from(permille).unwrap_or(1000)
+}
+
+/// 按面积倍数放大档位码率上限，并封顶到 [`NATIVE_MAX_BITRATE_KBPS`]。
+///
+/// `permille == 1000` = 原样返回（1080p / 非原生会话）。
+#[must_use]
+pub const fn scale_bitrate(preset_kbps: u32, permille: u32) -> u32 {
+    let scaled = preset_kbps.saturating_mul(permille) / 1000;
+    if scaled > NATIVE_MAX_BITRATE_KBPS {
         NATIVE_MAX_BITRATE_KBPS
     } else {
-        doubled
+        scaled
     }
+}
+
+/// 原生分辨率会话把档位码率上限按**最大**像素倍数放大（封顶
+/// [`NATIVE_MAX_BITRATE_KBPS`]），帧率不变。
+///
+/// 只有 `native_resolution == true` **且**协商到硬件 H.264 时才会用到；真正下发时
+/// 用 [`bitrate_permille_for_pixels`] 按当前显示器算，1080p 显示器不会拿到 4 倍。
+#[must_use]
+pub const fn native_bitrate_ceiling(preset_kbps: u32) -> u32 {
+    scale_bitrate(preset_kbps, NATIVE_BITRATE_FACTOR * 1000)
 }
 
 /// 屏幕编码参数——自阶段 3 起是**档位上限**。
@@ -957,24 +985,36 @@ impl FrameSink for NullFrameSink {
 mod tests {
     use super::*;
 
-    /// 原生分辨率（硬件 H.264 4K）的码率规则：档位翻倍，封顶 30 Mbps，帧率不动。
+    /// 原生分辨率的码率规则：档位按像素数放大（4×），封顶 60 Mbps，帧率不动。
     ///
-    /// 钉住两条：① 默认三档翻倍后仍在封顶之下（2000→4000 / 6000→12000 / 10000→20000）；
+    /// 钉住两条：① 默认三档放大后仍在封顶之下（2000→8000 / 6000→24000 / 10000→40000）；
     /// ② 任何输入都不越过 [`NATIVE_MAX_BITRATE_KBPS`]（饱和乘法 + 封顶，不溢出）。
     #[test]
-    fn native_bitrate_ceiling_doubles_and_caps() {
-        assert_eq!(native_bitrate_ceiling(2000), 4000);
-        assert_eq!(native_bitrate_ceiling(6000), 12_000);
-        assert_eq!(native_bitrate_ceiling(10_000), 20_000);
+    fn native_bitrate_ceiling_scales_with_pixels_and_caps() {
+        assert_eq!(native_bitrate_ceiling(2000), 8000);
+        assert_eq!(native_bitrate_ceiling(6000), 24_000);
+        assert_eq!(native_bitrate_ceiling(10_000), 40_000);
         assert_eq!(native_bitrate_ceiling(20_000), NATIVE_MAX_BITRATE_KBPS);
         assert_eq!(native_bitrate_ceiling(u32::MAX), NATIVE_MAX_BITRATE_KBPS);
-        // 帧率与分辨率无关：档位原样给出（这里用现有档位钉住「只翻码率」）。
+        // 4K 是 1080p 的 4 倍像素：每像素比特与会话的档位标定一致。
+        assert_eq!(NATIVE_BITRATE_FACTOR, 4);
+        // 按显示器像素数算的倍数：1080p 不放大、2.5K 约 1.78×、4K 封顶 4×。
+        assert_eq!(bitrate_permille_for_pixels(FULLHD_PIXELS), 1000);
+        assert_eq!(bitrate_permille_for_pixels(2560 * 1440), 1777);
+        assert_eq!(bitrate_permille_for_pixels(3840 * 2160), 4000);
+        assert_eq!(bitrate_permille_for_pixels(5120 * 2880), 4000);
+        assert_eq!(bitrate_permille_for_pixels(800 * 600), 1000);
+        // `scale_bitrate(1000‰)` 是原样（非原生会话不受影响）。
+        assert_eq!(scale_bitrate(6000, 1000), 6000);
+        assert_eq!(scale_bitrate(6000, 1777), 10_662);
+        assert_eq!(scale_bitrate(u32::MAX, 4000), NATIVE_MAX_BITRATE_KBPS);
+        // 帧率与分辨率无关：档位原样给出（这里用现有档位钉住「只放大码率」）。
         for preset in QualityPreset::all() {
-            let doubled = native_bitrate_ceiling(preset.options().target_bitrate_kbps);
+            let scaled = native_bitrate_ceiling(preset.options().target_bitrate_kbps);
             assert_eq!(
-                doubled,
-                preset.options().target_bitrate_kbps * 2,
-                "{} 档应恰好翻倍",
+                scaled,
+                preset.options().target_bitrate_kbps * NATIVE_BITRATE_FACTOR,
+                "{} 档应按像素数放大",
                 preset.label()
             );
         }

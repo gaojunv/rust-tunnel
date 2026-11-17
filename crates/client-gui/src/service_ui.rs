@@ -117,6 +117,12 @@ impl ServiceOp {
 /// `host.toml` 的 `auto_lock` 键，由实例在**会话收尾**时执行；实例模式下锁屏后仍可由服务
 /// 实例继续承载身份并接受下一次接入（GUI 模式则通常失去画面，见根 `CLAUDE.md`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+// 这些布尔字段一一对应 `host.toml` 的键（TLS / 跳过校验 / 自动锁屏 / 原生分辨率），
+// 拆成状态机会让「写文件时逐键对账」变得难读。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "字段与 host.toml 的键一一对应，按配置文件形状建模"
+)]
 pub struct HostSeed {
     /// 服务端地址（`host:port`）。
     server: String,
@@ -136,6 +142,9 @@ pub struct HostSeed {
     approval: ApprovalPolicy,
     /// 会话结束后是否自动锁定屏幕。
     auto_lock: bool,
+    /// 是否允许原生分辨率（4K）编码。**不写进 host.toml 时缺省也是 true**；这里落盘是为了
+    /// 让「GUI 里的选择」原样带到服务实例（用户在设置里关掉，装完的实例也不该偷偷开着）。
+    native_resolution: bool,
 }
 
 impl HostSeed {
@@ -145,6 +154,7 @@ impl HostSeed {
         config: &rust_tunnel_client::ClientConfig,
         approval: ApprovalPolicy,
         auto_lock: bool,
+        native_resolution: bool,
     ) -> Self {
         Self {
             server: config.server.clone(),
@@ -156,6 +166,7 @@ impl HostSeed {
             log: config.log.clone(),
             approval,
             auto_lock,
+            native_resolution,
         }
     }
 
@@ -175,6 +186,11 @@ impl HostSeed {
     /// 序列化失败时返回一句给用户看的说明（正常不会发生）。
     pub fn to_toml(&self) -> Result<String, String> {
         #[derive(serde::Serialize)]
+        // 与 `HostSeed` 同口径：字段就是 host.toml 的键。
+        #[expect(
+            clippy::struct_excessive_bools,
+            reason = "字段与 host.toml 的键一一对应，按配置文件形状建模"
+        )]
         struct File<'a> {
             server: &'a str,
             password: &'a str,
@@ -187,6 +203,7 @@ impl HostSeed {
             log: &'a str,
             approval: ApprovalPolicy,
             auto_lock: bool,
+            native_resolution: bool,
         }
         let file = File {
             server: &self.server,
@@ -198,6 +215,7 @@ impl HostSeed {
             log: &self.log,
             approval: self.approval,
             auto_lock: self.auto_lock,
+            native_resolution: self.native_resolution,
         };
         toml::to_string(&file).map_err(|err| format!("生成 host.toml 失败：{err}"))
     }
@@ -787,7 +805,7 @@ mod tests {
             ..Default::default()
         };
 
-        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto, true);
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Auto, true, true);
         assert_eq!(seed.approval(), ApprovalPolicy::Auto);
         let text = seed.to_toml().unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -804,6 +822,11 @@ mod tests {
             Some(true),
             "会话结束自动锁屏应写进 host.toml"
         );
+        assert_eq!(
+            parsed["native_resolution"].as_bool(),
+            Some(true),
+            "原生分辨率偏好应原样写进 host.toml（实例据此决定编码宽度）"
+        );
         // 没有 SNI 时不该写一个空字符串键（实例侧会把它当成真的 SNI）。
         assert!(parsed.get("tls_server_name").is_none());
     }
@@ -817,7 +840,7 @@ mod tests {
             password: "token".to_owned(),
             ..Default::default()
         };
-        let seed = HostSeed::from_config(&config, ApprovalPolicy::Confirm, false);
+        let seed = HostSeed::from_config(&config, ApprovalPolicy::Confirm, false, false);
         let path = write_temp_host_toml(&seed).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("server = \"127.0.0.1:8080\""), "{text}");

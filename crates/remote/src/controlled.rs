@@ -97,8 +97,9 @@ use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
-    native_bitrate_ceiling, CaptureInfo, CapturedPatches, Clipboard, CursorShape, DisplayInfo,
-    EncodeOptions, EncodeRates, EncoderInfo, InputSink, RawFrame, ScreenPatch, ScreenSource,
+    bitrate_permille_for_pixels, scale_bitrate, CaptureInfo, CapturedPatches, Clipboard,
+    CursorShape, DisplayInfo, EncodeOptions, EncodeRates, EncoderInfo, InputSink, RawFrame,
+    ScreenPatch, ScreenSource, NATIVE_BITRATE_FACTOR,
 };
 use crate::session::{
     trusted_rtt, CodecId, HostActivity, HostStats, RegionRect, SessionCodec, SessionEnd, SessionFrame,
@@ -845,6 +846,22 @@ fn encode_target_dims(
     encode_dimensions(capped_width, capped_height, scale, max_width)
 }
 
+/// 1080p 的像素数：内容上限的面积基准（见 [`content_area_permille`]）。
+const CONTENT_CAP_BASE_PIXELS: u64 = 1920 * 1080;
+
+/// 编码面积相对 1080p 的倍数（千分比：1080p = 1000，4K = 4000）。
+///
+/// 内容上限（UI 1.2 Mbps / Mixed 2.5 Mbps）是在 1080p 上标定的。同一个**比例**的变化
+/// 面积在 4K 上是四倍像素，按绝对码率收紧会让每像素比特掉到四分之一，文字就被量化糊
+/// （见 [`crate::qos::RateController::set_content_area_permille`]）。这里用
+/// **实际编码尺寸**（与视频路径同一套计算）算倍数，交给闭环等比放大。
+#[must_use]
+fn content_area_permille(frame_width: u32, frame_height: u32, scale: f32, max_width: u32) -> u32 {
+    let (width, height) = encode_dimensions(frame_width, frame_height, scale, max_width);
+    let pixels = u64::from(width) * u64::from(height);
+    u32::try_from(pixels.saturating_mul(1000) / CONTENT_CAP_BASE_PIXELS).unwrap_or(u32::MAX)
+}
+
 /// 本会话的有效编码宽度上限（像素）。
 ///
 /// **只有硬件 H.264 + 用户显式开启原生分辨率**才放宽到
@@ -859,16 +876,29 @@ fn effective_max_encode_width(codec: CodecId, native_resolution: bool) -> u32 {
     }
 }
 
-/// 原生分辨率会话把档位码率上限翻倍（帧率、缩放不动），见 [`native_bitrate_ceiling`]。
-fn session_encode_options(options: EncodeOptions, native_active: bool) -> EncodeOptions {
-    if native_active {
+/// 原生分辨率会话按**显示器面积**放大档位码率上限（帧率、缩放不动）。
+///
+/// `permille` 来自 [`bitrate_permille_for_pixels`]：1080p 显示器是 1000（原样），
+/// 4K 是 4000。用实际像素算而不是「开关是否打开」，避免 1080p 显示器凭空拿到 4 倍。
+fn session_encode_options(options: EncodeOptions, permille: u32) -> EncodeOptions {
+    if permille > 1000 {
         EncodeOptions {
-            target_bitrate_kbps: native_bitrate_ceiling(options.target_bitrate_kbps),
+            target_bitrate_kbps: scale_bitrate(options.target_bitrate_kbps, permille),
             ..options
         }
     } else {
         options
     }
+}
+
+/// 某台显示器在原生分辨率会话里的码率倍数（千分比）；非原生会话恒 1000。
+fn native_bitrate_permille(display: Option<&DisplayInfo>, native_active: bool) -> u32 {
+    if !native_active {
+        return 1000;
+    }
+    display.map_or(NATIVE_BITRATE_FACTOR * 1000, |display| {
+        bitrate_permille_for_pixels(u64::from(display.width) * u64::from(display.height))
+    })
 }
 
 /// 把逐帧变化面积喂给内容上限，并在帧率变化时立刻重排采集节拍。
@@ -1208,7 +1238,7 @@ pub struct ControlledConfig {
     ///
     /// 仅在协商到**硬件 H.264** 时生效：编码宽度上限从 [`MAX_ENCODE_WIDTH`]（1920）
     /// 放宽到 [`NATIVE_MAX_ENCODE_WIDTH`]（3840），档位码率经
-    /// [`crate::screen::native_bitrate_ceiling`] 翻倍（封顶 30 Mbps）；VP9 路径不受影响。
+    /// [`crate::screen::native_bitrate_ceiling`] 按显示器面积放大（封顶 60 Mbps）；VP9 路径不受影响。
     /// 这一项只在**会话开始**时读取，运行中改它只影响下一次会话。
     pub native_resolution: bool,
     /// 在途采集的看门狗时限（见 [`CAPTURE_WATCHDOG`]）。
@@ -1656,18 +1686,19 @@ pub async fn run_controlled(
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
     //
-    // 原生分辨率会话把上限**翻倍**（封顶 30 Mbps）：4K 桌面文字在 10 Mbps 下明显不够。
-    // 只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
-    let mut rate = RateController::new(session_encode_options(config.encode, native_active));
+    // 原生分辨率会话按**显示器面积**放大上限（4K = 4×，封顶 60 Mbps）：4K 桌面文字在
+    // 10 Mbps 下明显不够。只改上限——QoS 仍可在其下下调，且不触碰帧率/缩放。
+    // 用实际显示器像素而非开关状态：1080p 显示器拿不到任何放大。
+    let initial_display = displays.iter().find(|d| d.primary).or_else(|| displays.first());
+    let mut rate = RateController::new(session_encode_options(
+        config.encode,
+        native_bitrate_permille(initial_display, native_active),
+    ));
     let mut encode = rate.current();
     // pacing 按**链路**码率（AIMD）摊开：内容上限压的是「这一帧值多少比特」，不是链路速率
     // （见 [`RateController::keyframe_bitrate_kbps`]）。
     queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
-    let mut display_id = displays
-        .iter()
-        .find(|d| d.primary)
-        .or_else(|| displays.first())
-        .map_or(0, |d| d.id);
+    let mut display_id = initial_display.map_or(0, |d| d.id);
 
     // 3) 主循环。
     // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**，会话一建立就发
@@ -1981,6 +2012,16 @@ pub async fn run_controlled(
                                         force_encode = true;
                                         base_frame_sent.store(false, Ordering::Relaxed);
                                     }
+                                    // 内容上限按**编码像素数**等比放大：1080p 的 1.2 Mbps 在 4K
+                                    // 上只有四分之一的每像素比特，文字会被量化糊（见 `qos` 的
+                                    // `set_content_area_permille`）。几何变化本来就要重建 + 关键帧，
+                                    // 所以这里每帧设置一次没有额外代价（内部按值去重）。
+                                    rate.set_content_area_permille(content_area_permille(
+                                        frame.width,
+                                        frame.height,
+                                        encode.scale,
+                                        max_encode_width,
+                                    ));
                                     let job = EncodeJob {
                                         display: display_id,
                                         rates: encode,
@@ -2484,10 +2525,13 @@ pub async fn run_controlled(
                         }
                         SessionMessage::SetQuality { preset } => {
                             // 档位是**上限**：换上限并把闭环重置到新上限（用户显式意图，不带降级历史）。
-                            // 原生分辨率会话同样翻倍（见 `session_encode_options`）。
+                            // 原生分辨率会话按**当前显示器面积**放大（见 `session_encode_options`）。
                             rate.set_ceiling(session_encode_options(
                                 preset.options(),
-                                native_active,
+                                native_bitrate_permille(
+                                    displays.iter().find(|d| d.id == display_id),
+                                    native_active,
+                                ),
                             ));
                             // 用户显式选的帧率优先级高于档位默认值：换画质不应把它覆盖回去。
                             if let Some(fps) = selected_fps {
@@ -6290,25 +6334,59 @@ mod tests {
         assert_eq!(NATIVE_MAX_ENCODE_WIDTH, 3840);
     }
 
-    /// 原生分辨率只翻**码率上限**：帧率/缩放原样，封顶 30 Mbps。
+    /// 原生分辨率只按**显示器面积**放大码率上限：帧率/缩放原样，封顶 60 Mbps。
     #[test]
-    fn native_resolution_doubles_only_the_bitrate_ceiling() {
+    fn native_resolution_scales_only_the_bitrate_ceiling() {
         let hd = EncodeOptions::default();
-        let native = session_encode_options(hd, true);
-        assert_eq!(native.target_bitrate_kbps, hd.target_bitrate_kbps * 2);
-        assert_eq!(native.max_fps, hd.max_fps, "帧率不动");
-        assert!((native.scale - hd.scale).abs() < f32::EPSILON, "缩放不动");
-        // 非原生：逐字段原样（不悄悄改上限）。
-        assert_eq!(session_encode_options(hd, false), hd);
-        // 各档位都翻倍且不越过封顶。
+        // 4K 显示器：4 倍。
+        let four_k = session_encode_options(hd, 4000);
+        assert_eq!(
+            four_k.target_bitrate_kbps,
+            hd.target_bitrate_kbps * crate::screen::NATIVE_BITRATE_FACTOR
+        );
+        assert_eq!(four_k.max_fps, hd.max_fps, "帧率不动");
+        assert!((four_k.scale - hd.scale).abs() < f32::EPSILON, "缩放不动");
+        // 1080p 显示器（1000‰）：逐字段原样（开了原生开关也不凭空加码率）。
+        assert_eq!(session_encode_options(hd, 1000), hd);
+        // 2.5K：按像素数 1.78 倍。
+        let qhd = session_encode_options(hd, 1777);
+        assert_eq!(qhd.target_bitrate_kbps, 6000 * 1777 / 1000);
+        // 各档位放大后都不越过封顶。
         for preset in crate::screen::QualityPreset::all() {
-            let doubled = session_encode_options(preset.options(), true);
+            let scaled = session_encode_options(preset.options(), 4000);
             assert_eq!(
-                doubled.target_bitrate_kbps,
-                preset.options().target_bitrate_kbps * 2
+                scaled.target_bitrate_kbps,
+                preset.options().target_bitrate_kbps * crate::screen::NATIVE_BITRATE_FACTOR
             );
-            assert!(doubled.target_bitrate_kbps <= crate::screen::NATIVE_MAX_BITRATE_KBPS);
+            assert!(scaled.target_bitrate_kbps <= crate::screen::NATIVE_MAX_BITRATE_KBPS);
         }
+        // 非原生（`native_active == false`）恒 1000。
+        assert_eq!(native_bitrate_permille(None, false), 1000);
+    }
+
+    /// 内容上限的面积倍数：1080p = 1000‰，4K = 4000‰，与编码尺寸同口径。
+    #[test]
+    fn content_area_permille_follows_encode_dimensions() {
+        // 1080p 源、不缩放。
+        assert_eq!(
+            content_area_permille(1920, 1080, 1.0, MAX_ENCODE_WIDTH),
+            1000
+        );
+        // 4K 源在原生上限下不缩放。
+        assert_eq!(
+            content_area_permille(3840, 2160, 1.0, NATIVE_MAX_ENCODE_WIDTH),
+            4000
+        );
+        // 4K 源被默认 1920 上限封顶 → 仍是 1080p 的面积。
+        assert_eq!(
+            content_area_permille(3840, 2160, 1.0, MAX_ENCODE_WIDTH),
+            1000
+        );
+        // QoS 降分辨率后面积按比例下降，但 setter 会钳到 ≥1000。
+        assert_eq!(
+            content_area_permille(3840, 2160, 0.75, NATIVE_MAX_ENCODE_WIDTH),
+            2250
+        );
     }
 
     /// 顺序不变量：基准帧**真正写出**后才进入补丁模式；等不到就放弃并清零计数。
