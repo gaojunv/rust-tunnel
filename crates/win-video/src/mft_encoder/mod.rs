@@ -55,7 +55,7 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
     CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
-    CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncVideoMaxQP,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMaxFrameRate,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoOutputFrameRate, ICodecAPI, IMFActivate,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformHaveOutput,
@@ -1074,6 +1074,20 @@ fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) {
         if let Err(err) = set_codec_u32(codec, key, value) {
             tracing::debug!(%err, "编码器拒绝默认参数，按 MFT 默认值继续");
         }
+    }
+    // **QP 上限（画质地板）**：与 NVENC 路径同一套思路——按质量下限编码，码率当预算。
+    // 只给「最多多少 Mbps」时，码率控制会把预算摊到整幅画面，文字被平均掉；设 QP 上限
+    // 后编码器必须为文字掏更多比特（仍受 `AVEncCommonBufferSize` 的单帧上限约束）。
+    // 硬件 MFT 的 QP 属性支持度不一：`IsSupported` 不通过时静默跳过，质量下限退化为
+    // `AVEncCommonQuality` 的通用提示。
+    let max_qp = crate::max_qp();
+    // SAFETY: `codec` 有效；`IsSupported` 只查询能力。
+    if unsafe { codec.IsSupported(&CODECAPI_AVEncVideoMaxQP) }.is_ok() {
+        if let Err(err) = set_codec_u32(codec, &CODECAPI_AVEncVideoMaxQP, max_qp) {
+            tracing::debug!(%err, max_qp, "编码器拒绝 QP 上限，按 MFT 默认值继续");
+        }
+    } else {
+        tracing::debug!("编码器不支持 AVEncVideoMaxQP，画质下限仅靠 AVEncCommonQuality");
     }
 }
 
