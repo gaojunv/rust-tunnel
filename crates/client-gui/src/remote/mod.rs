@@ -2127,10 +2127,9 @@ impl RemoteView {
                     {
                         tracing::info!(
                             target: "latency",
-                            side = "present",
-                            frames = frame_count,
-                            present_us,
-                            "上屏阶段延迟"
+                            "present frames={} present_us={}",
+                            frame_count,
+                            present_us
                         );
                     }
                     if self.present_window_at.elapsed() >= Duration::from_secs(1) {
@@ -2140,9 +2139,8 @@ impl RemoteView {
                         if !summary.is_empty() {
                             tracing::info!(
                                 target: "latency",
-                                side = "present",
-                                %summary,
-                                "上屏每秒阶段延迟"
+                                "present_summary {}",
+                                summary
                             );
                         }
                     }

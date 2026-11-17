@@ -1963,13 +1963,14 @@ pub async fn run_controlled(
                 // 慢」用的拆解（info 级、默认完全静默）。窗口由主循环/编码任务/写任务共写。
                 if latency::enabled() {
                     if let Some(summary) = latency::take_summary(&latency_window) {
+                        // 全部信息塞进 message：GUI 的日志面板 / 服务端日志只保留 `message`
+                        // 字段（结构化字段会被丢掉），文件与 stdout 则两种都完整。
                         info!(
                             target: "latency",
-                            side = "controlled",
-                            fps = host.fps,
-                            patches = host.patch_mode,
-                            %summary,
-                            "被控端每秒阶段延迟"
+                            "controlled fps={} patches={} {}",
+                            host.fps,
+                            host.patch_mode,
+                            summary
                         );
                     }
                 }
@@ -3052,14 +3053,13 @@ pub(crate) async fn writer_loop(
                             {
                                 info!(
                                     target: "latency",
-                                    side = "controlled_wire",
+                                    "controlled_wire seq={} bytes={} idr={} send_q_us={} write_us={} capture_to_write_done_us={}",
                                     seq,
                                     bytes,
-                                    idr = keyframe,
+                                    keyframe,
                                     send_q_us,
-                                    write_us = done_us.saturating_sub(dequeued_us),
-                                    capture_to_write_done_us,
-                                    "写出阶段延迟"
+                                    done_us.saturating_sub(dequeued_us),
+                                    capture_to_write_done_us
                                 );
                             }
                         }
@@ -3997,19 +3997,18 @@ async fn encode_loop(
                     if latency::frame_logs() || total_us > latency::slow_threshold_us() {
                         info!(
                             target: "latency",
-                            side = "controlled",
+                            "controlled seq={} idr={} bytes={} changed_permille={} cap_wait_us={:?} cap_us={} enc_q_us={} enc_us={} out_q_us={} input_to_cap_us={:?} input_to_change_us={:?}",
                             seq,
-                            idr = keyframe,
-                            bytes = payload_bytes,
+                            keyframe,
+                            payload_bytes,
                             changed_permille,
-                            cap_wait_us = ?capture_wait_us,
-                            cap_us = capture_us,
+                            capture_wait_us,
+                            capture_us,
                             enc_q_us,
-                            enc_us = encode_micros,
+                            encode_micros,
                             out_q_us,
-                            input_to_cap_us = ?input_to_capture_us,
-                            input_to_change_us = ?input_to_change_us,
-                            "帧阶段延迟"
+                            input_to_capture_us,
+                            input_to_change_us
                         );
                     }
                 }

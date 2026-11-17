@@ -593,14 +593,14 @@ pub(crate) async fn run_controller_with_input(
                 // 与上面的 `SessionStats::Decode` 分开：那条是 UI 角标读数，这条是逐段拆解。
                 if latency::enabled() {
                     if let Some(summary) = latency::take_summary(&decode_shared.latency) {
+                        // 全部信息塞进 message：GUI 日志面板 / 服务端日志只保留 `message` 字段。
                         info!(
                             target: "latency",
-                            side = "controller",
-                            packets = window_packets,
-                            dropped = window_dropped,
-                            rtt_ms = last_rtt_ms.unwrap_or(0),
-                            %summary,
-                            "控制端每秒阶段延迟"
+                            "controller packets={} dropped={} rtt_ms={} {}",
+                            window_packets,
+                            window_dropped,
+                            last_rtt_ms.unwrap_or(0),
+                            summary
                         );
                     }
                 }
@@ -1497,12 +1497,11 @@ async fn decode_loop(
                         if latency::frame_logs() || e2e_micros > latency::slow_threshold_us() {
                             info!(
                                 target: "latency",
-                                side = "controller_patch",
-                                bytes = patch_bytes,
+                                "controller_patch bytes={} recv_q_us={} capture_to_recv_ms={} e2e_ms={}",
+                                patch_bytes,
                                 recv_q_us,
-                                capture_to_recv_ms = elapsed_ms(recv_us, offset, capture_ts_us),
-                                e2e_ms,
-                                "补丁阶段延迟"
+                                elapsed_ms(recv_us, offset, capture_ts_us),
+                                e2e_ms
                             );
                         }
                     }
@@ -1728,16 +1727,15 @@ async fn decode_loop(
                     if latency::frame_logs() || e2e_micros > latency::slow_threshold_us() {
                         info!(
                             target: "latency",
-                            side = "controller",
+                            "controller seq={} idr={} bytes={} recv_q_us={} dec_us={} capture_to_recv_ms={} e2e_ms={} backlog={}",
                             seq,
-                            idr = flags & VIDEO_FLAG_KEYFRAME != 0,
-                            bytes = packet_bytes,
+                            flags & VIDEO_FLAG_KEYFRAME != 0,
+                            packet_bytes,
                             recv_q_us,
-                            dec_us = decode_micros,
-                            capture_to_recv_ms = elapsed_ms(recv_us, offset, capture_ts_us),
+                            decode_micros,
+                            elapsed_ms(recv_us, offset, capture_ts_us),
                             e2e_ms,
-                            backlog = u32::try_from(rx.len()).unwrap_or(u32::MAX),
-                            "帧阶段延迟"
+                            u32::try_from(rx.len()).unwrap_or(u32::MAX)
                         );
                     }
                 }
