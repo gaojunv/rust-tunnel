@@ -162,13 +162,19 @@ pub struct GuiPrefs {
     /// 档位是**上限**，实际码率/帧率仍由 QoS 闭环在上限之下浮动。会话建立时自动下发一次。
     #[serde(default)]
     pub remote_quality: QualityPreset,
-    /// 被控端是否使用**原生分辨率**（4K）编码。**默认关闭**。
+    /// 被控端是否使用**原生分辨率**（不缩放到 1920 宽）编码。**默认开启**。
     ///
-    /// 只在协商到**硬件 H.264** 时生效：编码宽度上限从 1920 放宽到 3840，档位码率翻倍
-    /// （封顶 30 Mbps）。代价是控制器的解码/上屏压力随像素线性增长；VP9 路径不受影响。
-    /// 运行中修改只对下一次会话生效。
-    #[serde(default)]
+    /// 只在协商到**硬件 H.264** 时生效：编码宽度上限从 1920 放宽到 3840（显示宽度 ≤1920
+    /// 时不产生任何变化），档位码率翻倍（封顶 30 Mbps）。代价是控制器的解码/上屏压力与
+    /// 上行峰值随像素增长——但 4K 桌面缩到 1920 再上屏，任何码率都换不回文字细节，这是
+    /// 现场「字看不清」的直接原因。VP9 路径不受影响。运行中修改只对下一次会话生效。
+    ///
+    /// 旧配置由 [`migrate_native_resolution`] 一次性改为开启。
+    #[serde(default = "default_true")]
     pub remote_native_resolution: bool,
+    /// [`GuiPrefs::remote_native_resolution`] 的默认值迁移标记（只跑一次）。
+    #[serde(default)]
+    pub remote_native_resolution_migrated: bool,
     /// 自动检查客户端更新。**默认开启**：服务端在注册时也会主动推送一次，此项控制的是
     /// 长连接期间的 6 小时轮询。关掉后仍可在设置页手动检查。
     #[serde(default = "default_true")]
@@ -202,7 +208,9 @@ impl Default for GuiPrefs {
             remote_stats_detail: false,
             remote_frame_rate: default_remote_frame_rate(),
             remote_quality: QualityPreset::default(),
-            remote_native_resolution: false,
+            // 与字段上的 `#[serde(default = "default_true")]` 保持一致（理由见那里）。
+            remote_native_resolution: true,
+            remote_native_resolution_migrated: false,
             update_auto_check: true,
             update_skipped_version: None,
         }
@@ -237,6 +245,25 @@ pub fn migrate_toolbar_autohide(prefs: &mut GuiPrefs) -> bool {
     true
 }
 
+/// 一次性迁移：把 `remote_native_resolution` 的旧默认 `false` 改为 `true`。
+///
+/// **为什么可以改写用户的配置**：旧默认是「不缩放的代价（解码/上行）由用户显式承担」，
+/// 结果是 4K 桌面被缩到 1920 再上屏——文字细节在编码前就丢了，任何码率都救不回来。
+/// 磁盘上的 `false` 几乎只可能是旧默认值（这个开关藏在一级设置页，且说明写着「仅 4K 屏」）。
+/// 迁移后用户仍可在设置页关掉。
+///
+/// 由 `remote_native_resolution_migrated` 保证只跑一次。纯函数、无 I/O，便于单测。
+/// 返回是否发生改动，由调用方决定是否落盘。
+#[must_use]
+pub fn migrate_native_resolution(prefs: &mut GuiPrefs) -> bool {
+    if prefs.remote_native_resolution_migrated {
+        return false;
+    }
+    prefs.remote_native_resolution_migrated = true;
+    prefs.remote_native_resolution = true;
+    true
+}
+
 /// 加载 GUI 偏好；文件缺失/读取/解析失败时返回默认值。
 #[must_use]
 pub fn load() -> GuiPrefs {
@@ -246,6 +273,7 @@ pub fn load() -> GuiPrefs {
         // 用户打开自动隐藏（落盘 autohide=true, migrated=false）→ 重启」会被迁移误伤改回去。
         return GuiPrefs {
             remote_toolbar_autohide_migrated: true,
+            remote_native_resolution_migrated: true,
             ..GuiPrefs::default()
         };
     };
@@ -254,7 +282,10 @@ pub fn load() -> GuiPrefs {
             // 手改配置可能写入越界帧率；读进来就钳到合法范围（UI 只提供 30/60，将来扩到 15）。
             prefs.remote_frame_rate = normalize_remote_frame_rate(prefs.remote_frame_rate);
             // 迁移必须立刻落盘，否则标志在磁盘上仍是 false，每次启动都会重跑。
-            if migrate_toolbar_autohide(&mut prefs) {
+            // 两个迁移都必须无条件执行（各自的标志负责只跑一次），不能用 `||` 短路。
+            let toolbar_migrated = migrate_toolbar_autohide(&mut prefs);
+            let native_migrated = migrate_native_resolution(&mut prefs);
+            if toolbar_migrated || native_migrated {
                 if let Err(e) = save(&prefs) {
                     tracing::warn!("GUI 偏好一次性迁移落盘失败（{}）：{e}", p.display());
                 }
@@ -266,6 +297,7 @@ pub fn load() -> GuiPrefs {
             // 解析失败同样没有可信的旧值可迁移，标志置位。
             GuiPrefs {
                 remote_toolbar_autohide_migrated: true,
+                remote_native_resolution_migrated: true,
                 ..GuiPrefs::default()
             }
         }
@@ -428,24 +460,46 @@ mod tests {
         assert_eq!(reparsed.remote_frame_rate, 60);
     }
 
-    /// 原生分辨率（4K）默认关闭，且显式开启后能 TOML 往返保留。
+    /// 原生分辨率默认**开启**（4K/2K 桌面不再缩到 1920），且显式关闭后能 TOML 往返保留。
     #[test]
-    fn native_resolution_defaults_off_and_survives_roundtrip() {
+    fn native_resolution_defaults_on_and_survives_roundtrip() {
         assert!(
-            !GuiPrefs::default().remote_native_resolution,
-            "全新安装不得默认开 4K（控制器解码压力更大，必须是显式选择）"
+            GuiPrefs::default().remote_native_resolution,
+            "全新安装应默认按原生分辨率编码（缩到 1920 会让文字细节在编码前丢失）"
         );
-        // 缺键的旧配置落到 false（serde default）。
+        // 缺键的旧配置也落到 true（serde default = default_true）。
         let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
-        assert!(!prefs.remote_native_resolution, "旧配置缺该键应默认关闭");
-        // 往返保留用户选择。
+        assert!(prefs.remote_native_resolution, "旧配置缺该键应默认开启");
+        // 往返保留用户选择（显式关掉）。
         let saved = toml::to_string(&GuiPrefs {
-            remote_native_resolution: true,
+            remote_native_resolution: false,
+            remote_native_resolution_migrated: true,
             ..GuiPrefs::default()
         })
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
-        assert!(reparsed.remote_native_resolution);
+        assert!(!reparsed.remote_native_resolution);
+    }
+
+    /// 原生分辨率迁移只跑一次：旧配置（键为 false、无迁移标志）被改成 true 并落标志，
+    /// 之后用户再显式关掉不会被改回去。
+    #[test]
+    fn native_resolution_migration_runs_once() {
+        // 模拟旧配置：显式 false 且没有迁移标志。
+        let mut prefs: GuiPrefs = toml::from_str(
+            "remote_native_resolution = false\nremote_toolbar_autohide_migrated = true\n",
+        )
+        .unwrap();
+        assert!(!prefs.remote_native_resolution_migrated);
+        assert!(migrate_native_resolution(&mut prefs), "首次应发生迁移");
+        assert!(prefs.remote_native_resolution, "迁移应改为开启");
+
+        // 用户随后关掉并落盘；再次加载不得被迁移覆盖。
+        prefs.remote_native_resolution = false;
+        let saved = toml::to_string(&prefs).unwrap();
+        let mut reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(!migrate_native_resolution(&mut reparsed), "已迁移不得重跑");
+        assert!(!reparsed.remote_native_resolution, "用户显式选择必须保留");
     }
 
     /// 断线自动重连的缺省：**两条路径必须一致**——`Default::default()`（全新安装）与

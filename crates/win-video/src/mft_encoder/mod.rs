@@ -995,7 +995,11 @@ fn is_async_transform(transform: &IMFTransform) -> Result<bool, WinVideoError> {
 }
 
 /// VBV 缓冲涵盖的帧数（与 NVENC 路径同口径）。
-const VBV_FRAMES: u32 = 2;
+///
+/// 两帧太小：VBV 是**单帧比特上限**，而关键帧要编码整幅画面。60 fps 下两帧只有 33 ms
+/// 的预算，内容上限收紧到 1.2 Mbps 时 1080p 的关键帧只剩约 5 KB，文本糊掉且静态画面
+/// 不会自愈。六帧在 60 fps 下 100 ms、30 fps 下 200 ms，配合发送侧分块 pacing 足够。
+const VBV_FRAMES: u32 = 6;
 
 /// `CODECAPI_AVEncCommonBufferSize` 的 VBV 缓冲大小：约 [`VBV_FRAMES`] 帧的码率，
 /// 至少 1 位。`fps == 0` 按 1 处理（避免除零）。
@@ -1005,7 +1009,7 @@ const VBV_FRAMES: u32 = 2;
 /// 的，不必除以 8。
 ///
 /// 旧实现完全没设这个属性，驱动默认值允许很大的单帧突发：一帧就能吃掉半秒量级的
-/// 链路时间，后续帧全被堵住（帧到达抖动 400–500 ms）。按两帧口径设上限。
+/// 链路时间，后续帧全被堵住（帧到达抖动 400–500 ms）。按 [`VBV_FRAMES`] 的口径设上限。
 fn vbv_bits(bps: u32, fps: u32) -> u32 {
     (bps / fps.max(1)).saturating_mul(VBV_FRAMES).max(1)
 }
@@ -1357,19 +1361,19 @@ mod tests {
         assert!(validate_config(1280, 720, 60, 4000).is_ok());
     }
 
-    /// VBV 缓冲按「约两帧的码率」计算，与 NVENC 路径同口径。
+    /// VBV 缓冲按「约六帧的码率」计算，与 NVENC 路径同口径。
     #[test]
-    fn vbv_bits_is_about_two_frames() {
-        assert_eq!(vbv_bits(10_000_000, 30), 666_666);
-        assert_eq!(vbv_bits(6_000_000, 30), 400_000);
-        assert_eq!(vbv_bits(2_000_000, 15), 266_666);
-        assert_eq!(VBV_FRAMES, 2);
+    fn vbv_bits_gives_keyframes_headroom() {
+        assert_eq!(vbv_bits(10_000_000, 30), 1_999_998);
+        assert_eq!(vbv_bits(6_000_000, 30), 1_200_000);
+        assert_eq!(vbv_bits(2_000_000, 15), 799_998);
+        assert_eq!(VBV_FRAMES, 6);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
     #[test]
     fn vbv_bits_guards_zero() {
-        assert_eq!(vbv_bits(1, 0), 2);
+        assert_eq!(vbv_bits(1, 0), 6);
         assert_eq!(vbv_bits(0, 30), 1);
         assert!(vbv_bits(u32::MAX, 1) > 0);
     }
