@@ -1008,15 +1008,15 @@ fn is_async_transform(transform: &IMFTransform) -> Result<bool, WinVideoError> {
 /// 不会自愈。六帧在 60 fps 下 100 ms、30 fps 下 200 ms，配合发送侧分块 pacing 足够。
 const VBV_FRAMES: u32 = 6;
 
-/// 单帧比特预算的**每像素下限**（0.5 bit/px，与 NVENC 路径同口径）。
+/// 单帧比特预算的**每像素上限**（2 bit/px，与 NVENC 路径同口径）。
 ///
-/// VBV 同时是单帧上限。只按「6 帧码率」算时，内容上限把码率压低后单帧预算会塌到几十 KB
-/// （4K UI 档 4.8 Mbps → 60 KB），画面一变就是一团量化痕迹（「糊成一块」）。按几何兜底：
-/// 1080p ≈ 130 KB、4K ≈ 520 KB。平均码率仍由内容上限/闭环控制。
-const VBV_BITS_PER_PIXEL_TIMES_2: u32 = 1;
+/// VBV 同时是单帧上限。整页重绘（切标签/最大化窗口）想接近无损（QP ≈ 20）需要 1–2 bit/px；
+/// 只按「6 帧码率」算时 4K/60fps/40 Mbps 只有 4 Mbit（≈0.5 bit/px），整页一换就被量化成
+/// 一团。低带宽时由「1 秒码率」封顶，避免一帧吃掉整条链路（见 [`vbv_bits`]）。
+const VBV_BITS_PER_PIXEL: u32 = 2;
 
-/// `CODECAPI_AVEncCommonBufferSize` 的 VBV 缓冲大小：
-/// `max(`[`VBV_FRAMES`] 帧的码率, 每像素 0.5 位 × 像素数`)`，至少 1 位。
+/// `CODECAPI_AVEncCommonBufferSize` 的 VBV 缓冲大小（位）：
+/// `max(`[`VBV_FRAMES`] 帧的码率, min(每像素 [`VBV_BITS_PER_PIXEL`], 1 秒码率)`)`，至少 1 位。
 /// `fps == 0` 按 1 处理（避免除零）。
 ///
 /// **单位是位，与 `MaxBitRate` / `MeanBitRate` 一致**：FFmpeg 的 `mfenc.c` 就是把
@@ -1029,9 +1029,9 @@ fn vbv_bits(bps: u32, fps: u32, width: u32, height: u32) -> u32 {
     let frames = (bps / fps.max(1)).saturating_mul(VBV_FRAMES);
     let pixels = width
         .saturating_mul(height)
-        .saturating_mul(VBV_BITS_PER_PIXEL_TIMES_2)
-        / 2;
-    frames.max(pixels).max(1)
+        .saturating_mul(VBV_BITS_PER_PIXEL);
+    let burst_cap = bps.max(1);
+    frames.max(pixels.min(burst_cap)).max(1)
 }
 
 /// 设置码率控制：优先**峰值受限 VBR**，编码器不支持时回退 CBR。
@@ -1411,17 +1411,17 @@ mod tests {
         assert!(validate_config(1280, 720, 60, 4000).is_ok());
     }
 
-    /// VBV 取「六帧码率」与「每像素 0.5 位」的较大者，与 NVENC 路径同口径。
+    /// VBV 取「六帧码率」与 `min(每像素 2 位, 1 秒码率)` 的较大者，与 NVENC 路径同口径。
     #[test]
     fn vbv_bits_gives_keyframes_headroom() {
         assert_eq!(vbv_bits(10_000_000, 30, 640, 360), 1_999_998);
         assert_eq!(vbv_bits(2_000_000, 15, 640, 360), 799_998);
-        // 1080p 的几何下限 = 1920×1080/2 = 1_036_800 位（≈130 KB）。
-        assert_eq!(vbv_bits(2_000_000, 15, 1920, 1080), 1_036_800);
-        // 4K = 4_147_200 位（≈520 KB）。
-        assert_eq!(vbv_bits(40_000_000, 60, 3840, 2160), 4_147_200);
+        // 1080p、2 Mbps：每像素额度 4_147_200 位被「1 秒码率」2_000_000 位封顶。
+        assert_eq!(vbv_bits(2_000_000, 15, 1920, 1080), 2_000_000);
+        // 4K、40 Mbps：每像素额度 16_588_800 位（≈2 MB）生效。
+        assert_eq!(vbv_bits(40_000_000, 60, 3840, 2160), 16_588_800);
         assert_eq!(VBV_FRAMES, 6);
-        assert_eq!(VBV_BITS_PER_PIXEL_TIMES_2, 1);
+        assert_eq!(VBV_BITS_PER_PIXEL, 2);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。

@@ -23,13 +23,18 @@
 //! 重建编码器——重建会强制一个 IDR，AIMD 每秒动一次就变成每秒一个关键帧，正好把阶段 2 要消掉的
 //! 带宽尖峰引回来。只有**降编码分辨率**（几何变化，本模块的 `force_keyframe`）才需要重建 + IDR。
 //!
-//! # 变化面积驱动的生效上限
+//! # 变化面积驱动的生效上限（默认关闭，仅作可选项）
 //!
 //! AIMD 只看**链路**（RTT/积压），看不见**内容**：整帧编码 + VBR 会把档位预算与「画面变了
 //! 多少」解耦——打字只改几十个像素，编码器照样花完预算。采集层本来就在算像素级变化检测
 //! （`win-video` 的 `ChangeReport.changed_permille`）：**逐帧**交给
 //! [`RateController::promote_activity`] 负责升档，每秒的 `QosFeedback` 再交给
-//! [`RateController::observe_activity`] 负责带迟滞的降档，按三档给**生效值**加一个上限：
+//! [`RateController::observe_activity`] 负责带迟滞的降档。
+//!
+//! **默认不启用这些上限**（[`QosParams::content_caps_enabled`] = false，画质优先）：
+//! 上限压低码率后，编码器的 VBV 单帧预算跟着塌，画面一变就被量化成一团（现场「切浏览器
+//! 标签整页糊」）。静态画面本来就不花比特（VBR 无残差只发几 KB），不需要这层保护。
+//! 打开时按三档加钳制：
 //!
 //! | 面积 | 等级 | 码率上限 | 帧率上限 |
 //! |---|---|---|---|
@@ -39,9 +44,7 @@
 //!
 //! **帧率不再随内容档下调**（2026-11-16 真机 A/B）：直连链路上 RTT 只有 2–6 ms，UI 档把
 //! 帧率压到 15 fps 没有带宽收益，只会让光标/窗口操作明显发顿；ToDesk 在同网络不这么做。
-//! 带宽保护由**码率上限**承担——小面积变化在 1.2 Mbps 内足够，帧率保持档位上限即可。
-//! `ui_fps_cap` / `mixed_fps_cap` 仍保留为可调上限，默认 60（等于不压制；`effective_fps`
-//! 还会被档位上限钳制）。
+//! `ui_fps_cap` / `mixed_fps_cap` 仍保留为可调上限，默认 60（等于不压制）。
 //!
 //! 三条设计约束：
 //!
@@ -258,6 +261,14 @@ pub struct QosParams {
     /// 默认 2（QoS 每秒一次反馈 ≈ 2 秒）：视频刚开始就要放量，视频停了两秒才收紧。单次
     /// 静止帧（例如视频里的黑场）不该把上限压死。
     pub cap_hold_ticks: u32,
+    /// 是否**启用**内容面积驱动的码率/帧率上限。**默认关闭（画质优先）**。
+    ///
+    /// 上限的本意是「小面积变化别花整帧预算」，但它作用在**整帧编码器**上时有致命副作用：
+    /// 码率被压低后，编码器的 VBV（单帧比特上限）跟着塌，画面一变就被量化成一团
+    /// （现场「切浏览器标签整页糊」）。而且它对静态画面本来就是多余的——VBR 在没有残差时
+    /// 只花几 KB。因此默认只保留：档位/原生码率上限、AIMD 的**拥塞**响应（减的是链路速率，
+    /// 不是质量）、以及编码器自己的 QP 地板与单帧 VBV。内容面积仍照常上报给统计角标。
+    pub content_caps_enabled: bool,
 }
 
 impl Default for QosParams {
@@ -289,6 +300,8 @@ impl Default for QosParams {
             ui_ratio_permille: 50,
             active_ratio_permille: 200,
             cap_hold_ticks: 2,
+            // 画质优先：内容面积只做观测量，不再钳制码率（见字段文档）。
+            content_caps_enabled: false,
         }
     }
 }
@@ -333,7 +346,12 @@ impl Activity {
 
 impl QosParams {
     /// 某一活跃等级对应的 `(码率上限, 帧率上限)`；`Active` = 不设上限（完全交给 AIMD）。
+    ///
+    /// [`Self::content_caps_enabled`] 为假（默认）时恒不设上限：画质优先，面积只作观测。
     fn activity_caps(&self, activity: Activity) -> (Option<u32>, Option<u8>) {
+        if !self.content_caps_enabled {
+            return (None, None);
+        }
         match activity {
             Activity::Ui => (Some(self.ui_bitrate_cap_kbps), Some(self.ui_fps_cap)),
             Activity::Mixed => (
@@ -548,6 +566,25 @@ impl RateController {
             self.quiet_streak = 0;
             self.recompute_content_caps();
         }
+    }
+
+    /// 开/关内容面积上限（见 [`QosParams::content_caps_enabled`]）。
+    ///
+    /// 被控端按**编码器类型**决定：VP9 走 CBR，静止画面也会把目标码率灌满，需要这层上限；
+    /// H.264（NVENC/QSV 峰值受限 VBR）没有残差时只发几 KB，上限只会压低 VBV 单帧预算、
+    /// 让画面一变就糊，故关闭。
+    pub fn set_content_caps_enabled(&mut self, enabled: bool) {
+        if self.params.content_caps_enabled == enabled {
+            return;
+        }
+        self.params.content_caps_enabled = enabled;
+        self.recompute_content_caps();
+    }
+
+    /// 当前是否启用内容面积上限。仅用于日志/断言。
+    #[must_use]
+    pub fn content_caps_enabled(&self) -> bool {
+        self.params.content_caps_enabled
     }
 
     /// 当前**内容驱动**的码率上限（kbps）；`None` = 不压制。仅用于日志/断言。
@@ -1328,8 +1365,16 @@ mod tests {
     }
 
     /// 内容上限的「收紧」要连续 `cap_hold_ticks` 次：先配一个可预期的迟滞值。
+    ///
+    /// 生产默认**关闭**内容上限（画质优先）；本组测试专门验证这套机制，故显式打开。
     fn activity_controller() -> RateController {
-        RateController::with_params(QualityPreset::Balanced.options(), QosParams::default())
+        RateController::with_params(
+            QualityPreset::Balanced.options(),
+            QosParams {
+                content_caps_enabled: true,
+                ..QosParams::default()
+            },
+        )
     }
 
     #[test]
@@ -1369,7 +1414,14 @@ mod tests {
     /// 锁的是「安静两秒后开始拖窗」的第一秒：那条路径只有逐帧信号可用。
     #[test]
     fn promote_activity_lifts_ui_cap_immediately() {
-        let mut c = RateController::new(QualityPreset::Hd.options()); // 10000 kbps / 60 fps
+        // 生产默认关闭内容上限；本测试专门验证逐帧升档，故显式打开。
+        let mut c = RateController::with_params(
+            QualityPreset::Hd.options(), // 10000 kbps / 60 fps
+            QosParams {
+                content_caps_enabled: true,
+                ..QosParams::default()
+            },
+        );
         prime(&mut c);
         lo_activity_twice(&mut c);
         assert_eq!(
@@ -1440,6 +1492,7 @@ mod tests {
             ui_bitrate_cap_kbps: 8000,
             ui_fps_cap: 60,
             cap_hold_ticks: 1,
+            content_caps_enabled: true,
             ..QosParams::default()
         };
         let mut c = RateController::with_params(QualityPreset::Smooth.options(), params);
@@ -1494,6 +1547,25 @@ mod tests {
             6000,
             "关键帧必须用 AIMD 码率（不受面积上限钳制）"
         );
+    }
+
+    /// 内容面积上限可以按**编码器类型**开关：默认关（H.264 VBR），VP9 CBR 时打开。
+    #[test]
+    fn content_caps_can_be_toggled_by_encoder_type() {
+        let mut c = RateController::new(QualityPreset::Balanced.options());
+        prime(&mut c);
+        lo_activity_twice(&mut c);
+        assert!(!c.content_caps_enabled(), "默认画质优先：不设内容上限");
+        assert_eq!(c.content_cap_kbps(), None);
+
+        c.set_content_caps_enabled(true);
+        assert_eq!(
+            c.content_cap_kbps(),
+            Some(1200),
+            "打开后按当前活跃等级（UI）立刻收紧"
+        );
+        c.set_content_caps_enabled(false);
+        assert_eq!(c.content_cap_kbps(), None, "关闭后立刻放开");
     }
 
     /// 内容上限按**编码面积**等比放大：同样的变化比例在 4K 上是 4 倍像素。

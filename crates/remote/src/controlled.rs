@@ -1701,6 +1701,10 @@ pub async fn run_controlled(
         config.encode,
         native_bitrate_permille(initial_display, native_active),
     ));
+    // 内容面积上限按**编码器类型**开关：VP9 是 CBR（静止画面也会把目标码率灌满，需要这层
+    // 省带宽）；H.264 是峰值受限 VBR（没有残差时只发几 KB），上限只会压低 VBV 单帧预算，
+    // 让画面一变就被量化糊——画质优先，关闭。
+    rate.set_content_caps_enabled(codec == CodecId::Vp9);
     let mut encode = rate.current();
     // pacing 按**链路**码率（AIMD）摊开：内容上限压的是「这一帧值多少比特」，不是链路速率
     // （见 [`RateController::keyframe_bitrate_kbps`]）。
