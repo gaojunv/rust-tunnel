@@ -314,7 +314,13 @@ impl MftH264Encoder {
 
         let codec = transform.cast::<ICodecAPI>().ok();
         if let Some(codec) = &codec {
-            configure_codec_defaults(codec, bitrate_kbps.saturating_mul(1000), fps);
+            configure_codec_defaults(
+                codec,
+                bitrate_kbps.saturating_mul(1000),
+                fps,
+                width,
+                height,
+            );
         }
 
         configure_media_types(&transform, width, height, fps, bitrate_kbps)?;
@@ -1002,8 +1008,16 @@ fn is_async_transform(transform: &IMFTransform) -> Result<bool, WinVideoError> {
 /// 不会自愈。六帧在 60 fps 下 100 ms、30 fps 下 200 ms，配合发送侧分块 pacing 足够。
 const VBV_FRAMES: u32 = 6;
 
-/// `CODECAPI_AVEncCommonBufferSize` 的 VBV 缓冲大小：约 [`VBV_FRAMES`] 帧的码率，
-/// 至少 1 位。`fps == 0` 按 1 处理（避免除零）。
+/// 单帧比特预算的**每像素下限**（0.5 bit/px，与 NVENC 路径同口径）。
+///
+/// VBV 同时是单帧上限。只按「6 帧码率」算时，内容上限把码率压低后单帧预算会塌到几十 KB
+/// （4K UI 档 4.8 Mbps → 60 KB），画面一变就是一团量化痕迹（「糊成一块」）。按几何兜底：
+/// 1080p ≈ 130 KB、4K ≈ 520 KB。平均码率仍由内容上限/闭环控制。
+const VBV_BITS_PER_PIXEL_TIMES_2: u32 = 1;
+
+/// `CODECAPI_AVEncCommonBufferSize` 的 VBV 缓冲大小：
+/// `max(`[`VBV_FRAMES`] 帧的码率, 每像素 0.5 位 × 像素数`)`，至少 1 位。
+/// `fps == 0` 按 1 处理（避免除零）。
 ///
 /// **单位是位，与 `MaxBitRate` / `MeanBitRate` 一致**：FFmpeg 的 `mfenc.c` 就是把
 /// `AVCodecContext.rc_buffer_size`（位）原样写进 `CODECAPI_AVEncCommonBufferSize`
@@ -1011,8 +1025,13 @@ const VBV_FRAMES: u32 = 6;
 ///
 /// 旧实现完全没设这个属性，驱动默认值允许很大的单帧突发：一帧就能吃掉半秒量级的
 /// 链路时间，后续帧全被堵住（帧到达抖动 400–500 ms）。按 [`VBV_FRAMES`] 的口径设上限。
-fn vbv_bits(bps: u32, fps: u32) -> u32 {
-    (bps / fps.max(1)).saturating_mul(VBV_FRAMES).max(1)
+fn vbv_bits(bps: u32, fps: u32, width: u32, height: u32) -> u32 {
+    let frames = (bps / fps.max(1)).saturating_mul(VBV_FRAMES);
+    let pixels = width
+        .saturating_mul(height)
+        .saturating_mul(VBV_BITS_PER_PIXEL_TIMES_2)
+        / 2;
+    frames.max(pixels).max(1)
 }
 
 /// 设置码率控制：优先**峰值受限 VBR**，编码器不支持时回退 CBR。
@@ -1027,7 +1046,13 @@ fn vbv_bits(bps: u32, fps: u32) -> u32 {
 /// # Errors
 /// 连 CBR 的均值码率都设不进去时返回 [`WinVideoError::Encode`]（调用方按「编码器不可信、
 /// 重建」处理）。
-fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) -> Result<(), WinVideoError> {
+fn apply_rate_control(
+    codec: &ICodecAPI,
+    bitrate_bps: u32,
+    fps: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), WinVideoError> {
     let vbr = u32::try_from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0).unwrap_or(1);
     let mean = bitrate_bps.saturating_mul(VBR_MEAN_PERCENT) / 100;
     // 逐项确认：有些 MFT 只认模式、不认峰值属性；任何一步失败都退回 CBR。
@@ -1040,7 +1065,7 @@ fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) -> Result<(
     if vbr_applied {
         // VBV 缓冲大小是**可选**的收紧项：不少 MFT 不实现这个属性，设不进去时
         // 继续用驱动默认值即可，绝不因此把整个 VBR 回退成 CBR（那会让静止画面灌满上行）。
-        let vbv = vbv_bits(bitrate_bps, fps);
+        let vbv = vbv_bits(bitrate_bps, fps, width, height);
         if let Err(err) = set_codec_u32(codec, &CODECAPI_AVEncCommonBufferSize, vbv) {
             tracing::debug!(%err, vbv, "编码器不支持设置 VBV 缓冲大小，沿用驱动默认值");
         }
@@ -1058,8 +1083,14 @@ fn apply_rate_control(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) -> Result<(
 }
 
 /// 设置编码器的默认参数（码率控制、低延迟、无 B 帧）；失败只记 debug。
-fn configure_codec_defaults(codec: &ICodecAPI, bitrate_bps: u32, fps: u32) {
-    if let Err(err) = apply_rate_control(codec, bitrate_bps, fps) {
+fn configure_codec_defaults(
+    codec: &ICodecAPI,
+    bitrate_bps: u32,
+    fps: u32,
+    width: u32,
+    height: u32,
+) {
+    if let Err(err) = apply_rate_control(codec, bitrate_bps, fps, width, height) {
         tracing::debug!(%err, "编码器拒绝码率控制参数，按 MFT 默认值继续");
     }
     // `AVEncCommonQuality` 是 0..100 的**质量优先**提示（越高越照顾画质）。硬件 MFT 默认
@@ -1380,20 +1411,24 @@ mod tests {
         assert!(validate_config(1280, 720, 60, 4000).is_ok());
     }
 
-    /// VBV 缓冲按「约六帧的码率」计算，与 NVENC 路径同口径。
+    /// VBV 取「六帧码率」与「每像素 0.5 位」的较大者，与 NVENC 路径同口径。
     #[test]
     fn vbv_bits_gives_keyframes_headroom() {
-        assert_eq!(vbv_bits(10_000_000, 30), 1_999_998);
-        assert_eq!(vbv_bits(6_000_000, 30), 1_200_000);
-        assert_eq!(vbv_bits(2_000_000, 15), 799_998);
+        assert_eq!(vbv_bits(10_000_000, 30, 640, 360), 1_999_998);
+        assert_eq!(vbv_bits(2_000_000, 15, 640, 360), 799_998);
+        // 1080p 的几何下限 = 1920×1080/2 = 1_036_800 位（≈130 KB）。
+        assert_eq!(vbv_bits(2_000_000, 15, 1920, 1080), 1_036_800);
+        // 4K = 4_147_200 位（≈520 KB）。
+        assert_eq!(vbv_bits(40_000_000, 60, 3840, 2160), 4_147_200);
         assert_eq!(VBV_FRAMES, 6);
+        assert_eq!(VBV_BITS_PER_PIXEL_TIMES_2, 1);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
     #[test]
     fn vbv_bits_guards_zero() {
-        assert_eq!(vbv_bits(1, 0), 6);
-        assert_eq!(vbv_bits(0, 30), 1);
-        assert!(vbv_bits(u32::MAX, 1) > 0);
+        assert_eq!(vbv_bits(1, 0, 0, 0), 6);
+        assert_eq!(vbv_bits(0, 30, 0, 0), 1);
+        assert!(vbv_bits(u32::MAX, 1, u32::MAX, u32::MAX) > 0);
     }
 }

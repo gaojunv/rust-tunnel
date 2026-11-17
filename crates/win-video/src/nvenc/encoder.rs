@@ -275,11 +275,30 @@ fn kbps_to_bps(kbps: u32) -> u32 {
 /// 配合发送侧 32 KiB 分块 pacing（单间隙 ≤100 ms）不会再整段堵住后续帧。
 const VBV_FRAMES: u32 = 6;
 
-/// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小：约 [`VBV_FRAMES`] 帧的码率，至少 1 位。
+/// 单帧比特预算的**每像素下限**（0.5 bit/px，用 `pixels / 2` 表达）。
+///
+/// 「6 帧码率」这条口径有一个隐蔽的坑：VBV 同时是**单帧比特上限**，而码率会被内容上限
+/// 压到很低（4K 的 UI 档 4.8 Mbps → 60 fps 下每帧 10 KB、六帧 60 KB）。于是只要画面
+/// 真的变了一块（弹窗、菜单、网页局部刷新），这点预算只够约 **0.2 bit/像素**，编码器
+/// 只能把那一块量化成一团——现场表现就是「动不动糊成一块」。QP 地板救不了它：QP 只能
+/// 在预算内挑质量，预算本身被 VBV 卡死。
+///
+/// 因此 VBV 必须按**几何**兜底，而不是跟随时变的（被内容上限压低的）码率：
+/// 0.5 bit/px = 1080p ≈ 130 KB、4K ≈ 520 KB 的单帧上限。平均码率仍由内容上限/AIMD
+/// 控制（VBR 只在真需要时花），大帧由发送侧 32 KiB 分块 pacing 摊开。
+const VBV_BITS_PER_PIXEL_TIMES_2: u32 = 1;
+
+/// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小：
+/// `max(`[`VBV_FRAMES`] 帧的码率, 每像素 0.5 位 × 像素数`)`，至少 1 位。
 ///
 /// `fps == 0` 按 1 处理（避免除零；正常构造路径已拒绝 0 帧率）。
-fn vbv_size(bps: u32, fps: u32) -> u32 {
-    (bps / fps.max(1)).saturating_mul(VBV_FRAMES).max(1)
+fn vbv_size(bps: u32, fps: u32, width: u32, height: u32) -> u32 {
+    let frames = (bps / fps.max(1)).saturating_mul(VBV_FRAMES);
+    let pixels = width
+        .saturating_mul(height)
+        .saturating_mul(VBV_BITS_PER_PIXEL_TIMES_2)
+        / 2;
+    frames.max(pixels).max(1)
 }
 
 /// 一轮 **intra refresh（GDR）** 覆盖的时间（秒）：约 2 秒内把整屏刷成 intra。
@@ -565,6 +584,8 @@ fn build_encode_config(
     session: &NvencSession<'_>,
     bitrate_bps: u32,
     fps: u32,
+    width: u32,
+    height: u32,
 ) -> Result<sys::NV_ENC_CONFIG, WinVideoError> {
     let get_preset = session
         .api()
@@ -619,7 +640,7 @@ fn build_encode_config(
     config.rcParams.rateControlMode = sys::_NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
     config.rcParams.averageBitRate = vbr_average(bitrate_bps);
     config.rcParams.maxBitRate = bitrate_bps;
-    config.rcParams.vbvBufferSize = vbv_size(bitrate_bps, fps);
+    config.rcParams.vbvBufferSize = vbv_size(bitrate_bps, fps, width, height);
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
     // **两遍编码（四分之一分辨率）**：第一遍在低分辨率上预分析场景复杂度，第二遍据此
     // 分配比特。桌面文本的比特分配极不均匀（大片纯色 + 少量高频笔画），单遍 VBR 会把
@@ -692,6 +713,16 @@ fn build_encode_config(
         sys::_NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
     h264.h264VUIParameters.colourMatrix =
         sys::_NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+
+    // 真机排障要能确认这两个「画质旋钮」真的生效（每次编码器创建只打一行）。
+    tracing::info!(
+        max_qp,
+        intra_refresh = intra_refresh_supported,
+        intra_refresh_frames = intra_refresh_frames(fps),
+        fps,
+        bitrate_bps,
+        "NVENC 编码配置就绪（QP 地板 / 渐进刷新）"
+    );
 
     Ok(config)
 }
@@ -769,7 +800,13 @@ impl<'a> NvencEncoder<'a> {
 
         let session = api.open_session(&d3d)?;
         let bitrate_bps = kbps_to_bps(config.bitrate_kbps);
-        let encode_config = build_encode_config(&session, bitrate_bps, config.fps)?;
+        let encode_config = build_encode_config(
+            &session,
+            bitrate_bps,
+            config.fps,
+            config.width,
+            config.height,
+        )?;
 
         let context = d3d.context.clone();
         let texture = create_texture(
@@ -1239,7 +1276,7 @@ impl<'a> NvencEncoder<'a> {
         let bps = kbps_to_bps(kbps);
         self.config.rcParams.averageBitRate = vbr_average(bps);
         self.config.rcParams.maxBitRate = bps;
-        self.config.rcParams.vbvBufferSize = vbv_size(bps, self.fps);
+        self.config.rcParams.vbvBufferSize = vbv_size(bps, self.fps, self.width, self.height);
         self.config.rcParams.vbvInitialDelay = self.config.rcParams.vbvBufferSize;
         self.reconfigure()?;
         self.bitrate_bps = bps;
@@ -1257,7 +1294,8 @@ impl<'a> NvencEncoder<'a> {
         self.init.frameRateNum = fps;
         // VBV 额度按帧数计算，帧率一变额度也跟着变，故必须重算后一起重配置
         // （NVENC 的 `nvEncReconfigureEncoder` 同时接受帧率与 VBV，仍不重建/不插 IDR）。
-        self.config.rcParams.vbvBufferSize = vbv_size(self.bitrate_bps, fps);
+        self.config.rcParams.vbvBufferSize =
+            vbv_size(self.bitrate_bps, fps, self.width, self.height);
         self.config.rcParams.vbvInitialDelay = self.config.rcParams.vbvBufferSize;
         self.reconfigure()?;
         self.fps = fps;
@@ -1317,7 +1355,8 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        intra_refresh_frames, vbr_average, vbv_size, LruCache, INTRA_REFRESH_SECONDS, VBV_FRAMES,
+        intra_refresh_frames, vbr_average, vbv_size, LruCache, INTRA_REFRESH_SECONDS,
+        VBV_BITS_PER_PIXEL_TIMES_2, VBV_FRAMES,
     };
 
     /// Intra refresh 的周期按「秒 × fps」算；刷新跨度的帧数必须 ≥1 且不除零。
@@ -1330,26 +1369,42 @@ mod tests {
         assert!(intra_refresh_frames(u32::MAX) > 0);
     }
 
-    /// VBV 额度是「约六帧的码率」：既给关键帧足够的整帧比特，又不至于让单帧吃掉半秒预算。
+    /// VBV 取「六帧码率」与「每像素 0.5 位」的较大者。
     #[test]
     fn vbv_size_gives_keyframes_headroom() {
-        // 10 Mbps @ 30fps：每帧 333_333 位，六帧 1_999_998 位（≈250 KB）。
-        assert_eq!(vbv_size(10_000_000, 30), 1_999_998);
-        // 6 Mbps @ 30fps：每帧 200_000 位，六帧 1_200_000 位（≈150 KB）。
-        assert_eq!(vbv_size(6_000_000, 30), 1_200_000);
-        // 2 Mbps @ 15fps：每帧 133_333 位，六帧 799_998 位（≈100 KB）。
-        assert_eq!(vbv_size(2_000_000, 15), 799_998);
-        // 与帧数常量的口径一致（不是零散的魔数）。
+        // 10 Mbps @ 30fps、640×360：六帧 1_999_998 位 > 每像素下限 115_200 位。
+        assert_eq!(vbv_size(10_000_000, 30, 640, 360), 1_999_998);
+        // 2 Mbps @ 15fps、640×360：六帧 799_998 位 > 115_200 位。
+        assert_eq!(vbv_size(2_000_000, 15, 640, 360), 799_998);
+        // 1080p 的每像素下限 = 1920×1080/2 = 1_036_800 位（≈130 KB）。
+        assert_eq!(vbv_size(2_000_000, 15, 1920, 1080), 1_036_800);
+        // 4K = 3840×2160/2 = 4_147_200 位（≈520 KB）。
+        assert_eq!(vbv_size(40_000_000, 60, 3840, 2160), 4_147_200);
         assert_eq!(VBV_FRAMES, 6);
+        assert_eq!(VBV_BITS_PER_PIXEL_TIMES_2, 1);
+    }
+
+    /// 关键回归：内容上限把码率压到 UI 档（4K 4.8 Mbps）时，单帧预算不能跟着塌到几十 KB。
+    ///
+    /// 旧口径 `6 × bps/fps` 在这个组合下只有 60 KB（≈0.06 bit/px），任何一块画面变化都会被
+    /// 量化成一团——现场就是「动不动糊成一块」。geometry 兜底后是 520 KB（≈0.5 bit/px）。
+    #[test]
+    fn vbv_size_survives_the_content_cap_at_four_k() {
+        let capped = vbv_size(4_800_000, 60, 3840, 2160);
+        assert_eq!(capped, 4_147_200, "应按几何兜底，而不是按被压低的码率");
+        // 换算成字节：≈506 KB / 帧。
+        assert!(capped / 8 > 500_000);
+        // 1080p 的 UI 档（1.2 Mbps）同理。
+        assert_eq!(vbv_size(1_200_000, 60, 1920, 1080), 1_036_800);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
     #[test]
     fn vbv_size_guards_zero() {
-        assert_eq!(vbv_size(1, 0), 6);
-        assert_eq!(vbv_size(0, 30), 1);
+        assert_eq!(vbv_size(1, 0, 0, 0), 6);
+        assert_eq!(vbv_size(0, 30, 0, 0), 1);
         // 极大值走饱和乘法，不 panic。
-        assert!(vbv_size(u32::MAX, 1) > 0);
+        assert!(vbv_size(u32::MAX, 1, u32::MAX, u32::MAX) > 0);
     }
 
     #[test]
