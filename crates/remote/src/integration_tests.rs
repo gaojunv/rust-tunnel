@@ -901,19 +901,25 @@ async fn static_screen_emits_no_frames_and_change_emits_frames() {
         "应收到首帧关键帧"
     );
 
-    // 静止画面：**不再每拍编码**，但静止保活补编（`UNCHANGED_RESEND_INTERVAL` = 250 ms）
-    // 会周期性补一帧普通 P 帧——这是「检测盲区/背压丢帧不会让画面永久冻结」的代价。
-    // 断言因此从「零新增帧」改成「新增帧数落在保活频率附近」：
-    // - 上界：900 ms / 250 ms ≈ 4 帧（再多就说明去重闸门失效、退回每拍编码）；
-    // - 下界：至少 1 帧（少了就说明保活没跑）。
+    // 静止画面：**不再每拍编码**，但静止保活补编（`UNCHANGED_RESEND_INTERVAL`）会周期性补一帧
+    // 普通 P 帧——这是「检测盲区/背压丢帧不会让画面永久冻结」的代价。断言因此从「零新增帧」
+    // 改成「新增帧数落在保活频率附近」，且**上界由常量推导**（不要写死数字：保活间隔会随
+    // 解码侧停顿实测数据调整，写死会让这条测试变成改常量的绊脚石）。
+    // - 上界：窗口时长 / 保活间隔 + 2 帧余量（再多就说明去重闸门失效、退回每拍编码）；
+    // - 下界：至少 1 帧（少了就说明保活没跑）；
+    // - 另加一条绝对上界：必须明显少于采集拍数（30 fps 下 900 ms ≈ 27 拍）。
     let after_first = ctrl_sink.frames.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(900)).await;
     let added = ctrl_sink.frames.load(Ordering::Relaxed).saturating_sub(after_first);
+    let keepalive_ms = u64::try_from(UNCHANGED_RESEND_INTERVAL.as_millis()).unwrap_or(1).max(1);
+    let upper = 900 / keepalive_ms + 2;
+    let added_u64 = u64::try_from(added).unwrap_or(u64::MAX);
     assert!(
-        added <= 6,
-        "静止画面不应每拍编码（最多只有 250 ms 一次的保活补编），本窗口新增 {added} 帧"
+        added_u64 <= upper,
+        "静止画面不应每拍编码（900 ms 内最多 {upper} 帧保活补编），本窗口新增 {added} 帧"
     );
     assert!(added >= 1, "静止保活补编应在 UNCHANGED_RESEND_INTERVAL 内补至少一帧");
+    assert!(added < 20, "保活不得退化成每拍编码（30 fps 下 900 ms 有 ~27 拍），实得 {added}");
 
     // 改一块区域 → 应产生新的编码帧。
     {

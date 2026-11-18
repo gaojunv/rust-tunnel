@@ -27,6 +27,11 @@
 //!
 //! 分类由纯函数 [`outbound_class`] 决定，新增 `SessionMessage` 变体时编译器会强制在这里归类。
 //!
+//! **大帧 pacing 只削峰、不重复限速**：真实限速是传输层（UDP 可靠层接收窗口 ≈307 KB、TCP
+//! 内核流控），应用层按静态码率摊开只会加延迟。所以块间等待的总量被
+//! [`PACING_MAX_TOTAL_WAIT`]（20 ms）封住：一帧 392 KB 的 IDR 不再付 310 ms 的 sleep，IDR
+//! 期间输入/心跳最多等「一块 + 传输时间」。
+//!
 //! **丢弃策略是这个管线里最关键的正确性决定**：时域编码的参考链是串起来的，丢掉一个**已编码**
 //! 的 P 帧，后续引用它的帧在解码端永远解不出来（花屏且不自愈，只能等下一个 IDR）。所以背压的
 //! 出口只能放在**编码之前**——输出队列满就跳过这一帧（等价于降帧率，语义合法），绝不在编码之后
@@ -34,7 +39,8 @@
 //!
 //! 但「静止就不发」不能是绝对的。变化检测是**点采样**网格、存在盲区；编码前的背压出口、
 //! 采集看门狗作废结果（此时 `changed` 水位已经推进）也会让「变化确实发生了」却一帧都没
-//! 发出去。故静止时仍按 [`UNCHANGED_RESEND_INTERVAL`]（250 ms）补编一帧**普通 P 帧**作为
+//! 发出去。故静止时仍按 [`UNCHANGED_RESEND_INTERVAL`]（66 ms，见该常量里的实测依据）补编一帧
+//! **普通 P 帧**作为
 //! 保活——它只绕过「无变化就跳过」这一道闸门，**不会带出 IDR**。少了它，用户看到的是
 //! 「远端静止一段时间后，第一次变化要反复几次才出现」。
 //!
@@ -89,17 +95,28 @@
 //!   补丁只覆盖变化矩形，静态区域会长期沿用这一帧，若它继承了一张糊的参考（典型场景：
 //!   切浏览器标签导致整页重绘，那一帧被单帧预算压过），整页就再也不会自愈——补丁模式里
 //!   编码器不跑，intra refresh 也停了。这里付一个关键帧换「基底一定是整幅重编的」。
-//!   其余让参考链/几何失效的事件同样 IDR：会话首帧、`RequestKeyframe`、`SelectDisplay` /
-//!   `SetQuality`、显示器分辨率变化、QoS 降分辨率、编码器重建。
+//!   其余让参考链/几何失效的事件同样 IDR：会话首帧、`SelectDisplay` / `SetQuality`、
+//!   显示器分辨率变化、QoS 降分辨率、编码器重建。
+//!
+//!   **控制器 `RequestKeyframe` 不退出补丁模式**：它要的正是一张整幅重编的 IDR，而那张 IDR
+//!   本身就是合法的**新基准**。所以在补丁模式里收到请求时走 [`PatchMode::begin_rebase`]：
+//!   采集切回全帧 → 发一张 IDR → [`PatchMode::poll_base`] 确认它进了画面队列 → 继续补丁。
+//!   旧实现把它当退出信号并进 10–20 s 冷却，真机 5 次进入里 3 次被它打断（存活
+//!   38/203/292 ms），补丁占比从 28% 掉到 2%——「越改越卡」的直接原因。
+//!
+//!   顺序不变量在重设时同样成立：暂存区清空（旧补丁会把旧内容盖到新基准上），重设期间到达
+//!   的补丁采集结果丢弃（它们的采集时刻早于新基准），补丁要等 `base_frame_sent` 才恢复。
 //! - **超预算先拆批，不退出**：单条 `RegionUpdate` 的上限是 32 KiB，单个脏矩形编码后超限时
 //!   按行拆成若干横条分多条消息发出（同一拍总量 256 KiB / 最多 8 条）。只有**真的装不下**
 //!   （矩形数、单拍总量或条数超限）才回全帧。
-//! - **退出即全帧，且退出一律带冷却**：补丁采集失败、活跃度过高、装不下等只回到全帧并
+//! - **退出即全帧，冷却只惩罚自抖动**：补丁采集失败、活跃度过高、装不下等只回到全帧并
 //!   **立刻抓帧**（不插 IDR）；几何真的变了（显示器/缩放）才连带强制 IDR。退出后
 //!   [`PATCH_REENTRY_HOLDOFF`]（基础 5 s）内不重新进入，避免「退出 → 整帧 → 再进入 → 再整帧」
 //!   的抖动正反馈；若上一次补丁模式**寿命太短**（[`PATCH_SHORT_SESSION`]），冷却按
 //!   [`PATCH_REENTRY_HOLDOFF_MAX`] 封顶指数退避——反复抖动的场景正是「每 3 秒一张基准 IDR」
-//!   的来源（见 [`PATCH_ENTER_TICKS`] 的真机数据）。退出原因经 [`PatchExitReason`] 记一条
+//!   的来源（见 [`PATCH_ENTER_TICKS`] 的真机数据）。**只有内容自己抖**（活跃度/矩形数/预算/
+//!   写侧跟不上）才退避；被控制器关键帧请求打断已不再退出，切显示器/画质这类几何重建连冷却
+//!   都不设（见 [`PatchExitReason::penalizes_reentry`]）。退出原因经 [`PatchExitReason`] 记一条
 //!   `info!`，现场日志不必靠 IDR 间隔反推。
 //! - **QoS 闭环在补丁模式下暂停**：控制器此时不解码视频，`decode_ms`/`recv_kbps` 是陈旧值，
 //!   喂给 AIMD 只会制造假拥塞。回到全帧后的下一条 `QosFeedback` 自然恢复闭环。
@@ -490,7 +507,35 @@ const MAX_CAPTURE_TIMEOUTS: u32 = 3;
 /// 所以静止时也要定期补编一帧：**普通 P 帧、不请求 IDR**，把「变化发生 → 控制器看到画面」
 /// 的延迟上界压到 250 ms。代价可忽略：QSV/NVENC 实测静止 P 帧约 3 KB，4 fps ≈ 12 KB/s
 /// ≈ 100 kbps（1080p；这一帧同时会喂给控制端的解码器，不会额外触发关键帧）。
-pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_millis(250);
+///
+/// # 为什么是 66 ms（2026-11-18 两组实测）
+///
+/// 解码侧的 DXVA staging 回读有一个「GPU 空闲后第一次同步」的固定成本（真机 445 ms；本机
+/// `decode-stall-probe` 复现 410–500 ms，100% 落在 `Map` 上、与帧大小无关）。它对**帧到达
+/// 间隔**极敏感，两台机器各自测出的停顿率：
+///
+/// | 到达间隔 | 真机 HD 630（`lt3/att2.log`，按 `idle_ms` 分桶） | 本机 Arrow Lake（探针） |
+/// |---|---|---|
+/// | < 100 ms | 205 帧 **0 次** | 33 / 66 / 100 ms 三档共 **1100 帧 0 次** |
+/// | 100–250 ms | 44 帧 6 次（14%） | 200 ms 档 0–19%（两次测量不一致） |
+/// | 250–400 ms | 79 帧 34 次（43%） | 250 ms 档 **34%** |
+/// | ≥ 500 ms | 19 帧 0 次（样本少，不可外推） | 500 ms 档 65%、1 fps 50% |
+///
+/// 旧的 250 ms 正好落在最坏区间：静止桌面每秒只有 4 帧，**每一帧都落在停顿带里**，一次
+/// 445 ms 的停顿就足以把 4 深解码队列塞满并触发参考链重建（真机 91 秒 27 张 IDR、
+/// 164 帧被丢）。66 ms（15 fps）在两台机器上都低于任何已观测阈值（余量 ≥3 倍），把静止
+/// 停顿率从 30–43% 压到 0。
+///
+/// 代价：静止时 15 fps × ~3 KB ≈ **45 KB/s（≈360 kbps）**，编码占用约 25%（QSV 1080p
+/// 17 ms/帧）。对一个码率上限 10 Mbps 的会话可以接受，比「每秒一次 445 ms 冻结 + IDR 风暴」
+/// 便宜得多。解码侧的回读预算（`win-video` 的 `decode`）是**有意的兜底**：阈值与电源状态
+/// 相关（同一台机器 200 ms 档两次测量分别是 19% 与 0%），真卡住时最多丢一两帧重复内容，
+/// 不会重建参考链。
+///
+/// **可调旋钮**：`ControlledConfig::unchanged_resend`（生产路径由 `manager` 传入本常量）。
+/// 实测 100 ms 档在两台机器上也都没有停顿，要省带宽可以试 100 ms（≈30 KB/s），但真机
+/// 100–250 ms 桶已有 14% 停顿，**不要回到 250 ms**。
+pub const UNCHANGED_RESEND_INTERVAL: Duration = Duration::from_millis(66);
 
 /// 周期性强制关键帧的兜底间隔。
 ///
@@ -512,22 +557,63 @@ const PACING_MIN_FRAME_BYTES: usize = 96 * 1024;
 
 /// 大帧分段写的块大小（32 KiB）。
 ///
-/// 6 Mbps 上一块约 43 ms，恰好是「让后面排队的小帧有机会被内核/中继推进一个块」的粒度；
-/// 再大就失去交错的意义，再小则 write 次数与 TLS 记录开销都上去了。
+/// 只作为「一次 `write_all` 写多少」的粒度，让取消与传输层背压有机会在块之间介入；块间
+/// sleep 的总量另受 [`PACING_MAX_TOTAL_WAIT`] 约束（真实限速交给传输层）。
 const PACING_CHUNK_BYTES: usize = 32 * 1024;
 
 /// 单个块间等待的绝对上限（100 ms）。
 ///
-/// pacing 的目的是**削尖峰**，不是限速：码率读数偏低（刚降档、或读到的值还没跟上实际链路）
-/// 时，按目标码率算出的块间等待可能长达数百毫秒，一帧就会被拖成秒级。封顶之后即使读数
-/// 离谱，一帧最多也就多花「块数 × 100 ms」。
+/// 历史闸门，现在**永远不会先于预算生效**：实际 sleep 由 [`PacingBudget`] 封在
+/// [`PACING_MAX_TOTAL_WAIT`]（20 ms）以内，而 20 ms < 100 ms。保留它是为了 `pacing_plan` 的
+/// 纯函数语义（单测 `pacing_plan_bounds_chunk_and_gap` 用极端低码率锁定「一帧不会被拖成秒级」）。
 const PACING_MAX_GAP: Duration = Duration::from_millis(100);
 
 /// 全部块间等待相对「该帧在目标码率下的自然串行时间」的上限倍数。
 ///
-/// 与 [`PACING_MAX_GAP`] 是两道互补的闸门：前者管单个间隙，这条管总量（块数多时单个间隙
-/// 虽小、累加也可能超过一帧的自然时间）。
+/// 历史闸门，与 [`PACING_MAX_TOTAL_WAIT`] 叠加。`pacing_plan` 先用它封总量、再用 20 ms 预算
+/// 封实际 sleep 次数；真机读数下它从不生效（见 `pacing_caps_never_bind_at_the_real_session_rates`）。
 const PACING_MAX_WAIT_FACTOR: u32 = 2;
+
+/// 一帧分块写的**块间等待总预算**（20 ms）。
+///
+/// **为什么要这条**：分块的本意只是「别把一整帧 400 KB 一次性灌进传输层」，**真正的限速器
+/// 是传输层自己**——UDP 打洞路径的用户态可靠层接收窗口是 `MAX_RECV_WINDOW`(256 段) ×
+/// 1200 B ≈ **307 KB**（写满即阻塞等 ACK），直连/中继走 TCP，内核也有流控。所以在应用层再按
+/// **静态目标码率**摊一遍是**重复限速**，只会加延迟。
+///
+/// 真机代价（`lt3/att1.log`，91 s）：`pacing_plan` 的 `gap = chunk_natural`
+/// （32 KiB / 10 Mbps ≈ **26 ms**），一帧 392 KB 的 IDR 是 13 块 × 26 ms ≈ **310 ms**，而实测
+/// `write_us` 峰值正是 **310 ms**（p50 165 ms，平均 213 KB）——传输本身只要几十毫秒，剩下
+/// 全是 sleep。IDR 期间 `ctrl`（输入回显/心跳/QoS 反馈）一次都轮不到，控制器 `input_q` 峰值
+/// 因此到 **287 ms**。
+///
+/// 取 **20 ms**：一块的自然时间（26 ms @ 10 Mbps）就已经超过它，所以真机上一帧 IDR 最多只
+/// sleep 一次 ≈20 ms（甚至 0 次），其余各块连续写、由传输层背压自然限速。24 ms 的一半 ≈ 一个
+/// RTT 的量级（实测 RTT 8–40 ms），再加就回到「为整帧付 300 ms」的老问题。
+const PACING_MAX_TOTAL_WAIT: Duration = Duration::from_millis(20);
+
+/// 一帧分块写的块间等待预算（纯逻辑，便于单测锁定「总等待 ≤ [`PACING_MAX_TOTAL_WAIT`]」）。
+#[derive(Debug, Clone, Copy)]
+struct PacingBudget {
+    remaining: Duration,
+}
+
+impl PacingBudget {
+    fn new() -> Self {
+        Self {
+            remaining: PACING_MAX_TOTAL_WAIT,
+        }
+    }
+
+    /// 申请这一块的等待时长：返回 `min(gap, 剩余预算)` 并从预算里扣掉。
+    ///
+    /// 预算用完后返回零——调用方据此**不再 sleep**、连续写完剩余各块。
+    fn take(&mut self, gap: Duration) -> Duration {
+        let pause = gap.min(self.remaining);
+        self.remaining = self.remaining.saturating_sub(pause);
+        pause
+    }
+}
 
 /// 进入补丁模式的**变化面积**门槛（千分比，3%）：低于它才算「安静」。
 ///
@@ -540,19 +626,29 @@ const PATCH_EXIT_PERMILLE: u16 = 80;
 
 /// 连续多少个**低活跃**采集才请求进入补丁模式（迟滞）。
 ///
-/// 15 拍在 30 fps 下约 **500 ms**（旧值 3 拍 ≈100 ms）。**为什么要多等这 0.4 秒**：每进入
-/// 一次补丁模式都要先发一张**基准 IDR**，而真机数据（1080p30 H.264 / Intel QSV / Punch 路径
-/// RTT 13 ms，同一会话 64 秒）是：进入 **21 次**（平均每 3 秒一次）、共 31 张 IDR、占全部
-/// 字节 **43%**（平均 223 KB、最大 417 KB，P 帧平均只有 25 KB）。一张 417 KB 的 IDR 在
-/// 10 Mbps 的 pacing 下要写 **338 ms**，期间后续帧在 2 深的画面队列里干等（`send_q` p99
-/// 237 ms、max 1.34 s）。
+/// **8 拍**。进入判据只吃**视频采集**的结果，而静止桌面上的视频帧几乎全是
+/// [`UNCHANGED_RESEND_INTERVAL`]（现为 66 ms ≈ 15 fps）的保活补编，所以一拍 ≈ 66 ms：
+/// 8 拍 ≈ **0.53 s** 的连续安静。
 ///
-/// 换句话说，旧门槛把「任何一次 100 ms 的短暂安静」都当成可以进入补丁模式的静止桌面，
-/// 于是「进入 → 基准 IDR → 用户又动了一下 → 退出 → 整帧」反复循环。多等 0.4 秒的代价只是
-/// 静止桌面多几帧 ~3 KB 的 P 帧（≈30–40 KB），换来的是少一张 223 KB 的 IDR——收益是数量级
-/// 的。**不要用「把基准 IDR 改小」来解决这件事**：基准帧必须是整幅重编的 IDR（补丁只覆盖
+/// 历史取值必须连着当时的保活节奏看，否则会误读：
+/// - 3 拍（更早）在 30 fps 下只有 ≈100 ms，任何一次短暂停顿都被当成静止桌面——真机 64 秒
+///   进入 **21 次**、31 张 IDR 占 **43%** 字节，正是「退出 → 整帧 → 再进入 → 再整帧」的
+///   正反馈；
+/// - 15 拍（上一次改动）在**旧的 250 ms 保活**下，被控端每秒遥测只有 **3–14 fps**（`fps=4`
+///   占多数），于是要 **2–4 秒**连续安静才进得去；而补丁模式 e2e 是 5 ms、整帧是 166 ms，
+///   这段等待完全是白付的——真机补丁占比因此从 28% 掉到 2%。
+/// - 现在保活是 66 ms、静止桌面 ≈15 fps，8 拍 ≈0.53 s：既不会把一次 100 ms 级的停顿当静止，
+///   也不会让静止桌面白等几秒。
+///
+/// **为什么现在敢把门槛从 15 降回 8**：旧值是对「打断 = 退出 + 冷却」的补偿——关键帧请求
+/// 一来就退出补丁模式并进入 10–20 s 冷却（真机 5 次进入里有 3 次是 `keyframe_request`，
+/// 存活 38/203/292 ms，补丁占比因此从 28% 崩到 2%）。现在打断只重设基准、留在补丁模式
+/// （见 [`PatchMode::base_pending`]），误进一次的代价从「一张 IDR + 最长 20 s 冷却」降到
+/// 「一张 IDR，然后继续用补丁」，门槛就不必再靠「多等几秒」兜底了。
+///
+/// **不要用「把基准 IDR 改小」来解决误进**：基准帧必须是整幅重编的 IDR（补丁只覆盖
 /// 变化矩形，静态区域长期沿用这一帧，糊了就永不自我修复）。
-const PATCH_ENTER_TICKS: u32 = 15;
+const PATCH_ENTER_TICKS: u32 = 8;
 
 /// 补丁模式下空补丁（保活）的最大间隔。
 ///
@@ -755,10 +851,17 @@ impl PatchStaging {
 
 /// 退出补丁模式后的**基础重入冷却**（5 秒）。
 ///
-/// 退出原因（超预算、关键帧请求、活跃度回升）往往下一拍就消失；没有冷却时连续
+/// 退出原因（超预算、活跃度回升、装不下）往往下一拍就消失；没有冷却时连续
 /// [`PATCH_ENTER_TICKS`] 个安静拍就会重新进入，而进入前必须把一整帧基准帧写进
-/// 队列——「退出 → 全帧 → 再进入 → 再全帧」因此会变成正反馈。5 秒足够让一次突发过去，又
-/// 不至于让静止桌面长时间停在整帧模式。
+/// 队列——「退出 → 全帧 → 再进入 → 再全帧」因此会变成正反馈。
+///
+/// **为什么偏偏是 5 秒**（用真机字节数算的，`lt3/att1.log`）：静止桌面的整帧路径是
+/// 4 fps × 每帧 2.6–22 KB（均值 ≈11 KB）≈ **44 KB/s**，5 秒 ≈ **220 KB**——正好与一次
+/// 进入的基准 IDR（同批日志平均 223 KB）同量级。5 秒因此是「多等」与「多付一张 IDR」的
+/// **盈亏平衡点**：再短就为抖动反复付 IDR，再长就让静止桌面在 166 ms 的整帧路径上白待。
+///
+/// 冷却只对**自抖动**生效（见 [`PatchExitReason::penalizes_reentry`]）：被控制器关键帧
+/// 请求打断已经不再退出（见 [`PatchMode::begin_rebase`]），显示器/画质切换也不该连坐。
 ///
 /// **为什么不只是一个固定值**：真机上「用户每隔几秒碰一下鼠标/键盘」的桌面会让补丁模式
 /// 反复进入又立刻退出，每次固定 5 秒冷却仍会每 5 秒付一张基准 IDR。所以冷却按上一次补丁
@@ -838,8 +941,8 @@ enum PatchExitReason {
     NoPatches,
     /// 补丁尺寸与当前编码尺寸不符（几何已变）。
     SizeMismatch,
-    /// 控制器请求关键帧（它那块合成缓冲已不可信）。
-    KeyframeRequest,
+    /// 补丁模式内重设基准帧（发一张 IDR 重建控制器那块合成缓冲）迟迟写不出去。
+    RebaseTimeout,
     /// 切显示器/改画质/显示器热插拔等几何或参考链重建。
     Reconfigure,
 }
@@ -855,9 +958,35 @@ impl PatchExitReason {
             Self::StagingAge => "staging_age",
             Self::NoPatches => "no_patches",
             Self::SizeMismatch => "size_mismatch",
-            Self::KeyframeRequest => "keyframe_request",
+            Self::RebaseTimeout => "rebase_timeout",
             Self::Reconfigure => "reconfigure",
         }
+    }
+
+    /// 这次退出该不该让**重入冷却**指数退避（见 [`PATCH_REENTRY_HOLDOFF`]）。
+    ///
+    /// 退避的语义是「刚进去就被打断，说明桌面没那么静，下次多等一会」。真机日志
+    /// （`lt3/att1.log`）里 5 次退出的存活是 38 / 203 / 292 / 326 / 1042 ms，其中 3 次是
+    /// `keyframe_request`——那是**控制器**要 IDR，被控端补丁模式并没有抖动，把冷却翻到
+    /// 20 s 等于用控制器侧的故障惩罚静止桌面（补丁占比 28% → 2% 的直接原因）。
+    ///
+    /// 所以只有「内容自己抖」的退出才退避：
+    /// - [`Self::Activity`] / [`Self::Rects`] / [`Self::Budget`]：用户间歇操作，进出会循环；
+    /// - [`Self::StagingFull`] / [`Self::StagingAge`]：写侧跟不上，刚进去就退出，进去也没用。
+    ///
+    /// 几何/参考链重建（[`Self::Reconfigure`] / [`Self::SizeMismatch`] / [`Self::RebaseTimeout`]）
+    /// 不是自抖动：前者是用户主动换显示器/画质，后者是链路瞬时拥塞，恢复后应当立刻能再进
+    /// （`exit` 对它们连冷却都不设）。
+    const fn penalizes_reentry(self) -> bool {
+        matches!(
+            self,
+            Self::Activity
+                | Self::Rects
+                | Self::Budget
+                | Self::StagingFull
+                | Self::StagingAge
+                | Self::NoPatches
+        )
     }
 }
 
@@ -876,10 +1005,15 @@ struct PatchMode {
     mode: ScreenMode,
     /// 连续「低活跃采集」的次数。
     enter_streak: u32,
-    /// 已请求基准帧、正在等它真正写出。
-    enter_pending: bool,
+    /// 正在等一张**全帧基准**写出，以及它是怎么来的（进入 / 模式内重设）。
+    ///
+    /// 两种来源合用一个槽位，是因为它们的不变量完全相同（都必须等 `base_frame_sent`，
+    /// 都受 [`PATCH_BASE_TIMEOUT`] 约束，超时都必须回到一致的状态），差别只在成功/超时之后
+    /// 落到哪个模式、以及是否动 `entered_at`。旧实现只有一个布尔，于是「控制器要 IDR」只能
+    /// 走 [`Self::exit`]——那会把补丁模式整个拆掉并进冷却（真机回归的直接原因）。
+    base_pending: Option<BaseKind>,
     /// 等待基准帧的截止时刻。
-    enter_deadline: Option<std::time::Instant>,
+    base_deadline: Option<std::time::Instant>,
     /// 上一次真正发出 `RegionUpdate` 的时刻（空补丁保活用）。
     last_patch_sent: Option<std::time::Instant>,
     /// 补丁出码统计窗口的起点（进入补丁模式时重置）。
@@ -890,9 +1024,39 @@ struct PatchMode {
     holdoff_until: Option<std::time::Instant>,
     /// 本次补丁模式的进入时刻（算存活时长，驱动冷却退避）。`None` = 没进过/已退出。
     entered_at: Option<std::time::Instant>,
+    /// 最近一次**真正退出**补丁模式的时刻（`None` = 本会话还没退出过）。
+    ///
+    /// 只服务一件事：退出后的 [`PERIODIC_KEYFRAME_INTERVAL`] 兜底不该立刻命中。补丁模式里
+    /// 编码器根本不出帧，`last_keyframe_us` 会一路陈旧——一次 30 s 的补丁会话之后，退出后
+    /// 的第一拍就会看到一个「10 秒没关键帧」的假信号，白插一张 200–400 KB 的 IDR（而参考链
+    /// 完好，第一帧 P 帧就够）。
+    exited_at: Option<std::time::Instant>,
     /// 下一次退出后要用的重入冷却（基础 [`PATCH_REENTRY_HOLDOFF`]，短命会话翻倍，上限
     /// [`PATCH_REENTRY_HOLDOFF_MAX`]）。
     holdoff_backoff: Duration,
+}
+
+/// 正在等的那张全帧基准是怎么来的（见 [`PatchMode::base_pending`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseKind {
+    /// 连续安静后从视频模式**进入**补丁模式（成功后 `mode = Patches` 并记存活起点）。
+    Enter,
+    /// 已经在补丁模式里，因控制器 `RequestKeyframe` 需要一张新的 IDR 当基准。
+    /// 成功后**留在**补丁模式、不动 `entered_at`、不进冷却。
+    Rebase,
+}
+
+/// [`PatchMode::poll_base`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseOutcome {
+    /// 基准帧写进画面队列，已进入补丁模式。
+    Entered,
+    /// 基准帧写进画面队列，补丁模式**继续**（控制器要的那张 IDR 已上路）。
+    Rebased,
+    /// 进入超时：留在视频模式，连续计数清零。
+    EntryAbandoned,
+    /// 重设超时：基准帧迟迟写不出去，调用方应 [`exit_patch_mode`] 回全帧。
+    RebaseAbandoned,
 }
 
 impl PatchMode {
@@ -900,13 +1064,14 @@ impl PatchMode {
         Self {
             mode: ScreenMode::Video,
             enter_streak: 0,
-            enter_pending: false,
-            enter_deadline: None,
+            base_pending: None,
+            base_deadline: None,
             last_patch_sent: None,
             patch_window_start: std::time::Instant::now(),
             patch_window_bytes: 0,
             holdoff_until: None,
             entered_at: None,
+            exited_at: None,
             holdoff_backoff: PATCH_REENTRY_HOLDOFF,
         }
     }
@@ -934,9 +1099,25 @@ impl PatchMode {
         true
     }
 
-    /// 当前是否处于补丁模式。
+    /// 当前是否处于补丁模式（**状态**，含「正在重设基准」的短暂间隙）。
     fn is_patches(&self) -> bool {
         self.mode == ScreenMode::Patches
+    }
+
+    /// 本拍采集是否该走**补丁**路径。
+    ///
+    /// 与 [`Self::is_patches`] 不同：正在等一张新的全帧基准（[`BaseKind::Rebase`]）时，
+    /// 补丁模式本身还在（QoS 仍暂停、`HostStats.patch_mode` 仍为真），但采集必须切回**全帧**
+    /// ——基准帧只能由编码器产出。若继续采补丁，会产出一批「比基准更旧」的矩形：它们的
+    /// `capture_ts` 早于基准帧的采集时刻，排在基准之后到达就会把新画面盖回旧内容。
+    fn captures_patches(&self) -> bool {
+        self.is_patches() && self.base_pending.is_none()
+    }
+
+    /// 最近一次退出补丁模式是否发生在 `window` 之内（供周期 IDR 兜底判「刚离开补丁模式」）。
+    fn recently_exited(&self, window: Duration, now: std::time::Instant) -> bool {
+        self.exited_at
+            .is_some_and(|at| now.saturating_duration_since(at) < window)
     }
 
     /// 用一次**视频**采集的变化面积推进进入判据。
@@ -958,8 +1139,8 @@ impl PatchMode {
             }
             self.holdoff_until = None;
         }
-        // 已经在等基准帧：不重复触发（否则每帧都会重置截止时刻）。
-        if self.enter_pending {
+        // 已经在等基准帧（进入或重设）：不重复触发（否则每帧都会重置截止时刻）。
+        if self.base_pending.is_some() {
             return false;
         }
         if changed_permille <= PATCH_ENTER_PERMILLE {
@@ -970,36 +1151,63 @@ impl PatchMode {
         if self.enter_streak < PATCH_ENTER_TICKS {
             return false;
         }
-        self.enter_pending = true;
-        self.enter_deadline = Some(now + PATCH_BASE_TIMEOUT);
+        self.base_pending = Some(BaseKind::Enter);
+        self.base_deadline = Some(now + PATCH_BASE_TIMEOUT);
+        true
+    }
+
+    /// 补丁模式内**重设基准**：等一张新的 IDR 写出，然后留在补丁模式。
+    ///
+    /// 控制器发 `RequestKeyframe` 的语义是「我那块持久 NV12 缓冲已经不可信」——它要的正是一张
+    /// 整幅重编的 IDR，而这张 IDR 恰恰就是补丁模式要求的**合法基准**。旧实现把它当退出信号
+    /// （`exit_patch_mode(KeyframeRequest)` + 10–20 s 冷却），于是「控制器要 IDR」变成「补丁
+    /// 模式消失」，真机 5 次进入里 3 次这么被打断，补丁占比从 28% 掉到 2%。
+    ///
+    /// 重设期间：采集切回全帧（[`Self::captures_patches`] 变假）、补丁暂存区由调用方清空、
+    /// 到达的补丁采集结果丢弃——它们都**早于**基准帧的采集时刻，内容已包含在基准里。
+    /// 已经在等基准（`Enter` 或又一次 `Rebase`）时返回 `false`：那张基准本来就是 IDR。
+    fn begin_rebase(&mut self, now: std::time::Instant) -> bool {
+        if !self.is_patches() || self.base_pending.is_some() {
+            return false;
+        }
+        self.base_pending = Some(BaseKind::Rebase);
+        self.base_deadline = Some(now + PATCH_BASE_TIMEOUT);
         true
     }
 
     /// 在采集节拍上推进「等基准帧」的状态。
-    ///
-    /// `Some(true)` = 已进入补丁模式；`Some(false)` = 超时放弃；`None` = 继续等（仍在视频模式）。
-    fn poll_entry(&mut self, base_sent: bool, now: std::time::Instant) -> Option<bool> {
-        if !self.enter_pending {
-            return None;
-        }
+    fn poll_base(&mut self, base_sent: bool, now: std::time::Instant) -> Option<BaseOutcome> {
+        let kind = self.base_pending?;
         if base_sent {
-            self.mode = ScreenMode::Patches;
-            self.enter_pending = false;
-            self.enter_deadline = None;
-            // 基准帧刚发出，保活与带宽窗口都从这里起算；存活时长也从这里起算。
+            self.base_pending = None;
+            self.base_deadline = None;
+            // 基准帧刚写出：保活与带宽窗口都从这里起算。
             self.last_patch_sent = Some(now);
             self.patch_window_start = now;
             self.patch_window_bytes = 0;
-            self.entered_at = Some(now);
-            Some(true)
-        } else if self.enter_deadline.is_some_and(|deadline| now >= deadline) {
-            self.enter_pending = false;
-            self.enter_deadline = None;
-            self.enter_streak = 0;
-            Some(false)
-        } else {
-            None
+            return Some(match kind {
+                BaseKind::Enter => {
+                    self.mode = ScreenMode::Patches;
+                    // 存活时长只在**真正进入**时起算；重设基准不该把一次长命会话重置成
+                    // 「刚进去」（那会让下一次退出的冷却退避判错）。
+                    self.entered_at = Some(now);
+                    BaseOutcome::Entered
+                }
+                BaseKind::Rebase => BaseOutcome::Rebased,
+            });
         }
+        if self.base_deadline.is_some_and(|deadline| now >= deadline) {
+            self.base_pending = None;
+            self.base_deadline = None;
+            return Some(match kind {
+                BaseKind::Enter => {
+                    self.enter_streak = 0;
+                    BaseOutcome::EntryAbandoned
+                }
+                BaseKind::Rebase => BaseOutcome::RebaseAbandoned,
+            });
+        }
+        None
     }
 
     /// 退出补丁模式并清掉进入判据的历史（几何/参考已失效，需要重新积累）。
@@ -1010,7 +1218,8 @@ impl PatchMode {
     /// 冷却按上一次补丁模式的**存活时长**指数退避（见 [`PATCH_SHORT_SESSION`]）：短命会话
     /// 翻倍（5 → 10 → 20 秒，[`PATCH_REENTRY_HOLDOFF_MAX`] 封顶），长命会话归零回基础值。
     /// 真机上「用户每隔几秒碰一下鼠标/键盘」的桌面正是「每 3 秒一张基准 IDR」的来源，固定
-    /// 冷却挡不住这种抖动。
+    /// 冷却挡不住这种抖动。**退避只对自抖动生效**（[`PatchExitReason::penalizes_reentry`]）：
+    /// 被控制器关键帧请求打断、用户切显示器/画质都不该让静止桌面被罚站 20 秒。
     ///
     /// 退出原因在这里统一记一条 `info!`（与「进入脏矩形补丁模式」对称）：调用点只负责给出
     /// [`PatchExitReason`]，不必各打各的日志——现场日志（info 级）里原先什么都看不到，只能
@@ -1022,25 +1231,38 @@ impl PatchMode {
             .take()
             .map(|at| now.saturating_duration_since(at));
         let was_patches = self.mode == ScreenMode::Patches;
-        if let Some(dwell) = dwell {
-            if dwell < PATCH_SHORT_SESSION {
-                // 进去不到两秒就被打断：桌面并没真的静下来，下一次冷却翻倍。
-                self.holdoff_backoff = self
-                    .holdoff_backoff
-                    .saturating_mul(2)
-                    .min(PATCH_REENTRY_HOLDOFF_MAX);
-            } else if dwell >= PATCH_SHORT_SESSION * 2 {
-                // 撑过两倍阈值：这次进入确实有收益，退避归零。
-                self.holdoff_backoff = PATCH_REENTRY_HOLDOFF;
+        if reason.penalizes_reentry() {
+            if let Some(dwell) = dwell {
+                if dwell < PATCH_SHORT_SESSION {
+                    // 进去不到两秒就被内容自己打断：桌面并没真的静下来，下一次冷却翻倍。
+                    self.holdoff_backoff = self
+                        .holdoff_backoff
+                        .saturating_mul(2)
+                        .min(PATCH_REENTRY_HOLDOFF_MAX);
+                } else if dwell >= PATCH_SHORT_SESSION * 2 {
+                    // 撑过两倍阈值：这次进入确实有收益，退避归零。
+                    self.holdoff_backoff = PATCH_REENTRY_HOLDOFF;
+                }
             }
+        } else if dwell.is_some_and(|dwell| dwell >= PATCH_SHORT_SESSION * 2) {
+            // 非自抖动的退出也可能是「这次进入确实有收益」：照样允许退避回落，只是绝不上调。
+            self.holdoff_backoff = PATCH_REENTRY_HOLDOFF;
         }
         self.mode = ScreenMode::Video;
         self.enter_streak = 0;
-        self.enter_pending = false;
-        self.enter_deadline = None;
-        let holdoff = self.holdoff_backoff;
-        self.holdoff_until = Some(now + holdoff);
+        self.base_pending = None;
+        self.base_deadline = None;
+        // 冷却只对自抖动生效：几何/参考链重建退出后没必要再罚站 5 秒——重新进入本来就要
+        // 连续 [`PATCH_ENTER_TICKS`] 个安静拍，那已经是迟滞了。
+        let holdoff = if reason.penalizes_reentry() {
+            self.holdoff_backoff
+        } else {
+            Duration::ZERO
+        };
+        self.holdoff_until = (holdoff > Duration::ZERO).then(|| now + holdoff);
         if was_patches {
+            // 周期 IDR 兜底的滞后水位：见 [`Self::recently_exited`]。
+            self.exited_at = Some(now);
             let dwell_ms = dwell.map_or(0, |dwell| {
                 u64::try_from(dwell.as_millis()).unwrap_or(u64::MAX)
             });
@@ -1048,6 +1270,7 @@ impl PatchMode {
                 reason = reason.as_str(),
                 dwell_ms,
                 holdoff_ms = u64::try_from(holdoff.as_millis()).unwrap_or(u64::MAX),
+                penalized = reason.penalizes_reentry(),
                 "退出脏矩形补丁模式"
             );
         }
@@ -1266,21 +1489,76 @@ fn exit_patch_mode(
     schedule_capture(capture_tick, next_capture_at, Instant::now());
 }
 
-/// 关键帧请求的**去重窗口**（350 ms）。
+/// 补丁模式内**重设基准**：发一张 IDR 全帧、留在补丁模式（不退出、不进冷却）。
 ///
-/// 真机日志（Windows → Windows、QSV 1080p@30、10 Mbps、Punch）：74 秒会话 595 帧里 63 个
-/// IDR，占 51% 字节、**75% 的写线时间**；其中 0.8 秒内打出 4 个 ~240 KB 的 IDR，
-/// 246199 / 246117 字节几乎相同——同一幅画面被反复重编。控制器在 `awaiting_keyframe` 期间
-/// 每 400 ms 重发一次请求，而被控端「有请求就置 `force_keyframe`」，于是每个请求都变成一个
-/// 整帧尖峰；一帧 IDR 从编码到写完要 190+ ms，这段时间里到达的请求完全是在为**已经在路上**
-/// 的关键帧重复付费。
+/// 触发点是控制器 `RequestKeyframe`：它那块持久 NV12 合成缓冲已不可信，要的是一张整幅重编
+/// 的 IDR——而这张 IDR 恰好满足补丁模式对「基准必须是 IDR」的要求（补丁只覆盖变化矩形，
+/// 静态区域会长期沿用基准，基底糊了就永不自我修复）。所以正确动作是「换基底、继续补丁」，
+/// 而不是「退出补丁 + 冷却 + 回整帧」，后者把控制器侧的一次故障放大成 10–20 s 的整帧窗口
+/// （真机：5 次进入里 3 次被 `keyframe_request` 打断，存活 38/203/292 ms，补丁占比 2%）。
 ///
-/// 窗口取 350 ms 的依据是控制器 400 ms 的重发周期，它必须**严格小于**它：
-/// ① 被吸收的请求不会让控制器永久卡在 `awaiting_keyframe`——下一次重发必然落在窗口之外，
-///    一定会被满足；
-/// ② 若那个 IDR 真的在链路上丢了，最坏也只是多等一个重发周期（≈400 ms），而不是永久抑制。
-/// 取到 400 ms 以上就把「重发」也吞掉了，那就不再是去重。
-const KEYFRAME_DEDUP_WINDOW: Duration = Duration::from_millis(350);
+/// 三件必须一起做的事：
+/// - **清暂存区**：里面是重设之前那批补丁，排到新基准之后会把旧内容盖到新画面上；
+/// - **采一帧新的全帧**（`force_keyframe` + `force_encode` + 立刻到期）：基准必须是这一秒的
+///   画面，不能复用通道里在途的旧帧；
+/// - **清 `base_frame_sent`**：它是「基准已进画面队列」的信号，必须在请求发出前复位，否则
+///   一个陈旧的 `true` 会让 [`PatchMode::poll_base`] 当场判定重设完成、补丁立刻恢复。
+///
+/// 顺序不变量与进入时完全相同：补丁与新基准走**同一条画面 FIFO**，`poll_base` 只在编码任务
+/// 确认基准帧**进入出站队列**之后才让 `captures_patches()` 重新为真，所以之后的 `RegionUpdate`
+/// 必然排在它后面。
+///
+/// 返回 `false` 表示没有发起重设（不在补丁模式，或已经在等一张基准帧——那张本来就是 IDR）。
+fn rebase_patch_base(
+    mode: &mut PatchMode,
+    staging: &mut PatchStaging,
+    force_keyframe: &mut bool,
+    force_encode: &mut bool,
+    base_frame_sent: &AtomicBool,
+    capture_tick: &mut Pin<Box<Sleep>>,
+    next_capture_at: &mut Instant,
+) -> bool {
+    if !mode.begin_rebase(std::time::Instant::now()) {
+        return false;
+    }
+    staging.clear();
+    *force_keyframe = true;
+    *force_encode = true;
+    base_frame_sent.store(false, Ordering::Relaxed);
+    schedule_capture(capture_tick, next_capture_at, Instant::now());
+    true
+}
+
+/// 关键帧请求的**去重窗口**（1.2 秒）。
+///
+/// 历史：旧值 350 ms，取「严格小于控制器的 400 ms 重发周期」——它的前提是「控制器的重发
+/// 就是有效恢复路径」。真机日志（`lt3/att2.log`，91 s）推翻了那个前提：关键帧请求是**成簇**
+/// 的，控制器侧一次丢帧事件会连发 2–4 次，实测间隔 **421–800 ms（均值 ≈660 ms）**：
+///
+/// ```text
+/// 11:18:01.382 → 02.045 → 02.723   （663 ms / 678 ms）
+/// 11:18:08.005 → 08.732 → 09.436   （726 ms / 704 ms）
+/// 11:18:40.911 → 41.711 → 42.258 → 42.916
+/// ```
+///
+/// 一次事件因此换回 **3 张 IDR**（91 s 里 27 张 / 5.75 MB / 39% 带宽，其中 25 张的
+/// `changed_permille=0`——画面根本没变，纯粹为恢复参考链重编）。350 ms 的窗口挡不住 660 ms
+/// 的连发，每张 IDR 又各自引发一次控制器解码停顿（§2.1：DXVA 回读 445 ms），形成闭环。
+///
+/// **1.2 秒**的依据是把「一张 IDR 真正生效」的时间加起来（同一份日志）：
+/// - 写完到链路上：`write_us` 峰值 **281 ms**（392 KB 的 IDR）；
+/// - 单向 RTT：**8–40 ms**；
+/// - 控制器解码：`dec` 均值 61 ms、峰值 **516 ms**；
+///
+/// 最坏 ≈ 837 ms。1.2 s 覆盖它并留 ~43% 余量，同时 **< 2 × 660 ms**：一簇 3 张里最多吸收
+/// 2 张，下一张（≈1.3 s）必然被满足。**这不等于「抑制恢复」**：恢复的真正兜底在控制器侧
+/// （`awaiting_keyframe` 的清除时机），被控端只负责别为同一幅画面反复重编。
+///
+/// 用户手动请求（控制器侧的 `Manual`）与这条路径共用 `SessionMessage::RequestKeyframe`，
+/// 线上没有区分字段：做不到「手动立刻生效」而「恢复请求去重」，只能在控制器侧绕开本窗口
+/// （例如手动请求先清掉它自己的 `awaiting_keyframe` 再发）。这条限制写在
+/// `rt-perf/agent-c.md` 里，改协议不在本次范围。
+const KEYFRAME_DEDUP_WINDOW: Duration = Duration::from_millis(1200);
 
 /// IDR 在途/刚写出的共享观测点（进程内，**不上线**）。
 ///
@@ -2338,13 +2616,22 @@ pub async fn run_controlled(
                 // 它只兜「控制端整段没恢复」（丢包风暴、请求被限频吞掉）；正常会话里静止 P 帧
                 // 保活已经让画面持续流动，这个分支几乎不会命中。
                 //
+                // **补丁模式里不发**：编码器根本不跑，没有参考链要刷新（真机 `att1.log` 里
+                // 「周期兜底」一条都没有命中）。**刚离开补丁模式也不发**：`last_keyframe_us`
+                // 在补丁期间不会推进，一次 30 s 的补丁会话结束后它会显得「30 秒没关键帧」，
+                // 于是退出的第一拍就白插一张 200–400 KB 的 IDR——而退出后的第一帧 P 帧就够
+                // （补丁不碰参考链）。判据因此取二者中较新的那个时刻。
+                //
                 // `last_keyframe_us == 0` = 还没有关键帧（会话刚起）：跳过，等首帧 IDR 写值，
                 // 否则会话一开始就会白插一个重复的 IDR。`force_keyframe` 已为真时也不必重复。
                 let last_kf_us = last_keyframe_us.load(Ordering::Relaxed);
                 let periodic_us = u64::try_from(PERIODIC_KEYFRAME_INTERVAL.as_micros())
                     .unwrap_or(u64::MAX);
+                let patch_recent =
+                    screen_mode.recently_exited(PERIODIC_KEYFRAME_INTERVAL, std::time::Instant::now());
                 if screen_mode.mode == ScreenMode::Video
                     && !force_keyframe
+                    && !patch_recent
                     && last_kf_us != 0
                     && crate::clock::now_us().saturating_sub(last_kf_us) >= periodic_us
                 {
@@ -2643,9 +2930,14 @@ pub async fn run_controlled(
                                 }
                             }
                             CapturePayload::Patches(patches) => {
-                                if !screen_mode.is_patches() {
-                                    // 切模式/放弃之后才回来的在途补丁采集：丢掉即可。
-                                    // `capture_deadline` 已在上面清掉，下一拍照常采集。
+                                if !screen_mode.captures_patches() {
+                                    // 两种情形都丢掉，且都是**安全**的：
+                                    // - 已经不在补丁模式：切模式之后才回来的在途采集；
+                                    // - 正在重设基准（`RequestKeyframe`）：这批矩形的采集时刻
+                                    //   早于即将发出的 IDR，其内容已包含在那张整帧里，排在基准
+                                    //   之后到达只会把新画面盖回旧内容。
+                                    // 补丁「绝不静默丢弃」针对的是**补丁模式中**的补丁；这里是
+                                    // 有意的、由一张完整全帧兜底的作废，故记 debug 即可。
                                     debug!(capture_us, "丢弃补丁模式之外的补丁采集结果");
                                 } else if let Some(batch) = patches {
                                     let PatchBatch {
@@ -2810,8 +3102,7 @@ pub async fn run_controlled(
                                                     );
                                                     // 半批已发出：控制端合成缓冲缺块，必须一帧完整
                                                     // IDR。它与控制器自己的 `RequestKeyframe` 走
-                                                    // **同一道去重闸门**——同一 IDR 不在 0.8 秒里打
-                                                    // 四遍。
+                                                    // **同一道去重闸门**（见 [`KEYFRAME_DEDUP_WINDOW`]）。
                                                     if partial
                                                         && !keyframe_request_is_redundant(
                                                             force_keyframe,
@@ -2908,13 +3199,39 @@ pub async fn run_controlled(
                 warn!(count = capture_timeouts, "在途采集超过看门狗时限，判定已丢失");
             }
             () = &mut capture_tick, if capture => {
-                // 进入判据：基准帧**真正写出**之后才切模式（顺序不变量，见模块文档）。
-                match screen_mode.poll_entry(
+                // 进入判据 / 模式内重设基准：基准帧**真正写出**之后才切到补丁采集（顺序
+                // 不变量，见模块文档）。
+                match screen_mode.poll_base(
                     base_frame_sent.load(Ordering::Relaxed),
                     std::time::Instant::now(),
                 ) {
-                    Some(true) => info!("进入脏矩形补丁模式"),
-                    Some(false) => debug!("等待基准帧超时，放弃进入补丁模式"),
+                    Some(BaseOutcome::Entered) => info!("进入脏矩形补丁模式"),
+                    Some(BaseOutcome::Rebased) => info!(
+                        "补丁模式基准帧已重设（IDR 已进画面队列），继续补丁模式"
+                    ),
+                    Some(BaseOutcome::EntryAbandoned) => {
+                        debug!("等待基准帧超时，放弃进入补丁模式");
+                    }
+                    Some(BaseOutcome::RebaseAbandoned) => {
+                        // 重设的 IDR 一秒都没能写进画面队列：写侧真的堵住了（不是补丁自己
+                        // 的问题）。回全帧，让编码器继续出 P 帧。**不必**在这里补判「半批」：
+                        // 重设时暂存区已清空，而那张没发出去的 IDR 仍挂在 `force_keyframe` /
+                        // 编码任务的 `pending_keyframe` 上——背压一缓解它会照常发出，届时把
+                        // 控制器那块缓冲整体覆盖。
+                        warn!(
+                            seconds = PATCH_BASE_TIMEOUT.as_secs_f32(),
+                            "补丁模式重设基准帧超时，回到全帧"
+                        );
+                        exit_patch_mode(
+                            &mut screen_mode,
+                            &mut patch_staging,
+                            &mut force_encode,
+                            &mut last_changed_permille,
+                            &mut capture_tick,
+                            &mut next_capture_at,
+                            PatchExitReason::RebaseTimeout,
+                        );
+                    }
                     None => {}
                 }
                 // 补丁暂存区：每拍先按 FIFO 补投（非阻塞），再判滞留是否已超龄。
@@ -2993,12 +3310,13 @@ pub async fn run_controlled(
                     let screen = Arc::clone(&screen);
                     let display_now = display_id;
                     let generation_now = capture_generation;
-                    let request = match screen_mode.mode {
-                        ScreenMode::Patches => CaptureRequest::Patches {
+                    let request = if screen_mode.captures_patches() {
+                        CaptureRequest::Patches {
                             scale: encode.scale,
                             max_width: max_encode_width,
-                        },
-                        ScreenMode::Video => CaptureRequest::Frame { gpu: gpu_capture },
+                        }
+                    } else {
+                        CaptureRequest::Frame { gpu: gpu_capture }
                     };
                     let tx = capture_tx.clone();
                     // 采集是阻塞调用（xcap 的 portal 路径可能数秒），整体挪出 async worker。
@@ -3348,42 +3666,67 @@ pub async fn run_controlled(
                             }
                         }
                         SessionMessage::RequestKeyframe { display } => {
-                            // 控制器解码失败/丢弃了参考帧时的恢复请求。补丁模式下的「参考帧」就是
-                            // 控制器那块持久缓冲：请求到达即说明它已不可信，必须回全帧重发 IDR。
-                            if screen_mode.is_patches() {
-                                exit_patch_mode(
+                            // 控制器解码失败/丢弃了参考帧时的恢复请求。它要的就是一张整幅重编的
+                            // IDR：在补丁模式下这张 IDR 同时是**新的合法基准**，所以动作是
+                            // 「换基底、继续补丁」，**不是**退出补丁模式（见 [`rebase_patch_base`]
+                            // 与 [`PatchMode::begin_rebase`]：旧实现退出 + 10–20 s 冷却，把控制器
+                            // 侧的一次故障放大成整帧窗口，真机补丁占比因此从 28% 掉到 2%）。
+                            //
+                            // **同一个 IDR 不连打**（`display` 也必须匹配：请求别的显示器与当前
+                            // 参考链无关）：控制器侧一次丢帧事件会连发 2–4 次请求（实测间隔
+                            // 421–800 ms，见 [`KEYFRAME_DEDUP_WINDOW`]），而一张 IDR 从编码到
+                            // 写完要 190–281 ms、控制器解码还要 61 ms 均值 / 516 ms 峰值。已有
+                            // IDR 在途、或有待发的 IDR、或刚写出不到窗口，一律吸收——但**必须
+                            // 记一条日志**：现场看不到的话，「控制器一直在请求、画面却不动」
+                            // 与「请求被吞了」两种情况无法区分。
+                            if display != display_id {
+                                // `display` 会与 `tracing::display` 撞名（见 `SelectDisplay` 分支
+                                // 的同款处理），字段值改用一个别名。
+                                let requested = display;
+                                debug!(
+                                    requested,
+                                    current = display_id,
+                                    "忽略非当前显示器的关键帧请求"
+                                );
+                            } else if keyframe_request_is_redundant(
+                                force_keyframe,
+                                idr_tracker.in_flight(),
+                                idr_tracker.last_written_us(),
+                                crate::clock::now_us(),
+                            ) {
+                                let since_written_ms = {
+                                    let last = idr_tracker.last_written_us();
+                                    let now = crate::clock::now_us();
+                                    if last == 0 { None } else { Some(now.saturating_sub(last) / 1000) }
+                                };
+                                info!(
+                                    in_flight = idr_tracker.in_flight(),
+                                    force_keyframe,
+                                    since_written_ms = ?since_written_ms,
+                                    window_ms = u64::try_from(KEYFRAME_DEDUP_WINDOW.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "去重：已有 IDR 在途/待发或刚写出，吸收重复的关键帧请求"
+                                );
+                            } else if screen_mode.is_patches() {
+                                // 补丁模式：发一张 IDR 当**新基准**，然后留在补丁模式。
+                                if rebase_patch_base(
                                     &mut screen_mode,
                                     &mut patch_staging,
+                                    &mut force_keyframe,
                                     &mut force_encode,
-                                    &mut last_changed_permille,
+                                    &base_frame_sent,
                                     &mut capture_tick,
                                     &mut next_capture_at,
-                                    PatchExitReason::KeyframeRequest,
-                                );
-                            }
-                            // 「请求了就一定 IDR」（仅限请求的就是当前显示器）：这是控制器明确
-                            // 报告参考帧不可信，与补丁模式自己退出时的 P 帧语义不同。
-                            //
-                            // 但**同一个 IDR 不连打**：控制器在 `awaiting_keyframe` 期间每 400 ms
-                            // 重发一次，而一帧 IDR 从编码到写完要 190+ ms。真机日志里 0.8 秒 4 个
-                            // ~240 KB 的 IDR（246199 / 246117 字节几乎相同）就是这么来的。已有
-                            // IDR 在途、或刚写出不到 [`KEYFRAME_DEDUP_WINDOW`] 时直接吸收；
-                            // 窗口（350 ms）严格小于重发周期（400 ms），所以被吸收的请求会在
-                            // 下一次重发时得到满足——若那个 IDR 真的丢了，最多多等一个周期。
-                            if display == display_id {
-                                if keyframe_request_is_redundant(
-                                    force_keyframe,
-                                    idr_tracker.in_flight(),
-                                    idr_tracker.last_written_us(),
-                                    crate::clock::now_us(),
                                 ) {
-                                    debug!(
-                                        in_flight = idr_tracker.in_flight(),
-                                        "已有 IDR 在途或刚写出，吸收重复的关键帧请求"
+                                    info!(
+                                        "补丁模式下收到关键帧请求：发一张 IDR 重建基准并留在补丁模式"
                                     );
                                 } else {
-                                    force_keyframe = true;
+                                    // 已经在等基准帧（进入或上一次重设）：那张本来就是 IDR。
+                                    debug!("已在等待基准帧，关键帧请求由在途 IDR 满足");
                                 }
+                            } else {
+                                force_keyframe = true;
                             }
                         }
                         SessionMessage::Clipboard { text } => {
@@ -3540,9 +3883,13 @@ pub async fn run_controlled(
 
 /// 计算一帧的 pacing 方案：`(每块字节数, 块间等待)`；`None` = 走原来的整帧发送。
 ///
-/// 抽成纯函数便于单测锁定两条上界：
+/// 抽成纯函数便于单测锁定三条上界：
 /// - 单个间隙 ≤ [`PACING_MAX_GAP`]（码率读数离谱时不会把一帧拖成秒级）；
-/// - 全部间隙之和 ≤ [`PACING_MAX_WAIT_FACTOR`] × 该帧自然串行时间。
+/// - 全部间隙之和 ≤ [`PACING_MAX_WAIT_FACTOR`] × 该帧自然串行时间；
+/// - **实际 sleep 的总量另有 [`PACING_MAX_TOTAL_WAIT`]（20 ms）预算**（由
+///   [`PacingBudget`] 在写侧扣减）——本函数返回的 `gap` 只是「每块名义上该等多久」，
+///   真机读数下第一块就会把预算用完，剩余各块连续写，限速交给传输层。`gap` 保留小块语义是
+///   为了不把整帧一次性灌进可靠层窗口，而不是为了按码率限速。
 ///
 /// `kbps == 0` 表示关闭（控制器侧永远如此）；小于 [`PACING_MIN_FRAME_BYTES`] 的帧返回 `None`
 /// ——它们本身就是交互延迟，加 sleep 只会更慢。
@@ -3582,10 +3929,10 @@ fn pacing_plan(len: usize, kbps: u32) -> Option<(usize, Duration)> {
 /// # 大帧 pacing
 ///
 /// screen 档里**编码后 ≥ [`PACING_MIN_FRAME_BYTES`] 的帧**（典型是 IDR）不整帧 `send`，而是
-/// 编码成一段线上字节后**按 [`PACING_CHUNK_BYTES`] 分块写**，块间按目标码率 sleep
-/// （[`pacing_plan`]）。理由：一帧 300 KB 在 6 Mbps 上是 400 ms 的串行化尖峰，它会把后面排队的
-/// 输入回显帧一起堵住；摊开写之后抖动相位被打散，瓶颈处也不容易成片丢包。小帧、ctrl、file、
-/// close 全部走原路径，行为不变。
+/// 编码成一段线上字节后**按 [`PACING_CHUNK_BYTES`] 分块写**，块间等待总量受
+/// [`PACING_MAX_TOTAL_WAIT`]（20 ms）约束（[`pacing_plan`] / [`PacingBudget`]）。分块只是
+/// 「别一次性灌进传输层」，20 ms 预算保证一帧最多多花 20 ms——限速交给传输层，不在应用层
+/// 按静态码率重复做。小帧、ctrl、file、close 全部走原路径，行为不变。
 pub(crate) async fn writer_loop(
     mut writer: FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
     mut rx: OutboundReceivers,
@@ -3765,7 +4112,25 @@ async fn write_screen(
     write_paced(writer, cancel, &bytes, chunk, gap, cancelled).await
 }
 
-/// 把已经编码好的线上字节按 `chunk` 分块写，块间 `sleep(gap)`（可取消）。
+/// 把一条**已经决定要走分块 pacing**的画面帧按 `chunk` 分块写，块间 `sleep` 受
+/// [`PACING_MAX_TOTAL_WAIT`] 约束（可取消）。
+///
+/// # 为什么要有总等待上限
+///
+/// 分块的本意只是「别把一整帧 400 KB 一次性灌进传输层」；**真正的限速器是传输层自己**：
+/// UDP 打洞路径的用户态可靠层接收窗口是 `MAX_RECV_WINDOW`(256 段) × 1200 B ≈ **307 KB**，
+/// 写满即阻塞等 ACK；直连/中继走 TCP，内核同样有流控。所以在应用层再按**静态目标码率**
+/// 摊一遍，是**重复限速**。
+///
+/// 真机代价（`lt3/att1.log`，91 s）：`pacing_plan` 给出 `gap = chunk_natural`
+/// （32 KiB / 10 Mbps ≈ 26 ms），一帧 392 KB 的 IDR 是 13 块 × 26 ms ≈ **310 ms**，而同一帧
+/// `write_us` 峰值实测正是 **310 ms**（p50 165 ms，平均 213 KB）——也就是说**传输本身只要几十
+/// 毫秒，剩下全是 sleep**。IDR 期间 `ctrl` 一次都轮不到（控制器 `input_q` 峰值 287 ms）。
+///
+/// 上限取 **20 ms**：一次 IDR 最多多花 20 ms（≈ 一个 RTT 的一半），同时仍保留「先写一块再等」
+/// 的削峰形状——只是不再为整帧付 300 ms。注意**不能**把另一条完整帧插进分块之间：会话帧是
+/// `[4 字节大端长度前缀][bincode]`，接收端按长度前缀恢复帧边界，帧内插字节会让整条流错位
+/// （`SessionCodec::encode_frame_owned` 返回的是一条完整帧，不是可分割的裸字节）。
 ///
 /// # 前提：`FramedWrite` 的内部缓冲是空的
 ///
@@ -3788,16 +4153,21 @@ async fn write_paced(
     cancelled: &mut bool,
 ) -> bool {
     let chunk = chunk.max(1);
+    // 整帧的块间等待预算：预算用完后剩余各块连续写（由传输层自己限速）。
+    let mut budget = PacingBudget::new();
     for (index, part) in bytes.chunks(chunk).enumerate() {
         // 第一块立刻写，块间才等：等待代表「上一块占用的链路时间」。
-        if index > 0 && !gap.is_zero() {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    *cancelled = true;
-                    return true;
+        if index > 0 {
+            let pause = budget.take(gap);
+            if !pause.is_zero() {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        *cancelled = true;
+                        return true;
+                    }
+                    () = sleep(pause) => {}
                 }
-                () = sleep(gap) => {}
             }
         }
         let written = tokio::select! {
@@ -7268,7 +7638,10 @@ mod tests {
             mode.observe_video(PATCH_ENTER_PERMILLE, now),
             "连续 {PATCH_ENTER_TICKS} 次低活跃才应请求基准帧"
         );
-        assert!(mode.enter_pending);
+        assert!(
+            mode.base_pending == Some(BaseKind::Enter),
+            "连续 {PATCH_ENTER_TICKS} 拍安静后应请求进入基准帧"
+        );
         // 已在等待基准帧时不重复触发。
         assert!(!mode.observe_video(0, now));
         assert_eq!(mode.mode, ScreenMode::Video, "基准未发出前不得切模式");
@@ -7370,7 +7743,7 @@ mod tests {
             (PatchExitReason::StagingAge, "staging_age"),
             (PatchExitReason::NoPatches, "no_patches"),
             (PatchExitReason::SizeMismatch, "size_mismatch"),
-            (PatchExitReason::KeyframeRequest, "keyframe_request"),
+            (PatchExitReason::RebaseTimeout, "rebase_timeout"),
             (PatchExitReason::Reconfigure, "reconfigure"),
         ] {
             assert_eq!(reason.as_str(), want);
@@ -7556,11 +7929,14 @@ mod tests {
         for _ in 0..PATCH_ENTER_TICKS {
             mode.observe_video(0, t0);
         }
-        assert_eq!(mode.poll_entry(false, t0 + Duration::from_millis(1)), None);
+        assert_eq!(
+            mode.poll_base(false, t0 + Duration::from_millis(1)),
+            None
+        );
         assert_eq!(mode.mode, ScreenMode::Video, "基准未发出前不得切模式");
         assert_eq!(
-            mode.poll_entry(true, t0 + Duration::from_millis(2)),
-            Some(true)
+            mode.poll_base(true, t0 + Duration::from_millis(2)),
+            Some(BaseOutcome::Entered)
         );
         assert_eq!(mode.mode, ScreenMode::Patches);
         assert!(mode.last_patch_sent.is_some(), "进入时保活计时从此刻起算");
@@ -7574,9 +7950,141 @@ mod tests {
         for _ in 0..PATCH_ENTER_TICKS {
             mode.observe_video(0, t0);
         }
-        assert_eq!(mode.poll_entry(false, t0 + PATCH_BASE_TIMEOUT), Some(false));
+        assert_eq!(
+            mode.poll_base(false, t0 + PATCH_BASE_TIMEOUT),
+            Some(BaseOutcome::EntryAbandoned)
+        );
         assert_eq!(mode.mode, ScreenMode::Video);
         assert_eq!(mode.enter_streak, 0, "放弃后连续计数必须清零");
+    }
+
+    /// **关键帧请求不再退出补丁模式**：它只重设基准，且重设期间采集切回全帧。
+    ///
+    /// 真机回归就是这一条：`exit_patch_mode(KeyframeRequest)` 把控制器侧的一次丢帧放大成
+    /// 「退出 + 10–20 s 冷却」，5 次进入里 3 次这么被打断（存活 38/203/292 ms），补丁占比
+    /// 从 28% 掉到 2%。
+    #[test]
+    fn keyframe_request_rebases_the_patch_base_without_leaving_the_mode() {
+        let t0 = Instant::now();
+        let mut mode = PatchMode::new();
+        // 先把状态机推进到「已在补丁模式里。」中途经过一次进入基准。
+        for _ in 0..PATCH_ENTER_TICKS {
+            mode.observe_video(0, t0);
+        }
+        assert_eq!(
+            mode.poll_base(true, t0 + Duration::from_millis(1)),
+            Some(BaseOutcome::Entered)
+        );
+        let entered_at = mode.entered_at.expect("进入时记存活起点");
+        assert!(mode.captures_patches(), "基准写出后采集应走补丁路径");
+
+        // 控制器要 IDR：请求重设基准。
+        assert!(mode.begin_rebase(t0 + Duration::from_millis(100)));
+        assert_eq!(mode.mode, ScreenMode::Patches, "重设期间**仍是**补丁模式");
+        assert!(
+            !mode.captures_patches(),
+            "重设期间采集必须切回全帧——基准帧只能由编码器产出"
+        );
+        // 重设请求不能被重复触发（那张 IDR 已经在路上）。
+        assert!(!mode.begin_rebase(t0 + Duration::from_millis(120)));
+        // 基准还没写出：继续等，不改模式。
+        assert_eq!(
+            mode.poll_base(false, t0 + Duration::from_millis(200)),
+            None
+        );
+        // 基准写出 → 留在补丁模式、不进冷却、存活起点不被重置。
+        assert_eq!(
+            mode.poll_base(true, t0 + Duration::from_millis(300)),
+            Some(BaseOutcome::Rebased)
+        );
+        assert_eq!(mode.mode, ScreenMode::Patches);
+        assert!(mode.captures_patches(), "重设完成后立刻恢复补丁采集");
+        assert_eq!(mode.entered_at, Some(entered_at), "存活起点不得被重设改写");
+        assert!(
+            mode.holdoff_until.is_none(),
+            "重设基准绝不能让静止桌面进入重入冷却"
+        );
+
+        // 重设超时（IDR 一秒都没写进画面队列）才回全帧，且这条退出**不**罚冷却。
+        let mut mode = PatchMode::new();
+        for _ in 0..PATCH_ENTER_TICKS {
+            mode.observe_video(0, t0);
+        }
+        mode.poll_base(true, t0 + Duration::from_millis(1));
+        assert!(mode.begin_rebase(t0 + Duration::from_millis(2)));
+        assert_eq!(
+            mode.poll_base(false, t0 + Duration::from_millis(2) + PATCH_BASE_TIMEOUT),
+            Some(BaseOutcome::RebaseAbandoned)
+        );
+        mode.exit(PatchExitReason::RebaseTimeout, t0 + Duration::from_millis(3));
+        assert_eq!(mode.mode, ScreenMode::Video);
+        assert!(
+            mode.holdoff_until.is_none(),
+            "重设超时是链路瞬时拥塞，不是自抖动：不该冷却"
+        );
+        assert_eq!(
+            mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF,
+            "非自抖动的退出也不该把退避翻倍"
+        );
+    }
+
+    /// 退避只惩罚**自抖动**，且非自抖动的退出连冷却都不设。
+    #[test]
+    fn reentry_holdoff_penalises_only_self_jitter() {
+        let t0 = Instant::now();
+        // 内容自己抖：Activity 退避、设冷却。
+        let mut mode = PatchMode::new();
+        mode.mode = ScreenMode::Patches;
+        mode.entered_at = Some(t0);
+        mode.exit(PatchExitReason::Activity, t0 + Duration::from_millis(100));
+        assert_eq!(mode.holdoff_backoff, Duration::from_secs(10));
+        assert_eq!(
+            mode.holdoff_until,
+            Some(t0 + Duration::from_millis(100) + Duration::from_secs(10))
+        );
+
+        // 同一次短会话，若退出原因是几何/参考链重建：不翻倍、也不设冷却。
+        let mut mode = PatchMode::new();
+        mode.mode = ScreenMode::Patches;
+        mode.entered_at = Some(t0);
+        mode.exit(PatchExitReason::Reconfigure, t0 + Duration::from_millis(100));
+        assert_eq!(
+            mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF,
+            "用户换显示器/画质不该被当成补丁抖动"
+        );
+        assert!(
+            mode.holdoff_until.is_none(),
+            "重建类退出后应立刻允许重新进入（迟滞已由连续安静拍提供）"
+        );
+
+        // 长命会话的退避归零对两类退出都成立。
+        let mut mode = PatchMode::new();
+        mode.holdoff_backoff = PATCH_REENTRY_HOLDOFF_MAX;
+        mode.mode = ScreenMode::Patches;
+        mode.entered_at = Some(t0);
+        mode.exit(PatchExitReason::Reconfigure, t0 + PATCH_SHORT_SESSION * 2);
+        assert_eq!(mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF);
+    }
+
+    /// 退出补丁模式后的**周期 IDR 兜底**必须滞后：补丁期间 `last_keyframe_us` 不推进。
+    #[test]
+    fn periodic_keyframe_is_suppressed_right_after_a_patch_session() {
+        let t0 = Instant::now();
+        let mut mode = PatchMode::new();
+        assert!(!mode.recently_exited(PERIODIC_KEYFRAME_INTERVAL, t0));
+
+        mode.mode = ScreenMode::Patches;
+        mode.entered_at = Some(t0);
+        let exited = t0 + Duration::from_secs(30);
+        mode.exit(PatchExitReason::Activity, exited);
+        assert!(
+            mode.recently_exited(PERIODIC_KEYFRAME_INTERVAL, exited + Duration::from_secs(1)),
+            "刚退出补丁模式时不得立刻插周期 IDR（退出后的第一帧 P 帧就够）"
+        );
+        assert!(!mode.recently_exited(
+            PERIODIC_KEYFRAME_INTERVAL,
+            exited + PERIODIC_KEYFRAME_INTERVAL
+        ));
     }
 
     /// 造一条补丁消息：`seed` 写进 `data`，便于断言暂存区/投递的 FIFO 顺序。
@@ -7722,14 +8230,23 @@ mod tests {
         assert!(keyframe_request_is_redundant(false, 0, now - window_us + 1, now));
         // 已经有一个待发的 IDR（force_keyframe 还没被编码任务消费）：吸收。
         assert!(keyframe_request_is_redundant(true, 0, 0, now));
-        // 恰好到达窗口边界：不再吸收（控制器 400 ms 的重发必须能穿透）。
+        // 恰好到达窗口边界：不再吸收。
         assert!(!keyframe_request_is_redundant(false, 0, now - window_us, now));
         // 从没写过 IDR、也没有在途：必须放行，否则会话早期的请求会被饿死。
         assert!(!keyframe_request_is_redundant(false, 0, 0, now));
-        // 安全前提写死在测试里：窗口必须**严格小于**控制器的 400 ms 重发周期。
+
+        // 窗口取值的两条边界（数字全部来自 `lt3/att2.log` 的 IDR 到达间隔与 §2 的耗时拆分）：
+        // ① 必须覆盖「一张 IDR 真正生效」的时间 = 写完（281 ms 峰值）+ RTT（≤40 ms）+
+        //    控制器解码（516 ms 峰值）≈ 837 ms，否则一簇请求里必然漏放一张；
         assert!(
-            KEYFRAME_DEDUP_WINDOW < Duration::from_millis(400),
-            "窗口不小于重发周期就会把「重发」也吞掉 = 永久抑制"
+            KEYFRAME_DEDUP_WINDOW >= Duration::from_millis(850),
+            "窗口小于「IDR 生效时间」就挡不住同一次丢帧事件的连发"
+        );
+        // ② 必须 < 2 × 实测请求间隔（≈660 ms → 1320 ms），否则一簇 3 张里的最后一张也会被
+        //    吞掉，控制器就要多等一个周期才恢复（真机 IDR 间隔 421–800 ms，均值 ≈660 ms）。
+        assert!(
+            KEYFRAME_DEDUP_WINDOW < Duration::from_millis(1320),
+            "窗口不小于两个重发周期就不再是去重，而是抑制恢复"
         );
     }
 
@@ -7891,10 +8408,10 @@ mod tests {
             .message
     }
 
-    /// 端到端：低活跃 + H.264 + 采集源支持补丁 → 先发基准帧（P 帧），再发 `RegionUpdate`；
-    /// 控制器 `RequestKeyframe` 后必须退回全帧并重发 IDR。
+    /// 端到端：低活跃 + H.264 + 采集源支持补丁 → 先发基准帧，再发 `RegionUpdate`；
+    /// 控制器 `RequestKeyframe` 后**仍在补丁模式**：发一张 IDR 当新基准，然后补丁继续。
     #[tokio::test]
-    async fn patch_mode_sends_region_update_after_base_frame_and_exits_on_request() {
+    async fn patch_mode_rebases_on_request_and_keeps_sending_region_updates() {
         let (a, b) = tokio::io::duplex(256 * 1024);
         let plan = plan_controller_handshake("sess-1", "TOK", "111111111").expect("造握手材料");
         let screen = Arc::new(PatchyScreen::quiet());
@@ -7952,11 +8469,11 @@ mod tests {
             "应真的走补丁采集，而不是退回全帧"
         );
 
-        // 控制器请求关键帧（参考丢失/队列溢出）→ 被控端退出补丁模式并重发全帧 IDR。
+        // 控制器请求关键帧（参考丢失/队列溢出）→ 被控端发一张 IDR 当**新基准**，然后留在
+        // 补丁模式继续发补丁（旧行为是退出 + 10–20 s 冷却，见 [`PatchMode::begin_rebase`]）。
         //
-        // 先等过**去重窗口**：刚进补丁模式时基准 IDR 是刚刚写出的，窗口内到达的请求会被
-        // 吸收（真机上控制器在 `awaiting_keyframe` 期间每 400 ms 重发，重发必然落在窗口
-        // 之外）。这里等过窗口，验证的正是「重发会被满足」这条路径。
+        // 先等过**去重窗口**：刚进补丁模式时基准 IDR 是刚刚写出的，窗口内到达的请求会被吸收
+        // （真机上控制器的连发间隔 421–800 ms，必然有一张落在窗口之外被满足）。
         tokio::time::sleep(KEYFRAME_DEDUP_WINDOW + Duration::from_millis(50)).await;
         peer_writer
             .send(SessionFrame::control(SessionMessage::RequestKeyframe {
@@ -7964,6 +8481,7 @@ mod tests {
             }))
             .await
             .expect("发送关键帧请求应成功");
+        // ① 必须出现一张新的 IDR（它就是控制器要的基准）。
         let recovered = tokio::time::timeout(WAIT, async {
             loop {
                 match next_message(&mut peer_reader).await {
@@ -7979,7 +8497,24 @@ mod tests {
         .await;
         assert!(
             recovered.is_ok(),
-            "RequestKeyframe 后必须退出补丁模式并重发全帧 IDR"
+            "RequestKeyframe 后必须重发一张全帧 IDR（新基准）"
+        );
+        // ② 之后必须**继续**收到补丁：证明没有退出补丁模式（退出后会一直出全帧 P 帧）。
+        let patches_after = tokio::time::timeout(WAIT, async {
+            loop {
+                if let SessionMessage::RegionUpdate { rects, .. } =
+                    next_message(&mut peer_reader).await
+                {
+                    return rects;
+                }
+            }
+        })
+        .await;
+        assert!(
+            !patches_after
+                .expect("重设基准后应继续发补丁（不退出补丁模式）")
+                .is_empty(),
+            "重设后的补丁仍应带脏矩形"
         );
 
         cancel.cancel();
@@ -8287,6 +8822,112 @@ mod tests {
         // 874 ms），一帧绝不会因此被拖成秒级。
         let (_, slow_gap) = pacing_plan(300 * 1024, 300).expect("大帧应 pace");
         assert_eq!(slow_gap, PACING_MAX_GAP, "低码率下用单个间隙上限");
+    }
+
+    /// 真机会话的读数下，`pacing_plan` 的两个「上限」其实**都不生效**——真正生效的闸门是
+    /// [`PacingBudget`] 的 20 ms 总等待预算（见 `pacing_total_wait_is_capped_per_frame`）。
+    ///
+    /// 数字来自 `lt3/att1.log`（1080p H.264 / QSV / 10 Mbps 档位，91 s）：IDR 平均 213 KB、
+    /// 最大 392 KB，`write_us` p50 165 ms / 峰值 310 ms。按 `pacing_plan` 的公式：
+    ///
+    /// - 32 KiB @ 10 Mbps 的自然时间 = 26.2 ms，而 `PACING_MAX_GAP` 是 100 ms ⇒ 不封顶；
+    /// - 块间等待之和 = 串行时间减去**最后一块**（最后一块写完不必等）：213 KB 时 ≈ 157 ms
+    ///   （自然时间 175 ms）、392 KB 时 ≈ 315 ms（自然时间 321 ms），而总量上限是
+    ///   `PACING_MAX_WAIT_FACTOR`(2) × 自然时间 ⇒ 也不封顶。
+    ///
+    /// 也就是说 `pacing_plan` 自己**不提供任何实际约束**：它按 AIMD 码率把整帧摊开，恰好就是
+    /// 「按目标码率发完这些字节本来要多久」（实测 `write_us` 峰值 310 ms 与 392 KB @ 10 Mbps
+    /// 的 321 ms 吻合）。把 FACTOR 从 2 收到 1 或 0.5、把 GAP 从 100 ms 收到 30 ms，对真机读数
+    /// **一个字节都不会变**。真正的闸门只能是「整帧最多等多少」——那就是
+    /// [`PACING_MAX_TOTAL_WAIT`]（20 ms）；其余收益在「少发 IDR」
+    /// （见 [`PatchMode::begin_rebase`] 与 [`KEYFRAME_DEDUP_WINDOW`]）。
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "字节数与码率都远小于 2^53，转 f64 只用于算时长，不损精度"
+    )]
+    #[test]
+    fn pacing_caps_never_bind_at_the_real_session_rates() {
+        let chunk_natural = Duration::from_secs_f64(
+            (PACING_CHUNK_BYTES as f64 * 8.0) / (10_000.0 * 1000.0),
+        );
+        assert!(
+            chunk_natural < PACING_MAX_GAP,
+            "10 Mbps 上一块 32 KiB（{chunk_natural:?}）远小于单个间隙上限"
+        );
+        for bytes in [213 * 1024_usize, 392 * 1024] {
+            let (chunk, gap) = pacing_plan(bytes, 10_000).expect("真机 IDR 都应 pace");
+            assert_eq!(gap, chunk_natural, "{bytes} B 的块间等待就是自然串行时间");
+            let gaps = u32::try_from(bytes.div_ceil(chunk) - 1).expect("块数很少");
+            let frame_natural =
+                Duration::from_secs_f64((bytes as f64 * 8.0) / (10_000.0 * 1000.0));
+            let total = gap * gaps;
+            // 总等待 = 自然串行时间减去最后一块（最后一块写完不必等），所以差值不会超过
+            // 一个块的自然时间。
+            assert!(total <= frame_natural, "总等待不得超过自然串行时间");
+            assert!(
+                frame_natural.saturating_sub(total) <= chunk_natural,
+                "总等待与自然串行时间只应差最后一块（{chunk_natural:?}）"
+            );
+            assert!(
+                total <= frame_natural * PACING_MAX_WAIT_FACTOR,
+                "总量上限（2×）在真机读数下从不生效"
+            );
+        }
+    }
+
+    /// 分块写的**总等待上限**：一帧最多为 pacing 付 [`PACING_MAX_TOTAL_WAIT`]。
+    ///
+    /// 真机依据（`lt3/att1.log`）：`pacing_plan` 在 10 Mbps 上给出 26 ms 的块间等待，一帧
+    /// 392 KB 的 IDR 因此要 13 × 26 ≈ 310 ms，而实测 `write_us` 峰值正是 310 ms——传输本身只
+    /// 要几十毫秒，剩下全是应用层的 sleep（控制器 `input_q` 峰值 287 ms 由此而来）。改完之后
+    /// 一帧 IDR 的附加等待 ≤ 20 ms，剩余各块连续写、由传输层背压限速。
+    #[test]
+    fn pacing_total_wait_is_capped_per_frame() {
+        // 10 Mbps 的块间等待（26.2 ms）大于预算 ⇒ 第一块就把预算吃掉 20 ms，之后不再 sleep。
+        let gap = Duration::from_millis(26);
+        let mut budget = PacingBudget::new();
+        let first = budget.take(gap);
+        assert_eq!(first, PACING_MAX_TOTAL_WAIT, "第一块最多 sleep 到预算用完");
+        // 13 块的 IDR：其余 12 块一分钱都不等。
+        let mut total = first;
+        for _ in 0..12 {
+            total = total.saturating_add(budget.take(gap));
+        }
+        assert!(
+            total <= PACING_MAX_TOTAL_WAIT,
+            "一帧的全部块间等待不得超过预算（实得 {total:?}）"
+        );
+        assert_eq!(total, PACING_MAX_TOTAL_WAIT);
+
+        // gap 小于预算时保留小块语义：前几块照常等，预算用完后停止。
+        let gap = Duration::from_millis(6);
+        let mut budget = PacingBudget::new();
+        let mut total = Duration::ZERO;
+        let mut sleeps = 0_u32;
+        for _ in 0..10 {
+            let pause = budget.take(gap);
+            if pause.is_zero() {
+                break;
+            }
+            sleeps += 1;
+            total = total.saturating_add(pause);
+            assert!(total <= PACING_MAX_TOTAL_WAIT, "累计等待越界：{total:?}");
+        }
+        assert_eq!(
+            sleeps, 4,
+            "20 ms 预算 / 6 ms 一块 = 3 次整块 + 最后 2 ms（之后预算为零）"
+        );
+        assert_eq!(total, PACING_MAX_TOTAL_WAIT);
+
+        // 预算用完后 `take` 恒为零（调用方据此连续写完剩余各块）。
+        let mut budget = PacingBudget::new();
+        let _ = budget.take(Duration::from_secs(1));
+        for _ in 0..5 {
+            assert!(
+                budget.take(gap).is_zero(),
+                "预算耗尽后不得再 sleep"
+            );
+        }
     }
 
     /// 暂存区保持 FIFO：`FileDone` 绝不能越过尚未投递的 `FileChunk`。
