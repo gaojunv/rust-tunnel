@@ -36,6 +36,10 @@ path = "src/bin/mft_gpu_probe.rs"
 name = "win-video-patch-probe"
 path = "src/bin/patch_probe.rs"
 
+[[bin]]
+name = "decode-stall-probe"
+path = "src/bin/decode_stall_probe.rs"
+
 [target.'cfg(windows)'.dependencies]
 # WinRT（WGC）+ Win32（D3D11/DXGI/GDI）。与 client-gui 已有的 windows 0.62 共用同一份
 # 依赖图，不额外引入大版本。

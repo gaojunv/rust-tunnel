@@ -35,6 +35,11 @@
 mod color;
 mod dxva;
 
+pub use dxva::{
+    MapMode, ReadbackBreakdown, ReadbackOptions, ReadbackPhase, WarmUp,
+    DEFAULT_READBACK_BUDGET_US, READBACK_BUDGET_ENV,
+};
+
 use crate::WinVideoError;
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -67,6 +72,8 @@ const HNS_PER_SECOND: i64 = 10_000_000;
 const MAX_OUTPUT_TYPES: u32 = 64;
 /// 调用方未提供输出样本时，缓冲区的额外余量。
 const OUTPUT_BUFFER_SLACK: u32 = 4096;
+/// `readback_budget_skip` 日志的限频间隔：每秒最多一条。
+const SKIP_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 解码器实际协商到的输出色度布局。
 ///
@@ -214,6 +221,14 @@ struct DisplayRect {
 }
 
 /// 一个可复用的 Media Foundation H.264 解码器。
+//
+// 这些 bool 都是解码器**状态机**的不同维度（是否自供样本、是否真的收到过 DXGI
+// 样本、告警是否已打过、本帧是否因回读超预算被放弃），彼此独立、语义各不相同；
+// 合并成枚举只会让调用点更难读。
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "四个独立的状态标志，语义不同且各自单独判读"
+)]
 pub struct H264Decoder {
     transform: IMFTransform,
     output: OutputFormat,
@@ -245,6 +260,20 @@ pub struct H264Decoder {
     /// 在每次 `decode()` 开头清零、随解码过程累加；`decode()` 返回 `Err` 时仍是
     /// **本次已经发生**的那部分读数（例如送包成功、出帧失败）。
     last_timings: DecodePhaseTimings,
+    /// 最近一次 `decode()` 里 DXVA 回读的三段细分（微秒）。
+    ///
+    /// 与 [`Self::last_timings`] 同寿命、同清零时机；软件路径恒为零。
+    last_readback: dxva::ReadbackBreakdown,
+    /// 回读诊断选项（默认 = 生产行为；重建解码器时原样保留）。
+    readback_options: ReadbackOptions,
+    /// 最近一次 `decode()` 是否因为回读超出预算而**放弃了一帧**。
+    last_readback_skipped: bool,
+    /// 本进程累计被预算放弃的帧数（只增，供日志/探针读数）。
+    readback_skip_count: u64,
+    /// 上一条 `readback_budget_skip` 日志的时刻（限频用）。
+    last_skip_log: Option<Instant>,
+    /// 当前正在解码的访问单元是否含 IDR slice（决定回读要不要强制阻塞）。
+    current_access_unit_has_idr: bool,
 }
 
 impl std::fmt::Debug for H264Decoder {
@@ -349,7 +378,8 @@ impl H264Decoder {
         output_mode: H264OutputMode,
     ) -> Result<Self, WinVideoError> {
         let pipeline = create_pipeline(width, height, DEFAULT_FPS, preference)?;
-        Ok(Self {
+        let readback_options = ReadbackOptions::production();
+        let mut decoder = Self {
             transform: pipeline.transform,
             output: pipeline.output,
             requested_width: width,
@@ -366,7 +396,18 @@ impl H264Decoder {
             dxgi_seen: false,
             warned_no_dxgi: false,
             last_timings: DecodePhaseTimings::default(),
-        })
+            last_readback: dxva::ReadbackBreakdown::default(),
+            readback_options,
+            last_readback_skipped: false,
+            readback_skip_count: 0,
+            last_skip_log: None,
+            current_access_unit_has_idr: false,
+        };
+        // 把（可能来自环境变量的）回读预算交给硬件上下文；软件路径下是空操作。
+        if let Some(hardware) = decoder.hardware.as_mut() {
+            hardware.set_options(readback_options);
+        }
+        Ok(decoder)
     }
 
     /// 当前配置的输出模式。
@@ -443,6 +484,72 @@ impl H264Decoder {
         self.last_timings
     }
 
+    /// 最近一次 [`H264Decoder::decode`] 里 DXVA 回读的**三段细分**（微秒）。
+    ///
+    /// 只回答一个排障问题：`readback_us` 很大时，究竟是
+    /// `IMFDXGIBuffer::GetResource`、`CopySubresourceRegion` 还是 `Map`
+    /// （等待 GPU 完成）在等。软件路径恒为全 0。与 [`Self::last_phase_timings`]
+    /// 同步清零/累加，两者互不影响（`DecodePhaseTimings` 的字段语义不变）。
+    #[must_use]
+    pub fn last_readback_breakdown(&self) -> ReadbackBreakdown {
+        self.last_readback
+    }
+
+    /// 最近一次 [`H264Decoder::decode`] 是否因**回读超出预算**而放弃了一帧。
+    ///
+    /// 真机上 GPU 空闲后的一次 staging 回读可能卡 400+ ms；解码器按
+    /// [`ReadbackOptions::readback_budget_us`]（默认
+    /// [`DEFAULT_READBACK_BUDGET_US`]，可由环境变量
+    /// [`READBACK_BUDGET_ENV`] 覆盖，`0` = 不限）有界等待，超时就把这一帧丢掉、
+    /// 让 `decode()` 返回 `Ok(None)`，而不是把调用方卡满半秒。
+    /// 丢弃**不影响** H.264 参考链与解码器实例（与「解码错误」不是一回事）。
+    #[must_use]
+    pub fn last_readback_skipped(&self) -> bool {
+        self.last_readback_skipped
+    }
+
+    /// 本进程累计因回读超预算被放弃的帧数（只增）。
+    ///
+    /// 现场日志里对应 [`H264Decoder::decode`] 打的 `readback_budget_skip`（限频 1 条/秒），
+    /// 这里给探针/单测一个精确计数。
+    #[must_use]
+    pub fn readback_skip_count(&self) -> u64 {
+        self.readback_skip_count
+    }
+
+    /// 按 [`SKIP_LOG_INTERVAL`] 限频地记一条跳过日志（字段全部内联：GUI 日志层会
+    /// 丢弃 tracing 的字段）。
+    fn log_skip_if_due(&mut self, map_us: u64) {
+        let now = Instant::now();
+        if !skip_log_due(self.last_skip_log, now) {
+            return;
+        }
+        self.last_skip_log = Some(now);
+        tracing::warn!(
+            "readback_budget_skip count={} budget_ms={} map_us={}",
+            self.readback_skip_count,
+            self.readback_options.readback_budget_us / 1000,
+            map_us,
+        );
+    }
+
+    /// 设置 DXVA 回读的选项（生产默认见 [`ReadbackOptions::production`]）。
+    ///
+    /// 生产默认 = 原有行为 + 100 ms 回读预算；其余字段（Flush / 显式事件等待 /
+    /// 重建 staging / 拷前预热）只给真机探针做 A/B 用，默认全关。软件路径下无效果。
+    pub fn set_readback_options(&mut self, options: ReadbackOptions) {
+        self.readback_options = options;
+        if let Some(hardware) = self.hardware.as_mut() {
+            hardware.set_options(options);
+        }
+    }
+
+    /// 当前 DXVA 回读诊断选项。
+    #[must_use]
+    pub fn readback_options(&self) -> ReadbackOptions {
+        self.readback_options
+    }
+
     /// 重建解码器以适配新的编码尺寸（`ScreenConfig` 变化时调用）。
     ///
     /// 重建会丢弃当前参考帧，下一帧必须是 IDR；这与 remote 的分辨率变更规则
@@ -464,6 +571,12 @@ impl H264Decoder {
         self.dxgi_seen = false;
         self.warned_no_dxgi = false;
         self.last_timings = DecodePhaseTimings::default();
+        self.last_readback = dxva::ReadbackBreakdown::default();
+        self.last_readback_skipped = false;
+        self.current_access_unit_has_idr = false;
+        if let Some(hardware) = self.hardware.as_mut() {
+            hardware.set_options(self.readback_options);
+        }
         Ok(())
     }
 
@@ -471,6 +584,25 @@ impl H264Decoder {
     ///
     /// 返回本次调用产生的**最后一帧**；MFT 缓冲了输入、暂时没有输出时返回
     /// `None`。空输入返回 `None`。
+    ///
+    /// # `Ok(None)` 的两种含义（都不代表解流出错）
+    ///
+    /// 1. **MFT 还在缓冲输入**：这次送进去的包还没解出画面（硬件编码器/解码器都有
+    ///    一帧流水线延迟）。下一批到达时自然会出帧。
+    /// 2. **回读超预算，这一帧被主动放弃**（见 [`H264Decoder::last_readback_skipped`]
+    ///    与 [`ReadbackOptions::readback_budget_us`]）。
+    ///
+    /// 两种情况下**解码器实例与 H.264 参考链都完好**：第 2 种是「解码已完成、只是
+    /// 没把像素读回 CPU（也没有解映射）」，解码器内部状态与后续 P 帧的参考关系不受
+    /// 任何影响，**不需要**重建解码器、**不需要**请求关键帧。调用方（remote 控制器）
+    /// 把 `Ok(None)` 当成「本批无输出」是正确语义；用
+    /// [`H264Decoder::last_readback_skipped`] / [`H264Decoder::readback_skip_count`]
+    /// 才能把两者区分开。
+    ///
+    /// **跳过是一次性的、量级很小**：本机 250 ms 节奏实测「卡 → 卡 → 2.8 ms 成功」，
+    /// 即一次空闲事件通常丢 2 帧；节奏越密丢得越多，上界约等于
+    /// 停顿时长（~0.45 s）÷ 到达间隔。含 **IDR** 的访问单元**永不跳过**（补丁模式
+    /// 的基准帧必须是这一张），见 `dxva::readback_policy`。
     ///
     /// 子阶段读数（[`H264Decoder::last_phase_timings`]）在**本次调用开头清零**，
     /// 各段在批内累加；早退（空输入）后读数为全 0，出错返回时保留已发生的部分。
@@ -481,6 +613,9 @@ impl H264Decoder {
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedH264Frame>, WinVideoError> {
         // 读数按「本次调用」计：上一批的耗时不能混进来。
         self.last_timings = DecodePhaseTimings::default();
+        self.last_readback = dxva::ReadbackBreakdown::default();
+        self.last_readback_skipped = false;
+        self.current_access_unit_has_idr = false;
         if data.is_empty() {
             return Ok(None);
         }
@@ -515,6 +650,9 @@ impl H264Decoder {
                 ))
             })?;
             let submit_started = Instant::now();
+            // IDR 判定必须在送包之前完成：`submit` 在 `MF_E_NOTACCEPTING` 时会顺手
+            // 排空输出，那一次 `convert_sample` 也要看到这个标志。
+            self.current_access_unit_has_idr = access_unit_has_idr(payload);
             let submitted = self.submit(payload);
             // 失败也要记：读数的语义是「本次已经发生的耗时」，错误路径同样要看得出卡在哪。
             self.last_timings.submit_us = self
@@ -525,6 +663,7 @@ impl H264Decoder {
             if let Some(frame) = self.drain_output()? {
                 last = Some(frame);
             }
+            self.current_access_unit_has_idr = false;
             offset = end;
         }
         Ok(last)
@@ -644,7 +783,10 @@ impl H264Decoder {
                     let sample = produced.ok_or_else(|| {
                         WinVideoError::Decode("ProcessOutput 成功但未返回样本".to_owned())
                     })?;
-                    last = Some(self.convert_sample(&sample)?);
+                    // `None` = 回读超预算、这一帧被放弃（不是错误，也不影响参考链）。
+                    if let Some(frame) = self.convert_sample(&sample)? {
+                        last = Some(frame);
+                    }
                 }
                 Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(last),
                 Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
@@ -681,7 +823,10 @@ impl H264Decoder {
     ///
     /// 回读/转换两段在这里测、**累加**进 [`DecodePhaseTimings`]（一次 `decode()` 可能
     /// 产出多帧）；清零由 [`H264Decoder::decode`] 在开头统一做。
-    fn convert_sample(&mut self, sample: &IMFSample) -> Result<DecodedH264Frame, WinVideoError> {
+    fn convert_sample(
+        &mut self,
+        sample: &IMFSample,
+    ) -> Result<Option<DecodedH264Frame>, WinVideoError> {
         let mode = self.output_mode;
 
         // SAFETY: `sample` 有效；返回的缓冲区在作用域内保持引用计数。
@@ -695,10 +840,14 @@ impl H264Decoder {
                 let output = self.output;
                 let mut color_us = 0u64;
                 let readback_started = Instant::now();
+                let mut breakdown = dxva::ReadbackBreakdown::default();
+                let force_block = self.current_access_unit_has_idr;
                 let converted = hardware.with_mapped(
                     output.coded_width,
                     output.coded_height,
                     &dxgi_buffer,
+                    &mut breakdown,
+                    force_block,
                     |scanline, pitch| {
                         // 闭包只做像素转换/打包：`with_mapped` 在调用它之前已完成
                         // staging 拷贝与 Map，故“总耗时 - 本段”就是回读耗时。
@@ -713,7 +862,14 @@ impl H264Decoder {
                 self.last_timings.readback_us =
                     self.last_timings.readback_us.saturating_add(readback_us);
                 self.last_timings.color_us = self.last_timings.color_us.saturating_add(color_us);
+                self.last_readback.accumulate(breakdown);
                 self.dxgi_seen = true;
+                if matches!(converted, Ok(None)) {
+                    // 回读超预算：这一帧被放弃，解码器本身与参考链都不受影响。
+                    self.last_readback_skipped = true;
+                    self.readback_skip_count = self.readback_skip_count.saturating_add(1);
+                    self.log_skip_if_due(breakdown.map_us);
+                }
                 return converted;
             }
         }
@@ -746,7 +902,7 @@ impl H264Decoder {
                 .saturating_add(elapsed_us(color_started));
             // SAFETY: 与上面的 Lock2D 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { buffer_2d.Unlock2D() };
-            combine_unlock(converted, unlocked, "IMF2DBuffer::Unlock2D")
+            combine_unlock(converted, unlocked, "IMF2DBuffer::Unlock2D").map(Some)
         } else {
             let mut scanline: *mut u8 = ptr::null_mut();
             // SAFETY: `scanline` 指向本栈帧；`contiguous` 在解锁前一直有效。
@@ -761,7 +917,7 @@ impl H264Decoder {
                 .saturating_add(elapsed_us(color_started));
             // SAFETY: 与上面的 Lock 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { contiguous.Unlock() };
-            combine_unlock(converted, unlocked, "IMFMediaBuffer::Unlock（输出）")
+            combine_unlock(converted, unlocked, "IMFMediaBuffer::Unlock（输出）").map(Some)
         }
     }
 }
@@ -1630,6 +1786,42 @@ fn decode_err(context: &str, error: &windows::core::Error) -> WinVideoError {
     WinVideoError::Decode(format!("{context} 失败: {error}"))
 }
 
+/// 判断一个访问单元（Annex B）里是否含 IDR slice（`nal_unit_type == 5`）。
+///
+/// `decode()` 拿到的每个包是完整访问单元，头部带内联 SPS/PPS；这里只扫起始码
+/// （`00 00 01`，4 字节起始码 `00 00 00 01` 也含它），再看 NAL 头的低 5 位。
+/// 首帧/整屏重绘/关键帧请求的 IDR 都是几百 KB，逐字节扫一遍也在微秒级；
+/// 而且只对**含片段数据**的包有意义，SPS/PPS 的 NAL 头不会命中 5。
+///
+/// 为什么要这个判定：补丁模式（协议 v6）的基准帧就是这张 IDR，控制器若把它
+/// 按回读预算**跳过**，合成缓冲会停在旧基准上，后续补丁会盖到旧画面上——
+/// 于是画面一直错到下一次 IDR。所以含 IDR 的访问单元必须阻塞回读。
+fn access_unit_has_idr(payload: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index.saturating_add(3) < payload.len() {
+        let window = &payload[index..index.saturating_add(3)];
+        if window == [0, 0, 1] {
+            // 起始码之后就是 NAL 头：F(1) | nal_ref_idc(2) | nal_unit_type(5)。
+            let nal_type = payload[index.saturating_add(3)] & 0x1F;
+            if nal_type == 5 {
+                return true;
+            }
+            index = index.saturating_add(3);
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    false
+}
+
+/// 跳过日志的限频判定：从未打过、或距上一条已满 [`SKIP_LOG_INTERVAL`]。
+///
+/// 抽成纯函数是为了让「每秒最多一条」这条语义能被单测钉住——现场日志洪泛会把
+/// 真正有用的行冲掉。
+fn skip_log_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= SKIP_LOG_INTERVAL)
+}
+
 /// 把从 `started` 到现在的耗时取整为微秒（饱和到 `u64::MAX`）。
 ///
 /// 解码的子阶段（尤其 GPU 回读）常只有几十微秒量级，毫秒取整会把它们全显示成 0，
@@ -1815,6 +2007,201 @@ mod tests {
         assert_eq!(pack_size(1280, 720), 0x0000_0500_0000_02D0);
         assert_eq!(unpack_size(pack_size(1280, 720)), (1280, 720));
         assert_eq!(pack_ratio(60, 1), 0x0000_003C_0000_0001);
+    }
+
+    /// 回读三段细分的判读：`total_us` 求和、`dominant` 归因（并列时优先 `Map`）。
+    ///
+    /// 真机排障就是靠这条语义把 445 ms 归到 `Map`（GPU 同步）而不是 `Copy`。
+    #[test]
+    fn readback_breakdown_sums_and_classifies_dominant_segment() {
+        let zeros = ReadbackBreakdown::default();
+        assert_eq!(zeros.total_us(), 0);
+        assert_eq!(zeros.dominant(), ReadbackPhase::None);
+
+        let map_heavy = ReadbackBreakdown {
+            get_resource_us: 40,
+            copy_us: 120,
+            map_us: 445_000,
+        };
+        assert_eq!(map_heavy.total_us(), 445_160);
+        assert_eq!(map_heavy.dominant(), ReadbackPhase::Map);
+
+        let copy_heavy = ReadbackBreakdown {
+            get_resource_us: 10,
+            copy_us: 9_000,
+            map_us: 300,
+        };
+        assert_eq!(copy_heavy.dominant(), ReadbackPhase::Copy);
+
+        let get_heavy = ReadbackBreakdown {
+            get_resource_us: 7_000,
+            copy_us: 10,
+            map_us: 20,
+        };
+        assert_eq!(get_heavy.dominant(), ReadbackPhase::GetResource);
+
+        // 并列时优先 Map：它是唯一的同步点，宁可把锅判给它。
+        let tie = ReadbackBreakdown {
+            get_resource_us: 500,
+            copy_us: 500,
+            map_us: 500,
+        };
+        assert_eq!(tie.dominant(), ReadbackPhase::Map);
+    }
+
+    /// 测试回读预算的解析：缺省/非法回落默认，`0` = 不限，其余按毫秒 → 微秒。
+    #[test]
+    fn readback_budget_parsing_is_bounded() {
+        use dxva::parse_readback_budget_us;
+        assert_eq!(parse_readback_budget_us(None), DEFAULT_READBACK_BUDGET_US);
+        assert_eq!(parse_readback_budget_us(Some("")), DEFAULT_READBACK_BUDGET_US);
+        assert_eq!(parse_readback_budget_us(Some("abc")), DEFAULT_READBACK_BUDGET_US);
+        assert_eq!(parse_readback_budget_us(Some("-1")), DEFAULT_READBACK_BUDGET_US);
+        assert_eq!(parse_readback_budget_us(Some("0")), 0, "0 = 关闭上限");
+        assert_eq!(parse_readback_budget_us(Some(" 150 ")), 150_000);
+        assert_eq!(
+            parse_readback_budget_us(Some(&u64::MAX.to_string())),
+            dxva::MAX_READBACK_BUDGET_US,
+            "荒谬值必须夹住，否则 Instant + Duration 会溢出"
+        );
+        assert_eq!(ReadbackOptions::default().readback_budget_us, DEFAULT_READBACK_BUDGET_US);
+        assert_eq!(ReadbackOptions::unbounded().readback_budget_us, 0);
+    }
+
+    /// IDR 判定：只有 `nal_unit_type == 5` 的 slice 才算 IDR。
+    ///
+    /// 这条判定决定「补丁模式基准帧不允许被回读预算跳过」——判错（漏判）会让
+    /// 控制端的合成缓冲停在旧基准上，画面一直错到下一次 IDR。
+    #[test]
+    fn access_unit_idr_detection_covers_annex_b_shapes() {
+        // 空/无起始码。
+        assert!(!access_unit_has_idr(&[]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x02, 0x65]));
+
+        // 3 字节起始码 + nal_unit_type=5（IDR slice）。
+        assert!(access_unit_has_idr(&[0x00, 0x00, 0x01, 0x65, 0xAA]));
+        // 4 字节起始码（`00 00 00 01`）同样命中。
+        assert!(access_unit_has_idr(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xAA]));
+        // 带 nal_ref_idc 位的 IDR（0x65 已是；再试 0xE5）。
+        assert!(access_unit_has_idr(&[0x00, 0x00, 0x01, 0xE5]));
+
+        // SPS(7) / PPS(8) / 非 IDR slice(1) / SEI(6) 都不算。
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x67]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x68]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x41]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x06]));
+
+        // 典型 IDR 访问单元：SPS + PPS + SEI + IDR。
+        let mut access_unit = Vec::new();
+        access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F]);
+        access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C]);
+        access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x06, 0x05]);
+        access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x88, 0x84]);
+        assert!(access_unit_has_idr(&access_unit));
+
+        // 只有 SPS/PPS 的配置包看起来像参数集时仍不是 IDR。
+        access_unit.truncate(14);
+        assert!(!access_unit_has_idr(&access_unit));
+
+        // 起始码在末尾但没有 NAL 头字节：不越界、判 false。
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x00]));
+    }
+
+    /// 跳过日志限频：一秒内只放第一条，满一秒后再放。
+    #[test]
+    fn skip_log_is_rate_limited_to_one_per_second() {
+        let base = Instant::now();
+        assert!(skip_log_due(None, base), "首帧必须打出来");
+        assert!(!skip_log_due(Some(base), base), "同一时刻的连续跳过不应重复打");
+        assert!(!skip_log_due(
+            Some(base),
+            base + std::time::Duration::from_millis(999)
+        ));
+        assert!(skip_log_due(
+            Some(base),
+            base + std::time::Duration::from_secs(1)
+        ));
+        assert!(skip_log_due(
+            Some(base),
+            base + std::time::Duration::from_secs(5)
+        ));
+    }
+
+    /// 回读策略：IDR 永远阻塞（绝对优先）；预算 0 阻塞；否则按空闲时间判。
+    #[test]
+    fn readback_policy_never_skips_idr() {
+        use dxva::{readback_policy, ReadbackPolicy};
+
+        // IDR + 预算开启（哪怕空闲很久）→ 阻塞。
+        assert_eq!(
+            readback_policy(100_000, true, Some(5_000_000)),
+            ReadbackPolicy::Blocking,
+            "IDR 绝不能被预算跳过（补丁模式基准帧）"
+        );
+        // IDR + 预算关闭 → 也是阻塞（语义一致，不因为配置改变而不同）。
+        assert_eq!(
+            readback_policy(0, true, Some(5_000_000)),
+            ReadbackPolicy::Blocking
+        );
+
+        // 非 IDR + 预算关闭 → 阻塞（旧行为）。
+        assert_eq!(
+            readback_policy(0, false, Some(5_000_000)),
+            ReadbackPolicy::Blocking
+        );
+        // 非 IDR + 空闲未知（会话第一帧）→ 有界。
+        assert_eq!(readback_policy(100_000, false, None), ReadbackPolicy::Bounded);
+        // 健康节奏（间隔 ≤ 预算一半）→ 阻塞，零额外开销。
+        assert_eq!(
+            readback_policy(100_000, false, Some(30_000)),
+            ReadbackPolicy::Blocking
+        );
+        assert_eq!(
+            readback_policy(100_000, false, Some(50_000)),
+            ReadbackPolicy::Blocking
+        );
+        // 空闲超过预算一半 → 有界。
+        assert_eq!(
+            readback_policy(100_000, false, Some(50_001)),
+            ReadbackPolicy::Bounded
+        );
+        assert_eq!(
+            readback_policy(100_000, false, Some(250_000)),
+            ReadbackPolicy::Bounded
+        );
+    }
+
+    /// 累加语义：一次 `decode()` 多帧时逐段相加，溢出饱和而不是回绕。
+    #[test]
+    fn readback_breakdown_accumulates_and_saturates() {
+        let one = ReadbackBreakdown {
+            get_resource_us: 1,
+            copy_us: 2,
+            map_us: 3,
+        };
+        let mut total = ReadbackBreakdown::default();
+        total.accumulate(one);
+        total.accumulate(one);
+        assert_eq!(
+            total,
+            ReadbackBreakdown {
+                get_resource_us: 2,
+                copy_us: 4,
+                map_us: 6,
+            }
+        );
+
+        let mut big = ReadbackBreakdown {
+            get_resource_us: u64::MAX,
+            copy_us: u64::MAX,
+            map_us: u64::MAX,
+        };
+        big.accumulate(one);
+        assert_eq!(big.get_resource_us, u64::MAX);
+        assert_eq!(big.copy_us, u64::MAX);
+        assert_eq!(big.map_us, u64::MAX);
+        assert_eq!(big.total_us(), u64::MAX);
     }
 
     #[test]
