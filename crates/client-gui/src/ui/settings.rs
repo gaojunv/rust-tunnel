@@ -1,4 +1,4 @@
-//! 设置页：页头 + 左侧二级导航 + 右侧滚动内容（Win11 Fluent 布局）。
+//! 设置页：页头 + 顶部分组 Tab + 下方滚动内容（Win11 Fluent 布局）。
 //!
 //! 分组的意义是把**不同后果的东西分开**：连接（改了就重连）、远程编码（影响下一次会话）、
 //! 无人值守（装一个 SYSTEM 服务，后果不可逆）、更新（换掉本机 exe）。这四件事的失败模式
@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use egui::{Align, Layout, RichText, Sense, Stroke, Ui, Vec2};
+use egui::{RichText, Ui};
 use rust_tunnel_client::ClientConfig;
 use rust_tunnel_remote::{ApprovalPolicy, RemoteManager};
 
@@ -21,7 +21,7 @@ use crate::service_ui::{
 use crate::service_watch::ServicePresence;
 use crate::{app::AppState, config_store};
 
-/// 设置页的分组（左侧二级导航）。
+/// 设置页的分组（顶部分组 Tab）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsPage {
     /// 连接：服务器地址 / 客户端名 / token 与传输安全。
@@ -36,10 +36,10 @@ pub enum SettingsPage {
 }
 
 impl SettingsPage {
-    /// 全部分组（顺序即导航顺序）。
+    /// 全部分组（顺序即 Tab 顺序）。
     pub const ALL: [Self; 4] = [Self::Connection, Self::Remote, Self::Service, Self::Update];
 
-    /// 导航标签。
+    /// Tab 标签。
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -49,21 +49,7 @@ impl SettingsPage {
             Self::Update => "更新",
         }
     }
-
-    /// 导航图标。
-    #[must_use]
-    pub const fn icon(self) -> Icon {
-        match self {
-            Self::Connection => Icon::Link,
-            Self::Remote => Icon::Monitor,
-            Self::Service => Icon::Shield,
-            Self::Update => Icon::Refresh,
-        }
-    }
 }
-
-/// 左侧二级导航的固定宽度。
-const NAV_WIDTH: f32 = 156.0;
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -131,7 +117,7 @@ impl SettingsState {
     }
 }
 
-/// 设置页入口：页头 + 左侧二级导航 + 右侧滚动内容。
+/// 设置页入口：页头 + 顶部分组 Tab + 下方滚动内容。
 ///
 /// 返回 `(偏好是否变化需落盘, 更新动作)`。调用方负责在第一个元素为 `true` 时
 /// [`crate::prefs::save`]，并在第二个元素非空时执行更新动作。
@@ -165,60 +151,39 @@ pub fn show(
         },
     );
 
-    // 整块内容用一个固定高度的横向布局：导航固定在左，右侧自己滚动。高度必须先取——
-    // 进入 `horizontal_top` 之后 `available_height` 就是这一行的高度，不再代表整页。
-    let body_height = ui.available_height().max(160.0);
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(
-            Vec2::new(NAV_WIDTH, body_height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                ui.set_width(NAV_WIDTH);
-                for candidate in SettingsPage::ALL {
-                    if widgets::sub_nav_item(
-                        ui,
-                        candidate.icon(),
-                        candidate.label(),
-                        *page == candidate,
-                    )
-                    .clicked()
-                    {
-                        *page = candidate;
-                    }
+    // 顶部分组 Tab：与「远程」页同一套分段控件，直接左对齐排布（**不要**用裸 `with_layout`
+    // 做右对齐——它会吃掉父级剩余高度，把下面的滚动区压成零高）。标签来自枚举本身，
+    // 避免这里和 `ALL` / `label()` 各维护一份顺序。
+    let tabs: Vec<_> = SettingsPage::ALL
+        .iter()
+        .map(|tab| (*tab, tab.label()))
+        .collect();
+    if let Some(next) = widgets::segmented(ui, *page, &tabs) {
+        *page = next;
+    }
+    ui.add_space(10.0);
+
+    // 每个分组各自记住滚动位置（id 带标签）：从长长的「无人值守」切回「连接」时不会
+    // 停在半截，切回去时也能回到原来的位置。
+    egui::ScrollArea::vertical()
+        .id_salt(("settings_page", page.label()))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(2.0);
+            match *page {
+                SettingsPage::Connection => connection_page(ui, state, app_state),
+                SettingsPage::Remote => {
+                    prefs_changed |= remote_page(ui, prefs, manager);
                 }
-            },
-        );
-        // 竖直分隔线：用 painter 直接画，避免 `ui.separator()` 在横向布局里变成一条短横线。
-        let (rule, _) = ui.allocate_exact_size(Vec2::new(1.0, body_height), Sense::hover());
-        ui.painter().vline(
-            rule.center().x,
-            rule.y_range(),
-            Stroke::new(1.0_f32, p.divider),
-        );
-        ui.add_space(8.0);
-        let content_size = Vec2::new(ui.available_width().max(200.0), body_height);
-        ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(2.0);
-                    match *page {
-                        SettingsPage::Connection => connection_page(ui, state, app_state),
-                        SettingsPage::Remote => {
-                            prefs_changed |= remote_page(ui, prefs, manager);
-                        }
-                        SettingsPage::Service => service_page(ui, prefs, app_state, service),
-                        SettingsPage::Update => {
-                            let (changed, picked) =
-                                crate::ui::update::settings_section(ui, update, prefs);
-                            prefs_changed |= changed;
-                            action = picked;
-                        }
-                    }
-                    ui.add_space(8.0);
-                });
+                SettingsPage::Service => service_page(ui, prefs, app_state, service),
+                SettingsPage::Update => {
+                    let (changed, picked) = crate::ui::update::settings_section(ui, update, prefs);
+                    prefs_changed |= changed;
+                    action = picked;
+                }
+            }
+            ui.add_space(8.0);
         });
-    });
 
     (prefs_changed, action)
 }

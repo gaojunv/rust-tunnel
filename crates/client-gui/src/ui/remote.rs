@@ -4,10 +4,16 @@
 //! Tab 只留下**摘要卡**：会话状态、延迟、数据面路径、以及「显示窗口 / 中断会话」两个动作。会话窗
 //! 口可被最小化（会话继续保留），故这里必须留一个把它召回入口。
 //!
-//! 信息架构（Fluent，上下两大区）：
-//! - **页头**：标题 / 副标题 / 控制通道状态徽标；
-//! - **本机被控**：允许被控、接入确认策略、自动锁屏、本机元信息、已信任对端；
-//! - **连接到其他设备**：重连提示、当前会话摘要、在线客户端。
+//! 信息架构（Fluent，页头 + 顶部两个 Tab）：
+//! - **页头**：标题 / 副标题 / 控制通道状态徽标（固定，不随内容滚动）；
+//! - **Tab 行**：「本机被控」/「连接到其他设备」二选一（固定，不随内容滚动）；
+//! - **本机被控**：允许被控、接入确认策略、自动锁屏、本机元信息、已信任对端、被控方会话摘要；
+//! - **连接到其他设备**：重连提示、控制方会话摘要、在线客户端。
+//!
+//! 为什么用 Tab 而不是继续上下堆叠：这两大区的**语义完全独立**（一个是「别人能连我」，一个是
+//! 「我去连别人」），彼此之间没有阅读顺序上的依赖；而默认窗口只有 760 宽、高度也有限，两个大区
+//! 叠在一起时第二区几乎整块落在可视区之外（本页此前还没有滚动区）。拆成 Tab 后每个 Tab 只
+//! 呈现一条完整任务线，窗口再矮也只需滚动一个区。
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -47,6 +53,27 @@ fn lock(view: &Arc<Mutex<RemoteView>>) -> MutexGuard<'_, RemoteView> {
     view.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// 「远程」页顶部的两个 Tab。
+///
+/// 两个大区语义独立（「别人能连我」vs「我去连别人」），默认窗口放不下并排展示，故用 Tab 二选一。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemoteTab {
+    /// 本机被控：被控开关、接入确认、自动锁屏、已信任对端、被控方会话摘要。
+    #[default]
+    LocalControl,
+    /// 连接到其他设备：重连提示、控制方会话摘要、在线客户端列表。
+    OtherDevices,
+}
+
+/// 「远程」页的跨帧 UI 状态（目前只有选中的 Tab）。
+///
+/// 由 `GuiApp` 持有并传入 [`show`]：Tab 选择必须在帧之间保持，否则每次重绘都会跳回第一个 Tab。
+#[derive(Default)]
+pub struct RemotePage {
+    /// 当前选中的 Tab（默认「本机被控」）。
+    pub tab: RemoteTab,
+}
+
 /// 「远程」Tab 的用户操作结果，由 `GuiApp` 同步到引擎与偏好文件。
 #[derive(Default)]
 pub struct RemoteTabActions {
@@ -72,11 +99,14 @@ fn header_badge(ui: &mut Ui, state: &RemoteUiState) {
     }
 }
 
-/// 渲染「远程」Tab。返回本帧的用户操作，由调用方（`GuiApp`）同步到引擎、托盘与偏好文件。
+/// 渲染「远程」页。返回本帧的用户操作，由调用方（`GuiApp`）同步到引擎、托盘与偏好文件。
+///
+/// `page` 携带跨帧的 UI 状态（当前 Tab）；页头与 Tab 行留在滚动区外固定，只有 Tab 内容滚动。
 pub fn show(
     ui: &mut Ui,
     view: &Arc<Mutex<RemoteView>>,
     manager: Option<&Arc<RemoteManager>>,
+    page: &mut RemotePage,
     _app_state: &Arc<AppState>,
 ) -> RemoteTabActions {
     let Some(manager) = manager else {
@@ -107,17 +137,45 @@ pub fn show(
         },
     );
 
-    show_permissions(ui);
+    // Tab 行：直接左对齐放在页头下方（**不要**用裸 `with_layout` 做右对齐——它会吃掉父级剩余
+    // 高度，把下面的滚动区压成零高）。
+    if let Some(tab) = ui
+        .horizontal(|ui| {
+            widgets::segmented(
+                ui,
+                page.tab,
+                &[
+                    (RemoteTab::LocalControl, "本机被控"),
+                    (RemoteTab::OtherDevices, "连接到其他设备"),
+                ],
+            )
+        })
+        .inner
+    {
+        page.tab = tab;
+    }
+    ui.add_space(10.0);
 
-    widgets::section_label(ui, "本机被控");
-    let actions = show_local_control(ui, &state);
-    show_trusted_peers(ui, &state, manager);
-
-    ui.add_space(2.0);
-    widgets::section_label(ui, "连接到其他设备");
-    show_reconnect(ui, view, manager);
-    show_session(ui, view, manager, &state);
-    show_peers(ui, &state, manager, view);
+    // 每个 Tab 各自记住滚动位置：切到另一条任务线时不会停在上一个 Tab 的半截位置。
+    let mut actions = RemoteTabActions::default();
+    egui::ScrollArea::vertical()
+        .id_salt(("remote_page", matches!(page.tab, RemoteTab::OtherDevices)))
+        .auto_shrink([false, false])
+        .show(ui, |ui| match page.tab {
+            RemoteTab::LocalControl => {
+                show_permissions(ui);
+                actions = show_local_control(ui, &state);
+                show_trusted_peers(ui, &state, manager);
+                // 被控方的会话摘要只在这个 Tab 出现：它属于「别人正在连我」这条任务线。
+                show_session(ui, view, manager, &state, SessionRole::Controlled);
+            }
+            RemoteTab::OtherDevices => {
+                show_reconnect(ui, view, manager);
+                // 控制方的会话摘要只在这个 Tab 出现：它属于「我正在连别人」这条任务线。
+                show_session(ui, view, manager, &state, SessionRole::Controller);
+                show_peers(ui, &state, manager, view);
+            }
+        });
     actions
 }
 
@@ -400,18 +458,28 @@ pub fn controlled_banner(ui: &mut Ui, manager: Option<&Arc<RemoteManager>>) {
 }
 
 /// 会话摘要卡（画面与输入已迁到独立窗口，这里只留状态与动作）。
+///
+/// `role` 指定本 Tab 关心的是哪一种角色的会话：只有 `active.role == role` 时才绘制摘要。
+/// 角色不符时**不做任何事**（也不消费关闭原因）——两个 Tab 各管一条任务线，在错误的 Tab 里
+/// 显示对方的会话会让用户无从判断自己到底在控制谁；而「会话已结束」提示也只由该角色的 Tab
+/// 取走，否则切到另一个 Tab 会被它的 `take_closed` 吞掉。
 fn show_session(
     ui: &mut Ui,
     view: &Arc<Mutex<RemoteView>>,
     manager: &Arc<RemoteManager>,
     state: &RemoteUiState,
+    role: SessionRole,
 ) {
     let Some(active) = state.active.as_ref() else {
+        // 没有活动会话：谁先渲染谁取走结束原因（同一时刻只渲染一个 Tab）。
         if let Some(reason) = lock(view).take_closed() {
             widgets::info_bar(ui, Tone::Warn, Some("会话已结束"), reason.as_str());
         }
         return;
     };
+    if active.role != role {
+        return;
+    }
 
     // 关键帧请求速率：管理面只累计计数，这里按「累计值差分」每秒结算一次（与帧率同款）。
     // 只有控制器会发关键帧请求；被控端保持 `None`，不显示这一项。
@@ -428,13 +496,14 @@ fn show_session(
 
     widgets::card(ui, |ui| {
         let p = palette(ui.style());
-        let role = match active.role {
+        // 注意与函数参数 `role`（筛选用）区分：这里是要显示的文案。
+        let role_label = match active.role {
             SessionRole::Controller => "控制中",
             SessionRole::Controlled => "被控中",
         };
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(role)
+                RichText::new(role_label)
                     .font(icons::heading_font(16.0))
                     .color(p.text),
             );
