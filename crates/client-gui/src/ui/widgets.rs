@@ -127,13 +127,6 @@ pub fn card_header(ui: &mut Ui, title: &str, subtitle: Option<&str>) {
     }
 }
 
-/// 小节标题（卡片内的分组标签）。
-pub fn section_label(ui: &mut Ui, text: &str) {
-    let p = palette(ui.style());
-    ui.label(RichText::new(text).size(12.0).color(p.text_weak));
-    ui.add_space(4.0);
-}
-
 /// 左侧导航项（图标 + 文字）；返回点击响应。
 pub fn nav_item(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
     let p = palette(ui.style());
@@ -166,47 +159,6 @@ pub fn nav_item(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Respons
         egui::Align2::LEFT_CENTER,
         label,
         font,
-        p.text,
-    );
-    resp
-}
-
-/// 设置页的二级导航项（更紧凑）。
-pub fn sub_nav_item(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
-    let p = palette(ui.style());
-    let width = ui.available_width().max(80.0);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
-    let row = rect.shrink2(Vec2::new(0.0, 1.0));
-    if resp.hovered() && !selected {
-        ui.painter()
-            .rect_filled(row, CornerRadius::same(6), p.surface_alt);
-    }
-    if selected {
-        ui.painter()
-            .rect_filled(row, CornerRadius::same(6), p.accent_dim);
-        let bar = Rect::from_min_size(
-            Pos2::new(row.left(), row.top() + 8.0),
-            Vec2::new(3.0, row.height() - 16.0),
-        );
-        ui.painter()
-            .rect_filled(bar, CornerRadius::same(2), p.accent);
-    }
-    let icon_rect = Rect::from_min_size(
-        Pos2::new(rect.left() + 14.0, rect.center().y - 8.0),
-        Vec2::splat(16.0),
-    );
-    icons::paint(
-        ui.painter(),
-        icon_rect,
-        icon,
-        if selected { p.accent } else { p.text_weak },
-        1.6,
-    );
-    ui.painter().text(
-        Pos2::new(rect.left() + 38.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        FontId::new(13.5, FontFamily::Proportional),
         p.text,
     );
     resp

@@ -79,6 +79,18 @@ fn initial_settings_page() -> ui::settings::SettingsPage {
     }
 }
 
+/// 「远程」页初始 Tab；`RUST_TUNNEL_GUI_REMOTE_TAB=remote|other` 仅供截图评审。
+///
+/// 默认落在「本机被控」（安全设置是这一页最常被翻看的内容）；截图/QA 需要「连接到其他设备」
+/// 那一屏时用环境变量直接切过去，免去自动化工具模拟点击 Tab。
+fn initial_remote_page() -> ui::remote::RemotePage {
+    let tab = match std::env::var("RUST_TUNNEL_GUI_REMOTE_TAB").ok().as_deref() {
+        Some("remote" | "other") => ui::remote::RemoteTab::OtherDevices,
+        _ => ui::remote::RemoteTab::LocalControl,
+    };
+    ui::remote::RemotePage { tab }
+}
+
 struct GuiApp {
     app_state: Arc<app::AppState>,
     settings: ui::settings::SettingsState,
@@ -122,6 +134,8 @@ struct GuiApp {
     status_history: ui::status::StatusHistory,
     /// 设置页当前选中的二级分组。
     settings_page: ui::settings::SettingsPage,
+    /// 「远程」页当前选中的 Tab（本机被控 / 连接到其他设备），跨帧保持。
+    remote_page: ui::remote::RemotePage,
 }
 
 impl GuiApp {
@@ -160,6 +174,7 @@ impl GuiApp {
             map_state: initial_map_state(),
             status_history: ui::status::StatusHistory::default(),
             settings_page: initial_settings_page(),
+            remote_page: initial_remote_page(),
         }
     }
 
@@ -627,6 +642,7 @@ impl eframe::App for GuiApp {
         let logs_state = &mut self.logs_state;
         let map_state = &mut self.map_state;
         let settings_page = &mut self.settings_page;
+        let remote_page = &mut self.remote_page;
         let prefs_mut = &mut self.prefs;
         let status_history = &self.status_history;
         let remote_view = Arc::clone(&self.remote_view);
@@ -640,11 +656,16 @@ impl eframe::App for GuiApp {
                     0 => ui::status::show(ui, &status, app_state.service_owner(), status_history),
                     1 => ui::mappings::show(ui, &status, map_state),
                     2 => {
-                        remote_actions =
-                            ui::remote::show(ui, &remote_view, remote_manager.as_ref(), app_state);
+                        remote_actions = ui::remote::show(
+                            ui,
+                            &remote_view,
+                            remote_manager.as_ref(),
+                            remote_page,
+                            app_state,
+                        );
                     }
                     3 => {
-                        // 设置页自带「页头 + 二级导航 + 右侧滚动内容」，调用方不再包 ScrollArea。
+                        // 设置页自带「页头 + 顶部分组 Tab + 滚动内容」，调用方不再包 ScrollArea。
                         let (prefs_changed, action) = ui::settings::show(
                             ui,
                             settings_page,

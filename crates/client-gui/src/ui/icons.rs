@@ -56,8 +56,6 @@ pub enum Icon {
     Shield,
     /// 时钟。
     Clock,
-    /// 链路。
-    Link,
     /// 下载。
     Download,
     /// 删除。
@@ -205,11 +203,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32, width: f
         Icon::Clock => {
             pen.circle(12.0, 12.0, 8.2);
             pen.line(&[(12.0, 6.6), (12.0, 12.2), (16.2, 14.4)]);
-        }
-        Icon::Link => {
-            pen.rounded_rect(2.8, 8.8, 13.2, 15.2, 3.2);
-            pen.rounded_rect(10.8, 8.8, 21.2, 15.2, 3.2);
-            pen.line(&[(9.5, 12.0), (14.5, 12.0)]);
         }
         Icon::Download => {
             pen.line(&[(12.0, 3.0), (12.0, 15.0)]);
@@ -368,7 +361,7 @@ mod tests {
 
     #[test]
     fn every_icon_is_listed() {
-        // 与 `Icon` 枚举一一对应；新增图标时在这里补一行。
+        // 与 `Icon` 枚举一一对应；新增/删除图标时在这里同步。
         let icons = [
             Icon::Pulse,
             Icon::Route,
@@ -389,7 +382,6 @@ mod tests {
             Icon::Refresh,
             Icon::Shield,
             Icon::Clock,
-            Icon::Link,
             Icon::Download,
             Icon::Trash,
             Icon::Copy,
@@ -398,6 +390,6 @@ mod tests {
             Icon::Server,
             Icon::Gauge,
         ];
-        assert_eq!(icons.len(), 27);
+        assert_eq!(icons.len(), 26);
     }
 }

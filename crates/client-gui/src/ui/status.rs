@@ -1,5 +1,8 @@
 //! 状态页：连接概览、延迟趋势与最近隧道。
 //!
+//! 统计块固定 2×2：第一行是实时指标（延迟、活跃隧道），第二行是计数指标（等待拨号、在线时长）；
+//! 布局不随窗口宽度变化，宽度自适应性交给 `stat_tile` 内部。
+//!
 //! 页面只读 [`ClientStatus`] 与 [`StatusHistory`]，自身不持有状态：趋势采样由调用方每帧调用
 //! [`StatusHistory::sample`] 推进，这里只负责把快照画成 Fluent 风的实色层次。
 
@@ -35,13 +38,6 @@ const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 
 /// 最近隧道一次展示的行数；超出部分在卡片内滚动查看。
 const RECENT_TUNNEL_ROWS: usize = 8;
-
-/// 统计块的最小可读宽度：低于它时 4 列会把文字挤成一团，退化成 2×2。
-/// 统计块的最小可读宽度：低于它就把 4 列降级成 2×2。
-///
-/// 110 只够放下标签与两位数，`2h 14m` 这类在线时长会把卡片撑出可视区——默认 760 窗口
-/// 扣掉导航与页边距后约 520，这里取 150 让它在默认尺寸下走 2×2，窗口拉宽后再回到 4 列。
-const MIN_STAT_TILE_WIDTH: f32 = 150.0;
 
 /// RTT 与活跃隧道数的秒级趋势（约 1 Hz、容量 60），供状态页画迷你趋势线。
 ///
@@ -323,19 +319,14 @@ fn hero_latency(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory, wid
     });
 }
 
-/// 四个等宽统计块：延迟（趋势）、活跃隧道（趋势）、等待拨号、在线时长。
+/// 四个统计块：固定 2×2 布局——第一行实时指标（延迟、活跃隧道），第二行计数指标
+/// （等待拨号、在线时长）。
 ///
-/// 正常宽度下一行 4 列；窗口被拖到最窄（480 减去左侧导航后不足）时退化成 2×2，
-/// 否则 4 列会被压到读不出数字。
+/// 两块等宽平分可用宽度：窗口最窄（480）时也不拆分、不缩列，只让 `stat_tile` 内部
+/// 按宽度自适应字号，避免宽度算出来的换行在不同窗口尺寸下不可控。
 fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
     let gap = ui.spacing().item_spacing.x;
-    let avail = ui.available_width();
-    let columns = if avail >= 4.0 * MIN_STAT_TILE_WIDTH + 3.0 * gap {
-        4.0
-    } else {
-        2.0
-    };
-    let width = ((avail - gap * (columns - 1.0)) / columns).max(MIN_STAT_TILE_WIDTH);
+    let width = ((ui.available_width() - gap) / 2.0).max(0.0);
     let (rtt_value, rtt_unit) = match status.rtt_ms {
         Some(ms) => (format!("{ms:.0}"), "ms"),
         None => ("—".to_owned(), ""),
@@ -344,7 +335,8 @@ fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
         .connected_at
         .and_then(|at| at.elapsed().ok())
         .map_or_else(|| "—".to_owned(), format_uptime);
-    ui.horizontal_wrapped(|ui| {
+    // 第一行：实时指标（带趋势线）。
+    ui.horizontal(|ui| {
         stat_tile(
             ui,
             width,
@@ -363,6 +355,9 @@ fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
             "条",
             Some(history.tunnels()),
         );
+    });
+    // 第二行：计数指标（无趋势线）。行间沿用主题的 8px 垂直间距。
+    ui.horizontal(|ui| {
         stat_tile(
             ui,
             width,
