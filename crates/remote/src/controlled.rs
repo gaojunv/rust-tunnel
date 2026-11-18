@@ -69,13 +69,21 @@
 //! 不再走编码器，而是把脏矩形的紧包 NV12（zstd level 1 压缩，压不下去就存原始）装进
 //! [`SessionMessage::RegionUpdate`] 直接发出。控制器维护一块持久 NV12 帧缓冲，逐块覆写。
 //!
-//! 四条硬约束：
+//! 六条硬约束：
 //! - **顺序**：补丁必须排在那块全帧基准**之后**。进入模式前先让一帧基准全帧**真正投进出站
 //!   队列**（编码任务回报 `base_frame_sent`）之后才切模式；两者走**同一条画面队列**
-//!   （`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::try_enqueue_screen`]
+//!   （`ScreenConfig` 也在其中），故顺序天然成立。发送补丁走 [`OutboundQueues::try_enqueue_screen_or_return`]
 //!   （**非阻塞**：主循环绝不能在补丁投递上 `.await`，否则网络拥塞时输入/心跳一并被卡住）。
-//!   队列满时退出补丁模式并强制一帧全帧 IDR——可能已发出同一批的**部分**横条，控制端那块
-//!   合成缓冲只有一帧完整 IDR 才能修复。
+//! - **补丁先暂存，不因「队列瞬时满」退出**（[`PatchStaging`]）：画面队列只有
+//!   [`SCREEN_QUEUE`] 两深，刚进补丁模式时排在前面的基准 IDR 往往还没写完（真机上一帧
+//!   ~240 KB 的 IDR 要 190+ ms），第一条补丁必然投不进去。旧实现在这里直接退出补丁模式并
+//!   强制 IDR，于是「进入 → 5 ms 后 abort → 再打一个 IDR」形成自激——真机 0.8 秒打出 4 个
+//!   ~240 KB 的 IDR。现在整拍补丁整批进有界暂存区、每拍补投，只有暂存区**超龄
+//!   （[`PATCH_STAGING_MAX_AGE`]）或超字节上限（[`PATCH_STAGING_MAX_BYTES`]）**才退出——那
+//!   才是「写侧真的跟不上」。补丁模式期间**暂停 QoS 闭环**，写侧不会因降档突然变快，所以
+//!   上限必须按「一帧 IDR 的写出时间」量级取，不能按一帧补丁的大小取。
+//!   退出时：若有**半批**横条已经发出（同批更早的已投递、其余仍暂存），控制端合成缓冲缺块，
+//!   必须强制一帧完整 IDR；整批未发的直接丢弃即可——退出后那一帧全帧会整体覆盖。
 //! - **进补丁模式用 IDR，退出用 P 帧**：补丁只改控制器侧的合成帧缓冲，**不碰 H.264 参考链**
 //!   （补丁模式期间编码器根本不编码），退出后的第一帧只需普通 P 帧。但**基准帧必须是 IDR**：
 //!   补丁只覆盖变化矩形，静态区域会长期沿用这一帧，若它继承了一张糊的参考（典型场景：
@@ -399,15 +407,20 @@ impl OutboundQueues {
 
     /// **非阻塞**地把一条画面帧投进去（补丁路径专用）。
     ///
-    /// 返回 `Ok(true)` = 已入队；`Ok(false)` = 队列已满，调用方必须自己决定退让策略（补丁路径
-    /// 是「退出补丁模式 + 强制一帧 IDR」，见 `run_controlled`）——这里**不等待、不丢帧**。
+    /// 返回 `Ok(None)` = 已入队；`Ok(Some(frame))` = 队列已满，帧原样还回来——调用方必须
+    /// 自己决定退让策略（补丁路径是放进暂存区等下一拍，见 [`PatchStaging`]）。这里**不等待、
+    /// 不丢帧**。把帧还回来而不是只回一个布尔值，是为了让暂存区能原样放回（FIFO，且不必
+    /// 为几 KB–32 KiB 的补丁重建一份）。
     ///
     /// # Errors
     /// 写任务已结束（通道关闭）时返回 [`link_closed`]。
-    pub(crate) fn try_enqueue_screen(&self, frame: SessionFrame) -> RemoteResult<bool> {
+    pub(crate) fn try_enqueue_screen_or_return(
+        &self,
+        frame: SessionFrame,
+    ) -> RemoteResult<Option<SessionFrame>> {
         match self.screen.try_send(frame) {
-            Ok(()) => Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Ok(()) => Ok(None),
+            Err(mpsc::error::TrySendError::Full(frame)) => Ok(Some(frame)),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(link_closed()),
         }
     }
@@ -569,6 +582,160 @@ const PATCH_MAX_MESSAGES_PER_TICK: usize = 8;
 /// 首块在约「32 KiB / 链路速率」后就能显示，不必等整批发完——这正是它能替代「退回全帧」
 /// 的原因（整帧要等编码完成且整帧送达才可见）。
 const PATCH_MAX_TICK_BYTES: usize = PATCH_MESSAGE_MAX_BYTES * PATCH_MAX_MESSAGES_PER_TICK;
+
+/// 补丁暂存区允许滞留的**最长时间**（500 ms）。
+///
+/// 真机日志（Windows → Windows、QSV 1080p@30、会话码率 10 Mbps、路径 Punch）里，一帧
+/// 232–246 KB 的 IDR 从入队到写完要 190+ ms（32 KiB/块、块间 26 ms 的 pacing）。画面队列只有
+/// [`SCREEN_QUEUE`] 两深，所以「刚进补丁模式」的头几百毫秒里排在前面的基准 IDR 必然占满队列
+/// ——这是**瞬态**，不是写侧跟不上。旧实现在第一条补丁投不进去时就退出补丁模式并强制 IDR，
+/// 于是每次进入补丁模式都立刻产出又一个 ~240 KB 的 IDR（现场：0.8 秒 4 个）。
+///
+/// 500 ms ≈ 2.6 个这样的 IDR 写出时间，足以吸收「基准 IDR + 退出的 P 帧」这类正常排队；超过
+/// 它就说明补丁真的在被持续丢弃，继续攒只会让控制端画面越来越旧，回全帧重来更划算。
+const PATCH_STAGING_MAX_AGE: Duration = Duration::from_millis(500);
+
+/// 补丁暂存区允许滞留的**最大字节数**（256 KiB = 一个满配补丁拍）。
+///
+/// 与 [`PATCH_STAGING_MAX_AGE`] 是两道互补的闸门：时间管「陈旧」，字节管「内存与迟到量」。
+/// 取单拍上限（[`PATCH_MAX_TICK_BYTES`]）而不是更多拍：攒下两拍以上的补丁再发出去，控制端
+/// 看到的就是几百毫秒前的画面，已经不如直接回一帧全帧。单拍本身不会超限，所以「空暂存区
+/// 接一拍」永远成功——超限只可能来自「之前几拍一直没投出去」。
+const PATCH_STAGING_MAX_BYTES: usize = PATCH_MAX_TICK_BYTES;
+
+/// 暂存区里的一条画面消息（补丁或空保活）。
+struct StagedScreen {
+    /// 已装好的线上帧（`RegionUpdate`）。
+    frame: SessionFrame,
+    /// 这条消息的补丁载荷字节数（`rects` 的 `data` 总和；空保活为 0）。
+    bytes: usize,
+    /// 是否是所在补丁批的**首条**。
+    ///
+    /// 它只服务一件事：区分「整批还没发」与「半批已发出、其余仍滞留」。前者退出补丁模式后
+    /// 直接丢弃是安全的（下一帧全帧整体覆盖控制端缓冲）；后者控制端合成缓冲**缺块**，
+    /// 退出必须强制一帧完整 IDR 才能修复。
+    batch_start: bool,
+    /// 进入暂存区的时刻（滞留时长按**头部**这条算）。
+    staged_at: std::time::Instant,
+}
+
+/// 补丁出站的有界暂存区（语义与 file 档的 `file_staging` 相同，见 [`OutboundQueues`]）。
+///
+/// 主循环绝不能在补丁投递上 `.await`（那会把输入注入/心跳/采集节拍一起卡住），而画面队列
+/// 又只有 [`SCREEN_QUEUE`] 深。满队列时把**整拍**补丁先放这里、下一拍再 `try` 补投，
+/// 是「不阻塞」与「补丁绝不丢」之间唯一成立的组合：
+/// - 补丁丢了，控制端合成缓冲会永久缺一块（直到下一个 IDR），所以不能像视频帧那样在背压出口
+///   直接放弃；
+/// - 反过来，攒得太久说明写侧真的跟不上，这时退出补丁模式 + 全帧（必要时 IDR）比继续攒好。
+///
+/// 整批入区是**原子**的（先算总字节再决定），所以暂存区里不会出现「某批只进了一半」的中间态；
+/// 半批只可能来自**投递**过程（`drain` 投到一半队满），由 [`PatchStaging::partial`] 识别。
+#[derive(Default)]
+struct PatchStaging {
+    frames: VecDeque<StagedScreen>,
+    bytes: usize,
+}
+
+impl PatchStaging {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 把**一整拍**补丁放进暂存区；返回 `false` 表示装不下（调用方应退出补丁模式）。
+    ///
+    /// 先按整批总量判定再入区，故不会出现「半批进暂存区」：要么整批都在，要么一条都没进。
+    fn push_batch(&mut self, messages: Vec<SessionMessage>, now: std::time::Instant) -> bool {
+        let batch_bytes = messages.iter().fold(0_usize, |acc, msg| {
+            acc.saturating_add(usize::try_from(region_update_bytes(msg)).unwrap_or(usize::MAX))
+        });
+        if self.bytes.saturating_add(batch_bytes) > PATCH_STAGING_MAX_BYTES {
+            return false;
+        }
+        for (index, msg) in messages.into_iter().enumerate() {
+            let bytes = usize::try_from(region_update_bytes(&msg)).unwrap_or(usize::MAX);
+            self.frames.push_back(StagedScreen {
+                frame: SessionFrame::screen(msg),
+                bytes,
+                batch_start: index == 0,
+                staged_at: now,
+            });
+        }
+        self.bytes = self.bytes.saturating_add(batch_bytes);
+        true
+    }
+
+    /// **非阻塞**地按 FIFO 补投；队满即停、剩余留到下一拍。返回本轮投出的条数。
+    ///
+    /// `try_send(frame, bytes)` 返回 `Ok(None)` = 已入队；`Ok(Some(frame))` = 队列已满，
+    /// 帧原样还回来（保持 FIFO，绝不重建、绝不丢）。这里保持严格 FIFO：后面的消息绝不会
+    /// 越过前面没投出去的，所以控制端收到的补丁顺序永远是采集顺序。
+    ///
+    /// # Errors
+    /// 写任务已结束（链路断开）时返回错误，暂存区一并清空。
+    fn drain<F>(&mut self, mut try_send: F) -> RemoteResult<usize>
+    where
+        F: FnMut(SessionFrame, u64) -> RemoteResult<Option<SessionFrame>>,
+    {
+        let mut sent = 0;
+        while let Some(staged) = self.frames.pop_front() {
+            let StagedScreen {
+                frame,
+                bytes,
+                batch_start,
+                staged_at,
+            } = staged;
+            match try_send(frame, u64::try_from(bytes).unwrap_or(u64::MAX)) {
+                Ok(None) => {
+                    self.bytes = self.bytes.saturating_sub(bytes);
+                    sent += 1;
+                }
+                Ok(Some(frame)) => {
+                    self.frames.push_front(StagedScreen {
+                        frame,
+                        bytes,
+                        batch_start,
+                        staged_at,
+                    });
+                    break;
+                }
+                Err(err) => {
+                    self.clear();
+                    return Err(err);
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    /// 暂存区头部是否是**半批**（同批更早的横条已经投出、其余仍滞留）。
+    ///
+    /// 头部的 `batch_start == false` 等价于「这一批的首条已经离开暂存区」，也就是控制端的
+    /// 合成缓冲已经吃到了这批的一部分。整批都在暂存区时返回 `false`。
+    fn partial(&self) -> bool {
+        self.frames.front().is_some_and(|staged| !staged.batch_start)
+    }
+
+    /// 头部这条滞留是否已超龄（见 [`PATCH_STAGING_MAX_AGE`]）。
+    fn over_age(&self, now: std::time::Instant) -> bool {
+        self.frames.front().is_some_and(|staged| {
+            now.saturating_duration_since(staged.staged_at) >= PATCH_STAGING_MAX_AGE
+        })
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+}
 
 /// 退出补丁模式后的**重入冷却**（2 秒）。
 ///
@@ -938,16 +1105,22 @@ fn refresh_activity(
 /// 调用方只在参考链/几何真的失效时（`RequestKeyframe`、切显示器、改缩放）额外置
 /// `force_keyframe`。无条件插 IDR 会让每次切窗口/开文件夹都付出一个 150–400 KB 的尖峰。
 ///
-/// 退出同时开启重入冷却（[`PATCH_REENTRY_HOLDOFF`]），避免「退出 → 整帧 → 立刻再进入 →
-/// 再整帧」的抖动正反馈。
+/// 退出同时丢弃暂存区（见 [`PatchStaging`]）并开启重入冷却（[`PATCH_REENTRY_HOLDOFF`]），
+/// 避免「退出 → 整帧 → 立刻再进入 → 再整帧」的抖动正反馈。暂存区必须在退出时清掉：里面
+/// 是**旧**画面的补丁，若让它们排到退出后的全帧之后，控制端会把旧内容盖到新画面上。
+///
+/// 已发出的**半批**横条由调用方判断（[`PatchStaging::partial`]）并另行强制关键帧——那时
+/// 控制端合成缓冲缺块，只有完整 IDR 能修复。
 fn exit_patch_mode(
     mode: &mut PatchMode,
+    staging: &mut PatchStaging,
     force_encode: &mut bool,
     last_changed_permille: &mut u16,
     capture_tick: &mut Pin<Box<Sleep>>,
     next_capture_at: &mut Instant,
 ) {
     mode.exit(std::time::Instant::now());
+    staging.clear();
     *force_encode = true;
     // 面积未知/刚发生大变化：保守给满面积，别让下一次 1Hz 反馈拿补丁模式里的旧值
     // 把内容上限压回 UI 档（15 fps / 1.2 Mbps）。
@@ -955,6 +1128,160 @@ fn exit_patch_mode(
     // 立刻抓一帧，并把 `next_capture_at` 一起锚到现在；否则它仍停在未来，下一次输入
     // 提前采集会因为 `target < next_capture_at` 反过来把这个「立刻」推迟。
     schedule_capture(capture_tick, next_capture_at, Instant::now());
+}
+
+/// 关键帧请求的**去重窗口**（350 ms）。
+///
+/// 真机日志（Windows → Windows、QSV 1080p@30、10 Mbps、Punch）：74 秒会话 595 帧里 63 个
+/// IDR，占 51% 字节、**75% 的写线时间**；其中 0.8 秒内打出 4 个 ~240 KB 的 IDR，
+/// 246199 / 246117 字节几乎相同——同一幅画面被反复重编。控制器在 `awaiting_keyframe` 期间
+/// 每 400 ms 重发一次请求，而被控端「有请求就置 `force_keyframe`」，于是每个请求都变成一个
+/// 整帧尖峰；一帧 IDR 从编码到写完要 190+ ms，这段时间里到达的请求完全是在为**已经在路上**
+/// 的关键帧重复付费。
+///
+/// 窗口取 350 ms 的依据是控制器 400 ms 的重发周期，它必须**严格小于**它：
+/// ① 被吸收的请求不会让控制器永久卡在 `awaiting_keyframe`——下一次重发必然落在窗口之外，
+///    一定会被满足；
+/// ② 若那个 IDR 真的在链路上丢了，最坏也只是多等一个重发周期（≈400 ms），而不是永久抑制。
+/// 取到 400 ms 以上就把「重发」也吞掉了，那就不再是去重。
+const KEYFRAME_DEDUP_WINDOW: Duration = Duration::from_millis(350);
+
+/// IDR 在途/刚写出的共享观测点（进程内，**不上线**）。
+///
+/// 编码任务在**承诺编码一个 IDR** 时入账，写任务在该帧**真正写完**时销账；会话循环据此
+/// 吸收重复的关键帧请求（见 [`keyframe_request_is_redundant`]）。
+///
+/// 与 `base_frame_sent` 分开是刻意的：后者只服务补丁基准帧的**顺序**不变量（「基准帧已进入
+/// 出站队列」），语义不能被这里的「IDR 是否已上线」污染；两者的事件点也不同（基准帧是 P 帧
+/// 也会置位）。
+#[derive(Debug, Default)]
+pub(crate) struct IdrTracker {
+    /// 已承诺、但还没写完到链路上的 IDR 数（正常只会是 0 或 1，用计数是为了容错/重叠）。
+    pending: AtomicU32,
+    /// 最近一次 IDR **写完**的时刻（[`crate::clock::now_us`] 的单调微秒；0 = 还没写过）。
+    written_us: AtomicU64,
+}
+
+impl IdrTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 编码任务：承诺一个 IDR。**在真正编码之前**登记，覆盖「已决定编码 IDR」到「出包」
+    /// 那十几毫秒——否则这段时间到达的请求会再插一个 IDR。
+    fn commit(&self) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 销账一个 IDR（编码失败/被跳过，或写任务写完）。
+    fn release(&self) {
+        let _ = self
+            .pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            });
+    }
+
+    /// 写任务：一个 IDR 已经写完（销账并推进「刚写出」时间戳）。
+    fn on_idr_written(&self, now_us: u64) {
+        self.release();
+        self.written_us.store(now_us, Ordering::Relaxed);
+    }
+
+    /// 当前在途（已承诺、未写完）的 IDR 数。
+    fn in_flight(&self) -> u32 {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// 最近一次 IDR 写完的时刻（微秒；0 = 还没写过）。
+    fn last_written_us(&self) -> u64 {
+        self.written_us.load(Ordering::Relaxed)
+    }
+}
+
+/// 编码任务里的「已承诺 IDR」在途登记（RAII）。
+///
+/// 承诺点在真正编码之前，而编码循环里有好几条 `continue`（出站队列满、编码器创建/编码失败、
+/// 空包）。任何一条没有走到 [`IdrInFlight::handoff`] 的路径都必须销账，否则 `pending` 会
+/// 永久卡在 >0，把后续所有关键帧请求都吸收掉。用 `Drop` 兜住比在每个 `continue` 前手写一遍
+/// 可靠得多。
+struct IdrInFlight {
+    tracker: Arc<IdrTracker>,
+    armed: bool,
+}
+
+impl IdrInFlight {
+    fn begin(tracker: Arc<IdrTracker>) -> Self {
+        tracker.commit();
+        Self {
+            tracker,
+            armed: true,
+        }
+    }
+
+    /// 已交给写任务：由它在写完时销账。
+    fn handoff(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IdrInFlight {
+    fn drop(&mut self) {
+        if self.armed {
+            self.tracker.release();
+        }
+    }
+}
+
+/// 一次**外部触发**（控制器 `RequestKeyframe`、补丁半批退出）的关键帧请求是否应被吸收。
+///
+/// 三种情形都说明已经有一个 IDR 在路上或刚刚上过线，再打一个只是同一幅画面重编一遍：
+/// - `force_keyframe` 已为真：上一次请求还没被编码任务消费；
+/// - `in_flight > 0`：编码任务已承诺一个 IDR，它还在编码/画面队列/写线途中（真机上一帧
+///   IDR 写完要 190+ ms，这段时间最长）；
+/// - 最近一次 IDR 写出不超过 [`KEYFRAME_DEDUP_WINDOW`]。
+///
+/// **只用于外部请求**：周期性 IDR、切显示器/切画质、几何变化、编码器重建是「参考链/几何真的
+/// 失效」，必须无条件生效，不走这里。
+#[must_use]
+fn keyframe_request_is_redundant(
+    force_keyframe: bool,
+    in_flight: u32,
+    last_written_us: u64,
+    now_us: u64,
+) -> bool {
+    if force_keyframe || in_flight > 0 {
+        return true;
+    }
+    let window_us = u64::try_from(KEYFRAME_DEDUP_WINDOW.as_micros()).unwrap_or(u64::MAX);
+    last_written_us != 0 && now_us.saturating_sub(last_written_us) < window_us
+}
+
+/// 把补丁暂存区按 FIFO 补投进画面队列（**非阻塞**，队满即停）。
+///
+/// 两条副作用只在**真正入队之后**发生，与旧实现按条投递时一致：
+/// - `last_patch_sent` 是补丁保活（空 `RegionUpdate`）的水位，只有发出去才算数；
+/// - `meter` 是 QoS 投递率口径，只有真正交给画面队列的字节才计入。
+///
+/// # Errors
+/// 写任务已结束（链路断开）时返回错误。
+fn drain_patch_staging(
+    staging: &mut PatchStaging,
+    queues: &OutboundQueues,
+    mode: &mut PatchMode,
+    meter: &ScreenSendMeter,
+) -> RemoteResult<usize> {
+    staging.drain(|frame, bytes| {
+        match queues.try_enqueue_screen_or_return(frame)? {
+            None => {
+                mode.last_patch_sent = Some(std::time::Instant::now());
+                meter.add_bytes(bytes);
+                Ok(None)
+            }
+            // 队满：把帧原样还回去，暂存区保序留到下一拍。
+            Some(frame) => Ok(Some(frame)),
+        }
+    })
 }
 
 /// 一段已编码（压缩或原始）的横向条块，坐标是**目标帧缓冲**坐标系。
@@ -1593,6 +1920,9 @@ pub async fn run_controlled(
     // ——否则写侧被背压卡住时（对端停读、中继停走），输入/心跳分支完全得不到轮询，形成队头阻塞。
     // 协商阶段的 `HeartbeatAck` / `CodecSelect` 也走这些队列，故先把它起来。
     let (mut queues, receivers) = OutboundQueues::new();
+    // IDR 在途/刚写出的共享观测点：编码任务登记、写任务销账、会话循环据此吸收重复的
+    // 关键帧请求（见 [`keyframe_request_is_redundant`]）。只在本端参与调度，**不上线**。
+    let idr_tracker = IdrTracker::new();
     // 诊断：主循环 / 编码任务 / 写任务共写一份延迟窗口，由主循环每秒取走并打一行汇总
     // （见 `crate::latency`）。未开延迟诊断时只有一次 `enabled()` 判断。
     let latency_window: Arc<std::sync::Mutex<LatencyWindow>> =
@@ -1602,6 +1932,7 @@ pub async fn run_controlled(
         receivers,
         cancel.clone(),
         Some(Arc::clone(&latency_window)),
+        Some(Arc::clone(&idr_tracker)),
     ));
 
     // 2.5) 编解码协商：**必须先拿到 `CodecOffer` 才能开始采集/编码**——否则首帧可能用了控制器
@@ -1698,6 +2029,7 @@ pub async fn run_controlled(
         max_encode_width,
         Arc::clone(&encode_snapshot),
         Arc::clone(&latency_window),
+        Arc::clone(&idr_tracker),
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -1805,6 +2137,10 @@ pub async fn run_controlled(
     let mut force_encode = false;
     // 脏矩形补丁模式的状态机（见模块文档）。`patch_capable == false` 时它永远停在 `Video`。
     let mut screen_mode = PatchMode::new();
+    // 补丁出站的有界暂存区：画面队列瞬时满时整拍补丁先留在这里、下一拍补投（见
+    // [`PatchStaging`]）。它是「主循环绝不 `.await` 画面队列」与「补丁绝不丢」同时成立的
+    // 唯一办法；只有超龄/超字节上限（写侧真的跟不上）才退出补丁模式。
+    let mut patch_staging = PatchStaging::new();
     // 最近一帧采集报告的**变化面积**（千分比）：逐帧喂 `RateController::promote_activity`
     // （升档立刻生效），每秒再随 `QosFeedback` 喂 `observe_activity`（带迟滞的降档）。
     // 初值 1000 = 面积未知/满帧，保守地不收紧上限。
@@ -2210,6 +2546,7 @@ pub async fn run_controlled(
                                         // 退出后必须重发 IDR。
                                         exit_patch_mode(
                                             &mut screen_mode,
+                                            &mut patch_staging,
                                             &mut force_encode,
                                             &mut last_changed_permille,
                                             &mut capture_tick,
@@ -2221,6 +2558,7 @@ pub async fn run_controlled(
                                         // 只是画面变忙：参考链完好，退出后的第一帧 P 帧即可。
                                         exit_patch_mode(
                                             &mut screen_mode,
+                                            &mut patch_staging,
                                             &mut force_encode,
                                             &mut last_changed_permille,
                                             &mut capture_tick,
@@ -2230,6 +2568,7 @@ pub async fn run_controlled(
                                         warn!(rects = rect_count, "脏矩形过多，退出补丁模式");
                                         exit_patch_mode(
                                             &mut screen_mode,
+                                            &mut patch_staging,
                                             &mut force_encode,
                                             &mut last_changed_permille,
                                             &mut capture_tick,
@@ -2273,63 +2612,76 @@ pub async fn run_controlled(
                                                 std::time::Instant::now(),
                                                 budget_kbps,
                                             ) {
-                                                debug!(
-                                                    capture_us,
-                                                    messages = messages.len(),
-                                                    rects = rect_count,
-                                                    bytes,
-                                                    "发送脏矩形补丁"
-                                                );
-                                                // 补丁按序投递（控制器按到达顺序合成），但**绝不能在
-                                                // 主循环里 `.await` 画面队列**：网络拥塞时那会把整个
-                                                // `select!` 卡住，期间读不到/注入不了输入、采集也停拍。
-                                                // 故走 `try_enqueue_screen`，满了就退让（见下）。
-                                                let mut write_err = None;
-                                                let mut enqueue_full = false;
-                                                for msg in messages {
-                                                    let len = region_update_bytes(&msg);
-                                                    match queues
-                                                        .try_enqueue_screen(SessionFrame::screen(msg))
-                                                    {
-                                                        Ok(true) => {}
-                                                        Ok(false) => {
-                                                            enqueue_full = true;
-                                                            break;
-                                                        }
-                                                        Err(err) => {
-                                                            write_err = Some(err);
-                                                            break;
-                                                        }
+                                                let count = messages.len();
+                                                // 整拍补丁**整批**进暂存区，而不是逐条 try 投递：
+                                                // 队列满时不会留下「本批只发了一半」的中间态。
+                                                //
+                                                // 为什么不能像旧实现那样「投不进去就退出补丁模式」：
+                                                // 画面队列只有 [`SCREEN_QUEUE`] 两深，刚进补丁模式
+                                                // 时排在前面的基准 IDR 还在写（真机 ~240 KB / 190+
+                                                // ms），第一条必然投不进去；退出又强制一个 IDR，于是
+                                                // 「进入 → 5 ms 后 abort → 再打 IDR」自激。
+                                                if patch_staging
+                                                    .push_batch(messages, std::time::Instant::now())
+                                                {
+                                                    debug!(
+                                                        capture_us,
+                                                        messages = count,
+                                                        rects = rect_count,
+                                                        bytes,
+                                                        staged_bytes = patch_staging.bytes(),
+                                                        "补丁已进暂存区"
+                                                    );
+                                                    // 队列通常有空位：立刻补投一次，不必等下一拍
+                                                    // （否则每条补丁白等最多一个采集周期）。
+                                                    let drained = match drain_patch_staging(
+                                                        &mut patch_staging,
+                                                        &queues,
+                                                        &mut screen_mode,
+                                                        &screen_send_meter,
+                                                    ) {
+                                                        Ok(drained) => drained,
+                                                        Err(err) => break Err(err),
+                                                    };
+                                                    if drained < count {
+                                                        debug!(
+                                                            drained,
+                                                            pending = count - drained,
+                                                            "画面队列暂无空位，补丁留在暂存区等下一拍"
+                                                        );
                                                     }
-                                                    // 每条成功入队后才推进保活水位、才计出码：中途
-                                                    // 放弃时这两件事都不能假装发生过。
-                                                    screen_mode.last_patch_sent =
-                                                        Some(std::time::Instant::now());
-                                                    screen_send_meter.add_bytes(len);
-                                                }
-                                                if let Some(err) = write_err {
-                                                    break Err(err);
-                                                }
-                                                if enqueue_full {
-                                                    // 画面队列满 = 写侧已经跟不上。可能已发出本批的
-                                                    // **部分**横条，控制端那块合成缓冲只有一帧完整
-                                                    // IDR 才能修复，所以这里必须连带强制关键帧
-                                                    // （与其它「补丁装不下」路径的 P 帧语义不同）。
-                                                    // 已入队的那几条仍排在这一帧全帧之前（同一条画面
-                                                    // FIFO），顺序与合成语义都成立。
+                                                } else {
+                                                    // 暂存区都装不下 = 写侧已经连续一整段没消化。
+                                                    // 这**才是**真的跟不上：退回全帧（必要时 IDR）。
                                                     warn!(
                                                         bytes,
+                                                        staged_bytes = patch_staging.bytes(),
                                                         rects = rect_count,
-                                                        "画面队列已满，补丁投递受阻，退出补丁模式并强制关键帧"
+                                                        "补丁暂存区已满，写侧持续跟不上，退出补丁模式"
                                                     );
+                                                    let partial = patch_staging.partial();
                                                     exit_patch_mode(
                                                         &mut screen_mode,
+                                                        &mut patch_staging,
                                                         &mut force_encode,
                                                         &mut last_changed_permille,
                                                         &mut capture_tick,
                                                         &mut next_capture_at,
                                                     );
-                                                    force_keyframe = true;
+                                                    // 半批已发出：控制端合成缓冲缺块，必须一帧完整
+                                                    // IDR。它与控制器自己的 `RequestKeyframe` 走
+                                                    // **同一道去重闸门**——同一 IDR 不在 0.8 秒里打
+                                                    // 四遍。
+                                                    if partial
+                                                        && !keyframe_request_is_redundant(
+                                                            force_keyframe,
+                                                            idr_tracker.in_flight(),
+                                                            idr_tracker.last_written_us(),
+                                                            crate::clock::now_us(),
+                                                        )
+                                                    {
+                                                        force_keyframe = true;
+                                                    }
                                                 }
                                             } else {
                                                 warn!(
@@ -2339,6 +2691,7 @@ pub async fn run_controlled(
                                                 );
                                                 exit_patch_mode(
                                                     &mut screen_mode,
+                                                    &mut patch_staging,
                                                     &mut force_encode,
                                                     &mut last_changed_permille,
                                                     &mut capture_tick,
@@ -2354,6 +2707,7 @@ pub async fn run_controlled(
                                             );
                                             exit_patch_mode(
                                                 &mut screen_mode,
+                                                &mut patch_staging,
                                                 &mut force_encode,
                                                 &mut last_changed_permille,
                                                 &mut capture_tick,
@@ -2367,6 +2721,7 @@ pub async fn run_controlled(
                                     debug!("补丁采集未产出补丁，返回全帧视频");
                                     exit_patch_mode(
                                         &mut screen_mode,
+                                        &mut patch_staging,
                                         &mut force_encode,
                                         &mut last_changed_permille,
                                         &mut capture_tick,
@@ -2418,6 +2773,54 @@ pub async fn run_controlled(
                     Some(true) => info!("进入脏矩形补丁模式"),
                     Some(false) => debug!("等待基准帧超时，放弃进入补丁模式"),
                     None => {}
+                }
+                // 补丁暂存区：每拍先按 FIFO 补投（非阻塞），再判滞留是否已超龄。
+                //
+                // 补投必须放在采集**派发之前**：排在前面的基准 IDR 一写完，补丁就在这一拍
+                // 立刻上路，而不是等下一拍（最多白等一个采集周期）。超龄是唯一会触发退出的
+                // 时间条件——它量的是「头部这条补丁等了多久」，而不是「队列满没满」：队列满
+                // 本身是瞬态（一帧大 IDR 写完就腾空），退出并强制 IDR 只会把瞬态放大成自激。
+                if screen_mode.is_patches() {
+                    let drained = match drain_patch_staging(
+                        &mut patch_staging,
+                        &queues,
+                        &mut screen_mode,
+                        &screen_send_meter,
+                    ) {
+                        Ok(drained) => drained,
+                        Err(err) => break Err(err),
+                    };
+                    if drained > 0 {
+                        debug!(drained, "补丁暂存区补投");
+                    }
+                    if patch_staging.over_age(std::time::Instant::now()) {
+                        warn!(
+                            seconds = PATCH_STAGING_MAX_AGE.as_secs_f32(),
+                            staged_bytes = patch_staging.bytes(),
+                            "补丁滞留超过上限（写侧持续跟不上），退出补丁模式"
+                        );
+                        let partial = patch_staging.partial();
+                        exit_patch_mode(
+                            &mut screen_mode,
+                            &mut patch_staging,
+                            &mut force_encode,
+                            &mut last_changed_permille,
+                            &mut capture_tick,
+                            &mut next_capture_at,
+                        );
+                        // 半批横条已发出 → 控制端合成缓冲缺块，只能靠完整 IDR 修复；走与
+                        // `RequestKeyframe` 相同的去重闸门（别为同一幅画面连打 IDR）。
+                        if partial
+                            && !keyframe_request_is_redundant(
+                                force_keyframe,
+                                idr_tracker.in_flight(),
+                                idr_tracker.last_written_us(),
+                                crate::clock::now_us(),
+                            )
+                        {
+                            force_keyframe = true;
+                        }
+                    }
                 }
                 let period = capture_tick_period(screen_mode.mode, &encode);
                 let tick_now = Instant::now();
@@ -2512,6 +2915,7 @@ pub async fn run_controlled(
                             }
                             // 几何/来源都变了：补丁模式的持久缓冲与编码器尺寸都要重建。
                             screen_mode.exit(std::time::Instant::now());
+                            patch_staging.clear();
                             force_keyframe = true;
                             schedule_capture(
                                 &mut capture_tick,
@@ -2528,6 +2932,7 @@ pub async fn run_controlled(
                                 old.width, old.height, new.width, new.height
                             );
                             screen_mode.exit(std::time::Instant::now());
+                            patch_staging.clear();
                             force_keyframe = true;
                             schedule_capture(
                                 &mut capture_tick,
@@ -2650,6 +3055,7 @@ pub async fn run_controlled(
                                 // 几何变了：补丁模式（以及正在等的进入）一律作废，控制器那块
                                 // 持久帧缓冲的尺寸已经不对了。
                                 screen_mode.exit(std::time::Instant::now());
+                                patch_staging.clear();
                                 force_keyframe = true;
                                 let at = Instant::now() + encode.capture_interval();
                                 schedule_capture(&mut capture_tick, &mut next_capture_at, at);
@@ -2678,6 +3084,7 @@ pub async fn run_controlled(
                             // 档位可能改缩放 → 几何可能变化：补丁模式的持久缓冲尺寸随之作废，
                             // 必须退出（并靠下面的 `force_keyframe` 重发基准）。
                             screen_mode.exit(std::time::Instant::now());
+                            patch_staging.clear();
                             let at = Instant::now() + encode.capture_interval();
                             schedule_capture(&mut capture_tick, &mut next_capture_at, at);
                             force_keyframe = true;
@@ -2790,6 +3197,7 @@ pub async fn run_controlled(
                             if screen_mode.is_patches() {
                                 exit_patch_mode(
                                     &mut screen_mode,
+                                    &mut patch_staging,
                                     &mut force_encode,
                                     &mut last_changed_permille,
                                     &mut capture_tick,
@@ -2798,8 +3206,27 @@ pub async fn run_controlled(
                             }
                             // 「请求了就一定 IDR」（仅限请求的就是当前显示器）：这是控制器明确
                             // 报告参考帧不可信，与补丁模式自己退出时的 P 帧语义不同。
+                            //
+                            // 但**同一个 IDR 不连打**：控制器在 `awaiting_keyframe` 期间每 400 ms
+                            // 重发一次，而一帧 IDR 从编码到写完要 190+ ms。真机日志里 0.8 秒 4 个
+                            // ~240 KB 的 IDR（246199 / 246117 字节几乎相同）就是这么来的。已有
+                            // IDR 在途、或刚写出不到 [`KEYFRAME_DEDUP_WINDOW`] 时直接吸收；
+                            // 窗口（350 ms）严格小于重发周期（400 ms），所以被吸收的请求会在
+                            // 下一次重发时得到满足——若那个 IDR 真的丢了，最多多等一个周期。
                             if display == display_id {
-                                force_keyframe = true;
+                                if keyframe_request_is_redundant(
+                                    force_keyframe,
+                                    idr_tracker.in_flight(),
+                                    idr_tracker.last_written_us(),
+                                    crate::clock::now_us(),
+                                ) {
+                                    debug!(
+                                        in_flight = idr_tracker.in_flight(),
+                                        "已有 IDR 在途或刚写出，吸收重复的关键帧请求"
+                                    );
+                                } else {
+                                    force_keyframe = true;
+                                }
                             }
                         }
                         SessionMessage::Clipboard { text } => {
@@ -3008,6 +3435,9 @@ pub(crate) async fn writer_loop(
     cancel: CancellationToken,
     // 诊断：与主循环/编码任务共享的延迟窗口；控制器侧传 `None`（它不写画面帧）。
     latency_window: Option<Arc<std::sync::Mutex<LatencyWindow>>>,
+    // IDR 在途/刚写出观测点；控制器侧传 `None`（它不产生 IDR）。被控端在**写完**一帧
+    // 关键帧时销账并置「刚写出」时间戳，会话循环据此吸收重复的关键帧请求。
+    idr_tracker: Option<Arc<IdrTracker>>,
 ) {
     // 取消后不再写普通帧，只等收尾帧。
     let mut cancelled = false;
@@ -3032,8 +3462,21 @@ pub(crate) async fn writer_loop(
                 let trace = latency_window.is_some() && latency::enabled();
                 let dequeued_us = if trace { crate::clock::now_us() } else { 0 };
                 let meta = if trace { screen_frame_meta(&frame) } else { None };
+                // 关键帧标记必须**无条件**取：延迟诊断关闭时 `meta` 是 `None`，但 IDR 销账
+                // 与诊断无关（见 [`IdrTracker`]）。
+                let wrote_idr = matches!(
+                    &frame.message,
+                    SessionMessage::VideoPacket { flags, .. } if flags & VIDEO_FLAG_KEYFRAME != 0
+                );
                 if !write_screen(&mut writer, &cancel, frame, &mut cancelled, pacing_kbps).await {
                     break;
+                }
+                // 只有**完整写完**才算「刚写出」：pacing 中途被取消的那一帧没有完整上线，
+                // 会话也正在收尾，不需要再吸收任何请求。
+                if wrote_idr && !cancelled {
+                    if let Some(tracker) = &idr_tracker {
+                        tracker.on_idr_written(crate::clock::now_us());
+                    }
                 }
                 if let (Some(window), Some((seq, capture_ts_us, bytes, keyframe))) =
                     (latency_window.as_ref(), meta)
@@ -3738,6 +4181,9 @@ async fn encode_loop(
     encode_snapshot: Arc<std::sync::Mutex<Option<EncodeSnapshot>>>,
     // 诊断：与主循环/写任务共享的延迟窗口（见 [`crate::latency`]）。
     latency_window: Arc<std::sync::Mutex<LatencyWindow>>,
+    // IDR 在途/刚写出观测点：编码任务在承诺编码 IDR 时入账，写任务写完时销账
+    // （见 [`IdrTracker`]）。主循环据此吸收重复的关键帧请求。
+    idr_tracker: Arc<IdrTracker>,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -3899,6 +4345,11 @@ async fn encode_loop(
         let Some(enc) = encoder.take() else {
             continue;
         };
+        // 承诺一个 IDR：从这一刻起到它**写完**，外部来的重复关键帧请求都会被吸收
+        // （见 [`IdrTracker`] / [`keyframe_request_is_redundant`]）。登记点必须在真正编码
+        // **之前**——否则「已决定编码 IDR」到「出包」那十几毫秒里到达的请求会再插一个。
+        // RAII 保证编码器创建失败/编码出错/空包这些 `continue` 路径自动销账。
+        let mut idr_in_flight = idr.then(|| IdrInFlight::begin(Arc::clone(&idr_tracker)));
         let started = Instant::now();
         // 编码是阻塞调用，移出 async worker；编码器与整帧（CPU 的 `rgba` 或 GPU 纹理）
         // 随闭包移入、随结果移出（独占持有）。码率/帧率的在线重配置也在这里做
@@ -3981,6 +4432,14 @@ async fn encode_loop(
                 let out_started = Instant::now();
                 if !send_video(&out, &cancel, msg).await {
                     break;
+                }
+                // 真的产出了关键帧并交给画面队列：销账交给写任务（它在**写完**时置
+                // 「刚写出」时间戳）。编码器没照做（`keyframe == false`）时 `idr_in_flight`
+                // 保持 armed，由 `Drop` 在本轮结束时销账。
+                if keyframe {
+                    if let Some(guard) = idr_in_flight.take() {
+                        guard.handoff();
+                    }
                 }
                 let out_q_us = u64::try_from(out_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 if latency::enabled() {
@@ -5065,6 +5524,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -5152,6 +5612,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -5313,6 +5774,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
         // 内容上限把 P 帧压到 1.2 Mbps；关键帧仍应按 6 Mbps 编码。
         let capped = EncodeRates {
@@ -5385,6 +5847,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
 
         job_tx
@@ -5459,6 +5922,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -5561,6 +6025,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -5659,6 +6124,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force_keyframe: bool, force_encode: bool| EncodeJob {
@@ -5744,6 +6210,7 @@ mod tests {
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -6864,6 +7331,189 @@ mod tests {
         assert_eq!(mode.enter_streak, 0, "放弃后连续计数必须清零");
     }
 
+    /// 造一条补丁消息：`seed` 写进 `data`，便于断言暂存区/投递的 FIFO 顺序。
+    fn patch_message(seed: u8, bytes: usize) -> SessionMessage {
+        SessionMessage::RegionUpdate {
+            display: 0,
+            width: 32,
+            height: 24,
+            rects: vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                flags: 0,
+                data: vec![seed; bytes],
+            }],
+            capture_ts_us: 0,
+        }
+    }
+
+    /// 取回 [`patch_message`] 写进去的 `seed`。
+    fn patch_seed(frame: &SessionFrame) -> u8 {
+        match &frame.message {
+            SessionMessage::RegionUpdate { rects, .. } => {
+                rects.first().map_or(u8::MAX, |rect| rect.data[0])
+            }
+            other => panic!("期望 RegionUpdate，实得 {other:?}"),
+        }
+    }
+
+    /// 暂存区**跨拍续投且严格 FIFO**：队满时一条都不丢，投出一部分后仍保持原序。
+    ///
+    /// 这是「补丁绝不丢」的核心断言：丢了控制端合成缓冲会永久缺一块（直到下一个 IDR）。
+    #[test]
+    fn patch_staging_drains_fifo_across_capture_ticks() {
+        let t0 = Instant::now();
+        let mut staging = PatchStaging::new();
+        // 两拍：A 批 2 条、B 批 2 条，按采集顺序进区。
+        assert!(staging.push_batch(vec![patch_message(1, 100), patch_message(2, 100)], t0));
+        assert!(staging.push_batch(
+            vec![patch_message(3, 100), patch_message(4, 100)],
+            t0 + Duration::from_millis(33)
+        ));
+        assert_eq!(staging.bytes(), 400);
+
+        // 第一拍：画面队列只剩 1 个空位 → 只投出 A 批首条，其余留在暂存区。
+        let mut sent: Vec<u8> = Vec::new();
+        let count = staging
+            .drain(|frame, _bytes| {
+                if !sent.is_empty() {
+                    return Ok(Some(frame));
+                }
+                sent.push(patch_seed(&frame));
+                Ok(None)
+            })
+            .expect("写任务仍在");
+        assert_eq!(count, 1);
+        assert_eq!(sent, vec![1]);
+        assert_eq!(staging.bytes(), 300, "投出的字节必须从暂存区扣掉");
+        assert!(
+            staging.partial(),
+            "A 批首条已发出、其余仍滞留 ⇒ 半批（退出时需要 IDR 修复）"
+        );
+
+        // 第二拍：多腾出三个空位 → 严格按 FIFO 续投，不越过、不重排。
+        let mut sent: Vec<u8> = Vec::new();
+        staging
+            .drain(|frame, _bytes| {
+                if sent.len() >= 3 {
+                    return Ok(Some(frame));
+                }
+                sent.push(patch_seed(&frame));
+                Ok(None)
+            })
+            .expect("写任务仍在");
+        assert_eq!(sent, vec![2, 3, 4], "续投必须保持采集顺序");
+        assert!(!staging.partial(), "整批都投出后不再是半批");
+        assert!(staging.is_empty());
+        assert_eq!(staging.bytes(), 0);
+    }
+
+    /// 暂存区满 → **整批拒收**（调用方据此退出补丁模式）；空暂存区总能接下一整拍。
+    #[test]
+    fn patch_staging_rejects_a_batch_when_full() {
+        let t0 = Instant::now();
+        let mut staging = PatchStaging::new();
+        let half = PATCH_STAGING_MAX_BYTES / 2;
+        assert!(staging.push_batch(vec![patch_message(1, half)], t0));
+        assert!(staging.push_batch(vec![patch_message(2, half)], t0));
+        assert_eq!(staging.bytes(), PATCH_STAGING_MAX_BYTES, "恰好顶到上限");
+        // 再来一批（哪怕只有 1 字节）：装不下就整批拒收，暂存区原样不动。
+        assert!(
+            !staging.push_batch(vec![patch_message(3, 1)], t0),
+            "超上限必须拒收，调用方据此退出补丁模式"
+        );
+        assert_eq!(staging.bytes(), PATCH_STAGING_MAX_BYTES, "拒收不得改动暂存区");
+        // 空暂存区总能接下**一整拍**（单拍上限 = 暂存区上限）：否则补丁会永远进不来。
+        staging.clear();
+        assert!(staging.push_batch(vec![patch_message(4, PATCH_STAGING_MAX_BYTES)], t0));
+    }
+
+    /// 滞留判定按**头部**那条的入区时刻算：未到上限不退出，到点即退出。
+    #[test]
+    fn patch_staging_aborts_only_after_the_age_limit() {
+        let t0 = Instant::now();
+        let mut staging = PatchStaging::new();
+        assert!(!staging.over_age(t0), "空暂存区不超龄");
+        assert!(staging.push_batch(vec![patch_message(1, 10)], t0));
+        assert!(
+            !staging.over_age(t0 + PATCH_STAGING_MAX_AGE.saturating_sub(Duration::from_millis(1))),
+            "差 1 ms 不该退出"
+        );
+        assert!(staging.over_age(t0 + PATCH_STAGING_MAX_AGE), "到点即超龄");
+
+        // 头部投出后滞留时长从**新的头部**重新起算（它入区更晚）。
+        let later = t0 + PATCH_STAGING_MAX_AGE / 2;
+        assert!(staging.push_batch(vec![patch_message(2, 10)], later));
+        let mut budget = 1_u32;
+        staging
+            .drain(|frame, _bytes| {
+                if budget == 0 {
+                    return Ok(Some(frame));
+                }
+                budget -= 1;
+                Ok(None)
+            })
+            .expect("写任务仍在");
+        assert!(
+            !staging.over_age(t0 + PATCH_STAGING_MAX_AGE),
+            "新头部只滞留了半个上限"
+        );
+        assert!(staging.over_age(later + PATCH_STAGING_MAX_AGE));
+    }
+
+    /// 去重闸门：IDR 在途、刚写出、或已有待发 IDR 时吸收；其余一律放行。
+    #[test]
+    fn keyframe_request_dedup_absorbs_in_flight_and_recent_ids() {
+        let window_us = u64::try_from(KEYFRAME_DEDUP_WINDOW.as_micros()).expect("窗口是微秒级");
+        let now = 10_000_000_u64;
+        // 有 IDR 在途（编码/画面队列/写线途中）：吸收。
+        assert!(keyframe_request_is_redundant(false, 1, 0, now));
+        // 刚写出（窗口内）：吸收。
+        assert!(keyframe_request_is_redundant(false, 0, now - window_us + 1, now));
+        // 已经有一个待发的 IDR（force_keyframe 还没被编码任务消费）：吸收。
+        assert!(keyframe_request_is_redundant(true, 0, 0, now));
+        // 恰好到达窗口边界：不再吸收（控制器 400 ms 的重发必须能穿透）。
+        assert!(!keyframe_request_is_redundant(false, 0, now - window_us, now));
+        // 从没写过 IDR、也没有在途：必须放行，否则会话早期的请求会被饿死。
+        assert!(!keyframe_request_is_redundant(false, 0, 0, now));
+        // 安全前提写死在测试里：窗口必须**严格小于**控制器的 400 ms 重发周期。
+        assert!(
+            KEYFRAME_DEDUP_WINDOW < Duration::from_millis(400),
+            "窗口不小于重发周期就会把「重发」也吞掉 = 永久抑制"
+        );
+    }
+
+    /// IDR 在途计数：承诺/销账配对、写完记时间戳；RAII 守卫在没交接时自动销账。
+    #[test]
+    fn idr_tracker_balances_commit_release_and_records_write() {
+        let tracker = IdrTracker::new();
+        assert_eq!(tracker.in_flight(), 0);
+        assert_eq!(tracker.last_written_us(), 0, "还没写过 IDR");
+
+        {
+            let guard = IdrInFlight::begin(Arc::clone(&tracker));
+            assert_eq!(tracker.in_flight(), 1, "承诺编码就要立刻登记在途");
+            // 没走到 `handoff` 就离开作用域（编码失败/空包）：必须自动销账，否则后续请求
+            // 会被永久吸收。
+            drop(guard);
+        }
+        assert_eq!(tracker.in_flight(), 0);
+
+        let guard = IdrInFlight::begin(Arc::clone(&tracker));
+        assert_eq!(tracker.in_flight(), 1);
+        guard.handoff();
+        assert_eq!(tracker.in_flight(), 1, "交接后由写任务销账，期间仍算在途");
+        tracker.on_idr_written(42);
+        assert_eq!(tracker.in_flight(), 0);
+        assert_eq!(tracker.last_written_us(), 42);
+        // 编码器自发插 IDR 时写任务也会销账一次：不得把计数减成负数。
+        tracker.on_idr_written(99);
+        assert_eq!(tracker.in_flight(), 0);
+        assert_eq!(tracker.last_written_us(), 99);
+    }
+
     /// 输入触发采集的提前量：最多提前到「上一拍之后半个周期」，且不早于当前时刻。
     ///
     /// 钉住三件事：① 还没采过时立刻采；② 刚采过时等半个周期（把相位等待从 `0..period`
@@ -7055,6 +7705,11 @@ mod tests {
         );
 
         // 控制器请求关键帧（参考丢失/队列溢出）→ 被控端退出补丁模式并重发全帧 IDR。
+        //
+        // 先等过**去重窗口**：刚进补丁模式时基准 IDR 是刚刚写出的，窗口内到达的请求会被
+        // 吸收（真机上控制器在 `awaiting_keyframe` 期间每 400 ms 重发，重发必然落在窗口
+        // 之外）。这里等过窗口，验证的正是「重发会被满足」这条路径。
+        tokio::time::sleep(KEYFRAME_DEDUP_WINDOW + Duration::from_millis(50)).await;
         peer_writer
             .send(SessionFrame::control(SessionMessage::RequestKeyframe {
                 display: 0,
@@ -7303,12 +7958,12 @@ mod tests {
         }
     }
 
-    /// 补丁投递必须**非阻塞**：画面队列满时 `try_enqueue_screen` 立即返回 `false`。
+    /// 补丁投递必须**非阻塞**：画面队列满时立即把帧还回来（不是等空位、也不是丢帧）。
     ///
     /// 主循环的补丁路径只能用它（P1-1）：退化成 `.await` 的话，网络拥塞时输入注入、心跳、
-    /// 采集节拍会被一起卡住。
+    /// 采集节拍会被一起卡住。把帧还回来则让补丁暂存区能原样放回、保持 FIFO。
     #[tokio::test]
-    async fn try_enqueue_screen_returns_false_when_full() {
+    async fn try_enqueue_screen_returns_the_frame_when_full() {
         let (queues, rx) = OutboundQueues::new();
         let probe = || {
             SessionFrame::screen(SessionMessage::ScreenConfig {
@@ -7320,20 +7975,29 @@ mod tests {
         };
         for index in 0..SCREEN_QUEUE {
             assert!(
-                queues.try_enqueue_screen(probe()).expect("写任务仍在"),
+                queues
+                    .try_enqueue_screen_or_return(probe())
+                    .expect("写任务仍在")
+                    .is_none(),
                 "第 {index} 条应入队"
             );
         }
-        // 函数是同步的：满队列只可能立刻返回 `false`，不存在「等空位」这条路径。
-        assert!(
-            !queues.try_enqueue_screen(probe()).expect("满不是错误"),
-            "队列已满时应返回 false"
-        );
+        // 函数是同步的：满队列只可能立刻把帧还回来，不存在「等空位」这条路径。
+        match queues
+            .try_enqueue_screen_or_return(probe())
+            .expect("满不是错误")
+        {
+            Some(frame) => assert!(matches!(
+                frame.message,
+                SessionMessage::ScreenConfig { .. }
+            )),
+            None => panic!("队列已满时帧必须被还回来"),
+        }
         // 写任务结束（接收端全部丢弃）≠ 队列满：必须报链路关闭，否则调用方会把它当成
         // 「只是忙」而无限循环。
         drop(rx);
         assert!(
-            queues.try_enqueue_screen(probe()).is_err(),
+            queues.try_enqueue_screen_or_return(probe()).is_err(),
             "写任务已结束时必须返回错误"
         );
 
