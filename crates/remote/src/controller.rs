@@ -28,7 +28,7 @@ use crate::video::MAX_FRAME_DIM;
 use futures_util::StreamExt as _;
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,44 +52,25 @@ const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 /// @30fps 就是 533 ms 的陈旧画面缓冲，正是延迟审查要消掉的东西。解码在常用码率下本来
 /// 就跟得上，队列深度的正确量级是「吸收抖动」而不是「存下整个卡顿」。
 ///
-/// 即使只有 4 深，主循环仍会按采集时间戳**主动老化**：队列接近满且某帧已经太老时直接
-/// 丢弃（见 [`should_drop_stale`]），让旧画面作废而不是排队等解码。队列满同样丢帧——丢弃会
-/// 打断 VP9 的参考链，故解码任务用**序号断层**检测到它并请求关键帧（见 [`decode_loop`]）。
-/// 队列满时还会推进 `drop_epoch`，让队列里的陈旧 P 帧整体作废，解码端直接跳到最新包。
+/// 队列满时的策略见 [`DecodeQueue`]：**淘汰最旧的一条、让最新的包一定进队**（旧实现用
+/// `mpsc::try_send`，满了丢的是刚到的包，队列里继续解 4 张更旧的帧）。「按年龄丢旧帧」
+/// 因此不需要独立的时钟判据——队列本身就是按到达顺序老化的。
 const DECODE_QUEUE: usize = 4;
 
-/// 陈旧帧的年龄上限（毫秒）：超过它、且解码队列接近满、且该帧不是关键帧、且已过 IDR
-/// 冷静期时才丢弃。
-///
-/// 原来的 150 ms 在「慢但没坏」的链路上等于**自锁**：真机日志（1080p30 H.264 / QSV）里
-/// 端到端常态就是 p50 33 ms / p90 416 ms，远超 150 ms，于是几乎每一帧都命中老化判据 →
-/// 丢一个 P 帧 → 断参考链 → 请求 IDR（平均 223 KB、传输 180–340 ms、解码 300–500 ms）→
-/// 期间的 P 帧又老又积压 → 再丢。64 秒内被迫出了 31 张 IDR（占全部字节 43%），控制器只解到
-/// 被控端发帧的 74%，一次 500 ms 的解码停顿被放大成十几秒的死区。600 ms 才是「这帧已经没有
-/// 观看价值」，也给一次 300–500 ms 的解码停顿留出恢复窗口。
-const STALE_FRAME_AGE_MS: u64 = 600;
-
-/// 触发老化丢弃的最小解码队列积压（帧数），**等于 `DECODE_QUEUE - 1`**。
-///
-/// 4 深队列里积压 ≥2 只是「解码欠一拍」的常态（每张 IDR 传输/解码期间必然出现），按它开火
-/// 等于每次 IDR 之后都丢帧、重新自锁。只有队头再进一帧就满，才说明解码器真的落后于网络。
-/// 不取 `DECODE_QUEUE`（4）：那一档等价于「只在队列已满时才老化」，而队列满本身已有独立的
-/// 丢弃路径（`enqueue_decode` 返回 `Dropped`），老化判据会完全失去意义。
-const STALE_DROP_MIN_BACKLOG: u32 = 3;
-
-/// 成功解出一张 IDR 后的冷静期（毫秒）：这段时间内**不允许**老化丢帧。
-///
-/// 参考链刚被 IDR 重建，队列里的 P 帧只是「IDR 传输/解码期间攒下的瞬态积压」，它们能正常
-/// 解码、且只有解完才能追上实时画面；此刻按年龄丢掉它们等于把刚花 200+ KB 重建的参考链又
-/// 砍断一次。500 ms 覆盖一次 IDR 的解码停顿（实测 300–500 ms）而不至于长期掩盖真正的持续
-/// 拥塞——超过 [`STALE_FRAME_AGE_MS`] 的帧在冷静期结束后照样会被清掉。
-const KEYFRAME_SETTLE_MS: u64 = 500;
-
-/// 关键帧请求的最小间隔。
+/// 关键帧请求的最小间隔（同时也是「等 IDR 期间的**重试周期**」）。
 ///
 /// 序号断层/队列溢出/解码失败都可能每帧触发一次「请补 IDR」。不限频就会形成 IDR 风暴：
 /// 每个 IDR 都是带宽尖峰，反而让解码队列更满、继续丢包。400 ms 内最多一次，既压住风暴，
 /// 又保证等待中的请求会在该窗口内被重试（不会永久卡在等 IDR）。
+///
+/// **为什么是 400 ms**：它是「等 IDR 期间的探测周期」，不是「一张 IDR 的生效时间」。被控端
+/// 的去重窗口（`KEYFRAME_DEDUP_WINDOW` = 1.2 s，见 `crates/remote/src/controlled.rs`）按
+/// 「写完全帧 281 ms + RTT 40 ms + 解码 516 ms ≈ 837 ms」标定，**大于**本周期：在途 IDR 期间
+/// 到达的重试会被对端吸收（这正是目的——真机一次丢帧事件曾换回 3 张 ~223 KB 的 IDR）。
+///
+/// 代价是「IDR 真的丢了/解码失败」时，恢复要等窗口过期：上界 ≈ 1200 + 400 ms。这个取舍是
+/// 有意的——Punch 路径有用户态可靠层（ARQ）保交付、直连/中继是 TCP，IDR 本身丢包不是常见
+/// 故障；把周期压到窗口以内只会把「偶尔的重发」变成常态化的 IDR 风暴。
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
 
 /// 在途心跳时刻队列的上限（1s 探测、10s 可信上限 ⇒ 8 个足够覆盖任何可信延迟）。
@@ -116,6 +97,7 @@ const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const SLOW_DECODE_US: u64 = 100_000;
 
 /// 一条待解码的画面载荷（尚未解码）。
+#[derive(Debug)]
 enum DecodeJob {
     /// 被控端选定 codec（`CodecSelect`）。解码任务据此换解码器；新 codec 的码流仍从关键帧起步。
     SelectCodec(CodecId),
@@ -123,10 +105,12 @@ enum DecodeJob {
     Packet {
         /// 来源显示器编号。
         display: u32,
-        /// 帧序号（被控端递增；用于检测「有包被丢弃」的断层）。
+        /// 帧序号（被控端递增）。
+        ///
+        /// 只在**解码任务实际看到**的包之间比较：主循环有意丢掉的包根本不会进到这里，所以
+        /// 丢弃不会再表现成「断层」（见 [`seq_is_gap`]）。旧实现里每次丢弃之后到达的 IDR
+        /// 都会被判成断层，于是销毁解码器、再请求一张 IDR——一次事件换回 3 张 IDR。
         seq: u64,
-        /// 入队时的 `drop_epoch`。小于当前 epoch 的包说明队列曾溢出，已被更新的包取代。
-        epoch: u32,
         /// 编解码器（应与 `SelectCodec` 一致；缺失时作为兜底）。
         codec: CodecId,
         /// 标志位（[`VIDEO_FLAG_KEYFRAME`] 等）。
@@ -163,6 +147,246 @@ enum DecodeJob {
     },
 }
 
+/// [`DecodeJob`] 的类别（截断策略只关心类别，不需要整条载荷）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    /// `SelectCodec`：控制项，**永不丢弃**（丢了它解码器就不会切 codec）。
+    Codec,
+    /// 关键帧：参考链上**唯一安全的切点**。
+    Keyframe,
+    /// 普通视频帧：直接或间接引用前面的帧，单独丢它会花屏。
+    Frame,
+    /// 补丁批：可增量应用，丢一批会在合成帧上永久缺块，因此**不主动丢弃**。
+    Patch,
+}
+
+impl DecodeJob {
+    fn kind(&self) -> JobKind {
+        match self {
+            Self::SelectCodec(_) => JobKind::Codec,
+            Self::Packet { flags, .. } if flags & VIDEO_FLAG_KEYFRAME != 0 => JobKind::Keyframe,
+            Self::Packet { .. } => JobKind::Frame,
+            Self::Region { .. } => JobKind::Patch,
+        }
+    }
+
+    /// 载荷对应的视频序号（补丁/控制项没有序号）。
+    ///
+    /// 只给单测用：运行时日志改成输出计数/布尔（`flushed=n kept_from_keyframe=…`），
+    /// 不再逐条打印被截断的序号。
+    #[cfg(test)]
+    fn seq(&self) -> Option<u64> {
+        match self {
+            Self::Packet { seq, .. } => Some(*seq),
+            Self::SelectCodec(_) | Self::Region { .. } => None,
+        }
+    }
+}
+
+/// 队列满时**按参考链截断**：返回与输入等长的「是否保留」掩码（**纯函数**，便于单测）。
+///
+/// H.264/VP9 的参考链是**线性**的：`P5` 依赖 `P4` 依赖 `P3`……所以「挑一帧丢掉」必然让排在
+/// 它后面的帧全部解出花屏。唯一安全的切点是**关键帧**——它自己就是新链的起点。故：
+///
+/// - 找到队列里**最新**的一张关键帧 `k`：保留 `k..`（它们的参考链从 `k` 重新起算，完好），
+///   丢弃 `k` 之前的全部载荷（它们排在关键帧之前，本来就会被跳过）。
+/// - 队列里没有关键帧：一个都不保留（整条链作废）。
+/// - `SelectCodec` 是控制项，任何情况下都保留。
+///
+/// 于是「淘汰」不再是「丢一帧换一帧」，而是「截掉一段作废的链、留下可以正常解码的那一段」：
+/// 一次 445 ms 停顿把队列塞满时，**不会先闪 1–4 帧花屏再等 IDR**。
+#[must_use]
+fn flush_keep(kinds: &[JobKind]) -> Vec<bool> {
+    let anchor = kinds.iter().rposition(|kind| *kind == JobKind::Keyframe);
+    kinds
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| *kind == JobKind::Codec || anchor.is_some_and(|anchor| index >= anchor))
+        .collect()
+}
+
+/// 队列满时的截断结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlushReport {
+    /// 被丢弃的**视频帧**数（普通帧 + 关键帧，不含本包）。
+    dropped_frames: usize,
+    /// 被丢弃的补丁批数（补丁不参与 `SessionStats::Decode::dropped` 的口径）。
+    dropped_patches: usize,
+    /// 本包是否入队。
+    ///
+    /// `false` = 参考链上留了缺口（本包引用的帧全被丢了），**本包也一起丢**——留下它只会
+    /// 解出一张花屏。调用方必须关闸门并请求一张 IDR。
+    admitted: bool,
+    /// 截断后队列里是否有关键帧作为新基准（本包本身是关键帧时也算）。`admitted` 为真时必为真。
+    anchored: bool,
+}
+
+/// [`DecodeQueue::push`] 的结果。
+#[derive(Debug)]
+enum PushOutcome {
+    /// 已入队。
+    Queued,
+    /// 队列已满，按参考链截断后又收下了本包（见 [`FlushReport`]）。
+    Flushed(FlushReport),
+    /// 队列已满且本批不可截断（补丁），本批被丢弃。调用方应请求关键帧。
+    Dropped,
+    /// 解码任务已结束。
+    Closed,
+}
+
+/// 待解码队列：**按参考链截断**的最小队列。
+///
+/// 为什么不用 `tokio::mpsc`：它只能丢**最新**的那一条（`try_send` 满即失败），而解码落后时
+/// 最新的画面恰恰是最该保留的。2026-11-18 真机日志（1080p30 / H.264 / QSV / DXGI）里，一次
+/// 445 ms 的 DXVA 回读停顿就把 4 深队列塞满，旧语义下丢的是刚到的包、队列里继续解 4 张更旧
+/// 的帧（最深 ≈1.8 s 陈旧画面），随后的 `drop_epoch` 又把它们整体作废——一次事件丢 5 帧，
+/// 而且最关键的那张 IDR（恢复参考链的唯一手段）也常常是被丢的那一张。
+///
+/// 满队列的处理见 [`flush_keep`]：截断到**最新关键帧之后**（没有关键帧就整队清空），
+/// 这样留下的帧参考链完好、不会花屏，也不需要为此请 IDR。于是：
+/// ① 关键帧永远不会因为队列满而错过；② 用户追到的是最新画面；③ 「按年龄丢旧帧」不再需要
+/// 采集时间戳与时钟偏差估计（旧的 `should_drop_stale` 要四个条件同时成立，91 秒里一次都没
+/// 命中）。
+struct DecodeQueue {
+    jobs: std::sync::Mutex<VecDeque<DecodeJob>>,
+    /// 入队唤醒。用 `notify_one`（会存 permit）而不是 `notify_waiters`：后者不存 permit，
+    /// 「检查队列为空 → 对端入队并通知 → 本端才注册等待」这一步会丢唤醒。
+    notify: tokio::sync::Notify,
+    /// 会话结束（主循环收尾）：之后的 `push` 一律 `Closed`，等待中的 `pop` 返回 `None`。
+    closed: AtomicBool,
+}
+
+impl DecodeQueue {
+    fn new() -> Self {
+        Self {
+            jobs: std::sync::Mutex::new(VecDeque::with_capacity(DECODE_QUEUE)),
+            notify: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// 锁住队列。持锁期间只做 `VecDeque` 操作（无 `await`），毒化按「继续用」处理。
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<DecodeJob>> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 投递一条载荷（**不阻塞**，满时按参考链截断）。
+    fn push(&self, job: DecodeJob) -> PushOutcome {
+        if self.closed.load(Ordering::Acquire) {
+            return PushOutcome::Closed;
+        }
+        let mut jobs = self.lock();
+        if jobs.len() < DECODE_QUEUE {
+            jobs.push_back(job);
+            drop(jobs);
+            self.notify.notify_one();
+            return PushOutcome::Queued;
+        }
+        match job.kind() {
+            // 补丁不可截断：丢一批会在合成帧上永久缺块，唯一安全动作是换一整帧重建。
+            JobKind::Patch => return PushOutcome::Dropped,
+            // 控制项正常不会在队列满时到达（每路 codec 至多一条，且紧接握手）；真到了就
+            // 直接放行，队列短暂超一格——控制项数量本身有界。
+            JobKind::Codec => {
+                jobs.push_back(job);
+                drop(jobs);
+                self.notify.notify_one();
+                return PushOutcome::Queued;
+            }
+            JobKind::Frame | JobKind::Keyframe => {}
+        }
+        // 满队列：先按参考链截断，再决定本包能不能进。
+        //
+        // 进来的**关键帧**把整条旧链作废（它自己是新起点），所以什么都不留——否则「守着一个
+        // 旧基准 + 一堆旧帧」会让队列永远满着。普通帧只保留最新关键帧及其之后的部分。
+        let incoming_keyframe = job.kind() == JobKind::Keyframe;
+        let keep = if incoming_keyframe {
+            vec![false; jobs.len()]
+        } else {
+            flush_keep(&jobs.iter().map(DecodeJob::kind).collect::<Vec<_>>())
+        };
+        let mut dropped_frames = 0_usize;
+        let mut dropped_patches = 0_usize;
+        let mut index = 0_usize;
+        jobs.retain(|old| {
+            let keep_it = keep[index];
+            if !keep_it {
+                match old.kind() {
+                    JobKind::Frame | JobKind::Keyframe => dropped_frames += 1,
+                    JobKind::Patch => dropped_patches += 1,
+                    JobKind::Codec => {}
+                }
+            }
+            index += 1;
+            keep_it
+        });
+        // 本包自己就是关键帧时它就是新基准，否则看截断后有没有留下关键帧。
+        let anchored = incoming_keyframe
+            || jobs
+                .iter()
+                .any(|old| matches!(old.kind(), JobKind::Keyframe));
+        // 有关键帧基准时，留下的帧与紧随其后的这一帧都能按序解码；截断后仍然满
+        // （锚点就在队首、后面的帧已占满）或根本没有锚点时，本包不能进——它与留下的链之间
+        // 已经断开了。
+        let admitted = incoming_keyframe || (anchored && jobs.len() < DECODE_QUEUE);
+        if admitted {
+            jobs.push_back(job);
+            drop(jobs);
+            self.notify.notify_one();
+        }
+        PushOutcome::Flushed(FlushReport {
+            dropped_frames,
+            dropped_patches,
+            admitted,
+            anchored,
+        })
+    }
+
+    /// 取一条待解码载荷；队列空则等通知，队列关闭（且排空）后返回 `None`。
+    ///
+    /// 取消安全：`Notify::notified()` 被丢弃不会丢通知（permit 由 `notify_one` 保存），
+    /// 因此可以安全地放进 `select!`。
+    async fn pop(&self) -> Option<DecodeJob> {
+        loop {
+            if let Some(job) = self.lock().pop_front() {
+                return Some(job);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    /// 当前积压条数。
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// 当前积压条数（`u32`，直接填 `QosFeedback` / 日志）。
+    fn backlog(&self) -> u32 {
+        u32::try_from(self.len()).unwrap_or(u32::MAX)
+    }
+
+    /// 队列里是否已经有一张关键帧（含正在被淘汰/刚入队的那张）。
+    ///
+    /// 解码任务用它抑制「多余的 IDR 请求」：参考链断了但关键帧已经在队列里排着，再请求一张
+    /// 只会多花 200–400 KB 带宽。
+    fn has_keyframe(&self) -> bool {
+        self.lock().iter().any(|job| job.kind() == JobKind::Keyframe)
+    }
+
+    /// 关闭队列：等待中的 `pop` 立即醒来并返回 `None`。
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        // `notify_one` 会存 permit（`notify_waiters` 不会），故「检查 closed 之后才注册等待」
+        // 的那一瞬也不会漏唤醒。
+        self.notify.notify_one();
+    }
+}
+
 /// 主循环与解码任务共享的原子读数/状态。
 ///
 /// 都是 `Relaxed` 足够的观测值：写的是每帧热路径，读的是每秒一次或入队前的一次判断，
@@ -170,10 +394,6 @@ enum DecodeJob {
 struct DecodeShared {
     /// 最近一帧的解码耗时（毫秒）。
     decode_ms: Arc<AtomicU32>,
-    /// 解码队列溢出代次（主循环 `fetch_add`，解码任务比较）。
-    drop_epoch: Arc<AtomicU32>,
-    /// 解码任务是否正在等 IDR（主循环据此在入队前丢 P 帧）。
-    awaiting_keyframe: Arc<AtomicBool>,
     /// 解码任务**已应用**到合成帧的补丁批数（主循环每秒 `swap(0)` 取走，填进
     /// [`SessionStats::Decode`] 的 `patches` 字段）。
     ///
@@ -186,13 +406,6 @@ struct DecodeShared {
     clock_offset_us: Arc<AtomicI64>,
     /// 解码任务最近一次算出的端到端延迟（毫秒；采集完成 → 解码完成）。
     e2e_ms: Arc<AtomicU32>,
-    /// 解码任务**最近一次成功解出 IDR** 的时刻（本端单调时钟，微秒；`0` = 本会话还没解出过）。
-    ///
-    /// 主循环据此算「距上次 IDR 已过多少毫秒」，在 [`KEYFRAME_SETTLE_MS`] 内禁止老化丢帧。
-    last_idr_us: Arc<AtomicU64>,
-    /// 解码任务因 `drop_epoch` 作废而丢弃的陈旧视频包数（主循环每秒 `swap(0)` 取走，
-    /// 只进延迟诊断日志的按原因拆分，**不进** [`SessionStats::Decode::dropped`]）。
-    epoch_drops: Arc<AtomicU32>,
     /// 诊断：主循环与解码任务共享的分阶段延迟窗口（见 [`crate::latency`]）。
     latency: Arc<std::sync::Mutex<LatencyWindow>>,
 }
@@ -201,13 +414,9 @@ impl DecodeShared {
     fn new() -> Self {
         Self {
             decode_ms: Arc::new(AtomicU32::new(0)),
-            drop_epoch: Arc::new(AtomicU32::new(0)),
-            awaiting_keyframe: Arc::new(AtomicBool::new(false)),
             applied_patches: Arc::new(AtomicU32::new(0)),
             clock_offset_us: Arc::new(AtomicI64::new(UNKNOWN_OFFSET)),
             e2e_ms: Arc::new(AtomicU32::new(0)),
-            last_idr_us: Arc::new(AtomicU64::new(0)),
-            epoch_drops: Arc::new(AtomicU32::new(0)),
             latency: Arc::new(std::sync::Mutex::new(LatencyWindow::new())),
         }
     }
@@ -427,27 +636,26 @@ pub(crate) async fn run_controller_with_input(
     //
     // 解码任务会占住运行时的**一个** worker 线程（解码期间不同让）。这是 CPU 密集工作的必然代价，
     // 且比原先占住会话循环本身好得多。
-    let (decode_tx, decode_rx) = mpsc::channel::<DecodeJob>(DECODE_QUEUE);
-    // 解码任务 → 循环的关键帧请求通道（无界：只承载「重置后请对端补一个 IDR」这种低频控制）。
-    // 循环自己保留 `keyframe_tx`，故 `recv()` 永不返回 `None`（否则会 100% 空转）。
-    // 载荷是 `(显示器, 原因)`：原因只进管理面（进程内 `SessionStats`），**不上线**。
-    let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
-    // 主循环与解码任务共享的原子读数/状态（见 [`DecodeShared`]）：
-    // - 解码耗时：由解码任务写、主循环读（填进 `QosFeedback`）；
-    // - `drop_epoch`：队列溢出时推进，解码任务据此整体作废陈旧 P 帧；
-    // - `awaiting_keyframe`：解码任务在等 IDR 时置位，主循环据此**在入队前**直接丢弃
-    //   P 帧——等待期间队列里只留关键帧，IDR 一到就能立刻解码，不会被一堆过期 P 帧
-    //   挤掉（打破「丢弃→请求 IDR→IDR 又被丢」的自锁）。
+    let decode_queue = Arc::new(DecodeQueue::new());
+    // 解码任务 → 循环的通知通道（无界：只承载低频控制/状态变化，**不上线**）。
+    // 循环自己保留 `notice_tx`，故 `recv()` 永不返回 `None`（否则会 100% 空转）。
+    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<DecodeNotice>();
+    // 主循环与解码任务共享的原子读数（见 [`DecodeShared`]）：解码耗时、补丁计数、时钟偏差、
+    // 端到端延迟、延迟窗口。**参考链/等待关键帧的状态不在这里**——它由主循环的 [`ChainGate`]
+    // 独立持有，解码侧只经 [`DecodeNotice`] 告知（见 `ChainGate` 的文档：共享一个原子会让
+    // 「IDR 已入队」与「IDR 已解出」两个清除点互相覆盖）。
     let decode_shared = Arc::new(DecodeShared::new());
     let decode_task = tokio::spawn(decode_loop(
-        decode_rx,
-        keyframe_tx.clone(),
+        Arc::clone(&decode_queue),
+        notice_tx.clone(),
         std::sync::Arc::clone(&sink),
         cancel.clone(),
         Arc::clone(&decode_shared),
         config.h264_decoder_factory.clone(),
         config.stats.clone(),
     ));
+    // 循环自己持有发送端（`recv()` 因此不会返回 `None`）；命名带下划线表明此处不再使用。
+    let _notice_tx = notice_tx;
 
     // 3) 主循环。
     // 起点取 `now` 而非 `now + HEARTBEAT_INTERVAL`：**首个 tick 因此立即到期**（起点已过去），
@@ -482,10 +690,11 @@ pub(crate) async fn run_controller_with_input(
     let mut window_packets: u32 = 0;
     let mut window_dropped: u32 = 0;
     // 按原因的丢帧拆分：**只进延迟诊断日志**，不进 `SessionStats`（`dropped` 语义保持不变）。
-    // `epoch` 那一类发生在解码任务里，经 `decode_shared.epoch_drops` 每秒 `swap(0)` 取回。
+    // `flushed` 是 `queue_full` 的子集：队列满时被**截断丢掉**的旧帧数（按参考链截断，见
+    // [`flush_keep`]）；两者之差是被拒绝的补丁批。
     let mut window_drop_awaiting: u32 = 0;
-    let mut window_drop_stale: u32 = 0;
     let mut window_drop_queue_full: u32 = 0;
+    let mut window_flushed: u32 = 0;
     let mut qos_window_start = Instant::now();
     // 帧到达抖动（A5）：上一个视频包的到达时刻、再上一个到达间隔、本窗口的抖动累加与样本数。
     let mut last_packet_at: Option<Instant> = None;
@@ -500,11 +709,17 @@ pub(crate) async fn run_controller_with_input(
     let mut last_frame_at = Instant::now();
     // 最近一次请求关键帧的时刻（限频，避免静止桌面上刷屏）。语义是**无帧看门狗**的 3s 限频。
     let mut last_keyframe_request_at: Option<Instant> = None;
-    // 最近一次因「陈旧帧老化」请求关键帧的时刻（同一个 400 ms 窗口限频）。
-    //
-    // **刻意与上面那个分开**：无帧看门狗用 3s 窗口（静止桌面合法地不产帧），若老化丢弃顺手
-    // 推进它，真正的采集/编码挂死会晚 3s 才告警。两者限频目的不同，状态也必须分开。
-    let mut last_stale_keyframe_request_at: Option<Instant> = None;
+    // 主循环独占的「参考链已断」闸门：见 [`ChainGate`]。
+    let mut chain = ChainGate::default();
+    // 关键帧请求闸门（单飞 + 去重 + 重试）：见 [`KeyframeGate`]。**只有它**发 `RequestKeyframe`，
+    // 解码任务只负责把「链断了 / IDR 解出来了」告诉主循环。
+    let mut keyframe_gate = KeyframeGate::default();
+    // 重试节拍：只在等待期间被轮询（`if keyframe_gate.is_waiting()`），空闲时不产生唤醒。
+    let mut keyframe_tick = interval_at(
+        Instant::now() + KEYFRAME_REQUEST_INTERVAL,
+        KEYFRAME_REQUEST_INTERVAL,
+    );
+    keyframe_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // 自最近一次收到画面帧以来已发出的关键帧请求数：0 = 这次是首次请求（静止桌面的常规情况，
     // 只记 `debug`），≥1 = 上次请求没换回帧（对端可能真挂住，升到 `warn`）。收到帧即清零。
     let mut stall_requests: u32 = 0;
@@ -599,7 +814,7 @@ pub(crate) async fn run_controller_with_input(
                 )]
                 let recv_kbps = (window_bytes * 8.0 / 1000.0 / elapsed).round() as u32;
                 let decode_ms = decode_shared.decode_ms.load(Ordering::Relaxed);
-                let backlog = decode_backlog(&decode_tx);
+                let backlog = decode_queue.backlog();
                 let feedback = SessionMessage::QosFeedback {
                     rtt_ms: last_rtt_ms.unwrap_or(0),
                     recv_kbps,
@@ -632,22 +847,23 @@ pub(crate) async fn run_controller_with_input(
                     jitter_ms,
                     clock_offset_us: decode_shared.clock_offset_us.load(Ordering::Relaxed),
                 });
-                // 解码任务里的「epoch 作废」丢帧数：每秒取回并清零，与本地计数器同一窗口。
-                let epoch_drops = decode_shared.epoch_drops.swap(0, Ordering::Relaxed);
                 // 诊断：每秒一行分阶段延迟汇总（**只在延迟诊断打开时**）。
                 // 与上面的 `SessionStats::Decode` 分开：那条是 UI 角标读数，这条是逐段拆解。
                 if latency::enabled() {
                     if let Some(summary) = latency::take_summary(&decode_shared.latency) {
                         // 全部信息塞进 message：GUI 日志面板 / 服务端日志只保留 `message` 字段。
+                        //
+                        // `flushed` 是 `queue_full` 的子集：队列满时被**按参考链截断**丢掉的
+                        // 旧帧数；两者之差是被拒绝的补丁批。`stale` 已随按年龄老化一起删除——
+                        // 截断点只看参考链（见 [`flush_keep`]），不看时间戳。
                         info!(
                             target: "latency",
-                            "controller packets={} dropped={} drop_split=awaiting:{} stale:{} queue_full:{} epoch:{} rtt_ms={} {}",
+                            "controller packets={} dropped={} drop_split=awaiting:{} queue_full:{} flushed:{} rtt_ms={} {}",
                             window_packets,
                             window_dropped,
                             window_drop_awaiting,
-                            window_drop_stale,
                             window_drop_queue_full,
-                            epoch_drops,
+                            window_flushed,
                             last_rtt_ms.unwrap_or(0),
                             summary
                         );
@@ -665,8 +881,8 @@ pub(crate) async fn run_controller_with_input(
                 window_packets = 0;
                 window_dropped = 0;
                 window_drop_awaiting = 0;
-                window_drop_stale = 0;
                 window_drop_queue_full = 0;
+                window_flushed = 0;
                 jitter_sum_us = 0;
                 jitter_samples = 0;
                 qos_window_start = Instant::now();
@@ -821,20 +1037,50 @@ pub(crate) async fn run_controller_with_input(
                     }
                 }
             }
-            // 解码任务请求关键帧（解码失败 / 丢弃了参考帧）：转达给被控端，让它补一个 IDR。
-            // `keyframe_tx` 常驻于本函数 → `recv()` 不会返回 `None`，本分支只在真的有请求时触发。
+            // 解码任务的通知：参考链断了（需要一张 IDR）/ 关键帧已解出（等待结束）。
+            // `notice_tx` 常驻于本函数 → `recv()` 不会返回 `None`，本分支只在真有事件时触发。
             // 原因只进管理面（进程内上报），线上 `RequestKeyframe` 仍只有 `display` 一个字段。
-            Some((display, reason)) = keyframe_rx.recv() => {
-                if let Err(err) = queues
-                    .enqueue_ctrl(
-                        &cancel,
-                        SessionFrame::screen(SessionMessage::RequestKeyframe { display }),
-                    )
-                    .await
-                {
-                    break Err(err);
+            Some(notice) = notice_rx.recv() => {
+                match notice {
+                    DecodeNotice::Broken { display, reason } => {
+                        // 解码侧发现参考链断了：闸门立刻开始丢后续 P 帧（直到下一张关键帧
+                        // **入队**为止，见 [`ChainGate`]），并按 [`KeyframeGate`] 的去重/重试
+                        // 规则决定现在要不要真的发一次请求。
+                        //
+                        // 但队列里**已经排着**一张关键帧时不能关闸门：那条通知已经过时
+                        // （关键帧一到就恢复），关上去反而会一直关到下一张关键帧*入队*，
+                        // 把「一张 IDR 就能恢复」拖成两次 IDR。
+                        if !decode_queue.has_keyframe() {
+                            chain.on_drop();
+                        }
+                        if let Some(request) = keyframe_gate.on_break(display, reason, Instant::now()) {
+                            if let Err(err) =
+                                dispatch_keyframe_request(&mut queues, &cancel, &config.stats, request)
+                                    .await
+                            {
+                                break 'session Err(err);
+                            }
+                        }
+                    }
+                    // IDR 已解出：本次等待事件结束，清空重试状态（下一次断链会立刻重发）。
+                    DecodeNotice::Satisfied => keyframe_gate.satisfied(),
                 }
-                config.stats.report(SessionStats::KeyframeRequest { reason });
+            }
+            // 等待 IDR 期间的定时重试：**保证只要还在等就一定有请求在路上**。
+            //
+            // 旧实现把重试放在解码任务里（`kf_tick`），而解码任务正卡在几百毫秒的
+            // `spawn_blocking` 里，重试被一起挡住；主循环侧又有三个互不相干的限频器，
+            // 请求被任何一个吞掉都没有人补发。现在只有 [`KeyframeGate`] 一处状态。
+            //
+            // 分支带 `if` 守卫：不等待时不轮询该 interval（不产生空闲唤醒）。
+            _ = keyframe_tick.tick(), if keyframe_gate.is_waiting() => {
+                if let Some(request) = keyframe_gate.on_tick(Instant::now()) {
+                    if let Err(err) =
+                        dispatch_keyframe_request(&mut queues, &cancel, &config.stats, request).await
+                    {
+                        break 'session Err(err);
+                    }
+                }
             }
             // 文件块生产**永不阻塞主循环**：先补投暂存区，再在 file 队列确实有空位时才读下一块。
             // `dispatch_frame` 对 File 类只做 `try_send`（满了留暂存区），绝不 `.await` 空位，
@@ -912,12 +1158,20 @@ pub(crate) async fn run_controller_with_input(
                             if selected_codec.is_some_and(|selected| selected != codec) {
                                 debug!(?codec, ?selected_codec, "视频包 codec 与已选 codec 不一致");
                             }
-                            // 第一道闸门（5.6）：解码任务在等 IDR 时，P 帧一律不入队。
-                            // 否则队列会被过期 P 帧塞满，IDR 反而被挤掉，形成「丢弃→请求 IDR
-                            // →IDR 又被丢」的自锁。关键帧必须放行。
-                            if decode_shared.awaiting_keyframe.load(Ordering::Relaxed)
-                                && flags & VIDEO_FLAG_KEYFRAME == 0
-                            {
+                            let keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
+                            // 第一道闸门：参考链断了、且还没有新的关键帧**入队** → P 帧不入队。
+                            //
+                            // 旧实现读的是解码任务共享的 `awaiting_keyframe`，而它在 **IDR 解码
+                            // 成功之后**才清；真机上一次 IDR 解码本身就可能 445 ms（DXVA 回读
+                            // 停顿，卷宗 §2.1），这段时间里到达的 2–5 张 P 帧全被丢掉 → 每张都让
+                            // 解码任务的序号出现断层 → 解码任务再重置一次、再请一张 IDR →
+                            // 一次事件换回 3 张 IDR（91 秒 27 张，39% 带宽）。
+                            //
+                            // 正确语义是「直到 IDR **已入队**」：IDR 一旦进入队列，它之后的 P 帧
+                            // 在队列里天然排在它后面、可以按序解码，闸门必须立刻打开；只有
+                            // 「请求已发出、IDR 还没到」期间到达的 P 帧才必须丢。清除点见下面
+                            // `chain.on_keyframe_enqueued()`。[`ChainGate`] 有单测锁住这一点。
+                            if chain.should_drop(keyframe) {
                                 window_dropped = window_dropped.saturating_add(1);
                                 window_drop_awaiting = window_drop_awaiting.saturating_add(1);
                                 if latency::enabled() {
@@ -930,74 +1184,12 @@ pub(crate) async fn run_controller_with_input(
                                 debug!("等待关键帧期间丢弃 P 帧（不让它占用解码队列）");
                                 continue;
                             }
-                            // 第二道闸门（延迟审查 P1-5）：按采集时间戳老化。
-                            //
-                            // 队列只有 4 深，但一次几百毫秒的卡顿依旧能让队头压着几帧旧画面，
-                            // 解码器必须把它们逐个解完才追上最新帧——用户看到的是「卡顿结束后
-                            // 先回放一段旧画面」。故入队前丢掉已经太老的 P 帧，让解码器直接
-                            // 追到最新画面。
-                            //
-                            // 四个条件**缺一不可**（[`should_drop_stale`]），都是为了不误伤正常链路：
-                            // ① 队列接近满（≥ 3，即 `DECODE_QUEUE - 1`）：积压 2 帧只是解码欠一拍
-                            //    的常态，丢掉它只会白断参考链；
-                            // ② 端到端年龄 > 600 ms：这是「解码来不及」而非「网络毛刺」的判据；
-                            // ③ 不是关键帧：IDR 是恢复参考链的唯一手段，丢了它等于堵死恢复路径；
-                            // ④ 已过 IDR 冷静期：刚解出 IDR 时队列积压只是瞬态，按年龄丢帧会
-                            //    把新参考链又砍断（自锁的起点）。
-                            // 另外时钟偏差未知时年龄是 `None`，绝不丢帧——估计尚未建立时守可
-                            // 错放、不可错杀。
-                            let backlog = decode_backlog(&decode_tx);
-                            let keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
-                            let now = now_us();
-                            let age_ms = frame_age_ms(
-                                now,
-                                capture_ts_us,
-                                decode_shared.clock_offset_us.load(Ordering::Relaxed),
-                            );
-                            let since_idr_ms =
-                                since_idr_ms(now, decode_shared.last_idr_us.load(Ordering::Relaxed));
-                            if should_drop_stale(age_ms, backlog, keyframe, since_idr_ms) {
-                                window_dropped = window_dropped.saturating_add(1);
-                                window_drop_stale = window_drop_stale.saturating_add(1);
-                                if latency::enabled() {
-                                    // 命中判据即保证 `age_ms` 为 `Some`，`unwrap_or(0)` 只是兜底。
-                                    info!(
-                                        target: "latency",
-                                        "controller_drop seq={} reason=stale age_ms={} backlog={}",
-                                        seq,
-                                        age_ms.unwrap_or(0),
-                                        backlog
-                                    );
-                                }
-                                // 丢一个 P 帧即断参考链：解码任务必须整体作废队列里的旧包、
-                                // 只等 IDR，而不是先把它们解一遍再重置。
-                                decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
-                                decode_shared.drop_epoch.fetch_add(1, Ordering::Relaxed);
-                                // 请求关键帧，按 400 ms 限频（与 [`decode_loop`] 同一窗口）。
-                                // 限频状态是**本闸门私有**的：无帧看门狗那个用 3s 窗口，
-                                // 共用会把真正的挂死告警推迟 3s。
-                                //
-                                // 被限频挡掉也不必担心丢请求：我们同时推进了 `drop_epoch`，
-                                // 队列里 >= 2 个旧代次包出队时 [`decode_loop`] 会按自己的
-                                // 400 ms 限频（外加 `kf_tick` 重试）再发一次；若积压的是补丁，
-                                // 补丁本身还在持续更新画面、不会冻结。
-                                if last_stale_keyframe_request_at
-                                    .is_none_or(|sent| sent.elapsed() >= KEYFRAME_REQUEST_INTERVAL)
-                                {
-                                    last_stale_keyframe_request_at = Some(Instant::now());
-                                    let _ = keyframe_tx.send((display, KeyframeReason::QueueOverflow));
-                                    // `display` 与 tracing 宏展开里的 `field::display` 撞名，
-                                    // 日志里换个别名。
-                                    let monitor = display;
-                                    debug!(monitor, ?age_ms, backlog, "丢弃陈旧画面帧并请求关键帧");
-                                }
-                                continue;
-                            }
-                            let epoch = decode_shared.drop_epoch.load(Ordering::Relaxed);
-                            match enqueue_decode(&decode_tx, DecodeJob::Packet {
+                            let backlog = decode_queue.backlog();
+                            // 队列满时**按参考链截断**（见 [`flush_keep`]）：留下最新关键帧及其
+                            // 之后的帧（参考链完好，不会花屏），丢掉它之前那段作废的链。
+                            match decode_queue.push(DecodeJob::Packet {
                                 display,
                                 seq,
-                                epoch,
                                 codec,
                                 flags,
                                 width,
@@ -1006,23 +1198,67 @@ pub(crate) async fn run_controller_with_input(
                                 capture_ts_us,
                                 recv_us: now_us(),
                             }) {
-                                DecodeEnqueue::Queued => {}
-                                // 第二道兜底：队列满时推进 epoch，让队列里的陈旧 P 帧
-                                // 出队时被整体作废，解码端直接跳到最新包。
-                                DecodeEnqueue::Dropped => {
-                                    decode_shared.drop_epoch.fetch_add(1, Ordering::Relaxed);
-                                    window_dropped = window_dropped.saturating_add(1);
-                                    window_drop_queue_full = window_drop_queue_full.saturating_add(1);
+                                PushOutcome::Queued => {
+                                    // **闸门的清除点**：IDR 已入队，后面的 P 帧可以正常入队。
+                                    if keyframe {
+                                        chain.on_keyframe_enqueued();
+                                    }
+                                }
+                                PushOutcome::Flushed(report) => {
+                                    // 本包被拒时它自己也算一帧丢弃。
+                                    let dropped = report
+                                        .dropped_frames
+                                        .saturating_add(usize::from(!report.admitted));
+                                    let dropped_u32 = u32::try_from(dropped).unwrap_or(u32::MAX);
+                                    window_dropped = window_dropped.saturating_add(dropped_u32);
+                                    window_drop_queue_full =
+                                        window_drop_queue_full.saturating_add(dropped_u32);
+                                    window_flushed = window_flushed.saturating_add(dropped_u32);
                                     if latency::enabled() {
+                                        // `flushed=n` 是**截断丢掉**的旧帧数；`admitted=false`
+                                        // 表示本包也一起丢了（它与留下的链之间已断开）。
                                         info!(
                                             target: "latency",
-                                            "controller_drop seq={} reason=queue_full backlog={}",
+                                            "controller_drop seq={} reason=queue_full flushed={} patches={} kept_from_keyframe={} admitted={} backlog={}",
                                             seq,
+                                            report.dropped_frames,
+                                            report.dropped_patches,
+                                            report.anchored,
+                                            report.admitted,
                                             backlog
                                         );
                                     }
+                                    if report.admitted {
+                                        // 截断后队列里有关键帧基准：留下的帧与紧随其后的这一帧
+                                        // 都能按序解码，闸门打开、不必再请 IDR。
+                                        chain.on_keyframe_enqueued();
+                                    } else {
+                                        // 参考链上留了缺口（大概率是整队清空）：关闸门并请求
+                                        // 一张 IDR，后续 P 帧一律不入队。
+                                        chain.on_drop();
+                                        if let Some(request) = keyframe_gate.on_break(
+                                            display,
+                                            KeyframeReason::QueueOverflow,
+                                            Instant::now(),
+                                        ) {
+                                            if let Err(err) = dispatch_keyframe_request(
+                                                &mut queues,
+                                                &cancel,
+                                                &config.stats,
+                                                request,
+                                            )
+                                            .await
+                                            {
+                                                break 'session Err(err);
+                                            }
+                                        }
+                                    }
                                 }
-                                DecodeEnqueue::Closed => {
+                                // 视频包永远可截断/可入队（见 `DecodeQueue::push`）。
+                                PushOutcome::Dropped => {
+                                    debug!(seq, "视频包被解码队列拒绝（不应发生）");
+                                }
+                                PushOutcome::Closed => {
                                     break Err(RemoteError::Platform(
                                         "画面解码任务已结束".to_owned(),
                                     ));
@@ -1076,26 +1312,37 @@ pub(crate) async fn run_controller_with_input(
                                     rects = rects.len(),
                                     "补丁批的帧几何非法，丢弃并请求关键帧"
                                 );
-                                let _ = keyframe_tx.send((monitor, KeyframeReason::DecodeError));
+                                if let Some(request) =
+                                    keyframe_gate.on_break(monitor, KeyframeReason::DecodeError, Instant::now())
+                                {
+                                    if let Err(err) = dispatch_keyframe_request(
+                                        &mut queues,
+                                        &cancel,
+                                        &config.stats,
+                                        request,
+                                    )
+                                    .await
+                                    {
+                                        break 'session Err(err);
+                                    }
+                                }
                                 continue;
                             }
-                            // 补丁走 `try_send`：它绝不能卡住主循环（输入/心跳照常轮询）。
-                            match enqueue_decode(
-                                &decode_tx,
-                                DecodeJob::Region {
-                                    display: monitor,
-                                    width,
-                                    height,
-                                    rects,
-                                    capture_ts_us,
-                                    recv_us: now_us(),
-                                },
-                            ) {
-                                DecodeEnqueue::Queued => {}
-                                DecodeEnqueue::Dropped => {
-                                    // 队列满时**不**推进 `drop_epoch`：补丁不是参考链上的帧，
-                                    // 直接请一个全帧 IDR 即可——被控端收到后会退出补丁模式并
-                                    // 发一整帧，合成帧随之重建。
+                            // 补丁入队同样**不阻塞**：队列满时拒绝本批（补丁不可淘汰，见
+                            // [`DecodeQueue`]），换一整帧重建合成帧。
+                            match decode_queue.push(DecodeJob::Region {
+                                display: monitor,
+                                width,
+                                height,
+                                rects,
+                                capture_ts_us,
+                                recv_us: now_us(),
+                            }) {
+                                // 补丁只会是 `Queued` 或 `Dropped`（截断只对视频包生效）。
+                                PushOutcome::Queued | PushOutcome::Flushed(_) => {}
+                                PushOutcome::Dropped => {
+                                    // 补丁不是参考链上的帧，**不**动 [`ChainGate`]：丢一批补丁
+                                    // 不会让后续 P 帧不可解码，只需要一张全帧把合成帧重建。
                                     if latency::enabled() {
                                         // 补丁不计入 `window_drop_*`（那套计数器沿用视频包
                                         // 口径，与 `SessionStats::Decode::dropped` 对齐）。
@@ -1106,10 +1353,24 @@ pub(crate) async fn run_controller_with_input(
                                         );
                                     }
                                     debug!(monitor, "解码队列已满，丢弃补丁批并请求关键帧");
-                                    let _ = keyframe_tx
-                                        .send((monitor, KeyframeReason::QueueOverflow));
+                                    if let Some(request) = keyframe_gate.on_break(
+                                        monitor,
+                                        KeyframeReason::QueueOverflow,
+                                        Instant::now(),
+                                    ) {
+                                        if let Err(err) = dispatch_keyframe_request(
+                                            &mut queues,
+                                            &cancel,
+                                            &config.stats,
+                                            request,
+                                        )
+                                        .await
+                                        {
+                                            break 'session Err(err);
+                                        }
+                                    }
                                 }
-                                DecodeEnqueue::Closed => {
+                                PushOutcome::Closed => {
                                     break Err(RemoteError::Platform(
                                         "画面解码任务已结束".to_owned(),
                                     ));
@@ -1140,13 +1401,16 @@ pub(crate) async fn run_controller_with_input(
                             if selected_codec != Some(codec) {
                                 // 换 codec 意味着参考链作废：解码任务会重置解码器并等关键帧。
                                 selected_codec = Some(codec);
-                                if enqueue_decode(&decode_tx, DecodeJob::SelectCodec(codec))
-                                    == DecodeEnqueue::Closed
-                                {
+                                if matches!(
+                                    decode_queue.push(DecodeJob::SelectCodec(codec)),
+                                    PushOutcome::Closed
+                                ) {
                                     break Err(RemoteError::Platform(
                                         "画面解码任务已结束".to_owned(),
                                     ));
                                 }
+                                // 换 codec 后解码器是新的，下一张关键帧之前不能解码任何 P 帧。
+                                chain.on_drop();
                                 // A1：协商结果上报本端 UI（角标显示 codec）。
                                 config.stats.report(SessionStats::Codec { codec });
                             }
@@ -1307,7 +1571,8 @@ pub(crate) async fn run_controller_with_input(
     let _ = timeout(BYE_TIMEOUT, &mut writer_task).await;
     writer_task.abort();
     // 解码任务持有 `sink`：必须先让它停下，`on_closed` 之后才不会有画面再投进来。
-    drop(decode_tx);
+    // 关闭队列让解码任务的 `pop()` 返回 `None` 并退出（它会把已入队的载荷解完）。
+    decode_queue.close();
     let mut decode_task = decode_task;
     let _ = timeout(BYE_TIMEOUT, &mut decode_task).await;
     decode_task.abort();
@@ -1315,28 +1580,31 @@ pub(crate) async fn run_controller_with_input(
     result
 }
 
-/// 画面解码任务：从有界队列取原始载荷，串行解码后交给 [`FrameSink`]。
+/// 画面解码任务：从 [`DecodeQueue`] 取原始载荷，串行解码后交给 [`FrameSink`]。
 ///
 /// 独立成任务是为了把 CPU 密集的解码移出会话 `select!` 循环（见 `run_controller` 的说明）。
 /// 取消一旦触发即退出；队列关闭（会话结束）时把已入队的载荷解完再退出，保证顺序不乱。
 ///
 /// # 丢弃与恢复（**改动前先读这段**）
 ///
-/// 控制器**可以**丢帧（解码跟不上时不可避免），但 VP9 是时域编码：丢掉一个 P 帧会断掉参考链，
+/// 控制器**可以**丢帧（解码跟不上时不可避免），但视频是时域编码：丢掉一个 P 帧会断掉参考链，
 /// 后续引用它的帧在解码端永远解不出来。故本任务维护「参考链是否完好」这一状态：
 ///
-/// - **序号断层**（`seq` 不等于预期）说明会话循环因队列满丢弃过包 → 重置解码器、进入
-///   `awaiting_keyframe`，并请求对端补一个 IDR。
-/// - **解码失败**（数据损坏/缺参考帧）同上。
-/// - **队列溢出代次**（`epoch < drop_epoch`）说明主循环在 `try_send` 失败时已经推进了代次：
-///   队列里排着的都是过期 P 帧，直接丢弃并等 IDR，避免「先解一堆陈旧帧再重置」。
-/// - `awaiting_keyframe` 期间**丢弃所有非关键帧**，只等 IDR；收到 IDR 后恢复。主循环也通过
-///   共享的 `awaiting_keyframe` 原子做**第一道闸门**：入队前就丢掉 P 帧，保证队列里只留
-///   关键帧，IDR 不会被过期 P 帧挤掉。
+/// - **参考链断了**（序号断层 / 解码失败 / 配置失败 / 补丁没有基底）：进入 `awaiting_keyframe`
+///   并**丢弃后续非关键帧**，直到一张关键帧被取出。
+/// - **关键帧一被取出就恢复**：IDR 是新的参考链起点，排在它之后的 P 帧可以按序解码，不必等
+///   IDR 解完。旧实现在这里晚了一步（等解码成功才恢复），真机上 IDR 解码本身可能 445 ms，
+///   期间到达的 P 帧全被丢 → 再断链 → 再请你一张 IDR。
+/// - **不因丢包销毁解码器**：H.264 / VP9 解码器都能直接吃下一张 IDR 重新同步，重建实例只会
+///   让恢复更慢（还要重新 configure）。只有**解码器自己坏了**（`decode` 返回错误、
+///   `configure` 失败、`spawn_blocking` panic）才重建。
+/// - **序号**只在「本任务实际看到的包」之间比较：主循环有意丢掉的包根本到不了这里，
+///   因此丢弃不会再表现成断层（见 [`seq_is_gap`]）。
+/// - **不在这里发请求**：本任务只把「链断了 / IDR 解出来了」经 [`DecodeNotice`] 告诉主循环，
+///   由主循环的 [`KeyframeGate`] 统一去重、限频、重试。旧实现把限频状态放在这里，而本任务
+///   正卡在几百毫秒的 `spawn_blocking` 里，重试 tick 也被一起挡住。
 ///
-/// 被控端会周期性发关键帧作兜底，但**不能只靠它**——请求关键帧是丢帧后唯一的快速恢复路径。
-/// 所有请求都走 [`request_keyframe`] 的 400 ms 限频：断层/溢出风暴时最多每 400 ms 一个 IDR；
-/// 同时挂起的请求由 `kf_tick` 重试，不会永久卡在等 IDR。
+/// 被控端会周期性发关键帧作兜底，但**不能只靠它**——请求关键帧是断链后唯一的快速恢复路径。
 ///
 /// # 解码耗时（阶段 3）
 ///
@@ -1359,26 +1627,179 @@ fn decoder_factory_for(
     }
 }
 
-/// 发送一个关键帧请求，按 [`KEYFRAME_REQUEST_INTERVAL`] 限频。
+/// 解码任务 → 主循环的通知（进程内，**不上线**）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeNotice {
+    /// 参考链断了：主循环据此丢 P 帧（[`ChainGate`]），并按 [`KeyframeGate`] 请求 IDR。
+    Broken {
+        /// 出事的那台显示器（被控端只认自己正在采集的那台）。
+        display: u32,
+        /// 原因（只进管理面，不进线上协议）。
+        reason: KeyframeReason,
+    },
+    /// 关键帧已成功解出：本次等待事件结束。
+    Satisfied,
+}
+
+/// 告诉主循环「这台显示器的参考链断了」。
 ///
-/// 距上次请求已满一个窗口就立即发出并记录时刻；否则只把显示器记进 `pending`，由
-/// [`decode_loop`] 的 400 ms tick 补发。这样断层/溢出风暴里 400 ms 内最多一个 IDR，
-/// 又不会让请求永久丢失（tick 保证 400 ms 内必定重试）。
-fn request_keyframe(
-    tx: &mpsc::UnboundedSender<(u32, KeyframeReason)>,
-    last: &mut Option<Instant>,
-    pending: &mut Option<(u32, KeyframeReason)>,
-    monitor: u32,
+/// 通道无界且主循环常驻接收端，故不会阻塞也不会失败（`send` 只在对端被 drop 后返回 `Err`，
+/// 而那时会话已经在收尾）。去重/限频在 [`KeyframeGate`] 里做，这里可以放心地每帧都发。
+fn note_broken(tx: &mpsc::UnboundedSender<DecodeNotice>, display: u32, reason: KeyframeReason) {
+    let _ = tx.send(DecodeNotice::Broken { display, reason });
+}
+
+/// 解码侧的断链上报：**队列里已经有关键帧时不报**。
+///
+/// 关键帧一到就恢复，这时再让主循环关闸门/再请一张 IDR 都是多余的——而且闸门的打开条件是
+/// 「关键帧**入队**」，那张关键帧已经入过队了，关上去就会一直关着，直到再骗一张 IDR。
+fn report_break(
+    queue: &DecodeQueue,
+    tx: &mpsc::UnboundedSender<DecodeNotice>,
+    display: u32,
     reason: KeyframeReason,
 ) {
-    let now = Instant::now();
-    if last.is_none_or(|sent| now.duration_since(sent) >= KEYFRAME_REQUEST_INTERVAL) {
-        let _ = tx.send((monitor, reason));
-        *last = Some(now);
-        *pending = None;
-    } else {
-        *pending = Some((monitor, reason));
+    if !queue.has_keyframe() {
+        note_broken(tx, display, reason);
     }
+}
+
+/// 主循环的「参考链已断」闸门：自上一个关键帧**入队**以来，是否丢过参考链上的帧。
+///
+/// **清除点必须是「IDR 入队」而不是「IDR 解出」**。旧实现把清除放在解码任务里、IDR 解码
+/// 成功之后，而真机上一次 IDR 解码本身就可能 445 ms（DXVA staging 回读停顿，卷宗 §2.1）：
+/// 这段时间里到达的 2–5 张 P 帧全被丢掉 → 每张都让解码任务的序号出现断层 → 解码任务重置
+/// 解码器并再请求一次 IDR → 一次事件换回 3 张 IDR（91 秒 27 张、39% 带宽）。
+///
+/// IDR 一旦**进入队列**，它之后的 P 帧在队列里天然排在它后面、可以按序解码，闸门必须立刻
+/// 打开；只有「请求已发出、IDR 还没到」期间到达的 P 帧才必须丢。
+///
+/// 状态**只由主循环写**（解码侧只经 [`DecodeNotice::Broken`] 告知），因此不存在「解码任务
+/// 在别的时刻把它清掉」的竞态——旧实现里两处共写同一个原子，解码成功一帧就会把主循环刚
+/// 建好的断链状态抹掉。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ChainGate {
+    broken: bool,
+}
+
+impl ChainGate {
+    /// 成功入队一张关键帧：IDR 之后的 P 帧可以正常解码，闸门打开。
+    fn on_keyframe_enqueued(&mut self) {
+        self.broken = false;
+    }
+
+    /// 有意丢了一帧（或解码侧报告断链）：在下一张关键帧入队前，P 帧一律不放行。
+    fn on_drop(&mut self) {
+        self.broken = true;
+    }
+
+    /// 本包是否应被闸门挡下。关键帧永远放行。
+    #[must_use]
+    fn should_drop(self, keyframe: bool) -> bool {
+        self.broken && !keyframe
+    }
+}
+
+/// 关键帧请求闸门：**单飞 + 去重 + 超时重试**（主循环独占，纯决策 → 可单测）。
+///
+/// 不变量：**只要还在等 IDR，就一定有请求在路上**。
+///
+/// 旧实现把限频状态放在解码任务里（`last_kf_request` + 单个 `kf_pending` + `kf_tick`），而
+/// 解码任务正卡在几百毫秒的 `spawn_blocking` 里，tick 被一起挡住；主循环侧另有三个互不
+/// 相干的限频器（无帧看门狗 3 s、老化 400 ms、解码任务 400 ms），请求被其中任何一个吞掉都
+/// 没有人补发——真机日志里 63 帧连续 `reason=awaiting`（4.8 s 无画面）就是这么来的。
+///
+/// 新模型只有一处状态：
+/// - 每个「断链」事件只更新 `desired`（**按显示器/原因去重**），并且只在距上次发送已满
+///   [`KEYFRAME_REQUEST_INTERVAL`] 时才真的发；
+/// - 等待期间主循环的 `keyframe_tick` 按同一间隔重试，直到 IDR 解码成功（[`Self::satisfied`]）；
+/// - 一次等待事件最多换回一张 IDR：重试周期（400 ms）**不小于**被控端的关键帧去重窗口
+///   （`KEYFRAME_DEDUP_WINDOW = 350 ms`，见 `crates/remote/src/controlled.rs`），在途 IDR
+///   期间到达的重试会被对端吸收。
+#[derive(Debug, Default)]
+struct KeyframeGate {
+    /// 是否在等 IDR（一次「等待事件」）。
+    waiting: bool,
+    /// 本次等待的最近一次请求目标；重试沿用同一目标，不重复上报。
+    desired: Option<(u32, KeyframeReason)>,
+    /// 上一次真正发出的时刻。
+    last_sent: Option<Instant>,
+}
+
+impl KeyframeGate {
+    /// 断链事件：记录目标，并在窗口允许时立刻发一次。
+    ///
+    /// 返回 `Some` 表示调用方**现在就要**把这条 `RequestKeyframe` 发出去。
+    fn on_break(
+        &mut self,
+        display: u32,
+        reason: KeyframeReason,
+        now: Instant,
+    ) -> Option<(u32, KeyframeReason)> {
+        self.waiting = true;
+        self.desired = Some((display, reason));
+        if self.due(now) {
+            self.last_sent = Some(now);
+            return self.desired;
+        }
+        None
+    }
+
+    /// 定时重试：仍在等待且已过一个窗口 → 再发一次；否则 `None`。
+    fn on_tick(&mut self, now: Instant) -> Option<(u32, KeyframeReason)> {
+        if !self.waiting || !self.due(now) {
+            return None;
+        }
+        self.last_sent = Some(now);
+        self.desired
+    }
+
+    /// IDR 已解出：本次等待事件结束（下一次断链会立刻重发）。
+    fn satisfied(&mut self) {
+        self.waiting = false;
+        self.desired = None;
+        self.last_sent = None;
+    }
+
+    #[must_use]
+    fn is_waiting(&self) -> bool {
+        self.waiting
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.last_sent
+            .is_none_or(|sent| now.saturating_duration_since(sent) >= KEYFRAME_REQUEST_INTERVAL)
+    }
+}
+
+/// 本包的序号是否构成「意料之外的断层」（解码任务用）。
+///
+/// **关键帧永远不算**：它本身就是新的参考链起点，序号跳跃是正常的（主循环丢掉一批 P 帧之后
+/// IDR 必然跳号）。旧实现不区分这一点，于是每次丢包之后到达的 IDR 都被判成断层 → 销毁解码器
+/// + 再请求一张 IDR，这是「一次事件换回 3 张 IDR」的另一半来源。
+///
+/// 主循环有意丢弃的包**根本不会进入解码队列**，所以本函数只在「网络/协议真的漏了一帧」或
+/// 「解码任务自己丢过包却忘了推进期望值」时返回 `true`。
+#[must_use]
+fn seq_is_gap(expected: Option<u64>, seq: u64, keyframe: bool) -> bool {
+    !keyframe && expected.is_some_and(|expected| seq != expected)
+}
+
+/// 发一条 `RequestKeyframe` 并上报原因。
+async fn dispatch_keyframe_request(
+    queues: &mut OutboundQueues,
+    cancel: &CancellationToken,
+    stats: &SessionStatsReporter,
+    (display, reason): (u32, KeyframeReason),
+) -> RemoteResult<()> {
+    queues
+        .enqueue_ctrl(
+            cancel,
+            SessionFrame::screen(SessionMessage::RequestKeyframe { display }),
+        )
+        .await?;
+    stats.report(SessionStats::KeyframeRequest { reason });
+    Ok(())
 }
 
 #[expect(
@@ -1386,8 +1807,8 @@ fn request_keyframe(
     reason = "序号断层/关键帧等待/解码器重建/切 codec 是一条不可分割的状态机，拆开反而要来回传状态"
 )]
 async fn decode_loop(
-    mut rx: mpsc::Receiver<DecodeJob>,
-    keyframe_tx: mpsc::UnboundedSender<(u32, KeyframeReason)>,
+    queue: Arc<DecodeQueue>,
+    notice_tx: mpsc::UnboundedSender<DecodeNotice>,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
     decode_shared: Arc<DecodeShared>,
@@ -1401,46 +1822,28 @@ async fn decode_loop(
     // 当前解码器已经 `configure` 过的编码尺寸；`None` = 新实例，首个包必须先 configure。
     // 尺寸来自 `VideoPacket`（即编码尺寸），**不是** `ScreenConfig`——后者不经过解码队列。
     let mut configured_dims: Option<(u32, u32)> = None;
-    // 参考链已断，只等 IDR。
+    // 参考链已断，只等 IDR。**关键帧一被取出就清**（不必等它解完）。
     let mut awaiting_keyframe = false;
-    // 下一个期望的帧序号（被控端按发送顺序递增；断层 = 中间有包被丢弃）。
+    // 进入等待的原因：补丁在没有基底时被跳过要沿用同一原因重发（见下方 `DecodeNotice`）。
+    let mut awaiting_reason = KeyframeReason::DecodeError;
+    // 下一个期望的帧序号（只在**本任务实际看到**的包之间比较；见 [`seq_is_gap`]）。
     let mut expected_seq: Option<u64> = None;
-    // 关键帧请求限频状态：上次真正发出的时刻、被限频挂起的显示器。
-    let mut last_kf_request: Option<Instant> = None;
-    let mut kf_pending: Option<(u32, KeyframeReason)> = None;
     // 上一次**解码完成**的时刻（`now_us()`）。真机的 300–505 ms 单帧停顿 18/18 次都出现在
     // 「距上一帧超过 600 ms 的空闲」之后，故把空闲间隔一并打进逐帧日志，现场才能对上号。
     let mut last_decode_done_us: u64 = 0;
-    // 诊断开关**每帧读一次**（Relaxed 原子）：设置页运行中切换立即生效（见 [`crate::latency`]）。
-    // 定期检查挂起的请求：距上次请求已满一个窗口就发出去，保证不会永久等 IDR。
-    let mut kf_tick = tokio::time::interval_at(
-        Instant::now() + KEYFRAME_REQUEST_INTERVAL,
-        KEYFRAME_REQUEST_INTERVAL,
-    );
-    kf_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 本任务只发「断链 / IDR 解出」通知；请求的去重、限频与重试全部在主循环的
+    // [`KeyframeGate`] 里（本任务会卡在 `spawn_blocking` 中，放这里的 tick 会被一起挡住）。
     loop {
         let job = tokio::select! {
             biased;
             () = cancel.cancelled() => break,
-            _ = kf_tick.tick() => {
-                if awaiting_keyframe {
-                    if let Some((monitor, reason)) = kf_pending.take() {
-                        let _ = keyframe_tx.send((monitor, reason));
-                        last_kf_request = Some(Instant::now());
-                    }
-                } else {
-                    // 已不在等 IDR（例如收到了关键帧）：挂起的请求作废。
-                    kf_pending = None;
-                }
-                continue;
-            }
-            job = rx.recv() => match job {
+            job = queue.pop() => match job {
                 Some(job) => job,
                 None => break,
             },
         };
         // `display` 会与 tracing 宏展开里引入的 `field::display` 撞名，故绑定名用 monitor。
-        let (monitor, seq, epoch, packet_codec, flags, width, height, data, capture_ts_us, recv_us) =
+        let (monitor, seq, packet_codec, flags, width, height, data, capture_ts_us, recv_us) =
             match job {
                 DecodeJob::SelectCodec(selected) => {
                     // 换 codec：旧解码器的参考帧不可用，重置并等新 codec 的关键帧。
@@ -1451,9 +1854,6 @@ async fn decode_loop(
                         // **只建解码器、不 configure**：尺寸由首个 `VideoPacket` 给出。
                         configured_dims = None;
                         awaiting_keyframe = true;
-                        decode_shared
-                            .awaiting_keyframe
-                            .store(true, Ordering::Relaxed);
                         expected_seq = None;
                         if let Some(factory) =
                             decoder_factory_for(selected, h264_decoder_factory.as_ref())
@@ -1508,13 +1908,8 @@ async fn decode_loop(
                     // 即使此刻已经在等 IDR。
                     if codec != Some(CodecId::H264) {
                         debug!(monitor, ?codec, "非 H.264 会话收到补丁，丢弃并请求关键帧");
-                        request_keyframe(
-                            &keyframe_tx,
-                            &mut last_kf_request,
-                            &mut kf_pending,
-                            monitor,
-                            KeyframeReason::DecodeError,
-                        );
+                        awaiting_reason = KeyframeReason::DecodeError;
+                        report_break(&queue, &notice_tx, monitor, awaiting_reason);
                         continue;
                     }
                     if configured_dims != Some((width, height)) {
@@ -1526,20 +1921,17 @@ async fn decode_loop(
                             "补丁尺寸与当前合成帧不符，丢弃并请求关键帧"
                         );
                         awaiting_keyframe = true;
-                        decode_shared
-                            .awaiting_keyframe
-                            .store(true, Ordering::Relaxed);
-                        request_keyframe(
-                            &keyframe_tx,
-                            &mut last_kf_request,
-                            &mut kf_pending,
-                            monitor,
-                            KeyframeReason::DecodeError,
-                        );
+                        awaiting_reason = KeyframeReason::DecodeError;
+                        report_break(&queue, &notice_tx, monitor, awaiting_reason);
                         continue;
                     }
                     if awaiting_keyframe {
-                        // 还没有可应用的全帧基底；关键帧请求已经在途（见上）。
+                        // 还没有可应用的全帧基底。**不能静默**：这里必须保证真的有一条
+                        // `RequestKeyframe` 在途（或会在重试窗口内发出），否则画面会永久冻结。
+                        // 主循环的 [`KeyframeGate`] 本来就在等待期间重试，这条通知只是把「画面
+                        // 还在缺基底」这个事实持续告诉它（同一显示器/原因会被去重），这样即使
+                        // 某次请求被限频或丢失，也不会没有人补发。
+                        report_break(&queue, &notice_tx, monitor, awaiting_reason);
                         continue;
                     }
                     let mut patches = Vec::with_capacity(rects.len());
@@ -1559,16 +1951,8 @@ async fn decode_loop(
                             width, height, "补丁矩形非法或解压失败，丢弃整批并请求关键帧"
                         );
                         awaiting_keyframe = true;
-                        decode_shared
-                            .awaiting_keyframe
-                            .store(true, Ordering::Relaxed);
-                        request_keyframe(
-                            &keyframe_tx,
-                            &mut last_kf_request,
-                            &mut kf_pending,
-                            monitor,
-                            KeyframeReason::DecodeError,
-                        );
+                        awaiting_reason = KeyframeReason::DecodeError;
+                        report_break(&queue, &notice_tx, monitor, awaiting_reason);
                         continue;
                     }
                     let patch_bytes = patches.iter().fold(0_u64, |acc, rect| {
@@ -1607,8 +1991,7 @@ async fn decode_loop(
                 DecodeJob::Packet {
                     display,
                     seq,
-                    epoch,
-                    codec,
+                    codec: packet_codec,
                     flags,
                     width,
                     height,
@@ -1618,8 +2001,7 @@ async fn decode_loop(
                 } => (
                     display,
                     seq,
-                    epoch,
-                    codec,
+                    packet_codec,
                     flags,
                     width,
                     height,
@@ -1639,37 +2021,13 @@ async fn decode_loop(
         };
         // 诊断：载荷字节数（`data` 稍后会被 move 进 `spawn_blocking`）。
         let packet_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
-        // 队列曾溢出（主循环推进了 epoch）：本包已被更新的包取代。丢掉它并重置参考链，
-        // `expected_seq = None` 避免紧接着的下一个包再触发一次「断层」重置。
-        if epoch < decode_shared.drop_epoch.load(Ordering::Relaxed) {
-            // 只作观测：按原因的丢帧拆分（延迟诊断日志每秒取走），不影响任何决策。
-            decode_shared.epoch_drops.fetch_add(1, Ordering::Relaxed);
-            debug!(seq, epoch, "解码队列曾溢出，丢弃陈旧视频包并等待关键帧");
-            decoder = None;
-            configured_dims = None;
-            awaiting_keyframe = true;
-            decode_shared
-                .awaiting_keyframe
-                .store(true, Ordering::Relaxed);
-            expected_seq = None;
-            request_keyframe(
-                &keyframe_tx,
-                &mut last_kf_request,
-                &mut kf_pending,
-                monitor,
-                KeyframeReason::QueueOverflow,
-            );
-            continue;
-        }
         // 兜底：正常情况下 `SelectCodec` 一定先到；万一对端漏发，用视频包自带的 codec。
+        // 换解码器 ⇒ 旧参考帧作废，必须等关键帧。
         if codec.is_none() {
             codec = Some(packet_codec);
             decoder = None;
             configured_dims = None;
             awaiting_keyframe = true;
-            decode_shared
-                .awaiting_keyframe
-                .store(true, Ordering::Relaxed);
         }
 
         // 声明尺寸的纵深防御：真正的解码尺寸由码流决定（下方解码后还会再校验一次），但先挡掉
@@ -1680,41 +2038,36 @@ async fn decode_loop(
         }
 
         let keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
-        // 序号断层 = 会话循环丢弃过包 → 参考链已断，重置解码器并等关键帧。
-        if expected_seq.is_some_and(|expected| seq != expected) {
-            debug!(seq, ?expected_seq, "视频序号断层，重置解码器并等待关键帧");
-            decoder = None;
-            configured_dims = None;
+        // 序号断层 = 真的漏了包（主循环有意丢的包根本到不了这里）→ 参考链已断。
+        //
+        // **不销毁解码器**：H.264 / VP9 都能直接吃下一张 IDR 重新同步，重建实例只会让恢复
+        // 更慢。旧实现在这里 `decoder = None`，于是一次丢帧就换一次重建 + 一次多余的 IDR。
+        if seq_is_gap(expected_seq, seq, keyframe) {
+            debug!(seq, ?expected_seq, "视频序号断层，等待关键帧后恢复");
             awaiting_keyframe = true;
-            decode_shared
-                .awaiting_keyframe
-                .store(true, Ordering::Relaxed);
-            request_keyframe(
-                &keyframe_tx,
-                &mut last_kf_request,
-                &mut kf_pending,
-                monitor,
-                KeyframeReason::SeqGap,
-            );
+            awaiting_reason = KeyframeReason::SeqGap;
+            // 队列里已经有一张关键帧排着就不再上报：请求只会多花 200–400 KB 带宽
+            // （见 [`report_break`]）。
+            report_break(&queue, &notice_tx, monitor, awaiting_reason);
         }
+        // 期望值对**每一个看到的包**推进（含下面被丢弃的那些）：本任务主动丢弃的包不应该在
+        // 下一个包上再表现成一次「断层」。
         expected_seq = Some(seq.wrapping_add(1));
 
+        // 关键帧**一被取出**就恢复：它是新的参考链起点，排在它之后的 P 帧在队列里天然排在
+        // 它后面、可以按序解码。旧实现等解码成功才恢复，真机上 IDR 解码本身可能 445 ms，
+        // 期间到达的 P 帧全被丢 → 再断链 → 再换一张 IDR。
+        if keyframe {
+            awaiting_keyframe = false;
+        }
         if awaiting_keyframe && !keyframe {
             continue;
         }
         // 尚无解码器时必须从关键帧起步，否则 P 帧无从参考。
         if decoder.is_none() && !keyframe {
             awaiting_keyframe = true;
-            decode_shared
-                .awaiting_keyframe
-                .store(true, Ordering::Relaxed);
-            request_keyframe(
-                &keyframe_tx,
-                &mut last_kf_request,
-                &mut kf_pending,
-                monitor,
-                KeyframeReason::NoDecoder,
-            );
+            awaiting_reason = KeyframeReason::NoDecoder;
+            report_break(&queue, &notice_tx, monitor, awaiting_reason);
             continue;
         }
         if decoder.is_none() {
@@ -1723,16 +2076,8 @@ async fn decode_loop(
             let Some(factory) = factory else {
                 warn!(?codec, "没有对应 codec 的解码器工厂，丢弃本帧并等待关键帧");
                 awaiting_keyframe = true;
-                decode_shared
-                    .awaiting_keyframe
-                    .store(true, Ordering::Relaxed);
-                request_keyframe(
-                    &keyframe_tx,
-                    &mut last_kf_request,
-                    &mut kf_pending,
-                    monitor,
-                    KeyframeReason::NoDecoder,
-                );
+                awaiting_reason = KeyframeReason::NoDecoder;
+                report_break(&queue, &notice_tx, monitor, awaiting_reason);
                 continue;
             };
             match factory.create() {
@@ -1769,16 +2114,8 @@ async fn decode_loop(
                     decoder = None;
                     configured_dims = None;
                     awaiting_keyframe = true;
-                    decode_shared
-                        .awaiting_keyframe
-                        .store(true, Ordering::Relaxed);
-                    request_keyframe(
-                        &keyframe_tx,
-                        &mut last_kf_request,
-                        &mut kf_pending,
-                        monitor,
-                        KeyframeReason::ConfigureFailed,
-                    );
+                    awaiting_reason = KeyframeReason::ConfigureFailed;
+                    report_break(&queue, &notice_tx, monitor, awaiting_reason);
                     continue;
                 }
             }
@@ -1814,16 +2151,12 @@ async fn decode_loop(
                 let decode_ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
                 decode_shared.decode_ms.store(decode_ms, Ordering::Relaxed);
                 awaiting_keyframe = false;
-                decode_shared
-                    .awaiting_keyframe
-                    .store(false, Ordering::Relaxed);
-                // 刚解出一张 IDR：记下时刻，主循环据此在 [`KEYFRAME_SETTLE_MS`] 内不老化丢帧
-                // （此刻队列里的积压只是 IDR 传输/解码期间攒下的瞬态，能正常解出来）。
+                // IDR 已**解出**：本次等待事件结束，主循环清空重试状态（下一次断链会立刻重发）。
+                // 注意主循环的入队闸门比这里早一步打开（IDR 入队即打开），两者语义不同：
+                // 这里管「还要不要发请求」，那边管「还要不要丢 P 帧」。
                 if keyframe {
-                    decode_shared.last_idr_us.store(now_us(), Ordering::Relaxed);
+                    let _ = notice_tx.send(DecodeNotice::Satisfied);
                 }
-                // IDR 已解出：被限频挂起的请求没有意义了。
-                kf_pending = None;
                 // 端到端（D2）：采集完成 → 本端解码完成。偏差未知/时间戳缺失时给 0
                 // （见 [`crate::clock::elapsed_ms`]）。
                 let offset = decode_shared.clock_offset_us.load(Ordering::Relaxed);
@@ -1846,7 +2179,7 @@ async fn decode_loop(
                             decode_micros,
                             elapsed_ms(recv_us, offset, capture_ts_us),
                             e2e_ms,
-                            u32::try_from(rx.len()).unwrap_or(u32::MAX)
+                            queue.backlog()
                         );
                     }
                     // 慢帧才打四段细分：空闲后的第一帧到底卡在 MFT 出帧、GPU 回读，
@@ -1879,28 +2212,17 @@ async fn decode_loop(
             Ok((dec, Ok(None), _elapsed)) => {
                 decoder = Some(dec);
                 awaiting_keyframe = false;
-                decode_shared
-                    .awaiting_keyframe
-                    .store(false, Ordering::Relaxed);
-                kf_pending = None;
             }
             Ok((dec, Err(err), _elapsed)) => {
-                // 解码失败：这个实例不可信，丢弃并等下一个关键帧（`dec` 在分支结束时 drop）。
+                // **解码器自己坏了**（不是「参考链断了」）：这个实例不可信，重建并等下一个
+                // 关键帧。这是唯一需要重建解码器的路径——丢包/断层只需喂一张 IDR。
                 drop(dec);
                 warn!(error = %err, "画面解码失败，重置解码器并请求关键帧");
                 decoder = None;
                 configured_dims = None;
                 awaiting_keyframe = true;
-                decode_shared
-                    .awaiting_keyframe
-                    .store(true, Ordering::Relaxed);
-                request_keyframe(
-                    &keyframe_tx,
-                    &mut last_kf_request,
-                    &mut kf_pending,
-                    monitor,
-                    KeyframeReason::DecodeError,
-                );
+                awaiting_reason = KeyframeReason::DecodeError;
+                report_break(&queue, &notice_tx, monitor, awaiting_reason);
             }
             Err(join_err) => {
                 // `spawn_blocking` 里 panic：解码器已随闭包一起 drop，只能重建实例并等
@@ -1914,16 +2236,8 @@ async fn decode_loop(
                 decoder = None;
                 configured_dims = None;
                 awaiting_keyframe = true;
-                decode_shared
-                    .awaiting_keyframe
-                    .store(true, Ordering::Relaxed);
-                request_keyframe(
-                    &keyframe_tx,
-                    &mut last_kf_request,
-                    &mut kf_pending,
-                    monitor,
-                    KeyframeReason::DecodeError,
-                );
+                awaiting_reason = KeyframeReason::DecodeError;
+                report_break(&queue, &notice_tx, monitor, awaiting_reason);
             }
         }
         // 下一次「空闲间隔」的起点。失败/panic 也算一次解码尝试完成——它们同样结束了
@@ -2028,109 +2342,6 @@ fn idle_ms(now_us: u64, last_done_us: u64) -> u64 {
         return 0;
     }
     now_us.saturating_sub(last_done_us) / 1000
-}
-
-/// 解码队列当前积压的载荷数（[`DECODE_QUEUE`] 减去剩余容量）。
-///
-/// `mpsc::Sender::capacity()` 返回的是**剩余**容量，故 `DECODE_QUEUE - capacity` 才是在队列里
-/// 排着的条数（含解码任务刚刚取走之前的那一瞬，最多差一条，无碍判断）。
-fn decode_backlog(tx: &mpsc::Sender<DecodeJob>) -> u32 {
-    u32::try_from(DECODE_QUEUE.saturating_sub(tx.capacity())).unwrap_or(u32::MAX)
-}
-
-/// 按采集时间戳算一帧「现在有多老」（毫秒）；年龄不可知时返回 `None`。
-///
-/// `offset_us` 是**对端时钟相对本端**的偏差（正值 = 对端更快，见 [`crate::clock`]），故对端
-/// 时间轴上的现在是 `now_us + offset_us`。以下情况一律返回 `None`（年龄未知 ⇒ **绝不**据此
-/// 丢帧，宁可放过一个旧帧，也不要在估计未建立时误杀正常帧）：
-///
-/// - `capture_ts_us == 0`：对端没填时间戳；
-/// - `offset_us == UNKNOWN_OFFSET`：时钟偏差估计尚未建立。这里用的是**专用哨兵**而不是 0，
-///   所以「真的没有偏差」（offset == 0）与「还不知道」可以区分，不需要额外的同步标志；
-/// - 差值为负：偏差误差或乱序让时间戳落在「未来」，此时年龄没有意义。
-#[must_use]
-fn frame_age_ms(now_us: u64, capture_ts_us: u64, offset_us: i64) -> Option<u64> {
-    if capture_ts_us == 0 || offset_us == UNKNOWN_OFFSET {
-        return None;
-    }
-    let peer_now = i128::from(now_us) + i128::from(offset_us);
-    let delta = peer_now - i128::from(capture_ts_us);
-    if delta < 0 {
-        return None;
-    }
-    u64::try_from(delta / 1000).ok()
-}
-
-/// 距上次成功解出 IDR 已过多少毫秒；本会话还没解出过 IDR 时返回 `None`。
-///
-/// `now_us` 与 `last_idr_us` 都是本端单调时钟（[`crate::clock::now_us`]），跨线程读的是
-/// `Relaxed` 原子，最多差一拍；用于 [`KEYFRAME_SETTLE_MS`] 这种 500 ms 量级的判断足够。
-///
-/// `None` 的语义是「没有新参考链需要保护」：会话刚开始时解码器本来就在等第一张 IDR
-/// （第一道闸门会拦住 P 帧），这里按其余条件判断即可。时间戳倒退（原子的轻微乱序）用
-/// 饱和减法折成 0，宁可多等一个冷静期，也不要把「刚解出 IDR」误判成「早就过了」。
-#[must_use]
-fn since_idr_ms(now_us: u64, last_idr_us: u64) -> Option<u64> {
-    if last_idr_us == 0 {
-        return None;
-    }
-    Some(now_us.saturating_sub(last_idr_us) / 1000)
-}
-
-/// 是否应在入队前丢弃这个陈旧画面帧。
-///
-/// 四个条件**缺一不可**，少任何一个都会误伤正常链路：
-///
-/// 1. `backlog >= STALE_DROP_MIN_BACKLOG`：队列接近满（`DECODE_QUEUE - 1`），说明解码真的
-///    落后于网络，而不是欠了一拍的常态；
-/// 2. `age_ms > STALE_FRAME_AGE_MS`：帧真的老了，而不是一次网络毛刺；
-/// 3. `!keyframe`：IDR 是恢复参考链的唯一手段，再老也必须放行；
-/// 4. 不在 IDR 冷静期内：`since_idr_ms` 为 `None`（本会话还没解出过 IDR）或
-///    `>= KEYFRAME_SETTLE_MS`。刚解出 IDR 时参考链是全新的，队列积压只是瞬态，此刻丢帧
-///    会把刚重建的参考链又砍断，正是「丢帧 → 请求 IDR → IDR 期间又积压 → 再丢」的起点。
-///
-/// `age_ms == None`（时间戳缺失/时钟偏差未知）时永远返回 `false`。
-#[must_use]
-fn should_drop_stale(
-    age_ms: Option<u64>,
-    backlog: u32,
-    keyframe: bool,
-    since_idr_ms: Option<u64>,
-) -> bool {
-    !keyframe
-        && backlog >= STALE_DROP_MIN_BACKLOG
-        && age_ms.is_some_and(|age| age > STALE_FRAME_AGE_MS)
-        && since_idr_ms.is_none_or(|elapsed| elapsed >= KEYFRAME_SETTLE_MS)
-}
-
-/// [`enqueue_decode`] 的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodeEnqueue {
-    /// 已入队。
-    Queued,
-    /// 队列满，该包被丢弃。调用方应推进 `drop_epoch`，让队列里的陈旧包整体作废。
-    Dropped,
-    /// 解码任务已结束。
-    Closed,
-}
-
-/// 投递一条待解码载荷。
-///
-/// 队列满时**丢弃**该批而不是 `await`：在 `select!` 分支里等解码腾出位置会重新把循环卡住（正是
-/// 本次要修的问题）。丢包会打断 VP9 的参考链，故解码任务用**序号断层**检测到它、重置解码器并
-/// 请求关键帧（见 [`decode_loop`]）——丢帧本身安全，静默花屏才不安全。
-///
-/// 主循环还会在 `Dropped` 时推进 `drop_epoch`：队列里排着的 P 帧都是过期画面，解码端应直接
-/// 跳到最新包，而不是先把它们解完再重置。
-fn enqueue_decode(tx: &mpsc::Sender<DecodeJob>, job: DecodeJob) -> DecodeEnqueue {
-    match tx.try_send(job) {
-        Ok(()) => DecodeEnqueue::Queued,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            debug!("解码队列已满，丢弃一批画面（解码侧将按序号断层请求关键帧）");
-            DecodeEnqueue::Dropped
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => DecodeEnqueue::Closed,
-    }
 }
 
 /// 把 [`TransferHub::abort_all`] 返回的 `FileError` 依次投进出站队列。
@@ -2792,8 +3003,8 @@ mod tests {
     /// 画面永远黑屏。这里用记录创建次数的假工厂做机械断言。
     #[tokio::test]
     async fn codec_select_uses_injected_h264_decoder_factory() {
-        let (job_tx, job_rx) = mpsc::channel::<DecodeJob>(4);
-        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
+        let queue = Arc::new(DecodeQueue::new());
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<DecodeNotice>();
         let sink = Arc::new(CountingSink::default());
         let cancel = CancellationToken::new();
         let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2804,8 +3015,8 @@ mod tests {
             calls: Arc::clone(&calls),
         });
         let task = tokio::spawn(decode_loop(
-            job_rx,
-            keyframe_tx,
+            Arc::clone(&queue),
+            notice_tx,
             sink.clone(),
             cancel.clone(),
             Arc::new(DecodeShared::new()),
@@ -2813,25 +3024,18 @@ mod tests {
             SessionStatsReporter::noop(),
         ));
 
-        job_tx
-            .send(DecodeJob::SelectCodec(CodecId::H264))
-            .await
-            .expect("投递 codec 选择");
-        job_tx
-            .send(DecodeJob::Packet {
-                display: 0,
-                seq: 1,
-                epoch: 0,
-                codec: CodecId::H264,
-                flags: VIDEO_FLAG_KEYFRAME,
-                width: 2,
-                height: 2,
-                data: vec![1, 2, 3],
-                capture_ts_us: 0,
-                recv_us: 0,
-            })
-            .await
-            .expect("投递关键帧");
+        queue.push(DecodeJob::SelectCodec(CodecId::H264));
+        queue.push(DecodeJob::Packet {
+            display: 0,
+            seq: 1,
+            codec: CodecId::H264,
+            flags: VIDEO_FLAG_KEYFRAME,
+            width: 2,
+            height: 2,
+            data: vec![1, 2, 3],
+            capture_ts_us: 0,
+            recv_us: 0,
+        });
 
         // 等解码任务真的建了解码器并投出一帧。
         let decoded = tokio::time::timeout(WAIT, async {
@@ -2871,8 +3075,8 @@ mod tests {
     /// 存在于 `VideoPacket` 里（`ScreenConfig` 不经过解码队列）。VP9 用默认空实现，不受影响。
     #[tokio::test]
     async fn decoder_configure_runs_on_first_packet_and_on_size_change_only() {
-        let (job_tx, job_rx) = mpsc::channel::<DecodeJob>(8);
-        let (keyframe_tx, _keyframe_rx) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
+        let queue = Arc::new(DecodeQueue::new());
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<DecodeNotice>();
         let sink = Arc::new(CountingSink::default());
         let cancel = CancellationToken::new();
         let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2883,8 +3087,8 @@ mod tests {
             calls: Arc::clone(&calls),
         });
         let task = tokio::spawn(decode_loop(
-            job_rx,
-            keyframe_tx,
+            Arc::clone(&queue),
+            notice_tx,
             sink.clone(),
             cancel.clone(),
             Arc::new(DecodeShared::new()),
@@ -2892,15 +3096,11 @@ mod tests {
             SessionStatsReporter::noop(),
         ));
 
-        job_tx
-            .send(DecodeJob::SelectCodec(CodecId::H264))
-            .await
-            .expect("投递 codec 选择");
+        queue.push(DecodeJob::SelectCodec(CodecId::H264));
 
         let packet = |seq: u64, flags: u8, width: u32, height: u32| DecodeJob::Packet {
             display: 0,
             seq,
-            epoch: 0,
             codec: CodecId::H264,
             flags,
             width,
@@ -2910,20 +3110,11 @@ mod tests {
             recv_us: 0,
         };
         // 首包（关键帧）→ configure + decode。
-        job_tx
-            .send(packet(1, VIDEO_FLAG_KEYFRAME, 64, 48))
-            .await
-            .expect("投递首包");
+        queue.push(packet(1, VIDEO_FLAG_KEYFRAME, 64, 48));
         // 同尺寸 → 只 decode，不重复 configure。
-        job_tx
-            .send(packet(2, 0, 64, 48))
-            .await
-            .expect("投递同尺寸包");
+        queue.push(packet(2, 0, 64, 48));
         // 尺寸变化（关键帧）→ 再次 configure + decode。
-        job_tx
-            .send(packet(3, VIDEO_FLAG_KEYFRAME, 96, 64))
-            .await
-            .expect("投递改尺寸包");
+        queue.push(packet(3, VIDEO_FLAG_KEYFRAME, 96, 64));
 
         let decoded = tokio::time::timeout(WAIT, async {
             for _ in 0..200 {
@@ -3028,29 +3219,31 @@ mod tests {
         }
     }
 
-    /// 解码任务测试装置：H.264 假工厂 + 记录型 sink + 关键帧请求接收端。
+    /// 解码任务测试装置：H.264 假工厂 + 记录型 sink + 通知接收端。
     struct DecodeHarness {
-        jobs: mpsc::Sender<DecodeJob>,
-        keyframes: mpsc::UnboundedReceiver<(u32, KeyframeReason)>,
+        queue: Arc<DecodeQueue>,
+        notices: mpsc::UnboundedReceiver<DecodeNotice>,
         sink: Arc<PatchSink>,
+        created: Arc<std::sync::atomic::AtomicUsize>,
         cancel: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl DecodeHarness {
         fn spawn() -> Self {
-            let (jobs, job_rx) = mpsc::channel::<DecodeJob>(8);
-            let (keyframe_tx, keyframes) = mpsc::unbounded_channel::<(u32, KeyframeReason)>();
+            let queue = Arc::new(DecodeQueue::new());
+            let (notice_tx, notices) = mpsc::unbounded_channel::<DecodeNotice>();
             let sink = Arc::new(PatchSink::default());
             let cancel = CancellationToken::new();
+            let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let factory: Arc<dyn VideoDecoderFactory> = Arc::new(RecordingDecoderFactory {
                 codec: CodecId::H264,
-                created: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                created: Arc::clone(&created),
                 calls: Arc::new(Mutex::new(Vec::new())),
             });
             let task = tokio::spawn(decode_loop(
-                job_rx,
-                keyframe_tx,
+                Arc::clone(&queue),
+                notice_tx,
                 sink.clone(),
                 cancel.clone(),
                 Arc::new(DecodeShared::new()),
@@ -3058,9 +3251,10 @@ mod tests {
                 SessionStatsReporter::noop(),
             ));
             Self {
-                jobs,
-                keyframes,
+                queue,
+                notices,
                 sink,
+                created,
                 cancel,
                 task,
             }
@@ -3068,25 +3262,18 @@ mod tests {
 
         /// 走完「选 codec → 首帧关键帧」，让解码任务进入可应用补丁的状态。
         async fn prime(&self, width: u32, height: u32) {
-            self.jobs
-                .send(DecodeJob::SelectCodec(CodecId::H264))
-                .await
-                .expect("投递 codec 选择");
-            self.jobs
-                .send(DecodeJob::Packet {
-                    display: 0,
-                    seq: 1,
-                    epoch: 0,
-                    codec: CodecId::H264,
-                    flags: VIDEO_FLAG_KEYFRAME,
-                    width,
-                    height,
-                    data: vec![1, 2, 3],
-                    capture_ts_us: 0,
-                    recv_us: 0,
-                })
-                .await
-                .expect("投递关键帧");
+            self.queue.push(DecodeJob::SelectCodec(CodecId::H264));
+            self.queue.push(DecodeJob::Packet {
+                display: 0,
+                seq: 1,
+                codec: CodecId::H264,
+                flags: VIDEO_FLAG_KEYFRAME,
+                width,
+                height,
+                data: vec![1, 2, 3],
+                capture_ts_us: 0,
+                recv_us: 0,
+            });
             let decoded = tokio::time::timeout(WAIT, async {
                 for _ in 0..200 {
                     if self.sink.frames() >= 1 {
@@ -3101,18 +3288,15 @@ mod tests {
             assert!(decoded, "prime 应解出一个全帧");
         }
 
-        async fn region(&self, width: u32, height: u32, rects: Vec<RegionRect>) {
-            self.jobs
-                .send(DecodeJob::Region {
-                    display: 0,
-                    width,
-                    height,
-                    rects,
-                    capture_ts_us: 0,
-                    recv_us: 0,
-                })
-                .await
-                .expect("投递补丁批");
+        fn region(&self, width: u32, height: u32, rects: Vec<RegionRect>) {
+            self.queue.push(DecodeJob::Region {
+                display: 0,
+                width,
+                height,
+                rects,
+                capture_ts_us: 0,
+                recv_us: 0,
+            });
         }
 
         /// 等一批补丁上屏（解码是异步的）。
@@ -3129,12 +3313,19 @@ mod tests {
             .expect("应收到补丁批")
         }
 
-        /// 等解码任务请求关键帧；返回 `(显示器, 原因)`。
+        /// 等解码任务报告「参考链断了」；返回 `(显示器, 原因)`。
         async fn expect_keyframe(&mut self) -> (u32, KeyframeReason) {
-            tokio::time::timeout(WAIT, self.keyframes.recv())
-                .await
-                .expect("补丁被丢弃时必须请求关键帧")
-                .expect("关键帧请求通道不应关闭")
+            loop {
+                match tokio::time::timeout(WAIT, self.notices.recv())
+                    .await
+                    .expect("补丁被丢弃时必须报告断链")
+                    .expect("通知通道不应关闭")
+                {
+                    DecodeNotice::Broken { display, reason } => return (display, reason),
+                    // 只要解码成功就会有一条 `Satisfied`，跳过它继续等断链通知。
+                    DecodeNotice::Satisfied => {}
+                }
+            }
         }
     }
 
@@ -3142,6 +3333,16 @@ mod tests {
         fn drop(&mut self) {
             self.cancel.cancel();
             self.task.abort();
+        }
+    }
+
+    /// 断言通知通道里没有「参考链断了」（`Satisfied` 忽略不计）。
+    fn assert_no_break(notices: &mut mpsc::UnboundedReceiver<DecodeNotice>) {
+        while let Ok(notice) = notices.try_recv() {
+            assert!(
+                !matches!(notice, DecodeNotice::Broken { .. }),
+                "不应报告断链，实得 {notice:?}"
+            );
         }
     }
 
@@ -3176,8 +3377,7 @@ mod tests {
                         data: raw_nv12.clone(),
                     },
                 ],
-            )
-            .await;
+            );
 
         let patch = harness.next_patch().await;
         assert_eq!(patch.display, 0);
@@ -3202,10 +3402,7 @@ mod tests {
             ],
             "两种 flags 都应解成同一份紧包 NV12"
         );
-        assert!(
-            harness.keyframes.try_recv().is_err(),
-            "合法补丁不该请求关键帧"
-        );
+        assert_no_break(&mut harness.notices);
     }
 
     /// **基底不存在**：首个全帧之前到达的补丁没有可应用的目标，必须丢弃并请求关键帧。
@@ -3213,11 +3410,7 @@ mod tests {
     async fn region_update_before_any_video_packet_drops_and_requests_keyframe() {
         let mut harness = DecodeHarness::spawn();
         // 只选 codec、不投视频包：`configured_dims` 仍为空。
-        harness
-            .jobs
-            .send(DecodeJob::SelectCodec(CodecId::H264))
-            .await
-            .expect("投递 codec 选择");
+        harness.queue.push(DecodeJob::SelectCodec(CodecId::H264));
         harness
             .region(
                 8,
@@ -3230,8 +3423,7 @@ mod tests {
                     flags: 0,
                     data: vec![0_u8; 6],
                 }],
-            )
-            .await;
+            );
 
         assert_eq!(
             harness.expect_keyframe().await,
@@ -3247,7 +3439,7 @@ mod tests {
     async fn assert_bad_region_requests_keyframe(rect: RegionRect) {
         let mut harness = DecodeHarness::spawn();
         harness.prime(8, 8).await;
-        harness.region(8, 8, vec![rect]).await;
+        harness.region(8, 8, vec![rect]);
         assert_eq!(
             harness.expect_keyframe().await,
             (0, KeyframeReason::DecodeError)
@@ -3334,8 +3526,7 @@ mod tests {
                     flags: 0,
                     data: vec![7_u8; 6],
                 }],
-            )
-            .await;
+            );
         // 等补丁上屏，但**不要取走**事件——下面要检查完整顺序。
         tokio::time::timeout(WAIT, async {
             loop {
@@ -3365,81 +3556,180 @@ mod tests {
         );
     }
 
-    /// 老化判据的输入：缺时间戳、时钟未知、时间戳「在未来」都不得给出年龄。
+    /// 造一条视频包（内容无所谓，解码器是假的）。
+    fn packet(seq: u64, keyframe: bool) -> DecodeJob {
+        DecodeJob::Packet {
+            display: 0,
+            seq,
+            codec: CodecId::H264,
+            flags: if keyframe { VIDEO_FLAG_KEYFRAME } else { 0 },
+            width: 2,
+            height: 2,
+            data: vec![1, 2, 3],
+            capture_ts_us: 0,
+            recv_us: 0,
+        }
+    }
+
+    /// 造一批补丁。
+    fn patch_batch() -> DecodeJob {
+        DecodeJob::Region {
+            display: 0,
+            width: 2,
+            height: 2,
+            rects: vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+                flags: 0,
+                data: vec![0_u8; 6],
+            }],
+            capture_ts_us: 0,
+            recv_us: 0,
+        }
+    }
+
+    /// **按参考链截断**：只保留最新关键帧及其之后的条目（`SelectCodec` 永远保留）。
     ///
-    /// 这些分支存在的意义就是**不丢帧**——估计尚未建立时宁可放过旧帧，也不能按一个错误
-    /// 的年龄误杀正常帧（那会白断参考链并制造 IDR 风暴）。
+    /// H.264/VP9 的参考链是线性的：`P5` 依赖 `P4` 依赖 `P3`……单独丢一帧会让排在它后面的
+    /// 帧全部解出花屏。唯一安全的切点因此是关键帧。
     #[test]
-    fn frame_age_requires_known_clock_and_timestamp() {
-        // 对端没填时间戳：年龄未知。
-        assert_eq!(frame_age_ms(10_000_000, 0, 0), None);
-        // 时钟偏差尚未估计（哨兵不是 0，故「真的没有偏差」与「未知」可区分）。
-        assert_eq!(frame_age_ms(10_000_000, 9_000_000, UNKNOWN_OFFSET), None);
-        // 负差（时间戳落在未来，来自偏差误差/乱序）：年龄无意义。
-        assert_eq!(frame_age_ms(1_000, 2_000, 0), None);
-        // 正常：本端 10s + 偏差 1s = 对端 11s，采集于 10.85s → 150 ms。
-        assert_eq!(frame_age_ms(10_000_000, 10_850_000, 1_000_000), Some(150));
-        // 亚毫秒截断（向零取整，与 `elapsed_ms` 一致）。
-        assert_eq!(frame_age_ms(10_000_000, 9_999_000, 0), Some(1));
-        // offset == 0 是合法偏差，不是「未知」。
-        assert_eq!(frame_age_ms(10_000_000, 9_000_000, 0), Some(1_000));
+    fn flush_keep_truncates_to_the_newest_keyframe() {
+        use JobKind::{Codec, Frame, Keyframe, Patch};
+        // 没有关键帧：一个都不留（整条链作废）。
+        assert_eq!(flush_keep(&[Frame, Frame, Frame, Frame]), [false; 4]);
+        // 关键帧在中间：丢掉它之前那段（它们排在关键帧之前，本来就会被跳过）。
+        assert_eq!(
+            flush_keep(&[Frame, Frame, Keyframe, Frame]),
+            [false, false, true, true]
+        );
+        // 关键帧在队首：全都保留（参考链完好）。
+        assert_eq!(
+            flush_keep(&[Keyframe, Frame, Patch, Frame]),
+            [true, true, true, true]
+        );
+        // 有多张关键帧：以**最新**那张为切点。
+        assert_eq!(
+            flush_keep(&[Keyframe, Frame, Keyframe, Frame]),
+            [false, false, true, true]
+        );
+        // 控制项在任何位置都不丢。
+        assert_eq!(flush_keep(&[Codec, Frame, Frame, Frame]), [true, false, false, false]);
+        assert_eq!(flush_keep(&[]), Vec::<bool>::new());
     }
 
-    /// 四个条件缺一不可：任缺一个都不得丢帧。
+    /// `[P,P,P,P] + P5` → **整队清空且 P5 不入队**（它引用的链全被丢了，留下只会花屏）。
     #[test]
-    fn stale_drop_needs_backlog_age_and_non_keyframe() {
-        // 年龄未知（无时间戳/时钟未知）：绝不丢。
-        assert!(!should_drop_stale(None, 4, false, None));
-        // 队列没积压：解码跟得上，丢了只会白断参考链。
-        assert!(!should_drop_stale(Some(5_000), 0, false, None));
-        assert!(!should_drop_stale(
-            Some(5_000),
-            STALE_DROP_MIN_BACKLOG - 1,
-            false,
-            None
+    fn queue_flush_discards_everything_when_no_keyframe_is_queued() {
+        assert_eq!(DECODE_QUEUE, 4, "16 帧 @30fps 等于 533 ms 陈旧画面缓冲");
+        let queue = DecodeQueue::new();
+        for seq in 1..=u64::try_from(DECODE_QUEUE).unwrap() {
+            assert!(matches!(queue.push(packet(seq, false)), PushOutcome::Queued));
+        }
+        match queue.push(packet(5, false)) {
+            PushOutcome::Flushed(report) => {
+                assert_eq!(
+                    report,
+                    FlushReport {
+                        dropped_frames: 4,
+                        dropped_patches: 0,
+                        admitted: false,
+                        anchored: false,
+                    },
+                    "没有关键帧基准时必须整队作废，且本包也一起丢"
+                );
+            }
+            other => panic!("满队列应走截断路径，实得 {other:?}"),
+        }
+        assert_eq!(queue.backlog(), 0, "队列必须清空");
+    }
+
+    /// `[P,P,IDR,P] + P5` → 保留 `[IDR,P]` 并收下 P5（关键帧之后参考链完好，不花屏、不请 IDR）。
+    #[test]
+    fn queue_flush_keeps_frames_after_the_newest_keyframe() {
+        let queue = DecodeQueue::new();
+        queue.push(packet(1, false));
+        queue.push(packet(2, false));
+        queue.push(packet(3, true));
+        queue.push(packet(4, false));
+        match queue.push(packet(5, false)) {
+            PushOutcome::Flushed(report) => {
+                assert_eq!(
+                    report,
+                    FlushReport {
+                        dropped_frames: 2,
+                        dropped_patches: 0,
+                        admitted: true,
+                        anchored: true,
+                    }
+                );
+            }
+            other => panic!("满队列应走截断路径，实得 {other:?}"),
+        }
+        let seqs = queue.lock().iter().map(DecodeJob::seq).collect::<Vec<_>>();
+        assert_eq!(seqs, vec![Some(3), Some(4), Some(5)], "保留 [IDR,P] + 本包");
+    }
+
+    /// `[P,P,P,P] + IDR` → 只留 IDR（它就是新基准，旧链整体作废）。
+    #[test]
+    fn queue_flush_on_keyframe_keeps_only_the_keyframe() {
+        let queue = DecodeQueue::new();
+        for seq in 1..=u64::try_from(DECODE_QUEUE).unwrap() {
+            queue.push(packet(seq, false));
+        }
+        match queue.push(packet(9, true)) {
+            PushOutcome::Flushed(report) => {
+                assert_eq!(
+                    report,
+                    FlushReport {
+                        dropped_frames: 4,
+                        dropped_patches: 0,
+                        admitted: true,
+                        anchored: true,
+                    }
+                );
+            }
+            other => panic!("满队列 + 关键帧应走截断路径，实得 {other:?}"),
+        }
+        let seqs = queue.lock().iter().map(DecodeJob::seq).collect::<Vec<_>>();
+        assert_eq!(seqs, vec![Some(9)], "关键帧永远进得去，且旧链整体作废");
+    }
+
+    /// 控制项**永不丢弃**：满队列里 `SelectCodec` 必须活过截断。
+    #[test]
+    fn queue_flush_never_drops_control_items() {
+        let queue = DecodeQueue::new();
+        queue.push(DecodeJob::SelectCodec(CodecId::H264));
+        for seq in 1..=u64::try_from(DECODE_QUEUE - 1).unwrap() {
+            queue.push(packet(seq, false));
+        }
+        // 没有关键帧 → 载荷清空、控制项保留、本包被拒。
+        assert!(matches!(
+            queue.push(packet(9, false)),
+            PushOutcome::Flushed(FlushReport {
+                admitted: false,
+                anchored: false,
+                ..
+            })
         ));
-        // 关键帧：恢复参考链的唯一手段，再老也放行。
-        assert!(!should_drop_stale(Some(5_000), 4, true, None));
-        // 不够老（恰好等于阈值也算「不够老」）：可能只是一次网络毛刺。
-        assert!(!should_drop_stale(Some(STALE_FRAME_AGE_MS), 4, false, None));
-        // IDR 冷静期内（解出不到 500 ms）：积压只是瞬态，一律不丢。
-        assert!(!should_drop_stale(Some(5_000), 4, false, Some(0)));
-        assert!(!should_drop_stale(
-            Some(5_000),
-            4,
-            false,
-            Some(KEYFRAME_SETTLE_MS - 1)
-        ));
-        // 冷静期恰好结束：恢复老化判据。
-        assert!(should_drop_stale(
-            Some(5_000),
-            4,
-            false,
-            Some(KEYFRAME_SETTLE_MS)
-        ));
-        // 本会话还没解出过 IDR：没有新参考链要保护，按其余条件判断。
-        assert!(should_drop_stale(Some(5_000), 4, false, None));
-        // 四条件齐备才丢。
-        assert!(should_drop_stale(
-            Some(STALE_FRAME_AGE_MS + 1),
-            STALE_DROP_MIN_BACKLOG,
-            false,
-            None
-        ));
-        assert!(should_drop_stale(
-            Some(5_000),
-            u32::try_from(DECODE_QUEUE).unwrap_or(u32::MAX),
-            false,
-            None
+        assert_eq!(queue.backlog(), 1, "只剩 SelectCodec");
+        assert!(matches!(
+            queue.lock().front().map(DecodeJob::kind),
+            Some(JobKind::Codec)
         ));
     }
 
-    /// 冷静期的读数：未解出过 IDR 是 `None`；时间戳倒退按 0 处理（保守地留在冷静期）。
+    /// 满队列 + 补丁 → **拒绝本批**（补丁是增量的，丢一批会在合成帧上永久缺块，
+    /// 只能换一整帧重建）。
     #[test]
-    fn since_idr_is_unknown_before_first_idr() {
-        assert_eq!(since_idr_ms(10_000_000, 0), None);
-        assert_eq!(since_idr_ms(10_000_000, 9_600_000), Some(400));
-        assert_eq!(since_idr_ms(10_000_000, 10_001_000), Some(0));
+    fn queue_rejects_patches_when_full() {
+        let queue = DecodeQueue::new();
+        for seq in 1..=u64::try_from(DECODE_QUEUE).unwrap() {
+            queue.push(packet(seq, false));
+        }
+        assert!(matches!(queue.push(patch_batch()), PushOutcome::Dropped));
+        assert_eq!(queue.backlog(), u32::try_from(DECODE_QUEUE).unwrap());
     }
 
     /// 空闲间隔：未解码过给 0（哨兵）、正常取整到毫秒、时钟倒退饱和为 0。
@@ -3455,34 +3745,116 @@ mod tests {
         assert_eq!(idle_ms(1_000, 2_000), 0);
     }
 
-    /// 老化判据的常量由真机数据标定（见各常量的文档），改动必须同步这里：
-    /// 150 ms / 积压 2 在「慢但没坏」的链路上必然自锁（64 秒 31 张 IDR、43% 字节）。
+    /// **闸门的清除点是「IDR 入队」，不是「IDR 解出」**（本次修复的核心不变量）。
+    ///
+    /// 旧实现要等 IDR 解码成功才放行 P 帧，而真机上 IDR 解码本身可能 445 ms（DXVA 回读
+    /// 停顿）：这段时间里到达的 P 帧全被丢 → 每张都造成序号断层 → 再请一张 IDR →
+    /// 一次事件换回 3 张 IDR、63 帧连续 `reason=awaiting`。
+    ///
+    /// 破坏它会怎样：把 `on_keyframe_enqueued` 挪回「解码成功之后」，本用例立刻失败。
     #[test]
-    fn stale_drop_constants_match_field_tuning() {
-        let queue = u32::try_from(DECODE_QUEUE).unwrap_or(u32::MAX);
-        assert_eq!(STALE_FRAME_AGE_MS, 600, "150 ms 在慢链路上每一帧都命中");
-        assert_eq!(
-            STALE_DROP_MIN_BACKLOG, 3,
-            "必须等于 DECODE_QUEUE - 1：积压 2 只是常态"
-        );
+    fn chain_gate_opens_when_the_keyframe_is_enqueued_not_decoded() {
+        let mut gate = ChainGate::default();
+        // 正常：全放行。
+        assert!(!gate.should_drop(false));
+        assert!(!gate.should_drop(true));
+        // 丢了一帧：P 帧被闸门挡下，关键帧仍放行（否则永远恢复不了）。
+        gate.on_drop();
+        assert!(gate.should_drop(false), "断链后 P 帧必须丢");
+        assert!(!gate.should_drop(true), "关键帧永远放行");
+        // **IDR 入队**：紧跟着的 P 帧必须放行（它们排在 IDR 后面，可以正常解码）。
+        gate.on_keyframe_enqueued();
         assert!(
-            STALE_DROP_MIN_BACKLOG < queue,
-            "老化阈值必须小于队列深度，否则永远轮不到老化"
+            !gate.should_drop(false),
+            "IDR 一入队，后续 P 帧就必须放行——不能等它解码成功"
         );
-        assert_eq!(KEYFRAME_SETTLE_MS, 500);
-        // 冷静期超过年龄阈值等于永久禁用老化（编译期可判，故用 const 断言）。
-        const { assert!(KEYFRAME_SETTLE_MS <= STALE_FRAME_AGE_MS) };
     }
 
-    /// 队列积压按 `DECODE_QUEUE - 剩余容量` 计算，且队列深度已按延迟审查降到 4。
+    /// 关键帧请求闸门：首个事件立刻发；窗口内的事件只去重不发；窗口过后按 tick 重试；
+    /// IDR 解出后清空（下一次断链立刻重发）。
+    #[test]
+    fn keyframe_gate_sends_now_dedupes_then_retries_until_satisfied() {
+        let t0 = Instant::now();
+        let mut gate = KeyframeGate::default();
+        assert!(!gate.is_waiting());
+        assert_eq!(gate.on_tick(t0), None, "没在等就不该有请求");
+
+        // 首个断链事件立刻发一次。
+        assert_eq!(
+            gate.on_break(0, KeyframeReason::SeqGap, t0),
+            Some((0, KeyframeReason::SeqGap))
+        );
+        assert!(gate.is_waiting());
+
+        // 窗口内的事件只更新目标（按显示器/原因去重），不发第二次。
+        let half = t0 + KEYFRAME_REQUEST_INTERVAL / 2;
+        assert_eq!(gate.on_break(1, KeyframeReason::QueueOverflow, half), None);
+        assert_eq!(gate.on_tick(half), None, "重试必须等满一个窗口");
+
+        // 窗口边界：重试沿用**最新**的目标（去重后的那一条）。
+        let due = t0 + KEYFRAME_REQUEST_INTERVAL;
+        assert_eq!(
+            gate.on_tick(due),
+            Some((1, KeyframeReason::QueueOverflow)),
+            "只要还在等，就一定有请求在路上"
+        );
+        // 重试也受同一窗口约束。
+        assert_eq!(gate.on_tick(due), None);
+
+        // IDR 解出：清空；下一次断链立刻重发（不残留节流状态）。
+        gate.satisfied();
+        assert!(!gate.is_waiting());
+        assert_eq!(gate.on_tick(due), None);
+        assert_eq!(
+            gate.on_break(0, KeyframeReason::DecodeError, due),
+            Some((0, KeyframeReason::DecodeError))
+        );
+    }
+
+    /// 序号语义：**关键帧永远不算断层**（它本身就是新参考链的起点）。
+    ///
+    /// 旧实现不区分，于是每次丢包之后到达的 IDR 都被判成断层 → 销毁解码器 + 再请求一张
+    /// IDR；这是「一次事件换回 3 张 IDR」的另一半来源。
+    #[test]
+    fn seq_gap_ignores_keyframes_and_first_packet() {
+        // 首个包（没有期望值）不算断层。
+        assert!(!seq_is_gap(None, 7, false));
+        // 连续的两个 P 帧：没有断层。
+        assert!(!seq_is_gap(Some(3), 3, false));
+        // 跳号：真断层。
+        assert!(seq_is_gap(Some(3), 5, false));
+        // 跳号但来的是关键帧：正常（主循环丢过一批 P 帧之后 IDR 必然跳号）。
+        assert!(!seq_is_gap(Some(3), 5, true));
+    }
+
+    /// **解码器不因丢包而重建**：丢了几帧之后来一张 IDR，解码器实例应原样继续用。
+    ///
+    /// 破坏它会怎样：每次丢帧都销毁解码器 + 重新 `configure`，恢复更慢，且真机上每条重建
+    /// 路径都伴随一次多余的 IDR 请求。
     #[tokio::test]
-    async fn decode_backlog_counts_queued_jobs() {
-        assert_eq!(DECODE_QUEUE, 4, "16 帧 @30fps 等于 533 ms 陈旧画面缓冲");
-        let (tx, _rx) = mpsc::channel::<DecodeJob>(DECODE_QUEUE);
-        assert_eq!(decode_backlog(&tx), 0);
-        for _ in 0..2 {
-            assert!(tx.try_send(DecodeJob::SelectCodec(CodecId::Vp9)).is_ok());
-        }
-        assert_eq!(decode_backlog(&tx), 2);
+    async fn keyframe_after_intentional_drops_resumes_without_rebuilding_decoder() {
+        let mut harness = DecodeHarness::spawn();
+        harness.prime(8, 8).await;
+        assert_eq!(harness.created.load(Ordering::SeqCst), 1);
+
+        // 主循环有意丢掉了 seq 2..=5（那些包根本不会到这里），然后补一张 IDR seq=6。
+        harness.queue.push(packet(6, true));
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if harness.sink.frames() >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("IDR 应正常解出");
+
+        assert_eq!(
+            harness.created.load(Ordering::SeqCst),
+            1,
+            "参考链断掉不该重建解码器：喂一张 IDR 就够"
+        );
+        assert_no_break(&mut harness.notices);
     }
 }

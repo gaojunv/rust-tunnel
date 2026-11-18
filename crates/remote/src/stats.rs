@@ -25,7 +25,8 @@ use tokio::sync::mpsc;
 pub enum KeyframeReason {
     /// 帧序号断层：会话循环丢过包，参考链已断。
     SeqGap,
-    /// 解码队列溢出：主循环推进了 `drop_epoch`，队列里的帧整体作废。
+    /// 解码队列溢出：主循环按参考链截断了队列（`DecodeQueue::push` 的 `FlushReport`），
+    /// 留下一段没有关键帧锚点的帧。
     QueueOverflow,
     /// 解码器返回错误（码流损坏/缺参考帧）。
     DecodeError,
