@@ -217,13 +217,23 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 
 **双向版本门控**（`MIN_UPDATE_CLIENT_VERSION = (0,15,0)`，见 `crates/agent/src/runner/version_gate.rs`）：服务端只在客户端版本 ≥ 此值时才下发任何 S→C 更新变体；客户端也只在**收到过服务端更新消息**后才上行 `ClientUpdateCheck` / `ClientUpdateRequest`（否则新客户端配老服务端会因未知 bincode 变体断连）。因此服务端即使是「已是最新」也**必须**回一条 `ClientUpdateUpToDate`——它同时是「对端理解更新协议」的能力凭据。
 
-**更新源与产物选择**：`control_plane/update.rs::select_update` 从归档中取**语义化版本最高、且含可自动替换 GUI 产物**的目录（不依赖 `latest` 软链——它只由 CLI 发布流程维护）。可自动替换 = 文件名以 `rust-tunnel-client-gui-` 开头 + 扩展名 `.exe` 或无扩展名 + `SHA256SUMS` 有 64 位摘要；CLI 二进制、无人值守服务 exe、Windows 单包 zip、macOS dmg 一律排除（本机自更新不做解包）。macOS 发布 workflow 因此额外上传裸二进制 `rust-tunnel-client-gui-macos-aarch64`（dmg 仍保留给首次安装）。
+**更新源与产物选择**：`control_plane/update.rs::select_update` 从归档中取**语义化版本最高、且含可自动替换 GUI 产物**的目录（不依赖 `latest` 软链——它只由 CLI 发布流程维护）。可自动替换 = 文件名以 `rust-tunnel-client-gui-` 开头 + 扩展名 `.exe` 或无扩展名 + `SHA256SUMS` 有 64 位摘要；CLI 二进制、Windows 单包 zip、macOS dmg 一律排除（本机自更新不做解包）。macOS 发布 workflow 因此额外上传裸二进制 `rust-tunnel-client-gui-macos-aarch64`（dmg 仍保留给首次安装）。
 
-**传输**：`ClientUpdateChunk` 按 **256 KiB** 分片（控制通道单条上限 1 MiB），带 `transfer_id` + `offset`，最后一片 `data` 为空、`last = true`；同一客户端同一时刻只允许一个传输（`ClientEntry::update_transfer_active` 原子位），失败/结束必定释放。分片在独立任务里推送，不阻塞控制通道读循环。
+**服务 exe 随客户端一起下发**（`MIN_SERVICE_UPDATE_CLIENT_VERSION = (0,20,0)`）：同一版本目录里的 `rust-tunnel-client-service-*.exe` 只在客户端版本 ≥ 0.20.0 时才追加进 `ClientUpdateAvailable.files`（GUI 在前、服务在后）。**老客户端绝不能收到它**——0.15–0.19 的 `on_available` 会取「第一个平台匹配的文件」，会把服务 exe 当成自己的 GUI 覆盖掉。线上协议**零改动**（仍是一个 `Vec<ClientUpdateFile>`），因此新服务端可以先于客户端部署：老客户端照旧只拿 GUI。`handle_update_request` 也只对 ≥ 0.20.0 的客户端放行服务 exe 的下载请求。
+
+**传输**：`ClientUpdateChunk` 按 **256 KiB** 分片（控制通道单条上限 1 MiB），带 `transfer_id` + `offset`，最后一片 `data` 为空、`last = true`；同一客户端同一时刻只允许一个传输（`ClientEntry::update_transfer_active` 原子位），失败/结束必定释放。分片在独立任务里推送，不阻塞控制通道读循环。客户端本轮要下载两个文件时**顺序**复用同一个传输位（GUI 完成后再请求服务 exe），每一片仍带独立的 `transfer_id`。
 
 **客户端**（`crates/client-gui/src/update.rs`）：`UpdateBridge` 在控制通道读循环里同步收包（`ClientUpdateBridge`，接口在 `common/update_bridge.rs`，与 `RemoteBridge` 同构），内存拼装 → **SHA-256 必校验** → 写临时目录 → GUI 线程取走并替换。哈希不匹配/长度不符**绝不**进入可执行状态。UI 弹窗（`ui/update.rs::modal`）显示版本号并常驻所有 Tab 之上，首次出现强制显示并聚焦窗口；设置页提供「自动检查更新」（6 小时轮询，默认开）、手动检查、「稍后」与「跳过此版本」（后者落盘 `GuiPrefs.update_skipped_version`，新版本到来时自动重新弹窗）。
 
-**替换与重启**：Windows 不能覆盖正在运行的 exe，故以**下载到的新 exe** 作为 updater 拉起 `--apply-update <target>`，本进程立即退出；updater 轮询复制（最长 30 秒）到目标路径后重启目标。Unix 走同目录临时文件 + 原子 `rename` 再拉起新进程。目标目录不可写（如 `Program Files` 下的服务安装副本）时更新会失败并在弹窗中报错，需手工处理。
+**替换与重启（GUI）**：替换在后台线程执行（提权会阻塞到子进程结束，放 UI 线程就是「界面无响应」）。Windows 上若本机装了无人值守服务（`%ProgramFiles%\rust-tunnel\rust-tunnel-client-service.exe` 存在），**先提权**执行新服务 exe 的 `--install --gui-exe <新 GUI>`（停服务 → 复制两个 exe → 重新注册；`--host-config` 不传，保留现有 `host.toml`；按更新前的运行状态决定是否带 `--start`），**成功后才**用下载到的新 GUI exe 拉起 `--apply-update <target>`。**任何一步失败（含用户取消 UAC）两端都不更新**：GUI 与服务实例的数据面 `SESSION_PROTO_VERSION` 是硬相等校验，半套更新会让远程控制直接握手失败。已下载的包留在临时目录供「重试」直接重装。Unix 走同目录临时文件 + 原子 `rename` 再拉起新进程。
+
+**替换与重启（无人值守实例）**：服务在跑时 GUI 被动、根本不注册，走不了上面的路。无头实例（`--instance`）自己接同一条更新通道（`UpdateBridge::for_instance`）：收到通告就自动下载 GUI + 服务 exe，两个都到齐后**以 SYSTEM 身份**就地换掉 `%ProgramFiles%` 下的两个副本（先写 `.<name>.new`，再把运行中的旧 exe 改名为 `.<name>.old`，最后换入；服务先换、实例后换，实例失败会回滚服务），成功后置 `exit` 让实例退出，服务立刻拉起新实例——**不需要 UAC**。服务 exe 的映像在下次服务启动（通常重启）时才切换，但真正承载业务的是实例 exe，新版本当拍生效。**实例更新会重启进程，正在进行的远程会话会中断**（控制器重连即可）；这是无人值守自动更新的代价，换版本不重启就得长期停在旧版本。下载中断/写入失败都继续跑旧版本（5 分钟冷却后由下次通告重试），绝不半套更新。实例没有 GUI 的每帧 `maybe_check`，故 `instance.rs` 另起一个 30 分钟的定期 `ClientUpdateCheck` 定时器（服务端只在注册时主动推一次）。
+
+**「服务是否已安装」必须查 SCM，不能 `is_file()`**：`--install` 把 `%ProgramFiles%\rust-tunnel\` 的 DACL 收敛到「仅 SYSTEM + Administrators」，**未提权的 GUI 连 stat 都不进去**——`Path::is_file()` 会把 `ACCESS_DENIED` 折成 `false`，于是更新会永远跳过服务。`update::service_installed()` 用 `service::query_state()`（查询服务状态对普通用户开放）。查询本身失败按「没装」处理：宁可漏一次服务更新，也不能把普通 GUI 更新变成「顺手 `--install` 注册一个 AUTO_START 服务」。
+
+**迁移与发布顺序**：0.20.0 之前的客户端不认识服务更新（GUI 只换自己；无人值守实例根本没有更新桥），所以**已经在跑的旧服务/旧实例需要手工装一次 0.20.0**，之后两条路径才会自动。0.19 → 0.20 的 GUI 自更新仍只换 GUI（服务端按 `MIN_SERVICE_UPDATE_CLIENT_VERSION` 不给老客户端下发服务 exe），服务要等到下一次更新（0.21）才随 GUI 补齐；这期间数据面协议未变（v9），新旧混跑不影响远程控制。服务端可以先部署（门控只影响下发内容），客户端铺到 0.20.0 后服务更新才对 ≥0.20.0 的客户端生效；若要让新版服务端对旧客户端也立即生效，需把门控降下来，但那会让 0.15–0.19 把服务 exe 当成 GUI——别这么做。
+
+**抬版清单**：服务端看到的是 `Register.client_version`，它在 **`crates/client`** 里用 `env!("CARGO_PKG_VERSION")` 拼出来，**不是** `client-gui` 的版本。所以 0.20.0 必须同时抬 `crates/client`、`crates/client-gui`、`crates/win-service`、`crates/win-platform` 四处（`Cargo.lock` 随之更新），并让 `v0.20.0` 与 `gui-v0.20.0` 两个 tag 指向同一版本一起发；只抬 GUI 会让门控按 0.17.0 判定，服务 exe 永远不下发。`crates/win-service` 的 `--install` 新增了 `--gui-sha256` / `--self-sha256`（复制前复验），GUI 更新路径会带上它们；手工安装不传，行为与从前一致。
 
 #### Windows 无人值守被控端（SYSTEM 服务 + 无头实例）
 

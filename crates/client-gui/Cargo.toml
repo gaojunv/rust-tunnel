@@ -12,7 +12,11 @@ name = "rust-tunnel-client-gui"
 # 0.17.0 = 数据面 v9（`CursorShape` 远端光标形状跟随），两端必须同为 0.17.0。
 # 0.19.0 = 仅 GUI 外观现代化（Win11 Fluent：左侧导航、卡片、趋势线、日志过滤）。
 #          控制通道与数据面协议均未改动，可与 0.18.x 客户端互连。
-version = "0.19.0"
+# 0.20.0 = 自更新同时更新 Windows 无人值守服务（服务端按
+#          `MIN_SERVICE_UPDATE_CLIENT_VERSION = (0,20,0)` 才在清单里附带服务 exe）。
+#          线上协议逐字节不变，0.19.x ↔ 0.20.0 可互连；`client`（Register 上报的就是
+#          它的版本）/ `win-service` / `win-platform` 必须同版本一起发。
+version = "0.20.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"

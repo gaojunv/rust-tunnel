@@ -40,6 +40,12 @@ use rust_tunnel_remote::{ApprovalPolicy, RemoteManager, APPROVAL_TIMEOUT};
 use crate::remote::{PlatformMode, SessionRelease};
 use crate::{build_remote_manager, run_client_loop, LoopExit, ManagerOptions};
 
+/// 无人值守实例定期检查更新的间隔。
+///
+/// 服务端只在注册时主动推一次；实例可能在同一条连接上跑几天，没有这个定时器就
+/// 永远等不到下一次通告（GUI 那边靠每帧 `maybe_check` 补上这一环）。
+const INSTANCE_UPDATE_CHECK_INTERVAL: Duration = Duration::from_mins(30);
+
 /// 实例的路径参数（全部可由命令行 / 环境变量覆盖；默认值**明确落到 `%ProgramData%`**）。
 #[derive(Debug, Clone)]
 pub struct InstanceOptions {
@@ -414,7 +420,23 @@ pub(crate) fn spawn_instance_runtime(
             exit.store(true, Ordering::SeqCst);
             return;
         };
+        // 自更新桥接（实例模式）：收到服务端通告就自动下载 GUI + 服务 exe，以 SYSTEM
+        // 身份就地换掉 `%ProgramFiles%` 下的两个副本，成功后置 `exit` 让本进程退出，
+        // 服务随即拉起新实例。GUI 被动期间**只有这条路径**能更新无人值守机器。
+        let update_bridge = Arc::new(crate::update::UpdateBridge::for_instance(Arc::clone(&exit)));
         rt.block_on(async move {
+            // 服务端只在**注册时**主动推一次更新通告；实例没有 GUI 的每帧轮询，故自己
+            // 定期问一次。30 分钟也是「上次替换失败（AV 占用/临时目录被锁）」的重试节拍
+            // ——桥接内部另有 5 分钟冷却，不会因此变成下载风暴。
+            let watchdog = Arc::clone(&update_bridge);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(INSTANCE_UPDATE_CHECK_INTERVAL).await;
+                    if let Err(e) = watchdog.check_now() {
+                        tracing::debug!("实例定期检查更新失败：{e}");
+                    }
+                }
+            });
             let (manager, release) = build_remote_manager(
                 &config,
                 ManagerOptions {
@@ -437,7 +459,7 @@ pub(crate) fn spawn_instance_runtime(
             // `service_owner` 传 `None`：实例**就是**服务的孩子，它必须始终注册——身份归属
             // 的监督只属于用户桌面的常规 GUI（见 `crate::service_watch`）。
             tokio::select! {
-                exit = run_client_loop(config, None, None, None, manager, None, None) => match exit {
+                exit = run_client_loop(config, None, None, None, manager, Some(update_bridge), None) => match exit {
                     LoopExit::Unrecoverable => tracing::warn!(
                         "控制通道循环结束（注册被拒等不可重连的错误），实例退出"
                     ),
