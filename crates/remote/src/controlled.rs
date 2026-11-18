@@ -96,8 +96,11 @@
 //!   （矩形数、单拍总量或条数超限）才回全帧。
 //! - **退出即全帧，且退出一律带冷却**：补丁采集失败、活跃度过高、装不下等只回到全帧并
 //!   **立刻抓帧**（不插 IDR）；几何真的变了（显示器/缩放）才连带强制 IDR。退出后
-//!   [`PATCH_REENTRY_HOLDOFF`]（2 s）内不重新进入，避免「退出 → 整帧 → 再进入 → 再整帧」
-//!   的抖动正反馈。
+//!   [`PATCH_REENTRY_HOLDOFF`]（基础 5 s）内不重新进入，避免「退出 → 整帧 → 再进入 → 再整帧」
+//!   的抖动正反馈；若上一次补丁模式**寿命太短**（[`PATCH_SHORT_SESSION`]），冷却按
+//!   [`PATCH_REENTRY_HOLDOFF_MAX`] 封顶指数退避——反复抖动的场景正是「每 3 秒一张基准 IDR」
+//!   的来源（见 [`PATCH_ENTER_TICKS`] 的真机数据）。退出原因经 [`PatchExitReason`] 记一条
+//!   `info!`，现场日志不必靠 IDR 间隔反推。
 //! - **QoS 闭环在补丁模式下暂停**：控制器此时不解码视频，`decode_ms`/`recv_kbps` 是陈旧值，
 //!   喂给 AIMD 只会制造假拥塞。回到全帧后的下一条 `QosFeedback` 自然恢复闭环。
 
@@ -536,7 +539,20 @@ const PATCH_ENTER_PERMILLE: u16 = 30;
 const PATCH_EXIT_PERMILLE: u16 = 80;
 
 /// 连续多少个**低活跃**采集才请求进入补丁模式（迟滞）。
-const PATCH_ENTER_TICKS: u32 = 3;
+///
+/// 15 拍在 30 fps 下约 **500 ms**（旧值 3 拍 ≈100 ms）。**为什么要多等这 0.4 秒**：每进入
+/// 一次补丁模式都要先发一张**基准 IDR**，而真机数据（1080p30 H.264 / Intel QSV / Punch 路径
+/// RTT 13 ms，同一会话 64 秒）是：进入 **21 次**（平均每 3 秒一次）、共 31 张 IDR、占全部
+/// 字节 **43%**（平均 223 KB、最大 417 KB，P 帧平均只有 25 KB）。一张 417 KB 的 IDR 在
+/// 10 Mbps 的 pacing 下要写 **338 ms**，期间后续帧在 2 深的画面队列里干等（`send_q` p99
+/// 237 ms、max 1.34 s）。
+///
+/// 换句话说，旧门槛把「任何一次 100 ms 的短暂安静」都当成可以进入补丁模式的静止桌面，
+/// 于是「进入 → 基准 IDR → 用户又动了一下 → 退出 → 整帧」反复循环。多等 0.4 秒的代价只是
+/// 静止桌面多几帧 ~3 KB 的 P 帧（≈30–40 KB），换来的是少一张 223 KB 的 IDR——收益是数量级
+/// 的。**不要用「把基准 IDR 改小」来解决这件事**：基准帧必须是整幅重编的 IDR（补丁只覆盖
+/// 变化矩形，静态区域长期沿用这一帧，糊了就永不自我修复）。
+const PATCH_ENTER_TICKS: u32 = 15;
 
 /// 补丁模式下空补丁（保活）的最大间隔。
 ///
@@ -737,13 +753,31 @@ impl PatchStaging {
     }
 }
 
-/// 退出补丁模式后的**重入冷却**（2 秒）。
+/// 退出补丁模式后的**基础重入冷却**（5 秒）。
 ///
 /// 退出原因（超预算、关键帧请求、活跃度回升）往往下一拍就消失；没有冷却时连续
-/// [`PATCH_ENTER_TICKS`] 个安静拍（≈100 ms）就会重新进入，而进入前必须把一整帧基准帧写进
-/// 队列——「退出 → 全帧 → 再进入 → 再全帧」因此会变成正反馈。2 秒足够让一次突发过去，又
+/// [`PATCH_ENTER_TICKS`] 个安静拍就会重新进入，而进入前必须把一整帧基准帧写进
+/// 队列——「退出 → 全帧 → 再进入 → 再全帧」因此会变成正反馈。5 秒足够让一次突发过去，又
 /// 不至于让静止桌面长时间停在整帧模式。
-const PATCH_REENTRY_HOLDOFF: Duration = Duration::from_secs(2);
+///
+/// **为什么不只是一个固定值**：真机上「用户每隔几秒碰一下鼠标/键盘」的桌面会让补丁模式
+/// 反复进入又立刻退出，每次固定 5 秒冷却仍会每 5 秒付一张基准 IDR。所以冷却按上一次补丁
+/// 模式的**存活时长**指数退避（见 [`PatchMode::exit`]）：短命会话 5 → 10 → 20 秒，长命
+/// 会话（≥ 2 × [`PATCH_SHORT_SESSION`]）归零回到 5 秒。
+const PATCH_REENTRY_HOLDOFF: Duration = Duration::from_secs(5);
+
+/// 重入冷却指数退避的**上限**（20 秒）。
+///
+/// 封顶的理由：退避只是「别让抖动正反馈」，不是想把补丁模式关掉。桌面真的安静下来之后，
+/// 用户最迟 20 秒内应回到补丁模式（补丁态的 e2e 实测 5 ms），再长就会让静止桌面长期停在
+/// 整帧编码的带宽开销上。
+const PATCH_REENTRY_HOLDOFF_MAX: Duration = Duration::from_secs(20);
+
+/// 「短命补丁会话」的判定阈值（2 秒）。
+///
+/// 存活短于它说明这次进入几乎立刻被打断（用户还在间歇操作，桌面并未真正静止），下一次
+/// 冷却翻倍；存活达到它的 2 倍（4 秒）才说明桌面确实静下来了，退避归零。
+const PATCH_SHORT_SESSION: Duration = Duration::from_secs(2);
 
 /// 补丁出码的**窗口长度**（带宽保护）。
 const PATCH_BANDWIDTH_WINDOW: Duration = Duration::from_secs(1);
@@ -760,9 +794,10 @@ const PATCH_MIN_BUDGET_KBPS: u32 = 500;
 
 /// 补丁窗口的码率**上限**（kbps）。
 ///
-/// 补丁模式可能在 QoS 的内容上限收紧之前就进入（连续 3 拍低活跃只要几百毫秒，而面积上限
-/// 要 2 个 1s 的反馈 tick）。若直接拿 `rate.current()` 的 6/10 Mbps 当预算，补丁窗口的
-/// 兜底就形同虚设。2 Mbps 对「UI 小面积变化」足够宽裕，超过它就说明该走全帧了。
+/// 补丁模式可能在 QoS 的内容上限收紧之前就进入（连续 [`PATCH_ENTER_TICKS`] 拍低活跃
+/// ≈500 ms，而面积上限要 2 个 1s 的反馈 tick）。若直接拿 `rate.current()` 的 6/10 Mbps
+/// 当预算，补丁窗口的兜底就形同虚设。2 Mbps 对「UI 小面积变化」足够宽裕，超过它就说明该
+/// 走全帧了。
 const PATCH_MAX_BUDGET_KBPS: u32 = 2000;
 
 /// 等基准帧真正写出的上限。
@@ -778,6 +813,58 @@ enum ScreenMode {
     Video,
     /// 脏矩形补丁（不出视频帧，只发 `RegionUpdate`）。
     Patches,
+}
+
+/// 退出补丁模式的原因（**只用于日志**，不参与任何判据）。
+///
+/// 真机日志（info 级）里原先只有「进入脏矩形补丁模式」一条，退出只有个别分支打 `debug!`，
+/// 现场只能靠 IDR 间隔反推「为什么又退出了」。这些字符串是排查入口：哪一个闸门在频繁
+/// 触发（`activity`？`staging_age`？`keyframe_request`？）直接决定该调哪个常量。
+///
+/// 取值稳定、简短，便于 grep/统计；`Display` 与 [`Self::as_str`] 同值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchExitReason {
+    /// 画面活跃度回升（超过 [`PATCH_EXIT_PERMILLE`]）。
+    Activity,
+    /// 脏矩形数量超过 [`MAX_REGION_RECTS`]。
+    Rects,
+    /// 补丁出码超过窗口预算，或单拍装不进预算。
+    Budget,
+    /// 补丁暂存区已满（写侧持续跟不上）。
+    StagingFull,
+    /// 补丁在暂存区滞留超过 [`PATCH_STAGING_MAX_AGE`]。
+    StagingAge,
+    /// 补丁采集本拍未产出补丁（平台判定不适合补丁）。
+    NoPatches,
+    /// 补丁尺寸与当前编码尺寸不符（几何已变）。
+    SizeMismatch,
+    /// 控制器请求关键帧（它那块合成缓冲已不可信）。
+    KeyframeRequest,
+    /// 切显示器/改画质/显示器热插拔等几何或参考链重建。
+    Reconfigure,
+}
+
+impl PatchExitReason {
+    /// 日志里使用的稳定字符串。
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Activity => "activity",
+            Self::Rects => "rects",
+            Self::Budget => "budget",
+            Self::StagingFull => "staging_full",
+            Self::StagingAge => "staging_age",
+            Self::NoPatches => "no_patches",
+            Self::SizeMismatch => "size_mismatch",
+            Self::KeyframeRequest => "keyframe_request",
+            Self::Reconfigure => "reconfigure",
+        }
+    }
+}
+
+impl std::fmt::Display for PatchExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// 补丁模式的状态机（纯逻辑，便于单测锁定进入/退出判据）。
@@ -801,6 +888,11 @@ struct PatchMode {
     patch_window_bytes: u64,
     /// 重入冷却的截止时刻（见 [`PATCH_REENTRY_HOLDOFF`]）：`None` = 不在冷却期。
     holdoff_until: Option<std::time::Instant>,
+    /// 本次补丁模式的进入时刻（算存活时长，驱动冷却退避）。`None` = 没进过/已退出。
+    entered_at: Option<std::time::Instant>,
+    /// 下一次退出后要用的重入冷却（基础 [`PATCH_REENTRY_HOLDOFF`]，短命会话翻倍，上限
+    /// [`PATCH_REENTRY_HOLDOFF_MAX`]）。
+    holdoff_backoff: Duration,
 }
 
 impl PatchMode {
@@ -814,6 +906,8 @@ impl PatchMode {
             patch_window_start: std::time::Instant::now(),
             patch_window_bytes: 0,
             holdoff_until: None,
+            entered_at: None,
+            holdoff_backoff: PATCH_REENTRY_HOLDOFF,
         }
     }
 
@@ -892,10 +986,11 @@ impl PatchMode {
             self.mode = ScreenMode::Patches;
             self.enter_pending = false;
             self.enter_deadline = None;
-            // 基准帧刚发出，保活与带宽窗口都从这里起算。
+            // 基准帧刚发出，保活与带宽窗口都从这里起算；存活时长也从这里起算。
             self.last_patch_sent = Some(now);
             self.patch_window_start = now;
             self.patch_window_bytes = 0;
+            self.entered_at = Some(now);
             Some(true)
         } else if self.enter_deadline.is_some_and(|deadline| now >= deadline) {
             self.enter_pending = false;
@@ -911,12 +1006,51 @@ impl PatchMode {
     ///
     /// `now` 由调用方传入（而不是内部取 `Instant::now()`）：单测要能直接构造时刻验证冷却，
     /// 不必真的等待 [`PATCH_REENTRY_HOLDOFF`]。
-    fn exit(&mut self, now: std::time::Instant) {
+    ///
+    /// 冷却按上一次补丁模式的**存活时长**指数退避（见 [`PATCH_SHORT_SESSION`]）：短命会话
+    /// 翻倍（5 → 10 → 20 秒，[`PATCH_REENTRY_HOLDOFF_MAX`] 封顶），长命会话归零回基础值。
+    /// 真机上「用户每隔几秒碰一下鼠标/键盘」的桌面正是「每 3 秒一张基准 IDR」的来源，固定
+    /// 冷却挡不住这种抖动。
+    ///
+    /// 退出原因在这里统一记一条 `info!`（与「进入脏矩形补丁模式」对称）：调用点只负责给出
+    /// [`PatchExitReason`]，不必各打各的日志——现场日志（info 级）里原先什么都看不到，只能
+    /// 靠 IDR 间隔反推。只有**真的在补丁模式里**才记（几何重建等也会调用本函数，那时没有
+    /// 「退出」可言）。
+    fn exit(&mut self, reason: PatchExitReason, now: std::time::Instant) {
+        let dwell = self
+            .entered_at
+            .take()
+            .map(|at| now.saturating_duration_since(at));
+        let was_patches = self.mode == ScreenMode::Patches;
+        if let Some(dwell) = dwell {
+            if dwell < PATCH_SHORT_SESSION {
+                // 进去不到两秒就被打断：桌面并没真的静下来，下一次冷却翻倍。
+                self.holdoff_backoff = self
+                    .holdoff_backoff
+                    .saturating_mul(2)
+                    .min(PATCH_REENTRY_HOLDOFF_MAX);
+            } else if dwell >= PATCH_SHORT_SESSION * 2 {
+                // 撑过两倍阈值：这次进入确实有收益，退避归零。
+                self.holdoff_backoff = PATCH_REENTRY_HOLDOFF;
+            }
+        }
         self.mode = ScreenMode::Video;
         self.enter_streak = 0;
         self.enter_pending = false;
         self.enter_deadline = None;
-        self.holdoff_until = Some(now + PATCH_REENTRY_HOLDOFF);
+        let holdoff = self.holdoff_backoff;
+        self.holdoff_until = Some(now + holdoff);
+        if was_patches {
+            let dwell_ms = dwell.map_or(0, |dwell| {
+                u64::try_from(dwell.as_millis()).unwrap_or(u64::MAX)
+            });
+            info!(
+                reason = reason.as_str(),
+                dwell_ms,
+                holdoff_ms = u64::try_from(holdoff.as_millis()).unwrap_or(u64::MAX),
+                "退出脏矩形补丁模式"
+            );
+        }
     }
 }
 
@@ -1105,9 +1239,10 @@ fn refresh_activity(
 /// 调用方只在参考链/几何真的失效时（`RequestKeyframe`、切显示器、改缩放）额外置
 /// `force_keyframe`。无条件插 IDR 会让每次切窗口/开文件夹都付出一个 150–400 KB 的尖峰。
 ///
-/// 退出同时丢弃暂存区（见 [`PatchStaging`]）并开启重入冷却（[`PATCH_REENTRY_HOLDOFF`]），
-/// 避免「退出 → 整帧 → 立刻再进入 → 再整帧」的抖动正反馈。暂存区必须在退出时清掉：里面
-/// 是**旧**画面的补丁，若让它们排到退出后的全帧之后，控制端会把旧内容盖到新画面上。
+/// 退出同时丢弃暂存区（见 [`PatchStaging`]）并开启重入冷却（[`PATCH_REENTRY_HOLDOFF`]，
+/// 按存活时长指数退避），避免「退出 → 整帧 → 立刻再进入 → 再整帧」的抖动正反馈。暂存区
+/// 必须在退出时清掉：里面是**旧**画面的补丁，若让它们排到退出后的全帧之后，控制端会把旧
+/// 内容盖到新画面上。
 ///
 /// 已发出的**半批**横条由调用方判断（[`PatchStaging::partial`]）并另行强制关键帧——那时
 /// 控制端合成缓冲缺块，只有完整 IDR 能修复。
@@ -1118,8 +1253,9 @@ fn exit_patch_mode(
     last_changed_permille: &mut u16,
     capture_tick: &mut Pin<Box<Sleep>>,
     next_capture_at: &mut Instant,
+    reason: PatchExitReason,
 ) {
-    mode.exit(std::time::Instant::now());
+    mode.exit(reason, std::time::Instant::now());
     staging.clear();
     *force_encode = true;
     // 面积未知/刚发生大变化：保守给满面积，别让下一次 1Hz 反馈拿补丁模式里的旧值
@@ -2551,6 +2687,7 @@ pub async fn run_controlled(
                                             &mut last_changed_permille,
                                             &mut capture_tick,
                                             &mut next_capture_at,
+                                            PatchExitReason::SizeMismatch,
                                         );
                                         force_keyframe = true;
                                     } else if changed_permille > PATCH_EXIT_PERMILLE {
@@ -2563,6 +2700,7 @@ pub async fn run_controlled(
                                             &mut last_changed_permille,
                                             &mut capture_tick,
                                             &mut next_capture_at,
+                                            PatchExitReason::Activity,
                                         );
                                     } else if rect_count > MAX_REGION_RECTS {
                                         warn!(rects = rect_count, "脏矩形过多，退出补丁模式");
@@ -2573,6 +2711,7 @@ pub async fn run_controlled(
                                             &mut last_changed_permille,
                                             &mut capture_tick,
                                             &mut next_capture_at,
+                                            PatchExitReason::Rects,
                                         );
                                     } else {
                                         last_changed_permille = changed_permille;
@@ -2667,6 +2806,7 @@ pub async fn run_controlled(
                                                         &mut last_changed_permille,
                                                         &mut capture_tick,
                                                         &mut next_capture_at,
+                                                        PatchExitReason::StagingFull,
                                                     );
                                                     // 半批已发出：控制端合成缓冲缺块，必须一帧完整
                                                     // IDR。它与控制器自己的 `RequestKeyframe` 走
@@ -2696,6 +2836,7 @@ pub async fn run_controlled(
                                                     &mut last_changed_permille,
                                                     &mut capture_tick,
                                                     &mut next_capture_at,
+                                                    PatchExitReason::Budget,
                                                 );
                                             }
                                         } else {
@@ -2712,6 +2853,7 @@ pub async fn run_controlled(
                                                 &mut last_changed_permille,
                                                 &mut capture_tick,
                                                 &mut next_capture_at,
+                                                PatchExitReason::Budget,
                                             );
                                         }
                                     }
@@ -2726,6 +2868,7 @@ pub async fn run_controlled(
                                         &mut last_changed_permille,
                                         &mut capture_tick,
                                         &mut next_capture_at,
+                                        PatchExitReason::NoPatches,
                                     );
                                 }
                             }
@@ -2807,6 +2950,7 @@ pub async fn run_controlled(
                             &mut last_changed_permille,
                             &mut capture_tick,
                             &mut next_capture_at,
+                            PatchExitReason::StagingAge,
                         );
                         // 半批横条已发出 → 控制端合成缓冲缺块，只能靠完整 IDR 修复；走与
                         // `RequestKeyframe` 相同的去重闸门（别为同一幅画面连打 IDR）。
@@ -2914,7 +3058,10 @@ pub async fn run_controlled(
                                 display_id = new_id;
                             }
                             // 几何/来源都变了：补丁模式的持久缓冲与编码器尺寸都要重建。
-                            screen_mode.exit(std::time::Instant::now());
+                            screen_mode.exit(
+                                PatchExitReason::Reconfigure,
+                                std::time::Instant::now(),
+                            );
                             patch_staging.clear();
                             force_keyframe = true;
                             schedule_capture(
@@ -2931,7 +3078,10 @@ pub async fn run_controlled(
                                 "显示器 {display_id} 分辨率变化 {}x{} -> {}x{}，重建编码器并强制关键帧",
                                 old.width, old.height, new.width, new.height
                             );
-                            screen_mode.exit(std::time::Instant::now());
+                            screen_mode.exit(
+                                PatchExitReason::Reconfigure,
+                                std::time::Instant::now(),
+                            );
                             patch_staging.clear();
                             force_keyframe = true;
                             schedule_capture(
@@ -3054,7 +3204,10 @@ pub async fn run_controlled(
                                 display_id = target;
                                 // 几何变了：补丁模式（以及正在等的进入）一律作废，控制器那块
                                 // 持久帧缓冲的尺寸已经不对了。
-                                screen_mode.exit(std::time::Instant::now());
+                                screen_mode.exit(
+                                    PatchExitReason::Reconfigure,
+                                    std::time::Instant::now(),
+                                );
                                 patch_staging.clear();
                                 force_keyframe = true;
                                 let at = Instant::now() + encode.capture_interval();
@@ -3083,7 +3236,10 @@ pub async fn run_controlled(
                             queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
                             // 档位可能改缩放 → 几何可能变化：补丁模式的持久缓冲尺寸随之作废，
                             // 必须退出（并靠下面的 `force_keyframe` 重发基准）。
-                            screen_mode.exit(std::time::Instant::now());
+                            screen_mode.exit(
+                                PatchExitReason::Reconfigure,
+                                std::time::Instant::now(),
+                            );
                             patch_staging.clear();
                             let at = Instant::now() + encode.capture_interval();
                             schedule_capture(&mut capture_tick, &mut next_capture_at, at);
@@ -3202,6 +3358,7 @@ pub async fn run_controlled(
                                     &mut last_changed_permille,
                                     &mut capture_tick,
                                     &mut next_capture_at,
+                                    PatchExitReason::KeyframeRequest,
                                 );
                             }
                             // 「请求了就一定 IDR」（仅限请求的就是当前显示器）：这是控制器明确
@@ -7094,12 +7251,19 @@ mod tests {
     fn patch_mode_entry_needs_consecutive_quiet_captures() {
         let mut mode = PatchMode::new();
         let now = Instant::now();
-        assert!(!mode.observe_video(PATCH_ENTER_PERMILLE, now));
-        assert!(!mode.observe_video(PATCH_ENTER_PERMILLE, now));
+        // 旧门槛（3 拍）必须**不再**足以进入：真机上它把每次 100 ms 的短暂安静都当成静止
+        // 桌面，64 秒进入 21 次、IDR 占 43% 字节（见 [`PATCH_ENTER_TICKS`]）。
+        for _ in 0..3 {
+            assert!(
+                !mode.observe_video(PATCH_ENTER_PERMILLE, now),
+                "3 拍安静不该再触发进入（真实门槛是 {PATCH_ENTER_TICKS} 拍）"
+            );
+        }
         // 一帧高活跃打断连续计数。
         assert!(!mode.observe_video(PATCH_ENTER_PERMILLE + 1, now));
-        assert!(!mode.observe_video(PATCH_ENTER_PERMILLE, now));
-        assert!(!mode.observe_video(PATCH_ENTER_PERMILLE, now));
+        for _ in 0..PATCH_ENTER_TICKS - 1 {
+            assert!(!mode.observe_video(PATCH_ENTER_PERMILLE, now));
+        }
         assert!(
             mode.observe_video(PATCH_ENTER_PERMILLE, now),
             "连续 {PATCH_ENTER_TICKS} 次低活跃才应请求基准帧"
@@ -7115,23 +7279,103 @@ mod tests {
     fn patch_reentry_respects_holdoff() {
         let mut mode = PatchMode::new();
         let t0 = Instant::now();
+        // 一次「长命」补丁会话（≥ 2 × 短会话阈值）：退避归零回基础冷却。
         mode.mode = ScreenMode::Patches;
-        mode.exit(t0);
+        mode.entered_at = Some(t0);
+        let exited = t0 + PATCH_SHORT_SESSION * 2;
+        mode.exit(PatchExitReason::Activity, exited);
+        assert_eq!(mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF);
+        assert!(mode.entered_at.is_none(), "退出后必须清掉存活计时");
+        let holdoff = exited + PATCH_REENTRY_HOLDOFF;
         // 冷却期内喂再多安静拍也不得触发（`enter_streak` 每拍被清零）。
-        for tick in 0..6_u32 {
+        for tick in 0..14_u32 {
+            let at = exited + Duration::from_millis(333) * tick;
+            assert!(at < holdoff, "构造的采样点必须落在冷却期内");
             assert!(
-                !mode.observe_video(0, t0 + Duration::from_millis(333) * tick),
+                !mode.observe_video(0, at),
                 "冷却期内第 {tick} 拍不得进入补丁模式"
             );
         }
         // 冷却结束后需要重新凑满 PATCH_ENTER_TICKS 个安静拍。
-        let t1 = t0 + PATCH_REENTRY_HOLDOFF;
-        assert!(!mode.observe_video(0, t1));
-        assert!(!mode.observe_video(0, t1 + Duration::from_millis(33)));
+        for tick in 0..PATCH_ENTER_TICKS - 1 {
+            assert!(!mode.observe_video(0, holdoff + Duration::from_millis(33) * tick));
+        }
         assert!(
-            mode.observe_video(0, t1 + Duration::from_millis(66)),
+            mode.observe_video(
+                0,
+                holdoff + Duration::from_millis(33) * (PATCH_ENTER_TICKS - 1)
+            ),
             "冷却结束且连续 {PATCH_ENTER_TICKS} 拍安静后应允许重新进入"
         );
+    }
+
+    /// 重入冷却按上一次补丁模式的**存活时长**指数退避，并在长命会话后归零。
+    ///
+    /// 真机上「用户每隔几秒碰一下鼠标/键盘」会让补丁模式反复进入又立刻退出：固定冷却挡不住
+    /// 这种抖动，每次都要为进入付一张基准 IDR（平均 223 KB）。短命会话 5 → 10 → 20 秒
+    /// （[`PATCH_REENTRY_HOLDOFF_MAX`] 封顶），一旦撑过 2 × [`PATCH_SHORT_SESSION`] 就归零。
+    #[test]
+    fn patch_holdoff_backs_off_on_short_sessions_and_resets_on_long_ones() {
+        assert_eq!(PATCH_REENTRY_HOLDOFF, Duration::from_secs(5));
+        assert_eq!(PATCH_REENTRY_HOLDOFF_MAX, Duration::from_secs(20));
+        assert_eq!(PATCH_SHORT_SESSION, Duration::from_secs(2));
+
+        let mut mode = PatchMode::new();
+        let t0 = Instant::now();
+        // 存活 1.999 秒：算「短命」，冷却 5 → 10 → 20 → 封顶仍是 20。
+        let short = PATCH_SHORT_SESSION
+            .checked_sub(Duration::from_millis(1))
+            .expect("短命阈值远大于 1 ms");
+        for want in [
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            PATCH_REENTRY_HOLDOFF_MAX,
+        ] {
+            mode.mode = ScreenMode::Patches;
+            mode.entered_at = Some(t0);
+            mode.exit(PatchExitReason::Activity, t0 + short);
+            assert_eq!(mode.holdoff_backoff, want, "短命会话必须翻倍并封顶");
+            assert_eq!(mode.holdoff_until, Some(t0 + short + want), "冷却按新退避设置");
+        }
+        // 存活落在 [2s, 4s)：既不算抖动、也还没证明「真静下来了」——退避保持不动。
+        let borderline = (PATCH_SHORT_SESSION * 2)
+            .checked_sub(Duration::from_millis(1))
+            .expect("两倍阈值远大于 1 ms");
+        mode.mode = ScreenMode::Patches;
+        mode.entered_at = Some(t0);
+        mode.exit(PatchExitReason::Activity, t0 + borderline);
+        assert_eq!(
+            mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF_MAX,
+            "中间时长不该让退避回落"
+        );
+        // 存活 ≥ 2 × 阈值：退避归零回基础冷却。
+        mode.mode = ScreenMode::Patches;
+        mode.entered_at = Some(t0);
+        mode.exit(PatchExitReason::Activity, t0 + PATCH_SHORT_SESSION * 2);
+        assert_eq!(mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF);
+        assert_eq!(
+            mode.holdoff_until,
+            Some(t0 + PATCH_SHORT_SESSION * 2 + PATCH_REENTRY_HOLDOFF)
+        );
+    }
+
+    /// 退出原因字符串是现场排查入口：取值必须稳定（日志/统计靠它做 grep 与分桶）。
+    #[test]
+    fn patch_exit_reasons_have_stable_strings() {
+        for (reason, want) in [
+            (PatchExitReason::Activity, "activity"),
+            (PatchExitReason::Rects, "rects"),
+            (PatchExitReason::Budget, "budget"),
+            (PatchExitReason::StagingFull, "staging_full"),
+            (PatchExitReason::StagingAge, "staging_age"),
+            (PatchExitReason::NoPatches, "no_patches"),
+            (PatchExitReason::SizeMismatch, "size_mismatch"),
+            (PatchExitReason::KeyframeRequest, "keyframe_request"),
+            (PatchExitReason::Reconfigure, "reconfigure"),
+        ] {
+            assert_eq!(reason.as_str(), want);
+            assert_eq!(reason.to_string(), want, "Display 必须与 as_str 同值");
+        }
     }
 
     /// 出码窗口换算：累计字节差按**实际间隔**归一，间隔为 0 时不除零。
@@ -7320,6 +7564,10 @@ mod tests {
         );
         assert_eq!(mode.mode, ScreenMode::Patches);
         assert!(mode.last_patch_sent.is_some(), "进入时保活计时从此刻起算");
+        assert!(
+            mode.entered_at.is_some(),
+            "进入时必须记下存活计时（退出时据此决定冷却退避）"
+        );
 
         // 超时路径：基准迟迟发不出去（例如出站队列被背压卡住）。
         let mut mode = PatchMode::new();

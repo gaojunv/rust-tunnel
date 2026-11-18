@@ -280,23 +280,47 @@ const VBV_FRAMES: u32 = 6;
 /// 一帧整页变化想接近无损（QP ≈ 20 的 H.264 文本），需要 **1–2 bit/像素**。而「6 帧码率」
 /// 这条口径在 4K/60 fps/40 Mbps 下只有 4 Mbit（≈0.5 bit/px），整页一换就被量化成一团；
 /// 更糟的是它跟随**时变码率**——内容上限一压，预算还会再塌一截。所以这里按几何给足
-/// 2 bit/px（1080p ≈520 KB、4K ≈2 MB），再用「不超过 1 秒码率」兜住低带宽场景
-/// （见 [`vbv_size`]），避免一帧吃掉整条链路。
+/// 2 bit/px（1080p ≈520 KB、4K ≈2 MB），再用「不超过 0.35 秒码率」兜住低带宽场景
+/// （见 [`vbv_size`]），避免一帧吃掉半秒量级的链路时间。
 const VBV_BITS_PER_PIXEL: u32 = 2;
 
+/// 单帧比特预算的**时间上界**（千分比：350 = 0.35 秒码率，与 MFT 路径同口径）。
+///
+/// VBV 同时是**单帧比特上限**，而一张 IDR 的写出时间直接决定它后面那些帧的排队延迟：
+/// 10 Mbps 链路上 518 KB（旧口径「1 秒码率」）要写约 414 ms，0.35 秒封顶后是 437 KB /
+/// 350 ms。真机上补丁模式每次进入都要重发一张基准 IDR（平均 223 KB、最大 417 KB）。
+///
+/// 影响面（「六帧码率」这条口径都不受影响）：
+/// - 1080p/30fps/10 Mbps：2 bit/px 的 518 KB 被 0.35 s 封到 **437 KB**；
+/// - 2 Mbps 档（1080p/30fps）：250 KB → **87 KB**；
+/// - 4K/60fps/40 Mbps：2 bit/px 的 2.07 MB 被 0.35 s 封到 **1.75 MB**（仍合 1.69 bit/px，
+///   落在「1–2 bit/px 接近无损」区间内）；4K/60fps/**60 Mbps**（原生分辨率上限）才真正由
+///   2 bit/px 决定（16.59 Mbit < 21 Mbit）。
+///
+/// **不是**真机「IDR 占 43% 字节」的主因：那是**频率**问题（补丁模式每 3 秒进入一次都要
+/// 一张基准 IDR），由 `controlled.rs` 的进入门槛与冷却退避解决。本项收益主要落在**低码率
+/// 档位**与 QoS 降档后的会话。
+const VBV_BURST_PERMILLE: u32 = 350;
+
 /// `NV_ENC_RC_PARAMS` 的 VBV 缓冲大小（位）：
-/// `max(`[`VBV_FRAMES`] 帧的码率, min(每像素 [`VBV_BITS_PER_PIXEL`], 1 秒码率)`)`，至少 1 位。
+/// `max(`[`VBV_FRAMES`] 帧的码率, min(每像素 [`VBV_BITS_PER_PIXEL`], 0.35 秒码率)`)`，至少 1 位。
 ///
 /// `fps == 0` 按 1 处理（避免除零；正常构造路径已拒绝 0 帧率）。
+///
+/// **NVENC 的优越处**：`set_bitrate` / `set_fps` 会用 `nvEncReconfigureEncoder` 按新参数
+/// 重算这里（`resetEncoder=0`/`forceIDR=0`，不重建、不插 IDR），所以 QoS 降档后单帧预算
+/// 立刻跟着收紧。MFT 路径做不到这一点（运行期重设缓冲会给下一帧插 IDR），只在创建时设一次。
 fn vbv_size(bps: u32, fps: u32, width: u32, height: u32) -> u32 {
     let frames = (bps / fps.max(1)).saturating_mul(VBV_FRAMES);
     let pixels = width
         .saturating_mul(height)
         .saturating_mul(VBV_BITS_PER_PIXEL);
-    // 「不超过 1 秒码率」：低带宽（或 Smooth 档）下不允许单帧吃掉整条链路；
-    // 高带宽下每像素额度才有意义。
-    let burst_cap = bps.max(1);
-    frames.max(pixels.min(burst_cap)).max(1)
+    // 单帧最多吃掉 0.35 秒的链路时间（见 [`VBV_BURST_PERMILLE`]）：低带宽（或 Smooth 档）
+    // 下不允许单帧吃掉半秒量级的链路；高带宽下每像素额度才有意义。先升到 u64：40–60 Mbps
+    // 的 `bps × 350` 会越过 u32（40 M × 350 = 14 G），在 u32 里饱和会得到离谱的上界。
+    let burst_cap =
+        u32::try_from(u64::from(bps) * u64::from(VBV_BURST_PERMILLE) / 1000).unwrap_or(u32::MAX);
+    frames.max(pixels.min(burst_cap.max(1))).max(1)
 }
 
 /// 一轮 **intra refresh（GDR）** 覆盖的时间（秒）：约 1 秒内把整屏刷成 intra。
@@ -1357,7 +1381,7 @@ fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
 mod tests {
     use super::{
         intra_refresh_frames, vbr_average, vbv_size, LruCache, INTRA_REFRESH_SECONDS,
-        VBV_BITS_PER_PIXEL, VBV_FRAMES,
+        VBV_BITS_PER_PIXEL, VBV_BURST_PERMILLE, VBV_FRAMES,
     };
 
     /// Intra refresh 的周期按「秒 × fps」算；刷新跨度的帧数必须 ≥1 且不除零。
@@ -1370,35 +1394,59 @@ mod tests {
         assert!(intra_refresh_frames(u32::MAX) > 0);
     }
 
-    /// VBV 取「六帧码率」与 `min(每像素 2 位, 1 秒码率)` 的较大者。
+    /// VBV 取「六帧码率」与 `min(每像素 2 位, 0.35 秒码率)` 的较大者。
     #[test]
     fn vbv_size_gives_keyframes_headroom() {
         // 10 Mbps @ 30fps、640×360：六帧 1_999_998 位 > 每像素额度 460_800 位。
         assert_eq!(vbv_size(10_000_000, 30, 640, 360), 1_999_998);
         // 2 Mbps @ 15fps、640×360：六帧 799_998 位 > 460_800 位。
         assert_eq!(vbv_size(2_000_000, 15, 640, 360), 799_998);
-        // 1080p、2 Mbps：每像素额度 4_147_200 位被「1 秒码率」2_000_000 位封顶。
-        assert_eq!(vbv_size(2_000_000, 15, 1920, 1080), 2_000_000);
-        // 4K、40 Mbps：每像素额度 16_588_800 位（≈2 MB）生效。
-        assert_eq!(vbv_size(40_000_000, 60, 3840, 2160), 16_588_800);
+        // 1080p、2 Mbps/15fps：每像素额度 4_147_200 位被 0.35 秒码率 700_000 位封顶，但
+        // 「六帧码率」799_998 位更高 → 仍是它生效。
+        assert_eq!(vbv_size(2_000_000, 15, 1920, 1080), 799_998);
+        // 4K、60 Mbps/60fps：每像素额度 16_588_800 位低于 0.35 秒码率 21_000_000 位，
+        // 2 bit/px 仍是决定项（≈2 MB，整页重绘接近无损）。
+        assert_eq!(vbv_size(60_000_000, 60, 3840, 2160), 16_588_800);
         assert_eq!(VBV_FRAMES, 6);
         assert_eq!(VBV_BITS_PER_PIXEL, 2);
+        assert_eq!(VBV_BURST_PERMILLE, 350);
+    }
+
+    /// 单帧预算的**时间上界**：低码率档位不再让一张 IDR 独占半秒以上的链路时间。
+    #[test]
+    fn vbv_size_caps_single_frame_to_a_burst_window() {
+        // 1080p/30fps/10 Mbps：2 bit/px 的 4_147_200 位（≈518 KB）被 0.35 秒码率
+        // 3_500_000 位（437 500 字节）封顶。
+        assert_eq!(vbv_size(10_000_000, 30, 1920, 1080), 3_500_000);
+        assert_eq!(vbv_size(10_000_000, 30, 1920, 1080) / 8, 437_500);
+        // 2 Mbps 档（1080p/30fps）：旧「1 秒码率」250 KB → 现在 700_000 位 = 87 500 字节。
+        assert_eq!(vbv_size(2_000_000, 30, 1920, 1080), 700_000);
+        assert_eq!(vbv_size(2_000_000, 30, 1920, 1080) / 8, 87_500);
+        // 4K/60fps/40 Mbps：2 bit/px 的 2.07 MB 被封到 1.75 MB（1.69 bit/px），但「六帧
+        // 码率」只有 4 Mbit，所以仍是像素口径在起作用。
+        assert_eq!(vbv_size(40_000_000, 60, 3840, 2160), 14_000_000);
+        assert!(vbv_size(40_000_000, 60, 3840, 2160) > 4_000_000);
     }
 
     /// 关键回归：整页重绘（切浏览器标签）时，4K 单帧必须拿到接近无损的预算。
     ///
     /// 旧口径 `6 × bps/fps` 在 4K/60fps/40 Mbps 下只有 4 Mbit（≈0.5 bit/px），整页一换就被
-    /// 量化成一团——现场「切标签整页糊、过几秒才靠 GDR 恢复」。现在 2 bit/px（≈2 MB），
-    /// 且低带宽时用「1 秒码率」封顶，不会让一帧吃掉整条链路。
+    /// 量化成一团——现场「切标签整页糊、过几秒才靠 GDR 恢复」。现在按几何给 2 bit/px
+    /// （≈2 MB），0.35 秒码率把低带宽档位的单帧时间压回去，但最低也保证 1.69 bit/px
+    /// （4K/40 Mbps），仍落在「1–2 bit/px 接近无损」区间内。
     #[test]
     fn vbv_size_covers_a_full_page_repaint() {
-        // 40 Mbps @ 60fps、4K：16_588_800 位 = 2_073_600 字节（≈2 MB，2 bit/px）。
-        let budget = vbv_size(40_000_000, 60, 3840, 2160);
+        // 60 Mbps @ 60fps、4K：60 Mbps × 0.35 s = 21 Mbit > 16_588_800 位 = 2_073_600 字节
+        // （≈2 MB，2 bit/px，完全按几何给足）。
+        let budget = vbv_size(60_000_000, 60, 3840, 2160);
         assert_eq!(budget / 8, 2_073_600);
-        // 低带宽（4.8 Mbps，4K）：被 1 秒码率封顶 → 600 KB（仍远高于旧的 60 KB）。
-        assert_eq!(vbv_size(4_800_000, 60, 3840, 2160), 4_800_000);
-        // 1080p/10 Mbps：每像素额度 4.1 Mbit 生效 → ≈520 KB。
-        assert_eq!(vbv_size(10_000_000, 60, 1920, 1080), 4_147_200);
+        // 40 Mbps（Hd 档 × 4K 的 4000‰）：被封到 14_000_000 位 = 1_750_000 字节，合
+        // 1.69 bit/px——比旧的 2.07 MB 低 15.6%，但仍在「1–2 bit/px 接近无损」区间内。
+        assert_eq!(vbv_size(40_000_000, 60, 3840, 2160) / 8, 1_750_000);
+        // 低带宽（4.8 Mbps，4K）：0.35 秒码率 → 1_680_000 位 = 210 KB（远高于旧的 60 KB）。
+        assert_eq!(vbv_size(4_800_000, 60, 3840, 2160), 1_680_000);
+        // 1080p/10 Mbps：每像素额度 4_147_200 位被 0.35 秒码率 3_500_000 位封顶 → 437 KB。
+        assert_eq!(vbv_size(10_000_000, 60, 1920, 1080), 3_500_000);
     }
 
     /// 帧率为 0 时按 1 处理（不除零），极小码率也不返回 0。
