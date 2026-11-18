@@ -132,6 +132,31 @@ pub struct DecodedH264Frame {
     pub nv12: Option<Nv12Frame>,
 }
 
+/// 一次 `decode()` 内部四个子阶段的耗时（微秒）。
+///
+/// 真机上出现过「空闲 600 ms 后的第一帧解码卡 300–500 ms、而同尺寸的后续帧只要
+/// 6 ms」的现象，光看总耗时无法判断卡在 MFT 的哪一段。四段分别对应：
+///
+/// - [`Self::submit_us`]：把包拷进 `IMFSample` 并 `ProcessInput`（含 MFT 内部输入队列满
+///   时的那次重试）；
+/// - [`Self::output_us`]：`ProcessOutput` 及其等待（MFT 出帧本身）；
+/// - [`Self::readback_us`]：DXVA 的 staging 拷贝 + `Map`（GPU 同步，系统内存路径恒为 0）；
+/// - [`Self::color_us`]：NV12 打包或 NV12→RGBA 的像素转换。
+///
+/// 四者之和近似等于调用方测到的总解码耗时，差额是 COM/日志等零碎开销。各段在同一
+/// 次 `decode()` 里**累加**（一批多包时是整批之和）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DecodePhaseTimings {
+    /// 送包：`ProcessInput` + 缓冲区拷贝。
+    pub submit_us: u64,
+    /// MFT 出帧：`drain_output` 里除回读/转换之外的部分（`ProcessOutput` 及其等待）。
+    pub output_us: u64,
+    /// DXVA 回读：staging 拷贝 + `Map`（系统内存路径恒为 0）。
+    pub readback_us: u64,
+    /// 像素转换/打包（NV12 紧包或 RGBA）。
+    pub color_us: u64,
+}
+
 /// 硬件解码偏好。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H264HardwarePreference {
@@ -215,10 +240,11 @@ pub struct H264Decoder {
     dxgi_seen: bool,
     /// 「配置了 DXVA 却没有 DXGI 样本」的告警只打一次。
     warned_no_dxgi: bool,
-    /// 最近一帧 DXGI staging 回读（纹理拷贝 + Map）的耗时（毫秒）；软件路径为 0。
-    last_readback_ms: u32,
-    /// 最近一帧像素转换 / NV12 打包的耗时（毫秒）。
-    last_color_ms: u32,
+    /// 最近一次 [`H264Decoder::decode`] 的四个子阶段耗时（微秒）。
+    ///
+    /// 在每次 `decode()` 开头清零、随解码过程累加；`decode()` 返回 `Err` 时仍是
+    /// **本次已经发生**的那部分读数（例如送包成功、出帧失败）。
+    last_timings: DecodePhaseTimings,
 }
 
 impl std::fmt::Debug for H264Decoder {
@@ -339,8 +365,7 @@ impl H264Decoder {
             hardware: pipeline.hardware,
             dxgi_seen: false,
             warned_no_dxgi: false,
-            last_readback_ms: 0,
-            last_color_ms: 0,
+            last_timings: DecodePhaseTimings::default(),
         })
     }
 
@@ -392,18 +417,30 @@ impl H264Decoder {
     /// 最近一帧 DXGI staging 回读的耗时，单位毫秒（软件路径恒为 0）。
     ///
     /// 覆盖 `IMFDXGIBuffer`→staging 纹理的 `CopySubresourceRegion` 与 `Map`；
-    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。
+    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。由微秒读数向下取整派生
+    /// （一次 `decode` 处理多包时是该批之和），需要更细的粒度用
+    /// [`H264Decoder::last_phase_timings`]。
     #[must_use]
     pub fn last_readback_ms(&self) -> u32 {
-        self.last_readback_ms
+        u32::try_from(self.last_timings.readback_us / 1000).unwrap_or(u32::MAX)
     }
 
     /// 最近一帧像素转换（RGBA 模式）或 NV12 打包（NV12 模式）的耗时，单位毫秒。
     ///
-    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。
+    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取；同样由微秒读数派生。
     #[must_use]
     pub fn last_color_ms(&self) -> u32 {
-        self.last_color_ms
+        u32::try_from(self.last_timings.color_us / 1000).unwrap_or(u32::MAX)
+    }
+
+    /// 最近一次 [`H264Decoder::decode`] 的四个子阶段耗时（微秒）。
+    ///
+    /// 用来回答「空闲后的第一帧到底卡在哪一段」：`output_us` 大说明卡在 MFT 出帧，
+    /// `readback_us` 大说明卡在 GPU 同步，`color_us` 大说明是 CPU 像素转换。
+    /// `decode()` 返回 `Err` 时读数仍是本次已发生的部分耗时（开头会先清零）。
+    #[must_use]
+    pub fn last_phase_timings(&self) -> DecodePhaseTimings {
+        self.last_timings
     }
 
     /// 重建解码器以适配新的编码尺寸（`ScreenConfig` 变化时调用）。
@@ -426,8 +463,7 @@ impl H264Decoder {
         self.next_pts = 0;
         self.dxgi_seen = false;
         self.warned_no_dxgi = false;
-        self.last_readback_ms = 0;
-        self.last_color_ms = 0;
+        self.last_timings = DecodePhaseTimings::default();
         Ok(())
     }
 
@@ -436,10 +472,15 @@ impl H264Decoder {
     /// 返回本次调用产生的**最后一帧**；MFT 缓冲了输入、暂时没有输出时返回
     /// `None`。空输入返回 `None`。
     ///
+    /// 子阶段读数（[`H264Decoder::last_phase_timings`]）在**本次调用开头清零**，
+    /// 各段在批内累加；早退（空输入）后读数为全 0，出错返回时保留已发生的部分。
+    ///
     /// # Errors
     /// 长度前缀不完整/越界、空包、媒体类型或 MFT 处理失败时返回
     /// [`WinVideoError`]。
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedH264Frame>, WinVideoError> {
+        // 读数按「本次调用」计：上一批的耗时不能混进来。
+        self.last_timings = DecodePhaseTimings::default();
         if data.is_empty() {
             return Ok(None);
         }
@@ -473,7 +514,14 @@ impl H264Decoder {
                     data.len().saturating_sub(start)
                 ))
             })?;
-            self.submit(payload)?;
+            let submit_started = Instant::now();
+            let submitted = self.submit(payload);
+            // 失败也要记：读数的语义是「本次已经发生的耗时」，错误路径同样要看得出卡在哪。
+            self.last_timings.submit_us = self
+                .last_timings
+                .submit_us
+                .saturating_add(elapsed_us(submit_started));
+            submitted?;
             if let Some(frame) = self.drain_output()? {
                 last = Some(frame);
             }
@@ -541,7 +589,31 @@ impl H264Decoder {
     }
 
     /// 循环取走 MFT 已产生的全部输出帧，返回最后一帧。
+    ///
+    /// 同时累计出帧（`output_us`）读数：总耗时减去本函数内测到的回读/转换，
+    /// 剩下的就是 `ProcessOutput` 及其等待。`submit` 在 `MF_E_NOTACCEPTING`
+    /// 时的重试也走这里，所以那段排空同样计入。
     fn drain_output(&mut self) -> Result<Option<DecodedH264Frame>, WinVideoError> {
+        let started = Instant::now();
+        let readback_before = self.last_timings.readback_us;
+        let color_before = self.last_timings.color_us;
+        let result = self.drain_output_inner();
+        let total_us = elapsed_us(started);
+        let measured_us = self
+            .last_timings
+            .readback_us
+            .saturating_sub(readback_before)
+            .saturating_add(self.last_timings.color_us.saturating_sub(color_before));
+        // 饱和减法：时钟粒度较粗时子段之和可能略超总耗时，宁可记 0 也不回绕。
+        self.last_timings.output_us = self
+            .last_timings
+            .output_us
+            .saturating_add(total_us.saturating_sub(measured_us));
+        result
+    }
+
+    /// [`H264Decoder::drain_output`] 的本体（计量在调用方）。
+    fn drain_output_inner(&mut self) -> Result<Option<DecodedH264Frame>, WinVideoError> {
         let mut last = None;
         loop {
             let mut output = MFT_OUTPUT_DATA_BUFFER {
@@ -606,10 +678,10 @@ impl H264Decoder {
     }
 
     /// 把一个输出样本转成配置的输出模式（DXGI 纹理优先，其次系统内存）。
+    ///
+    /// 回读/转换两段在这里测、**累加**进 [`DecodePhaseTimings`]（一次 `decode()` 可能
+    /// 产出多帧）；清零由 [`H264Decoder::decode`] 在开头统一做。
     fn convert_sample(&mut self, sample: &IMFSample) -> Result<DecodedH264Frame, WinVideoError> {
-        // 每帧重新计数：软件路径的回读恒为 0，诊断读数不应沿用上一帧。
-        self.last_readback_ms = 0;
-        self.last_color_ms = 0;
         let mode = self.output_mode;
 
         // SAFETY: `sample` 有效；返回的缓冲区在作用域内保持引用计数。
@@ -621,7 +693,7 @@ impl H264Decoder {
         if let Ok(dxgi_buffer) = buffer.cast::<IMFDXGIBuffer>() {
             if let Some(hardware) = self.hardware.as_mut() {
                 let output = self.output;
-                let mut color_ms = 0u32;
+                let mut color_us = 0u64;
                 let readback_started = Instant::now();
                 let converted = hardware.with_mapped(
                     output.coded_width,
@@ -632,13 +704,15 @@ impl H264Decoder {
                         // staging 拷贝与 Map，故“总耗时 - 本段”就是回读耗时。
                         let color_started = Instant::now();
                         let converted = convert_frame(&output, mode, scanline, pitch);
-                        color_ms = elapsed_ms(color_started);
+                        color_us = elapsed_us(color_started);
                         converted
                     },
                 );
                 // 两次独立测量的差值即回读（staging 拷贝 + Map）耗时。
-                self.last_readback_ms = elapsed_ms(readback_started).saturating_sub(color_ms);
-                self.last_color_ms = color_ms;
+                let readback_us = elapsed_us(readback_started).saturating_sub(color_us);
+                self.last_timings.readback_us =
+                    self.last_timings.readback_us.saturating_add(readback_us);
+                self.last_timings.color_us = self.last_timings.color_us.saturating_add(color_us);
                 self.dxgi_seen = true;
                 return converted;
             }
@@ -666,7 +740,10 @@ impl H264Decoder {
                 .map_err(|err| decode_err("IMF2DBuffer::Lock2D", &err))?;
             let color_started = Instant::now();
             let converted = convert_system_memory(&self.output, mode, scanline, pitch);
-            self.last_color_ms = elapsed_ms(color_started);
+            self.last_timings.color_us = self
+                .last_timings
+                .color_us
+                .saturating_add(elapsed_us(color_started));
             // SAFETY: 与上面的 Lock2D 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { buffer_2d.Unlock2D() };
             combine_unlock(converted, unlocked, "IMF2DBuffer::Unlock2D")
@@ -678,7 +755,10 @@ impl H264Decoder {
             let pitch = i32::try_from(self.output.stride).unwrap_or(0);
             let color_started = Instant::now();
             let converted = convert_system_memory(&self.output, mode, scanline, pitch);
-            self.last_color_ms = elapsed_ms(color_started);
+            self.last_timings.color_us = self
+                .last_timings
+                .color_us
+                .saturating_add(elapsed_us(color_started));
             // SAFETY: 与上面的 Lock 配对；无论转换成败都必须解锁。
             let unlocked = unsafe { contiguous.Unlock() };
             combine_unlock(converted, unlocked, "IMFMediaBuffer::Unlock（输出）")
@@ -1550,9 +1630,12 @@ fn decode_err(context: &str, error: &windows::core::Error) -> WinVideoError {
     WinVideoError::Decode(format!("{context} 失败: {error}"))
 }
 
-/// 把从 `started` 到现在的耗时取整为毫秒（饱和到 `u32::MAX`）。
-fn elapsed_ms(started: Instant) -> u32 {
-    u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+/// 把从 `started` 到现在的耗时取整为微秒（饱和到 `u64::MAX`）。
+///
+/// 解码的子阶段（尤其 GPU 回读）常只有几十微秒量级，毫秒取整会把它们全显示成 0，
+/// 无法分辨「卡在出帧」还是「卡在 GPU 同步」。
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// 运行期加载的 Media Foundation 入口表。

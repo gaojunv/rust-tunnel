@@ -103,6 +103,29 @@ pub trait VideoEncoderApi: Send {
     }
 }
 
+/// 一次 `decode()` 内部子阶段的耗时（微秒），**纯诊断**用。
+///
+/// 与 `crates/win-video` 的 `DecodePhaseTimings` 同口径（本 crate 不能依赖平台 crate，
+/// 故独立定义一份；字段顺序与含义一一对应）：
+///
+/// - `submit_us`：送包（`ProcessInput` + 缓冲区拷贝）；
+/// - `output_us`：MFT 出帧（`ProcessOutput` 及其等待）；
+/// - `readback_us`：DXVA staging 拷贝 + `Map`（系统内存/软件路径恒为 0）；
+/// - `color_us`：像素转换/打包。
+///
+/// 只有平台解码器会填它；全 0 表示实现不上报（VP9 等），不代表零耗时。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeTimings {
+    /// 送包：`ProcessInput` + 缓冲区拷贝。
+    pub submit_us: u64,
+    /// MFT 出帧：`ProcessOutput` 及其等待。
+    pub output_us: u64,
+    /// DXVA 回读：staging 拷贝 + `Map`。
+    pub readback_us: u64,
+    /// 像素转换/打包（NV12 紧包或 RGBA）。
+    pub color_us: u64,
+}
+
 /// 解码器实例接口。
 pub trait VideoDecoderApi: Send {
     /// 告知解码器即将解码的**编码尺寸**（宽, 高）。
@@ -134,6 +157,15 @@ pub trait VideoDecoderApi: Send {
     /// 控制器在解码器创建成功、以及每次 `configure` 成功后读一次，**只在变化时**上报。
     fn info(&self) -> crate::screen::DecoderInfo {
         crate::screen::DecoderInfo::default()
+    }
+
+    /// 上一次 `decode` 的**内部子阶段**耗时（诊断用；默认全 0 = 实现不上报）。
+    ///
+    /// 控制器只在慢帧日志里读它，用来区分「卡在 MFT 出帧」「卡在 GPU 回读」还是
+    /// 「卡在 CPU 转换」。默认实现全 0：VP9 软件解码本来就没有这些分段，**不实现
+    /// 它不得影响任何解码路径**（纯观测，不参与决策）。
+    fn last_decode_timings(&self) -> DecodeTimings {
+        DecodeTimings::default()
     }
 }
 

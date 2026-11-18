@@ -28,7 +28,7 @@ use crate::video::MAX_FRAME_DIM;
 use futures_util::StreamExt as _;
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,23 +52,38 @@ const BYE_TIMEOUT: Duration = Duration::from_secs(2);
 /// @30fps 就是 533 ms 的陈旧画面缓冲，正是延迟审查要消掉的东西。解码在常用码率下本来
 /// 就跟得上，队列深度的正确量级是「吸收抖动」而不是「存下整个卡顿」。
 ///
-/// 即使只有 4 深，主循环仍会按采集时间戳**主动老化**：队列确有积压且某帧已经太老时直接
+/// 即使只有 4 深，主循环仍会按采集时间戳**主动老化**：队列接近满且某帧已经太老时直接
 /// 丢弃（见 [`should_drop_stale`]），让旧画面作废而不是排队等解码。队列满同样丢帧——丢弃会
 /// 打断 VP9 的参考链，故解码任务用**序号断层**检测到它并请求关键帧（见 [`decode_loop`]）。
 /// 队列满时还会推进 `drop_epoch`，让队列里的陈旧 P 帧整体作废，解码端直接跳到最新包。
 const DECODE_QUEUE: usize = 4;
 
-/// 陈旧帧的年龄上限（毫秒）：超过它、且解码队列确有积压、且该帧不是关键帧时才丢弃。
+/// 陈旧帧的年龄上限（毫秒）：超过它、且解码队列接近满、且该帧不是关键帧、且已过 IDR
+/// 冷静期时才丢弃。
 ///
-/// 150 ms 是「解码来不及」与「一次网络毛刺」的分界：正常 RTT 下帧的年龄只有几十毫秒，
-/// 而解码器一旦落后超过 150 ms，继续把它解出来已经不是用户此刻想看的画面了。
-const STALE_FRAME_AGE_MS: u64 = 150;
+/// 原来的 150 ms 在「慢但没坏」的链路上等于**自锁**：真机日志（1080p30 H.264 / QSV）里
+/// 端到端常态就是 p50 33 ms / p90 416 ms，远超 150 ms，于是几乎每一帧都命中老化判据 →
+/// 丢一个 P 帧 → 断参考链 → 请求 IDR（平均 223 KB、传输 180–340 ms、解码 300–500 ms）→
+/// 期间的 P 帧又老又积压 → 再丢。64 秒内被迫出了 31 张 IDR（占全部字节 43%），控制器只解到
+/// 被控端发帧的 74%，一次 500 ms 的解码停顿被放大成十几秒的死区。600 ms 才是「这帧已经没有
+/// 观看价值」，也给一次 300–500 ms 的解码停顿留出恢复窗口。
+const STALE_FRAME_AGE_MS: u64 = 600;
 
-/// 触发老化丢弃的最小解码队列积压（帧数）。
+/// 触发老化丢弃的最小解码队列积压（帧数），**等于 `DECODE_QUEUE - 1`**。
 ///
-/// 低于它说明解码跟得上（新帧入队即被取走），此时丢帧只会无谓地打断参考链。2 帧意味着
-/// 解码器已经欠了一拍以上，丢弃最老的帧才真正缩短「追帧」时间。
-const STALE_DROP_MIN_BACKLOG: u32 = 2;
+/// 4 深队列里积压 ≥2 只是「解码欠一拍」的常态（每张 IDR 传输/解码期间必然出现），按它开火
+/// 等于每次 IDR 之后都丢帧、重新自锁。只有队头再进一帧就满，才说明解码器真的落后于网络。
+/// 不取 `DECODE_QUEUE`（4）：那一档等价于「只在队列已满时才老化」，而队列满本身已有独立的
+/// 丢弃路径（`enqueue_decode` 返回 `Dropped`），老化判据会完全失去意义。
+const STALE_DROP_MIN_BACKLOG: u32 = 3;
+
+/// 成功解出一张 IDR 后的冷静期（毫秒）：这段时间内**不允许**老化丢帧。
+///
+/// 参考链刚被 IDR 重建，队列里的 P 帧只是「IDR 传输/解码期间攒下的瞬态积压」，它们能正常
+/// 解码、且只有解完才能追上实时画面；此刻按年龄丢掉它们等于把刚花 200+ KB 重建的参考链又
+/// 砍断一次。500 ms 覆盖一次 IDR 的解码停顿（实测 300–500 ms）而不至于长期掩盖真正的持续
+/// 拥塞——超过 [`STALE_FRAME_AGE_MS`] 的帧在冷静期结束后照样会被清掉。
+const KEYFRAME_SETTLE_MS: u64 = 500;
 
 /// 关键帧请求的最小间隔。
 ///
@@ -92,6 +107,13 @@ const QOS_INTERVAL: Duration = Duration::from_secs(1);
 /// 「静止」与「卡死」，代价是被控端在静止桌面上每 3s 补一个 IDR（1080p 静止帧只有几十字节到
 /// 几 KB，取决于编码器与码率控制模式，可忽略）。请求本身也按同一窗口限频，避免刷屏。
 const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 慢解码判据（微秒）：超过它才把解码的四段细分打进延迟日志。
+///
+/// 真机上 p50 只有 6.5 ms，正常帧没必要刷四行数字；而 300–500 ms 的停顿一次都不能漏。
+/// 取 100 ms 与延迟诊断的默认慢帧阈值（`RUST_TUNNEL_LATENCY_SLOW_MS`）同量级，
+/// 又与「体感卡顿」的门槛相当。
+const SLOW_DECODE_US: u64 = 100_000;
 
 /// 一条待解码的画面载荷（尚未解码）。
 enum DecodeJob {
@@ -164,6 +186,13 @@ struct DecodeShared {
     clock_offset_us: Arc<AtomicI64>,
     /// 解码任务最近一次算出的端到端延迟（毫秒；采集完成 → 解码完成）。
     e2e_ms: Arc<AtomicU32>,
+    /// 解码任务**最近一次成功解出 IDR** 的时刻（本端单调时钟，微秒；`0` = 本会话还没解出过）。
+    ///
+    /// 主循环据此算「距上次 IDR 已过多少毫秒」，在 [`KEYFRAME_SETTLE_MS`] 内禁止老化丢帧。
+    last_idr_us: Arc<AtomicU64>,
+    /// 解码任务因 `drop_epoch` 作废而丢弃的陈旧视频包数（主循环每秒 `swap(0)` 取走，
+    /// 只进延迟诊断日志的按原因拆分，**不进** [`SessionStats::Decode::dropped`]）。
+    epoch_drops: Arc<AtomicU32>,
     /// 诊断：主循环与解码任务共享的分阶段延迟窗口（见 [`crate::latency`]）。
     latency: Arc<std::sync::Mutex<LatencyWindow>>,
 }
@@ -177,6 +206,8 @@ impl DecodeShared {
             applied_patches: Arc::new(AtomicU32::new(0)),
             clock_offset_us: Arc::new(AtomicI64::new(UNKNOWN_OFFSET)),
             e2e_ms: Arc::new(AtomicU32::new(0)),
+            last_idr_us: Arc::new(AtomicU64::new(0)),
+            epoch_drops: Arc::new(AtomicU32::new(0)),
             latency: Arc::new(std::sync::Mutex::new(LatencyWindow::new())),
         }
     }
@@ -450,6 +481,11 @@ pub(crate) async fn run_controller_with_input(
     // 本窗口收到的视频包数 / 丢弃数（含等待 IDR 时主动丢掉的 P 帧与队列满）。
     let mut window_packets: u32 = 0;
     let mut window_dropped: u32 = 0;
+    // 按原因的丢帧拆分：**只进延迟诊断日志**，不进 `SessionStats`（`dropped` 语义保持不变）。
+    // `epoch` 那一类发生在解码任务里，经 `decode_shared.epoch_drops` 每秒 `swap(0)` 取回。
+    let mut window_drop_awaiting: u32 = 0;
+    let mut window_drop_stale: u32 = 0;
+    let mut window_drop_queue_full: u32 = 0;
     let mut qos_window_start = Instant::now();
     // 帧到达抖动（A5）：上一个视频包的到达时刻、再上一个到达间隔、本窗口的抖动累加与样本数。
     let mut last_packet_at: Option<Instant> = None;
@@ -596,6 +632,8 @@ pub(crate) async fn run_controller_with_input(
                     jitter_ms,
                     clock_offset_us: decode_shared.clock_offset_us.load(Ordering::Relaxed),
                 });
+                // 解码任务里的「epoch 作废」丢帧数：每秒取回并清零，与本地计数器同一窗口。
+                let epoch_drops = decode_shared.epoch_drops.swap(0, Ordering::Relaxed);
                 // 诊断：每秒一行分阶段延迟汇总（**只在延迟诊断打开时**）。
                 // 与上面的 `SessionStats::Decode` 分开：那条是 UI 角标读数，这条是逐段拆解。
                 if latency::enabled() {
@@ -603,9 +641,13 @@ pub(crate) async fn run_controller_with_input(
                         // 全部信息塞进 message：GUI 日志面板 / 服务端日志只保留 `message` 字段。
                         info!(
                             target: "latency",
-                            "controller packets={} dropped={} rtt_ms={} {}",
+                            "controller packets={} dropped={} drop_split=awaiting:{} stale:{} queue_full:{} epoch:{} rtt_ms={} {}",
                             window_packets,
                             window_dropped,
+                            window_drop_awaiting,
+                            window_drop_stale,
+                            window_drop_queue_full,
+                            epoch_drops,
                             last_rtt_ms.unwrap_or(0),
                             summary
                         );
@@ -622,6 +664,9 @@ pub(crate) async fn run_controller_with_input(
                 recv_bytes = 0;
                 window_packets = 0;
                 window_dropped = 0;
+                window_drop_awaiting = 0;
+                window_drop_stale = 0;
+                window_drop_queue_full = 0;
                 jitter_sum_us = 0;
                 jitter_samples = 0;
                 qos_window_start = Instant::now();
@@ -874,6 +919,14 @@ pub(crate) async fn run_controller_with_input(
                                 && flags & VIDEO_FLAG_KEYFRAME == 0
                             {
                                 window_dropped = window_dropped.saturating_add(1);
+                                window_drop_awaiting = window_drop_awaiting.saturating_add(1);
+                                if latency::enabled() {
+                                    info!(
+                                        target: "latency",
+                                        "controller_drop seq={} reason=awaiting",
+                                        seq
+                                    );
+                                }
                                 debug!("等待关键帧期间丢弃 P 帧（不让它占用解码队列）");
                                 continue;
                             }
@@ -884,22 +937,38 @@ pub(crate) async fn run_controller_with_input(
                             // 先回放一段旧画面」。故入队前丢掉已经太老的 P 帧，让解码器直接
                             // 追到最新画面。
                             //
-                            // 三个条件**缺一不可**（[`should_drop_stale`]），都是为了不误伤正常链路：
-                            // ① 队列确有积压（≥ 2）：没有积压时新帧入队即被取走，丢掉它只会
-                            //    白断参考链；
-                            // ② 端到端年龄 > 150 ms：这是「解码来不及」而非「网络毛刺」的判据；
-                            // ③ 不是关键帧：IDR 是恢复参考链的唯一手段，丢了它等于堵死恢复路径。
+                            // 四个条件**缺一不可**（[`should_drop_stale`]），都是为了不误伤正常链路：
+                            // ① 队列接近满（≥ 3，即 `DECODE_QUEUE - 1`）：积压 2 帧只是解码欠一拍
+                            //    的常态，丢掉它只会白断参考链；
+                            // ② 端到端年龄 > 600 ms：这是「解码来不及」而非「网络毛刺」的判据；
+                            // ③ 不是关键帧：IDR 是恢复参考链的唯一手段，丢了它等于堵死恢复路径；
+                            // ④ 已过 IDR 冷静期：刚解出 IDR 时队列积压只是瞬态，按年龄丢帧会
+                            //    把新参考链又砍断（自锁的起点）。
                             // 另外时钟偏差未知时年龄是 `None`，绝不丢帧——估计尚未建立时守可
                             // 错放、不可错杀。
                             let backlog = decode_backlog(&decode_tx);
                             let keyframe = flags & VIDEO_FLAG_KEYFRAME != 0;
+                            let now = now_us();
                             let age_ms = frame_age_ms(
-                                now_us(),
+                                now,
                                 capture_ts_us,
                                 decode_shared.clock_offset_us.load(Ordering::Relaxed),
                             );
-                            if should_drop_stale(age_ms, backlog, keyframe) {
+                            let since_idr_ms =
+                                since_idr_ms(now, decode_shared.last_idr_us.load(Ordering::Relaxed));
+                            if should_drop_stale(age_ms, backlog, keyframe, since_idr_ms) {
                                 window_dropped = window_dropped.saturating_add(1);
+                                window_drop_stale = window_drop_stale.saturating_add(1);
+                                if latency::enabled() {
+                                    // 命中判据即保证 `age_ms` 为 `Some`，`unwrap_or(0)` 只是兜底。
+                                    info!(
+                                        target: "latency",
+                                        "controller_drop seq={} reason=stale age_ms={} backlog={}",
+                                        seq,
+                                        age_ms.unwrap_or(0),
+                                        backlog
+                                    );
+                                }
                                 // 丢一个 P 帧即断参考链：解码任务必须整体作废队列里的旧包、
                                 // 只等 IDR，而不是先把它们解一遍再重置。
                                 decode_shared.awaiting_keyframe.store(true, Ordering::Relaxed);
@@ -943,6 +1012,15 @@ pub(crate) async fn run_controller_with_input(
                                 DecodeEnqueue::Dropped => {
                                     decode_shared.drop_epoch.fetch_add(1, Ordering::Relaxed);
                                     window_dropped = window_dropped.saturating_add(1);
+                                    window_drop_queue_full = window_drop_queue_full.saturating_add(1);
+                                    if latency::enabled() {
+                                        info!(
+                                            target: "latency",
+                                            "controller_drop seq={} reason=queue_full backlog={}",
+                                            seq,
+                                            backlog
+                                        );
+                                    }
                                 }
                                 DecodeEnqueue::Closed => {
                                     break Err(RemoteError::Platform(
@@ -1018,6 +1096,15 @@ pub(crate) async fn run_controller_with_input(
                                     // 队列满时**不**推进 `drop_epoch`：补丁不是参考链上的帧，
                                     // 直接请一个全帧 IDR 即可——被控端收到后会退出补丁模式并
                                     // 发一整帧，合成帧随之重建。
+                                    if latency::enabled() {
+                                        // 补丁不计入 `window_drop_*`（那套计数器沿用视频包
+                                        // 口径，与 `SessionStats::Decode::dropped` 对齐）。
+                                        info!(
+                                            target: "latency",
+                                            "controller_drop seq=- reason=queue_full kind=patch monitor={}",
+                                            monitor
+                                        );
+                                    }
                                     debug!(monitor, "解码队列已满，丢弃补丁批并请求关键帧");
                                     let _ = keyframe_tx
                                         .send((monitor, KeyframeReason::QueueOverflow));
@@ -1321,6 +1408,9 @@ async fn decode_loop(
     // 关键帧请求限频状态：上次真正发出的时刻、被限频挂起的显示器。
     let mut last_kf_request: Option<Instant> = None;
     let mut kf_pending: Option<(u32, KeyframeReason)> = None;
+    // 上一次**解码完成**的时刻（`now_us()`）。真机的 300–505 ms 单帧停顿 18/18 次都出现在
+    // 「距上一帧超过 600 ms 的空闲」之后，故把空闲间隔一并打进逐帧日志，现场才能对上号。
+    let mut last_decode_done_us: u64 = 0;
     // 诊断开关**每帧读一次**（Relaxed 原子）：设置页运行中切换立即生效（见 [`crate::latency`]）。
     // 定期检查挂起的请求：距上次请求已满一个窗口就发出去，保证不会永久等 IDR。
     let mut kf_tick = tokio::time::interval_at(
@@ -1552,6 +1642,8 @@ async fn decode_loop(
         // 队列曾溢出（主循环推进了 epoch）：本包已被更新的包取代。丢掉它并重置参考链，
         // `expected_seq = None` 避免紧接着的下一个包再触发一次「断层」重置。
         if epoch < decode_shared.drop_epoch.load(Ordering::Relaxed) {
+            // 只作观测：按原因的丢帧拆分（延迟诊断日志每秒取走），不影响任何决策。
+            decode_shared.epoch_drops.fetch_add(1, Ordering::Relaxed);
             debug!(seq, epoch, "解码队列曾溢出，丢弃陈旧视频包并等待关键帧");
             decoder = None;
             configured_dims = None;
@@ -1704,14 +1796,20 @@ async fn decode_loop(
         let Some(mut dec) = decoder.take() else {
             continue;
         };
+        // 本次解码开始前的空闲间隔：上一帧解码完成 → 现在。`0` = 本次会话首个可解码帧。
+        let idle = idle_ms(now_us(), last_decode_done_us);
         let blocking_result = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             let result = dec.decode(&data);
             (dec, result, started.elapsed())
         })
         .await;
+        let decode_done_us = now_us();
         match blocking_result {
             Ok((dec, Ok(Some(frame)), elapsed)) => {
+                // 子阶段读数要在把解码器放回 `decoder` 之前读（`decoder` 另行持有它）。
+                // 纯观测：只进日志，不参与任何决策。
+                let phase = dec.last_decode_timings();
                 decoder = Some(dec);
                 let decode_ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
                 decode_shared.decode_ms.store(decode_ms, Ordering::Relaxed);
@@ -1719,6 +1817,11 @@ async fn decode_loop(
                 decode_shared
                     .awaiting_keyframe
                     .store(false, Ordering::Relaxed);
+                // 刚解出一张 IDR：记下时刻，主循环据此在 [`KEYFRAME_SETTLE_MS`] 内不老化丢帧
+                // （此刻队列里的积压只是 IDR 传输/解码期间攒下的瞬态，能正常解出来）。
+                if keyframe {
+                    decode_shared.last_idr_us.store(now_us(), Ordering::Relaxed);
+                }
                 // IDR 已解出：被限频挂起的请求没有意义了。
                 kf_pending = None;
                 // 端到端（D2）：采集完成 → 本端解码完成。偏差未知/时间戳缺失时给 0
@@ -1734,15 +1837,31 @@ async fn decode_loop(
                     if latency::frame_logs() || e2e_micros > latency::slow_threshold_us() {
                         info!(
                             target: "latency",
-                            "controller seq={} idr={} bytes={} recv_q_us={} dec_us={} capture_to_recv_ms={} e2e_ms={} backlog={}",
+                            "controller seq={} idr={} bytes={} recv_q_us={} idle_ms={} dec_us={} capture_to_recv_ms={} e2e_ms={} backlog={}",
                             seq,
                             flags & VIDEO_FLAG_KEYFRAME != 0,
                             packet_bytes,
                             recv_q_us,
+                            idle,
                             decode_micros,
                             elapsed_ms(recv_us, offset, capture_ts_us),
                             e2e_ms,
                             u32::try_from(rx.len()).unwrap_or(u32::MAX)
+                        );
+                    }
+                    // 慢帧才打四段细分：空闲后的第一帧到底卡在 MFT 出帧、GPU 回读，
+                    // 还是 CPU 转换，全在这一行里。默认实现（VP9）四项全 0。
+                    if decode_micros > SLOW_DECODE_US {
+                        info!(
+                            target: "latency",
+                            "controller_decode_slow seq={} idle_ms={} dec_us={} submit_us={} output_us={} readback_us={} color_us={}",
+                            seq,
+                            idle,
+                            decode_micros,
+                            phase.submit_us,
+                            phase.output_us,
+                            phase.readback_us,
+                            phase.color_us
                         );
                     }
                 }
@@ -1807,6 +1926,9 @@ async fn decode_loop(
                 );
             }
         }
+        // 下一次「空闲间隔」的起点。失败/panic 也算一次解码尝试完成——它们同样结束了
+        // 「解码器闲着」的状态，不计的话下一次正常解码会被报成超长空闲。
+        last_decode_done_us = decode_done_us;
     }
 }
 
@@ -1896,6 +2018,18 @@ fn decode_region_rect(
     })
 }
 
+/// 两次解码完成之间的空闲间隔（毫秒），**纯函数**便于单测。
+///
+/// `last_done_us == 0` 是「本会话还没解码过」的哨兵，返回 0（不能拿进程启动至今去减，
+/// 否则首个可解码帧会被报成一个巨大的空闲）。时钟倒退同样饱和成 0：这里只描述
+/// 「闲置了多久」，负值是毫无意义的噪声，不该在日志里变成天文数字。
+fn idle_ms(now_us: u64, last_done_us: u64) -> u64 {
+    if last_done_us == 0 {
+        return 0;
+    }
+    now_us.saturating_sub(last_done_us) / 1000
+}
+
 /// 解码队列当前积压的载荷数（[`DECODE_QUEUE`] 减去剩余容量）。
 ///
 /// `mpsc::Sender::capacity()` 返回的是**剩余**容量，故 `DECODE_QUEUE - capacity` 才是在队列里
@@ -1927,20 +2061,46 @@ fn frame_age_ms(now_us: u64, capture_ts_us: u64, offset_us: i64) -> Option<u64> 
     u64::try_from(delta / 1000).ok()
 }
 
+/// 距上次成功解出 IDR 已过多少毫秒；本会话还没解出过 IDR 时返回 `None`。
+///
+/// `now_us` 与 `last_idr_us` 都是本端单调时钟（[`crate::clock::now_us`]），跨线程读的是
+/// `Relaxed` 原子，最多差一拍；用于 [`KEYFRAME_SETTLE_MS`] 这种 500 ms 量级的判断足够。
+///
+/// `None` 的语义是「没有新参考链需要保护」：会话刚开始时解码器本来就在等第一张 IDR
+/// （第一道闸门会拦住 P 帧），这里按其余条件判断即可。时间戳倒退（原子的轻微乱序）用
+/// 饱和减法折成 0，宁可多等一个冷静期，也不要把「刚解出 IDR」误判成「早就过了」。
+#[must_use]
+fn since_idr_ms(now_us: u64, last_idr_us: u64) -> Option<u64> {
+    if last_idr_us == 0 {
+        return None;
+    }
+    Some(now_us.saturating_sub(last_idr_us) / 1000)
+}
+
 /// 是否应在入队前丢弃这个陈旧画面帧。
 ///
-/// 三个条件**缺一不可**，少任何一个都会误伤正常链路：
+/// 四个条件**缺一不可**，少任何一个都会误伤正常链路：
 ///
-/// 1. `backlog >= STALE_DROP_MIN_BACKLOG`：队列确实积压，说明解码来不及；
+/// 1. `backlog >= STALE_DROP_MIN_BACKLOG`：队列接近满（`DECODE_QUEUE - 1`），说明解码真的
+///    落后于网络，而不是欠了一拍的常态；
 /// 2. `age_ms > STALE_FRAME_AGE_MS`：帧真的老了，而不是一次网络毛刺；
-/// 3. `!keyframe`：IDR 是恢复参考链的唯一手段，再老也必须放行。
+/// 3. `!keyframe`：IDR 是恢复参考链的唯一手段，再老也必须放行；
+/// 4. 不在 IDR 冷静期内：`since_idr_ms` 为 `None`（本会话还没解出过 IDR）或
+///    `>= KEYFRAME_SETTLE_MS`。刚解出 IDR 时参考链是全新的，队列积压只是瞬态，此刻丢帧
+///    会把刚重建的参考链又砍断，正是「丢帧 → 请求 IDR → IDR 期间又积压 → 再丢」的起点。
 ///
 /// `age_ms == None`（时间戳缺失/时钟偏差未知）时永远返回 `false`。
 #[must_use]
-fn should_drop_stale(age_ms: Option<u64>, backlog: u32, keyframe: bool) -> bool {
+fn should_drop_stale(
+    age_ms: Option<u64>,
+    backlog: u32,
+    keyframe: bool,
+    since_idr_ms: Option<u64>,
+) -> bool {
     !keyframe
         && backlog >= STALE_DROP_MIN_BACKLOG
         && age_ms.is_some_and(|age| age > STALE_FRAME_AGE_MS)
+        && since_idr_ms.is_none_or(|elapsed| elapsed >= KEYFRAME_SETTLE_MS)
 }
 
 /// [`enqueue_decode`] 的结果。
@@ -3225,29 +3385,93 @@ mod tests {
         assert_eq!(frame_age_ms(10_000_000, 9_000_000, 0), Some(1_000));
     }
 
-    /// 三个条件缺一不可：任缺一个都不得丢帧。
+    /// 四个条件缺一不可：任缺一个都不得丢帧。
     #[test]
     fn stale_drop_needs_backlog_age_and_non_keyframe() {
         // 年龄未知（无时间戳/时钟未知）：绝不丢。
-        assert!(!should_drop_stale(None, 4, false));
+        assert!(!should_drop_stale(None, 4, false, None));
         // 队列没积压：解码跟得上，丢了只会白断参考链。
-        assert!(!should_drop_stale(Some(5_000), 0, false));
-        assert!(!should_drop_stale(Some(5_000), 1, false));
+        assert!(!should_drop_stale(Some(5_000), 0, false, None));
+        assert!(!should_drop_stale(
+            Some(5_000),
+            STALE_DROP_MIN_BACKLOG - 1,
+            false,
+            None
+        ));
         // 关键帧：恢复参考链的唯一手段，再老也放行。
-        assert!(!should_drop_stale(Some(5_000), 4, true));
+        assert!(!should_drop_stale(Some(5_000), 4, true, None));
         // 不够老（恰好等于阈值也算「不够老」）：可能只是一次网络毛刺。
-        assert!(!should_drop_stale(Some(STALE_FRAME_AGE_MS), 4, false));
-        // 三条件齐备才丢。
+        assert!(!should_drop_stale(Some(STALE_FRAME_AGE_MS), 4, false, None));
+        // IDR 冷静期内（解出不到 500 ms）：积压只是瞬态，一律不丢。
+        assert!(!should_drop_stale(Some(5_000), 4, false, Some(0)));
+        assert!(!should_drop_stale(
+            Some(5_000),
+            4,
+            false,
+            Some(KEYFRAME_SETTLE_MS - 1)
+        ));
+        // 冷静期恰好结束：恢复老化判据。
+        assert!(should_drop_stale(
+            Some(5_000),
+            4,
+            false,
+            Some(KEYFRAME_SETTLE_MS)
+        ));
+        // 本会话还没解出过 IDR：没有新参考链要保护，按其余条件判断。
+        assert!(should_drop_stale(Some(5_000), 4, false, None));
+        // 四条件齐备才丢。
         assert!(should_drop_stale(
             Some(STALE_FRAME_AGE_MS + 1),
             STALE_DROP_MIN_BACKLOG,
-            false
+            false,
+            None
         ));
         assert!(should_drop_stale(
             Some(5_000),
             u32::try_from(DECODE_QUEUE).unwrap_or(u32::MAX),
-            false
+            false,
+            None
         ));
+    }
+
+    /// 冷静期的读数：未解出过 IDR 是 `None`；时间戳倒退按 0 处理（保守地留在冷静期）。
+    #[test]
+    fn since_idr_is_unknown_before_first_idr() {
+        assert_eq!(since_idr_ms(10_000_000, 0), None);
+        assert_eq!(since_idr_ms(10_000_000, 9_600_000), Some(400));
+        assert_eq!(since_idr_ms(10_000_000, 10_001_000), Some(0));
+    }
+
+    /// 空闲间隔：未解码过给 0（哨兵）、正常取整到毫秒、时钟倒退饱和为 0。
+    #[test]
+    fn idle_ms_handles_sentinel_truncates_and_saturates() {
+        // 本会话还没解码过：不能用「进程启动至今」当空闲。
+        assert_eq!(idle_ms(10_000_000, 0), 0);
+        // 正常：上一帧解码完成于 600 ms 前。
+        assert_eq!(idle_ms(10_000_000, 9_400_000), 600);
+        // 亚毫秒截断，与日志里其余毫秒读数一致。
+        assert_eq!(idle_ms(10_000_000, 9_999_500), 0);
+        // 时间倒退（理论上不该发生）：饱和为 0，不出现天文数字。
+        assert_eq!(idle_ms(1_000, 2_000), 0);
+    }
+
+    /// 老化判据的常量由真机数据标定（见各常量的文档），改动必须同步这里：
+    /// 150 ms / 积压 2 在「慢但没坏」的链路上必然自锁（64 秒 31 张 IDR、43% 字节）。
+    #[test]
+    fn stale_drop_constants_match_field_tuning() {
+        let queue = u32::try_from(DECODE_QUEUE).unwrap_or(u32::MAX);
+        assert_eq!(STALE_FRAME_AGE_MS, 600, "150 ms 在慢链路上每一帧都命中");
+        assert_eq!(
+            STALE_DROP_MIN_BACKLOG, 3,
+            "必须等于 DECODE_QUEUE - 1：积压 2 只是常态"
+        );
+        assert!(
+            STALE_DROP_MIN_BACKLOG < queue,
+            "老化阈值必须小于队列深度，否则永远轮不到老化"
+        );
+        assert_eq!(KEYFRAME_SETTLE_MS, 500);
+        // 冷静期超过年龄阈值等于永久禁用老化（编译期可判，故用 const 断言）。
+        const { assert!(KEYFRAME_SETTLE_MS <= STALE_FRAME_AGE_MS) };
     }
 
     /// 队列积压按 `DECODE_QUEUE - 剩余容量` 计算，且队列深度已按延迟审查降到 4。
