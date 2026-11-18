@@ -32,6 +32,10 @@ pub enum UpdateAction {
 /// 返回 `Some(action)` 表示用户点了按钮；弹窗的显示条件：有可用更新且未被「稍后」
 /// 隐藏且未被「跳过此版本」，或者正在下载/最近有错误（错误必须让用户看到）。
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "弹窗的四种状态（替换中/下载中/错误/可用）与按钮组必须放在一起看，拆开会丢掉互斥关系"
+)]
 pub fn modal(
     ctx: &egui::Context,
     update: &UpdateBridge,
@@ -42,7 +46,8 @@ pub fn modal(
         .available
         .as_ref()
         .is_some_and(|a| !snap.dismissed && Some(a.version.as_str()) != skipped);
-    let visible = available_visible || snap.download.is_some() || snap.error.is_some();
+    let visible =
+        available_visible || snap.download.is_some() || snap.error.is_some() || snap.applying;
     if !visible {
         return None;
     }
@@ -54,8 +59,31 @@ pub fn modal(
         let close = widgets::modal_title(ui, "客户端更新");
         ui.add_space(4.0);
 
+        // 替换（含提权更新无人值守服务）在后台线程跑：这期间不给按钮，也忽略关闭，
+        // 免得用户以为「点了没反应」又去点一次。
+        if snap.applying {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(RichText::new("正在安装更新…").strong());
+            ui.label(
+                RichText::new(
+                    "若本机装有 Windows 无人值守服务，会先弹出管理员授权并把它一起更新；\
+                     客户端随后自动重启。",
+                )
+                .size(12.0)
+                .color(p.text_weak),
+            );
+            return;
+        }
+
         if let Some(progress) = snap.download.as_ref() {
-            ui.label(RichText::new(format!("正在下载 {}", progress.version)).strong());
+            let counter = if progress.total_files > 1 {
+                format!("（{}/{}）", progress.index, progress.total_files)
+            } else {
+                String::new()
+            };
+            ui.label(RichText::new(format!("正在下载 {}{counter}", progress.version)).strong());
+            ui.label(RichText::new(&progress.name).size(12.0).color(p.text_weak));
             ui.add_space(4.0);
             let fraction = fraction(progress.received, progress.total);
             progress_bar(
@@ -116,6 +144,17 @@ pub fn modal(
             .size(12.0)
             .color(p.text_weak),
         );
+        if let Some(service) = available.service.as_ref() {
+            ui.label(
+                RichText::new(format!(
+                    "同时更新 Windows 无人值守服务（{}）。更新时会请求管理员授权；\
+                     取消授权则客户端与服务都不更新，以保持版本一致。",
+                    human_bytes(service.size)
+                ))
+                .size(12.0)
+                .color(p.text_weak),
+            );
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if widgets::primary_button(ui, "立即更新").clicked() {
@@ -186,9 +225,24 @@ pub fn settings_section(
                 );
             }
 
+            if snap.applying {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("正在安装更新（含 Windows 无人值守服务）…");
+                });
+                return;
+            }
+
             if let Some(progress) = snap.download.as_ref() {
                 ui.add_space(4.0);
-                ui.label(format!("正在下载 {}…", progress.version));
+                let counter = if progress.total_files > 1 {
+                    format!("（{}/{}）", progress.index, progress.total_files)
+                } else {
+                    String::new()
+                };
+                ui.label(format!("正在下载 {}{counter}…", progress.version));
+                ui.label(RichText::new(&progress.name).size(12.0).color(p.text_weak));
                 let fraction = fraction(progress.received, progress.total);
                 progress_bar(
                     ui,
@@ -251,6 +305,15 @@ pub fn settings_section(
                         })
                         .strong(),
                     );
+                    if available.service.is_some() && !skipped {
+                        ui.label(
+                            RichText::new(
+                                "将同时更新 Windows 无人值守服务（需要管理员授权；取消则两者都不更新）",
+                            )
+                            .size(12.0)
+                            .color(p.text_weak),
+                        );
+                    }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if skipped {

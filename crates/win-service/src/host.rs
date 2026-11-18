@@ -176,10 +176,17 @@ fn execute(command: Command) -> Result<(), String> {
             gui_exe,
             host_config,
             start,
+            gui_sha256,
+            self_sha256,
         } => {
             let gui_exe = gui_exe.map(PathBuf::from);
             let host_config = host_config.map(PathBuf::from);
-            install_service(gui_exe.as_deref(), host_config.as_deref())?;
+            install_service(
+                gui_exe.as_deref(),
+                host_config.as_deref(),
+                gui_sha256.as_deref(),
+                self_sha256.as_deref(),
+            )?;
             if start {
                 start_service()?;
             }
@@ -643,7 +650,9 @@ fn run_instance(session: u32) -> InstanceOutcome {
 }
 
 /// 取实例令牌，并把两条路的失败原因写进日志；成功时返回（令牌，来源名）。
-fn instance_token(session: u32) -> Option<(rust_tunnel_win_platform::handle::OwnedHandle, &'static str)> {
+fn instance_token(
+    session: u32,
+) -> Option<(rust_tunnel_win_platform::handle::OwnedHandle, &'static str)> {
     let picked = process::pick_instance_token(session);
     for (name, outcome) in &picked.privilege_failures {
         // 逐项渲染：`NotAssigned`（持有但没生效，`AdjustTokenPrivileges` 返回 TRUE 但
@@ -700,7 +709,10 @@ fn supervise_loop(spawned: &SpawnedProcess) -> InstanceOutcome {
 ///
 /// **必须等它退出**：不等的话，下一次 spawn 可能与还没死透的旧实例并存一小段时间，
 /// 而那正是单实例锁要防的窗口。
-fn kill_instance(job: Option<rust_tunnel_win_platform::handle::OwnedHandle>, spawned: &SpawnedProcess) {
+fn kill_instance(
+    job: Option<rust_tunnel_win_platform::handle::OwnedHandle>,
+    spawned: &SpawnedProcess,
+) {
     match process::terminate_process(&spawned.process, INSTANCE_TERMINATED_EXIT_CODE) {
         Ok(()) => {}
         Err(err) => tracing::debug!(%err, "TerminateProcess 失败（多半是它已经退出了）"),
@@ -881,10 +893,27 @@ fn stop_service() -> Result<(), String> {
 /// 的文件**（GUI 的「安装并启用」按钮就把当前客户端配置写进临时文件传进来）。此时安装器
 /// 把它复制到 `%ProgramData%\rust-tunnel\host.toml`，用户不再需要手工找 token、手工写文件。
 /// 没传 `--host-config` 时仍按原流程：只检查并打印「还差这一步」。
-fn install_service(gui_exe: Option<&Path>, host_config: Option<&Path>) -> Result<(), String> {
-    let service_exe = std::env::current_exe()
-        .map_err(|err| format!("拿不到本程序的路径，没法安装：{err}"))?;
+fn install_service(
+    gui_exe: Option<&Path>,
+    host_config: Option<&Path>,
+    gui_sha256: Option<&str>,
+    self_sha256: Option<&str>,
+) -> Result<(), String> {
+    let service_exe =
+        std::env::current_exe().map_err(|err| format!("拿不到本程序的路径，没法安装：{err}"))?;
     let gui_exe = locate_gui_exe(gui_exe, &service_exe)?;
+
+    // 0) 自更新路径会带上两个期望摘要：**复制前**复验源文件。
+    //
+    // 提权进程读的是用户临时目录里的暂存文件，而 GUI 在拉起 UAC 之前已经校验过一遍；
+    // 但 UAC 提示可能停留很久，同账户进程可以在这段时间里替换文件。这里把「复验 →
+    // 复制」的窗口压到微秒级。手工安装不传摘要，行为与从前一致。
+    if let Some(expected) = self_sha256 {
+        verify_sha256(&service_exe, expected)?;
+    }
+    if let Some(expected) = gui_sha256 {
+        verify_sha256(&gui_exe, expected)?;
+    }
 
     // 1) 先停掉正在跑的服务：旧实例占着 exe 文件，不先停就替换不了（`std::fs::copy`
     //    覆盖一个正在运行的 exe 会失败——升级路径必须走这一步）。
@@ -1000,6 +1029,23 @@ fn locate_gui_exe(explicit: Option<&Path>, service_exe: &Path) -> Result<PathBuf
     ))
 }
 
+/// 复验文件 SHA-256（大小写不敏感）。不一致时**拒绝安装**——这是自更新路径上
+/// 「用户点 UAC『是』之前暂存文件被替换」的唯一兜底。
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    use sha2::Digest as _;
+    let bytes =
+        std::fs::read(path).map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
+    let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} 的 SHA-256 与期望不符（期望 {expected}，实际 {actual}），已拒绝安装。\
+         更新包可能在下载后、提权前被改动。",
+        path.display()
+    ))
+}
+
 /// 复制一个 exe（目标目录必须已经存在且加固过）。
 fn copy_exe(from: &Path, to: &Path) -> Result<(), String> {
     if from == to {
@@ -1074,7 +1120,10 @@ fn register_service(installed_service: &Path) -> Result<(), String> {
         })?;
     }
     // 参数是**编译期常量**（见 `SERVICE_RUN_ARGS`）。
-    let extra_args: Vec<String> = SERVICE_RUN_ARGS.iter().map(|arg| String::from(*arg)).collect();
+    let extra_args: Vec<String> = SERVICE_RUN_ARGS
+        .iter()
+        .map(|arg| String::from(*arg))
+        .collect();
     install_with_retry(installed_service, &extra_args)
 }
 

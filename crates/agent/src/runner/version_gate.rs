@@ -163,6 +163,28 @@ pub fn client_supports_update(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_UPDATE_CLIENT_VERSION)
 }
 
+/// 首个「能理解 `ClientUpdateAvailable.files` 里同时含 GUI 与无人值守服务 exe
+/// 两份产物」的客户端版本。
+///
+/// 0.15–0.19 的客户端在 `on_available` 里只按平台挑**第一个**匹配文件，然后就把
+/// 它当作自己的 GUI 去替换。若服务端对它们也下发服务 exe，它们会拿
+/// `rust-tunnel-client-service-windows-x86_64.exe` 覆盖自己的 GUI 主程序——所以
+/// 服务端**只**对 ≥ 此版本的客户端附加服务文件。
+///
+/// 这道门控**只在服务端**生效：线上协议没有新增任何变体（`ClientUpdateFile` /
+/// `ClientUpdateChunk` 字节形状不变），只是 `files` 里多一个元素。因此新服务端可以
+/// 先于客户端部署，老客户端收到的内容与今天逐字节一致。
+pub const MIN_SERVICE_UPDATE_CLIENT_VERSION: (u64, u64, u64) = (0, 20, 0);
+
+/// 客户端版本是否理解「GUI + 服务 exe 两段式更新」；缺失/非法视为不支持
+/// （保守策略：老客户端会把服务 exe 当成自己的 GUI 去替换）。
+#[must_use]
+pub fn client_supports_service_update(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_SERVICE_UPDATE_CLIENT_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +300,21 @@ mod tests {
         assert!(!client_supports_update(Some("0.14.99")));
         assert!(!client_supports_update(None));
         assert!(!client_supports_update(Some("garbage")));
+    }
+
+    #[test]
+    fn test_client_supports_service_update() {
+        assert!(client_supports_service_update(Some("0.20.0")));
+        assert!(client_supports_service_update(Some("v0.20.0")));
+        // 回归：agent 模式版本后缀 +agent 不得破坏版本门控。
+        assert!(client_supports_service_update(Some("0.20.0+agent")));
+        assert!(client_supports_service_update(Some("1.0.0")));
+        // 0.19.x 及更早的客户端只认 `files` 里的第一个匹配文件，服务 exe 会被
+        // 它们当作自己的 GUI 替换掉——绝不能下发。
+        assert!(!client_supports_service_update(Some("0.19.9")));
+        assert!(!client_supports_service_update(Some("0.15.0")));
+        assert!(!client_supports_service_update(None));
+        assert!(!client_supports_service_update(Some("garbage")));
     }
 
     // ── agent_result_to_text WriteOutcome ───────────────────

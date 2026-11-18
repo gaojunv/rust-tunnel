@@ -106,6 +106,14 @@ struct GuiApp {
     /// 上一帧看到的「可用更新版本」。用于检测新版本首次出现时强制显示并聚焦窗口
     /// （窗口可能已隐藏到托盘，更新提示不能只在后台）。
     last_update_version: Option<String>,
+    /// 自更新替换任务（后台线程）的结果通道。`Some` = 正在更新（先服务、后客户端）。
+    ///
+    /// 替换要提权跑一次服务安装器并等它结束（UAC + 复制 + 停服务），放 UI 线程上就是
+    /// 「界面无响应」，所以走后台线程、每帧轮询。
+    apply_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// 已下载待安装的更新包。替换失败（例如用户取消 UAC）后保留，供「重试」直接再装，
+    /// 不必重新下载一遍——两端都不更新是刻意的策略，用户点重试就该接着装同一个包。
+    retry_staged: Option<update::StagedUpdate>,
     /// 日志页的本地筛选状态（等级/关键词/暂停自动滚动）。
     logs_state: ui::logs::LogsState,
     /// 映射页的本地状态（搜索词 + 已展开规则）。
@@ -146,6 +154,8 @@ impl GuiApp {
             last_pending_approval: None,
             service_ui: service_ui::ServiceOps::default(),
             last_update_version: None,
+            apply_rx: None,
+            retry_staged: None,
             logs_state: ui::logs::LogsState::default(),
             map_state: initial_map_state(),
             status_history: ui::status::StatusHistory::default(),
@@ -208,7 +218,12 @@ impl GuiApp {
     fn apply_update_action(&mut self, action: ui::update::UpdateAction, ctx: &egui::Context) {
         match action {
             ui::update::UpdateAction::Download => {
-                if let Err(e) = self.app_state.update.start_download() {
+                // 已经下载过（上一次替换失败，例如取消 UAC）：直接重装同一个包，
+                // 不再走一遍几十 MB 的下载。
+                if let Some(staged) = self.retry_staged.clone() {
+                    self.app_state.update.clear_error();
+                    self.begin_apply(staged);
+                } else if let Err(e) = self.app_state.update.start_download() {
                     self.app_state.update.fail(e);
                 }
             }
@@ -238,6 +253,16 @@ impl GuiApp {
             ui::update::UpdateAction::ClearError => self.app_state.update.clear_error(),
         }
         ctx.request_repaint();
+    }
+
+    /// 起后台任务执行整包替换（Windows 上先提权更新无人值守服务，再替换 GUI）。
+    ///
+    /// 结果由 [`eframe::App::update`] 每帧轮询：成功就退出本进程（updater 会重启新版本），
+    /// 失败则把错误显示在更新弹窗里，并保留 `retry_staged` 供重试。
+    fn begin_apply(&mut self, staged: update::StagedUpdate) {
+        self.app_state.update.mark_applying();
+        self.retry_staged = Some(staged.clone());
+        self.apply_rx = Some(update::spawn_apply(staged));
     }
 }
 
@@ -493,23 +518,45 @@ impl eframe::App for GuiApp {
         // 抽干服务操作的结果通道：一次 --install 要跑约二十秒，结果只能在后续帧里看到。
         self.service_ui.poll();
 
-        // 自更新：到点自动检查；已校验完成的包在这里执行替换并退出。
+        // 自更新：到点自动检查；已校验完成的包在后台线程执行替换（先服务、后客户端）。
         self.app_state
             .update
             .maybe_check(self.prefs.update_auto_check);
-        if let Some(staged) = self.app_state.update.take_staged() {
-            match update::apply_and_restart(&staged.path) {
-                Ok(()) => {
-                    tracing::info!(version = %staged.version, "更新包已就绪，正在重启应用");
+        if self.apply_rx.is_none() {
+            if let Some(staged) = self.app_state.update.take_staged() {
+                self.begin_apply(staged);
+            }
+        }
+        // 先把接收端取出来再 match：否则 `rx` 的可变借用会挡住下面改 `self.apply_rx`。
+        if let Some(rx) = self.apply_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    let version = self
+                        .retry_staged
+                        .as_ref()
+                        .map_or("", |staged| staged.version.as_str());
+                    tracing::info!(version, "更新已就绪，正在重启应用");
                     self.app_state
                         .should_exit
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
+                    self.app_state.update.clear_applying();
                     tracing::error!("应用更新失败：{e}");
                     self.app_state.update.fail(e);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.apply_rx = Some(rx);
+                    // 提权对话框 / 复制 exe 都要时间：保持重绘，别让弹窗停在旧帧上。
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.app_state.update.clear_applying();
+                    self.app_state
+                        .update
+                        .fail("更新任务异常结束，请重试".to_owned());
                 }
             }
         }

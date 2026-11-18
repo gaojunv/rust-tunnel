@@ -34,6 +34,7 @@ rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务�
                          服务是自动启动的，故「开机停在登录界面」那一趟的做法是：
                          装一次（本命令）→ 重启机器 → 登录后看报告。
   --install [--gui-exe <路径>] [--host-config <路径>] [--start]
+            [--gui-sha256 <摘要>] [--self-sha256 <摘要>]
                          安装无人值守被控端：把服务 exe 与实例（GUI）exe 复制到
                          %ProgramFiles%\\rust-tunnel\\（DACL 收敛到 SYSTEM + Administrators）、
                          建好 %ProgramData%\\rust-tunnel\\ 与它的 DACL，再把服务注册成自动启动。
@@ -47,6 +48,10 @@ rust-tunnel-client-service —— Windows 无人值守被控端（SYSTEM 服务�
                          省略时仍按老流程：装完要自己写 host.toml（token 只有服务端 Web 能给）。
                          --start 安装成功后立刻启动服务（需要 host.toml 已就位，否则服务会
                          拒跑并自停——见上面的闸门说明）。
+                         --gui-sha256 / --self-sha256 是**自更新时**传的期望摘要：复制前
+                         逐个复验源文件，不一致就拒绝安装。提权进程读的是用户临时目录里
+                         的暂存文件，这一步把「用户在 UAC 上点『是』之前文件被替换」的窗口
+                         压到几乎为零；手工安装不传这两个参数。
   --uninstall            卸载服务（幂等；服务不在也算成功）。**不删**已复制到
                          %ProgramFiles% / %ProgramData% 的文件。
   --start                启动已安装的服务（StartServiceW），并**确认它真的在跑**：看到
@@ -120,6 +125,10 @@ pub enum Command {
         host_config: Option<String>,
         /// 安装成功后立刻启动服务（需要 `host_config` 已就位）。
         start: bool,
+        /// 期望的实例 exe 摘要（自更新时传；复制前复验）。
+        gui_sha256: Option<String>,
+        /// 期望的**本 exe**（服务 exe）摘要（自更新时传；复制前复验）。
+        self_sha256: Option<String>,
     },
     /// `--uninstall`。
     Uninstall,
@@ -138,6 +147,8 @@ fn parse_install(rest: &[&str]) -> Result<Command, String> {
     let mut gui_exe: Option<String> = None;
     let mut host_config: Option<String> = None;
     let mut start = false;
+    let mut gui_sha256: Option<String> = None;
+    let mut self_sha256: Option<String> = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index] {
@@ -148,19 +159,26 @@ fn parse_install(rest: &[&str]) -> Result<Command, String> {
                 start = true;
                 index += 1;
             }
-            flag @ ("--gui-exe" | "--host-config") => {
+            flag @ ("--gui-exe" | "--host-config" | "--gui-sha256" | "--self-sha256") => {
                 let Some(value) = rest.get(index + 1) else {
-                    return Err(format!("{flag} 后面缺少路径"));
+                    return Err(format!("{flag} 后面缺少参数"));
                 };
-                // 下一个 token 又是个选项：同样按「缺路径」处理，避免把 `--start`
-                // 当成路径写进安装参数。
+                // 下一个 token 又是个选项：同样按「缺值」处理，避免把 `--start`
+                // 当成路径/摘要写进安装参数。
                 if value.starts_with("--") {
-                    return Err(format!("{flag} 后面缺少路径（收到的是「{value}」）"));
+                    return Err(format!("{flag} 后面缺少参数（收到的是「{value}」）"));
                 }
-                let slot = if flag == "--gui-exe" {
-                    &mut gui_exe
-                } else {
-                    &mut host_config
+                let is_hash = matches!(flag, "--gui-sha256" | "--self-sha256");
+                if is_hash && !is_sha256_hex(value) {
+                    return Err(format!(
+                        "{flag} 必须是 64 位十六进制 SHA-256，收到的是「{value}」"
+                    ));
+                }
+                let slot = match flag {
+                    "--gui-exe" => &mut gui_exe,
+                    "--host-config" => &mut host_config,
+                    "--gui-sha256" => &mut gui_sha256,
+                    _ => &mut self_sha256,
                 };
                 if slot.is_some() {
                     return Err(format!("{flag} 重复了"));
@@ -171,7 +189,7 @@ fn parse_install(rest: &[&str]) -> Result<Command, String> {
             other => {
                 return Err(format!(
                     "--install 不认识参数「{other}」。可用：--gui-exe <路径>、\
-                     --host-config <路径>、--start"
+                     --host-config <路径>、--gui-sha256 <摘要>、--self-sha256 <摘要>、--start"
                 ));
             }
         }
@@ -180,7 +198,14 @@ fn parse_install(rest: &[&str]) -> Result<Command, String> {
         gui_exe,
         host_config,
         start,
+        gui_sha256,
+        self_sha256,
     })
+}
+
+/// 是否是 64 位十六进制 SHA-256（大小写都认）。
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// 解析命令行（不含 argv[0]）。
@@ -268,6 +293,8 @@ mod tests {
                 gui_exe: None,
                 host_config: None,
                 start: false,
+                gui_sha256: None,
+                self_sha256: None,
             }
         );
         assert_eq!(
@@ -276,6 +303,8 @@ mod tests {
                 gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe")),
                 host_config: None,
                 start: false,
+                gui_sha256: None,
+                self_sha256: None,
             }
         );
         assert_eq!(
@@ -284,6 +313,8 @@ mod tests {
                 gui_exe: None,
                 host_config: Some(String::from("C:\\dl\\host.toml")),
                 start: true,
+                gui_sha256: None,
+                self_sha256: None,
             }
         );
         assert_eq!(
@@ -296,6 +327,8 @@ mod tests {
                 gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe")),
                 host_config: Some(String::from("C:\\dl\\host.toml")),
                 start: true,
+                gui_sha256: None,
+                self_sha256: None,
             },
             "三个选项应当可以任意顺序组合"
         );
@@ -315,6 +348,38 @@ mod tests {
         // `--host-config` 同理。
         let err = parse_str("--host-config C:\\host.toml").unwrap_err();
         assert!(err.contains("--install"), "{err}");
+    }
+
+    /// 自更新传的两个摘要必须原样进 `Install`，且形状不对直接拒绝
+    /// （它决定「复制前复验」是否真的发生，静默忽略等于没有这道闸门）。
+    #[test]
+    fn install_accepts_sha256_digests_for_the_update_path() {
+        let digest = "a".repeat(64);
+        let parsed = parse_str(&format!(
+            "--install --gui-exe C:\\dl\\rust-tunnel-client-gui.exe \
+             --gui-sha256 {digest} --self-sha256 {digest} --start"
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Command::Install {
+                gui_exe: Some(String::from("C:\\dl\\rust-tunnel-client-gui.exe")),
+                host_config: None,
+                start: true,
+                gui_sha256: Some(digest.clone()),
+                self_sha256: Some(digest),
+            }
+        );
+        // 形状不对（长度 / 非十六进制）必须报错，而不是当成「没传」。
+        assert!(parse_str("--install --gui-sha256 abc").is_err());
+        assert!(parse_str(&format!("--install --self-sha256 {}", "z".repeat(64))).is_err());
+        assert!(parse_str("--install --gui-sha256").is_err());
+        assert!(parse_str(&format!(
+            "--install --gui-sha256 {} --gui-sha256 {}",
+            "a".repeat(64),
+            "b".repeat(64)
+        ))
+        .is_err());
     }
 
     #[test]
@@ -372,6 +437,8 @@ mod tests {
             "--install",
             "--gui-exe",
             "--host-config",
+            "--gui-sha256",
+            "--self-sha256",
             "--start",
             "--uninstall",
             "--start",

@@ -25,6 +25,19 @@
 //! 只在收到过服务端的更新消息后才上行 `ClientUpdateCheck` / `ClientUpdateRequest`。
 //! 服务端即使「已是最新」也**必须**回一条 [`ControlMessage::ClientUpdateUpToDate`]，
 //! 正是为了让客户端拿到「对端理解更新协议」的凭据——否则客户端永远不会主动检查。
+//!
+//! # 两段式产物：GUI + 无人值守服务 exe
+//!
+//! Windows 上 GUI 主程序与无人值守服务 exe（
+//! `rust-tunnel-client-service-windows-x86_64.exe`）是一起发布的：同一次更新里两者
+//! 都要换，否则 GUI 与服务会各自停在不同的版本上。故 `ClientUpdateAvailable.files`
+//! 在 Windows 归档里会出现**两个**元素，且 GUI 在前、服务在后。
+//!
+//! 但 0.15–0.19 的客户端只会取 `files` 里**第一个**平台匹配的文件替换自己，服务 exe
+//! 若排在前面（或单独出现）就会被当成 GUI 装下去。因此服务文件只对
+//! ≥ [`crate::agent::runner::MIN_SERVICE_UPDATE_CLIENT_VERSION`] 的客户端附加，见
+//! [`client_supports_service_update`]；这道门控**不引入任何线上变体**，老客户端收到的
+//! 内容与今天逐字节一致。
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -33,7 +46,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, warn};
 
-use crate::agent::runner::{client_supports_update, parse_version};
+use crate::agent::runner::{client_supports_service_update, client_supports_update, parse_version};
 use crate::control_plane::client_registry::{ClientEntry, ControlSender};
 use crate::control_plane::state::ServerState;
 use crate::mgmt::api::client_downloads::{
@@ -56,7 +69,8 @@ pub(crate) enum UpdateDecision {
     Available {
         /// 最新版本目录名（如 `v0.15.0`）。
         version: String,
-        /// 可自动替换的文件清单，全部带 SHA-256。
+        /// 可自动替换的文件清单，全部带 SHA-256。GUI 主程序在前；对新客户端还会
+        /// 追加无人值守服务 exe（见 [`is_service_update_file`]）。
         files: Vec<ClientUpdateFile>,
     },
     /// 客户端已是最新，或归档里没有更新的可用 GUI 版本。
@@ -75,8 +89,13 @@ pub(crate) enum UpdateDecision {
 ///
 /// - 客户端版本缺失、非法或低于最低支持版本 → [`UpdateDecision::Unsupported`]；
 /// - 存在严格高于客户端版本、且至少含一个可自动替换文件的版本 → `Available`，
-///   只把可自动替换的文件下发（缺 SHA-256 的一律跳过）；
+///   只把可自动替换的文件下发（缺 SHA-256 的一律跳过）；对
+///   [`client_supports_service_update`] 为真的客户端，再追加同版本里的服务 exe
+///   （GUI 始终排在前面）；
 /// - 否则 `UpToDate`，版本号取归档里最新的可用 GUI 版本，没有则回显客户端版本。
+///
+/// 注意「版本是否更新」仍只由**GUI 产物**决定：一个只有服务 exe 的版本目录不算
+/// 更新，否则老客户端会收到一个 `files` 为空、或只有服务文件的 `Available`。
 #[must_use]
 pub(crate) fn select_update(
     client_version: Option<&str>,
@@ -100,15 +119,29 @@ pub(crate) fn select_update(
     });
 
     match newer {
-        Some(version) => UpdateDecision::Available {
-            version: version.version.clone(),
-            files: version
+        Some(version) => {
+            let mut files: Vec<ClientUpdateFile> = version
                 .files
                 .iter()
                 .filter(|file| is_auto_update_file(file))
                 .filter_map(to_wire_file)
-                .collect(),
-        },
+                .collect();
+            // 服务 exe 是**附加**产物：只有理解「files 里第二份是服务」的客户端才
+            // 能拿到。老客户端会把第一个平台匹配的文件当成自己的 GUI 去替换。
+            if client_supports_service_update(client_version) {
+                files.extend(
+                    version
+                        .files
+                        .iter()
+                        .filter(|file| is_service_update_file(file))
+                        .filter_map(to_wire_file),
+                );
+            }
+            UpdateDecision::Available {
+                version: version.version.clone(),
+                files,
+            }
+        }
         None => UpdateDecision::UpToDate {
             version: newest_with_files.map_or_else(
                 || client_version.unwrap_or_default().to_string(),
@@ -127,6 +160,22 @@ fn to_wire_file(file: &ClientDownloadFile) -> Option<ClientUpdateFile> {
         size: file.size,
         sha256: file.sha256.clone()?,
     })
+}
+
+/// 无人值守服务 exe：只在 Windows 上能自动安装，且始终随 `SHA256SUMS` 发布。
+///
+/// 三个条件与 [`is_auto_update_file`] 同样严格：文件名前缀把它与 GUI / CLI 产物
+/// 区分开；`format == "exe"` 排除单包 zip（本机自更新**不做解包**）；64 位十六进制
+/// 摘要保证客户端替换前能校验。服务 exe 是附加产物——服务端只对
+/// [`client_supports_service_update`] 为真的客户端下发它。
+#[must_use]
+fn is_service_update_file(file: &ClientDownloadFile) -> bool {
+    file.name.starts_with("rust-tunnel-client-service-")
+        && file.format.as_deref() == Some("exe")
+        && file
+            .sha256
+            .as_deref()
+            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// 注册后/客户端主动检查时，下发最新 GUI 版本或「已是最新」。
@@ -214,9 +263,10 @@ pub(crate) async fn handle_update_request(
             }
         };
 
-    // 即便路径合法，也只放行能就地替换的 GUI 主程序（`SHA256SUMS`、zip、dmg、
-    // CLI 二进制与服务 exe 一律拒绝）。
-    if !is_safe_segment(file) || !is_directly_replaceable(file) {
+    // 即便路径合法，也只放行能就地替换的产物：GUI 主程序任何时候都行；服务 exe
+    // 只对新客户端放行（`SHA256SUMS`、zip、dmg、CLI 二进制一律拒绝）。
+    if !is_safe_segment(file) || !is_requestable_update_file(file, entry.client_version.as_deref())
+    {
         entry.update_transfer_active.store(false, Ordering::SeqCst);
         send_failure(entry, transfer_id, "该文件不支持自动更新".to_string()).await;
         return;
@@ -245,13 +295,32 @@ pub(crate) async fn handle_update_request(
     });
 }
 
+/// 请求侧可放行的文件判据：GUI 主程序任何时候都可以；服务 exe 只对理解两段式
+/// 更新（[`client_supports_service_update`]）的客户端放行。
+///
+/// 老客户端不会请求服务 exe（服务端从不向它们通告它），这里再拒一次是 **fail-closed**：
+/// 即便有人手工构造 `ClientUpdateRequest`，也不能把服务 exe 拉到本地冒充 GUI。
+fn is_requestable_update_file(file: &str, client_version: Option<&str>) -> bool {
+    is_directly_replaceable(file)
+        || (client_supports_service_update(client_version) && is_directly_replaceable_service(file))
+}
+
 /// 与 [`is_auto_update_file`] 的命名/扩展名部分同构：只放行 GUI 主程序（`.exe`
 /// 或无扩展名的裸二进制）。
 fn is_directly_replaceable(file: &str) -> bool {
-    file.starts_with("rust-tunnel-client-gui-")
-        && file
-            .rsplit_once('.')
-            .is_none_or(|(_, ext)| ext.eq_ignore_ascii_case("exe"))
+    file.starts_with("rust-tunnel-client-gui-") && is_exe_or_extensionless(file)
+}
+
+/// 请求侧的服务 exe 放行：命名与扩展名口径同 [`is_service_update_file`]，但请求里
+/// 只有文件名（摘要与 format 已在归档扫描时校验过）。
+fn is_directly_replaceable_service(file: &str) -> bool {
+    file.starts_with("rust-tunnel-client-service-") && is_exe_or_extensionless(file)
+}
+
+/// 文件名是否以 `.exe` 结尾或无扩展名（本机自更新不做解包）。
+fn is_exe_or_extensionless(file: &str) -> bool {
+    file.rsplit_once('.')
+        .is_none_or(|(_, ext)| ext.eq_ignore_ascii_case("exe"))
 }
 
 /// 尽力回传失败原因；控制通道已关闭时静默丢弃。
@@ -318,6 +387,18 @@ mod tests {
             arch: "x86_64".into(),
             format: Some("exe".into()),
             size: 4096,
+            sha256: sha256.map(str::to_string),
+        }
+    }
+
+    /// 造一个无人值守服务 exe 文件描述。
+    fn service_exe(name: &str, sha256: Option<&str>) -> ClientDownloadFile {
+        ClientDownloadFile {
+            name: name.to_string(),
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            format: Some("exe".into()),
+            size: 8192,
             sha256: sha256.map(str::to_string),
         }
     }
@@ -531,5 +612,103 @@ mod tests {
         assert!(!is_directly_replaceable(
             "rust-tunnel-client-service-windows-x86_64.exe"
         ));
+    }
+
+    #[test]
+    fn service_exe_is_offered_only_to_new_enough_clients() {
+        let digest = sha();
+        let versions = vec![version(
+            "v0.20.0",
+            vec![
+                gui_exe("rust-tunnel-client-gui-windows-x86_64.exe", Some(&digest)),
+                service_exe(
+                    "rust-tunnel-client-service-windows-x86_64.exe",
+                    Some(&digest),
+                ),
+            ],
+        )];
+
+        // 0.19 只会拿第一个匹配文件替换自己：绝不能让它看到服务 exe。
+        match select_update(Some("0.19.0"), &versions) {
+            UpdateDecision::Available { files, .. } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].name, "rust-tunnel-client-gui-windows-x86_64.exe");
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+
+        // 0.20 理解两段式清单：GUI 在前、服务在后。
+        // 归档必须是**严格更新**的版本，否则 `select_update` 会正确地回 `UpToDate`。
+        let newer = vec![version(
+            "v0.21.0",
+            vec![
+                gui_exe("rust-tunnel-client-gui-windows-x86_64.exe", Some(&digest)),
+                service_exe(
+                    "rust-tunnel-client-service-windows-x86_64.exe",
+                    Some(&digest),
+                ),
+            ],
+        )];
+        match select_update(Some("0.20.0"), &newer) {
+            UpdateDecision::Available { files, .. } => {
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0].name, "rust-tunnel-client-gui-windows-x86_64.exe");
+                assert_eq!(
+                    files[1].name,
+                    "rust-tunnel-client-service-windows-x86_64.exe"
+                );
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_exe_needs_checksum_and_exe_format() {
+        let digest = sha();
+        let gui = || gui_exe("rust-tunnel-client-gui-windows-x86_64.exe", Some(&digest));
+
+        // 缺校验和：服务 exe 不能进清单（客户端无法校验就不许替换）。
+        // 归档版本必须严格高于客户端，否则判定结果会是 `UpToDate`。
+        let versions = vec![version(
+            "v0.21.0",
+            vec![
+                gui(),
+                service_exe("rust-tunnel-client-service-windows-x86_64.exe", None),
+            ],
+        )];
+        match select_update(Some("0.20.0"), &versions) {
+            UpdateDecision::Available { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("expected Available, got {other:?}"),
+        }
+
+        // format 不是 exe（单包 zip 需解包）：同样不下发，即便摘要齐备。
+        let mut zipped = service_exe(
+            "rust-tunnel-client-service-windows-x86_64.zip",
+            Some(&digest),
+        );
+        zipped.format = Some("zip".into());
+        let versions = vec![version("v0.21.0", vec![gui(), zipped])];
+        match select_update(Some("0.20.0"), &versions) {
+            UpdateDecision::Available { files, .. } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].name, "rust-tunnel-client-gui-windows-x86_64.exe");
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_request_is_accepted_for_new_clients() {
+        let gui = "rust-tunnel-client-gui-windows-x86_64.exe";
+        let service = "rust-tunnel-client-service-windows-x86_64.exe";
+
+        // GUI 主程序：新老客户端都可以请求。
+        assert!(is_requestable_update_file(gui, Some("0.19.0")));
+        assert!(is_requestable_update_file(gui, Some("0.20.0")));
+
+        // 服务 exe：只有理解两段式更新的客户端可以请求（老客户端 fail-closed）。
+        assert!(!is_requestable_update_file(service, Some("0.19.0")));
+        assert!(is_requestable_update_file(service, Some("0.20.0")));
+        assert!(!is_requestable_update_file(service, None));
     }
 }
