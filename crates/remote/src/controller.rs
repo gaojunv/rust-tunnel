@@ -382,7 +382,14 @@ pub(crate) async fn run_controller_with_input(
     // 不会在任何一次网络写上阻塞——对端停读/中继停走时，读画面、心跳、输入仍能继续轮询。
     // `queues` 与写任务共享同一组通道；`file_staging` 保证文件块在队列满时不丢字节。
     let (mut queues, receivers) = OutboundQueues::new();
-    let writer_task = tokio::spawn(writer_loop(writer, receivers, cancel.clone(), None));
+    let writer_task = tokio::spawn(writer_loop(
+        writer,
+        receivers,
+        cancel.clone(),
+        None,
+        // 控制器不产生 IDR（它只发输入/心跳/文件消息），IDR 去重是**被控端**的发送侧策略。
+        None,
+    ));
 
     // 解码任务：解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
     // 被它占住。故把解码挪到独立任务，循环只把原始载荷投进有界队列，输入/心跳照常得到轮询。
