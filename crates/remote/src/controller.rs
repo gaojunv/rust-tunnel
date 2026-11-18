@@ -108,6 +108,13 @@ const QOS_INTERVAL: Duration = Duration::from_secs(1);
 /// 几 KB，取决于编码器与码率控制模式，可忽略）。请求本身也按同一窗口限频，避免刷屏。
 const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 慢解码判据（微秒）：超过它才把解码的四段细分打进延迟日志。
+///
+/// 真机上 p50 只有 6.5 ms，正常帧没必要刷四行数字；而 300–500 ms 的停顿一次都不能漏。
+/// 取 100 ms 与延迟诊断的默认慢帧阈值（`RUST_TUNNEL_LATENCY_SLOW_MS`）同量级，
+/// 又与「体感卡顿」的门槛相当。
+const SLOW_DECODE_US: u64 = 100_000;
+
 /// 一条待解码的画面载荷（尚未解码）。
 enum DecodeJob {
     /// 被控端选定 codec（`CodecSelect`）。解码任务据此换解码器；新 codec 的码流仍从关键帧起步。
@@ -1401,6 +1408,9 @@ async fn decode_loop(
     // 关键帧请求限频状态：上次真正发出的时刻、被限频挂起的显示器。
     let mut last_kf_request: Option<Instant> = None;
     let mut kf_pending: Option<(u32, KeyframeReason)> = None;
+    // 上一次**解码完成**的时刻（`now_us()`）。真机的 300–505 ms 单帧停顿 18/18 次都出现在
+    // 「距上一帧超过 600 ms 的空闲」之后，故把空闲间隔一并打进逐帧日志，现场才能对上号。
+    let mut last_decode_done_us: u64 = 0;
     // 诊断开关**每帧读一次**（Relaxed 原子）：设置页运行中切换立即生效（见 [`crate::latency`]）。
     // 定期检查挂起的请求：距上次请求已满一个窗口就发出去，保证不会永久等 IDR。
     let mut kf_tick = tokio::time::interval_at(
@@ -1786,14 +1796,20 @@ async fn decode_loop(
         let Some(mut dec) = decoder.take() else {
             continue;
         };
+        // 本次解码开始前的空闲间隔：上一帧解码完成 → 现在。`0` = 本次会话首个可解码帧。
+        let idle = idle_ms(now_us(), last_decode_done_us);
         let blocking_result = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             let result = dec.decode(&data);
             (dec, result, started.elapsed())
         })
         .await;
+        let decode_done_us = now_us();
         match blocking_result {
             Ok((dec, Ok(Some(frame)), elapsed)) => {
+                // 子阶段读数要在把解码器放回 `decoder` 之前读（`decoder` 另行持有它）。
+                // 纯观测：只进日志，不参与任何决策。
+                let phase = dec.last_decode_timings();
                 decoder = Some(dec);
                 let decode_ms = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
                 decode_shared.decode_ms.store(decode_ms, Ordering::Relaxed);
@@ -1821,15 +1837,31 @@ async fn decode_loop(
                     if latency::frame_logs() || e2e_micros > latency::slow_threshold_us() {
                         info!(
                             target: "latency",
-                            "controller seq={} idr={} bytes={} recv_q_us={} dec_us={} capture_to_recv_ms={} e2e_ms={} backlog={}",
+                            "controller seq={} idr={} bytes={} recv_q_us={} idle_ms={} dec_us={} capture_to_recv_ms={} e2e_ms={} backlog={}",
                             seq,
                             flags & VIDEO_FLAG_KEYFRAME != 0,
                             packet_bytes,
                             recv_q_us,
+                            idle,
                             decode_micros,
                             elapsed_ms(recv_us, offset, capture_ts_us),
                             e2e_ms,
                             u32::try_from(rx.len()).unwrap_or(u32::MAX)
+                        );
+                    }
+                    // 慢帧才打四段细分：空闲后的第一帧到底卡在 MFT 出帧、GPU 回读，
+                    // 还是 CPU 转换，全在这一行里。默认实现（VP9）四项全 0。
+                    if decode_micros > SLOW_DECODE_US {
+                        info!(
+                            target: "latency",
+                            "controller_decode_slow seq={} idle_ms={} dec_us={} submit_us={} output_us={} readback_us={} color_us={}",
+                            seq,
+                            idle,
+                            decode_micros,
+                            phase.submit_us,
+                            phase.output_us,
+                            phase.readback_us,
+                            phase.color_us
                         );
                     }
                 }
@@ -1894,6 +1926,9 @@ async fn decode_loop(
                 );
             }
         }
+        // 下一次「空闲间隔」的起点。失败/panic 也算一次解码尝试完成——它们同样结束了
+        // 「解码器闲着」的状态，不计的话下一次正常解码会被报成超长空闲。
+        last_decode_done_us = decode_done_us;
     }
 }
 
@@ -1981,6 +2016,18 @@ fn decode_region_rect(
         height,
         nv12,
     })
+}
+
+/// 两次解码完成之间的空闲间隔（毫秒），**纯函数**便于单测。
+///
+/// `last_done_us == 0` 是「本会话还没解码过」的哨兵，返回 0（不能拿进程启动至今去减，
+/// 否则首个可解码帧会被报成一个巨大的空闲）。时钟倒退同样饱和成 0：这里只描述
+/// 「闲置了多久」，负值是毫无意义的噪声，不该在日志里变成天文数字。
+fn idle_ms(now_us: u64, last_done_us: u64) -> u64 {
+    if last_done_us == 0 {
+        return 0;
+    }
+    now_us.saturating_sub(last_done_us) / 1000
 }
 
 /// 解码队列当前积压的载荷数（[`DECODE_QUEUE`] 减去剩余容量）。
@@ -3393,6 +3440,19 @@ mod tests {
         assert_eq!(since_idr_ms(10_000_000, 0), None);
         assert_eq!(since_idr_ms(10_000_000, 9_600_000), Some(400));
         assert_eq!(since_idr_ms(10_000_000, 10_001_000), Some(0));
+    }
+
+    /// 空闲间隔：未解码过给 0（哨兵）、正常取整到毫秒、时钟倒退饱和为 0。
+    #[test]
+    fn idle_ms_handles_sentinel_truncates_and_saturates() {
+        // 本会话还没解码过：不能用「进程启动至今」当空闲。
+        assert_eq!(idle_ms(10_000_000, 0), 0);
+        // 正常：上一帧解码完成于 600 ms 前。
+        assert_eq!(idle_ms(10_000_000, 9_400_000), 600);
+        // 亚毫秒截断，与日志里其余毫秒读数一致。
+        assert_eq!(idle_ms(10_000_000, 9_999_500), 0);
+        // 时间倒退（理论上不该发生）：饱和为 0，不出现天文数字。
+        assert_eq!(idle_ms(1_000, 2_000), 0);
     }
 
     /// 老化判据的常量由真机数据标定（见各常量的文档），改动必须同步这里：

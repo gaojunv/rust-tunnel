@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use rust_tunnel_remote::codec::{
-    VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
+    DecodeTimings, VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
 use rust_tunnel_remote::screen::{
     CaptureInfo, CapturedPatches, CursorShape, DecoderInfo, EncoderInfo, ScreenPatch,
@@ -39,7 +39,7 @@ use rust_tunnel_remote::{
 use rust_tunnel_win_video::capture::{self, BgraReadback, CaptureSource};
 use rust_tunnel_win_video::d3d11;
 use rust_tunnel_win_video::decode::{
-    H264DecodePath, H264Decoder, H264HardwarePreference, H264OutputMode,
+    DecodePhaseTimings, H264DecodePath, H264Decoder, H264HardwarePreference, H264OutputMode,
 };
 use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
@@ -1736,8 +1736,7 @@ impl VideoDecoderApi for H264DecoderAdapter {
             .map_err(|err| RemoteError::Encode(format!("H.264 解码失败: {err}")))?;
         let total_ms = elapsed_ms(total_started);
         // 在结束 `decoder` 的可变借用前读出诊断读数与通路名。
-        let readback_ms = decoder.last_readback_ms();
-        let color_ms = decoder.last_color_ms();
+        let timings = decoder.last_phase_timings();
         let path = decoder.path().as_str();
         let Some(frame) = frame else {
             // MFT 还在缓冲输入，本帧没有输出；不计数、不打日志。
@@ -1745,9 +1744,16 @@ impl VideoDecoderApi for H264DecoderAdapter {
         };
         self.frames = self.frames.saturating_add(1);
         // 只在前 3 帧与每 120 帧打一条（GUI 日志层会丢弃 tracing 字段，全部内联）。
+        // 四段用微秒：回读/转换常在毫秒以下，毫秒取整会把它们全显示成 0。
         if self.frames <= 3 || self.frames.is_multiple_of(120) {
+            let DecodePhaseTimings {
+                submit_us,
+                output_us,
+                readback_us,
+                color_us,
+            } = timings;
             info!(
-                "H.264 解码细分 总计={total_ms}ms 回读={readback_ms}ms 打包={color_ms}ms 尺寸={}x{} path={path}",
+                "H.264 解码细分 总计={total_ms}ms 送包={submit_us}us 出帧={output_us}us 回读={readback_us}us 转换={color_us}us 尺寸={}x{} path={path}",
                 frame.width, frame.height,
             );
         }
@@ -1763,6 +1769,23 @@ impl VideoDecoderApi for H264DecoderAdapter {
             rgba: frame.rgba,
             nv12,
         }))
+    }
+
+    /// 把 MFT 解码的四个子阶段读数原样交给控制器（逐字段映射，micros）。
+    ///
+    /// 没有解码器实例时返回默认全 0——此时说任何读数都是编的。控制端只在慢帧
+    /// 日志里用它，**不参与任何决策**。
+    fn last_decode_timings(&self) -> DecodeTimings {
+        let Some(decoder) = self.decoder.as_ref() else {
+            return DecodeTimings::default();
+        };
+        let timings = decoder.last_phase_timings();
+        DecodeTimings {
+            submit_us: timings.submit_us,
+            output_us: timings.output_us,
+            readback_us: timings.readback_us,
+            color_us: timings.color_us,
+        }
     }
 }
 
