@@ -42,3 +42,16 @@ futures-util = "0.3"
 # `#[tokio::test(start_paused = true)]` 虚拟时钟（可靠层单测确定性驱动 RTO/重传）。
 # test-util 是加法式 feature，不影响生产构建。
 tokio = { version = "1.0", features = ["test-util"] }
+
+# `examples/loopback_bench.rs`（本机回环压测）要跑真机那条硬件链路：DXGI 采集 +
+# Intel QSV Media Foundation H.264 硬编 + MSH264DecoderMFT/DXVA 解码。`win-video` 不依赖
+# `remote`，所以只能作为本 crate 的 **dev-dependency** 引入（生产依赖图不变）。
+[target.'cfg(windows)'.dev-dependencies]
+rust-tunnel-win-video = { path = "../win-video" }
+# 只给压测窗口用（GDI 绘制 + 30 Hz 消息循环 + DPI 感知 + timeBeginPeriod）。
+# feature 是叠加的：workspace 清单已含 Foundation/Gdi/WindowsAndMessaging。
+windows-sys = { workspace = true, features = [
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_Media",
+] }

@@ -8658,6 +8658,7 @@ dependencies = [
  "rand 0.8.8",
  "rust-tunnel-common",
  "rust-tunnel-rustdesk",
+ "rust-tunnel-win-video",
  "serde",
  "sha2 0.10.9",
  "shiguredo_libvpx",
@@ -8666,6 +8667,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zstd",
 ]
