@@ -20,7 +20,9 @@ use std::time::Instant;
 
 use egui::{RichText, Ui};
 use rust_tunnel_common::protocol::{RemoteMode, RemotePeerInfo};
-use rust_tunnel_remote::{ApprovalPolicy, RemoteManager, RemoteUiState, SessionRole, SessionState};
+use rust_tunnel_remote::{
+    ActiveSessionInfo, ApprovalPolicy, RemoteManager, RemoteUiState, SessionRole, SessionState,
+};
 
 use crate::app::AppState;
 use crate::remote::{self, PermissionKind, ReconnectTarget, RemoteView};
@@ -171,8 +173,8 @@ pub fn show(
             }
             RemoteTab::OtherDevices => {
                 show_reconnect(ui, view, manager);
-                // 控制方的会话摘要只在这个 Tab 出现：它属于「我正在连别人」这条任务线。
-                show_session(ui, view, manager, &state, SessionRole::Controller);
+                // 控制中的会话摘要并进「在线客户端」卡片，直接显示在列表上方（同一张卡，
+                // 不再单独占一张卡片）；被控方的摘要仍留在「本机被控」Tab。
                 show_peers(ui, &state, manager, view);
             }
         });
@@ -481,6 +483,21 @@ fn show_session(
         return;
     }
 
+    widgets::card(ui, |ui| session_body(ui, view, manager, state, active));
+    ui.add_space(10.0);
+}
+
+/// 会话摘要的卡片内容（「控制中」与「被控中」共用）。
+///
+/// 独立的 [`show_session`] 把它包进一张卡片；「连接到其他设备」Tab 则把它直接画进
+/// 「在线客户端」卡片里，让活动会话显示在客户端列表上方，不再单独占一张卡。
+fn session_body(
+    ui: &mut Ui,
+    view: &Arc<Mutex<RemoteView>>,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+    active: &ActiveSessionInfo,
+) {
     // 关键帧请求速率：管理面只累计计数，这里按「累计值差分」每秒结算一次（与帧率同款）。
     // 只有控制器会发关键帧请求；被控端保持 `None`，不显示这一项。
     let keyframe_rate = (active.role == SessionRole::Controller).then(|| {
@@ -494,60 +511,57 @@ fn show_session(
         view.keyframe_rate
     });
 
-    widgets::card(ui, |ui| {
-        let p = palette(ui.style());
-        // 注意与函数参数 `role`（筛选用）区分：这里是要显示的文案。
-        let role_label = match active.role {
-            SessionRole::Controller => "控制中",
-            SessionRole::Controlled => "被控中",
-        };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(role_label)
-                    .font(icons::heading_font(16.0))
-                    .color(p.text),
-            );
-            widgets::badge(
-                ui,
-                state_label(active.state),
-                state_tone(active.state),
-                None,
-            );
-            ui.label(
-                RichText::new(format!("对端：{}", active.peer_name))
-                    .size(12.0)
-                    .color(p.text_weak),
-            );
-        });
-        ui.add_space(6.0);
-        show_latency(ui, state, keyframe_rate);
-
-        if active.role == SessionRole::Controlled {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("本机画面正发送给控制方；如需终止请点「中断会话」。")
-                    .size(12.0)
-                    .color(p.text_weak),
-            );
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            // 控制器才有独立窗口：没打开（最小化 / 关窗后未结束）时给个召回入口。
-            if active.role == SessionRole::Controller
-                && !lock(view).window_open
-                && widgets::button(ui, "显示窗口", None, ButtonKind::Secondary).clicked()
-            {
-                lock(view).window_open = true;
-                ui.ctx()
-                    .send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Focus);
-            }
-            if widgets::button(ui, "中断会话", None, ButtonKind::Danger).clicked() {
-                manager.abort_active();
-            }
-        });
+    let p = palette(ui.style());
+    // 注意与 [`show_session`] 的参数 `role`（筛选用）区分：这里是要显示的文案。
+    let role_label = match active.role {
+        SessionRole::Controller => "控制中",
+        SessionRole::Controlled => "被控中",
+    };
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(role_label)
+                .font(icons::heading_font(16.0))
+                .color(p.text),
+        );
+        widgets::badge(
+            ui,
+            state_label(active.state),
+            state_tone(active.state),
+            None,
+        );
+        ui.label(
+            RichText::new(format!("对端：{}", active.peer_name))
+                .size(12.0)
+                .color(p.text_weak),
+        );
     });
-    ui.add_space(10.0);
+    ui.add_space(6.0);
+    show_latency(ui, state, keyframe_rate);
+
+    if active.role == SessionRole::Controlled {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("本机画面正发送给控制方；如需终止请点「中断会话」。")
+                .size(12.0)
+                .color(p.text_weak),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        // 控制器才有独立窗口：没打开（最小化 / 关窗后未结束）时给个召回入口。
+        if active.role == SessionRole::Controller
+            && !lock(view).window_open
+            && widgets::button(ui, "显示窗口", None, ButtonKind::Secondary).clicked()
+        {
+            lock(view).window_open = true;
+            ui.ctx()
+                .send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Focus);
+        }
+        if widgets::button(ui, "中断会话", None, ButtonKind::Danger).clicked() {
+            manager.abort_active();
+        }
+    });
 }
 
 /// 延迟（按阈值上色）与数据面路径；本端作为**被控端**时另有编码侧读数（阶段 3 QoS）。
@@ -748,6 +762,23 @@ fn show_peers(
             widgets::badge(ui, count.as_str(), Tone::Neutral, None);
         });
         ui.add_space(8.0);
+        // 控制中的会话摘要直接画在列表上方（同一张卡）：用户切到这个 Tab 时，先看到
+        // 「我正在控制谁」，再看到还能连接哪些设备。会话结束后同一位置给出结束原因。
+        if let Some(active) = state
+            .active
+            .as_ref()
+            .filter(|active| active.role == SessionRole::Controller)
+        {
+            session_body(ui, view, manager, state, active);
+            ui.add_space(8.0);
+            widgets::divider(ui);
+            ui.add_space(8.0);
+        } else if state.active.is_none() {
+            if let Some(reason) = lock(view).take_closed() {
+                widgets::info_bar(ui, Tone::Warn, Some("会话已结束"), reason.as_str());
+                ui.add_space(8.0);
+            }
+        }
         if !state.capability {
             widgets::empty_state(
                 ui,

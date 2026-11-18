@@ -175,12 +175,16 @@ pub fn stat_tile(
     spark: Option<&[Option<f32>]>,
 ) {
     let p = palette(ui.style());
+    // 卡片外框的总宽 = 内容 + 左右内边距(32) + 左右描边(1×2)。统计块要求「总宽正好等于
+    // 传进来的 width」，所以内容宽度必须把这 34px 扣掉；否则每个卡片会比列宽多 2px，
+    // 带趋势线的第一行与第二行就会互相挤开、左右边缘对不齐。
+    let content_w = (width - 34.0).max(48.0);
     ui.allocate_ui_with_layout(
         Vec2::new(width, 108.0),
         Layout::top_down(Align::Min),
         |ui| {
             card_frame(ui.style()).show(ui, |ui| {
-                ui.set_width((width - 32.0).max(48.0));
+                ui.set_width(content_w);
                 ui.horizontal(|ui| {
                     icons::icon(ui, icon, 15.0, p.text_weak);
                     ui.label(RichText::new(label).size(12.0).color(p.text_weak));
@@ -201,7 +205,9 @@ pub fn stat_tile(
                 ui.add_space(2.0);
                 match spark {
                     Some(values) => {
-                        sparkline(ui, values, Vec2::new(ui.available_width(), 22.0), p.accent);
+                        // 趋势线固定在卡片内容宽度内，不按 `available_width()` 取宽：
+                        // 后者在窄列里可能比内容宽度大，越界后会把相邻统计块挤开。
+                        sparkline(ui, values, Vec2::new(content_w, 22.0), p.accent);
                     }
                     None => {
                         ui.add_space(22.0);
