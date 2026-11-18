@@ -16,7 +16,10 @@ name = "rust-tunnel-client-gui"
 #          `MIN_SERVICE_UPDATE_CLIENT_VERSION = (0,20,0)` 才在清单里附带服务 exe）。
 #          线上协议逐字节不变，0.19.x ↔ 0.20.0 可互连；`client`（Register 上报的就是
 #          它的版本）/ `win-service` / `win-platform` 必须同版本一起发。
-version = "0.20.0"
+# 0.21.0 = 远程控制延迟修复（补丁模式在关键帧请求时「重设基准」而不是退出；控制器解码
+#          队列按参考链截断、闸门改在 IDR 入队时打开；DXVA 回读改有界等待；静止保活
+#          250→66 ms）。数据面仍是 v9、线上帧逐字节不变，0.20.0 ↔ 0.21.0 可互连。
+version = "0.21.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"

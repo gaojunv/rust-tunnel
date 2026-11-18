@@ -14,7 +14,10 @@ name = "rust-tunnel-client"
 #          无人值守服务 exe；**这个版本号就是 GUI/实例上报给服务端的值**（`Register`
 #          在 client crate 里发），所以必须与 `client-gui` / `win-service` 一起抬。
 #          线上协议逐字节不变，0.17.0 ↔ 0.20.0 可互连。
-version = "0.20.0"
+# 0.21.0 = 远程控制延迟修复（补丁模式重设基准、解码队列按参考链截断、DXVA 回读预算、
+#          静止保活 250→66 ms）。**数据面仍是 v9、线上帧逐字节不变**，0.20.0 ↔ 0.21.0
+#          可互连；但两端都升到 0.21.0 才有完整收益（单端升级只改善该端行为）。
+version = "0.21.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"
