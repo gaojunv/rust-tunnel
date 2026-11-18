@@ -335,10 +335,11 @@ fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
         .connected_at
         .and_then(|at| at.elapsed().ok())
         .map_or_else(|| "—".to_owned(), format_uptime);
-    // 第一行：实时指标（带趋势线）。
-    ui.horizontal(|ui| {
+    // 两行都用 `columns(2)`：列宽由布局一次性平分（不依赖上一帧测量的内容宽度），
+    // 因此两行的左右边缘必然重合；内容差异（有无趋势线）不会把某一列撑宽。
+    ui.columns(2, |columns| {
         stat_tile(
-            ui,
+            &mut columns[0],
             width,
             Icon::Gauge,
             "延迟",
@@ -347,7 +348,7 @@ fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
             Some(history.rtt()),
         );
         stat_tile(
-            ui,
+            &mut columns[1],
             width,
             Icon::Route,
             "活跃隧道",
@@ -356,10 +357,9 @@ fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
             Some(history.tunnels()),
         );
     });
-    // 第二行：计数指标（无趋势线）。行间沿用主题的 8px 垂直间距。
-    ui.horizontal(|ui| {
+    ui.columns(2, |columns| {
         stat_tile(
-            ui,
+            &mut columns[0],
             width,
             Icon::Refresh,
             "等待拨号",
@@ -367,7 +367,15 @@ fn stat_row(ui: &mut Ui, status: &ClientStatus, history: &StatusHistory) {
             "条",
             None,
         );
-        stat_tile(ui, width, Icon::Clock, "在线时长", &uptime, "", None);
+        stat_tile(
+            &mut columns[1],
+            width,
+            Icon::Clock,
+            "在线时长",
+            &uptime,
+            "",
+            None,
+        );
     });
 }
 
