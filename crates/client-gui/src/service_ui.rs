@@ -148,6 +148,9 @@ pub struct HostSeed {
     /// 是否优先协商 H.265/HEVC（不写进 host.toml 时缺省也是 true）。同样把 GUI 当前选择
     /// 原样带到服务实例。
     prefer_h265: bool,
+    /// 是否优先 4:4:4（VP9 profile 1，不写进 host.toml 时缺省也是 false）。把 GUI 当前选择
+    /// 原样带到服务实例。
+    prefer_444: bool,
     /// 是否允许向对端转发系统声音（不写进 host.toml 时缺省也是 true）。
     audio: bool,
     /// 分阶段延迟诊断日志（安装时把 GUI 当前开关原样带进 `host.toml`）。
@@ -170,6 +173,7 @@ impl HostSeed {
         auto_lock: bool,
         native_resolution: bool,
         prefer_h265: bool,
+        prefer_444: bool,
         audio: bool,
         latency_log: bool,
         latency_log_frames: bool,
@@ -186,6 +190,7 @@ impl HostSeed {
             auto_lock,
             native_resolution,
             prefer_h265,
+            prefer_444,
             audio,
             latency_log,
             latency_log_frames,
@@ -227,6 +232,7 @@ impl HostSeed {
             auto_lock: bool,
             native_resolution: bool,
             prefer_h265: bool,
+            prefer_444: bool,
             audio: bool,
             latency_log: bool,
             latency_log_frames: bool,
@@ -243,6 +249,7 @@ impl HostSeed {
             auto_lock: self.auto_lock,
             native_resolution: self.native_resolution,
             prefer_h265: self.prefer_h265,
+            prefer_444: self.prefer_444,
             audio: self.audio,
             latency_log: self.latency_log,
             latency_log_frames: self.latency_log_frames,
@@ -836,7 +843,7 @@ mod tests {
         };
 
         let seed =
-            HostSeed::from_config(&config, ApprovalPolicy::Auto, true, true, true, true, true, false);
+            HostSeed::from_config(&config, ApprovalPolicy::Auto, true, true, true, true, true, true, false);
         assert_eq!(seed.approval(), ApprovalPolicy::Auto);
         let text = seed.to_toml().unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -862,6 +869,11 @@ mod tests {
             parsed["prefer_h265"].as_bool(),
             Some(true),
             "优先 H.265 偏好应原样写进 host.toml（实例据此决定协商优先级）"
+        );
+        assert_eq!(
+            parsed["prefer_444"].as_bool(),
+            Some(true),
+            "4:4:4（VP9）优先偏好应原样写进 host.toml（实例据此决定协商优先级）"
         );
         assert_eq!(
             parsed["audio"].as_bool(),
@@ -890,6 +902,7 @@ mod tests {
         let seed = HostSeed::from_config(
             &config,
             ApprovalPolicy::Confirm,
+            false,
             false,
             false,
             false,

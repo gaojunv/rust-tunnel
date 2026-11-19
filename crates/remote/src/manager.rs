@@ -337,7 +337,7 @@ impl RemoteUiState {
 /// [`RemoteManager`] 的构造参数。
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "这些是彼此独立的用户/平台开关（原生分辨率、H.265、音频），合并不是一个布尔位"
+    reason = "这些是彼此独立的用户/平台开关（原生分辨率、H.265、4:4:4、音频），合并不是一个布尔位"
 )]
 pub struct RemoteManagerConfig {
     /// 本机连接的服务端 `host:port`（用于补齐留空的 `rendezvous_host`）。
@@ -387,6 +387,13 @@ pub struct RemoteManagerConfig {
     ///
     /// 运行中修改经 [`RemoteManager::set_prefer_h265`]，只对**下一次会话**生效。
     pub prefer_h265: bool,
+    /// 是否**优先 4:4:4（VP9 profile 1）**（默认 `false`，由 GUI 层决定）。
+    ///
+    /// 开启后即使控制器也支持 H.264/H.265，被控端仍优先协商 VP9——VP9 的 I444 色度不子采样，
+    /// ClearType 文字的彩边最少；代价是软件编码、CPU 占用更高。优先级**高于**
+    /// [`Self::prefer_h265`]。运行中修改经 [`RemoteManager::set_prefer_444`]，只对**下一次会话**
+    /// 生效。
+    pub prefer_444: bool,
     /// 可选的音频采集源（被控端用；Windows GUI/实例注入，其它平台为 `None`）。
     pub audio_source: Option<Arc<dyn AudioSource>>,
     /// 可选的音频播放目标（控制端用；`None` = 本端不请求对端采集声音）。
@@ -537,6 +544,10 @@ pub struct RemoteManager {
     /// 与 [`Self::native_resolution`] 同构：GUI 的 UI 线程随时可改，会话任务只在**开始**时读
     /// 一次；改动只影响下一次会话（codec 在协商后固定）。
     prefer_h265: AtomicBool,
+    /// 被控端是否**优先 4:4:4（VP9 profile 1）**编码。
+    ///
+    /// 与 [`Self::prefer_h265`] 同构；优先级高于它（见 [`Self::set_prefer_444`]）。
+    prefer_444: AtomicBool,
     /// 控制端会话开始时是否请求转发声音（用户偏好）。
     ///
     /// 工具条的扬声器开关与设置页共享这一位：开关同时作用于**当前会话**（发
@@ -588,6 +599,7 @@ impl RemoteManager {
         let rt_field = rt.clone();
         let native_resolution = cfg.native_resolution;
         let prefer_h265 = cfg.prefer_h265;
+        let prefer_444 = cfg.prefer_444;
         let audio_enabled_pref = cfg.audio_enabled;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
@@ -614,6 +626,7 @@ impl RemoteManager {
             auto_lock_on_disconnect: Arc::new(AtomicBool::new(false)),
             native_resolution: AtomicBool::new(native_resolution),
             prefer_h265: AtomicBool::new(prefer_h265),
+            prefer_444: AtomicBool::new(prefer_444),
             audio_enabled_pref: AtomicBool::new(audio_enabled_pref),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
@@ -808,6 +821,21 @@ impl RemoteManager {
     #[must_use]
     pub fn prefer_h265(&self) -> bool {
         self.prefer_h265.load(Ordering::Relaxed)
+    }
+
+    /// 设置是否**优先 4:4:4（VP9 profile 1）**（默认关闭）。
+    ///
+    /// 只对**下一次**会话生效：codec 在会话开始、协商完成后确定。优先级**高于**
+    /// [`Self::set_prefer_h265`]：开启后即使双方都支持 H.264/H.265 也优先选 VP9（色度不
+    /// 子采样，文字彩边最少）；控制器不支持 VP9 时按原规则回落 H.264/H.265，不会把会话逼死。
+    pub fn set_prefer_444(&self, on: bool) {
+        self.prefer_444.store(on, Ordering::Relaxed);
+    }
+
+    /// 当前的 4:4:4 优先偏好（UI 镜像；服务安装时把它写进 `host.toml`）。
+    #[must_use]
+    pub fn prefer_444(&self) -> bool {
+        self.prefer_444.load(Ordering::Relaxed)
     }
 
     /// 把本机剪贴板文本发给被控端。
@@ -1818,6 +1846,7 @@ impl RemoteManager {
             h264_encoder_factory: self.cfg.h264_encoder_factory.clone(),
             h265_encoder_factory: self.cfg.h265_encoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
+            prefer_444: self.prefer_444.load(Ordering::Relaxed),
             lock_on_disconnect: Arc::clone(&self.auto_lock_on_disconnect),
             audio: self.cfg.audio_source.clone(),
             audio_allowed: Arc::clone(&self.cfg.audio_allowed),
@@ -2441,6 +2470,7 @@ mod tests {
             h265_encoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            prefer_444: false,
             audio_source: None,
             audio_sink: None,
             audio_enabled: false,
@@ -2610,6 +2640,7 @@ mod tests {
             h265_encoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            prefer_444: false,
             audio_source: None,
             audio_sink: None,
             audio_enabled: false,

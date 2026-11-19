@@ -2012,6 +2012,7 @@ mod bench {
                 })),
                 h265_encoder_factory: None,
                 prefer_h265: true,
+                prefer_444: false,
                 lock_on_disconnect: Arc::new(AtomicBool::new(false)),
                 audio: None,
                 audio_allowed: Arc::new(AtomicBool::new(true)),
