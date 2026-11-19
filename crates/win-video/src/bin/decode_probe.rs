@@ -8,9 +8,13 @@
 //! 最后保留两项回归：多包拼接输入、`reconfigure` 尺寸变化。
 
 #[cfg(windows)]
+use rust_tunnel_win_video::codec::{CodecKind, CodecSelection};
+#[cfg(windows)]
 use rust_tunnel_win_video::d3d11;
 #[cfg(windows)]
-use rust_tunnel_win_video::decode::{DecodedH264Frame, H264Decoder};
+use rust_tunnel_win_video::decode::{
+    DecodedH264Frame, H264HardwarePreference, H264OutputMode, MfVideoDecoder,
+};
 #[cfg(windows)]
 use rust_tunnel_win_video::nvenc::{EncoderConfig, NvencApi, NvencEncoder};
 #[cfg(windows)]
@@ -221,7 +225,7 @@ struct DecodeRun {
 /// 顺序解码一组码流包并统计。
 #[cfg(windows)]
 fn decode_packets(
-    decoder: &mut H264Decoder,
+    decoder: &mut MfVideoDecoder,
     packets: &[Vec<u8>],
 ) -> Result<DecodeRun, WinVideoError> {
     let capacity = packets
@@ -277,7 +281,7 @@ fn mean_abs_diff(left: &[u8], right: &[u8]) -> Option<f64> {
 fn print_run(
     label: &str,
     run: &DecodeRun,
-    decoder: &H264Decoder,
+    decoder: &MfVideoDecoder,
     expected: (u32, u32),
 ) -> Result<(), WinVideoError> {
     let dims = run
@@ -329,13 +333,17 @@ fn print_run(
 fn run_comparison(
     api: &NvencApi,
     encode_d3d: &Arc<d3d11::D3d11>,
+    codec: CodecKind,
     width: u32,
     height: u32,
 ) -> Result<(), WinVideoError> {
     let bitrate_kbps = if width >= 1920 { 8000 } else { 4000 };
-    println!("\n== 对照：{width}x{height} ==");
+    println!(
+        "\n== 对照（{}）：{width}x{height} ==",
+        codec.label()
+    );
 
-    let config = EncoderConfig::new(width, height, FPS, bitrate_kbps)?;
+    let config = EncoderConfig::new(width, height, FPS, bitrate_kbps)?.with_codec(codec);
     let mut encoder = NvencEncoder::new(api, Arc::clone(encode_d3d), config)?;
     let mut packets: Vec<Vec<u8>> = Vec::with_capacity(usize::try_from(FRAME_COUNT).unwrap_or(0));
     for index in 0..FRAME_COUNT {
@@ -345,11 +353,24 @@ fn run_comparison(
     }
     drop(encoder);
 
-    let mut software = H264Decoder::new_software(width, height)?;
+    let mut software = MfVideoDecoder::new_with_codec_preference_and_output(
+        width,
+        height,
+        codec,
+        H264HardwarePreference::Software,
+        H264OutputMode::Rgba,
+    )?;
     let soft_run = decode_packets(&mut software, &packets)?;
     print_run("软件", &soft_run, &software, (width, height))?;
 
-    match H264Decoder::new_hardware(width, height) {
+    let hardware = MfVideoDecoder::new_with_codec_preference_and_output(
+        width,
+        height,
+        codec,
+        H264HardwarePreference::RequireHardware,
+        H264OutputMode::Rgba,
+    );
+    match hardware {
         Ok(mut hardware) => {
             let hard_run = decode_packets(&mut hardware, &packets)?;
             print_run("硬件", &hard_run, &hardware, (width, height))?;
@@ -386,10 +407,11 @@ fn run_comparison(
 fn run_concatenated_probe(
     api: &NvencApi,
     encode_d3d: &Arc<d3d11::D3d11>,
+    codec: CodecKind,
 ) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
-    let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, 4000)?;
+    let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, 4000)?.with_codec(codec);
     let mut encoder = NvencEncoder::new(api, Arc::clone(encode_d3d), config)?;
     let mut combined = Vec::new();
     for index in 0..3u32 {
@@ -400,12 +422,13 @@ fn run_concatenated_probe(
     }
     drop(encoder);
 
-    let mut decoder = H264Decoder::new(WIDTH, HEIGHT)?;
+    let mut decoder = MfVideoDecoder::new_with_codec(WIDTH, HEIGHT, codec)?;
     let started = Instant::now();
     let output_frame = decoder.decode(&combined)?;
     let elapsed = started.elapsed();
     println!(
-        "\n== 拼接输入（IDR + 2 P 帧，共 {} 字节，路径={}）==",
+        "\n== 拼接输入（{} 关键帧 + 2 P 帧，共 {} 字节，路径={}）==",
+        codec.label(),
         combined.len(),
         decoder.path().as_str()
     );
@@ -426,17 +449,21 @@ fn run_concatenated_probe(
 
 /// `reconfigure` 尺寸变化回归（与路径无关）。
 #[cfg(windows)]
-fn run_resize_probe(api: &NvencApi, encode_d3d: &Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
+fn run_resize_probe(
+    api: &NvencApi,
+    encode_d3d: &Arc<d3d11::D3d11>,
+    codec: CodecKind,
+) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 360;
-    let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, 2000)?;
+    let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, 2000)?.with_codec(codec);
     let mut encoder = NvencEncoder::new(api, Arc::clone(encode_d3d), config)?;
     let bgra = synthetic_bgra(WIDTH, HEIGHT, 0);
     encoder.upload_bgra(&bgra)?;
     let packet = encoder.encode(true)?;
     drop(encoder);
 
-    let mut decoder = H264Decoder::new(1280, 720)?;
+    let mut decoder = MfVideoDecoder::new_with_codec(1280, 720, codec)?;
     let before = decoder.path();
     decoder.reconfigure(WIDTH, HEIGHT)?;
     let started = Instant::now();
@@ -486,11 +513,38 @@ fn run() -> Result<(), WinVideoError> {
     let encode_d3d = Arc::new(d3d11::create_nvidia()?);
     println!("\n  NVENC 编码设备: {}", encode_d3d.adapter.name);
 
-    for (width, height) in RESOLUTIONS {
-        run_comparison(&api, &encode_d3d, width, height)?;
+    let selection = CodecSelection::from_args();
+    println!("== 编码标准: {selection:?} ==");
+    let mut any_ok = false;
+    let mut last_error = None;
+    for codec in selection.kinds() {
+        // 每个标准独立失败（例如没有 HEVC 编码器），不影响另一路的结论。
+        let outcome = run_one_codec(&api, &encode_d3d, *codec);
+        match outcome {
+            Ok(()) => any_ok = true,
+            Err(err) => {
+                println!("  {} 探针失败，继续下一个标准: {err}", codec.label());
+                last_error = Some(err);
+            }
+        }
     }
+    if any_ok {
+        Ok(())
+    } else {
+        last_error.map_or(Ok(()), Err)
+    }
+}
 
-    run_concatenated_probe(&api, &encode_d3d)?;
-    run_resize_probe(&api, &encode_d3d)?;
-    Ok(())
+/// 单个标准的全部对照项。
+#[cfg(windows)]
+fn run_one_codec(
+    api: &NvencApi,
+    encode_d3d: &Arc<d3d11::D3d11>,
+    codec: CodecKind,
+) -> Result<(), WinVideoError> {
+    for (width, height) in RESOLUTIONS {
+        run_comparison(api, encode_d3d, codec, width, height)?;
+    }
+    run_concatenated_probe(api, encode_d3d, codec)?;
+    run_resize_probe(api, encode_d3d, codec)
 }

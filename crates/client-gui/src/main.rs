@@ -740,6 +740,10 @@ impl eframe::App for GuiApp {
 ///
 /// GUI 与无头实例（`--instance`）的开关、平台实现与目录来源都不同，故集中在这里传入，
 /// 免得 `build_remote_manager` 的形参表越拉越长。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "这些开关一一对应 `GuiPrefs` / `host.toml` 的键，拆成状态机只会让调用点更难读"
+)]
 struct ManagerOptions {
     /// 初始是否允许被远程控制。
     enabled: bool,
@@ -747,8 +751,10 @@ struct ManagerOptions {
     approval_policy: ApprovalPolicy,
     /// 被控端会话结束后是否自动锁定屏幕（GUI 取自 `GuiPrefs`，实例取自 `host.toml`）。
     auto_lock_on_disconnect: bool,
-    /// 被控端是否允许原生分辨率（4K）编码（仅硬件 H.264 生效）。
+    /// 被控端是否允许原生分辨率（4K）编码（仅硬件 H.264/H.265 生效）。
     native_resolution: bool,
+    /// 是否优先协商 H.265/HEVC（双方都支持时）；不可用则自动回退 H.264/VP9。
+    prefer_h265: bool,
     /// 平台实现模式（**必须在构造期选定**，见 [`remote::PlatformMode`]）。
     platform_mode: remote::PlatformMode,
     /// 被控端共享目录（`None` = 不接受文件请求）。
@@ -769,9 +775,14 @@ fn build_remote_manager(
     opts: ManagerOptions,
 ) -> (Arc<RemoteManager>, Option<Arc<dyn remote::SessionRelease>>) {
     let establisher = Arc::new(remote::LazyTransport::new(config.server.clone()));
-    // Windows 上探测 NVENC 与 Media Foundation H.264 MFT；任一侧不可用则为 `None`，
-    // 协商自动回退 VP9。其他平台恒为 `(None, None)`。
-    let (h264_encoder_factory, h264_decoder_factory) = remote::hardware_factories();
+    // Windows 上探测 NVENC/MFT 的 H.264 与 H.265 编解码器、以及 Media Foundation
+    // 解码器；缺失的组合让协商按 H.265 → H.264 → VP9 逐级回退。其他平台四个都是 `None`。
+    let remote::HardwareFactories {
+        h264_encoder: h264_encoder_factory,
+        h264_decoder: h264_decoder_factory,
+        h265_encoder: h265_encoder_factory,
+        h265_decoder: h265_decoder_factory,
+    } = remote::hardware_factories();
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),
         self_client_name: config.name.clone().unwrap_or_default(),
@@ -787,6 +798,10 @@ fn build_remote_manager(
         // Windows 硬件编解码实现由 `remote::win_video` 注入；其他平台保持 VP9。
         h264_encoder_factory,
         h264_decoder_factory,
+        h265_encoder_factory,
+        h265_decoder_factory,
+        // 偏好与工厂就位后即按 H.265 优先协商；任一侧缺能力或环境变量禁用则回退 H.264/VP9。
+        prefer_h265: opts.prefer_h265,
     });
     // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
     manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);
@@ -798,17 +813,23 @@ fn build_remote_manager(
 
 /// GUI 路径的引擎选项：共享目录固定为「下载」目录下的 `rust-tunnel-share`——可见、易找，
 /// 且与用户的个人目录隔离（用户要换目录只需在这里改一处）。
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "参数与 `GuiPrefs` 的开关一一对应，打包成结构体只会让调用点多一层样板"
+)]
 fn gui_manager_options(
     enabled: bool,
     approval_policy: ApprovalPolicy,
     auto_lock_on_disconnect: bool,
     native_resolution: bool,
+    prefer_h265: bool,
 ) -> ManagerOptions {
     ManagerOptions {
         enabled,
         approval_policy,
         auto_lock_on_disconnect,
         native_resolution,
+        prefer_h265,
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
@@ -818,6 +839,7 @@ fn gui_manager_options(
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
     clippy::items_after_statements,
     clippy::map_unwrap_or,
     reason = "GUI 托盘启动编排，一次性初始化链路拆分无益；开关参数与 prefs 一一对应"
@@ -831,6 +853,7 @@ fn spawn_runtime(
     initial_approval: ApprovalPolicy,
     initial_auto_lock: bool,
     initial_native_resolution: bool,
+    initial_prefer_h265: bool,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -932,6 +955,7 @@ fn spawn_runtime(
                     initial_approval,
                     initial_auto_lock,
                     initial_native_resolution,
+                    initial_prefer_h265,
                 ),
             );
             app_state.set_remote(Arc::clone(&remote_manager));
@@ -1621,6 +1645,8 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             prefs.remote_approval,
             prefs.remote_auto_lock_on_disconnect,
             prefs.remote_native_resolution,
+            // H.265 偏好与环境变量禁用合成生效值：环境变量优先（现场排障开关）。
+            remote::effective_prefer_h265(prefs.remote_prefer_h265, remote::h265_disabled_by_env()),
         );
     }
 

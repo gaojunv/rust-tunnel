@@ -7,9 +7,11 @@
 //! 4. 与现场 HD 630 的 VP9 软件编码基线（113 ms/帧）对照，报告硬件是否真的更快。
 
 #[cfg(windows)]
-use rust_tunnel_win_video::decode::H264Decoder;
+use rust_tunnel_win_video::codec::{CodecKind, CodecSelection};
 #[cfg(windows)]
-use rust_tunnel_win_video::mft_encoder::{enumerate_h264_encoders, MftH264Encoder};
+use rust_tunnel_win_video::decode::MfVideoDecoder;
+#[cfg(windows)]
+use rust_tunnel_win_video::mft_encoder::{enumerate_encoders, MfVideoEncoder};
 #[cfg(windows)]
 use rust_tunnel_win_video::WinVideoError;
 #[cfg(windows)]
@@ -140,10 +142,11 @@ fn mean_ms(times: &[Duration]) -> f64 {
     total / f64::from(u32::try_from(times.len()).unwrap_or(1))
 }
 
-/// 统计 Annex B 码流里的 NAL：`(IDR, SPS, PPS)`。
+/// 统计 Annex B 码流里的 NAL：`(关键帧, SPS, PPS)`（H.265 为 IRAP / SPS / PPS，
+/// 另外会单独报告 VPS）。
 #[cfg(windows)]
-fn nal_summary(annex_b: &[u8]) -> (bool, bool, bool) {
-    let mut idr = false;
+fn nal_summary(annex_b: &[u8], codec: CodecKind) -> (bool, bool, bool) {
+    let mut keyframe = false;
     let mut sps = false;
     let mut pps = false;
     let mut index = 0usize;
@@ -151,11 +154,20 @@ fn nal_summary(annex_b: &[u8]) -> (bool, bool, bool) {
         if annex_b[index] == 0 && annex_b[index + 1] == 0 && annex_b[index + 2] == 1 {
             let start = index + 3;
             if let Some(&header) = annex_b.get(start) {
-                match header & 0x1F {
-                    5 => idr = true,
-                    7 => sps = true,
-                    8 => pps = true,
-                    _ => {}
+                if codec.is_hevc() {
+                    match (header >> 1) & 0x3F {
+                        16..=23 => keyframe = true,
+                        33 => sps = true,
+                        34 => pps = true,
+                        _ => {}
+                    }
+                } else {
+                    match header & 0x1F {
+                        5 => keyframe = true,
+                        7 => sps = true,
+                        8 => pps = true,
+                        _ => {}
+                    }
                 }
             }
             index = start;
@@ -163,7 +175,45 @@ fn nal_summary(annex_b: &[u8]) -> (bool, bool, bool) {
             index += 1;
         }
     }
-    (idr, sps, pps)
+    (keyframe, sps, pps)
+}
+
+/// 码流里是否带完整参数集（H.264 SPS+PPS；H.265 VPS+SPS+PPS）。
+#[cfg(windows)]
+fn has_full_parameter_sets(annex_b: &[u8], codec: CodecKind) -> bool {
+    let mut vps = false;
+    let mut sps = false;
+    let mut pps = false;
+    let mut index = 0usize;
+    while index + 3 <= annex_b.len() {
+        if annex_b[index] == 0 && annex_b[index + 1] == 0 && annex_b[index + 2] == 1 {
+            let start = index + 3;
+            if let Some(&header) = annex_b.get(start) {
+                if codec.is_hevc() {
+                    match (header >> 1) & 0x3F {
+                        32 => vps = true,
+                        33 => sps = true,
+                        34 => pps = true,
+                        _ => {}
+                    }
+                } else {
+                    match header & 0x1F {
+                        7 => sps = true,
+                        8 => pps = true,
+                        _ => {}
+                    }
+                }
+            }
+            index = start;
+        } else {
+            index += 1;
+        }
+    }
+    if codec.is_hevc() {
+        vps && sps && pps
+    } else {
+        sps && pps
+    }
 }
 
 /// 两帧 RGBA 的平均绝对差（只比较 R/G/B，0–255）。
@@ -194,19 +244,21 @@ fn mean_abs_diff_rgba(original: &[u8], decoded: &[u8]) -> Option<f64> {
 
 /// 打印硬件与全部编码器列表。
 #[cfg(windows)]
-fn print_encoders() -> Result<(), WinVideoError> {
-    let hardware = enumerate_h264_encoders(true)?;
+fn print_encoders(codec: CodecKind) -> Result<(), WinVideoError> {
+    let hardware = enumerate_encoders(codec, true)?;
     println!(
-        "== 硬件 H.264 编码器（MFT_ENUM_FLAG_HARDWARE，{} 个）==",
+        "== 硬件 {} 编码器（MFT_ENUM_FLAG_HARDWARE，{} 个）==",
+        codec.label(),
         hardware.len()
     );
     for info in &hardware {
         println!("  {} | {}", info.name, info.clsid);
     }
-    let all = enumerate_h264_encoders(false)?;
+    let all = enumerate_encoders(codec, false)?;
     let hardware_ids: Vec<&str> = hardware.iter().map(|info| info.clsid.as_str()).collect();
     println!(
-        "\n== 全部 H.264 编码器（MFT_ENUM_FLAG_ALL，{} 个）==",
+        "\n== 全部 {} 编码器（MFT_ENUM_FLAG_ALL，{} 个）==",
+        codec.label(),
         all.len()
     );
     for info in &all {
@@ -247,7 +299,8 @@ struct EncodeStats {
 /// 编码一组合成帧并打印逐帧结果。
 #[cfg(windows)]
 fn encode_frames(
-    encoder: &mut MftH264Encoder,
+    encoder: &mut MfVideoEncoder,
+    codec: CodecKind,
     width: u32,
     height: u32,
 ) -> Result<EncodeStats, WinVideoError> {
@@ -280,11 +333,12 @@ fn encode_frames(
             continue;
         }
         let payload = packet.data.get(4..).unwrap_or_default();
-        let (idr, sps, pps) = nal_summary(payload);
+        let (keyframe, sps, pps) = nal_summary(payload, codec);
+        let full_parameter_sets = has_full_parameter_sets(payload, codec);
         let bytes = payload.len();
         if stats.produced == 0 {
             stats.first_keyframe = packet.keyframe;
-            stats.first_has_parameter_sets = sps && pps;
+            stats.first_has_parameter_sets = full_parameter_sets;
             stats.first_bytes = bytes;
             stats.first_preview = payload.iter().take(8).copied().collect();
         } else if !packet.keyframe {
@@ -295,15 +349,16 @@ fn encode_frames(
         }
         stats.produced = stats.produced.saturating_add(1);
         if index == FORCED_KEYFRAME_INDEX {
-            stats.midstream_keyframe_ok = packet.keyframe && idr && sps && pps;
+            stats.midstream_keyframe_ok = packet.keyframe && keyframe && full_parameter_sets;
             if !stats.midstream_keyframe_ok {
-                return Err(WinVideoError::Encode(
-                    "中途强制关键帧失败：输出不是带 SPS/PPS 的 IDR".to_owned(),
-                ));
+                return Err(WinVideoError::Encode(format!(
+                    "中途强制关键帧失败：输出不是带完整参数集的 {} 关键帧",
+                    codec.label()
+                )));
             }
         }
         println!(
-            "  帧 {index:>2}: {:6.2} ms, {bytes:>7} 字节, keyframe={}, IDR={idr}, SPS={sps}, PPS={pps}{}",
+            "  帧 {index:>2}: {:6.2} ms, {bytes:>7} 字节, keyframe={}, keyframe_nal={keyframe}, SPS={sps}, PPS={pps}{}",
             elapsed.as_secs_f64() * 1000.0,
             packet.keyframe,
             if force_keyframe { " [强制]" } else { "" }
@@ -322,7 +377,7 @@ fn print_stats(
     stats: &EncodeStats,
     width: u32,
     height: u32,
-    encoder: &MftH264Encoder,
+    encoder: &MfVideoEncoder,
 ) -> Result<(), WinVideoError> {
     let cpu_ms = stats.cpu_total.as_secs_f64() * 1000.0;
     println!(
@@ -335,7 +390,7 @@ fn print_stats(
         cpu_ms / f64::from(FRAME_COUNT),
     );
     println!(
-        "  首包: {} 字节, keyframe={}, SPS+PPS={}, 前 8 字节={:02X?}",
+        "  首包: {} 字节, keyframe={}, 完整参数集={}, 前 8 字节={:02X?}",
         stats.first_bytes,
         stats.first_keyframe,
         stats.first_has_parameter_sets,
@@ -353,7 +408,7 @@ fn print_stats(
     }
     if !stats.first_keyframe || !stats.first_has_parameter_sets {
         return Err(WinVideoError::Encode(format!(
-            "首包不是带 SPS/PPS 的关键帧（{width}x{height}）"
+            "首包不是带完整参数集的关键帧（{width}x{height}）"
         )));
     }
     if !stats.midstream_keyframe_ok {
@@ -379,7 +434,7 @@ fn print_stats(
 /// 在线改码率/帧率后各编码一帧，确认不产生 IDR。
 #[cfg(windows)]
 fn check_runtime_changes(
-    encoder: &mut MftH264Encoder,
+    encoder: &mut MfVideoEncoder,
     width: u32,
     height: u32,
     bitrate_kbps: u32,
@@ -426,10 +481,13 @@ fn check_runtime_changes(
 
 /// 某个分辨率的完整探针。
 #[cfg(windows)]
-fn run_resolution(width: u32, height: u32) -> Result<(), WinVideoError> {
+fn run_resolution(codec: CodecKind, width: u32, height: u32) -> Result<(), WinVideoError> {
     let bitrate_kbps = if width >= 1920 { 8000 } else { 4000 };
-    println!("\n== 硬件编码：{width}x{height} @ {FPS} fps, CBR {bitrate_kbps} kbps ==");
-    let mut encoder = MftH264Encoder::new(width, height, FPS, bitrate_kbps)?;
+    println!(
+        "\n== 硬件 {} 编码：{width}x{height} @ {FPS} fps, CBR {bitrate_kbps} kbps ==",
+        codec.label()
+    );
+    let mut encoder = MfVideoEncoder::new_codec(width, height, FPS, bitrate_kbps, codec)?;
     println!(
         "  MFT: {} | {}\n  D3D11 适配器: {}\n  尺寸: {:?} @ {} fps, {} kbps",
         encoder.mft_name(),
@@ -439,31 +497,34 @@ fn run_resolution(width: u32, height: u32) -> Result<(), WinVideoError> {
         encoder.fps(),
         encoder.bitrate_kbps()
     );
-    let stats = encode_frames(&mut encoder, width, height)?;
+    let stats = encode_frames(&mut encoder, codec, width, height)?;
     print_stats(&stats, width, height, &encoder)?;
     check_runtime_changes(&mut encoder, width, height, bitrate_kbps)?;
     Ok(())
 }
 
-/// QSV 编码 → 现有 H.264 解码器的端到端回环。
+/// QSV/硬件 MFT 编码 → Media Foundation 解码器的端到端回环。
 ///
-/// 验证：4 字节长度前缀、Annex B 起始码、首帧 IDR+SPS/PPS、解码尺寸
+/// 验证：4 字节长度前缀、Annex B 起始码、首帧关键帧 + 完整参数集、解码尺寸
 /// （1080p 必须裁到 1920x1080，而不是编码高度 1088），以及输入/输出像素 MAD。
 #[cfg(windows)]
-fn run_end_to_end(width: u32, height: u32) -> Result<(), WinVideoError> {
+fn run_end_to_end(codec: CodecKind, width: u32, height: u32) -> Result<(), WinVideoError> {
     let bitrate_kbps = if width >= 1920 { 8000 } else { 4000 };
-    println!("\n== 端到端：QSV 编码 → H264Decoder（{width}x{height}）==");
-    let mut encoder = match MftH264Encoder::new(width, height, FPS, bitrate_kbps) {
+    println!(
+        "\n== 端到端：{} 硬件编码 → MfVideoDecoder（{width}x{height}）==",
+        codec.label()
+    );
+    let mut encoder = match MfVideoEncoder::new_codec(width, height, FPS, bitrate_kbps, codec) {
         Ok(encoder) => encoder,
         Err(err) => {
-            println!("  跳过：硬件编码器不可用: {err}");
+            println!("  跳过：{} 硬件编码器不可用: {err}", codec.label());
             return Ok(());
         }
     };
-    let mut decoder = match H264Decoder::new(width, height) {
+    let mut decoder = match MfVideoDecoder::new_with_codec(width, height, codec) {
         Ok(decoder) => decoder,
         Err(err) => {
-            println!("  跳过：H264Decoder 不可用: {err}");
+            println!("  跳过：{} 解码器不可用: {err}", codec.label());
             return Ok(());
         }
     };
@@ -499,11 +560,13 @@ fn run_end_to_end(width: u32, height: u32) -> Result<(), WinVideoError> {
         if !(payload.starts_with(&[0, 0, 1]) || payload.starts_with(&[0, 0, 0, 1])) {
             return Err(WinVideoError::Encode("码流不是 Annex B".to_owned()));
         }
-        let (idr, sps, pps) = nal_summary(payload);
-        if index == 0 && !(packet.keyframe && idr && sps && pps) {
-            return Err(WinVideoError::Encode(
-                "首帧不是带 SPS/PPS 的 IDR".to_owned(),
-            ));
+        let (keyframe_nal, _sps, _pps) = nal_summary(payload, codec);
+        if index == 0 && !(packet.keyframe && keyframe_nal && has_full_parameter_sets(payload, codec))
+        {
+            return Err(WinVideoError::Encode(format!(
+                "首帧不是带完整参数集的 {} 关键帧",
+                codec.label()
+            )));
         }
 
         let started = Instant::now();
@@ -545,11 +608,17 @@ fn run_end_to_end(width: u32, height: u32) -> Result<(), WinVideoError> {
 
 #[cfg(windows)]
 fn run() -> Result<(), WinVideoError> {
-    print_encoders()?;
-    for (width, height) in RESOLUTIONS {
-        run_resolution(width, height)?;
+    let selection = CodecSelection::from_args();
+    println!("== 编码标准: {selection:?} ==");
+    for codec in selection.kinds() {
+        print_encoders(*codec)?;
+        for (width, height) in RESOLUTIONS {
+            if let Err(err) = run_resolution(*codec, width, height) {
+                println!("  跳过 {} {width}x{height}: {err}", codec.label());
+            }
+        }
+        run_end_to_end(*codec, 1280, 720)?;
+        run_end_to_end(*codec, 1920, 1080)?;
     }
-    run_end_to_end(1280, 720)?;
-    run_end_to_end(1920, 1080)?;
     Ok(())
 }

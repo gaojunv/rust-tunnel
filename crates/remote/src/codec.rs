@@ -23,8 +23,8 @@
 //!
 //! # 色度格式
 //!
-//! 本层**不协商色度格式**：VP9 固定 profile 1（4:4:4），H.264 固定 4:2:0。需要 4:4:4 的
-//! 调用方应继续选 VP9。
+//! 本层**不协商色度格式**：VP9 固定 profile 1（4:4:4），H.264 与 H.265/HEVC 固定
+//! Main 8-bit 4:2:0。需要 4:4:4 的调用方应继续选 VP9。
 
 use crate::error::RemoteResult;
 use crate::session::CodecId;

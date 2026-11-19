@@ -1,18 +1,18 @@
-//! Windows GUI 路径的硬件采集与 H.264 硬编解码适配。
+//! Windows GUI 路径的硬件采集与 H.264 / H.265 硬编解码适配。
 //!
 //! # 分工
 //!
 //! - **采集**：优先用 `rust-tunnel-win-video` 的 WGC/DXGI（自顶向下 BGRA，
 //!   4K 实测约 20 ms/帧），失败时**逐帧回退**到既有的 xcap（GDI）。
-//! - **编码**：NVENC H.264 4:2:0。采集纹理与编码器**同设备**时直接注册给 NVENC
-//!   （零拷贝，不落 CPU）：尺寸相等就原样直通，尺寸不等（4K 采集 → 1920 编码）先用
-//!   同一块 GPU 上的 VideoProcessor 缩到编码尺寸再直通；只有跨设备（混合显卡）或
-//!   直通在本会话失败过时才回读 BGRA，必要时 CPU 盒式下采样后上传。
-//! - **解码**：Media Foundation 的 `MSH264DecoderMFT`（控制器侧）。
+//! - **编码**：NVENC / Intel-AMD 硬件 MFT，H.264 与 H.265/HEVC 各一个工厂。采集纹理与
+//!   编码器**同设备**时直接注册给 NVENC（零拷贝，不落 CPU）：尺寸相等就原样直通，尺寸
+//!   不等（4K 采集 → 1920 编码）先用同一块 GPU 上的 VideoProcessor 缩到编码尺寸再直通；
+//!   只有跨设备（混合显卡）或直通在本会话失败过时才回读 BGRA，必要时 CPU 盒式下采样后上传。
+//! - **解码**：Media Foundation 的 `MSH264DecoderMFT` / `MSH265DecoderMFT`（控制器侧）。
 //!
 //! 平台能力探测在 [`factories`]：NVENC（DLL + NVIDIA 适配器）可用、或 NVENC
-//! 不可用但硬件 MFT 可用时才注入 H.264 编码工厂；否则该侧保持 `None`，数据面
-//! 协商回退 VP9。**编码后端在 `create()` 时按采集适配器选路**（见
+//! 不可用但硬件 MFT 可用时才注入对应标准的编码工厂；否则该侧保持 `None`，数据面
+//! 协商回退（H.265 → H.264 → VP9）。**编码后端在 `create()` 时按采集适配器选路**（见
 //! [`choose_backend`]）：混合显卡下采集设备常是 Intel 核显，此时优先 QSV MFT
 //! 才能复用同一块设备；无条件优先 NVENC 只会退化成跨设备回读。
 //!
@@ -37,11 +37,12 @@ use rust_tunnel_remote::{
     GpuFrame, RawFrame, RemoteError, RemoteResult, ScreenSource, MAX_ENCODE_WIDTH,
 };
 use rust_tunnel_win_video::capture::{self, BgraReadback, CaptureSource};
+use rust_tunnel_win_video::codec::CodecKind;
 use rust_tunnel_win_video::d3d11;
 use rust_tunnel_win_video::decode::{
-    DecodePhaseTimings, H264DecodePath, H264Decoder, H264HardwarePreference, H264OutputMode,
+    DecodePhaseTimings, H264DecodePath, H264HardwarePreference, H264OutputMode, MfVideoDecoder,
 };
-use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
+use rust_tunnel_win_video::mft_encoder::MfVideoEncoder;
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
 use rust_tunnel_win_video::scale::TextureScaler;
@@ -810,10 +811,10 @@ unsafe impl Send for SharedNvencApi {}
 // SAFETY: 同上——只读函数表可以被多个线程同时读取。
 unsafe impl Sync for SharedNvencApi {}
 
-/// 一种硬件 H.264 编码后端。
+/// 一种硬件编码后端（编码标准由 [`HardwareEncoderFactory::codec`] 决定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
-    /// NVIDIA NVENC（H.264 4:2:0，输入可以复用 NVIDIA 采集设备）。
+    /// NVIDIA NVENC（4:2:0，输入可以复用 NVIDIA 采集设备）。
     Nvenc,
     /// Media Foundation 硬件编码 MFT（Intel QSV / AMD VCE 等）。
     Mft,
@@ -851,25 +852,33 @@ fn choose_backend(capture_vendor: Option<u32>, nvenc: bool, mft: bool) -> Vec<Ba
     order
 }
 
-/// 进程级 MFT 编码器可用性（**懒探测**）。
+/// 进程级 MFT 编码器可用性（**懒探测**，按编码标准各缓存一份）。
 ///
-/// `MftH264Encoder::new` 要枚举硬件 MFT、初始化 COM/Media Foundation，启动成本
+/// `MfVideoEncoder::new_codec` 要枚举硬件 MFT、初始化 COM/Media Foundation，启动成本
 /// 明显高于加载 NVENC 函数表。只有真正可能用到它——NVENC 不可用，或采集设备是
 /// Intel/AMD——时才付这笔钱。探测结果在进程内缓存，失败不重试。
-static MFT_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static MFT_AVAILABLE_H264: OnceLock<bool> = OnceLock::new();
+static MFT_AVAILABLE_H265: OnceLock<bool> = OnceLock::new();
 
-/// 取（或首次探测）硬件 H.264 编码 MFT 是否可用。
-fn mft_available() -> bool {
-    *MFT_AVAILABLE.get_or_init(|| {
-        let available = MftEncoderFactory::probe();
+/// 取（或首次探测）某个编码标准的硬件编码 MFT 是否可用。
+fn mft_available(codec: CodecKind) -> bool {
+    let slot = match codec {
+        CodecKind::H264 => &MFT_AVAILABLE_H264,
+        CodecKind::H265 => &MFT_AVAILABLE_H265,
+    };
+    *slot.get_or_init(|| {
+        let available = MftEncoderFactory { codec }.probe();
         if available {
-            info!("Intel/AMD 硬件 MFT H.264 编码可用");
+            info!("Intel/AMD 硬件 MFT {} 编码可用", codec.label());
         }
         available
     })
 }
 
 /// 进程启动时探测一次 NVENC：驱动 DLL 可加载 **且** 存在非软件 NVIDIA 适配器。
+///
+/// H.264 的能力由「驱动 + NVIDIA 适配器存在」代表；H.265 还要求实际创建一次 HEVC
+/// 会话（见 [`nvenc_hevc_supported`]）。
 fn nvenc_supported() -> Option<SharedNvencApi> {
     let api = nvenc_api()?;
     match d3d11::adapters() {
@@ -885,15 +894,76 @@ fn nvenc_supported() -> Option<SharedNvencApi> {
     }
 }
 
-/// 统一的硬件 H.264 编码器工厂：在 NVENC 与 MFT 之间按采集设备选路。
+/// 进程级 HEVC 编码能力探测结果（一次，失败不重试）。
+static NVENC_HEVC_PROBED: OnceLock<bool> = OnceLock::new();
+
+/// 探测 NVENC 是否真能开 HEVC 编码会话；返回函数表表示可用。
+///
+/// **以真实创建为判据**（`supports_codec` 只查能力位）：老 GPU 往往报告 HEVC caps
+/// 却在实际初始化时被驱动拒绝。探测在专用线程上执行（D3D11/NVENC 初始化不占
+/// 调用线程），失败**关闭**（不声明 H.265，数据面照旧 H.264）。
+fn nvenc_hevc_supported() -> Option<SharedNvencApi> {
+    let api = nvenc_api()?;
+    match d3d11::adapters() {
+        Ok(adapters) if adapters.iter().any(d3d11::AdapterInfo::is_nvidia) => {}
+        Ok(_) => {
+            info!("没有可用的 NVIDIA 适配器，NVENC 不参与 H.265 编码");
+            return None;
+        }
+        Err(err) => {
+            info!("枚举 DXGI 适配器失败，NVENC 不参与 H.265 编码：{err}");
+            return None;
+        }
+    }
+    let supported = *NVENC_HEVC_PROBED.get_or_init(|| {
+        // 把整个 `SharedNvencApi` 绑成一个局部值再 move 进闭包：Rust 2021 的字段级捕获
+        // 会只捕获 `api.0`（一个 `&NvencApi`），而 `&NvencApi: Send` 要求 `NvencApi: Sync`
+        // （它含裸指针，不是）。整体捕获则用 `unsafe impl Send for SharedNvencApi`。
+        let shared = api;
+        let probe = std::thread::Builder::new()
+            .name("nvenc-hevc-probe".to_owned())
+            .spawn(move || -> bool {
+                let api: SharedNvencApi = shared;
+                let Ok(device) = d3d11::create_nvidia() else {
+                    return false;
+                };
+                let Ok(config) = EncoderConfig::new(1280, 720, 30, 2000) else {
+                    return false;
+                };
+                match NvencEncoder::new(api.0, Arc::new(device), config.with_codec(CodecKind::H265))
+                {
+                    Ok(_) => true,
+                    Err(err) => {
+                        info!("NVENC HEVC 编码会话创建失败，不声明 H.265：{err}");
+                        false
+                    }
+                }
+            })
+            .ok();
+        match probe.map(std::thread::JoinHandle::join) {
+            Some(Ok(ok)) => ok,
+            Some(Err(_)) => {
+                info!("NVENC HEVC 探测线程 panic，不声明 H.265");
+                false
+            }
+            None => false,
+        }
+    });
+    supported.then_some(api)
+}
+
+/// 统一的硬件编码器工厂：在 NVENC 与 MFT 之间按采集设备选路。
 ///
 /// 取代原先「只要 NVENC 可用就无条件选 NVENC、否则才探测 MFT」的二选一，
 /// 让混合显卡能落到与采集设备同设备的编码器。`api` 为 `None` 表示本进程
-/// 没有 NVENC（此时只有 MFT 可作为后端）。
+/// **没有可用于该标准的 NVENC**（此时只有 MFT 可作为后端）；`codec` 决定
+/// 编码标准（H.264 / H.265），两种标准各有一个工厂。
 #[derive(Debug)]
 pub struct HardwareEncoderFactory {
-    /// 进程级 NVENC 函数表。
+    /// 进程级 NVENC 函数表（仅当该标准的 HEVC/H.264 探测通过时才有）。
     api: Option<SharedNvencApi>,
+    /// 本工厂产出的编码标准。
+    codec: CodecKind,
 }
 
 impl HardwareEncoderFactory {
@@ -923,12 +993,22 @@ impl HardwareEncoderFactory {
                 };
                 let config =
                     EncoderConfig::new(width, height, u32::from(max_fps), target_bitrate_kbps)
-                        .map_err(|err| RemoteError::Encode(format!("H.264 编码参数非法: {err}")))?
+                        .map_err(|err| {
+                            RemoteError::Encode(format!(
+                                "{} 编码参数非法: {err}",
+                                self.codec.label()
+                            ))
+                        })?
                         // 回读出来的是 BGRA，而 `NV_ENC_BUFFER_FORMAT_ARGB` 在内存里
                         // 就是 BGRA 字节序：直接上传，省掉一次整帧通道交换。
-                        .with_input_format(InputFormat::Bgra);
-                let encoder = NvencEncoder::new(api.0, device, config)
-                    .map_err(|err| RemoteError::Encode(format!("NVENC 编码器创建失败: {err}")))?;
+                        .with_input_format(InputFormat::Bgra)
+                        .with_codec(self.codec);
+                let encoder = NvencEncoder::new(api.0, device, config).map_err(|err| {
+                    RemoteError::Encode(format!(
+                        "NVENC {} 编码器创建失败: {err}",
+                        self.codec.label()
+                    ))
+                })?;
                 Ok(Box::new(NvencAdapter {
                     encoder,
                     readback: BgraReadback::new(),
@@ -938,8 +1018,7 @@ impl HardwareEncoderFactory {
                     zero_copy_logged: false,
                 }))
             }
-            Backend::Mft => <MftEncoderFactory as VideoEncoderFactory>::create(
-                &MftEncoderFactory,
+            Backend::Mft => MftEncoderFactory { codec: self.codec }.create(
                 width,
                 height,
                 target_bitrate_kbps,
@@ -951,7 +1030,10 @@ impl HardwareEncoderFactory {
 
 impl VideoEncoderFactory for HardwareEncoderFactory {
     fn codec(&self) -> CodecId {
-        CodecId::H264
+        match self.codec {
+            CodecKind::H264 => CodecId::H264,
+            CodecKind::H265 => CodecId::H265,
+        }
     }
 
     fn create(
@@ -975,7 +1057,8 @@ impl VideoEncoderFactory for HardwareEncoderFactory {
                 capture_vendor,
                 Some(d3d11::VENDOR_INTEL | d3d11::VENDOR_AMD)
             );
-        let mft = mft_needed && mft_available();
+        let mft = mft_needed && mft_available(self.codec);
+        let codec_label = self.codec.label();
         let mut last_error = None;
         for backend in choose_backend(capture_vendor, nvenc, mft) {
             match self.create_backend(
@@ -989,19 +1072,19 @@ impl VideoEncoderFactory for HardwareEncoderFactory {
                 Ok(encoder) => {
                     // GUI 日志层会丢 tracing 字段，原因全部内联。
                     info!(
-                        "H.264 硬件编码后端已选定 backend={backend:?} 采集厂商={capture_vendor:?} 尺寸={width}x{height}"
+                        "{codec_label} 硬件编码后端已选定 backend={backend:?} 采集厂商={capture_vendor:?} 尺寸={width}x{height}"
                     );
                     return Ok(encoder);
                 }
                 Err(err) => {
-                    info!("H.264 编码后端 {backend:?} 创建失败，尝试下一个：{err}");
+                    info!("{codec_label} 编码后端 {backend:?} 创建失败，尝试下一个：{err}");
                     last_error = Some(err);
                 }
             }
         }
         // 候选里不含 MFT（懒探测未触发）时最后兜底一次：NVENC 创建失败不该
-        // 直接打断已经协商好的 H.264 会话。
-        if !mft && mft_available() {
+        // 直接打断已经协商好的会话。
+        if !mft && mft_available(self.codec) {
             match self.create_backend(
                 Backend::Mft,
                 capture.as_ref(),
@@ -1011,14 +1094,15 @@ impl VideoEncoderFactory for HardwareEncoderFactory {
                 max_fps,
             ) {
                 Ok(encoder) => {
-                    info!("H.264 编码后端回退到 MFT（采集厂商={capture_vendor:?}）");
+                    info!("{codec_label} 编码后端回退到 MFT（采集厂商={capture_vendor:?}）");
                     return Ok(encoder);
                 }
                 Err(err) => last_error = Some(err),
             }
         }
-        Err(last_error
-            .unwrap_or_else(|| RemoteError::Encode("没有可用的 H.264 硬件编码后端".to_owned())))
+        Err(last_error.unwrap_or_else(|| {
+            RemoteError::Encode(format!("没有可用的 {codec_label} 硬件编码后端"))
+        }))
     }
 }
 
@@ -1139,9 +1223,10 @@ impl VideoEncoderApi for NvencAdapter {
     /// 本适配器的主路径是 `nvEncRegisterResource` 纹理直通（零拷贝），回读上传只是
     /// 跨设备 / 需要缩放时的降级，仍属 GPU 编码。
     fn info(&self) -> EncoderInfo {
+        let codec = self.encoder.codec();
         EncoderInfo {
             backend: "NVENC".to_owned(),
-            name: "NVIDIA NVENC H.264".to_owned(),
+            name: format!("NVIDIA NVENC {}", codec.label()),
             adapter: self.encoder.device().adapter.name.clone(),
             gpu_input: true,
         }
@@ -1194,7 +1279,10 @@ impl VideoEncoderApi for NvencAdapter {
             rgba_to_bgra(rgba)
         } else {
             let scaled = scale_rgba_box(rgba, src_width, src_height, dst_width, dst_height)
-                .map_err(|err| RemoteError::Encode(format!("H.264 输入下采样失败: {err}")))?;
+                .map_err(|err| {
+                    let codec = self.encoder.codec();
+                    RemoteError::Encode(format!("{} 输入下采样失败: {err}", codec.label()))
+                })?;
             rgba_to_bgra(&scaled)
         };
         let packet = self
@@ -1311,28 +1399,34 @@ impl VideoEncoderApi for NvencAdapter {
     }
 }
 
-/// Media Foundation 硬件 H.264 编码器工厂（Intel QSV / AMD VCE 等）。
+/// Media Foundation 硬件编码器工厂（Intel QSV / AMD VCE 等），按编码标准实例化。
 ///
 /// 探测是**懒加载**的（见 [`mft_available`]）：NVENC 可用的机器只有在采集设备
 /// 是 Intel/AMD 时才会付 `MftEncoderFactory::probe()` 的启动成本。实际是否可用
-/// 由 `MftH264Encoder::new` 的硬件 MFT 枚举决定。Intel MFT 不支持运行期改帧率，
+/// 由 `MfVideoEncoder::new_codec` 的硬件 MFT 枚举决定。Intel MFT 不支持运行期改帧率，
 /// 适配器会保持内部帧率，只让采集节奏随 QoS 变化，避免重建编码器/插 IDR。
 #[derive(Debug)]
-pub struct MftEncoderFactory;
+pub struct MftEncoderFactory {
+    /// 本工厂产出的编码标准。
+    codec: CodecKind,
+}
 
 impl MftEncoderFactory {
-    /// 探测是否有可用的硬件 H.264 编码 MFT（专用线程，避免 COM 套间污染）。
+    /// 探测是否有可用的、指定标准的硬件编码 MFT（专用线程，避免 COM 套间污染）。
     #[must_use]
-    pub fn probe() -> bool {
+    pub fn probe(&self) -> bool {
+        let codec = self.codec;
         let probe = std::thread::Builder::new()
             .name("mft-encoder-probe".to_owned())
-            .spawn(|| match MftH264Encoder::new(1280, 720, 30, 2000) {
-                Ok(_) => true,
-                Err(err) => {
-                    info!(error = %err, "没有可用的硬件 H.264 编码 MFT");
-                    false
-                }
-            })
+            .spawn(
+                move || match MfVideoEncoder::new_codec(1280, 720, 30, 2000, codec) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        info!(error = %err, "没有可用的硬件 {} 编码 MFT", codec.label());
+                        false
+                    }
+                },
+            )
             .ok();
         match probe.map(std::thread::JoinHandle::join) {
             Some(Ok(ok)) => ok,
@@ -1347,7 +1441,10 @@ impl MftEncoderFactory {
 
 impl VideoEncoderFactory for MftEncoderFactory {
     fn codec(&self) -> CodecId {
-        CodecId::H264
+        match self.codec {
+            CodecKind::H264 => CodecId::H264,
+            CodecKind::H265 => CodecId::H265,
+        }
     }
 
     fn create(
@@ -1358,8 +1455,10 @@ impl VideoEncoderFactory for MftEncoderFactory {
         max_fps: u8,
     ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
         let fps = u32::from(max_fps.max(1));
+        let codec = self.codec;
+        let codec_label = codec.label();
         // GPU 零拷贝只在 **Intel** 采集设备上启用：VideoProcessor + QSV MFT 的同设备
-        // 路径是本机验证过的那一条（见 `MftH264Encoder::encode_texture`）。其它厂商
+        // 路径是本机验证过的那一条（见 `MfVideoEncoder::encode_texture`）。其它厂商
         // （AMD 等）继续走 CPU RGBA 输入，避免未验证的组合。
         let capture_device = if gpu_context().is_disabled() {
             None
@@ -1372,30 +1471,38 @@ impl VideoEncoderFactory for MftEncoderFactory {
             .cloned();
         let (encoder, device) = if let Some(device) = gpu_device {
             let adapter = device.adapter.name.clone();
-            match MftH264Encoder::new_with_device(
+            match MfVideoEncoder::new_with_device_codec(
                 Arc::clone(&device),
                 width,
                 height,
                 fps,
                 target_bitrate_kbps,
+                codec,
             ) {
                 Ok(encoder) => {
                     // GUI 日志层会丢 tracing 字段，全部内联。
-                    info!("MFT 编码器复用采集 D3D11 设备（GPU 零拷贝） adapter={adapter}");
+                    info!(
+                        "MFT {codec_label} 编码器复用采集 D3D11 设备（GPU 零拷贝） adapter={adapter}"
+                    );
                     (encoder, Some(device))
                 }
                 Err(err) => {
-                    info!("MFT 复用采集设备失败，回退 CPU RGBA 输入：{err}");
-                    let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
-                        .map_err(|err| {
-                            RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}"))
+                    info!("MFT {codec_label} 复用采集设备失败，回退 CPU RGBA 输入：{err}");
+                    let encoder =
+                        MfVideoEncoder::new_codec(width, height, fps, target_bitrate_kbps, codec)
+                            .map_err(|err| {
+                            RemoteError::Encode(format!(
+                                "硬件 MFT {codec_label} 编码器创建失败: {err}"
+                            ))
                         })?;
                     (encoder, None)
                 }
             }
         } else {
-            let encoder = MftH264Encoder::new(width, height, fps, target_bitrate_kbps)
-                .map_err(|err| RemoteError::Encode(format!("硬件 MFT 编码器创建失败: {err}")))?;
+            let encoder = MfVideoEncoder::new_codec(width, height, fps, target_bitrate_kbps, codec)
+                .map_err(|err| {
+                    RemoteError::Encode(format!("硬件 MFT {codec_label} 编码器创建失败: {err}"))
+                })?;
             (encoder, None)
         };
         let gpu = device.is_some();
@@ -1415,10 +1522,10 @@ impl VideoEncoderFactory for MftEncoderFactory {
     }
 }
 
-/// `MftH264Encoder` 的 remote 适配器：尺寸不同时先做 CPU 盒式下采样。
+/// `MfVideoEncoder` 的 remote 适配器：尺寸不同时先做 CPU 盒式下采样。
 struct MftAdapter {
     /// 硬件编码器。
-    encoder: MftH264Encoder,
+    encoder: MfVideoEncoder,
     /// 逻辑帧率（Intel MFT 不支持在线改输出帧率，实际节奏由采集控制）。
     fps: u32,
     /// 已编码帧数，用于限制细分耗时日志的频率（前 3 帧 + 每 120 帧）。
@@ -1510,6 +1617,7 @@ impl VideoEncoderApi for MftAdapter {
             )));
         }
         let (dst_width, dst_height) = self.encoder.dimensions();
+        let codec_label = self.encoder.codec().label();
         let total_started = Instant::now();
         let mut scale_ms = 0u32;
         let packet = if (src_width, src_height) == (dst_width, dst_height) {
@@ -1517,7 +1625,9 @@ impl VideoEncoderApi for MftAdapter {
         } else {
             let scale_started = Instant::now();
             let scaled = scale_rgba_box(rgba, src_width, src_height, dst_width, dst_height)
-                .map_err(|err| RemoteError::Encode(format!("H.264 输入下采样失败: {err}")))?;
+                .map_err(|err| {
+                    RemoteError::Encode(format!("{codec_label} 输入下采样失败: {err}"))
+                })?;
             scale_ms = elapsed_ms(scale_started);
             self.encoder.encode_rgba(&scaled, force_keyframe)
         }
@@ -1528,7 +1638,7 @@ impl VideoEncoderApi for MftAdapter {
         // 内联进消息文本。字段 = 适配器总耗时（缩放 + 转换 + MFT）。
         if self.frames <= 3 || self.frames.is_multiple_of(120) {
             info!(
-                "MFT H.264 编码细分 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={dst_width}x{dst_height} 缩放={scale_ms}ms",
+                "MFT {codec_label} 编码细分 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={dst_width}x{dst_height} 缩放={scale_ms}ms",
                 self.encoder.last_convert_ms(),
                 self.encoder.last_mft_ms(),
             );
@@ -1582,9 +1692,10 @@ impl VideoEncoderApi for MftAdapter {
         self.frames = self.frames.saturating_add(1);
         if self.frames <= 3 || self.frames.is_multiple_of(120) {
             let (width, height) = self.encoder.dimensions();
+            let codec_label = self.encoder.codec().label();
             // GUI 日志层会丢弃 tracing 字段，全部内联。
             info!(
-                "MFT GPU H.264 编码 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={width}x{height} 源={}x{}",
+                "MFT GPU {codec_label} 编码 总计={total_ms}ms 转换={}ms MFT={}ms 尺寸={width}x{height} 源={}x{}",
                 self.encoder.last_convert_ms(),
                 self.encoder.last_mft_ms(),
                 gpu_frame.source_width,
@@ -1605,30 +1716,13 @@ pub struct H264DecoderFactory;
 impl H264DecoderFactory {
     /// 探测 `MSH264DecoderMFT` 是否可用；不可用时返回 `None`（不声明 H.264 能力）。
     ///
-    /// **探测放在专用线程**：`H264Decoder::new` 会 `CoInitializeEx(MTA)` 并
+    /// **探测放在专用线程**：`MfVideoDecoder::new` 会 `CoInitializeEx(MTA)` 并
     /// `MFStartup`。虽然本函数跑在远程引擎的后台线程、不是 winit 主线程，但把
     /// COM 套间初始化限制在一条一次性线程上更干净，也不会与后续任何 STA 依赖
     /// 抢主线程的套间。
     #[must_use]
     pub fn new() -> Option<Self> {
-        let probe = std::thread::Builder::new()
-            .name("mft-probe".to_owned())
-            .spawn(|| match H264Decoder::new(64, 64) {
-                Ok(_) => true,
-                Err(err) => {
-                    info!(error = %err, "Media Foundation H.264 解码器不可用，控制器不声明 H.264 能力");
-                    false
-                }
-            })
-            .ok()?;
-        match probe.join() {
-            Ok(true) => Some(Self),
-            Ok(false) => None,
-            Err(_) => {
-                info!("MFT 探测线程 panic，控制器不声明 H.264 能力");
-                None
-            }
-        }
+        probe_decoder(CodecKind::H264, || MfVideoDecoder::new(64, 64)).then_some(Self)
     }
 }
 
@@ -1638,25 +1732,99 @@ impl VideoDecoderFactory for H264DecoderFactory {
     }
 
     fn create(&self) -> RemoteResult<Box<dyn VideoDecoderApi>> {
-        Ok(Box::new(H264DecoderAdapter {
-            decoder: None,
-            configured: None,
-            frames: 0,
-        }))
+        Ok(Box::new(MfDecoderAdapter::new(CodecKind::H264)))
     }
 }
 
-/// 惰性适配器：`configure(width, height)` 之前不创建 MFT。
-struct H264DecoderAdapter {
+/// Media Foundation H.265/HEVC 解码器工厂（控制器侧）。
+///
+/// HEVC 解码依赖 Microsoft Store 的 **HEVC Video Extensions**（提供 `MSH265DecoderMFT`）。
+/// 未安装该扩展的机器探测失败 → 返回 `None` → 控制器不声明 H.265，协商回退 H.264。
+#[derive(Debug)]
+pub struct H265DecoderFactory;
+
+impl H265DecoderFactory {
+    /// 探测 HEVC 解码器是否可用；不可用时返回 `None`（不声明 H.265 能力）。
+    ///
+    /// 探测同样在专用线程上构造一个 1280×720 的 HEVC 解码器（Com 套间理由同
+    /// [`H264DecoderFactory::new`]）。**以真实创建为判据**：只有真正初始化过
+    /// `MSH265DecoderMFT` 才声明能力，避免协商到 H.265 却在解码阶段才失败。
+    #[must_use]
+    pub fn new() -> Option<Self> {
+        probe_decoder(CodecKind::H265, || MfVideoDecoder::new_hevc(1280, 720)).then_some(Self)
+    }
+}
+
+impl VideoDecoderFactory for H265DecoderFactory {
+    fn codec(&self) -> CodecId {
+        CodecId::H265
+    }
+
+    fn create(&self) -> RemoteResult<Box<dyn VideoDecoderApi>> {
+        Ok(Box::new(MfDecoderAdapter::new(CodecKind::H265)))
+    }
+}
+
+/// 在专用线程上试创建一个解码器，返回它是否可用（失败或线程 panic 一律按不可用）。
+///
+/// 参数 `create` 里构造的是**任意编码标准**的解码器；COM/Media Foundation 的套间
+/// 初始化因此只落在这一条一次性线程上。
+fn probe_decoder(
+    codec: CodecKind,
+    create: impl FnOnce() -> Result<MfVideoDecoder, rust_tunnel_win_video::WinVideoError>
+        + Send
+        + 'static,
+) -> bool {
+    let probe = std::thread::Builder::new()
+        .name("mft-probe".to_owned())
+        .spawn(move || match create() {
+            Ok(_) => true,
+            Err(err) => {
+                info!(
+                    error = %err,
+                    "Media Foundation {} 解码器不可用，控制器不声明 {} 能力",
+                    codec.label(),
+                    codec.label()
+                );
+                false
+            }
+        })
+        .ok();
+    match probe.map(std::thread::JoinHandle::join) {
+        Some(Ok(ok)) => ok,
+        Some(Err(_)) => {
+            info!("MFT {} 探测线程 panic，控制器不声明该能力", codec.label());
+            false
+        }
+        None => false,
+    }
+}
+
+/// 惰性适配器：`configure(width, height)` 之前不创建 MFT（H.264 / H.265 共用）。
+struct MfDecoderAdapter {
+    /// 本解码器对应的编码标准。
+    codec: CodecKind,
     /// 当前解码器；`None` 表示尚未 configure 或上次创建失败。
-    decoder: Option<H264Decoder>,
+    decoder: Option<MfVideoDecoder>,
     /// 当前解码器适配的编码尺寸。
     configured: Option<(u32, u32)>,
     /// 已成功解出的帧数，用于限制细分耗时日志的频率（前 3 帧 + 每 120 帧）。
     frames: u64,
 }
 
-impl VideoDecoderApi for H264DecoderAdapter {
+impl MfDecoderAdapter {
+    /// 构造惰性适配器（尚未 configure）。
+    fn new(codec: CodecKind) -> Self {
+        Self {
+            codec,
+            decoder: None,
+            configured: None,
+            frames: 0,
+        }
+    }
+}
+
+impl VideoDecoderApi for MfDecoderAdapter {
     /// 控制器遥测口径：解码后端、MFT 名称与硬件解码绑定的适配器。
     ///
     /// 还没 `configure`（没有解码器实例）时返回默认值——此时说任何话都是编的。
@@ -1673,7 +1841,11 @@ impl VideoDecoderApi for H264DecoderAdapter {
                 H264DecodePath::Software => "MF Software",
             }
             .to_owned(),
-            name: "MSH264DecoderMFT".to_owned(),
+            name: match self.codec {
+                CodecKind::H264 => "MSH264DecoderMFT",
+                CodecKind::H265 => "MSH265DecoderMFT",
+            }
+            .to_owned(),
             adapter: decoder.adapter_name().unwrap_or_default().to_owned(),
             hardware: path == H264DecodePath::Dxva,
         }
@@ -1688,18 +1860,20 @@ impl VideoDecoderApi for H264DecoderAdapter {
         // 默认行为不变（Auto → DXVA 优先）。
         let software =
             std::env::var_os("RUST_TUNNEL_DECODE_SOFTWARE").is_some_and(|value| !value.is_empty());
-        // 输出 **紧包 NV12**：CPU 侧的 NV12→RGBA 转换移到 GUI 线程（阶段 1b 会换成
-        // GPU 着色器），解码线程只做 MFT 解码 + 可见区域拷贝。
-        let created = if software {
-            H264Decoder::new_with_preference_and_output(
-                width,
-                height,
-                H264HardwarePreference::Software,
-                H264OutputMode::Nv12,
-            )
-        } else {
-            H264Decoder::new_nv12(width, height)
-        };
+        let codec = self.codec;
+        // 输出 **紧包 NV12**：CPU 侧的 NV12→RGBA 转换移到 GUI 线程，解码线程只做
+        // MFT 解码 + 可见区域拷贝。H.265 走 `new_hevc_nv12`（同一条 NV12 渲染链路）。
+        let created = MfVideoDecoder::new_with_codec_preference_and_output(
+            width,
+            height,
+            codec,
+            if software {
+                H264HardwarePreference::Software
+            } else {
+                H264HardwarePreference::Auto
+            },
+            H264OutputMode::Nv12,
+        );
         match created {
             Ok(decoder) => {
                 info!(
@@ -1707,9 +1881,10 @@ impl VideoDecoderApi for H264DecoderAdapter {
                     adapter = ?decoder.adapter_name(),
                     software,
                     output = "Nv12",
+                    codec = codec.label(),
                     width,
                     height,
-                    "H.264 解码器已创建"
+                    "MFT 解码器已创建"
                 );
                 self.decoder = Some(decoder);
                 self.configured = Some((width, height));
@@ -1719,21 +1894,23 @@ impl VideoDecoderApi for H264DecoderAdapter {
                 self.decoder = None;
                 self.configured = None;
                 Err(RemoteError::Encode(format!(
-                    "H.264 解码器初始化失败: {err}"
+                    "{} 解码器初始化失败: {err}",
+                    codec.label()
                 )))
             }
         }
     }
 
     fn decode(&mut self, data: &[u8]) -> RemoteResult<Option<DecodedVideoFrame>> {
+        let codec_label = self.codec.label();
         let decoder = self
             .decoder
             .as_mut()
-            .ok_or_else(|| RemoteError::Encode("H.264 解码器尚未 configure".to_owned()))?;
+            .ok_or_else(|| RemoteError::Encode(format!("{codec_label} 解码器尚未 configure")))?;
         let total_started = Instant::now();
         let frame = decoder
             .decode(data)
-            .map_err(|err| RemoteError::Encode(format!("H.264 解码失败: {err}")))?;
+            .map_err(|err| RemoteError::Encode(format!("{codec_label} 解码失败: {err}")))?;
         let total_ms = elapsed_ms(total_started);
         // 在结束 `decoder` 的可变借用前读出诊断读数与通路名。
         let timings = decoder.last_phase_timings();
@@ -1753,7 +1930,7 @@ impl VideoDecoderApi for H264DecoderAdapter {
                 color_us,
             } = timings;
             info!(
-                "H.264 解码细分 总计={total_ms}ms 送包={submit_us}us 出帧={output_us}us 回读={readback_us}us 转换={color_us}us 尺寸={}x{} path={path}",
+                "{codec_label} 解码细分 总计={total_ms}ms 送包={submit_us}us 出帧={output_us}us 回读={readback_us}us 转换={color_us}us 尺寸={}x{} path={path}",
                 frame.width, frame.height,
             );
         }
@@ -1789,40 +1966,75 @@ impl VideoDecoderApi for H264DecoderAdapter {
     }
 }
 
-/// 探测并构造 Windows 硬件编解码工厂。
+/// 探测并构造 Windows 硬件编解码工厂（H.264 与 H.265/HEVC 各一对）。
 ///
-/// 返回的每一侧都是独立的：NVENC/MFT 不可用不影响 MFT 解码声明，反之亦然。
-/// 任一侧为 `None` 时，协商会回退到 VP9。
+/// 四个字段彼此独立：NVENC/MFT 不可用不影响 MFT 解码声明，H.265 探测失败也不影响
+/// H.264。缺失的组合让协商按 H.265 → H.264 → VP9 逐级回退。
 ///
-/// **编码后端在这里不锁定**：NVENC 可用时只代表「H.264 值得声明」，具体用
-/// NVENC 还是 MFT 由 [`HardwareEncoderFactory::create`] 在会话建立时按采集
-/// 适配器决定（见 [`choose_backend`]）。MFT 探测对 NVENC 可用的机器保持懒加载。
+/// **编码后端在这里不锁定**：NVENC 可用时只代表「该标准值得声明」，具体用 NVENC 还是
+/// MFT 由 [`HardwareEncoderFactory::create`] 在会话建立时按采集适配器决定（见
+/// [`choose_backend`]）。MFT 探测对 NVENC 可用的机器保持懒加载。
 #[must_use]
 pub fn factories() -> super::HardwareFactories {
     // 现场诊断开关：怀疑 NVENC/Media Foundation 探测导致启动问题时置 1，
     // 跳过所有硬件探测，数据面完全回退 VP9（GUI 仍应正常启动）。
     if std::env::var_os("RUST_TUNNEL_DISABLE_HWCODEC").is_some() {
         info!("RUST_TUNNEL_DISABLE_HWCODEC 已设置，跳过 NVENC/MFT 探测");
-        return (None, None);
+        return super::HardwareFactories::default();
     }
-    let api = nvenc_supported();
-    let encoder = if api.is_some() {
+    let mut out = super::HardwareFactories::default();
+
+    // ── H.264 编码器 ──
+    let h264_api = nvenc_supported();
+    if h264_api.is_some() {
         info!("NVENC H.264 硬件编码已注入（编码后端在会话建立时按采集设备选路）");
-        let factory: Arc<dyn VideoEncoderFactory> = Arc::new(HardwareEncoderFactory { api });
-        Some(factory)
-    } else if mft_available() {
+        out.h264_encoder = Some(Arc::new(HardwareEncoderFactory {
+            api: h264_api,
+            codec: CodecKind::H264,
+        }));
+    } else if mft_available(CodecKind::H264) {
         info!("Intel/AMD 硬件 MFT H.264 编码已注入");
-        let factory: Arc<dyn VideoEncoderFactory> = Arc::new(HardwareEncoderFactory { api: None });
-        Some(factory)
+        out.h264_encoder = Some(Arc::new(HardwareEncoderFactory {
+            api: None,
+            codec: CodecKind::H264,
+        }));
     } else {
         info!("没有可用的硬件 H.264 编码器（NVENC/MFT），回退 VP9");
-        None
-    };
-    let decoder = H264DecoderFactory::new().map(|factory| {
-        let factory: Arc<dyn VideoDecoderFactory> = Arc::new(factory);
-        factory
-    });
-    (encoder, decoder)
+    }
+
+    // ── H.265 编码器（环境变量或探测失败时保持 None → 协商回退 H.264）──
+    if super::h265_disabled_by_env() {
+        info!("RUST_TUNNEL_DISABLE_H265 已设置，不声明 H.265 编码能力");
+    } else {
+        let h265_api = nvenc_hevc_supported();
+        if h265_api.is_some() {
+            info!("NVENC H.265 硬件编码已注入（编码后端在会话建立时按采集设备选路）");
+            out.h265_encoder = Some(Arc::new(HardwareEncoderFactory {
+                api: h265_api,
+                codec: CodecKind::H265,
+            }));
+        } else if mft_available(CodecKind::H265) {
+            info!("Intel/AMD 硬件 MFT H.265 编码已注入");
+            out.h265_encoder = Some(Arc::new(HardwareEncoderFactory {
+                api: None,
+                codec: CodecKind::H265,
+            }));
+        } else {
+            info!("没有可用的硬件 H.265 编码器（NVENC/MFT），协商回退 H.264/VP9");
+        }
+    }
+
+    // ── 解码器（控制器侧，两侧独立探测）──
+    out.h264_decoder = H264DecoderFactory::new()
+        .map(|factory| -> Arc<dyn VideoDecoderFactory> { Arc::new(factory) });
+    // `RUST_TUNNEL_DISABLE_H265` 是**整机**的 H.265 kill switch：解码侧也必须一起关掉，
+    // 否则它在控制器上会照常声明 `CodecOffer.h265`，用户在设置页重新打开偏好后又能协商
+    // 到 H.265——那就不是「强制关闭」了。
+    if !super::h265_disabled_by_env() {
+        out.h265_decoder = H265DecoderFactory::new()
+            .map(|factory| -> Arc<dyn VideoDecoderFactory> { Arc::new(factory) });
+    }
+    out
 }
 
 /// 让进程在 eframe/winit 创建窗口**之前**切到「每显示器 DPI 感知 v2」。

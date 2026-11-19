@@ -19,7 +19,11 @@ name = "rust-tunnel-client-gui"
 # 0.21.0 = 远程控制延迟修复（补丁模式在关键帧请求时「重设基准」而不是退出；控制器解码
 #          队列按参考链截断、闸门改在 IDR 入队时打开；DXVA 回读改有界等待；静止保活
 #          250→66 ms）。数据面仍是 v9、线上帧逐字节不变，0.20.0 ↔ 0.21.0 可互连。
-version = "0.21.0"
+# 0.22.0 = 数据面 v10（`CodecId::H265` + `CodecOffer.h265`）：新增 H.265/HEVC 硬件编解码
+#          与自动协商（H.265 → H.264 → VP9），并新增设置开关 `remote_prefer_h265`
+#          （默认开）与实例 `host.toml` 的 `prefer_h265`。两端必须同为 0.22.0；
+#          `client` / `win-platform` / `win-service` 同步抬版。
+version = "0.22.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"

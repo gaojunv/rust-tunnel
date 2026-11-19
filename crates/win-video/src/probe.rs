@@ -1,9 +1,10 @@
-//! 真机探针：打印适配器、NVENC 版本与 H.264 能力，并跑编码回环。
+//! 真机探针：打印适配器、NVENC 版本与 H.264/H.265 能力，并跑编码回环。
 //!
 //! 这是把 FFI 层与驱动对齐的最短回路：先确认 `nvEncodeAPI64.dll` 能加载、
 //! 会话能开在独显上、能力值与预期一致，再验证 BGRA/RGBA 输入、在线改码率与
-//! （可选的）NVENC 输入缩放。
+//! （可选的）NVENC 输入缩放。`--codec h264|hevc|both` 选择跑哪一路，默认 H.264。
 
+use crate::codec::{CodecKind, CodecSelection};
 use crate::d3d11;
 use crate::nvenc::{self, EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use crate::WinVideoError;
@@ -63,21 +64,60 @@ fn synthetic_pixels(width: u32, height: u32, frame: u32, format: InputFormat) ->
     buf
 }
 
-fn run_encode_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
+/// 统计 Annex B 里的关键帧与完整参数集（H.264 SPS+PPS；H.265 VPS+SPS+PPS）。
+fn nal_summary(annex_b: &[u8], kind: CodecKind) -> (bool, bool) {
+    let mut keyframe = false;
+    let mut vps = false;
+    let mut sps = false;
+    let mut pps = false;
+    for nal in nal_units(annex_b) {
+        let Some(&header) = nal.first() else {
+            continue;
+        };
+        if kind.is_hevc() {
+            match (header >> 1) & 0x3F {
+                16..=23 => keyframe = true,
+                32 => vps = true,
+                33 => sps = true,
+                34 => pps = true,
+                _ => {}
+            }
+        } else {
+            match header & 0x1F {
+                5 => keyframe = true,
+                7 => sps = true,
+                8 => pps = true,
+                _ => {}
+            }
+        }
+    }
+    let parameter_sets = if kind.is_hevc() { vps && sps && pps } else { sps && pps };
+    (keyframe, parameter_sets)
+}
+
+fn run_encode_probe(
+    api: &NvencApi,
+    d3d: Arc<d3d11::D3d11>,
+    kind: CodecKind,
+) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
     const FPS: u32 = 60;
     const BITRATE_KBPS: u32 = 4000;
     const P_FRAMES: u32 = 10;
 
-    println!("\n== NVENC H.264 4:2:0 编码（合成 BGRA {WIDTH}x{HEIGHT}）==");
-    let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, BITRATE_KBPS)?;
+    println!(
+        "\n== NVENC {} 4:2:0 编码（合成 BGRA {WIDTH}x{HEIGHT}）==",
+        kind.label()
+    );
+    let config = EncoderConfig::new(WIDTH, HEIGHT, FPS, BITRATE_KBPS)?.with_codec(kind);
     let mut encoder = NvencEncoder::new(api, d3d, config)?;
     println!(
-        "  编码器: {}x{} @ {FPS} fps, CBR {} kbps, H.264 High, 无 B 帧, 输入 {:?}",
+        "  编码器: {}x{} @ {FPS} fps, CBR {} kbps, {}, 无 B 帧, 输入 {:?}",
         encoder.size().0,
         encoder.size().1,
         BITRATE_KBPS,
+        kind.label(),
         encoder.input_format()
     );
 
@@ -97,20 +137,31 @@ fn run_encode_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVid
         let encode_start = Instant::now();
         let packet = encoder.encode(force_idr)?;
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+        let (keyframe, parameter_sets) =
+            nal_summary(packet.data.get(4..).unwrap_or_default(), kind);
 
         println!(
-            "  帧 {index:>2}: 上传 {upload_ms:6.2} ms, 编码 {encode_ms:6.2} ms, {:>7} 字节, keyframe={}",
+            "  帧 {index:>2}: 上传 {upload_ms:6.2} ms, 编码 {encode_ms:6.2} ms, {:>7} 字节, keyframe={}, 参数集={}",
             packet.payload_len(),
-            packet.keyframe
+            packet.keyframe,
+            parameter_sets
         );
         if force_idr {
             idr_bytes = packet.payload_len();
             idr_time_ms = encode_ms;
-            idr_dims = parse_sps_dimensions(packet.data.get(4..).unwrap_or_default());
+            if !kind.is_hevc() {
+                idr_dims = parse_sps_dimensions(packet.data.get(4..).unwrap_or_default());
+            }
             if !packet.keyframe {
                 return Err(WinVideoError::Nvenc(
                     "首帧被要求 IDR 但驱动返回非关键帧".to_owned(),
                 ));
+            }
+            if !keyframe || !parameter_sets {
+                return Err(WinVideoError::Nvenc(format!(
+                    "{} 首帧关键帧缺少完整参数集（keyframe={keyframe}, 参数集={parameter_sets}）",
+                    kind.label()
+                )));
             }
         } else {
             p_bytes_total += packet.payload_len();
@@ -125,6 +176,7 @@ fn run_encode_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVid
 
     match idr_dims {
         Some((w, h)) => println!("  SPS 解析输出尺寸: {w}x{h}"),
+        None if kind.is_hevc() => println!("  （HEVC 不解析 SPS 尺寸，编码尺寸以接口为准）"),
         None => println!("  警告: 无法从 SPS 解析输出尺寸"),
     }
 
@@ -158,13 +210,22 @@ fn run_encode_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVid
     Ok(())
 }
 
-fn run_rgba_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
+fn run_rgba_probe(
+    api: &NvencApi,
+    d3d: Arc<d3d11::D3d11>,
+    kind: CodecKind,
+) -> Result<(), WinVideoError> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
     const FRAMES: u32 = 3;
 
-    println!("\n== NVENC H.264 4:2:0 编码（合成 RGBA {WIDTH}x{HEIGHT}）==");
-    let config = EncoderConfig::new(WIDTH, HEIGHT, 60, 4000)?.with_input_format(InputFormat::Rgba);
+    println!(
+        "\n== NVENC {} 4:2:0 编码（合成 RGBA {WIDTH}x{HEIGHT}）==",
+        kind.label()
+    );
+    let config = EncoderConfig::new(WIDTH, HEIGHT, 60, 4000)?
+        .with_input_format(InputFormat::Rgba)
+        .with_codec(kind);
     let mut encoder = NvencEncoder::new(api, d3d, config)?;
     println!(
         "  编码器: {}x{} 输出, 源 {:?}, 输入格式 {:?}（DXGI {:?}）, NVENC 缓冲 {:?}",
@@ -210,7 +271,11 @@ fn run_rgba_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideo
 /// 探测 NVENC 能否自行把 4K 输入缩放到 1080p 编码尺寸。
 ///
 /// 失败不视为探针失败：这条能力是可选的，结论会打印出来供适配层决策。
-fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
+fn run_scaling_probe(
+    api: &NvencApi,
+    d3d: Arc<d3d11::D3d11>,
+    kind: CodecKind,
+) -> Result<(), WinVideoError> {
     const ENCODE_WIDTH: u32 = 1920;
     const ENCODE_HEIGHT: u32 = 1080;
     const SOURCE_WIDTH: u32 = 3840;
@@ -218,10 +283,12 @@ fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVi
     const FRAMES: u32 = 3;
 
     println!(
-        "\n== NVENC 输入缩放探测（源 {SOURCE_WIDTH}x{SOURCE_HEIGHT} -> 编码 {ENCODE_WIDTH}x{ENCODE_HEIGHT}）=="
+        "\n== NVENC {} 输入缩放探测（源 {SOURCE_WIDTH}x{SOURCE_HEIGHT} -> 编码 {ENCODE_WIDTH}x{ENCODE_HEIGHT}）==",
+        kind.label()
     );
     let config = EncoderConfig::new(ENCODE_WIDTH, ENCODE_HEIGHT, 60, 6000)?
-        .with_source_size(SOURCE_WIDTH, SOURCE_HEIGHT);
+        .with_source_size(SOURCE_WIDTH, SOURCE_HEIGHT)
+        .with_codec(kind);
     let mut encoder = match NvencEncoder::new(api, Arc::clone(&d3d), config) {
         Ok(encoder) => encoder,
         Err(err) => {
@@ -260,7 +327,7 @@ fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVi
             packet.payload_len(),
             packet.keyframe
         );
-        if index == 0 {
+        if index == 0 && !kind.is_hevc() {
             sps_dims = parse_sps_dimensions(packet.data.get(4..).unwrap_or_default());
         }
     }
@@ -287,6 +354,7 @@ fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVi
     let baseline = scaling_test_p_frame(
         api,
         Arc::clone(&d3d),
+        kind,
         (ENCODE_WIDTH, ENCODE_HEIGHT),
         (SOURCE_WIDTH, SOURCE_HEIGHT),
         false,
@@ -294,6 +362,7 @@ fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVi
     let patched = scaling_test_p_frame(
         api,
         d3d,
+        kind,
         (ENCODE_WIDTH, ENCODE_HEIGHT),
         (SOURCE_WIDTH, SOURCE_HEIGHT),
         true,
@@ -317,12 +386,14 @@ fn run_scaling_probe(api: &NvencApi, d3d: Arc<d3d11::D3d11>) -> Result<(), WinVi
 fn scaling_test_p_frame(
     api: &NvencApi,
     d3d: Arc<d3d11::D3d11>,
+    kind: CodecKind,
     encode: (u32, u32),
     source: (u32, u32),
     white_outside: bool,
 ) -> Result<nvenc::EncodedPacket, WinVideoError> {
-    let config =
-        EncoderConfig::new(encode.0, encode.1, 60, 6000)?.with_source_size(source.0, source.1);
+    let config = EncoderConfig::new(encode.0, encode.1, 60, 6000)?
+        .with_source_size(source.0, source.1)
+        .with_codec(kind);
     let mut encoder = NvencEncoder::new(api, d3d, config)?;
     let black = solid_pixels(source.0, source.1, 0);
     encoder.upload_bgra(&black)?;
@@ -591,6 +662,9 @@ impl<'a> BitReader<'a> {
 /// # Errors
 /// DXGI/D3D11/NVENC 任一步失败时返回 [`WinVideoError`]。
 pub fn run() -> Result<(), WinVideoError> {
+    let selection = CodecSelection::from_args();
+    println!("== 编码标准: {selection:?} ==");
+
     println!("== DXGI 适配器 ==");
     let adapters = d3d11::adapters()?;
     for a in &adapters {
@@ -623,40 +697,59 @@ pub fn run() -> Result<(), WinVideoError> {
     let session = api.open_session(&d3d)?;
     println!("  会话: 已打开");
 
-    let caps = api.h264_caps(&session)?;
-    println!("\n== H.264 能力 ==");
-    println!("  最大尺寸: {}x{}", caps.max_width, caps.max_height);
-    println!("  最大 B 帧: {}", caps.max_bframes);
-    println!("  4:4:4 编码: {}", caps.yuv444_encode);
-    println!("  10-bit 编码: {}", caps.ten_bit_encode);
-    println!("  动态码率: {}", caps.dyn_bitrate);
-    println!("  动态分辨率: {}", caps.dyn_resolution);
-    println!("  异步编码: {}", caps.async_encode);
-    println!("  lookahead: {}", caps.lookahead);
-    println!("  temporal AQ: {}", caps.temporal_aq);
-    println!("  最大宏块/秒: {}", caps.mb_per_sec_max);
+    for kind in selection.kinds() {
+        let supported = api.supports_codec(&session, *kind);
+        println!("\n== {} 能力（支持={supported}）==", kind.label());
+        if !supported {
+            println!("  结论: 本机/驱动没有 {} 编码能力，跳过该标准的回环", kind.label());
+            continue;
+        }
+        let caps = api.caps(&session, *kind)?;
+        println!("  最大尺寸: {}x{}", caps.max_width, caps.max_height);
+        println!("  最大 B 帧: {}", caps.max_bframes);
+        println!("  4:4:4 编码: {}", caps.yuv444_encode);
+        println!("  10-bit 编码: {}", caps.ten_bit_encode);
+        println!("  动态码率: {}", caps.dyn_bitrate);
+        println!("  动态分辨率: {}", caps.dyn_resolution);
+        println!("  异步编码: {}", caps.async_encode);
+        println!("  lookahead: {}", caps.lookahead);
+        println!("  temporal AQ: {}", caps.temporal_aq);
+        println!("  intra refresh: {}", caps.intra_refresh);
+        println!("  最大宏块/秒: {}", caps.mb_per_sec_max);
 
-    println!("\n== H.264 profile ==");
-    for guid in api.h264_profiles(&session)? {
-        let name = if guid == nvenc::NV_ENC_H264_PROFILE_HIGH_GUID {
-            "High"
-        } else if guid == nvenc::NV_ENC_H264_PROFILE_HIGH_444_GUID {
-            "High 4:4:4"
-        } else {
-            "其他"
-        };
-        println!("  {name}: {guid:?}");
-    }
+        println!("\n== {} profile ==", kind.label());
+        for guid in api.profiles(&session, *kind)? {
+            let name = if guid == nvenc::NV_ENC_H264_PROFILE_HIGH_GUID {
+                "H.264 High"
+            } else if guid == nvenc::NV_ENC_H264_PROFILE_HIGH_444_GUID {
+                "H.264 High 4:4:4"
+            } else if guid == nvenc::NV_ENC_HEVC_PROFILE_MAIN_GUID {
+                "HEVC Main"
+            } else {
+                "其他"
+            };
+            println!("  {name}: {guid:?}");
+        }
 
-    println!("\n== H.264 输入格式 ==");
-    for fmt in api.h264_input_formats(&session)? {
-        println!("  {fmt:?}");
+        println!("\n== {} 输入格式 ==", kind.label());
+        for fmt in api.input_formats(&session, *kind)? {
+            println!("  {fmt:?}");
+        }
     }
 
     drop(session);
-    run_encode_probe(&api, Arc::clone(&d3d))?;
-    run_rgba_probe(&api, Arc::clone(&d3d))?;
-    run_scaling_probe(&api, d3d)?;
+    for kind in selection.kinds() {
+        let supported = {
+            let session = api.open_session(&d3d)?;
+            api.supports_codec(&session, *kind)
+        };
+        if !supported {
+            continue;
+        }
+        run_encode_probe(&api, Arc::clone(&d3d), *kind)?;
+        run_rgba_probe(&api, Arc::clone(&d3d), *kind)?;
+        run_scaling_probe(&api, Arc::clone(&d3d), *kind)?;
+    }
 
     Ok(())
 }

@@ -126,7 +126,7 @@ enum DecodeJob {
         /// 本端收到该包的时刻（本端单调时钟，微秒）。诊断用：解码队列等待 = 解码开始 - 它。
         recv_us: u64,
     },
-    /// 一批脏矩形补丁（协议 v5 `RegionUpdate`，仅 H.264 补丁模式）。
+    /// 一批脏矩形补丁（协议 v5 `RegionUpdate`，H.264/H.265 补丁模式）。
     ///
     /// 与 `Packet` 走**同一条**队列，因此 [`FrameSink::on_frame`] / [`FrameSink::on_patch`]
     /// 的调用顺序就是线上顺序——补丁永远应用在它前面那个全帧之上。这是补丁模式能够
@@ -467,8 +467,15 @@ pub struct ControllerConfig {
     pub stats: SessionStatsReporter,
     /// 可选的 H.264 解码器工厂（通常由 `crates/win-video` 注入）。
     ///
-    /// `None` = 本端只能解 VP9，`CodecOffer.h264` 因此为 `false`，被控端不会选 H.264。
+    /// `None` = 本端不能解 H.264，`CodecOffer.h264` 因此为 `false`，被控端不会选 H.264。
     pub h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    /// 可选的 H.265/HEVC 解码器工厂（通常由 `crates/win-video` 注入）。
+    ///
+    /// `None` = 本端不能解 H.265。是否向被控端**声明**该能力还取决于 [`Self::prefer_h265`]：
+    /// `CodecOffer.h265 = prefer_h265 && h265_decoder_factory.is_some()`。
+    pub h265_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    /// 是否**优先接受 H.265/HEVC**（默认 `true`）。`false` 时 offer 里不声明 H.265。
+    pub prefer_h265: bool,
     /// 数据面可靠层指标句柄（仅 UDP 打洞路径为 `Some`，见
     /// [`crate::transport::EstablishedStream::reliable`]）。
     ///
@@ -604,6 +611,7 @@ pub(crate) async fn run_controller_with_input(
     let offer = SessionMessage::CodecOffer {
         h264: config.h264_decoder_factory.is_some(),
         vp9: true,
+        h265: config.prefer_h265 && config.h265_decoder_factory.is_some(),
     };
     match send_cancellable(&mut writer, &cancel, SessionFrame::control(offer)).await {
         Ok(()) => {}
@@ -652,6 +660,7 @@ pub(crate) async fn run_controller_with_input(
         cancel.clone(),
         Arc::clone(&decode_shared),
         config.h264_decoder_factory.clone(),
+        config.h265_decoder_factory.clone(),
         config.stats.clone(),
     ));
     // 循环自己持有发送端（`recv()` 因此不会返回 `None`）；命名带下划线表明此处不再使用。
@@ -1391,12 +1400,18 @@ pub(crate) async fn run_controller_with_input(
                             debug!(monitor, ?codec, width, height, "收到屏幕配置");
                         }
                         SessionMessage::CodecSelect { codec } => {
-                            // 被控端在开始出帧前通告最终 codec。本端必须真的能解它；否则继续
-                            // 解码只会每帧失败并无限请求关键帧，不如明确报协议错误。
-                            if codec == CodecId::H264 && config.h264_decoder_factory.is_none() {
-                                break Err(RemoteError::Codec(
-                                    "被控端选择了本端未提供的 H.264 编解码器".to_owned(),
-                                ));
+                            // 被控端在开始出帧前通告最终 codec（运行时回退时也可能在会话中重发，
+                            // 见 `CodecSelect` 文档）。本端必须真的能解它；否则继续解码只会每帧
+                            // 失败并无限请求关键帧，不如明确报协议错误。
+                            let missing = match codec {
+                                CodecId::H264 => config.h264_decoder_factory.is_none(),
+                                CodecId::H265 => config.h265_decoder_factory.is_none(),
+                                CodecId::Vp9 => false,
+                            };
+                            if missing {
+                                break Err(RemoteError::Codec(format!(
+                                    "被控端选择了本端未提供的 {codec:?} 编解码器"
+                                )));
                             }
                             if selected_codec != Some(codec) {
                                 // 换 codec 意味着参考链作废：解码任务会重置解码器并等关键帧。
@@ -1616,14 +1631,16 @@ pub(crate) async fn run_controller_with_input(
 /// 只解码 + 打包 NV12，NV12→RGBA 的 CPU 转换被移到 GUI 线程（阶段 1b 会换成 GPU 着色器），
 /// 因此 B1 过渡期 H.264 的 `decode_ms` **不含**颜色转换，读数会比旧版本低。QoS 阈值暂不改，
 /// 待着色器落地、转换成本重新可见后再校准。
-/// 按 codec 取解码器工厂：VP9 用内置实现，H.264 用注入实现（未注入则为 `None`）。
+/// 按 codec 取解码器工厂：VP9 用内置实现，H.264/H.265 用注入实现（未注入则为 `None`）。
 fn decoder_factory_for(
     codec: CodecId,
     h264_decoder_factory: Option<&Arc<dyn VideoDecoderFactory>>,
+    h265_decoder_factory: Option<&Arc<dyn VideoDecoderFactory>>,
 ) -> Option<Arc<dyn VideoDecoderFactory>> {
     match codec {
         CodecId::Vp9 => Some(vp9_decoder_factory()),
         CodecId::H264 => h264_decoder_factory.cloned(),
+        CodecId::H265 => h265_decoder_factory.cloned(),
     }
 }
 
@@ -1804,7 +1821,9 @@ async fn dispatch_keyframe_request(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "序号断层/关键帧等待/解码器重建/切 codec 是一条不可分割的状态机，拆开反而要来回传状态"
+    clippy::too_many_arguments,
+    reason = "序号断层/关键帧等待/解码器重建/切 codec 是一条不可分割的状态机，拆开反而要来回传状态；\
+              工厂按 codec 分两个是协商的直接结果，打包成结构体只会多一层解构"
 )]
 async fn decode_loop(
     queue: Arc<DecodeQueue>,
@@ -1813,6 +1832,7 @@ async fn decode_loop(
     cancel: CancellationToken,
     decode_shared: Arc<DecodeShared>,
     h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    h265_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
     stats: SessionStatsReporter,
 ) {
     let mut codec: Option<CodecId> = None;
@@ -1855,9 +1875,11 @@ async fn decode_loop(
                         configured_dims = None;
                         awaiting_keyframe = true;
                         expected_seq = None;
-                        if let Some(factory) =
-                            decoder_factory_for(selected, h264_decoder_factory.as_ref())
-                        {
+                        if let Some(factory) = decoder_factory_for(
+                            selected,
+                            h264_decoder_factory.as_ref(),
+                            h265_decoder_factory.as_ref(),
+                        ) {
                             match factory.create() {
                                 Ok(dec) => {
                                     report_decoder_info(
@@ -1906,7 +1928,7 @@ async fn decode_loop(
                     // 因此 codec / 几何检查排在 `awaiting_keyframe` **之前**：几何不符意味着
                     // 我们的合成帧基底与对端以为的不是同一块缓冲，这正是必须换回全帧的理由，
                     // 即使此刻已经在等 IDR。
-                    if codec != Some(CodecId::H264) {
+                    if !matches!(codec, Some(CodecId::H264 | CodecId::H265)) {
                         debug!(monitor, ?codec, "非 H.264 会话收到补丁，丢弃并请求关键帧");
                         awaiting_reason = KeyframeReason::DecodeError;
                         report_break(&queue, &notice_tx, monitor, awaiting_reason);
@@ -2071,8 +2093,13 @@ async fn decode_loop(
             continue;
         }
         if decoder.is_none() {
-            let factory =
-                codec.and_then(|codec| decoder_factory_for(codec, h264_decoder_factory.as_ref()));
+            let factory = codec.and_then(|codec| {
+                decoder_factory_for(
+                    codec,
+                    h264_decoder_factory.as_ref(),
+                    h265_decoder_factory.as_ref(),
+                )
+            });
             let Some(factory) = factory else {
                 warn!(?codec, "没有对应 codec 的解码器工厂，丢弃本帧并等待关键帧");
                 awaiting_keyframe = true;
@@ -2487,6 +2514,8 @@ mod tests {
             mode: RemoteMode::Control,
             stats: SessionStatsReporter::noop(),
             h264_decoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
             reliable: None,
         }
     }
@@ -3021,6 +3050,7 @@ mod tests {
             cancel.clone(),
             Arc::new(DecodeShared::new()),
             Some(factory),
+            None,
             SessionStatsReporter::noop(),
         ));
 
@@ -3068,6 +3098,80 @@ mod tests {
         let _ = tokio::time::timeout(WAIT, task).await;
     }
 
+    /// **协商不变量（H.265）**：`CodecSelect{H265}` 必须让解码任务改用注入的 H.265 工厂。
+    ///
+    /// 与 H.264 用例同构：破坏它会用 VP9 解码器去解 HEVC 码流，画面永远黑屏。这里用
+    /// 记录创建次数的假工厂做机械断言，并确认它**没有**误用 H.264 工厂。
+    #[tokio::test]
+    async fn codec_select_uses_injected_h265_decoder_factory() {
+        let queue = Arc::new(DecodeQueue::new());
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<DecodeNotice>();
+        let sink = Arc::new(CountingSink::default());
+        let cancel = CancellationToken::new();
+        let h265_created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h264_created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let h265_factory: Arc<dyn VideoDecoderFactory> = Arc::new(RecordingDecoderFactory {
+            codec: CodecId::H265,
+            created: Arc::clone(&h265_created),
+            calls: Arc::clone(&calls),
+        });
+        let h264_factory: Arc<dyn VideoDecoderFactory> = Arc::new(RecordingDecoderFactory {
+            codec: CodecId::H264,
+            created: Arc::clone(&h264_created),
+            calls: Arc::clone(&calls),
+        });
+        let task = tokio::spawn(decode_loop(
+            Arc::clone(&queue),
+            notice_tx,
+            sink.clone(),
+            cancel.clone(),
+            Arc::new(DecodeShared::new()),
+            Some(h264_factory),
+            Some(h265_factory),
+            SessionStatsReporter::noop(),
+        ));
+
+        queue.push(DecodeJob::SelectCodec(CodecId::H265));
+        queue.push(DecodeJob::Packet {
+            display: 0,
+            seq: 1,
+            codec: CodecId::H265,
+            flags: VIDEO_FLAG_KEYFRAME,
+            width: 2,
+            height: 2,
+            data: vec![1, 2, 3],
+            capture_ts_us: 0,
+            recv_us: 0,
+        });
+
+        let decoded = tokio::time::timeout(WAIT, async {
+            for _ in 0..200 {
+                if sink.frames.load(Ordering::SeqCst) >= 1 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        })
+        .await
+        .expect("解码任务应及时出帧");
+        assert!(decoded, "应收到解码帧");
+        assert_eq!(
+            h265_created.load(Ordering::SeqCst),
+            1,
+            "H.265 选择必须由注入的 H.265 工厂创建解码器（且只建一次）"
+        );
+        assert_eq!(
+            h264_created.load(Ordering::SeqCst),
+            0,
+            "选择 H.265 时不得创建 H.264 解码器"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(WAIT, task).await;
+    }
+
     /// **解码器生命周期**：首个包先 `configure` 再 `decode`；尺寸不变不重复 configure；
     /// 尺寸变化再次 configure。
     ///
@@ -3093,6 +3197,7 @@ mod tests {
             cancel.clone(),
             Arc::new(DecodeShared::new()),
             Some(factory),
+            None,
             SessionStatsReporter::noop(),
         ));
 
@@ -3248,6 +3353,7 @@ mod tests {
                 cancel.clone(),
                 Arc::new(DecodeShared::new()),
                 Some(factory),
+                None,
                 SessionStatsReporter::noop(),
             ));
             Self {

@@ -1,4 +1,4 @@
-//! NVENC H.264 4:2:0 硬件编码器的运行期加载与能力查询。
+//! NVENC 4:2:0 硬件编码器的运行期加载与能力查询（H.264 / H.265）。
 //!
 //! 驱动库 `nvEncodeAPI64.dll` 在运行期用 `libloading` 打开：没有 NVIDIA 驱动的
 //! 机器上本 crate 仍能编译、也能正常回退到软件编码（调用方据此选择 VP9）。
@@ -6,10 +6,15 @@
 //! 绑定是 vendored 的（见 [`sys`]），对应 NVENC API 12.1。打开会话时请求
 //! `min(驱动支持的最大版本, 12.1)`，而不是硬编码 13.x——旧驱动（例如 470 系列）
 //! 也能工作。
+//!
+//! 能力查询按 [`CodecKind`] 参数化：H.264 与 HEVC 的会话、profile、输入格式集合
+//! 是分开的（老 GPU 往往只有 H.264）。旧名字 [`NvencApi::h264_caps`] 等保留为
+//! H.264 包装。
 
 mod encoder;
 mod sys;
 
+use crate::codec::CodecKind;
 use crate::d3d11::D3d11;
 use crate::WinVideoError;
 use std::ffi::{c_int, c_void};
@@ -21,9 +26,21 @@ pub use encoder::{
     MAX_SOURCE_DIMENSION,
 };
 pub use sys::{
-    NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_H264_GUID, NV_ENC_H264_PROFILE_HIGH_444_GUID,
-    NV_ENC_H264_PROFILE_HIGH_GUID,
+    NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
+    NV_ENC_H264_PROFILE_HIGH_444_GUID, NV_ENC_H264_PROFILE_HIGH_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID,
 };
+
+/// 给定编码标准对应的 NVENC codec GUID。
+///
+/// 用作 `NV_ENC_INITIALIZE_PARAMS.encodeGUID` 与全部 `nvEncGetEncode*` 查询的
+/// `codec` 参数：两套标准的能力/会话互不相通，查询串了会得到「无能力」。
+#[must_use]
+pub(crate) fn codec_guid(codec: CodecKind) -> sys::GUID {
+    match codec {
+        CodecKind::H264 => sys::NV_ENC_CODEC_H264_GUID,
+        CodecKind::H265 => sys::NV_ENC_CODEC_HEVC_GUID,
+    }
+}
 
 /// 本 crate 绑定对应的 NVENC API 版本。
 #[must_use]
@@ -176,13 +193,17 @@ impl NvencApi {
         Ok(value)
     }
 
-    /// 查询 H.264 编码器的关键能力。
+    /// 查询某个编码标准的编码器关键能力。
     ///
     /// # Errors
     /// 能力查询失败时返回 [`WinVideoError::Nvenc`]。
-    pub fn h264_caps(&self, session: &NvencSession<'_>) -> Result<H264Caps, WinVideoError> {
-        let codec = sys::NV_ENC_CODEC_H264_GUID;
-        Ok(H264Caps {
+    pub fn caps(
+        &self,
+        session: &NvencSession<'_>,
+        kind: CodecKind,
+    ) -> Result<EncoderCaps, WinVideoError> {
+        let codec = codec_guid(kind);
+        Ok(EncoderCaps {
             max_width: self.cap(session, codec, sys::_NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX)?,
             max_height: self.cap(session, codec, sys::_NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX)?,
             max_bframes: self.cap(
@@ -230,16 +251,40 @@ impl NvencApi {
                 codec,
                 sys::_NV_ENC_CAPS::NV_ENC_CAPS_MB_PER_SEC_MAX,
             )?,
+            intra_refresh: self.cap(
+                session,
+                codec,
+                sys::_NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_INTRA_REFRESH,
+            )?,
         })
     }
 
-    /// 查询 H.264 支持的 profile GUID。
+    /// 查询 H.264 编码器的关键能力（[`Self::caps`] 的 H.264 包装）。
+    ///
+    /// # Errors
+    /// 能力查询失败时返回 [`WinVideoError::Nvenc`]。
+    pub fn h264_caps(&self, session: &NvencSession<'_>) -> Result<EncoderCaps, WinVideoError> {
+        self.caps(session, CodecKind::H264)
+    }
+
+    /// 某个编码标准在这块 GPU 上是否可用。
+    ///
+    /// 以「能力查询成功且最大编码尺寸非零」为判据——老 GPU 没有 HEVC 编码时，
+    /// 查询会失败或返回 0，上层据此不声明 H.265 能力。
+    #[must_use]
+    pub fn supports_codec(&self, session: &NvencSession<'_>, kind: CodecKind) -> bool {
+        self.caps(session, kind)
+            .is_ok_and(|caps| caps.max_width > 0 && caps.max_height > 0)
+    }
+
+    /// 查询某个编码标准支持的 profile GUID。
     ///
     /// # Errors
     /// 查询失败时返回 [`WinVideoError::Nvenc`]。
-    pub fn h264_profiles(
+    pub fn profiles(
         &self,
         session: &NvencSession<'_>,
+        kind: CodecKind,
     ) -> Result<Vec<sys::GUID>, WinVideoError> {
         let count_fn = self
             .fns
@@ -250,7 +295,7 @@ impl NvencApi {
             .nvEncGetEncodeProfileGUIDs
             .ok_or_else(|| WinVideoError::Nvenc("驱动未导出 profile 枚举入口".to_owned()))?;
 
-        let codec = sys::NV_ENC_CODEC_H264_GUID;
+        let codec = codec_guid(kind);
         let mut count: u32 = 0;
         // SAFETY: 输出指针指向栈上 u32。
         let status = unsafe { count_fn(session.handle, codec, &raw mut count) };
@@ -276,13 +321,25 @@ impl NvencApi {
         Ok(guids)
     }
 
-    /// 查询 H.264 支持的输入图像格式。
+    /// 查询 H.264 支持的 profile GUID（[`Self::profiles`] 的 H.264 包装）。
     ///
     /// # Errors
     /// 查询失败时返回 [`WinVideoError::Nvenc`]。
-    pub fn h264_input_formats(
+    pub fn h264_profiles(
         &self,
         session: &NvencSession<'_>,
+    ) -> Result<Vec<sys::GUID>, WinVideoError> {
+        self.profiles(session, CodecKind::H264)
+    }
+
+    /// 查询某个编码标准支持的输入图像格式。
+    ///
+    /// # Errors
+    /// 查询失败时返回 [`WinVideoError::Nvenc`]。
+    pub fn input_formats(
+        &self,
+        session: &NvencSession<'_>,
+        kind: CodecKind,
     ) -> Result<Vec<sys::NV_ENC_BUFFER_FORMAT>, WinVideoError> {
         let count_fn = self
             .fns
@@ -292,7 +349,7 @@ impl NvencApi {
             .fns
             .nvEncGetInputFormats
             .ok_or_else(|| WinVideoError::Nvenc("驱动未导出输入格式枚举入口".to_owned()))?;
-        let codec = sys::NV_ENC_CODEC_H264_GUID;
+        let codec = codec_guid(kind);
 
         let mut count: u32 = 0;
         // SAFETY: 输出指针指向栈上 u32。
@@ -319,18 +376,29 @@ impl NvencApi {
         formats.truncate(actual as usize);
         Ok(formats)
     }
+
+    /// 查询 H.264 支持的输入图像格式（[`Self::input_formats`] 的 H.264 包装）。
+    ///
+    /// # Errors
+    /// 查询失败时返回 [`WinVideoError::Nvenc`]。
+    pub fn h264_input_formats(
+        &self,
+        session: &NvencSession<'_>,
+    ) -> Result<Vec<sys::NV_ENC_BUFFER_FORMAT>, WinVideoError> {
+        self.input_formats(session, CodecKind::H264)
+    }
 }
 
-/// H.264 编码器能力快照。
+/// NVENC 编码器能力快照（H.264 / H.265 共用同一套字段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct H264Caps {
+pub struct EncoderCaps {
     /// 最大编码宽度。
     pub max_width: i32,
     /// 最大编码高度。
     pub max_height: i32,
     /// 最大 B 帧数。
     pub max_bframes: i32,
-    /// 是否支持 4:4:4 编码（H.264 通常为 0；保留展示）。
+    /// 是否支持 4:4:4 编码（通常为 0；保留展示）。
     pub yuv444_encode: i32,
     /// 是否支持 10-bit 编码。
     pub ten_bit_encode: i32,
@@ -346,7 +414,12 @@ pub struct H264Caps {
     pub temporal_aq: i32,
     /// 每秒最大宏块数。
     pub mb_per_sec_max: i32,
+    /// 是否支持 intra refresh（GDR / 渐进式刷新）。
+    pub intra_refresh: i32,
 }
+
+/// 旧名字：H.264 能力快照（与 [`EncoderCaps`] 是同一类型）。
+pub type H264Caps = EncoderCaps;
 
 /// 一个打开的 NVENC 编码会话。
 ///

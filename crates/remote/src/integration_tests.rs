@@ -310,6 +310,9 @@ fn manager_with_dirs(
         approval_policy: ApprovalPolicy::Auto,
         h264_encoder_factory: None,
         h264_decoder_factory: None,
+        h265_encoder_factory: None,
+        h265_decoder_factory: None,
+        prefer_h265: true,
     })
 }
 
@@ -649,6 +652,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         unchanged_resend: UNCHANGED_RESEND_INTERVAL,
         stats: SessionStatsReporter::noop(),
         h264_encoder_factory: None,
+        h265_encoder_factory: None,
+        prefer_h265: true,
         lock_on_disconnect: Arc::new(AtomicBool::new(false)),
     };
     let ctrl_cfg = ControllerConfig {
@@ -658,6 +663,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         mode: RemoteMode::Control,
         stats: SessionStatsReporter::noop(),
         h264_decoder_factory: None,
+        h265_decoder_factory: None,
+        prefer_h265: true,
         reliable: None,
     };
 
@@ -728,6 +735,8 @@ async fn correct_token_completes_handshake_and_streams() {
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
+            h265_encoder_factory: None,
+            prefer_h265: true,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
@@ -746,6 +755,8 @@ async fn correct_token_completes_handshake_and_streams() {
             mode: RemoteMode::ViewOnly,
             stats: SessionStatsReporter::noop(),
             h264_decoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
             reliable: None,
         },
         plan,
@@ -862,6 +873,8 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
             mode: RemoteMode::Control,
             stats: SessionStatsReporter::noop(),
             h264_decoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
             reliable: None,
         },
         plan,
@@ -1411,6 +1424,8 @@ async fn handshake_against_unregistered_token(
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
+            h265_encoder_factory: None,
+            prefer_h265: true,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),

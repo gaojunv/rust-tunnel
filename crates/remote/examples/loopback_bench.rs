@@ -1978,6 +1978,8 @@ mod bench {
                 h264_decoder_factory: Some(Arc::new(BenchDecoderFactory {
                     metrics: Arc::clone(&ctrl_metrics),
                 })),
+                h265_decoder_factory: None,
+                prefer_h265: true,
                 reliable: None,
             },
             plan,
@@ -2006,6 +2008,8 @@ mod bench {
                 h264_encoder_factory: Some(Arc::new(MftOnlyFactory {
                     metrics: Arc::clone(&ctld_metrics),
                 })),
+                h265_encoder_factory: None,
+                prefer_h265: true,
                 lock_on_disconnect: Arc::new(AtomicBool::new(false)),
             },
             screen,

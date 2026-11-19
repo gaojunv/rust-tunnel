@@ -23,8 +23,9 @@ fn main() {
 #[cfg(windows)]
 mod windows_probe {
     use rust_tunnel_win_video::capture::{self, BgraReadback, CaptureSource};
+    use rust_tunnel_win_video::codec::{CodecKind, CodecSelection};
     use rust_tunnel_win_video::d3d11;
-    use rust_tunnel_win_video::decode::H264Decoder;
+    use rust_tunnel_win_video::decode::MfVideoDecoder;
     use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
     use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba};
     use rust_tunnel_win_video::scale::TextureScaler;
@@ -175,7 +176,10 @@ mod windows_probe {
         clippy::too_many_lines,
         reason = "GPU 缩放直通、回读对照、判据与解码比对是一条不可分割的验证链"
     )]
-    fn zero_copy_ab(source: &mut dyn CaptureSource) -> Result<(), WinVideoError> {
+    fn zero_copy_ab(
+        source: &mut dyn CaptureSource,
+        codec: CodecKind,
+    ) -> Result<(), WinVideoError> {
         let Some(device) = source.device() else {
             println!(
                 "零拷贝对照: 采集后端没有 D3D11 设备，zero-copy used = false 原因=后端不支持 GPU 纹理"
@@ -209,7 +213,8 @@ mod windows_probe {
 
         let api = NvencApi::load()?;
         let config = EncoderConfig::new(dst_w, dst_h, FPS, BITRATE_KBPS)?
-            .with_input_format(InputFormat::Bgra);
+            .with_input_format(InputFormat::Bgra)
+            .with_codec(codec);
         let mut encoder = NvencEncoder::new(&api, Arc::clone(&device), config)?;
 
         // ① GPU 缩放 + 纹理直通：VideoProcessor 缩到编码尺寸 → 注册给 NVENC。
@@ -300,7 +305,7 @@ mod windows_probe {
 
         // 解码比对放在最后：即使解码器建不起来（例如 4K 输入超出 MFT 能力），
         // 上面的耗时对照仍然是有效结论。
-        let mut decoder = match H264Decoder::new(dst_w, dst_h) {
+        let mut decoder = match MfVideoDecoder::new_with_codec(dst_w, dst_h, codec) {
             Ok(decoder) => decoder,
             Err(err) => {
                 println!("零拷贝对照: 解码器不可用，跳过像素比较（{err}）");
@@ -327,10 +332,6 @@ mod windows_probe {
     ///
     /// # Errors
     /// 采集、NVENC、MFT 或文件写入失败时返回 [`WinVideoError`]。
-    #[expect(
-        clippy::too_many_lines,
-        reason = "采集 → 转换 → 下采样 → 编码 → 解码 → 统计是一条不可分割的验证链"
-    )]
     pub fn run() -> Result<(), WinVideoError> {
         let monitors = capture::enumerate_monitors()?;
         let monitor = monitors
@@ -359,12 +360,42 @@ mod windows_probe {
 
         let api = NvencApi::load()?;
         let d3d = Arc::new(d3d11::create_nvidia()?);
+        let selection = CodecSelection::from_args();
+        println!("编码标准: {selection:?}");
+        for codec in selection.kinds() {
+            if run_codec(&api, &d3d, *codec, source.as_mut(), &first, (dst_w, dst_h)).is_err() {
+                // 单个标准失败不影响另一个（例如 HEVC 编码器不可用）。
+                println!("{} 全链路失败，继续下一个标准", codec.label());
+            }
+        }
+
+        // 零拷贝对照：直通 vs 回读（需采集设备就是 NVIDIA）。
+        println!();
+        let zero_copy_codec = selection.kinds().first().copied().unwrap_or_default();
+        if let Err(err) = zero_copy_ab(source.as_mut(), zero_copy_codec) {
+            println!("零拷贝对照失败（不影响上面的全链路结论）：{err}");
+        }
+
+        Ok(())
+    }
+
+    /// 单个编码标准的全链路（采集 → 转换/缩放 → NVENC → 解码）。
+    fn run_codec(
+        api: &NvencApi,
+        d3d: &Arc<d3d11::D3d11>,
+        codec: CodecKind,
+        source: &mut dyn CaptureSource,
+        first: &rust_tunnel_win_video::capture::CapturedFrame,
+        (dst_w, dst_h): (u32, u32),
+    ) -> Result<(), WinVideoError> {
         let config = EncoderConfig::new(dst_w, dst_h, FPS, BITRATE_KBPS)?
-            .with_input_format(InputFormat::Rgba);
-        let mut encoder = NvencEncoder::new(&api, d3d, config)?;
-        let mut decoder = H264Decoder::new(dst_w, dst_h)?;
+            .with_input_format(InputFormat::Rgba)
+            .with_codec(codec);
+        let mut encoder = NvencEncoder::new(api, Arc::clone(d3d), config)?;
+        let mut decoder = MfVideoDecoder::new_with_codec(dst_w, dst_h, codec)?;
         println!(
-            "NVENC 会话已打开（驱动 {:?}），MFT 已初始化",
+            "\n== {} 全链路（驱动 {:?}）==",
+            codec.label(),
             api.driver_api_version()
         );
 
@@ -435,26 +466,21 @@ mod windows_probe {
         let (enc_med, enc_mean) = stats(&encode_ms);
         let (dec_med, dec_mean) = stats(&decode_ms);
         println!(
-            "\n汇总（{FRAMES} 帧）:\n  采集      中位 {cap_med:6.2} ms / 均值 {cap_mean:6.2} ms\n  \
+            "\n汇总（{}，{FRAMES} 帧）:\n  采集      中位 {cap_med:6.2} ms / 均值 {cap_mean:6.2} ms\n  \
              转换+缩放 中位 {conv_med:6.2} ms / 均值 {conv_mean:6.2} ms\n  \
              编码      中位 {enc_med:6.2} ms / 均值 {enc_mean:6.2} ms\n  \
-             解码      中位 {dec_med:6.2} ms / 均值 {dec_mean:6.2} ms"
+             解码      中位 {dec_med:6.2} ms / 均值 {dec_mean:6.2} ms",
+            codec.label()
         );
 
         if let Some((width, height, rgba)) = first_decoded {
-            let path = std::env::temp_dir().join("rust-tunnel-e2e-probe.bmp");
+            let path = std::env::temp_dir()
+                .join(format!("rust-tunnel-e2e-probe-{}.bmp", codec.label().replace('.', "_")));
             write_bmp(&path, width, height, &rgba)?;
             println!("第一帧解码结果已写入 {}", path.display());
         } else {
             println!("警告：没有任何解码输出，BMP 未写入");
         }
-
-        // 零拷贝对照：直通 vs 回读（需采集设备就是 NVIDIA）。
-        println!();
-        if let Err(err) = zero_copy_ab(source.as_mut()) {
-            println!("零拷贝对照失败（不影响上面的全链路结论）：{err}");
-        }
-
         Ok(())
     }
 }

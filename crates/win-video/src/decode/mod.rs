@@ -28,7 +28,7 @@
 //!
 //! # 线程
 //!
-//! [`H264Decoder`] 只实现 `Send`、**不实现 `Sync`**：它独占持有 COM 的
+//! [`MfVideoDecoder`] 只实现 `Send`、**不实现 `Sync`**：它独占持有 COM 的
 //! `IMFTransform`，调用方按约定把它移进 `spawn_blocking` 后只由一个线程使用。
 //! `decode` 是同步阻塞调用。
 
@@ -40,6 +40,7 @@ pub use dxva::{
     DEFAULT_READBACK_BUDGET_US, READBACK_BUDGET_ENV,
 };
 
+use crate::codec::CodecKind;
 use crate::WinVideoError;
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -47,21 +48,23 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::OnceLock;
 use std::time::Instant;
-use windows::core::{IUnknown, Interface as _};
+use windows::core::{GUID, IUnknown, Interface as _};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFDXGIBuffer, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFTransform, MFMediaType_Video, MFVideoArea, MFVideoFormat_H264, MFVideoFormat_IYUV,
+    CLSID_MSH264DecoderMFT, CLSID_MSH265DecoderMFT, IMF2DBuffer, IMFActivate, IMFDXGIBuffer,
+    IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFMediaType_Video, MFVideoArea,
+    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_HEVC_ES, MFVideoFormat_IYUV,
     MFVideoFormat_NV12, MFVideoFormat_YV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_E_NOTACCEPTING, MF_E_NO_MORE_TYPES,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_GEOMETRIC_APERTURE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_NOTACCEPTING,
+    MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_LOW_LATENCY, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_GEOMETRIC_APERTURE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
 /// 未指定帧率时使用的名义帧率（解码本身不依赖它，只用于时间戳与媒体类型）。
@@ -229,12 +232,14 @@ struct DisplayRect {
     clippy::struct_excessive_bools,
     reason = "四个独立的状态标志，语义不同且各自单独判读"
 )]
-pub struct H264Decoder {
+pub struct MfVideoDecoder {
     transform: IMFTransform,
     output: OutputFormat,
     requested_width: u32,
     requested_height: u32,
     fps: u32,
+    /// 本解码器实例的编码标准。
+    kind: CodecKind,
     /// MFT 是否自己分配输出样本（`MFT_OUTPUT_STREAM_PROVIDES_SAMPLES`）。
     provides_samples: bool,
     /// 调用方必须提供的输出缓冲区最小字节数。
@@ -247,7 +252,7 @@ pub struct H264Decoder {
     preference: H264HardwarePreference,
     /// 输出模式（RGBA 还是紧包 NV12）。
     output_mode: H264OutputMode,
-    /// 当前配置的数据通路（DXVA 是否真正生效另见 [`H264Decoder::hardware_buffers_seen`]）。
+    /// 当前配置的数据通路（DXVA 是否真正生效另见 [`MfVideoDecoder::hardware_buffers_seen`]）。
     path: H264DecodePath,
     /// DXVA 的 D3D11 设备、设备管理器与 staging 纹理；软件路径为 `None`。
     hardware: Option<dxva::HardwareContext>,
@@ -255,7 +260,7 @@ pub struct H264Decoder {
     dxgi_seen: bool,
     /// 「配置了 DXVA 却没有 DXGI 样本」的告警只打一次。
     warned_no_dxgi: bool,
-    /// 最近一次 [`H264Decoder::decode`] 的四个子阶段耗时（微秒）。
+    /// 最近一次 [`MfVideoDecoder::decode`] 的四个子阶段耗时（微秒）。
     ///
     /// 在每次 `decode()` 开头清零、随解码过程累加；`decode()` 返回 `Err` 时仍是
     /// **本次已经发生**的那部分读数（例如送包成功、出帧失败）。
@@ -272,13 +277,17 @@ pub struct H264Decoder {
     readback_skip_count: u64,
     /// 上一条 `readback_budget_skip` 日志的时刻（限频用）。
     last_skip_log: Option<Instant>,
-    /// 当前正在解码的访问单元是否含 IDR slice（决定回读要不要强制阻塞）。
+    /// 当前正在解码的访问单元是否含关键帧 slice（决定回读要不要强制阻塞）。
     current_access_unit_has_idr: bool,
 }
 
-impl std::fmt::Debug for H264Decoder {
+/// 旧名字：H.264 解码器（就是 [`MfVideoDecoder`]，`new` 默认建 H.264）。
+pub type H264Decoder = MfVideoDecoder;
+
+impl std::fmt::Debug for MfVideoDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H264Decoder")
+        f.debug_struct("MfVideoDecoder")
+            .field("codec", &self.kind)
             .field("requested", &(self.requested_width, self.requested_height))
             .field(
                 "decoded",
@@ -297,23 +306,23 @@ impl std::fmt::Debug for H264Decoder {
     }
 }
 
-// SAFETY: `H264Decoder` 独占持有一个进程内 MFT（`MSH264DecoderMFT`）。COM 接口
+// SAFETY: `MfVideoDecoder` 独占持有一个进程内 MFT（`MSH264DecoderMFT`）。COM 接口
 // 只在持有者线程上调用，结构体**不实现 `Sync`**，所以任何时刻只有一个线程能
 // 访问它；`decode`/`reconfigure` 都取 `&mut self`。控制器把解码器移进
 // `spawn_blocking` 后不会跨线程共享，满足 COM 的单线程使用约定。
-unsafe impl Send for H264Decoder {}
+unsafe impl Send for MfVideoDecoder {}
 
 /// 编译期断言：解码器必须能移进 `spawn_blocking`（只要求 `Send`）。
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<H264Decoder>();
+    assert_send::<MfVideoDecoder>();
 };
 
-impl H264Decoder {
+impl MfVideoDecoder {
     /// 创建一个解码 `width × height` 码流的 H.264 解码器。
     ///
     /// 宽高是**第一帧的预期尺寸**，用于配置输入媒体类型；若码流后续因
-    /// `ScreenConfig` 变化而换分辨率，调用 [`H264Decoder::reconfigure`] 重建，
+    /// `ScreenConfig` 变化而换分辨率，调用 [`MfVideoDecoder::reconfigure`] 重建，
     /// 或依赖 MFT 的 `MF_E_TRANSFORM_STREAM_CHANGE` 自动重协商输出类型。
     ///
     /// # Errors
@@ -356,7 +365,7 @@ impl H264Decoder {
     /// 创建输出紧包 NV12 的解码器（Auto：DXVA 优先，失败回退系统内存）。
     ///
     /// # Errors
-    /// 同 [`H264Decoder::new`]。
+    /// 同 [`MfVideoDecoder::new`]。
     pub fn new_nv12(width: u32, height: u32) -> Result<Self, WinVideoError> {
         Self::new_with_preference_and_output(
             width,
@@ -377,7 +386,68 @@ impl H264Decoder {
         preference: H264HardwarePreference,
         output_mode: H264OutputMode,
     ) -> Result<Self, WinVideoError> {
-        let pipeline = create_pipeline(width, height, DEFAULT_FPS, preference)?;
+        Self::new_with_codec_preference_and_output(
+            width,
+            height,
+            CodecKind::H264,
+            preference,
+            output_mode,
+        )
+    }
+
+    /// 创建指定编码标准的解码器（Auto 硬件偏好、RGBA 输出）。
+    ///
+    /// # Errors
+    /// 同 [`MfVideoDecoder::new`]（H.265 还要求系统有 `MSH265DecoderMFT`）。
+    pub fn new_with_codec(
+        width: u32,
+        height: u32,
+        codec: CodecKind,
+    ) -> Result<Self, WinVideoError> {
+        Self::new_with_codec_preference_and_output(
+            width,
+            height,
+            codec,
+            H264HardwarePreference::Auto,
+            H264OutputMode::Rgba,
+        )
+    }
+
+    /// 创建 H.265/HEVC 解码器（Auto 硬件偏好、RGBA 输出）。
+    ///
+    /// # Errors
+    /// 同 [`MfVideoDecoder::new_with_codec`]。
+    pub fn new_hevc(width: u32, height: u32) -> Result<Self, WinVideoError> {
+        Self::new_with_codec(width, height, CodecKind::H265)
+    }
+
+    /// 创建输出紧包 NV12 的 H.265/HEVC 解码器（Auto：DXVA 优先）。
+    ///
+    /// # Errors
+    /// 同 [`MfVideoDecoder::new_with_codec`]。
+    pub fn new_hevc_nv12(width: u32, height: u32) -> Result<Self, WinVideoError> {
+        Self::new_with_codec_preference_and_output(
+            width,
+            height,
+            CodecKind::H265,
+            H264HardwarePreference::Auto,
+            H264OutputMode::Nv12,
+        )
+    }
+
+    /// 按编码标准 + 硬件偏好 + 输出模式创建解码器（内部统一入口）。
+    ///
+    /// # Errors
+    /// 尺寸非法、Media Foundation 初始化失败、对应标准的解码 MFT 不可用或
+    /// （`RequireHardware` 下）DXVA 初始化失败时返回 [`WinVideoError`]。
+    pub fn new_with_codec_preference_and_output(
+        width: u32,
+        height: u32,
+        codec: CodecKind,
+        preference: H264HardwarePreference,
+        output_mode: H264OutputMode,
+    ) -> Result<Self, WinVideoError> {
+        let pipeline = create_pipeline(codec, width, height, DEFAULT_FPS, preference)?;
         let readback_options = ReadbackOptions::production();
         let mut decoder = Self {
             transform: pipeline.transform,
@@ -385,6 +455,7 @@ impl H264Decoder {
             requested_width: width,
             requested_height: height,
             fps: DEFAULT_FPS,
+            kind: codec,
             provides_samples: pipeline.provides_samples,
             output_buffer_size: pipeline.output_buffer_size,
             next_pts: 0,
@@ -416,10 +487,16 @@ impl H264Decoder {
         self.output_mode
     }
 
+    /// 本解码器的编码标准。
+    #[must_use]
+    pub fn codec(&self) -> CodecKind {
+        self.kind
+    }
+
     /// 当前配置的数据通路。
     ///
     /// `Dxva` 只说明设备管理器已成功交给 MFT；是否真的输出 DXGI 纹理要看
-    /// [`H264Decoder::hardware_buffers_seen`]。
+    /// [`MfVideoDecoder::hardware_buffers_seen`]。
     #[must_use]
     pub fn path(&self) -> H264DecodePath {
         self.path
@@ -458,9 +535,9 @@ impl H264Decoder {
     /// 最近一帧 DXGI staging 回读的耗时，单位毫秒（软件路径恒为 0）。
     ///
     /// 覆盖 `IMFDXGIBuffer`→staging 纹理的 `CopySubresourceRegion` 与 `Map`；
-    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取。由微秒读数向下取整派生
+    /// 只用于诊断，在 [`MfVideoDecoder::decode`] 返回后读取。由微秒读数向下取整派生
     /// （一次 `decode` 处理多包时是该批之和），需要更细的粒度用
-    /// [`H264Decoder::last_phase_timings`]。
+    /// [`MfVideoDecoder::last_phase_timings`]。
     #[must_use]
     pub fn last_readback_ms(&self) -> u32 {
         u32::try_from(self.last_timings.readback_us / 1000).unwrap_or(u32::MAX)
@@ -468,13 +545,13 @@ impl H264Decoder {
 
     /// 最近一帧像素转换（RGBA 模式）或 NV12 打包（NV12 模式）的耗时，单位毫秒。
     ///
-    /// 只用于诊断，在 [`H264Decoder::decode`] 返回后读取；同样由微秒读数派生。
+    /// 只用于诊断，在 [`MfVideoDecoder::decode`] 返回后读取；同样由微秒读数派生。
     #[must_use]
     pub fn last_color_ms(&self) -> u32 {
         u32::try_from(self.last_timings.color_us / 1000).unwrap_or(u32::MAX)
     }
 
-    /// 最近一次 [`H264Decoder::decode`] 的四个子阶段耗时（微秒）。
+    /// 最近一次 [`MfVideoDecoder::decode`] 的四个子阶段耗时（微秒）。
     ///
     /// 用来回答「空闲后的第一帧到底卡在哪一段」：`output_us` 大说明卡在 MFT 出帧，
     /// `readback_us` 大说明卡在 GPU 同步，`color_us` 大说明是 CPU 像素转换。
@@ -484,7 +561,7 @@ impl H264Decoder {
         self.last_timings
     }
 
-    /// 最近一次 [`H264Decoder::decode`] 里 DXVA 回读的**三段细分**（微秒）。
+    /// 最近一次 [`MfVideoDecoder::decode`] 里 DXVA 回读的**三段细分**（微秒）。
     ///
     /// 只回答一个排障问题：`readback_us` 很大时，究竟是
     /// `IMFDXGIBuffer::GetResource`、`CopySubresourceRegion` 还是 `Map`
@@ -495,7 +572,7 @@ impl H264Decoder {
         self.last_readback
     }
 
-    /// 最近一次 [`H264Decoder::decode`] 是否因**回读超出预算**而放弃了一帧。
+    /// 最近一次 [`MfVideoDecoder::decode`] 是否因**回读超出预算**而放弃了一帧。
     ///
     /// 真机上 GPU 空闲后的一次 staging 回读可能卡 400+ ms；解码器按
     /// [`ReadbackOptions::readback_budget_us`]（默认
@@ -510,7 +587,7 @@ impl H264Decoder {
 
     /// 本进程累计因回读超预算被放弃的帧数（只增）。
     ///
-    /// 现场日志里对应 [`H264Decoder::decode`] 打的 `readback_budget_skip`（限频 1 条/秒），
+    /// 现场日志里对应 [`MfVideoDecoder::decode`] 打的 `readback_budget_skip`（限频 1 条/秒），
     /// 这里给探针/单测一个精确计数。
     #[must_use]
     pub fn readback_skip_count(&self) -> u64 {
@@ -558,7 +635,7 @@ impl H264Decoder {
     /// # Errors
     /// 新尺寸非法或 MFT 创建/媒体类型协商失败时返回 [`WinVideoError`]。
     pub fn reconfigure(&mut self, width: u32, height: u32) -> Result<(), WinVideoError> {
-        let pipeline = create_pipeline(width, height, self.fps, self.preference)?;
+        let pipeline = create_pipeline(self.kind, width, height, self.fps, self.preference)?;
         self.transform = pipeline.transform;
         self.output = pipeline.output;
         self.requested_width = width;
@@ -589,14 +666,14 @@ impl H264Decoder {
     ///
     /// 1. **MFT 还在缓冲输入**：这次送进去的包还没解出画面（硬件编码器/解码器都有
     ///    一帧流水线延迟）。下一批到达时自然会出帧。
-    /// 2. **回读超预算，这一帧被主动放弃**（见 [`H264Decoder::last_readback_skipped`]
+    /// 2. **回读超预算，这一帧被主动放弃**（见 [`MfVideoDecoder::last_readback_skipped`]
     ///    与 [`ReadbackOptions::readback_budget_us`]）。
     ///
     /// 两种情况下**解码器实例与 H.264 参考链都完好**：第 2 种是「解码已完成、只是
     /// 没把像素读回 CPU（也没有解映射）」，解码器内部状态与后续 P 帧的参考关系不受
     /// 任何影响，**不需要**重建解码器、**不需要**请求关键帧。调用方（remote 控制器）
     /// 把 `Ok(None)` 当成「本批无输出」是正确语义；用
-    /// [`H264Decoder::last_readback_skipped`] / [`H264Decoder::readback_skip_count`]
+    /// [`MfVideoDecoder::last_readback_skipped`] / [`MfVideoDecoder::readback_skip_count`]
     /// 才能把两者区分开。
     ///
     /// **跳过是一次性的、量级很小**：本机 250 ms 节奏实测「卡 → 卡 → 2.8 ms 成功」，
@@ -604,7 +681,7 @@ impl H264Decoder {
     /// 停顿时长（~0.45 s）÷ 到达间隔。含 **IDR** 的访问单元**永不跳过**（补丁模式
     /// 的基准帧必须是这一张），见 `dxva::readback_policy`。
     ///
-    /// 子阶段读数（[`H264Decoder::last_phase_timings`]）在**本次调用开头清零**，
+    /// 子阶段读数（[`MfVideoDecoder::last_phase_timings`]）在**本次调用开头清零**，
     /// 各段在批内累加；早退（空输入）后读数为全 0，出错返回时保留已发生的部分。
     ///
     /// # Errors
@@ -650,9 +727,9 @@ impl H264Decoder {
                 ))
             })?;
             let submit_started = Instant::now();
-            // IDR 判定必须在送包之前完成：`submit` 在 `MF_E_NOTACCEPTING` 时会顺手
+            // 关键帧判定必须在送包之前完成：`submit` 在 `MF_E_NOTACCEPTING` 时会顺手
             // 排空输出，那一次 `convert_sample` 也要看到这个标志。
-            self.current_access_unit_has_idr = access_unit_has_idr(payload);
+            self.current_access_unit_has_idr = access_unit_has_idr(payload, self.kind);
             let submitted = self.submit(payload);
             // 失败也要记：读数的语义是「本次已经发生的耗时」，错误路径同样要看得出卡在哪。
             self.last_timings.submit_us = self
@@ -751,7 +828,7 @@ impl H264Decoder {
         result
     }
 
-    /// [`H264Decoder::drain_output`] 的本体（计量在调用方）。
+    /// [`MfVideoDecoder::drain_output`] 的本体（计量在调用方）。
     fn drain_output_inner(&mut self) -> Result<Option<DecodedH264Frame>, WinVideoError> {
         let mut last = None;
         loop {
@@ -822,7 +899,7 @@ impl H264Decoder {
     /// 把一个输出样本转成配置的输出模式（DXGI 纹理优先，其次系统内存）。
     ///
     /// 回读/转换两段在这里测、**累加**进 [`DecodePhaseTimings`]（一次 `decode()` 可能
-    /// 产出多帧）；清零由 [`H264Decoder::decode`] 在开头统一做。
+    /// 产出多帧）；清零由 [`MfVideoDecoder::decode`] 在开头统一做。
     fn convert_sample(
         &mut self,
         sample: &IMFSample,
@@ -1322,6 +1399,7 @@ struct Pipeline {
 
 /// 按偏好创建流水线；`Auto` 在硬件任一步失败时回退软件。
 fn create_pipeline(
+    codec: CodecKind,
     width: u32,
     height: u32,
     fps: u32,
@@ -1339,29 +1417,40 @@ fn create_pipeline(
     ensure_com_initialized()?;
 
     match preference {
-        H264HardwarePreference::Software => create_software_pipeline(width, height, fps),
-        H264HardwarePreference::Auto => match create_hardware_pipeline(width, height, fps) {
-            Ok(pipeline) => Ok(pipeline),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "H.264 DXVA 初始化失败，回退系统内存软件解码"
-                );
-                create_software_pipeline(width, height, fps)
+        H264HardwarePreference::Software => create_software_pipeline(codec, width, height, fps),
+        H264HardwarePreference::Auto => {
+            match create_hardware_pipeline(codec, width, height, fps) {
+                Ok(pipeline) => Ok(pipeline),
+                Err(err) => {
+                    tracing::warn!(
+                        codec = codec.label(),
+                        error = %err,
+                        "DXVA 初始化失败，回退系统内存软件解码"
+                    );
+                    create_software_pipeline(codec, width, height, fps)
+                }
             }
-        },
-        H264HardwarePreference::RequireHardware => create_hardware_pipeline(width, height, fps),
+        }
+        H264HardwarePreference::RequireHardware => {
+            create_hardware_pipeline(codec, width, height, fps)
+        }
     }
 }
 
 /// 系统内存软件解码流水线。
-fn create_software_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipeline, WinVideoError> {
-    let transform = create_transform()?;
+fn create_software_pipeline(
+    codec: CodecKind,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<Pipeline, WinVideoError> {
+    let transform = create_transform(codec)?;
     let (output, provides_samples, output_buffer_size) =
-        configure_types(&transform, width, height, fps)?;
+        configure_types(&transform, codec, width, height, fps)?;
     tracing::info!(
+        codec = codec.label(),
         path = H264DecodePath::Software.as_str(),
-        "H.264 解码流水线已就绪"
+        "解码流水线已就绪"
     );
     Ok(Pipeline {
         transform,
@@ -1379,7 +1468,12 @@ fn create_software_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipelin
 static FORCE_HARDWARE_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn create_hardware_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipeline, WinVideoError> {
+fn create_hardware_pipeline(
+    codec: CodecKind,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<Pipeline, WinVideoError> {
     #[cfg(test)]
     {
         if FORCE_HARDWARE_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1389,15 +1483,16 @@ fn create_hardware_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipelin
         }
     }
     let device = dxva::create_device()?;
-    let transform = create_transform()?;
+    let transform = create_transform(codec)?;
     // 设备管理器必须在 SetInputType / SetOutputType 之前交给 MFT。
     let hardware = dxva::HardwareContext::new(device, &transform)?;
     let (output, provides_samples, output_buffer_size) =
-        configure_types(&transform, width, height, fps)?;
+        configure_types(&transform, codec, width, height, fps)?;
     tracing::info!(
+        codec = codec.label(),
         path = H264DecodePath::Dxva.as_str(),
         adapter = hardware.adapter_name(),
-        "H.264 解码流水线已就绪"
+        "解码流水线已就绪"
     );
     Ok(Pipeline {
         transform,
@@ -1409,32 +1504,172 @@ fn create_hardware_pipeline(width: u32, height: u32, fps: u32) -> Result<Pipelin
     })
 }
 
-/// 创建 `MSH264DecoderMFT` 并设置低延迟属性。
-fn create_transform() -> Result<IMFTransform, WinVideoError> {
-    // SAFETY: 进程内 COM 工厂，CLSID 由系统注册；`None` 表示不聚合。
-    let transform: IMFTransform = unsafe {
-        CoCreateInstance(
-            &CLSID_MSH264DecoderMFT,
-            None::<&IUnknown>,
-            CLSCTX_INPROC_SERVER,
-        )
+/// 创建解码 MFT 并设置低延迟属性。
+///
+/// H.264 固定用系统自带的 `CLSID_MSH264DecoderMFT`。H.265 先试
+/// `CLSID_MSH265DecoderMFT`（HEVC Video Extensions 安装后的稳定注册），失败再
+/// `MFTEnumEx` 枚举能接受 HEVC 输入的解码器——不同 Windows 版本/Store 安装方式
+/// 的注册点可能不一致。
+fn create_transform(codec: CodecKind) -> Result<IMFTransform, WinVideoError> {
+    match codec {
+        CodecKind::H264 => {
+            // SAFETY: 进程内 COM 工厂，CLSID 由系统注册；`None` 表示不聚合。
+            let transform: IMFTransform = unsafe {
+                CoCreateInstance(
+                    &CLSID_MSH264DecoderMFT,
+                    None::<&IUnknown>,
+                    CLSCTX_INPROC_SERVER,
+                )
+            }
+            .map_err(|err| decode_err("CoCreateInstance(CLSID_MSH264DecoderMFT)", &err))?;
+            configure_low_latency(&transform);
+            Ok(transform)
+        }
+        CodecKind::H265 => {
+            // SAFETY: 同上；HEVC 解码器由 Microsoft Store 扩展注册。
+            let created: windows::core::Result<IMFTransform> = unsafe {
+                CoCreateInstance(
+                    &CLSID_MSH265DecoderMFT,
+                    None::<&IUnknown>,
+                    CLSCTX_INPROC_SERVER,
+                )
+            };
+            match created {
+                Ok(transform) => {
+                    configure_low_latency(&transform);
+                    Ok(transform)
+                }
+                Err(create_err) => {
+                    tracing::debug!(
+                        error = %create_err,
+                        "CLSID_MSH265DecoderMFT 直接创建失败，改按输入 subtype 枚举解码器"
+                    );
+                    create_hevc_transform_from_enumeration().map_err(|err| {
+                        WinVideoError::Decode(format!(
+                            "H.265 解码器不可用（CoCreateInstance/CLSID_MSH265DecoderMFT: \
+                             {create_err}；枚举: {err}）"
+                        ))
+                    })
+                }
+            }
+        }
     }
-    .map_err(|err| decode_err("CoCreateInstance(CLSID_MSH264DecoderMFT)", &err))?;
-    configure_low_latency(&transform);
-    Ok(transform)
+}
+
+/// 枚举能接受 HEVC 输入的解码器 MFT 并激活第一个可用的。
+fn create_hevc_transform_from_enumeration() -> Result<IMFTransform, WinVideoError> {
+    let mut errors = Vec::new();
+    for (subtype, name) in [
+        (MFVideoFormat_HEVC_ES, "HEVC_ES"),
+        (MFVideoFormat_HEVC, "HEVC"),
+    ] {
+        match enumerate_decoder_activates(&subtype) {
+            Ok(activates) => {
+                for activate in &activates {
+                    // SAFETY: `activate` 来自 MFTEnumEx，是有效的 IMFActivate。
+                    let transform: IMFTransform = match unsafe { activate.ActivateObject() } {
+                        Ok(transform) => transform,
+                        Err(err) => {
+                            errors.push(format!("{name} 激活失败: {err}"));
+                            continue;
+                        }
+                    };
+                    configure_low_latency(&transform);
+                    return Ok(transform);
+                }
+                if activates.is_empty() {
+                    errors.push(format!("{name}: 没有枚举到解码器"));
+                }
+            }
+            Err(err) => errors.push(format!("{name}: {err}")),
+        }
+    }
+    // 全部失败：把每个 subtype 的错误带出去，工厂探测据此返回 None。
+    Err(WinVideoError::Decode(errors.join("；")))
+}
+
+/// 按输入 subtype（压缩格式）枚举解码器 MFT，返回激活对象。
+fn enumerate_decoder_activates(subtype: &GUID) -> Result<Vec<IMFActivate>, WinVideoError> {
+    let api = mf_api()?;
+    let enum_ex = api.enum_ex.ok_or_else(|| {
+        WinVideoError::Decode("mfplat.dll 未导出 MFTEnumEx（无法枚举 HEVC 解码器）".to_owned())
+    })?;
+    let input = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: *subtype,
+    };
+    let flags = u32::try_from(MFT_ENUM_FLAG_ALL.0 | MFT_ENUM_FLAG_SORTANDFILTER.0).unwrap_or(0);
+    let mut array: *mut *mut c_void = ptr::null_mut();
+    let mut count = 0u32;
+    // SAFETY: `input` 指向本栈帧；输出 subtype 传 NULL 表示不限；成功后
+    // `array` 是 CoTaskMemAlloc 分配的 `IMFActivate*` 数组。
+    let result = unsafe {
+        enum_ex(
+            MFT_CATEGORY_VIDEO_DECODER,
+            flags,
+            &raw const input,
+            ptr::null(),
+            &raw mut array,
+            &raw mut count,
+        )
+    };
+    result
+        .ok()
+        .map_err(|err| WinVideoError::Decode(format!("MFTEnumEx(解码器) 失败: {err}")))?;
+
+    let mut activates = Vec::new();
+    if !array.is_null() {
+        let len = usize::try_from(count).unwrap_or(0);
+        // SAFETY: `MFTEnumEx` 承诺 `array` 指向 `count` 个接口指针。
+        let pointers = unsafe { std::slice::from_raw_parts(array, len) };
+        for &pointer in pointers {
+            if pointer.is_null() {
+                continue;
+            }
+            // SAFETY: 每个非空指针都是引用计数为 1 的 IMFActivate，所有权移交给 Vec。
+            let converted: windows::core::Result<IMFActivate> =
+                unsafe { windows::core::Type::from_abi(pointer) };
+            match converted {
+                Ok(activate) => activates.push(activate),
+                Err(err) => tracing::debug!(%err, "枚举到的解码器激活对象无法转换，跳过"),
+            }
+        }
+        // SAFETY: 数组由 MFTEnumEx 用 CoTaskMemAlloc 分配；对象引用已取走。
+        unsafe {
+            CoTaskMemFree(Some(array.cast::<c_void>().cast_const()));
+        }
+    }
+    Ok(activates)
 }
 
 /// 设置输入/输出媒体类型并启动流。
 fn configure_types(
     transform: &IMFTransform,
+    codec: CodecKind,
     width: u32,
     height: u32,
     fps: u32,
 ) -> Result<(OutputFormat, bool, u32), WinVideoError> {
-    let input = build_input_type(width, height, fps)?;
-    // SAFETY: `transform` 与 `input` 都有效；输入流 0 是解码器唯一的输入。
-    unsafe { transform.SetInputType(0, &input, 0) }
-        .map_err(|err| decode_err("SetInputType(H.264)", &err))?;
+    let mut errors = Vec::new();
+    let mut input_set = false;
+    for (subtype, name) in decoder_input_subtypes(codec) {
+        let input = build_input_type(subtype, width, height, fps)?;
+        // SAFETY: `transform` 与 `input` 都有效；输入流 0 是解码器唯一的输入。
+        match unsafe { transform.SetInputType(0, &input, 0) } {
+            Ok(()) => {
+                input_set = true;
+                break;
+            }
+            Err(err) => errors.push(format!("{name}: {err}")),
+        }
+    }
+    if !input_set {
+        return Err(WinVideoError::Decode(format!(
+            "SetInputType({}) 失败（{}）",
+            codec.label(),
+            errors.join("；")
+        )));
+    }
 
     let output = negotiate_output_type(transform, width, height)?;
 
@@ -1452,6 +1687,18 @@ fn configure_types(
     Ok((output, provides_samples, output_buffer_size))
 }
 
+/// 某个标准解码器的输入 subtype 候选与可读名称（按尝试顺序）。
+fn decoder_input_subtypes(codec: CodecKind) -> &'static [(GUID, &'static str)] {
+    match codec {
+        CodecKind::H264 => &[(MFVideoFormat_H264, "H.264")],
+        // Annex B 带内参数集走 HEVC_ES；部分 MFT 只注册 MFVideoFormat_HEVC。
+        CodecKind::H265 => &[
+            (MFVideoFormat_HEVC_ES, "HEVC_ES"),
+            (MFVideoFormat_HEVC, "HEVC"),
+        ],
+    }
+}
+
 /// 尽力打开低延迟模式；不支持时只记 debug，不影响解码。
 fn configure_low_latency(transform: &IMFTransform) {
     // SAFETY: `transform` 有效；属性存储生命周期由 COM 引用计数维护。
@@ -1460,12 +1707,17 @@ fn configure_low_latency(transform: &IMFTransform) {
     };
     // SAFETY: 属性存储有效；`MF_LOW_LATENCY` 的约定类型是 UINT32。
     if let Err(err) = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) } {
-        tracing::debug!(%err, "MSH264DecoderMFT 拒绝 MF_LOW_LATENCY，按默认延迟解码");
+        tracing::debug!(%err, "解码 MFT 拒绝 MF_LOW_LATENCY，按默认延迟解码");
     }
 }
 
-/// 构造 H.264 输入媒体类型。
-fn build_input_type(width: u32, height: u32, fps: u32) -> Result<IMFMediaType, WinVideoError> {
+/// 构造输入媒体类型（`subtype` 为压缩格式）。
+fn build_input_type(
+    subtype: &GUID,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<IMFMediaType, WinVideoError> {
     let media_type = create_media_type()?;
     let progressive = u32::try_from(MFVideoInterlace_Progressive.0).unwrap_or_default();
     // SAFETY: `media_type` 有效；所有 GUID 常数都是 `'static`。
@@ -1474,7 +1726,7 @@ fn build_input_type(width: u32, height: u32, fps: u32) -> Result<IMFMediaType, W
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .map_err(|err| decode_err("输入类型 MF_MT_MAJOR_TYPE", &err))?;
         media_type
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
+            .SetGUID(&MF_MT_SUBTYPE, subtype)
             .map_err(|err| decode_err("输入类型 MF_MT_SUBTYPE", &err))?;
         media_type
             .SetUINT64(&MF_MT_FRAME_SIZE, pack_size(width, height))
@@ -1786,24 +2038,38 @@ fn decode_err(context: &str, error: &windows::core::Error) -> WinVideoError {
     WinVideoError::Decode(format!("{context} 失败: {error}"))
 }
 
-/// 判断一个访问单元（Annex B）里是否含 IDR slice（`nal_unit_type == 5`）。
+/// 判断一个访问单元（Annex B）里是否含关键帧 slice。
 ///
-/// `decode()` 拿到的每个包是完整访问单元，头部带内联 SPS/PPS；这里只扫起始码
-/// （`00 00 01`，4 字节起始码 `00 00 00 01` 也含它），再看 NAL 头的低 5 位。
-/// 首帧/整屏重绘/关键帧请求的 IDR 都是几百 KB，逐字节扫一遍也在微秒级；
-/// 而且只对**含片段数据**的包有意义，SPS/PPS 的 NAL 头不会命中 5。
+/// `decode()` 拿到的每个包是完整访问单元，头部带内联参数集；这里只扫起始码
+/// （`00 00 01`，4 字节起始码 `00 00 00 01` 也含它），再按编码标准解 NAL 头：
 ///
-/// 为什么要这个判定：补丁模式（协议 v6）的基准帧就是这张 IDR，控制器若把它
+/// - H.264：`b0 & 0x1F`，IDR = 5；
+/// - H.265：`(b0 >> 1) & 0x3F`，IRAP = `16..=23`（BLA/IDR/CRA）。
+///
+/// 首帧/整屏重绘/关键帧请求的关键帧都是几百 KB，逐字节扫一遍也在微秒级；
+/// 而且只对**含片段数据**的包有意义，参数集的 NAL 头不会误命中。
+///
+/// 为什么要这个判定：补丁模式（协议 v6）的基准帧就是这张关键帧，控制器若把它
 /// 按回读预算**跳过**，合成缓冲会停在旧基准上，后续补丁会盖到旧画面上——
-/// 于是画面一直错到下一次 IDR。所以含 IDR 的访问单元必须阻塞回读。
-fn access_unit_has_idr(payload: &[u8]) -> bool {
+/// 于是画面一直错到下一次关键帧。所以含关键帧的访问单元必须阻塞回读。
+fn access_unit_has_idr(payload: &[u8], codec: CodecKind) -> bool {
     let mut index = 0usize;
     while index.saturating_add(3) < payload.len() {
         let window = &payload[index..index.saturating_add(3)];
         if window == [0, 0, 1] {
-            // 起始码之后就是 NAL 头：F(1) | nal_ref_idc(2) | nal_unit_type(5)。
-            let nal_type = payload[index.saturating_add(3)] & 0x1F;
-            if nal_type == 5 {
+            // 起始码之后就是 NAL 头的第一个字节。
+            let first = payload[index.saturating_add(3)];
+            let nal_type = if codec.is_hevc() {
+                (first >> 1) & 0x3F
+            } else {
+                first & 0x1F
+            };
+            let keyframe = if codec.is_hevc() {
+                (16..=23).contains(&nal_type)
+            } else {
+                nal_type == 5
+            };
+            if keyframe {
                 return true;
             }
             index = index.saturating_add(3);
@@ -1853,7 +2119,23 @@ struct MfApi {
     /// 回退软件，不能把软件解码一起拖下水。
     create_dxgi_device_manager:
         Option<unsafe extern "system" fn(*mut u32, *mut *mut c_void) -> windows::core::HRESULT>,
+    /// `MFTEnumEx(category, flags, in, out, activates, count)`。
+    ///
+    /// 设为 `Option`：只有 H.265 在 `CLSID_MSH265DecoderMFT` 直接创建失败时
+    /// 才用它枚举可用的 HEVC 解码器；缺失时 H.265 探测失败（回退 H.264），
+    /// H.264 路径完全不受影响。
+    enum_ex: Option<MftEnumExFn>,
 }
+
+/// `MFTEnumEx(GUID, UINT, in, out, IMFActivate***, UINT*)`。
+type MftEnumExFn = unsafe extern "system" fn(
+    GUID,
+    u32,
+    *const MFT_REGISTER_TYPE_INFO,
+    *const MFT_REGISTER_TYPE_INFO,
+    *mut *mut *mut c_void,
+    *mut u32,
+) -> windows::core::HRESULT;
 
 // SAFETY: 函数表在进程生命周期内只读；`mfplat.dll` 由 `OnceLock` 永久持有，
 // 不会卸载；每次调用创建的 COM 对象仍由调用线程独占。
@@ -1902,6 +2184,13 @@ impl MfApi {
             .ok()
             .map(|symbol| *symbol)
         };
+        // H.265 的枚举回退入口；可选符号，缺失时只影响 HEVC 探测。
+        // SAFETY: 与上面的符号相同；失败时保持 `None`。
+        let enum_ex = unsafe {
+            lib.get::<MftEnumExFn>(b"MFTEnumEx")
+                .ok()
+                .map(|symbol| *symbol)
+        };
         Ok(Self {
             _lib: lib,
             startup,
@@ -1909,6 +2198,7 @@ impl MfApi {
             create_memory_buffer,
             create_sample,
             create_dxgi_device_manager,
+            enum_ex,
         })
     }
 }
@@ -2068,28 +2358,32 @@ mod tests {
         assert_eq!(ReadbackOptions::unbounded().readback_budget_us, 0);
     }
 
-    /// IDR 判定：只有 `nal_unit_type == 5` 的 slice 才算 IDR。
+    /// IDR 判定：H.264 只有 `nal_unit_type == 5` 的 slice 才算关键帧。
     ///
     /// 这条判定决定「补丁模式基准帧不允许被回读预算跳过」——判错（漏判）会让
     /// 控制端的合成缓冲停在旧基准上，画面一直错到下一次 IDR。
     #[test]
     fn access_unit_idr_detection_covers_annex_b_shapes() {
+        let h264 = CodecKind::H264;
         // 空/无起始码。
-        assert!(!access_unit_has_idr(&[]));
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x02, 0x65]));
+        assert!(!access_unit_has_idr(&[], h264));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x02, 0x65], h264));
 
         // 3 字节起始码 + nal_unit_type=5（IDR slice）。
-        assert!(access_unit_has_idr(&[0x00, 0x00, 0x01, 0x65, 0xAA]));
+        assert!(access_unit_has_idr(&[0x00, 0x00, 0x01, 0x65, 0xAA], h264));
         // 4 字节起始码（`00 00 00 01`）同样命中。
-        assert!(access_unit_has_idr(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xAA]));
+        assert!(access_unit_has_idr(
+            &[0x00, 0x00, 0x00, 0x01, 0x65, 0xAA],
+            h264
+        ));
         // 带 nal_ref_idc 位的 IDR（0x65 已是；再试 0xE5）。
-        assert!(access_unit_has_idr(&[0x00, 0x00, 0x01, 0xE5]));
+        assert!(access_unit_has_idr(&[0x00, 0x00, 0x01, 0xE5], h264));
 
         // SPS(7) / PPS(8) / 非 IDR slice(1) / SEI(6) 都不算。
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x67]));
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x68]));
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x41]));
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x06]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x67], h264));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x68], h264));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x41], h264));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x06], h264));
 
         // 典型 IDR 访问单元：SPS + PPS + SEI + IDR。
         let mut access_unit = Vec::new();
@@ -2097,15 +2391,44 @@ mod tests {
         access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C]);
         access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x06, 0x05]);
         access_unit.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x88, 0x84]);
-        assert!(access_unit_has_idr(&access_unit));
+        assert!(access_unit_has_idr(&access_unit, h264));
 
         // 只有 SPS/PPS 的配置包看起来像参数集时仍不是 IDR。
         access_unit.truncate(14);
-        assert!(!access_unit_has_idr(&access_unit));
+        assert!(!access_unit_has_idr(&access_unit, h264));
 
         // 起始码在末尾但没有 NAL 头字节：不越界、判 false。
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01]));
-        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x00]));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01], h264));
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x00], h264));
+    }
+
+    /// HEVC 关键帧判定：IRAP `16..=23` 全算，参数集（VPS 32 / SPS 33 / PPS 34）
+    /// 与普通 P 帧都不算；且不会把 H.264 的 IDR 字节误判成 HEVC 关键帧。
+    #[test]
+    fn access_unit_hevc_irap_detection() {
+        let hevc = CodecKind::H265;
+        for nal_type in 16u8..=23 {
+            let unit = [0x00, 0x00, 0x00, 0x01, (nal_type << 1) | 1, 0x01];
+            assert!(
+                access_unit_has_idr(&unit, hevc),
+                "IRAP {nal_type} 必须被识别为关键帧"
+            );
+        }
+        for nal_type in [0u8, 1, 2, 15, 24, 32, 33, 34, 39] {
+            let unit = [0x00, 0x00, 0x00, 0x01, (nal_type << 1) | 1, 0x01];
+            assert!(
+                !access_unit_has_idr(&unit, hevc),
+                "{nal_type} 不是 IRAP，不应算关键帧"
+            );
+        }
+        // 交叉判定：H.264 的 IDR（0x65）按 HEVC 解是 type 50，不是关键帧。
+        assert!(!access_unit_has_idr(&[0x00, 0x00, 0x01, 0x65, 0xAA], hevc));
+        // 典型 HEVC IDR 访问单元：VPS + SPS + PPS + IDR_W_RADL(19)。
+        let mut unit = Vec::new();
+        for nal_type in [32u8, 33, 34, 19] {
+            unit.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, (nal_type << 1) | 1, 0x01]);
+        }
+        assert!(access_unit_has_idr(&unit, hevc));
     }
 
     /// 跳过日志限频：一秒内只放第一条，满一秒后再放。
@@ -2213,7 +2536,7 @@ mod tests {
     #[test]
     fn auto_falls_back_to_software_when_dxva_init_fails() {
         FORCE_HARDWARE_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
-        let result = H264Decoder::new(640, 360);
+        let result = MfVideoDecoder::new(640, 360);
         FORCE_HARDWARE_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(result.is_ok(), "Auto 应在 DXVA 失败后回退软件: {result:?}");
         if let Ok(decoder) = result {
