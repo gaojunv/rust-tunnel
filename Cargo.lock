@@ -8812,6 +8812,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-win-audio"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "rust-tunnel-win-platform"
 version = "0.22.0"
 dependencies = [

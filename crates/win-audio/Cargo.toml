@@ -1,0 +1,34 @@
+[package]
+name = "rust-tunnel-win-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Windows 远程控制音频数据面：WASAPI loopback 采集 / 播放 + Opus（vendored libopus）"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "win-audio-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+# 非 Windows 平台只编译空壳：本 crate 是 workspace 成员，`cargo build` 在 macOS/Linux
+# 上也要能过（与 win-video 的取舍一致）。
+[target.'cfg(windows)'.dependencies]
+# 与 win-video / client-gui 共用同一份 windows 0.62 依赖图，不额外引入大版本。
+# 这里用 wrapper 而非 windows-sys：WASAPI 是 COM 接口族，手写 vtable 的成本与风险
+# 远高于这份依赖（win-video 的 Media Foundation 部分同理）。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    # IMMDevice::Activate 的 pactivationparams 是 PROPVARIANT（来自这两个 feature）
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    # Sleep / AvSetMmThreadCharacteristicsW
+    "Win32_System_Threading",
+] }
