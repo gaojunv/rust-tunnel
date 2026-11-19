@@ -468,6 +468,10 @@ pub(crate) fn spawn_instance_runtime(
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,
+                    // 实例没有控制器，不会播放声音；采集默认开启（`host.toml` 的 `audio`
+                    // 在 M3 接线，这里先用默认值）。
+                    audio_enabled: false,
+                    audio_allowed: true,
                 },
             );
             spawn_session_watcher(Arc::clone(&manager), release);

@@ -13,13 +13,17 @@ use crate::error::{AudioError, AudioResult};
 pub const MAX_PACKET_BYTES: usize = 4_000;
 
 /// `OPUS_APPLICATION_AUDIO`：音乐/系统声音优先，而不是纯语音。
+#[cfg(target_env = "gnu")]
 const OPUS_APPLICATION_AUDIO: i32 = 2049;
 
 /// `OPUS_SET_BITRATE_REQUEST`。
+#[cfg(target_env = "gnu")]
 const OPUS_SET_BITRATE_REQUEST: i32 = 4002;
 /// `OPUS_SET_VBR_REQUEST`。
+#[cfg(target_env = "gnu")]
 const OPUS_SET_VBR_REQUEST: i32 = 4006;
 /// `OPUS_SET_COMPLEXITY_REQUEST`。
+#[cfg(target_env = "gnu")]
 const OPUS_SET_COMPLEXITY_REQUEST: i32 = 4010;
 
 #[cfg(target_env = "gnu")]

@@ -761,6 +761,10 @@ struct ManagerOptions {
     share_dir: Option<PathBuf>,
     /// 控制器下载文件的落盘目录。
     download_dir: PathBuf,
+    /// 控制端会话开始时是否请求转发声音（GUI 取自偏好；实例没有控制器，恒 `false`）。
+    audio_enabled: bool,
+    /// 被控端是否允许转发声音（GUI 取自偏好；实例取自 `host.toml`）。
+    audio_allowed: bool,
 }
 
 /// 构造远程控制引擎（配置就绪后调用一次）。
@@ -783,6 +787,7 @@ fn build_remote_manager(
         h265_encoder: h265_encoder_factory,
         h265_decoder: h265_decoder_factory,
     } = remote::hardware_factories();
+    let audio = remote::audio_endpoints();
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),
         self_client_name: config.name.clone().unwrap_or_default(),
@@ -802,12 +807,12 @@ fn build_remote_manager(
         h265_decoder_factory,
         // 偏好与工厂就位后即按 H.265 优先协商；任一侧缺能力或环境变量禁用则回退 H.264/VP9。
         prefer_h265: opts.prefer_h265,
-        // 音频数据面在 M2/M3 接入 `crates/win-audio`；在此之前两侧都「不具备音频能力」，
-        // 控制端不会请求采集，被控端也不会打开设备。
-        audio_source: None,
-        audio_sink: None,
-        audio_enabled: false,
-        audio_allowed: Arc::new(AtomicBool::new(true)),
+        // 音频：Windows 上同时注入采集源与播放器；其它平台为空（引擎会向对端上报不可用）。
+        // 是否真的开始转发由控制端 `SetAudioEnabled` 驱动，构造这里不打开设备。
+        audio_source: audio.source,
+        audio_sink: audio.sink,
+        audio_enabled: opts.audio_enabled,
+        audio_allowed: Arc::new(AtomicBool::new(opts.audio_allowed)),
     });
     // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
     manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);
@@ -839,6 +844,9 @@ fn gui_manager_options(
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
+        // 偏好接线在 M3 的 GUI 设置页完成；先按「批准即转发」的默认值。
+        audio_enabled: true,
+        audio_allowed: true,
     }
 }
 

@@ -40,13 +40,21 @@
 )]
 
 #[cfg(windows)]
+pub mod clock;
+#[cfg(windows)]
 pub mod error;
 #[cfg(windows)]
 pub mod format;
 #[cfg(windows)]
+pub mod jitter;
+#[cfg(windows)]
 pub mod metrics;
 #[cfg(windows)]
 pub mod opus;
+#[cfg(windows)]
+pub mod playback;
+#[cfg(windows)]
+pub mod source;
 #[cfg(windows)]
 pub mod wasapi;
 #[cfg(windows)]

@@ -833,6 +833,10 @@ pub(crate) async fn run_controller_with_input(
             _ = qos_tick.tick() => {
                 // 每秒一条 `QosFeedback`，驱动被控端 AIMD（见 [`crate::qos`]）。**不新增数据面
                 // 变体**——`QosFeedback` 自阶段 2 起就在协议里，阶段 2 只是定义未消费。
+                // 同一节拍顺带上报本端音频播放读数（进程内，不落线）。
+                if let Some(audio) = config.audio.as_ref() {
+                    config.stats.report(SessionStats::AudioPlayback(audio.snapshot()));
+                }
                 let elapsed = qos_window_start.elapsed().as_secs_f64().max(f64::EPSILON);
                 let window_bytes = f64::from(u32::try_from(recv_bytes).unwrap_or(u32::MAX));
                 #[expect(
@@ -1598,6 +1602,7 @@ pub(crate) async fn run_controller_with_input(
                             if let Some(audio) = config.audio.as_ref() {
                                 audio.on_status(&state);
                             }
+                            config.stats.report(SessionStats::Audio(state.clone()));
                             let should_request = available
                                 && config.audio_enabled
                                 && !audio_requested

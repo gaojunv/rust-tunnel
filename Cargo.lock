@@ -8464,6 +8464,7 @@ dependencies = [
  "rust-tunnel-client",
  "rust-tunnel-common",
  "rust-tunnel-remote",
+ "rust-tunnel-win-audio",
  "rust-tunnel-win-platform",
  "rust-tunnel-win-video",
  "serde",

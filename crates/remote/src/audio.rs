@@ -89,6 +89,19 @@ pub struct ReceivedAudio {
     pub data: Vec<u8>,
 }
 
+/// 控制器收到的音频播放读数（进程内观测，不上线）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioPlaybackStats {
+    /// 收到的编码包数。
+    pub received: u64,
+    /// 播放队列满而丢弃的包数。
+    pub dropped: u64,
+    /// 抖动缓冲欠载次数（PLC 次数的一部分）。
+    pub underruns: u64,
+    /// 当前目标缓冲（毫秒）。
+    pub buffer_ms: u32,
+}
+
 /// 被控端音频采集源（平台实现）。
 ///
 /// 实现负责「设备打开 → 20 ms 分块 → 编码」的整条链路；引擎只消费编码后的包。
@@ -126,4 +139,15 @@ pub trait AudioSink: Send + Sync + 'static {
 
     /// 对端音频状态变化（可用性/启停/原因）。
     fn on_status(&self, state: &AudioState);
+
+    /// 设置本机播放音量（百分比，0–200）。默认实现忽略（无播放能力）。
+    ///
+    /// 这是**本地播放增益**，不上线；控制端静音走
+    /// [`crate::session::SessionMessage::SetAudioEnabled`]。
+    fn set_volume(&self, _percent: u32) {}
+
+    /// 取一份播放读数（每秒由控制器上报到 UI）。默认全 0（无播放能力）。
+    fn snapshot(&self) -> AudioPlaybackStats {
+        AudioPlaybackStats::default()
+    }
 }

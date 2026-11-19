@@ -2491,6 +2491,7 @@ pub async fn run_controlled(
         queues
             .enqueue_ctrl(&cancel, SessionFrame::control(state.to_message()))
             .await?;
+        config.stats.report(SessionStats::Audio(state));
         None
     } else if let Some(source) = config.audio.as_ref() {
         let mut state = source.capability();
@@ -2502,11 +2503,13 @@ pub async fn run_controlled(
         queues
             .enqueue_ctrl(&cancel, SessionFrame::control(state.to_message()))
             .await?;
+        config.stats.report(SessionStats::Audio(state));
         Some(spawn_audio_supervisor(
             Arc::clone(source),
             queues.ctrl_sender(),
             queues.audio_sender(),
             Arc::clone(&config.audio_allowed),
+            config.stats.clone(),
             cancel.clone(),
         ))
     } else {
@@ -2514,6 +2517,7 @@ pub async fn run_controlled(
         queues
             .enqueue_ctrl(&cancel, SessionFrame::control(state.to_message()))
             .await?;
+        config.stats.report(SessionStats::Audio(state));
         None
     };
 
@@ -4077,11 +4081,12 @@ fn spawn_audio_supervisor(
     ctrl: mpsc::Sender<SessionFrame>,
     audio: mpsc::Sender<SessionFrame>,
     allowed: Arc<AtomicBool>,
+    stats: SessionStatsReporter,
     cancel: CancellationToken,
 ) -> watch::Sender<bool> {
     let (enabled_tx, enabled_rx) = watch::channel(false);
     tokio::spawn(audio_supervisor(
-        source, ctrl, audio, allowed, enabled_rx, cancel,
+        source, ctrl, audio, allowed, stats, enabled_rx, cancel,
     ));
     enabled_tx
 }
@@ -4092,6 +4097,7 @@ async fn audio_supervisor(
     ctrl: mpsc::Sender<SessionFrame>,
     audio: mpsc::Sender<SessionFrame>,
     allowed: Arc<AtomicBool>,
+    stats: SessionStatsReporter,
     mut enabled: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) {
@@ -4126,9 +4132,12 @@ async fn audio_supervisor(
                             let ctrl = ctrl.clone();
                             let audio = audio.clone();
                             let allowed = Arc::clone(&allowed);
+                            let stats = stats.clone();
                             let stop = Arc::clone(&stop);
                             tokio::task::spawn_blocking(move || {
-                                run_audio_capture(&*source, &ctrl, &audio, &allowed, &stop);
+                                run_audio_capture(
+                                    &*source, &ctrl, &audio, &allowed, &stats, &stop,
+                                );
                             })
                         };
                         running = Some((task, stop));
@@ -4159,34 +4168,35 @@ fn run_audio_capture(
     ctrl: &mpsc::Sender<SessionFrame>,
     audio: &mpsc::Sender<SessionFrame>,
     allowed: &AtomicBool,
+    reporter: &SessionStatsReporter,
     stop: &AtomicBool,
 ) {
     let capability = source.capability();
     if !capability.available {
-        send_audio_status(ctrl, &capability);
+        send_audio_status(ctrl, reporter, &capability);
         return;
     }
     if !allowed.load(Ordering::Relaxed) {
-        let mut state = capability;
-        state.enabled = false;
-        state.reason = Some("本机已停止转发声音".to_owned());
-        send_audio_status(ctrl, &state);
+        let mut status = capability;
+        status.enabled = false;
+        status.reason = Some("本机已停止转发声音".to_owned());
+        send_audio_status(ctrl, reporter, &status);
         return;
     }
     if let Err(err) = source.start() {
         warn!(error = %err, "启动音频采集失败");
-        let mut state = capability;
-        state.enabled = false;
-        state.available = false;
-        state.reason = Some(format!("启动音频采集失败: {err}"));
-        send_audio_status(ctrl, &state);
+        let mut status = capability;
+        status.enabled = false;
+        status.available = false;
+        status.reason = Some(format!("启动音频采集失败: {err}"));
+        send_audio_status(ctrl, reporter, &status);
         return;
     }
 
-    let mut state = capability;
-    state.enabled = true;
-    state.reason = None;
-    send_audio_status(ctrl, &state);
+    let mut status = capability;
+    status.enabled = true;
+    status.reason = None;
+    send_audio_status(ctrl, reporter, &status);
 
     let mut seq = 0_u64;
     let mut failure: Option<String> = None;
@@ -4221,25 +4231,30 @@ fn run_audio_capture(
     }
     source.stop();
 
-    let mut final_state = state;
-    final_state.enabled = false;
+    status.enabled = false;
     if let Some(err) = failure {
-        final_state.available = false;
-        final_state.reason = Some(format!("音频采集中断: {err}"));
+        status.available = false;
+        status.reason = Some(format!("音频采集中断: {err}"));
     } else if vetoed {
-        final_state.reason = Some("本机已停止转发声音".to_owned());
+        status.reason = Some("本机已停止转发声音".to_owned());
     } else {
-        final_state.reason = None;
+        status.reason = None;
     }
-    send_audio_status(ctrl, &final_state);
+    send_audio_status(ctrl, reporter, &status);
 }
 
-/// 把一条 [`AudioState`] 作为 `AudioStatus` 投进控制队列（绝不丢、可阻塞发送）。
-fn send_audio_status(ctrl: &mpsc::Sender<SessionFrame>, state: &AudioState) {
-    let _ = ctrl.blocking_send(SessionFrame::control(state.to_message()));
+/// 把一条 [`AudioState`] 作为 `AudioStatus` 投进控制队列（绝不丢、可阻塞发送），
+/// 同时喂本机 UI（被控端状态页的「正在转发声音」）。
+fn send_audio_status(
+    ctrl: &mpsc::Sender<SessionFrame>,
+    reporter: &SessionStatsReporter,
+    status: &AudioState,
+) {
+    let _ = ctrl.blocking_send(SessionFrame::control(status.to_message()));
+    reporter.report(SessionStats::Audio(status.clone()));
 }
 
-/// 计算一帧的 pacing 方案：`(每块字节数, 块间等待)`；`None` = 走原来的整帧发送。///
+/// 计算一帧的 pacing 方案：`(每块字节数, 块间等待)`；`None` = 走原来的整帧发送。
 /// 抽成纯函数便于单测锁定三条上界：
 /// - 单个间隙 ≤ [`PACING_MAX_GAP`]（码率读数离谱时不会把一帧拖成秒级）；
 /// - 全部间隙之和 ≤ [`PACING_MAX_WAIT_FACTOR`] × 该帧自然串行时间；
@@ -10225,7 +10240,7 @@ mod tests {
             let stop = Arc::clone(&stop);
             let ctrl = ctrl_tx.clone();
             let audio = audio_tx.clone();
-            move || run_audio_capture(&*source, &ctrl, &audio, &allowed, &stop)
+            move || run_audio_capture(&*source, &ctrl, &audio, &allowed, &SessionStatsReporter::noop(), &stop)
         });
 
         let first = timeout(Duration::from_secs(1), ctrl_rx.recv())
@@ -10287,7 +10302,7 @@ mod tests {
             let source = Arc::clone(&source);
             let ctrl = ctrl_tx.clone();
             let audio = audio_tx.clone();
-            move || run_audio_capture(&*source, &ctrl, &audio, &allowed, &stop)
+            move || run_audio_capture(&*source, &ctrl, &audio, &allowed, &SessionStatsReporter::noop(), &stop)
         });
         task.await.expect("阻塞采集任务");
 

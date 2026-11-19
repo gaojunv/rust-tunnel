@@ -82,7 +82,9 @@ pub mod video;
 mod integration_tests;
 
 pub use approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
-pub use audio::{AudioSink, AudioSource, AudioState, EncodedAudio, ReceivedAudio};
+pub use audio::{
+    AudioPlaybackStats, AudioSink, AudioSource, AudioState, EncodedAudio, ReceivedAudio,
+};
 pub use codec::{
     vp9_decoder_factory, vp9_encoder_factory, VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi,
     VideoEncoderFactory, Vp9DecoderFactory, Vp9EncoderFactory,

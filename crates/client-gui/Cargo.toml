@@ -106,6 +106,9 @@ rust-tunnel-win-platform = { path = "../win-platform" }
 # GUI 用户会话直接用；无人值守实例在 Default 桌面上也复用它（零拷贝），
 # Winlogon / Screen-saver 等安全桌面仍回退 win-platform 的 GDI BitBlt。
 rust-tunnel-win-video = { path = "../win-video" }
+# 远程音频数据面：WASAPI loopback 采集 / 播放 + Opus（vendored libopus）。
+# 与 win-video 一样只在 Windows 编译，`remote` 不依赖它（引擎只认平台 trait）。
+rust-tunnel-win-audio = { path = "../win-audio" }
 # `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`
 # 与主线程 STA 占位（`OleInitialize`，避免 winit 在 MTA 线程上 panic）。
 # workspace 的 windows-sys 清单不含这两个，这里按需追加 feature（feature 是叠加的）。

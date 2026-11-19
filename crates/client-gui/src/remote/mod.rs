@@ -43,6 +43,37 @@ pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
 pub use view_scale::{display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER};
 
+// 音频平台适配（WASAPI loopback + Opus 编码 / 播放）；只在 Windows 编译。
+#[cfg(target_os = "windows")]
+mod audio;
+
+/// 本端音频端点：被控端采集源 + 控制端播放器。非 Windows 全为 `None`。
+pub struct AudioEndpoints {
+    /// 被控端音频采集源。
+    pub source: Option<Arc<dyn rust_tunnel_remote::AudioSource>>,
+    /// 控制端音频播放器。
+    pub sink: Option<Arc<dyn rust_tunnel_remote::AudioSink>>,
+}
+
+/// 构造本端音频端点。
+///
+/// Windows 上两端都注入（同一进程既可能是控制器也可能是被控端）；其它平台返回空，
+/// 引擎会向对端上报「本机不支持音频」。
+#[must_use]
+pub fn audio_endpoints() -> AudioEndpoints {
+    #[cfg(target_os = "windows")]
+    {
+        audio::endpoints()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        AudioEndpoints {
+            source: None,
+            sink: None,
+        }
+    }
+}
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};

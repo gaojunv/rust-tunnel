@@ -5,6 +5,7 @@
 //! win-audio-probe capture [秒数] [输出.wav]
 //! win-audio-probe rt      [秒数] [输出.wav]
 //! win-audio-probe tone    [秒数]
+//! win-audio-probe playtest [秒数]
 //! ```
 
 #[cfg(windows)]
@@ -33,6 +34,7 @@ fn run() -> rust_tunnel_win_audio::AudioResult<()> {
         "capture" => capture(seconds(rest.first(), 3), rest.get(1)),
         "rt" => roundtrip(seconds(rest.first(), 5), rest.get(1)),
         "tone" => tone(seconds(rest.first(), 2)),
+        "playtest" => playtest(seconds(rest.first(), 2)),
         other => Err(AudioError::Message(format!(
             "未知子命令 {other:?}（devices / capture / rt / tone）"
         ))),
@@ -192,6 +194,44 @@ fn tone(seconds: u64) -> rust_tunnel_win_audio::AudioResult<()> {
         render.write_block(&decoded_pcm[..frames * usize::from(CHANNELS)])?;
     }
     println!("播放完成。");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn playtest(seconds: u64) -> rust_tunnel_win_audio::AudioResult<()> {
+    use rust_tunnel_win_audio::format::{CHANNELS, FRAME_MS, OPUS_BITRATE_BPS, SAMPLE_RATE};
+    use rust_tunnel_win_audio::opus::{Encoder, MAX_PACKET_BYTES};
+    use rust_tunnel_win_audio::playback::Playback;
+
+    let blocks = blocks_for(seconds, FRAME_MS);
+    let mut encoder = Encoder::new(SAMPLE_RATE, CHANNELS, OPUS_BITRATE_BPS)?;
+    let playback = Playback::start()?;
+    println!("播放自检：合成 440 Hz → Opus → 抖动缓冲 → 默认输出，共 {seconds} 秒……");
+    let mut packet = vec![0_u8; MAX_PACKET_BYTES];
+    let mut seq = 0_u64;
+    let started = std::time::Instant::now();
+    for index in 0..blocks {
+        let pcm = sine_block(index, blocks);
+        let written = encoder.encode(&pcm, &mut packet)?;
+        seq = seq.wrapping_add(1);
+        playback.push(seq, packet[..written].to_vec());
+        let due = std::time::Duration::from_millis(
+            u64::from(FRAME_MS).saturating_mul(u64::try_from(index + 1).unwrap_or(u64::MAX)),
+        );
+        if let Some(wait) = started
+            .checked_add(due)
+            .and_then(|at| at.checked_duration_since(std::time::Instant::now()))
+        {
+            std::thread::sleep(wait);
+        }
+    }
+    // 等抖动缓冲与设备缓冲把尾巴播完（80 ms + 200 ms 缓冲，留足余量）。
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let stats = playback.snapshot();
+    println!(
+        "播放自检完成：收包 {}，队列丢包 {}，欠载 {}，目标缓冲 {} ms",
+        stats.received, stats.dropped, stats.underruns, stats.buffer_ms
+    );
     Ok(())
 }
 

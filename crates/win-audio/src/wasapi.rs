@@ -146,6 +146,11 @@ pub struct Capture {
     _not_send: PhantomData<*const ()>,
 }
 
+// SAFETY: WASAPI 的 MTA 对象是自由线程的；`_not_send` 只是防止误用的类型标记。
+// 引擎保证 `start`/`read`/`stop` 都在同一个 `spawn_blocking` 线程上调用，且访问全部经
+// `&mut self` 串行化。把已创建的 `Capture` 移到同一时刻只有一个使用者线程是安全的。
+unsafe impl Send for Capture {}
+
 impl Capture {
     /// 打开默认回放设备的 loopback 采集并启动。
     ///
