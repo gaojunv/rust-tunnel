@@ -535,27 +535,34 @@ fn audio_controls(
     p: &theme::Palette,
 ) {
     let available = state.audio_available;
-    let icon = if state.audio_enabled {
+    // 图标跟**本地意图**走，而不是对端回报的 `state.audio_enabled`：后者要等一个来回去
+    // 更新（甚至可能一直不更新），点下去没有即时反馈就会像「按钮坏了」。对端的真实状态
+    // 放在悬停提示与统计角标里。
+    let icon = if v.audio_enabled {
         Icon::Speaker
     } else {
         Icon::SpeakerMuted
     };
     let color = (!available).then_some(p.text_disabled);
-    let tip = if available {
-        if state.audio_enabled {
-            "静音（同时停止对端采集，省带宽）"
-        } else {
-            "开启声音转发"
-        }
-    } else {
+    let tip = if !available {
         state
             .audio_reason
             .as_deref()
             .unwrap_or("本机或对端没有音频能力")
+            .to_owned()
+    } else if !v.audio_enabled {
+        "开启声音转发".to_owned()
+    } else if state.audio_enabled {
+        "静音（同时停止对端采集，省带宽）".to_owned()
+    } else if let Some(reason) = state.audio_reason.as_deref() {
+        // 已请求但没在转发：被控端本地停止、设备故障或还没起播。
+        format!("已请求转发，但对端未在发送：{reason}")
+    } else {
+        "已请求转发，等待对端开始发送".to_owned()
     };
     let response = ui
         .add_enabled_ui(available, |ui| {
-            widgets::toolbar_icon_colored(ui, icon, tip, color)
+            widgets::toolbar_icon_colored(ui, icon, &tip, color)
         })
         .inner;
     if response.clicked() {
@@ -563,7 +570,7 @@ fn audio_controls(
         manager.set_audio_enabled(v.audio_enabled);
     }
 
-    if available && state.audio_enabled {
+    if available && v.audio_enabled {
         ui.scope(|ui| {
             ui.spacing_mut().slider_width = 64.0;
             let mut volume = v.audio_volume;

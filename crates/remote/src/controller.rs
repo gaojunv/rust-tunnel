@@ -757,9 +757,14 @@ pub(crate) async fn run_controller_with_input(
         .find(|d| d.primary)
         .or_else(|| displays.first())
         .map_or(0, |d| d.id);
-    // 是否已经向被控端请求过「开始转发声音」。只在**首次可用**时自动请求一次：被控端
-    // 本地否决后回 `enabled:false`，这里不会反复重发（用户可从工具条显式再开）。
-    let mut audio_requested = false;
+    // 当前**用户意图**：是否希望转发声音。会话开始时取配置，之后由
+    // `ControllerCommand::SetAudioEnabled` 改写。
+    let mut audio_desired = config.audio_enabled;
+    // 本会话是否已经发过 `SetAudioEnabled{true}`。它只用来保证「首次可用时自动请求一次」，
+    // **绝不能拿 `audio_desired` 兼任**：静音会把意图置成 false，若自动请求也看这个标志，
+    // 被控端回报 `enabled:false` 的那一刻就会被当成「还没请求过」而立刻重发 true——静音
+    // 在一来一回后自行撤销（真机现象：点静音后图标闪一下就回到扬声器）。
+    let mut audio_request_sent = false;
     let mut reason = String::from("会话结束");
 
     let result: RemoteResult<SessionEnd> = 'session: loop {
@@ -1039,7 +1044,12 @@ pub(crate) async fn run_controller_with_input(
                         }
                     }
                     ControllerCommand::SetAudioEnabled { enabled } => {
-                        audio_requested = enabled;
+                        audio_desired = enabled;
+                        if enabled {
+                            // 显式请求过了；此后被控端的 `enabled:false`（设备故障/本地否决）
+                            // 不再触发自动请求，避免和用户/对端拉锯。
+                            audio_request_sent = true;
+                        }
                         if let Err(err) = queues
                             .enqueue_ctrl(
                                 &cancel,
@@ -1603,12 +1613,15 @@ pub(crate) async fn run_controller_with_input(
                                 audio.on_status(&state);
                             }
                             config.stats.report(SessionStats::Audio(state.clone()));
-                            let should_request = available
-                                && config.audio_enabled
-                                && !audio_requested
-                                && config.mode != RemoteMode::FileTransfer;
+                            let should_request = should_auto_request_audio(
+                                available,
+                                enabled,
+                                audio_desired,
+                                audio_request_sent,
+                                config.mode,
+                            );
                             if should_request {
-                                audio_requested = true;
+                                audio_request_sent = true;
                                 if let Err(err) = queues
                                     .enqueue_ctrl(
                                         &cancel,
@@ -2477,6 +2490,30 @@ async fn send_file_errors(
             .await?;
     }
     Ok(())
+}
+
+/// 控制器收到一条 `AudioStatus` 后是否应**自动**请求开始转发。纯函数，便于单测。
+///
+/// 只做**一次性**自动请求（`request_sent` 一旦置位就不再重发）。这一点是硬约束，不是优化：
+/// 用户点静音会把「意图」置成 false，被控端随后回报 `enabled:false`；若自动请求只看意图而
+/// 不看「已经请求过」，这条回报就会被当成「还没开始」而立刻重发 `SetAudioEnabled{true}`，
+/// 静音在一个来回后自行撤销（真机现象：图标闪一下就回到扬声器）。
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "四个独立的二值条件正是一张真值表，换成枚举只会让调用点更绕"
+)]
+fn should_auto_request_audio(
+    available: bool,
+    enabled: bool,
+    desired: bool,
+    request_sent: bool,
+    mode: RemoteMode,
+) -> bool {
+    available
+        && desired
+        && !enabled
+        && !request_sent
+        && mode != RemoteMode::FileTransfer
 }
 
 #[cfg(test)]
@@ -4054,5 +4091,35 @@ mod tests {
             "参考链断掉不该重建解码器：喂一张 IDR 就够"
         );
         assert_no_break(&mut harness.notices);
+    }
+
+    /// 首次可用时自动请求一次；**静音后绝不因为对端回报 `enabled:false` 又自动打开**。
+    ///
+    /// 真机回归：`audio_requested` 同时兼任「用户意图」与「已请求过」，静音把它置 false，
+    /// 被控端停采后回报 `enabled:false` 立刻命中自动请求条件，静音在一个来回后自行撤销，
+    /// 工具条图标闪一下就回到扬声器。
+    #[test]
+    fn audio_auto_request_is_one_shot_and_never_undoes_mute() {
+        let full = RemoteMode::Control;
+
+        // 会话开始（偏好开）：可用但还没发流 → 自动请求。
+        assert!(should_auto_request_audio(true, false, true, false, full));
+        // 已经请求过（无论结果如何）→ 不再重发。静音后 desired=false 且 sent=true。
+        assert!(!should_auto_request_audio(true, false, true, true, full));
+        // 用户点了静音 → 意图为 false，绝不能自动开回来。
+        assert!(!should_auto_request_audio(true, false, false, true, full));
+        assert!(!should_auto_request_audio(true, false, false, false, full));
+        // 已经在转发 → 不需要请求。
+        assert!(!should_auto_request_audio(true, true, true, false, full));
+        // 对端不可用 → 不请求（置灰按钮不会发命令）。
+        assert!(!should_auto_request_audio(false, false, true, false, full));
+        // 仅文件传输不采集声音。
+        assert!(!should_auto_request_audio(
+            true,
+            false,
+            true,
+            false,
+            RemoteMode::FileTransfer
+        ));
     }
 }
