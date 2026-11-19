@@ -1581,6 +1581,7 @@ fn opt_yes_no(value: Option<bool>) -> &'static str {
 fn codec_label(codec: Option<CodecId>) -> &'static str {
     match codec {
         Some(CodecId::H264) => "H.264 4:2:0",
+        Some(CodecId::H265) => "H.265 4:2:0",
         Some(CodecId::Vp9) => "VP9 4:4:4",
         None => UNKNOWN,
     }
@@ -2084,6 +2085,7 @@ mod tests {
         assert_eq!(dash_opt(Some("")), UNKNOWN);
         assert_eq!(codec_label(None), UNKNOWN);
         assert_eq!(codec_label(Some(CodecId::H264)), "H.264 4:2:0");
+        assert_eq!(codec_label(Some(CodecId::H265)), "H.265 4:2:0");
         assert_eq!(codec_label(Some(CodecId::Vp9)), "VP9 4:4:4");
         assert_eq!(opt_yes_no(None), UNKNOWN);
         assert_eq!(opt_yes_no(Some(false)), "否");

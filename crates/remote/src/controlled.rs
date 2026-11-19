@@ -145,7 +145,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
@@ -833,7 +833,9 @@ impl PatchStaging {
     /// 头部的 `batch_start == false` 等价于「这一批的首条已经离开暂存区」，也就是控制端的
     /// 合成缓冲已经吃到了这批的一部分。整批都在暂存区时返回 `false`。
     fn partial(&self) -> bool {
-        self.frames.front().is_some_and(|staged| !staged.batch_start)
+        self.frames
+            .front()
+            .is_some_and(|staged| !staged.batch_start)
     }
 
     /// 头部这条滞留是否已超龄（见 [`PATCH_STAGING_MAX_AGE`]）。
@@ -945,6 +947,9 @@ enum PatchExitReason {
     RebaseTimeout,
     /// 切显示器/改画质/显示器热插拔等几何或参考链重建。
     Reconfigure,
+    /// 编码任务运行时回退到 VP9（见 [`EncodeFallback`]）：VP9 解码输出是 RGBA，补丁模式依赖
+    /// NV12 合成缓冲，必须退出。**非自抖动**（与 [`Self::Reconfigure`] 一样不计冷却）。
+    CodecChanged,
 }
 
 impl PatchExitReason {
@@ -960,6 +965,7 @@ impl PatchExitReason {
             Self::SizeMismatch => "size_mismatch",
             Self::RebaseTimeout => "rebase_timeout",
             Self::Reconfigure => "reconfigure",
+            Self::CodecChanged => "codec_changed",
         }
     }
 
@@ -975,8 +981,8 @@ impl PatchExitReason {
     /// - [`Self::StagingFull`] / [`Self::StagingAge`]：写侧跟不上，刚进去就退出，进去也没用。
     ///
     /// 几何/参考链重建（[`Self::Reconfigure`] / [`Self::SizeMismatch`] / [`Self::RebaseTimeout`]）
-    /// 不是自抖动：前者是用户主动换显示器/画质，后者是链路瞬时拥塞，恢复后应当立刻能再进
-    /// （`exit` 对它们连冷却都不设）。
+    /// 或 codec 运行时回退（[`Self::CodecChanged`]）不是自抖动：前者是用户主动换显示器/画质，
+    /// 后者是编码器创建失败后的一次性降级，恢复后应当立刻能再进（`exit` 对它们连冷却都不设）。
     const fn penalizes_reentry(self) -> bool {
         matches!(
             self,
@@ -1361,7 +1367,7 @@ fn display_signature(displays: &[DisplayInfo]) -> Vec<(u32, u32, u32)> {
 /// （视频 960×540、补丁 1920×1080），控制端就会因尺寸不符拒绝所有补丁。
 ///
 /// `max_width` 必须是**本会话协商后的**有效上限（见 [`effective_max_encode_width`]）：
-/// 默认 1920，硬件 H.264 + 原生分辨率时 3840。
+/// 默认 1920，硬件 H.264/H.265 + 原生分辨率时 3840。
 fn encode_target_dims(
     display_width: u32,
     display_height: u32,
@@ -1391,12 +1397,12 @@ fn content_area_permille(frame_width: u32, frame_height: u32, scale: f32, max_wi
 
 /// 本会话的有效编码宽度上限（像素）。
 ///
-/// **只有硬件 H.264 + 用户显式开启原生分辨率**才放宽到
+/// **只有硬件 H.264/H.265 + 用户显式开启原生分辨率**才放宽到
 /// [`NATIVE_MAX_ENCODE_WIDTH`]（3840）；其余一律 [`MAX_ENCODE_WIDTH`]（1920）——
 /// 包括「开了选项但对端只有 VP9」：VP9 软件解码 4K 在控制器侧仍是 37–58 ms 一帧。
 #[must_use]
 fn effective_max_encode_width(codec: CodecId, native_resolution: bool) -> u32 {
-    if native_resolution && codec == CodecId::H264 {
+    if native_resolution && matches!(codec, CodecId::H264 | CodecId::H265) {
         NATIVE_MAX_ENCODE_WIDTH
     } else {
         MAX_ENCODE_WIDTH
@@ -2006,9 +2012,18 @@ pub struct ControlledConfig {
     pub stats: SessionStatsReporter,
     /// 可选的 H.264 编码器工厂（通常由 `crates/win-video` 注入）。
     ///
-    /// `None` = 本端只能编码 VP9，协商时一律选 VP9。**与控制器 offer 的交集**才是最终选择：
-    /// 只有本字段为 `Some` **且** `CodecOffer.h264 == true` 时才选 H.264。
+    /// `None` = 本端没有 H.264 编码器，协商时不会选 H.264。**与控制器 offer 的交集**才是最终
+    /// 选择：只有本字段为 `Some` **且** `CodecOffer.h264 == true` 时才可能选 H.264。
     pub h264_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
+    /// 可选的 H.265/HEVC 编码器工厂（通常由 `crates/win-video` 注入）。
+    ///
+    /// `None` = 本端没有 H.265 编码器。是否**优先**选它由 [`Self::prefer_h265`] 决定；即便如此
+    /// 也要求控制器声明 `CodecOffer.h265 == true`。
+    pub h265_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
+    /// 是否**优先选择 H.265/HEVC**（默认 `true`）。`false` 时即使双方都支持也回退 H.264。
+    ///
+    /// 这一项只在**会话开始**时读取，运行中改它只影响下一次会话。
+    pub prefer_h265: bool,
     /// 会话结束后是否**自动锁定本机屏幕**。
     ///
     /// 由收尾守卫（[`AutoLockOnExit`]）在会话结束时**实时读取**，故用户在会话进行中打开设置
@@ -2050,6 +2065,8 @@ enum CodecOfferOutcome {
         h264: bool,
         /// 控制器是否支持 VP9 解码。
         vp9: bool,
+        /// 控制器是否支持 H.265/HEVC 解码。
+        h265: bool,
     },
     /// 等待超时，调用方回退 VP9。
     Timeout,
@@ -2059,14 +2076,22 @@ enum CodecOfferOutcome {
 
 /// 纯函数：根据 offer 与本端编码能力选 codec。
 ///
-/// 规则（任务约定）：**本端有 H.264 编码工厂且控制器声明支持 H.264** 才选 H.264，否则 VP9。
-/// 超时（`None`）同样回退 VP9。
+/// 规则（`offer` 是 `(h264, vp9, h265)` 三元组）：
+/// - `prefer_h265 && offer.h265 && 本端有 H.265 编码器` → H.265；
+/// - 否则 `offer.h264 && 本端有 H.264 编码器` → H.264；
+/// - 否则 VP9。超时/关闭（`None`）同样回退 VP9。
+///
+/// `offer.vp9` 不参与判断：VP9 解码是内置实现，它是双方唯一都必定具备的兜底 codec。
 #[must_use]
-fn choose_codec(offer: Option<(bool, bool)>, has_h264_encoder: bool) -> CodecId {
+fn choose_codec(
+    offer: Option<(bool, bool, bool)>,
+    has_h264_encoder: bool,
+    has_h265_encoder: bool,
+    prefer_h265: bool,
+) -> CodecId {
     match offer {
-        Some((true, _)) if has_h264_encoder => CodecId::H264,
-        // 控制器永远声明 `vp9: true`（VP9 解码是内置实现）。即使它声明 false，VP9 仍是唯一
-        // 双方都可能具备的实现，发出去让对端显式报错好过静默卡死。
+        Some((_, _, true)) if prefer_h265 && has_h265_encoder => CodecId::H265,
+        Some((true, _, _)) if has_h264_encoder => CodecId::H264,
         _ => CodecId::Vp9,
     }
 }
@@ -2091,8 +2116,8 @@ async fn read_codec_offer(
             () = &mut deadline => return Ok(CodecOfferOutcome::Timeout),
             incoming = reader.next() => match incoming {
                 Some(Ok(frame)) => match frame.message {
-                    SessionMessage::CodecOffer { h264, vp9 } => {
-                        return Ok(CodecOfferOutcome::Offer { h264, vp9 });
+                    SessionMessage::CodecOffer { h264, vp9, h265 } => {
+                        return Ok(CodecOfferOutcome::Offer { h264, vp9, h265 });
                     }
                     SessionMessage::Heartbeat { .. } => {
                         // t2 = 收到时刻、t3 = 发出时刻（都是本端单调时钟）。两者之间只隔一条
@@ -2363,7 +2388,7 @@ pub async fn run_controlled(
         Err(err) => return Err(err),
     };
     let offer = match outcome {
-        CodecOfferOutcome::Offer { h264, vp9 } => Some((h264, vp9)),
+        CodecOfferOutcome::Offer { h264, vp9, h265 } => Some((h264, vp9, h265)),
         CodecOfferOutcome::Timeout => {
             warn!(
                 timeout = ?CODEC_OFFER_TIMEOUT,
@@ -2378,14 +2403,22 @@ pub async fn run_controlled(
             });
         }
     };
-    let codec = choose_codec(offer, config.h264_encoder_factory.is_some());
-    let encoder_factory: Arc<dyn VideoEncoderFactory> = if codec == CodecId::H264 {
-        // `choose_codec` 只在工厂存在时返回 H264；这里仍是防御性检查，不 panic。
-        config.h264_encoder_factory.clone().ok_or_else(|| {
+    let mut codec = choose_codec(
+        offer,
+        config.h264_encoder_factory.is_some(),
+        config.h265_encoder_factory.is_some(),
+        config.prefer_h265,
+    );
+    // 按协商结果取编码器工厂。`choose_codec` 只在对应工厂存在时才返回该硬件 codec；这里仍是
+    // 防御性检查（不 panic），缺失时给出明确的平台错误而不是静默换 codec。
+    let encoder_factory: Arc<dyn VideoEncoderFactory> = match codec {
+        CodecId::H265 => config.h265_encoder_factory.clone().ok_or_else(|| {
+            RemoteError::Platform("协商选择了 H.265，但本端没有编码器工厂".to_owned())
+        })?,
+        CodecId::H264 => config.h264_encoder_factory.clone().ok_or_else(|| {
             RemoteError::Platform("协商选择了 H.264，但本端没有编码器工厂".to_owned())
-        })?
-    } else {
-        vp9_encoder_factory()
+        })?,
+        CodecId::Vp9 => vp9_encoder_factory(),
     };
     queues
         .enqueue_ctrl(
@@ -2395,11 +2428,11 @@ pub async fn run_controlled(
         .await?;
     info!("编解码协商完成（被控端） codec={codec:?}");
 
-    // 本会话的**有效编码宽度上限**：只有硬件 H.264 + 用户显式开启原生分辨率才放宽到 3840
-    // （见 [`effective_max_encode_width`]）。采集侧也按它预缩放——采集实现必须与编码循环用
+    // 本会话的**有效编码宽度上限**：只有硬件 H.264/H.265 + 用户显式开启原生分辨率才放宽到
+    // 3840（见 [`effective_max_encode_width`]）。采集侧也按它预缩放——采集实现必须与编码循环用
     // 同一个值，否则补丁/全帧两条路径的尺寸会差一档。
-    let max_encode_width = effective_max_encode_width(codec, config.native_resolution);
-    let native_active = max_encode_width > MAX_ENCODE_WIDTH;
+    let mut max_encode_width = effective_max_encode_width(codec, config.native_resolution);
+    let mut native_active = max_encode_width > MAX_ENCODE_WIDTH;
     screen.set_max_encode_width(max_encode_width);
     info!("编码宽度上限（被控端） max_width={max_encode_width} native={native_active}");
 
@@ -2429,6 +2462,21 @@ pub async fn run_controlled(
     let encode_snapshot: Arc<std::sync::Mutex<Option<EncodeSnapshot>>> =
         Arc::new(std::sync::Mutex::new(None));
     let (encode_tx, encode_rx) = mpsc::channel::<EncodeJob>(1);
+    // 运行时回退：编码任务在**创建编码器失败**时按 `H265 → H264 → Vp9` 逐级切换，并把新
+    // codec 写进 `codec_state`，主循环下一拍据此切换采集/补丁/宽度（见 [`EncodeFallback`]）。
+    let codec_state = Arc::new(AtomicU8::new(codec_to_u8(codec)));
+    // H.264 只有「协商选中 H.265、控制器声明 h264、且本端确实注入了工厂」时才作为中间一级。
+    let h264_fallback = if codec == CodecId::H265 && offer.is_some_and(|(h264, _, _)| h264) {
+        config.h264_encoder_factory.clone()
+    } else {
+        None
+    };
+    let fallback = EncodeFallback {
+        h264: h264_fallback,
+        vp9: vp9_encoder_factory(),
+        vp9_attempted: false,
+        codec_state: Arc::clone(&codec_state),
+    };
     let encode_task = tokio::spawn(encode_loop(
         encode_rx,
         queues.screen_sender(),
@@ -2444,6 +2492,7 @@ pub async fn run_controlled(
         Arc::clone(&encode_snapshot),
         Arc::clone(&latency_window),
         Arc::clone(&idr_tracker),
+        fallback,
     ));
 
     let capture = config.mode != RemoteMode::FileTransfer;
@@ -2454,15 +2503,17 @@ pub async fn run_controlled(
         input: Arc::clone(&input),
         enabled: Arc::clone(&config.lock_on_disconnect),
     });
-    // GPU 采集只在**协商到 H.264** 且平台采集源支持时启用。计算一次即可：codec 在
-    // 会话内不变，平台能力也不会在会话中翻转。H.264 编码器在 GPU 输入不可用时由
-    // 适配器自行回退 CPU（`RawFrame::gpu == None` 走原来的 rgba 路径）。
-    let gpu_capture = codec == CodecId::H264 && screen.supports_gpu_capture();
-    // 补丁模式只在 **H.264 + 平台采集源支持** 时可用：VP9 的解码输出是 RGBA，控制器需要
-    // 另一套持久帧缓冲（见 [`ScreenSource::supports_patches`]）。
+    // GPU 采集只在**协商到硬件 H.264/H.265** 且平台采集源支持时启用。运行时回退到 VP9 时
+    // 会由主循环关掉它（见 [`EncodeFallback`]）。硬件编码器在 GPU 输入不可用时由适配器自行
+    // 回退 CPU（`RawFrame::gpu == None` 走原来的 rgba 路径）。
+    let mut gpu_capture =
+        matches!(codec, CodecId::H264 | CodecId::H265) && screen.supports_gpu_capture();
+    // 补丁模式只在 **H.264/H.265 + 平台采集源支持** 时可用：VP9 的解码输出是 RGBA，控制器
+    // 需要另一套持久帧缓冲（见 [`ScreenSource::supports_patches`]）。
     // **压缩在采集任务的 `spawn_blocking` 里做**（见 `run_capture` / `build_patch_batch`），
     // 不再占用会话循环——补丁模式下 zstd 曾同步阻塞循环 10–40 ms，直接拖慢采集节拍。
-    let patch_capable = codec == CodecId::H264 && screen.supports_patches();
+    let mut patch_capable =
+        matches!(codec, CodecId::H264 | CodecId::H265) && screen.supports_patches();
     // 编码参数自阶段 3 起分两层：`config.encode` 是档位**上限**，`encode` 是闭环**当前生效值**
     // （起步 = 上限）。`SetQuality` 换上限，`QosFeedback` 动生效值。
     //
@@ -2478,8 +2529,8 @@ pub async fn run_controlled(
         native_bitrate_permille(initial_display, native_active),
     ));
     // 内容面积上限按**编码器类型**开关：VP9 是 CBR（静止画面也会把目标码率灌满，需要这层
-    // 省带宽）；H.264 是峰值受限 VBR（没有残差时只发几 KB），上限只会压低 VBV 单帧预算，
-    // 让画面一变就被量化糊——画质优先，关闭。
+    // 省带宽）；H.264/H.265 是峰值受限 VBR（没有残差时只发几 KB），上限只会压低 VBV 单帧
+    // 预算，让画面一变就被量化糊——画质优先，关闭。
     rate.set_content_caps_enabled(codec == CodecId::Vp9);
     let mut encode = rate.current();
     // pacing 按**链路**码率（AIMD）摊开：内容上限压的是「这一帧值多少比特」，不是链路速率
@@ -2594,6 +2645,43 @@ pub async fn run_controlled(
     let mut meter_primed = false;
     let mut reason = String::from("会话结束");
     let result: RemoteResult<SessionEnd> = loop {
+        // 编码任务的运行时回退（见 [`EncodeFallback`]）：它在创建编码器失败后把新 codec 写进
+        // `codec_state`。采集节拍一直在跑，故最迟一帧内就能在这里观察到；编码任务自己已经
+        // 切到新工厂，并在切换前把 `CodecSelect` 投进了**画面车道**。
+        let observed_codec = codec_from_u8(codec_state.load(Ordering::Relaxed));
+        if observed_codec != codec {
+            info!(
+                from = ?codec,
+                to = ?observed_codec,
+                "编码任务运行时回退了 codec，切换采集路径"
+            );
+            codec = observed_codec;
+            if codec == CodecId::Vp9 {
+                // VP9 是纯软件 4:4:4，与硬件 H.264/H.265 的采集/补丁/宽度规则都不同：
+                // - GPU 纹理只有硬件编码器能吃；
+                // - 补丁模式依赖 NV12 合成缓冲，而 VP9 解码输出是 RGBA；
+                // - 4K 原生分辨率只在硬件路径上开放。
+                gpu_capture = false;
+                if screen_mode.is_patches() || screen_mode.base_pending.is_some() {
+                    exit_patch_mode(
+                        &mut screen_mode,
+                        &mut patch_staging,
+                        &mut force_encode,
+                        &mut last_changed_permille,
+                        &mut capture_tick,
+                        &mut next_capture_at,
+                        PatchExitReason::CodecChanged,
+                    );
+                }
+                patch_capable = false;
+                screen.set_max_encode_width(MAX_ENCODE_WIDTH);
+                max_encode_width = MAX_ENCODE_WIDTH;
+                native_active = false;
+                // VP9 走 CBR（静止画面也会把目标码率灌满），内容面积上限必须重新打开。
+                rate.set_content_caps_enabled(true);
+                queues.set_screen_pacing_kbps(rate.keyframe_bitrate_kbps());
+            }
+        }
         tokio::select! {
             () = cancel.cancelled() => {
                 "用户中断".clone_into(&mut reason);
@@ -4659,6 +4747,74 @@ fn kbps_from_bytes(bytes: u64, elapsed: Duration) -> u32 {
     u32::try_from(bytes.saturating_mul(8) / millis).unwrap_or(u32::MAX)
 }
 
+/// `CodecId` → `u8`（**进程内**约定：0=Vp9、1=H264、2=H265）。
+///
+/// 编码任务把运行时回退后的 codec 写进 `Arc<AtomicU8>`，主循环据此切换采集/补丁/宽度。
+/// 它**不上线**：线上 codec 仍由 [`SessionMessage::CodecSelect`] 承载。
+const fn codec_to_u8(codec: CodecId) -> u8 {
+    match codec {
+        CodecId::Vp9 => 0,
+        CodecId::H264 => 1,
+        CodecId::H265 => 2,
+    }
+}
+
+/// [`codec_to_u8`] 的逆运算；未知值按兜底 codec（VP9）处理。
+const fn codec_from_u8(value: u8) -> CodecId {
+    match value {
+        1 => CodecId::H264,
+        2 => CodecId::H265,
+        _ => CodecId::Vp9,
+    }
+}
+
+/// 运行时 codec 回退链 `H265 → H264 → Vp9`（纯逻辑，便于单测）。
+///
+/// **只**在 `encoder_factory.create(...)` 失败时使用——普通编码/在线重配置错误仍走既有的
+/// 「丢弃编码器、下一帧重建」路径，避免一次瞬时 GPU 故障就永久降级。每一级最多消费一次：
+/// 回退后的编码器再次创建失败时继续往下一级走，但不会回到已经失败过的级别，也不会无限循环。
+struct EncodeFallback {
+    /// H.265 创建失败时接手的 H.264 工厂。
+    ///
+    /// 仅当协商选中 H.265 **且**控制器声明 `offer.h264` **且**本端确实注入了 H.264 工厂时才为
+    /// `Some`；否则 H.265 失败直接落 VP9。
+    h264: Option<Arc<dyn VideoEncoderFactory>>,
+    /// 最终兜底的 VP9 工厂（生产恒为内置 [`vp9_encoder_factory`]；测试可注入假的以锁定
+    /// 「VP9 创建也失败时不再循环」）。
+    vp9: Arc<dyn VideoEncoderFactory>,
+    /// VP9 是否已经尝试过（最终一级，只消费一次）。
+    vp9_attempted: bool,
+    /// 当前 codec（[`codec_to_u8`]）：编码任务写、主循环读。只在**回退**时更新。
+    codec_state: Arc<AtomicU8>,
+}
+
+impl EncodeFallback {
+    /// 给定当前 codec，返回下一级要切换到的 `(codec, 工厂)`；没有可回退的级别时返回 `None`。
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "签名带 current 参数，不是 Iterator::next 的语义"
+    )]
+    fn next(&mut self, current: CodecId) -> Option<(CodecId, Arc<dyn VideoEncoderFactory>)> {
+        match current {
+            CodecId::H265 => match self.h264.take() {
+                Some(factory) => Some((CodecId::H264, factory)),
+                None => self.take_vp9(),
+            },
+            CodecId::H264 => self.take_vp9(),
+            CodecId::Vp9 => None,
+        }
+    }
+
+    /// VP9 的最终一级（只成功返回一次）。
+    fn take_vp9(&mut self) -> Option<(CodecId, Arc<dyn VideoEncoderFactory>)> {
+        if self.vp9_attempted {
+            return None;
+        }
+        self.vp9_attempted = true;
+        Some((CodecId::Vp9, Arc::clone(&self.vp9)))
+    }
+}
+
 /// 编码任务：独占编码器，去重 → （在线重配置）→ 编码 → 投递。
 ///
 /// # 丢弃策略（**改动前先读模块文档**）
@@ -4694,16 +4850,17 @@ async fn encode_loop(
     out: mpsc::Sender<SessionFrame>,
     cancel: CancellationToken,
     stats: SessionStatsReporter,
-    codec: CodecId,
-    encoder_factory: Arc<dyn VideoEncoderFactory>,
+    mut codec: CodecId,
+    mut encoder_factory: Arc<dyn VideoEncoderFactory>,
     unchanged_resend: Duration,
     send_meter: Arc<ScreenSendMeter>,
     base_frame_sent: Arc<AtomicBool>,
     // 最近一次真正编码出关键帧的时刻（微秒；0 = 还没有）。主循环据此做周期 IDR 兜底。
     last_keyframe_us: Arc<AtomicU64>,
     // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
-    // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。
-    max_encode_width: u32,
+    // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。回退到 VP9 后
+    // 这里会被本循环就地压回 [`MAX_ENCODE_WIDTH`]（主循环随后也会同步）。
+    mut max_encode_width: u32,
     // 每秒写一次的完整快照槽（主循环组装 `HostStats` 用）。
     encode_snapshot: Arc<std::sync::Mutex<Option<EncodeSnapshot>>>,
     // 诊断：与主循环/写任务共享的延迟窗口（见 [`crate::latency`]）。
@@ -4711,6 +4868,8 @@ async fn encode_loop(
     // IDR 在途/刚写出观测点：编码任务在承诺编码 IDR 时入账，写任务写完时销账
     // （见 [`IdrTracker`]）。主循环据此吸收重复的关键帧请求。
     idr_tracker: Arc<IdrTracker>,
+    // 运行时回退链（H265 → H264 → Vp9，**仅**编码器创建失败时触发）。
+    mut fallback: EncodeFallback,
 ) {
     let mut encoder: Option<Box<dyn VideoEncoderApi>> = None;
     // 当前编码器的**几何**（宽, 高）。**只有它变化才重建**——码率/帧率不在这里。
@@ -4719,6 +4878,8 @@ async fn encode_loop(
     let mut prev_rgba: Option<Vec<u8>> = None;
     // 已下发的 `ScreenConfig` 尺寸；变化时重发。
     let mut sent_dims: Option<(u32, u32)> = None;
+    // 已下发的 `ScreenConfig` codec；运行时回退换 codec 时同样必须重发（几何可能不变）。
+    let mut sent_codec: Option<CodecId> = None;
     // 因出站队列满而被跳过的那一帧若曾要求关键帧，这里记下来，**下一帧编码时补上**。
     //
     // 少了它就有个真实的坑：控制器进入 `awaiting_keyframe` 后只请求一次 IDR，若那一帧恰好因
@@ -4770,6 +4931,14 @@ async fn encode_loop(
 
         // GPU 帧没有 CPU 像素：不能做 memcmp 去重（也绝不能拿空 `rgba` 去比较）。
         let is_gpu = frame.gpu.is_some();
+        // 回退到 VP9 之后主循环还没把采集切回 CPU（它下一拍才观察到 `codec_state`）：
+        // VP9 是纯软件编码器，吃不了 GPU 纹理。跳过这些帧，但把「必须编码 / 必须 IDR」的请求
+        // 留到下一张 CPU 帧上（`continue` 不会清 `pending_*`）。
+        if codec == CodecId::Vp9 && is_gpu {
+            pending_keyframe |= force_keyframe;
+            pending_encode |= force_encode && !force_keyframe;
+            continue;
+        }
         // 变化判据分两条路：
         // - GPU：采集层已经做过**像素级**变化检测（`RawFrame::changed`），不做 CPU 读回比较。
         //   检测器不可用时采集层保守给 `true`，这里不需要额外兜底。
@@ -4785,19 +4954,22 @@ async fn encode_loop(
         window.encode_dims = Some((width, height));
         // **几何变化才重建**：码率/帧率在下方在线重配置。
         let geometry_changed = encoder_dims != Some((width, height));
-        if geometry_changed {
-            if sent_dims != Some((width, height)) {
-                let config = SessionMessage::ScreenConfig {
-                    display,
-                    codec,
-                    width,
-                    height,
-                };
-                if !send_video(&out, &cancel, config).await {
-                    break;
-                }
-                sent_dims = Some((width, height));
+        // `ScreenConfig` 是「(尺寸, codec)」的通告：二者任一变化都要重发。几何变化仍单独触发
+        // 编码器重建（下面）；codec 变化由运行时回退产生（`CodecSelect` 已先走画面车道）。
+        if sent_dims != Some((width, height)) || sent_codec != Some(codec) {
+            let config = SessionMessage::ScreenConfig {
+                display,
+                codec,
+                width,
+                height,
+            };
+            if !send_video(&out, &cancel, config).await {
+                break;
             }
+            sent_dims = Some((width, height));
+            sent_codec = Some(codec);
+        }
+        if geometry_changed {
             encoder = None;
             prev_rgba = None;
             encoder_dims = Some((width, height));
@@ -4862,6 +5034,35 @@ async fn encode_loop(
                     encoder = Some(enc);
                 }
                 Err(err) => {
+                    // **只有编码器创建失败**才触发运行时回退（`H265 → H264 → Vp9`，每级一次）。
+                    // 普通编码/在线重配置错误仍走下面的「丢弃编码器、下一帧重建」，否则一次
+                    // 瞬时 GPU 故障就会把整场会话永久降级。
+                    if let Some((next_codec, factory)) = fallback.next(codec) {
+                        warn!(
+                            error = %err,
+                            from = ?codec,
+                            to = ?next_codec,
+                            "编码器创建失败，运行时回退 codec"
+                        );
+                        codec = next_codec;
+                        encoder_factory = factory;
+                        if codec == CodecId::Vp9 {
+                            // 纯软件路径：4K 原生分辨率不可用，宽度上限就地回落到 1920，
+                            // 这样紧接着的 CPU 帧不会先按旧上限编出一张 4K VP9。
+                            max_encode_width = MAX_ENCODE_WIDTH;
+                        }
+                        // 先让主循环看到新 codec（下一拍切换采集/补丁/宽度），再把
+                        // `CodecSelect` 走**画面车道**（`send_video`）：它因此排在旧 codec 的
+                        // 最后一帧之后、新 codec 的 `ScreenConfig` 之前（见 `CodecSelect` 文档）。
+                        fallback
+                            .codec_state
+                            .store(codec_to_u8(codec), Ordering::Relaxed);
+                        if !send_video(&out, &cancel, SessionMessage::CodecSelect { codec }).await {
+                            break;
+                        }
+                        pending_keyframe = true;
+                        continue;
+                    }
                     warn!(error = %err, "编码器创建失败，跳过本帧");
                     pending_keyframe |= idr;
                     pending_encode |= force_encode && !idr;
@@ -5215,8 +5416,8 @@ mod tests {
         InputSink, KeyEvent, MouseButton, RawFrame, ScreenPatch, ScreenSource,
     };
     use crate::session::{
-        plan_controller_handshake, ControllerHandshake, SessionCodec, SessionFrame, SessionMessage,
-        LIVENESS_TIMEOUT,
+        plan_controller_handshake, ControllerHandshake, Lane, SessionCodec, SessionFrame,
+        SessionMessage, LIVENESS_TIMEOUT,
     };
     use crate::transfer::{TransferEvent, TransferHub};
     use crate::transport::BoxDuplex;
@@ -5495,7 +5696,127 @@ mod tests {
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: SessionStatsReporter::noop(),
             h264_encoder_factory: None,
+            h265_encoder_factory: None,
+            prefer_h265: true,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 无回退的编码任务参数（大多数用例只关心正常路径）。
+    fn no_fallback(codec: CodecId) -> EncodeFallback {
+        EncodeFallback {
+            h264: None,
+            vp9: vp9_encoder_factory(),
+            vp9_attempted: false,
+            codec_state: Arc::new(AtomicU8::new(codec_to_u8(codec))),
+        }
+    }
+
+    /// 可切换成功/失败的假编码器工厂：运行时回退测试用。
+    #[derive(Debug)]
+    struct FakeCodecFactory {
+        codec: CodecId,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl FakeCodecFactory {
+        /// 总是创建成功的工厂。
+        fn ok(codec: CodecId) -> Arc<Self> {
+            Arc::new(Self {
+                codec,
+                fail: Arc::new(AtomicBool::new(false)),
+            })
+        }
+
+        /// 总是创建失败的工厂。
+        fn failing(codec: CodecId) -> Arc<Self> {
+            Arc::new(Self {
+                codec,
+                fail: Arc::new(AtomicBool::new(true)),
+            })
+        }
+
+        /// 初始成功的工厂 + 一个可切换失败位的句柄（模拟「先成功、后几何重建失败」）。
+        fn switchable(codec: CodecId) -> (Arc<Self>, Arc<AtomicBool>) {
+            let fail = Arc::new(AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    codec,
+                    fail: Arc::clone(&fail),
+                }),
+                fail,
+            )
+        }
+    }
+
+    impl VideoEncoderFactory for FakeCodecFactory {
+        fn codec(&self) -> CodecId {
+            self.codec
+        }
+
+        fn create(
+            &self,
+            width: u32,
+            height: u32,
+            target_bitrate_kbps: u32,
+            max_fps: u8,
+        ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(RemoteError::Platform("假编码器创建失败".to_owned()));
+            }
+            Ok(Box::new(FakeH264Encoder {
+                width,
+                height,
+                bitrate: target_bitrate_kbps,
+                fps: u32::from(max_fps),
+                log: None,
+            }))
+        }
+    }
+
+    /// 用指定 codec / 工厂 / 回退链起一个编码任务（其余接线与生产一致）。
+    fn spawn_encode(
+        codec: CodecId,
+        factory: Arc<dyn VideoEncoderFactory>,
+        fallback: EncodeFallback,
+        out_tx: mpsc::Sender<SessionFrame>,
+        job_rx: mpsc::Receiver<EncodeJob>,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel,
+            SessionStatsReporter::noop(),
+            codec,
+            factory,
+            UNCHANGED_RESEND_INTERVAL,
+            Arc::new(ScreenSendMeter::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
+            fallback,
+        ))
+    }
+
+    /// 造一个编码任务（默认档位、可选强制关键帧）。
+    fn encode_job(frame: RawFrame, force_keyframe: bool) -> EncodeJob {
+        let rates = EncodeRates::ceiling(EncodeOptions::default());
+        EncodeJob {
+            display: 0,
+            rates,
+            keyframe_bitrate_kbps: rates.bitrate_kbps,
+            force_keyframe,
+            force_encode: false,
+            capture_us: 0,
+            capture_wait_us: None,
+            capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
+            frame,
         }
     }
 
@@ -5510,17 +5831,112 @@ mod tests {
         pending
     }
 
-    /// 协商规则：只有「本端有 H.264 编码器」且「控制器声明支持 H.264」才选 H.264。
+    /// 协商矩阵：H.265 优先（受 `prefer_h265` 与本端能力约束），其次 H.264，最后 VP9。
+    ///
+    /// `offer` 是 `(h264, vp9, h265)`；VP9 能力不参与判断（它始终是兜底）。
+    #[test]
+    fn choose_codec_prefers_h265_then_h264_then_vp9() {
+        // 全支持 + 偏好 H.265 + 本端有 H.265 编码器 → H.265。
+        assert_eq!(
+            choose_codec(Some((true, true, true)), true, true, true),
+            CodecId::H265
+        );
+        // 本端没有 H.265 编码器 → 退回 H.264（H.264 编码器与对端声明都在）。
+        assert_eq!(
+            choose_codec(Some((true, true, true)), true, false, true),
+            CodecId::H264
+        );
+        // 对端没声明 H.265 → H.264。
+        assert_eq!(
+            choose_codec(Some((true, true, false)), true, true, true),
+            CodecId::H264
+        );
+        // 偏好关闭（即便双方都有 H.265）→ H.264。
+        assert_eq!(
+            choose_codec(Some((true, true, true)), true, true, false),
+            CodecId::H264
+        );
+        // 只有 H.265 能力、偏好关闭、本端无 H.264 编码器 → VP9。
+        assert_eq!(
+            choose_codec(Some((false, true, true)), false, true, false),
+            CodecId::Vp9
+        );
+        // 只有 H.265 编码器、对端只声明 H.265，但偏好关闭 → VP9（不降级选 H.264）。
+        assert_eq!(
+            choose_codec(Some((true, true, true)), false, true, false),
+            CodecId::Vp9
+        );
+        // 本端没有 H.264 编码器：即便对端支持也不能选 H.264。
+        assert_eq!(
+            choose_codec(Some((true, true, false)), false, false, true),
+            CodecId::Vp9
+        );
+        // 对端不支持 H.264：本端有编码器也不选。
+        assert_eq!(
+            choose_codec(Some((false, true, false)), true, false, true),
+            CodecId::Vp9
+        );
+        // 超时/关闭（None）一律回退 VP9。
+        assert_eq!(choose_codec(None, true, true, true), CodecId::Vp9);
+        assert_eq!(choose_codec(None, false, false, false), CodecId::Vp9);
+    }
+
+    /// 旧用例（保留其语义）：H.264 需要「本端有编码器」且「控制器声明支持」。
     #[test]
     fn choose_codec_requires_both_sides_to_support_h264() {
-        assert_eq!(choose_codec(Some((true, true)), true), CodecId::H264);
-        // 本端没有编码器：即便对端支持也不能选。
-        assert_eq!(choose_codec(Some((true, true)), false), CodecId::Vp9);
-        // 对端不支持：本端有编码器也不选。
-        assert_eq!(choose_codec(Some((false, true)), true), CodecId::Vp9);
-        // 超时回退 VP9。
-        assert_eq!(choose_codec(None, true), CodecId::Vp9);
-        assert_eq!(choose_codec(None, false), CodecId::Vp9);
+        // 对端不支持 H.265（三元组末位 false）+ 本端只有 H.264 → H.264。
+        assert_eq!(
+            choose_codec(Some((true, true, false)), true, false, true),
+            CodecId::H264
+        );
+    }
+
+    /// `codec_to_u8` / `codec_from_u8` 必须互逆；未知值按兜底 codec（VP9）处理。
+    #[test]
+    fn codec_u8_roundtrip() {
+        for codec in [CodecId::Vp9, CodecId::H264, CodecId::H265] {
+            assert_eq!(codec_from_u8(codec_to_u8(codec)), codec);
+        }
+        assert_eq!(codec_from_u8(200), CodecId::Vp9, "未知值应兜底到 VP9");
+    }
+
+    /// 回退链 `H265 → H264 → Vp9`：每级只消费一次，Vp9 之后不再回退。
+    #[test]
+    fn encode_fallback_chain_is_h265_h264_vp9_each_once() {
+        let h264: Arc<dyn VideoEncoderFactory> = FakeCodecFactory::ok(CodecId::H264);
+        let vp9: Arc<dyn VideoEncoderFactory> = FakeCodecFactory::ok(CodecId::Vp9);
+        let mut fb = EncodeFallback {
+            h264: Some(Arc::clone(&h264)),
+            vp9: Arc::clone(&vp9),
+            vp9_attempted: false,
+            codec_state: Arc::new(AtomicU8::new(codec_to_u8(CodecId::H265))),
+        };
+
+        let (codec, factory) = fb.next(CodecId::H265).expect("H265 应先落到 H264");
+        assert_eq!(codec, CodecId::H264);
+        assert!(Arc::ptr_eq(&factory, &h264), "必须交出注入的 H.264 工厂");
+
+        let (codec, factory) = fb.next(CodecId::H264).expect("H264 应再落到 VP9");
+        assert_eq!(codec, CodecId::Vp9);
+        assert!(Arc::ptr_eq(&factory, &vp9), "必须交出注入的 VP9 工厂");
+
+        assert!(fb.next(CodecId::Vp9).is_none(), "VP9 之后没有下一级");
+        assert!(fb.next(CodecId::H264).is_none(), "VP9 已经尝试过，不再回退");
+        assert!(fb.next(CodecId::H265).is_none(), "H.264 与 VP9 都已消费完");
+    }
+
+    /// 没有可用的 H.264 时，H265 直接落 VP9；VP9 自身没有下一级。
+    #[test]
+    fn encode_fallback_h265_goes_straight_to_vp9_without_h264() {
+        let vp9: Arc<dyn VideoEncoderFactory> = FakeCodecFactory::ok(CodecId::Vp9);
+        let mut fb = EncodeFallback {
+            h264: None,
+            vp9,
+            vp9_attempted: false,
+            codec_state: Arc::new(AtomicU8::new(codec_to_u8(CodecId::H265))),
+        };
+        assert_eq!(fb.next(CodecId::H265).map(|(c, _)| c), Some(CodecId::Vp9));
+        assert!(fb.next(CodecId::Vp9).is_none(), "VP9 之后没有下一级");
     }
 
     /// 显示器签名：与枚举顺序无关、空列表为空签名、尺寸/编号变化看得出来。
@@ -5586,6 +6002,7 @@ mod tests {
             .send(SessionFrame::control(SessionMessage::CodecOffer {
                 h264: true,
                 vp9: true,
+                h265: false,
             }))
             .await
             .expect("发 offer");
@@ -5594,8 +6011,8 @@ mod tests {
             .await
             .expect("读 offer 应成功");
         match outcome {
-            CodecOfferOutcome::Offer { h264, vp9 } => {
-                assert!(h264 && vp9, "应原样带回控制器的能力声明");
+            CodecOfferOutcome::Offer { h264, vp9, h265 } => {
+                assert!(h264 && vp9 && !h265, "应原样带回控制器的能力声明");
             }
             _ => panic!("应收到 CodecOffer"),
         }
@@ -5868,12 +6285,13 @@ mod tests {
             .encoder_mut()
             .set_cipher(Cipher::new(keys.send).expect("密钥长度合法"));
         // 真实控制器在握手后立刻发 `CodecOffer`；协商窗口有超时，但测试不该为此等满 5s。
-        // 默认声明「只支持 VP9」，需要测 H.264 的用例自行发能力更全的 offer。
+        // 默认声明「只支持 VP9 / H.264」，需要测 H.265 的用例另行构造 offer。
         if let Some((h264, vp9)) = offer {
             writer
                 .send(SessionFrame::control(SessionMessage::CodecOffer {
                     h264,
                     vp9,
+                    h265: false,
                 }))
                 .await
                 .expect("发送 CodecOffer 应成功");
@@ -6052,6 +6470,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::Vp9),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -6140,6 +6559,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::Vp9),
         ));
 
         let hi = EncodeRates::ceiling(EncodeOptions::default());
@@ -6302,6 +6722,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::H264),
         ));
         // 内容上限把 P 帧压到 1.2 Mbps；关键帧仍应按 6 Mbps 编码。
         let capped = EncodeRates {
@@ -6375,6 +6796,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::H264),
         ));
 
         job_tx
@@ -6419,6 +6841,423 @@ mod tests {
             .expect("编码任务应结束");
     }
 
+    /// 运行时回退（**仅编码器创建失败**）：H.265 创建失败必须按 `CodecSelect{H264}`（画面车道）
+    /// → `ScreenConfig{H264}` → 关键帧包的顺序落到 H.264，且同尺寸下 `ScreenConfig` 也要重发。
+    #[tokio::test]
+    async fn h265_create_failure_falls_back_to_h264_with_screen_lane_order() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(16);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let codec_state = Arc::new(AtomicU8::new(codec_to_u8(CodecId::H265)));
+        let h264: Arc<dyn VideoEncoderFactory> = FakeCodecFactory::ok(CodecId::H264);
+        let fallback = EncodeFallback {
+            h264: Some(Arc::clone(&h264)),
+            vp9: FakeCodecFactory::ok(CodecId::Vp9),
+            vp9_attempted: false,
+            codec_state: Arc::clone(&codec_state),
+        };
+        let task = spawn_encode(
+            CodecId::H265,
+            FakeCodecFactory::failing(CodecId::H265),
+            fallback,
+            out_tx,
+            job_rx,
+            cancel.clone(),
+        );
+
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 10), true))
+            .await
+            .expect("投递首帧");
+
+        // 创建失败发生在 `ScreenConfig{H265}` 之后（它先于编码器创建发出）。
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                lane: Lane::Screen,
+                message: SessionMessage::ScreenConfig { codec, .. },
+            }) => assert_eq!(codec, CodecId::H265),
+            other => panic!("首个出站应为 ScreenConfig{{H265}}，实得 {other:?}"),
+        }
+        // 回退通告必须走**画面车道**，排在旧 codec 的 ScreenConfig 之后、新 codec 的之前。
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                lane: Lane::Screen,
+                message: SessionMessage::CodecSelect { codec },
+            }) => assert_eq!(codec, CodecId::H264),
+            other => panic!("第二个出站应为 Screen 车道的 CodecSelect{{H264}}，实得 {other:?}"),
+        }
+        assert_eq!(
+            codec_from_u8(codec_state.load(Ordering::Relaxed)),
+            CodecId::H264,
+            "回退后主循环必须能观察到新 codec"
+        );
+
+        // 第二帧：尺寸不变、只是 codec 变了 —— `ScreenConfig` 仍必须重发，且首帧是关键帧。
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 20), false))
+            .await
+            .expect("投递第二帧");
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                message:
+                    SessionMessage::ScreenConfig {
+                        codec,
+                        width,
+                        height,
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(
+                    codec,
+                    CodecId::H264,
+                    "同尺寸换 codec 也必须重发 ScreenConfig"
+                );
+                assert_eq!((width, height), (64, 48));
+            }
+            other => panic!("codec 变化必须重发 ScreenConfig，实得 {other:?}"),
+        }
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                message: SessionMessage::VideoPacket { codec, flags, .. },
+                ..
+            }) => {
+                assert_eq!(codec, CodecId::H264);
+                assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "回退后的首帧必须是关键帧");
+            }
+            other => panic!("回退后应产出 H.264 关键帧，实得 {other:?}"),
+        }
+
+        drop(job_tx);
+        tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束")
+            .expect("编码任务不应 panic");
+    }
+
+    /// 先成功、后在**几何重建**时创建失败：回退 `CodecSelect` 必须排在旧 codec 的最后一帧之后。
+    #[tokio::test]
+    async fn geometry_rebuild_failure_emits_fallback_after_last_old_codec_packet() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(16);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let codec_state = Arc::new(AtomicU8::new(codec_to_u8(CodecId::H265)));
+        let (h265, h265_fail) = FakeCodecFactory::switchable(CodecId::H265);
+        let h264: Arc<dyn VideoEncoderFactory> = FakeCodecFactory::ok(CodecId::H264);
+        let fallback = EncodeFallback {
+            h264: Some(h264),
+            vp9: FakeCodecFactory::ok(CodecId::Vp9),
+            vp9_attempted: false,
+            codec_state: Arc::clone(&codec_state),
+        };
+        let task = spawn_encode(
+            CodecId::H265,
+            h265 as Arc<dyn VideoEncoderFactory>,
+            fallback,
+            out_tx,
+            job_rx,
+            cancel.clone(),
+        );
+
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 10), true))
+            .await
+            .expect("投递首帧");
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig { codec, .. },
+                ..
+            }) => assert_eq!(codec, CodecId::H265),
+            other => panic!("首个出站应为 ScreenConfig{{H265}}，实得 {other:?}"),
+        }
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                message: SessionMessage::VideoPacket { codec, .. },
+                ..
+            }) => assert_eq!(codec, CodecId::H265),
+            other => panic!("第二个出站应为 H.265 视频包，实得 {other:?}"),
+        }
+
+        // 让下一次创建失败，并用不同尺寸触发几何重建。
+        h265_fail.store(true, Ordering::Relaxed);
+        job_tx
+            .send(encode_job(shaded(0, 128, 96, 30), false))
+            .await
+            .expect("投递几何变化帧");
+        // 几何重建会先发新尺寸的 `ScreenConfig`（仍是旧 codec），随后创建失败才回退。
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                message:
+                    SessionMessage::ScreenConfig {
+                        codec,
+                        width,
+                        height,
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(codec, CodecId::H265, "几何重建先按旧 codec 通告新尺寸");
+                assert_eq!((width, height), (128, 96));
+            }
+            other => panic!("几何变化应先重发 ScreenConfig，实得 {other:?}"),
+        }
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                lane: Lane::Screen,
+                message: SessionMessage::CodecSelect { codec },
+            }) => assert_eq!(codec, CodecId::H264),
+            other => panic!("几何重建失败后应回退 CodecSelect{{H264}}，实得 {other:?}"),
+        }
+
+        drop(job_tx);
+        tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束")
+            .expect("编码任务不应 panic");
+    }
+
+    /// 两个硬件工厂都创建失败 → 只发一次 `CodecSelect{Vp9}`，之后跳过来不及切换的 GPU 帧，
+    /// 并用 VP9 编出 CPU 帧。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "一条完整回退链的出站顺序断言，拆开反而要把同一组工厂/任务反复传参"
+    )]
+    #[tokio::test]
+    async fn both_hardware_factories_failing_fall_back_to_vp9_and_skip_gpu_frames() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(16);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let codec_state = Arc::new(AtomicU8::new(codec_to_u8(CodecId::H265)));
+        let vp9: Arc<dyn VideoEncoderFactory> = FakeCodecFactory::ok(CodecId::Vp9);
+        let fallback = EncodeFallback {
+            h264: Some(FakeCodecFactory::failing(CodecId::H264)),
+            vp9: Arc::clone(&vp9),
+            vp9_attempted: false,
+            codec_state: Arc::clone(&codec_state),
+        };
+        let task = spawn_encode(
+            CodecId::H265,
+            FakeCodecFactory::failing(CodecId::H265),
+            fallback,
+            out_tx,
+            job_rx,
+            cancel.clone(),
+        );
+
+        // 第 1 帧：H.265 失败 → H.264。
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 10), true))
+            .await
+            .expect("投递首帧");
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig {
+                    codec: CodecId::H265,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::CodecSelect {
+                    codec: CodecId::H264
+                },
+                ..
+            })
+        ));
+
+        // 第 2 帧：H.264 也失败 → VP9。
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 20), false))
+            .await
+            .expect("投递第二帧");
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig {
+                    codec: CodecId::H264,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::CodecSelect {
+                    codec: CodecId::Vp9
+                },
+                ..
+            })
+        ));
+        assert_eq!(
+            codec_from_u8(codec_state.load(Ordering::Relaxed)),
+            CodecId::Vp9
+        );
+
+        // 主循环还没来得及把采集切回 CPU：GPU 帧必须被跳过（VP9 吃不了纹理）。
+        job_tx
+            .send(encode_job(
+                RawFrame {
+                    display: 0,
+                    width: 64,
+                    height: 48,
+                    rgba: Vec::new(),
+                    gpu: Some(Arc::new(DummyGpuFrame)),
+                    changed: true,
+                    changed_permille: 1000,
+                },
+                false,
+            ))
+            .await
+            .expect("投递 GPU 帧");
+        wait_for(|| job_tx.capacity() == 4).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "VP9 回退后 GPU 帧必须被跳过，不能喂给软件编码器"
+        );
+
+        // CPU 帧照常编码：重发 ScreenConfig{Vp9}，并立即出关键帧。
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 40), false))
+            .await
+            .expect("投递 CPU 帧");
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig {
+                    codec: CodecId::Vp9,
+                    ..
+                },
+                ..
+            })
+        ));
+        match out_rx.recv().await {
+            Some(SessionFrame {
+                message: SessionMessage::VideoPacket { codec, flags, .. },
+                ..
+            }) => {
+                assert_eq!(codec, CodecId::Vp9);
+                assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "回退后的首帧必须是关键帧");
+            }
+            other => panic!("应产出 VP9 关键帧，实得 {other:?}"),
+        }
+
+        drop(job_tx);
+        tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束")
+            .expect("编码任务不应 panic");
+    }
+
+    /// VP9 创建也失败：没有下一级，不循环、不重复发 `CodecSelect`。
+    #[tokio::test]
+    async fn vp9_creation_failure_does_not_loop_or_resend_codec_select() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(16);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let codec_state = Arc::new(AtomicU8::new(codec_to_u8(CodecId::H265)));
+        let fallback = EncodeFallback {
+            h264: Some(FakeCodecFactory::failing(CodecId::H264)),
+            vp9: FakeCodecFactory::failing(CodecId::Vp9),
+            vp9_attempted: false,
+            codec_state: Arc::clone(&codec_state),
+        };
+        let task = spawn_encode(
+            CodecId::H265,
+            FakeCodecFactory::failing(CodecId::H265),
+            fallback,
+            out_tx,
+            job_rx,
+            cancel.clone(),
+        );
+
+        // H.265 → H.264
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 10), true))
+            .await
+            .expect("投递首帧");
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig {
+                    codec: CodecId::H265,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::CodecSelect {
+                    codec: CodecId::H264
+                },
+                ..
+            })
+        ));
+
+        // H.264 → VP9（VP9 也建不出来）
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 20), false))
+            .await
+            .expect("投递第二帧");
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig {
+                    codec: CodecId::H264,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::CodecSelect {
+                    codec: CodecId::Vp9
+                },
+                ..
+            })
+        ));
+
+        // 投第三帧：codec 已经切到 VP9，会重发 `ScreenConfig{Vp9}`，随后 VP9 创建也失败。
+        // 没有下一级了，只会「跳过本帧」，绝不循环并重发 `CodecSelect`。
+        job_tx
+            .send(encode_job(shaded(0, 64, 48, 30), true))
+            .await
+            .expect("投递第三帧");
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(SessionFrame {
+                message: SessionMessage::ScreenConfig {
+                    codec: CodecId::Vp9,
+                    ..
+                },
+                ..
+            })
+        ));
+        wait_for(|| job_tx.capacity() == 4).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "VP9 创建失败后不得再产出任何帧（更不能重复 CodecSelect）"
+        );
+        assert_eq!(
+            codec_from_u8(codec_state.load(Ordering::Relaxed)),
+            CodecId::Vp9
+        );
+
+        drop(job_tx);
+        tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束")
+            .expect("编码任务不应 panic");
+    }
+
     /// 被背压跳过的那一帧若曾要求关键帧，请求**不能蒸发**：下一帧必须补上 IDR。
     ///
     /// 少了这条，控制器进入 `awaiting_keyframe` 后只请求一次 IDR，若那一帧恰好因出站队列满被跳过，
@@ -6450,6 +7289,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::Vp9),
         ));
         let opts = EncodeRates::ceiling(EncodeOptions::default());
         let job = |frame: RawFrame, force: bool| EncodeJob {
@@ -6553,6 +7393,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::H264),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -6652,6 +7493,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::H264),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force_keyframe: bool, force_encode: bool| EncodeJob {
@@ -6738,6 +7580,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
             IdrTracker::new(),
+            no_fallback(CodecId::H264),
         ));
         let rates = EncodeRates::ceiling(EncodeOptions::default());
         let gpu_job = |changed: bool, force: bool| EncodeJob {
@@ -7708,7 +8551,11 @@ mod tests {
             mode.entered_at = Some(t0);
             mode.exit(PatchExitReason::Activity, t0 + short);
             assert_eq!(mode.holdoff_backoff, want, "短命会话必须翻倍并封顶");
-            assert_eq!(mode.holdoff_until, Some(t0 + short + want), "冷却按新退避设置");
+            assert_eq!(
+                mode.holdoff_until,
+                Some(t0 + short + want),
+                "冷却按新退避设置"
+            );
         }
         // 存活落在 [2s, 4s)：既不算抖动、也还没证明「真静下来了」——退避保持不动。
         let borderline = (PATCH_SHORT_SESSION * 2)
@@ -7851,12 +8698,17 @@ mod tests {
     #[test]
     fn effective_max_encode_width_table() {
         assert_eq!(effective_max_encode_width(CodecId::H264, true), 3840);
+        assert_eq!(effective_max_encode_width(CodecId::H265, true), 3840);
         assert_eq!(
             effective_max_encode_width(CodecId::Vp9, true),
             MAX_ENCODE_WIDTH
         );
         assert_eq!(
             effective_max_encode_width(CodecId::H264, false),
+            MAX_ENCODE_WIDTH
+        );
+        assert_eq!(
+            effective_max_encode_width(CodecId::H265, false),
             MAX_ENCODE_WIDTH
         );
         assert_eq!(
@@ -7929,10 +8781,7 @@ mod tests {
         for _ in 0..PATCH_ENTER_TICKS {
             mode.observe_video(0, t0);
         }
-        assert_eq!(
-            mode.poll_base(false, t0 + Duration::from_millis(1)),
-            None
-        );
+        assert_eq!(mode.poll_base(false, t0 + Duration::from_millis(1)), None);
         assert_eq!(mode.mode, ScreenMode::Video, "基准未发出前不得切模式");
         assert_eq!(
             mode.poll_base(true, t0 + Duration::from_millis(2)),
@@ -7988,10 +8837,7 @@ mod tests {
         // 重设请求不能被重复触发（那张 IDR 已经在路上）。
         assert!(!mode.begin_rebase(t0 + Duration::from_millis(120)));
         // 基准还没写出：继续等，不改模式。
-        assert_eq!(
-            mode.poll_base(false, t0 + Duration::from_millis(200)),
-            None
-        );
+        assert_eq!(mode.poll_base(false, t0 + Duration::from_millis(200)), None);
         // 基准写出 → 留在补丁模式、不进冷却、存活起点不被重置。
         assert_eq!(
             mode.poll_base(true, t0 + Duration::from_millis(300)),
@@ -8016,7 +8862,10 @@ mod tests {
             mode.poll_base(false, t0 + Duration::from_millis(2) + PATCH_BASE_TIMEOUT),
             Some(BaseOutcome::RebaseAbandoned)
         );
-        mode.exit(PatchExitReason::RebaseTimeout, t0 + Duration::from_millis(3));
+        mode.exit(
+            PatchExitReason::RebaseTimeout,
+            t0 + Duration::from_millis(3),
+        );
         assert_eq!(mode.mode, ScreenMode::Video);
         assert!(
             mode.holdoff_until.is_none(),
@@ -8047,7 +8896,10 @@ mod tests {
         let mut mode = PatchMode::new();
         mode.mode = ScreenMode::Patches;
         mode.entered_at = Some(t0);
-        mode.exit(PatchExitReason::Reconfigure, t0 + Duration::from_millis(100));
+        mode.exit(
+            PatchExitReason::Reconfigure,
+            t0 + Duration::from_millis(100),
+        );
         assert_eq!(
             mode.holdoff_backoff, PATCH_REENTRY_HOLDOFF,
             "用户换显示器/画质不该被当成补丁抖动"
@@ -8180,7 +9032,11 @@ mod tests {
             !staging.push_batch(vec![patch_message(3, 1)], t0),
             "超上限必须拒收，调用方据此退出补丁模式"
         );
-        assert_eq!(staging.bytes(), PATCH_STAGING_MAX_BYTES, "拒收不得改动暂存区");
+        assert_eq!(
+            staging.bytes(),
+            PATCH_STAGING_MAX_BYTES,
+            "拒收不得改动暂存区"
+        );
         // 空暂存区总能接下**一整拍**（单拍上限 = 暂存区上限）：否则补丁会永远进不来。
         staging.clear();
         assert!(staging.push_batch(vec![patch_message(4, PATCH_STAGING_MAX_BYTES)], t0));
@@ -8227,11 +9083,21 @@ mod tests {
         // 有 IDR 在途（编码/画面队列/写线途中）：吸收。
         assert!(keyframe_request_is_redundant(false, 1, 0, now));
         // 刚写出（窗口内）：吸收。
-        assert!(keyframe_request_is_redundant(false, 0, now - window_us + 1, now));
+        assert!(keyframe_request_is_redundant(
+            false,
+            0,
+            now - window_us + 1,
+            now
+        ));
         // 已经有一个待发的 IDR（force_keyframe 还没被编码任务消费）：吸收。
         assert!(keyframe_request_is_redundant(true, 0, 0, now));
         // 恰好到达窗口边界：不再吸收。
-        assert!(!keyframe_request_is_redundant(false, 0, now - window_us, now));
+        assert!(!keyframe_request_is_redundant(
+            false,
+            0,
+            now - window_us,
+            now
+        ));
         // 从没写过 IDR、也没有在途：必须放行，否则会话早期的请求会被饿死。
         assert!(!keyframe_request_is_redundant(false, 0, 0, now));
 
@@ -8770,10 +9636,7 @@ mod tests {
             .try_enqueue_screen_or_return(probe())
             .expect("满不是错误")
         {
-            Some(frame) => assert!(matches!(
-                frame.message,
-                SessionMessage::ScreenConfig { .. }
-            )),
+            Some(frame) => assert!(matches!(frame.message, SessionMessage::ScreenConfig { .. })),
             None => panic!("队列已满时帧必须被还回来"),
         }
         // 写任务结束（接收端全部丢弃）≠ 队列满：必须报链路关闭，否则调用方会把它当成
@@ -8847,9 +9710,8 @@ mod tests {
     )]
     #[test]
     fn pacing_caps_never_bind_at_the_real_session_rates() {
-        let chunk_natural = Duration::from_secs_f64(
-            (PACING_CHUNK_BYTES as f64 * 8.0) / (10_000.0 * 1000.0),
-        );
+        let chunk_natural =
+            Duration::from_secs_f64((PACING_CHUNK_BYTES as f64 * 8.0) / (10_000.0 * 1000.0));
         assert!(
             chunk_natural < PACING_MAX_GAP,
             "10 Mbps 上一块 32 KiB（{chunk_natural:?}）远小于单个间隙上限"
@@ -8858,8 +9720,7 @@ mod tests {
             let (chunk, gap) = pacing_plan(bytes, 10_000).expect("真机 IDR 都应 pace");
             assert_eq!(gap, chunk_natural, "{bytes} B 的块间等待就是自然串行时间");
             let gaps = u32::try_from(bytes.div_ceil(chunk) - 1).expect("块数很少");
-            let frame_natural =
-                Duration::from_secs_f64((bytes as f64 * 8.0) / (10_000.0 * 1000.0));
+            let frame_natural = Duration::from_secs_f64((bytes as f64 * 8.0) / (10_000.0 * 1000.0));
             let total = gap * gaps;
             // 总等待 = 自然串行时间减去最后一块（最后一块写完不必等），所以差值不会超过
             // 一个块的自然时间。
@@ -8923,10 +9784,7 @@ mod tests {
         let mut budget = PacingBudget::new();
         let _ = budget.take(Duration::from_secs(1));
         for _ in 0..5 {
-            assert!(
-                budget.take(gap).is_zero(),
-                "预算耗尽后不得再 sleep"
-            );
+            assert!(budget.take(gap).is_zero(), "预算耗尽后不得再 sleep");
         }
     }
 

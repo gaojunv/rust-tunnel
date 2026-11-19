@@ -1,23 +1,23 @@
-//! Media Foundation H.264 **硬件编码器**（Intel Quick Sync / NVIDIA / AMD）。
+//! Media Foundation **硬件编码器**（Intel Quick Sync / NVIDIA / AMD），H.264 或 H.265。
 //!
 //! # 为什么需要这个后端
 //!
 //! Intel HD 630 没有 NVENC，现有路径会回退到 VP9 软件编码（实测 113 ms/帧）。
-//! Windows 上 Intel 核显通过 Quick Sync Video 注册了硬件 H.264 编码器 MFT；
-//! 本模块用 `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)` 找到它，把 RGBA 转成 NV12 后
-//! 交给 GPU 编码，输出 Annex B 码流。
+//! Windows 上 Intel 核显通过 Quick Sync Video 注册了硬件编码器 MFT（`MFVideoFormat_H264`，
+//! 或 HEVC 的 `MFVideoFormat_HEVC` / `MFVideoFormat_HEVC_ES`）；本模块用
+//! `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)` 找到它，把 RGBA/NV12 交给 GPU 编码，输出 Annex B 码流。
 //!
 //! # 输入/输出约定
 //!
 //! - 输入：`width × height` 的 **RGBA8**（与 remote 的采集侧一致），CPU 转
 //!   NV12（BT.709 limited range，与 [`crate::nvenc`] / [`crate::decode`] 同一套常数）。
 //! - 输出：[`EncodedPacket`]：`data` = **4 字节大端长度前缀 + Annex B**，与
-//!   NVENC 后端逐字节同构；`keyframe` 由码流里的 IDR NAL 判定。MFT 若输出
-//!   AVCC，会先转成 Annex B。关键帧会自动确保带 SPS/PPS。
+//!   NVENC 后端逐字节同构；`keyframe` 由码流里的关键帧 NAL 判定（H.264 IDR / H.265
+//!   IRAP）。MFT 若输出 AVCC，会先转成 Annex B。关键帧会自动确保带参数集。
 //!
 //! # 只选硬件
 //!
-//! [`MftH264Encoder::new`] **只枚举 `MFT_ENUM_FLAG_HARDWARE`**；一个都没有就
+//! [`MfVideoEncoder::new`] **只枚举 `MFT_ENUM_FLAG_HARDWARE`**；一个都没有就
 //! 返回错误，让上层回退 VP9。不会静默选择软件 MFT——那会把「硬件编码」变成
 //! 「更慢的软件编码」。
 //!
@@ -36,10 +36,12 @@ mod mfplat;
 mod video_processor;
 
 use crate::capture::CapturedTexture;
+use crate::codec::CodecKind;
 use crate::d3d11;
 use crate::nvenc::EncodedPacket;
 use crate::WinVideoError;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr;
@@ -53,23 +55,27 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
-    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
+    eAVEncH265VProfile_Main_420_8, CODECAPI_AVEncCommonBufferSize,
+    CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncVideoMaxQP,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMaxFrameRate,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoOutputFrameRate, ICodecAPI, IMFActivate,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformHaveOutput,
-    METransformNeedInput, MFMediaType_Video, MFT_FRIENDLY_NAME_Attribute,
-    MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    METransformNeedInput, MFMediaType_Video, MFNominalRange_16_235, MFT_FRIENDLY_NAME_Attribute,
+    MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoFormat_HEVC_ES, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
+    MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
     MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_NO_MORE_TYPES,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VARIANT, VT_UI4, VT_UI8};
@@ -104,13 +110,15 @@ pub struct EncoderMftInfo {
     pub hardware: bool,
 }
 
-/// 一个硬件 H.264 编码器实例。
-pub struct MftH264Encoder {
+/// 一个硬件编码器实例（H.264 或 H.265）。
+pub struct MfVideoEncoder {
     transform: IMFTransform,
     /// 编码器 MFT 绑定的 D3D11 设备与设备管理器；必须活到 MFT 销毁。
     encode_device: device::EncodeDevice,
     /// 编码器暴露的 `ICodecAPI`；运行期改码率/帧率/强制关键帧都靠它。
     codec: Option<ICodecAPI>,
+    /// 本编码器实例的编码标准。
+    kind: CodecKind,
     /// 异步 MFT 的事件源（Intel QSV 是异步的）。
     events: Option<IMFMediaEventGenerator>,
     /// 上一次事件循环里 MFT 已经请求输入、但当时没有新样本可喂。
@@ -140,9 +148,13 @@ pub struct MftH264Encoder {
     last_mft_ms: u32,
 }
 
-impl std::fmt::Debug for MftH264Encoder {
+/// 旧名字：H.264 编码器（就是 [`MfVideoEncoder`]，`new` 默认建 H.264）。
+pub type MftH264Encoder = MfVideoEncoder;
+
+impl std::fmt::Debug for MfVideoEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MftH264Encoder")
+        f.debug_struct("MfVideoEncoder")
+            .field("codec", &self.kind)
             .field("name", &self.name)
             .field("adapter", &self.encode_device.device.adapter.name)
             .field("size", &(self.width, self.height))
@@ -152,27 +164,33 @@ impl std::fmt::Debug for MftH264Encoder {
     }
 }
 
-// SAFETY: `MftH264Encoder` 独占持有进程内编码器 MFT 与它的 `ICodecAPI`；结构体
+// SAFETY: `MfVideoEncoder` 独占持有进程内编码器 MFT 与它的 `ICodecAPI`；结构体
 // 不实现 `Sync`，`encode_rgba`/`set_*` 都取 `&mut self`，所以同一时刻只有一个
 // 线程访问 COM 对象。编码任务把它移进 `spawn_blocking` 后不会跨线程共享。
-unsafe impl Send for MftH264Encoder {}
+unsafe impl Send for MfVideoEncoder {}
 
 /// 编译期断言：编码器必须能移进独占的编码线程。
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<MftH264Encoder>();
+    assert_send::<MfVideoEncoder>();
 };
 
-/// 枚举 H.264 编码器 MFT。
+/// 枚举指定标准的硬件/全部编码器 MFT。
 ///
 /// `hardware_only == true` 时只用 `MFT_ENUM_FLAG_HARDWARE`（生产路径）；
 /// `false` 时用 `MFT_ENUM_FLAG_ALL` 作对照，把硬件/软件 MFT 都列出来。
 ///
+/// H.265 的输出 subtype 先试 `MFVideoFormat_HEVC`、再试 `MFVideoFormat_HEVC_ES`
+/// （不同厂商注册的 subtype 不一致），并按 CLSID 去重。
+///
 /// # Errors
 /// `mfplat.dll` 缺失 / 缺 `MFTEnumEx`、或枚举本身失败时返回 [`WinVideoError::Encode`]。
-pub fn enumerate_h264_encoders(hardware_only: bool) -> Result<Vec<EncoderMftInfo>, WinVideoError> {
+pub fn enumerate_encoders(
+    codec: CodecKind,
+    hardware_only: bool,
+) -> Result<Vec<EncoderMftInfo>, WinVideoError> {
     ensure_com_initialized()?;
-    let activates = enumerate_activates(hardware_only)?;
+    let activates = enumerate_activates(codec, hardware_only)?;
     Ok(activates
         .iter()
         .map(|activate| EncoderMftInfo {
@@ -183,17 +201,32 @@ pub fn enumerate_h264_encoders(hardware_only: bool) -> Result<Vec<EncoderMftInfo
         .collect())
 }
 
-/// 按过滤条件枚举编码器激活对象。
-fn enumerate_activates(hardware_only: bool) -> Result<Vec<IMFActivate>, WinVideoError> {
+/// 枚举 H.264 编码器 MFT（[`enumerate_encoders`] 的 H.264 包装）。
+///
+/// # Errors
+/// 同 [`enumerate_encoders`]。
+pub fn enumerate_h264_encoders(hardware_only: bool) -> Result<Vec<EncoderMftInfo>, WinVideoError> {
+    enumerate_encoders(CodecKind::H264, hardware_only)
+}
+
+/// 某个标准在编码器 MFT 上的输出 subtype 候选（按尝试顺序）。
+fn encoder_output_subtypes(codec: CodecKind) -> &'static [GUID] {
+    match codec {
+        CodecKind::H264 => &[MFVideoFormat_H264],
+        CodecKind::H265 => &[MFVideoFormat_HEVC, MFVideoFormat_HEVC_ES],
+    }
+}
+
+/// 按过滤条件枚举编码器激活对象（H.265 会合并两个输出 subtype 并按 CLSID 去重）。
+fn enumerate_activates(
+    codec: CodecKind,
+    hardware_only: bool,
+) -> Result<Vec<IMFActivate>, WinVideoError> {
     ensure_com_initialized()?;
     mfplat::ensure_started()?;
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
-    };
-    let output = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
     };
     let base = if hardware_only {
         MFT_ENUM_FLAG_HARDWARE.0
@@ -201,7 +234,24 @@ fn enumerate_activates(hardware_only: bool) -> Result<Vec<IMFActivate>, WinVideo
         MFT_ENUM_FLAG_ALL.0
     };
     let flags = u32::try_from(base | MFT_ENUM_FLAG_SORTANDFILTER.0).unwrap_or(0);
-    mfplat::enumerate_encoders(flags, &input, &output)
+
+    let subtypes = encoder_output_subtypes(codec);
+    let mut activates = Vec::new();
+    let mut seen = HashSet::new();
+    for subtype in subtypes {
+        let output = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: *subtype,
+        };
+        for activate in mfplat::enumerate_encoders(flags, &input, &output)? {
+            // 同一个 MFT 可能同时注册 HEVC 与 HEVC_ES，按 CLSID 去重。
+            let id = clsid(&activate);
+            if seen.insert(id) {
+                activates.push(activate);
+            }
+        }
+    }
+    Ok(activates)
 }
 
 /// 读取激活对象的友好名称（`CoTaskMemAlloc` 分配，读完释放）。
@@ -231,8 +281,8 @@ fn clsid(activate: &IMFActivate) -> String {
     }
 }
 
-impl MftH264Encoder {
-    /// 创建并初始化一个硬件 H.264 编码器。
+impl MfVideoEncoder {
+    /// 创建并初始化一个硬件 H.264 编码器（旧接口，行为不变）。
     ///
     /// 优先选择名称含 `Intel` / `Quick Sync` 的 MFT，其次任意硬件 H.264 编码器。
     ///
@@ -245,15 +295,30 @@ impl MftH264Encoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self, WinVideoError> {
+        Self::new_codec(width, height, fps, bitrate_kbps, CodecKind::H264)
+    }
+
+    /// 创建指定标准（H.264 / H.265）的硬件编码器。
+    ///
+    /// # Errors
+    /// 参数非法、没有对应标准的硬件编码器 MFT、激活/媒体类型协商失败时返回
+    /// [`WinVideoError::Encode`]。
+    pub fn new_codec(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+        codec: CodecKind,
+    ) -> Result<Self, WinVideoError> {
         validate_config(width, height, fps, bitrate_kbps)?;
         ensure_com_initialized()?;
         let encode_device = device::create()?;
-        Self::with_device(encode_device, width, height, fps, bitrate_kbps)
+        Self::with_device(encode_device, codec, width, height, fps, bitrate_kbps)
     }
 
-    /// 用调用方提供的 D3D11 设备创建硬件 H.264 编码器。
+    /// 用调用方提供的 D3D11 设备创建硬件 H.264 编码器（旧接口，行为不变）。
     ///
-    /// GPU 纹理路径（[`MftH264Encoder::encode_texture`]）**必须**走这个构造函数：
+    /// GPU 纹理路径（[`MfVideoEncoder::encode_texture`]）**必须**走这个构造函数：
     /// 采集纹理与编码器 MFT 的设备管理器必须处在同一个设备上（调用方可用
     /// 采集源的 [`CaptureSource::device`](crate::capture::CaptureSource::device)）。
     /// 传入的 `device` 会被 `Arc` 共享，不会重建或替换。
@@ -268,27 +333,70 @@ impl MftH264Encoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self, WinVideoError> {
+        Self::new_with_device_codec(device, width, height, fps, bitrate_kbps, CodecKind::H264)
+    }
+
+    /// 用调用方提供的 D3D11 设备创建指定标准的硬件编码器。
+    ///
+    /// # Errors
+    /// 同 [`Self::new_with_device`]（按 `codec` 选择 MFT）。
+    pub fn new_with_device_codec(
+        device: Arc<d3d11::D3d11>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+        codec: CodecKind,
+    ) -> Result<Self, WinVideoError> {
         validate_config(width, height, fps, bitrate_kbps)?;
         ensure_com_initialized()?;
         let encode_device = device::create_with_device(device)?;
-        Self::with_device(encode_device, width, height, fps, bitrate_kbps)
+        Self::with_device(encode_device, codec, width, height, fps, bitrate_kbps)
+    }
+
+    /// 创建硬件 H.265/HEVC 编码器（独立设备）。
+    ///
+    /// # Errors
+    /// 同 [`Self::new_codec`]。
+    pub fn new_hevc(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, WinVideoError> {
+        Self::new_codec(width, height, fps, bitrate_kbps, CodecKind::H265)
+    }
+
+    /// 用调用方设备创建硬件 H.265/HEVC 编码器。
+    ///
+    /// # Errors
+    /// 同 [`Self::new_with_device_codec`]。
+    pub fn new_hevc_with_device(
+        device: Arc<d3d11::D3d11>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, WinVideoError> {
+        Self::new_with_device_codec(device, width, height, fps, bitrate_kbps, CodecKind::H265)
     }
 
     /// 公共初始化：枚举/激活 MFT、绑定设备管理器、协商媒体类型。
     fn with_device(
         encode_device: device::EncodeDevice,
+        codec: CodecKind,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self, WinVideoError> {
         ensure_com_initialized()?;
-        let activates = enumerate_activates(true)?;
+        let activates = enumerate_activates(codec, true)?;
         if activates.is_empty() {
-            return Err(WinVideoError::Encode(
-                "没有可用的硬件 H.264 编码器 MFT（需要 Intel QSV/NVIDIA/AMD 硬件编码器）"
-                    .to_owned(),
-            ));
+            return Err(WinVideoError::Encode(format!(
+                "没有可用的硬件 {} 编码器 MFT（需要 Intel QSV/NVIDIA/AMD 硬件编码器）",
+                codec.label()
+            )));
         }
         let selected = select_preferred(&activates);
 
@@ -312,10 +420,10 @@ impl MftH264Encoder {
                 None
             };
 
-        let codec = transform.cast::<ICodecAPI>().ok();
-        if let Some(codec) = &codec {
+        let codec_api = transform.cast::<ICodecAPI>().ok();
+        if let Some(codec_api) = &codec_api {
             configure_codec_defaults(
-                codec,
+                codec_api,
                 bitrate_kbps.saturating_mul(1000),
                 fps,
                 width,
@@ -323,7 +431,14 @@ impl MftH264Encoder {
             );
         }
 
-        configure_media_types(&transform, width, height, fps, bitrate_kbps)?;
+        configure_media_types(
+            &transform,
+            codec,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+        )?;
 
         // SAFETY: 媒体类型已设置；启动消息只影响 MFT 内部状态。
         unsafe {
@@ -339,18 +454,20 @@ impl MftH264Encoder {
         let (provides_samples, output_buffer_size) = output_stream_info(&transform, width, height)?;
 
         tracing::info!(
+            codec = codec.label(),
             mft = %name,
             clsid = %clsid,
             size = %format!("{width}x{height}"),
             fps,
             bitrate_kbps,
-            "Media Foundation 硬件 H.264 编码器已就绪"
+            "Media Foundation 硬件编码器已就绪"
         );
 
         Ok(Self {
             transform,
             encode_device,
-            codec,
+            codec: codec_api,
+            kind: codec,
             events,
             needs_input: false,
             name,
@@ -369,6 +486,12 @@ impl MftH264Encoder {
             last_convert_ms: 0,
             last_mft_ms: 0,
         })
+    }
+
+    /// 本编码器实例的编码标准。
+    #[must_use]
+    pub fn codec(&self) -> CodecKind {
+        self.kind
     }
 
     /// 编码尺寸 `(width, height)`。
@@ -410,7 +533,7 @@ impl MftH264Encoder {
     /// 最近一帧 RGBA→NV12 转换的耗时，单位毫秒。
     ///
     /// CPU 路径是 `convert::rgba_to_nv12` 的耗时；GPU 路径
-    /// （[`MftH264Encoder::encode_texture`]）是 `VideoProcessorBlt`（含首次
+    /// （[`MfVideoEncoder::encode_texture`]）是 `VideoProcessorBlt`（含首次
     /// 建转换器的开销）的耗时。只用于诊断，取整到毫秒。
     #[must_use]
     pub fn last_convert_ms(&self) -> u32 {
@@ -459,7 +582,7 @@ impl MftH264Encoder {
     /// 内部用 D3D11 VideoProcessor 把它转换/缩放成 NV12（BT.709 limited），再用
     /// `MFCreateDXGISurfaceBuffer` 包成样本喂给 MFT；全程不经过 CPU 内存。
     ///
-    /// 与 [`MftH264Encoder::encode_rgba`] 共享关键帧请求、异步事件循环、Annex B
+    /// 与 [`MfVideoEncoder::encode_rgba`] 共享关键帧请求、异步事件循环、Annex B
     /// 归一化与空包语义。
     ///
     /// # Errors
@@ -557,12 +680,12 @@ impl MftH264Encoder {
                 keyframe: false,
             });
         }
-        if bitstream::has_parameter_sets(&annex_b) {
-            self.sequence_header = bitstream::parameter_sets(&annex_b);
+        if bitstream::has_parameter_sets(&annex_b, self.kind) {
+            self.sequence_header = bitstream::parameter_sets(&annex_b, self.kind);
         }
-        let keyframe = bitstream::has_idr(&annex_b);
+        let keyframe = bitstream::has_keyframe(&annex_b, self.kind);
         let payload = if keyframe
-            && !bitstream::has_parameter_sets(&annex_b)
+            && !bitstream::has_parameter_sets(&annex_b, self.kind)
             && !self.sequence_header.is_empty()
         {
             let mut with_headers =
@@ -574,9 +697,10 @@ impl MftH264Encoder {
             annex_b
         };
         if force_keyframe && !keyframe {
-            return Err(WinVideoError::Encode(
-                "请求了关键帧，但编码器输出里没有 IDR NAL".to_owned(),
-            ));
+            return Err(WinVideoError::Encode(format!(
+                "请求了关键帧，但编码器输出里没有 {} 关键帧 NAL",
+                self.kind.label()
+            )));
         }
 
         let size = u32::try_from(payload.len())
@@ -915,9 +1039,9 @@ impl MftH264Encoder {
         Ok(sample)
     }
 
-    /// 处理 `MF_E_TRANSFORM_STREAM_CHANGE`：重新选一个 H.264 输出类型并刷新流信息。
+    /// 处理 `MF_E_TRANSFORM_STREAM_CHANGE`：重新选一个当前标准的输出类型并刷新流信息。
     fn renegotiate_output(&mut self) -> Result<(), WinVideoError> {
-        let media_type = select_h264_output_type(&self.transform)?;
+        let media_type = select_output_type(&self.transform, self.kind)?;
         // SAFETY: `media_type` 来自本 MFT 的可用类型列表。
         unsafe { self.transform.SetOutputType(0, &media_type, 0) }
             .map_err(|err| encode_err("SetOutputType（流变更重协商）", &err))?;
@@ -932,7 +1056,7 @@ impl MftH264Encoder {
     }
 }
 
-impl Drop for MftH264Encoder {
+impl Drop for MfVideoEncoder {
     fn drop(&mut self) {
         // SAFETY: 只发送停止消息，失败无副作用。
         unsafe {
@@ -1150,45 +1274,62 @@ fn configure_codec_defaults(
     }
 }
 
-/// 设置输入 NV12 / 输出 H.264 媒体类型。
+/// 设置输入 NV12 / 输出（H.264 或 H.265）媒体类型。
 ///
 /// 编码器通常要求先设输出再设输入；少数 MFT 相反，失败时交换顺序重试一次。
+/// H.265 的输出 subtype 依次尝试 `MFVideoFormat_HEVC` / `MFVideoFormat_HEVC_ES`。
 fn configure_media_types(
     transform: &IMFTransform,
+    codec: CodecKind,
     width: u32,
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
 ) -> Result<(), WinVideoError> {
-    let output = build_output_type(width, height, fps, bitrate_kbps.saturating_mul(1000))?;
     let input = build_input_type(width, height, fps)?;
-    // SAFETY: 两个媒体类型与 transform 都有效。
-    let output_first = unsafe {
-        transform
-            .SetOutputType(0, &output, 0)
-            .and_then(|()| transform.SetInputType(0, &input, 0))
-    };
-    if output_first.is_ok() {
-        return Ok(());
+    let target_bps = bitrate_kbps.saturating_mul(1000);
+    let mut errors = Vec::new();
+    for subtype in encoder_output_subtypes(codec) {
+        let output = build_output_type(codec, width, height, fps, target_bps, subtype)?;
+        // SAFETY: 两个媒体类型与 transform 都有效。
+        let output_first = unsafe {
+            transform
+                .SetOutputType(0, &output, 0)
+                .and_then(|()| transform.SetInputType(0, &input, 0))
+        };
+        match output_first {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(format!("输出优先: {err}")),
+        }
+        // SAFETY: 同上；改用输入优先的顺序重试。
+        let input_first = unsafe {
+            transform
+                .SetInputType(0, &input, 0)
+                .and_then(|()| transform.SetOutputType(0, &output, 0))
+        };
+        match input_first {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(format!("输入优先: {err}")),
+        }
     }
-    // SAFETY: 同上；改用输入优先的顺序重试。
-    unsafe {
-        transform
-            .SetInputType(0, &input, 0)
-            .map_err(|err| encode_err("SetInputType(NV12)", &err))?;
-        transform
-            .SetOutputType(0, &output, 0)
-            .map_err(|err| encode_err("SetOutputType(H.264)", &err))?;
-    }
-    Ok(())
+    Err(WinVideoError::Encode(format!(
+        "SetInput/OutputType({}, NV12) 失败（{}）",
+        codec.label(),
+        errors.join("；")
+    )))
 }
 
-/// 构造 H.264 输出媒体类型。
+/// 构造输出媒体类型（`subtype` 由调用方按 codec 选定）。
+///
+/// H.265 额外声明 Main profile 与 BT.709 limited range 的颜色属性；这些属性是
+/// **尽力而为**的——部分 MFT 只接受子集，设不进去时按驱动默认值继续。
 fn build_output_type(
+    codec: CodecKind,
     width: u32,
     height: u32,
     fps: u32,
     bitrate_bps: u32,
+    subtype: &GUID,
 ) -> Result<IMFMediaType, WinVideoError> {
     let media_type = mfplat::create_media_type()?;
     let progressive = u32::try_from(MFVideoInterlace_Progressive.0).unwrap_or_default();
@@ -1198,7 +1339,7 @@ fn build_output_type(
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .map_err(|err| encode_err("输出类型 MF_MT_MAJOR_TYPE", &err))?;
         media_type
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
+            .SetGUID(&MF_MT_SUBTYPE, subtype)
             .map_err(|err| encode_err("输出类型 MF_MT_SUBTYPE", &err))?;
         media_type
             .SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)
@@ -1215,6 +1356,31 @@ fn build_output_type(
         media_type
             .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))
             .map_err(|err| encode_err("输出类型 MF_MT_PIXEL_ASPECT_RATIO", &err))?;
+    }
+    if codec.is_hevc() {
+        // H.265 Main profile（4:2:0 8-bit）。失败不致命：多数 MFT 从 subtype 自行推断。
+        if let Ok(profile) = u32::try_from(eAVEncH265VProfile_Main_420_8.0) {
+            // SAFETY: `media_type` 有效。
+            if let Err(err) = unsafe { media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile) } {
+                tracing::debug!(%err, "编码器拒绝 MF_MT_MPEG2_PROFILE，按默认 profile 继续");
+            }
+        }
+        // BT.709 limited range 标签（与 H.264 路径的 VUI 同口径）。
+        let color = [
+            (&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0),
+            (&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0),
+            (&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0),
+            (&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0),
+        ];
+        for (key, value) in color {
+            let Ok(value) = u32::try_from(value) else {
+                continue;
+            };
+            // SAFETY: `media_type` 有效。
+            if let Err(err) = unsafe { media_type.SetUINT32(key, value) } {
+                tracing::debug!(%err, "编码器拒绝颜色属性，按默认颜色空间继续");
+            }
+        }
     }
     Ok(media_type)
 }
@@ -1301,8 +1467,15 @@ fn output_stream_info(
     Ok((provides_samples, info.cbSize.max(raw_frame).max(1)))
 }
 
-/// 从可用输出类型里挑 H.264。
-fn select_h264_output_type(transform: &IMFTransform) -> Result<IMFMediaType, WinVideoError> {
+/// 从可用输出类型里挑当前标准的 subtype。
+///
+/// H.265 接受 `MFVideoFormat_HEVC` 与 `MFVideoFormat_HEVC_ES` 两种（不同厂商的
+/// 注册方式不同）。
+fn select_output_type(
+    transform: &IMFTransform,
+    codec: CodecKind,
+) -> Result<IMFMediaType, WinVideoError> {
+    let wanted = encoder_output_subtypes(codec);
     for index in 0..MAX_OUTPUT_TYPES {
         // SAFETY: `transform` 有效；索引递增直到 `MF_E_NO_MORE_TYPES`。
         let candidate = match unsafe { transform.GetOutputAvailableType(0, index) } {
@@ -1312,7 +1485,7 @@ fn select_h264_output_type(transform: &IMFTransform) -> Result<IMFMediaType, Win
         };
         // SAFETY: `candidate` 有效。
         let subtype = unsafe { candidate.GetGUID(&MF_MT_SUBTYPE) }.ok();
-        if subtype == Some(MFVideoFormat_H264) {
+        if subtype.is_some_and(|subtype| wanted.contains(&subtype)) {
             return Ok(candidate);
         }
     }

@@ -1,13 +1,13 @@
 //! `mft-gpu-probe`：GPU 纹理直通 Intel QSV 的真机探针（阶段 2a）。
 //!
-//! 验证 [`CapturedTexture`] + [`MftH264Encoder::encode_texture`] 这条链路：
+//! 验证 [`CapturedTexture`] + [`MfVideoEncoder::encode_texture`] 这条链路：
 //!
 //! 1. 枚举适配器并选 Intel（其次第一块非软件适配器），在它上面建 D3D11 设备；
 //! 2. 用同一块设备创建 1920x1080 BGRA 测试图案纹理（`RENDER_TARGET |
 //!    SHADER_RESOURCE`，与采集池纹理同构），每帧 `UpdateSubresource` 上传；
-//! 3. `MftH264Encoder::new_with_device` 绑定同一设备，循环 60 次
+//! 3. `MfVideoEncoder::new_with_device` 绑定同一设备，循环 60 次
 //!    `encode_texture`，打印每帧耗时、码流字节与关键帧标志；
-//! 4. 把首帧 IDR 用现有 `H264Decoder` 解出来，与源 RGBA 比 MAD——颜色空间
+//! 4. 把首帧 IDR 用现有 `MfVideoDecoder` 解出来，与源 RGBA 比 MAD——颜色空间
 //!    （BT.709 limited）与通道顺序错了会立刻反映为很大的 MAD。
 //!
 //! 不依赖 libvpx / remote，可在 MSVC 下直接构建运行。
@@ -15,11 +15,13 @@
 #[cfg(windows)]
 use rust_tunnel_win_video::capture::CapturedTexture;
 #[cfg(windows)]
+use rust_tunnel_win_video::codec::{CodecKind, CodecSelection};
+#[cfg(windows)]
 use rust_tunnel_win_video::d3d11::{self, AdapterInfo, VENDOR_INTEL};
 #[cfg(windows)]
-use rust_tunnel_win_video::decode::H264Decoder;
+use rust_tunnel_win_video::decode::MfVideoDecoder;
 #[cfg(windows)]
-use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
+use rust_tunnel_win_video::mft_encoder::MfVideoEncoder;
 #[cfg(windows)]
 use rust_tunnel_win_video::WinVideoError;
 #[cfg(windows)]
@@ -279,7 +281,7 @@ struct EncodeRun {
 /// 循环上传测试图案并调用 `encode_texture`。
 #[cfg(windows)]
 fn encode_frames(
-    encoder: &mut MftH264Encoder,
+    encoder: &mut MfVideoEncoder,
     device: &Arc<d3d11::D3d11>,
     texture: &ID3D11Texture2D,
 ) -> Result<EncodeRun, WinVideoError> {
@@ -340,7 +342,7 @@ fn encode_frames(
 /// 每帧的 `UpdateSubresource` 确实进入了编码器（若 GPU 纹理被复用覆盖，中段
 /// 帧的 MAD 会明显变大）。
 #[cfg(windows)]
-fn verify_loopback(run: &EncodeRun) -> Result<(), WinVideoError> {
+fn verify_loopback(run: &EncodeRun, codec: CodecKind) -> Result<(), WinVideoError> {
     let (Some(first_source), Some(mid_source)) =
         (run.first_source.as_ref(), run.mid_source.as_ref())
     else {
@@ -349,7 +351,7 @@ fn verify_loopback(run: &EncodeRun) -> Result<(), WinVideoError> {
         ));
     };
     let mid_index = run.packets.len() / 2;
-    let mut decoder = H264Decoder::new(WIDTH, HEIGHT)?;
+    let mut decoder = MfVideoDecoder::new_with_codec(WIDTH, HEIGHT, codec)?;
     println!(
         "  解码路径: {}（顺序解码 {} 个包）",
         decoder.path().as_str(),
@@ -439,13 +441,23 @@ fn downsample_rgba_2x2(rgba: &[u8], width: u32) -> Vec<u8> {
 /// 解码回环拿到的画面与源图 2×2 盒式下采样比较；缩放算法不同（VideoProcessor
 /// 通常用双线性），MAD 会比 1:1 路径略大，但颜色错误仍会明显超出阈值。
 #[cfg(windows)]
-fn run_scaling_pass(device: &Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
+fn run_scaling_pass(
+    device: &Arc<d3d11::D3d11>,
+    codec: CodecKind,
+) -> Result<(), WinVideoError> {
     println!(
-        "\n== GPU 纹理缩放：{SCALE_INPUT_WIDTH}x{SCALE_INPUT_HEIGHT} → {WIDTH}x{HEIGHT}，{SCALE_FRAMES} 帧 =="
+        "\n== {} GPU 纹理缩放：{SCALE_INPUT_WIDTH}x{SCALE_INPUT_HEIGHT} → {WIDTH}x{HEIGHT}，{SCALE_FRAMES} 帧 ==",
+        codec.label()
     );
     let texture = create_test_texture(&device.device, SCALE_INPUT_WIDTH, SCALE_INPUT_HEIGHT)?;
-    let mut encoder =
-        MftH264Encoder::new_with_device(device.clone(), WIDTH, HEIGHT, FPS, BITRATE_KBPS)?;
+    let mut encoder = MfVideoEncoder::new_with_device_codec(
+        device.clone(),
+        WIDTH,
+        HEIGHT,
+        FPS,
+        BITRATE_KBPS,
+        codec,
+    )?;
     let mut packets = Vec::new();
     let mut first_source = None;
     let mut times = Vec::new();
@@ -490,7 +502,7 @@ fn run_scaling_pass(device: &Arc<d3d11::D3d11>) -> Result<(), WinVideoError> {
     let source =
         first_source.ok_or_else(|| WinVideoError::Encode("缩放路径没有任何编码输出".to_owned()))?;
     let expected = downsample_rgba_2x2(&source, SCALE_INPUT_WIDTH);
-    let mut decoder = H264Decoder::new(WIDTH, HEIGHT)?;
+    let mut decoder = MfVideoDecoder::new_with_codec(WIDTH, HEIGHT, codec)?;
     let mut outputs = Vec::with_capacity(packets.len());
     for packet in &packets {
         if let Some(frame) = decoder.decode(packet)? {
@@ -529,35 +541,59 @@ fn run() -> Result<(), WinVideoError> {
     let texture = create_test_texture(&device.device, WIDTH, HEIGHT)?;
     println!("  测试纹理已创建：{WIDTH}x{HEIGHT} BGRA8（RENDER_TARGET | SHADER_RESOURCE）");
 
-    let mut encoder =
-        MftH264Encoder::new_with_device(device.clone(), WIDTH, HEIGHT, FPS, BITRATE_KBPS)?;
-    println!(
-        "  MFT: {} | CLSID: {}\n  编码器设备: {} | 尺寸 {:?} @ {} fps, {} kbps",
-        encoder.mft_name(),
-        encoder.mft_clsid(),
-        encoder.adapter_name(),
-        encoder.dimensions(),
-        encoder.fps(),
-        encoder.bitrate_kbps()
-    );
-    println!(
-        "\n== GPU 纹理编码：{WIDTH}x{HEIGHT} @ {FPS} fps, CBR {BITRATE_KBPS} kbps, {FRAME_COUNT} 帧 =="
-    );
+    let selection = CodecSelection::from_args();
+    println!("== 编码标准: {selection:?} ==");
+    for codec in selection.kinds() {
+        let mut encoder = match MfVideoEncoder::new_with_device_codec(
+            device.clone(),
+            WIDTH,
+            HEIGHT,
+            FPS,
+            BITRATE_KBPS,
+            *codec,
+        ) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                println!("  跳过 {}：硬件编码器不可用: {err}", codec.label());
+                continue;
+            }
+        };
+        println!(
+            "  MFT: {} | CLSID: {}\n  编码器设备: {} | 尺寸 {:?} @ {} fps, {} kbps",
+            encoder.mft_name(),
+            encoder.mft_clsid(),
+            encoder.adapter_name(),
+            encoder.dimensions(),
+            encoder.fps(),
+            encoder.bitrate_kbps()
+        );
+        println!(
+            "\n== {} GPU 纹理编码：{WIDTH}x{HEIGHT} @ {FPS} fps, CBR {BITRATE_KBPS} kbps, {FRAME_COUNT} 帧 ==",
+            codec.label()
+        );
 
-    let run = encode_frames(&mut encoder, &device, &texture)?;
-    let cpu_ms =
-        f64::from(u32::try_from(run.cpu_ticks.saturating_mul(100) / 1_000_000).unwrap_or(u32::MAX));
-    println!(
-        "\n  汇总: 输出 {}/{FRAME_COUNT} 帧, 墙钟中位 {:.2} ms / 均值 {:.2} ms, encode_texture CPU 合计 {:.1} ms（每帧 {:.2} ms）",
-        run.produced,
-        median_ms(&run.times),
-        mean_ms(&run.times),
-        cpu_ms,
-        cpu_ms / f64::from(FRAME_COUNT),
-    );
+        let run = match encode_frames(&mut encoder, &device, &texture) {
+            Ok(run) => run,
+            Err(err) => {
+                println!("  {} 编码失败: {err}", codec.label());
+                continue;
+            }
+        };
+        let cpu_ms = f64::from(
+            u32::try_from(run.cpu_ticks.saturating_mul(100) / 1_000_000).unwrap_or(u32::MAX),
+        );
+        println!(
+            "\n  汇总: 输出 {}/{FRAME_COUNT} 帧, 墙钟中位 {:.2} ms / 均值 {:.2} ms, encode_texture CPU 合计 {:.1} ms（每帧 {:.2} ms）",
+            run.produced,
+            median_ms(&run.times),
+            mean_ms(&run.times),
+            cpu_ms,
+            cpu_ms / f64::from(FRAME_COUNT),
+        );
 
-    verify_loopback(&run)?;
-    drop(encoder);
-    drop(texture);
-    run_scaling_pass(&device)
+        verify_loopback(&run, *codec)?;
+        drop(encoder);
+        run_scaling_pass(&device, *codec)?;
+    }
+    Ok(())
 }

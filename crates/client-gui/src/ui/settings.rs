@@ -357,7 +357,7 @@ fn status_tone(message: &str) -> Tone {
 
 /// 「远程」组：被控端编码选项。返回偏好是否变化（调用方负责落盘）。
 ///
-/// 原生分辨率的语义有意保守：**只对硬件 H.264 生效**（VP9 软件解码 4K 在控制器侧
+/// 原生分辨率的语义有意保守：**只对硬件 H.264/H.265 生效**（VP9 软件解码 4K 在控制器侧
 /// 37–58 ms/帧），且只影响**下一次**会话（运行中的会话不重建编码器、不插 IDR）。
 fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteManager>>) -> bool {
     let p = palette(ui.style());
@@ -370,7 +370,7 @@ fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteMan
             let mut on = prefs.remote_native_resolution;
             if widgets::switch_row(
                 ui,
-                "原生分辨率（不缩放到 1080p，仅硬件 H.264）",
+                "原生分辨率（不缩放到 1080p，仅硬件 H.264/H.265）",
                 None,
                 &mut on,
             ) {
@@ -388,6 +388,32 @@ fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteMan
                      码率上限翻倍（封顶 30 Mbps）。关掉会把 4K/2K 桌面缩到 1920——文字细节在\
                      编码前就丢了，之后再高的码率也补不回来。对端只支持 VP9 时仍按 1080p。\
                      运行中修改在下次会话生效。",
+                )
+                .size(12.0)
+                .color(p.text_weak),
+            );
+
+            ui.add_space(10.0);
+            // 优先 H.265/HEVC：双方都支持时省 25–50% 码率；任一侧缺能力则自动回退。
+            let mut h265_on = prefs.remote_prefer_h265;
+            if widgets::switch_row(
+                ui,
+                "优先 H.265/HEVC（双方都支持时）",
+                Some("自动回退 H.264/VP9；运行中修改下次会话生效；RUST_TUNNEL_DISABLE_H265=1 可强制关闭"),
+                &mut h265_on,
+            ) {
+                prefs.remote_prefer_h265 = h265_on;
+                if let Some(manager) = manager {
+                    manager.set_prefer_h265(h265_on);
+                }
+                tracing::info!("优先 H.265/HEVC：{}", if h265_on { "开" } else { "关" });
+                changed = true;
+            }
+            ui.label(
+                RichText::new(
+                    "只在双方硬件/系统都支持 H.265 时生效（被控端 NVENC/硬件 MFT 编码，\
+                     控制器 HEVC Video Extensions 解码）。任一侧缺能力自动回退 H.264，再不行回退 VP9。\
+                     环境变量 RUST_TUNNEL_DISABLE_H265=1 会强制关闭，优先于本开关。",
                 )
                 .size(12.0)
                 .color(p.text_weak),
@@ -545,11 +571,16 @@ fn service_page(ui: &mut Ui, prefs: &GuiPrefs, app_state: &Arc<AppState>, servic
                     let native = app_state
                         .remote()
                         .is_some_and(|manager| manager.native_resolution());
+                    // H.265 优先级同样是被控端本机偏好：装服务时原样带进 host.toml。
+                    let prefer_h265 = app_state
+                        .remote()
+                        .is_some_and(|manager| manager.prefer_h265());
                     HostSeed::from_config(
                         &config,
                         approval,
                         auto_lock,
                         native,
+                        prefer_h265,
                         prefs.remote_latency_log,
                         prefs.remote_latency_log_frames,
                     )

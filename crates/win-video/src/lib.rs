@@ -5,16 +5,18 @@
 //! 1. **采集**：`Windows.Graphics.Capture`（WGC）优先，失败回退 DXGI Desktop
 //!    Duplication；两者都不可用时由调用方回退到既有的 GDI `BitBlt`（安全桌面/
 //!    Windows 登录界面只有 BitBlt 能用）。
-//! 2. **编码**：NVENC H.264 **4:2:0**（NV12），运行期加载 `nvEncodeAPI64.dll`。
+//! 2. **编码**：NVENC **H.264 / H.265 4:2:0**（NV12），运行期加载 `nvEncodeAPI64.dll`；
+//!    无 NVIDIA 时可用 Media Foundation 硬件 H.264/H.265 编码 MFT。
 //!
 //! 它**不依赖** `rust-tunnel-remote`，也不定义会话协议；`client-gui` 把这里的
 //! [`NvencEncoder`](nvenc::NvencEncoder) 与采集源适配成 remote 的编码/采集 trait。
 //!
 //! # 为什么固定 4:2:0
 //!
-//! 消费级 GPU 的 H.264 硬件编码器只支持 4:2:0；4:4:4 硬件编码只有 HEVC 在较新
-//! GPU 上提供。因此本 crate 不实现色度协商，固定 NV12 输入，颜色按 BT.709
-//! limited range 打 VUI 标签。
+//! 消费级 GPU 的 H.264/H.265 硬件编码器都以 4:2:0 为主；4:4:4 硬件编码只有 HEVC
+//! 在较新 GPU 上提供，但 4:4:4 **解码**侧没有可用的消费级/系统解码器，混合部署会断。
+//! 因此本 crate 不实现色度协商，H.264 与 H.265 都固定 NV12 输入，颜色按 BT.709
+//! limited range 打 VUI 标签（`CodecKind` 只区分码流语法）。
 //!
 //! # 编译面
 //!
@@ -31,6 +33,8 @@
 
 #[cfg(windows)]
 pub mod capture;
+/// 编码标准（H.264 / H.265），不依赖 Windows API。
+pub mod codec;
 #[cfg(windows)]
 pub mod d3d11;
 #[cfg(windows)]

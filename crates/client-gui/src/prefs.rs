@@ -165,6 +165,13 @@ pub struct GuiPrefs {
     /// [`GuiPrefs::remote_native_resolution`] 的默认值迁移标记（只跑一次）。
     #[serde(default)]
     pub remote_native_resolution_migrated: bool,
+    /// 是否**优先协商 H.265/HEVC**（双方都支持时）。**默认开启**。
+    ///
+    /// 只有双方硬件/系统扩展都具备时才真的走 H.265；任一侧缺能力、或设置了
+    /// `RUST_TUNNEL_DISABLE_H265`（任意非空值）都自动回退 H.264/VP9。运行中修改只对
+    /// **下一次会话**生效（引擎在会话建立时读一次）。
+    #[serde(default = "default_true")]
+    pub remote_prefer_h265: bool,
     /// 远程控制**分阶段延迟诊断日志**开关（默认关闭）。
     ///
     /// 打开后引擎每秒输出一行阶段汇总（采集/编码/发送/网络/解码/上屏），慢帧另打明细，
@@ -211,6 +218,8 @@ impl Default for GuiPrefs {
             // 与字段上的 `#[serde(default = "default_true")]` 保持一致（理由见那里）。
             remote_native_resolution: true,
             remote_native_resolution_migrated: false,
+            // 与字段上的 `#[serde(default = "default_true")]` 保持一致。
+            remote_prefer_h265: true,
             remote_latency_log: false,
             remote_latency_log_frames: false,
             update_auto_check: true,
@@ -500,6 +509,26 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert!(!reparsed.remote_native_resolution);
+    }
+
+    /// 优先 H.265 默认**开启**，缺键的旧配置也落到开启，用户显式关掉后能 TOML 往返保留。
+    #[test]
+    fn prefer_h265_defaults_on_and_survives_roundtrip() {
+        assert!(
+            GuiPrefs::default().remote_prefer_h265,
+            "全新安装应默认优先 H.265（双方都支持时省 25–50% 码率）"
+        );
+        // 缺键的旧配置也落到 true（serde default = default_true）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(prefs.remote_prefer_h265, "旧配置缺该键应默认开启");
+        // 往返保留用户选择（显式关掉）。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_prefer_h265: false,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(!reparsed.remote_prefer_h265);
     }
 
     /// 原生分辨率迁移只跑一次：旧配置（键为 false、无迁移标志）被改成 true 并落标志，

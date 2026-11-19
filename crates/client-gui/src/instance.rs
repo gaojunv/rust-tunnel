@@ -137,6 +137,8 @@ pub struct HostSettings {
     pub auto_lock: bool,
     /// 是否允许原生分辨率（4K）编码。
     pub native_resolution: bool,
+    /// 是否优先协商 H.265/HEVC（双方都支持时）。
+    pub prefer_h265: bool,
     /// 是否输出分阶段延迟诊断日志（默认关闭）。
     pub latency_log: bool,
     /// 延迟诊断日志是否每帧一行（量大；默认只打每秒汇总 + 慢帧）。
@@ -189,6 +191,7 @@ pub fn load_host_config(path: &Path) -> anyhow::Result<HostSettings> {
         approval: extras.approval.unwrap_or_default(),
         auto_lock: extras.auto_lock,
         native_resolution: extras.native_resolution.unwrap_or(true),
+        prefer_h265: extras.prefer_h265.unwrap_or(true),
         latency_log: extras.latency_log,
         latency_log_frames: extras.latency_log_frames,
     })
@@ -211,6 +214,13 @@ struct HostExtras {
     /// BitBlt 帧仍按 1920 封顶。要回到旧行为写 `native_resolution = false` 即可。
     #[serde(default)]
     native_resolution: Option<bool>,
+    /// 是否优先协商 H.265/HEVC；缺省 **`true`**。
+    ///
+    /// 与 GUI 的 `remote_prefer_h265` 同义：双方硬件都支持时才真的走 H.265，任一侧缺
+    /// 能力或设置了 `RUST_TUNNEL_DISABLE_H265` 都自动回退 H.264/VP9。由 GUI「安装并启用」
+    /// 把当前选择原样带进来。
+    #[serde(default)]
+    prefer_h265: Option<bool>,
     /// 分阶段延迟诊断日志；缺省 `false`。由 GUI「安装并启用」写入当前选择。
     #[serde(default)]
     latency_log: bool,
@@ -358,6 +368,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         approval,
         auto_lock,
         native_resolution,
+        prefer_h265,
         latency_log,
         latency_log_frames,
     } = host;
@@ -379,6 +390,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         download = %opts.download_dir.display(),
         auto_lock,
         native_resolution,
+        prefer_h265,
         latency_log,
         latency_log_frames,
         "无头实例启动"
@@ -390,6 +402,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         approval,
         auto_lock,
         native_resolution,
+        prefer_h265,
         opts,
         Arc::clone(&exit),
     );
@@ -405,6 +418,7 @@ pub(crate) fn spawn_instance_runtime(
     approval: ApprovalPolicy,
     auto_lock: bool,
     native_resolution: bool,
+    prefer_h265: bool,
     opts: &InstanceOptions,
     exit: Arc<AtomicBool>,
 ) {
@@ -448,6 +462,9 @@ pub(crate) fn spawn_instance_runtime(
                     // `Default` 桌面（WGC/DXGI + 硬件 H.264）时引擎才真的编 4K；安全桌面
                     // 的 BitBlt 帧由 `win_hybrid::clamp_bitblt_frame` 先缩到 1920。
                     native_resolution,
+                    // 优先 H.265（`host.toml` 缺省 true）。环境变量禁用由 `factories()`
+                    // 处理（`RUST_TUNNEL_DISABLE_H265` 会让 h265 编码器工厂保持 None）。
+                    prefer_h265,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

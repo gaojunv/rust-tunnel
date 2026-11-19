@@ -130,13 +130,24 @@ pub fn open_permission_settings(kind: PermissionKind) {
     platform::open_settings(kind);
 }
 
-/// 硬件编解码工厂对：`(H.264 编码器工厂, H.264 解码器工厂)`。
+/// 硬件编解码工厂：按编码标准各持一对（被控端用编码器、控制器用解码器）。
 ///
-/// 任一侧为 `None` 表示该方向不参与 H.264 协商，数据面回退 VP9。
-pub type HardwareFactories = (
-    Option<Arc<dyn VideoEncoderFactory>>,
-    Option<Arc<dyn VideoDecoderFactory>>,
-);
+/// 任一字段为 `None` 表示该 (方向, 标准) 不参与协商：
+/// - H.264 两侧都不可用 → 数据面回退 VP9；
+/// - H.265 任一侧不可用 → 协商阶段自动回退 H.264。
+///
+/// 非 Windows 平台恒为 [`Default`]（四个 `None`），行为与从前完全一致。
+#[derive(Default)]
+pub struct HardwareFactories {
+    /// H.264 编码器工厂（被控端）。
+    pub h264_encoder: Option<Arc<dyn VideoEncoderFactory>>,
+    /// H.264 解码器工厂（控制器）。
+    pub h264_decoder: Option<Arc<dyn VideoDecoderFactory>>,
+    /// H.265/HEVC 编码器工厂（被控端）。
+    pub h265_encoder: Option<Arc<dyn VideoEncoderFactory>>,
+    /// H.265/HEVC 解码器工厂（控制器）。
+    pub h265_decoder: Option<Arc<dyn VideoDecoderFactory>>,
+}
 
 /// 平台实现的选定模式。
 ///
@@ -210,7 +221,7 @@ pub(crate) fn gui_platform_handles() -> PlatformHandles {
 
 /// 构造本平台的硬件编解码工厂（Windows 返回 NVENC/MFT；其他平台都返回 `None`）。
 ///
-/// `None` 表示该方向不参与 H.264 协商，数据面继续用默认的 VP9。
+/// 每个字段为 `None` 表示该 (方向, 标准) 不参与协商，数据面按 VP9 或 H.264 继续。
 #[must_use]
 pub fn hardware_factories() -> HardwareFactories {
     #[cfg(target_os = "windows")]
@@ -219,8 +230,26 @@ pub fn hardware_factories() -> HardwareFactories {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        (None, None)
+        HardwareFactories::default()
     }
+}
+
+/// H.265/HEVC 是否被环境变量强制关闭（`RUST_TUNNEL_DISABLE_H265` 任意非空值）。
+///
+/// 这是现场排障开关：设成 `1` 后即使双方硬件都支持、偏好也打开，也**不会**协商 H.265，
+/// 数据面照旧走 H.264。读取发生在构造引擎与每次设置页改动时。
+#[must_use]
+pub fn h265_disabled_by_env() -> bool {
+    std::env::var_os("RUST_TUNNEL_DISABLE_H265").is_some_and(|value| !value.is_empty())
+}
+
+/// `prefer H.265` 的**生效值**：用户偏好与「环境变量是否强制关闭」的纯函数组合。
+///
+/// 拆成纯函数是为了能在不碰进程环境（并行测试里会互相干扰）的前提下，钉住
+/// 「环境变量优先于偏好开关」这条规则。环境变量的实际读取见 [`h265_disabled_by_env`]。
+#[must_use]
+pub fn effective_prefer_h265(prefer: bool, disabled_by_env: bool) -> bool {
+    prefer && !disabled_by_env
 }
 
 /// 控制器下载文件的落地目录（系统「下载」目录；取不到时回落到临时目录）。
@@ -3025,6 +3054,21 @@ mod tests {
             text: None,
             modifiers: 0,
         })
+    }
+
+    /// `prefer H.265` 的生效值：只有「偏好开 **且** 环境变量未强制关闭」才为真。
+    ///
+    /// 钉住「环境变量优先于用户偏好」——`RUST_TUNNEL_DISABLE_H265=1` 是现场排障开关，
+    /// 必须无条件压过设置页的开关。纯函数，不读环境变量（并行测试下读环境会互相干扰）。
+    #[test]
+    fn effective_prefer_h265_requires_pref_and_no_env_kill() {
+        assert!(effective_prefer_h265(true, false), "偏好开 + 未禁用 → 生效");
+        assert!(
+            !effective_prefer_h265(true, true),
+            "环境变量强制关闭必须压过偏好"
+        );
+        assert!(!effective_prefer_h265(false, false), "偏好关 → 不生效");
+        assert!(!effective_prefer_h265(false, true), "两者都关 → 不生效");
     }
 
     // ── InputGate：鼠标按键门控矩阵 ──────────────────────────────────

@@ -8,9 +8,9 @@
 //!
 //! 本探针复现那条链路的下半段（与真机同参）：
 //!
-//! - **编码**：`MftH264Encoder`（Intel QSV 硬件 MFT，**不是 NVENC**），
+//! - **编码**：`MfVideoEncoder`（Intel QSV 硬件 MFT，**不是 NVENC**），
 //!   1920x1080 @ 30 fps / 10 Mbps / H.264 4:2:0；
-//! - **解码**：`decode::H264Decoder` 默认（DXVA/D3D11，优先 Intel 适配器）；
+//! - **解码**：`decode::MfVideoDecoder` 默认（DXVA/D3D11，优先 Intel 适配器）；
 //! - **内容**：合成桌面样画面（窗口 + 文字块 + 缓慢滚动的「终端」小区域 +
 //!   偶发整屏变化），P 帧几 KB、IDR 几十~几百 KB，量级贴近现场日志。
 //!
@@ -61,11 +61,14 @@
 )]
 
 #[cfg(windows)]
+use rust_tunnel_win_video::codec::{CodecKind, CodecSelection};
+#[cfg(windows)]
 use rust_tunnel_win_video::decode::{
-    H264Decoder, H264HardwarePreference, MapMode, ReadbackOptions, ReadbackPhase,
+    H264HardwarePreference, H264OutputMode, MapMode, MfVideoDecoder, ReadbackOptions,
+    ReadbackPhase,
 };
 #[cfg(windows)]
-use rust_tunnel_win_video::mft_encoder::MftH264Encoder;
+use rust_tunnel_win_video::mft_encoder::MfVideoEncoder;
 #[cfg(windows)]
 use rust_tunnel_win_video::WinVideoError;
 #[cfg(windows)]
@@ -347,7 +350,7 @@ impl Stream {
 /// 预编码一条件码流。`changed == false` 时每帧内容相同（保活补编）。
 #[cfg(windows)]
 fn encode_stream(
-    encoder: &mut MftH264Encoder,
+    encoder: &mut MfVideoEncoder,
     count: usize,
     changed: bool,
 ) -> Result<Stream, WinVideoError> {
@@ -474,7 +477,7 @@ fn offsets_burst(
 #[cfg(windows)]
 fn replay(
     label: &str,
-    decoder: &mut H264Decoder,
+    decoder: &mut MfVideoDecoder,
     stream: &Stream,
     offsets: &[Duration],
 ) -> Result<Run, WinVideoError> {
@@ -562,7 +565,7 @@ fn replay(
 #[cfg(windows)]
 fn replay_with_keepalive(
     label: &str,
-    decoder: &mut H264Decoder,
+    decoder: &mut MfVideoDecoder,
     stream: &Stream,
     seconds: u64,
     keepalive: Duration,
@@ -1285,7 +1288,7 @@ fn plain_device_variants(iterations: usize, interval: Duration) -> Result<(), Wi
 /// 每次解码换一个新线程（模拟 `spawn_blocking` 的线程轮换）。
 #[cfg(windows)]
 fn replay_on_fresh_threads(
-    decoder: &mut H264Decoder,
+    decoder: &mut MfVideoDecoder,
     stream: &Stream,
     offsets: &[Duration],
 ) -> Result<Run, WinVideoError> {
@@ -1357,9 +1360,32 @@ fn replay_on_fresh_threads(
 
 #[cfg(windows)]
 fn run() -> Result<(), WinVideoError> {
+    let selection = CodecSelection::from_args();
+    println!("== 编码标准: {selection:?} ==");
+    let mut any_ok = false;
+    let mut last_error = None;
+    for codec in selection.kinds() {
+        match run_codec(*codec) {
+            Ok(()) => any_ok = true,
+            Err(err) => {
+                println!("  {} 探针失败，继续下一个标准: {err}", codec.label());
+                last_error = Some(err);
+            }
+        }
+    }
+    if any_ok {
+        Ok(())
+    } else {
+        last_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(windows)]
+fn run_codec(codec: CodecKind) -> Result<(), WinVideoError> {
     let seconds = env_u64("STALL_SECONDS", DEFAULT_SECONDS);
     println!(
-        "== decode-stall-probe：{WIDTH}x{HEIGHT} @ {FPS} fps / {BITRATE_KBPS} kbps，每种场景 {seconds} s =="
+        "== decode-stall-probe（{}）：{WIDTH}x{HEIGHT} @ {FPS} fps / {BITRATE_KBPS} kbps，每种场景 {seconds} s ==",
+        codec.label()
     );
     println!("== 适配器 ==");
     for adapter in rust_tunnel_win_video::d3d11::adapters()? {
@@ -1370,7 +1396,7 @@ fn run() -> Result<(), WinVideoError> {
     }
 
     // ---- 编码：Intel QSV 硬件 MFT（不是 NVENC）----
-    let mut encoder = MftH264Encoder::new(WIDTH, HEIGHT, FPS, BITRATE_KBPS)?;
+    let mut encoder = MfVideoEncoder::new_codec(WIDTH, HEIGHT, FPS, BITRATE_KBPS, codec)?;
     println!(
         "\n== 编码器: {}（CLSID {}）| 设备 {} | {:?} @ {} fps, {} kbps ==",
         encoder.mft_name(),
@@ -1390,9 +1416,16 @@ fn run() -> Result<(), WinVideoError> {
     drop(encoder);
 
     // ---- 解码器 ----
-    let mut decoder = H264Decoder::new_hardware(WIDTH, HEIGHT).or_else(|err| {
+    let mut decoder = MfVideoDecoder::new_with_codec_preference_and_output(
+        WIDTH,
+        HEIGHT,
+        codec,
+        H264HardwarePreference::RequireHardware,
+        H264OutputMode::Rgba,
+    )
+    .or_else(|err| {
         println!("  硬件解码器初始化失败（{err}），回退 Auto");
-        H264Decoder::new(WIDTH, HEIGHT)
+        MfVideoDecoder::new_with_codec(WIDTH, HEIGHT, codec)
     })?;
     println!(
         "\n== 解码器: path={} 适配器={} 输出={:?} ==",
@@ -1493,10 +1526,12 @@ fn run() -> Result<(), WinVideoError> {
 
     // ---- 软件解码对照 ----
     println!("\n== 对照组：软件解码（系统内存）==");
-    let mut software = H264Decoder::new_with_preference(
+    let mut software = MfVideoDecoder::new_with_codec_preference_and_output(
         WIDTH,
         HEIGHT,
+        codec,
         H264HardwarePreference::Software,
+        H264OutputMode::Rgba,
     )?;
     let count = usize::try_from(seconds.saturating_mul(15)).unwrap_or(300);
     let offsets = offsets_regular(count, frame_interval);

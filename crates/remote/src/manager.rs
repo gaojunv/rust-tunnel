@@ -342,12 +342,25 @@ pub struct RemoteManagerConfig {
     pub approval_policy: ApprovalPolicy,
     /// 可选的 H.264 编码器工厂（被控端用）。
     ///
-    /// `None` = 只编码 VP9。`client-gui` 在 Windows 上注入 `crates/win-video` 的实现。
+    /// `None` = 本端没有 H.264 编码器。`client-gui` 在 Windows 上注入 `crates/win-video` 的实现。
     pub h264_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
     /// 可选的 H.264 解码器工厂（控制器用）。
     ///
-    /// `None` = 只解 VP9，协商时不会向被控端声明 H.264 能力。
+    /// `None` = 本端不能解 H.264，协商时不会向被控端声明 H.264 能力。
     pub h264_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    /// 可选的 H.265/HEVC 编码器工厂（被控端用）。
+    ///
+    /// `None` = 本端没有 H.265 编码器。仅当 [`Self::prefer_h265`] 为真且控制器也声明 H.265 时
+    /// 才会被协商选中。
+    pub h265_encoder_factory: Option<Arc<dyn VideoEncoderFactory>>,
+    /// 可选的 H.265/HEVC 解码器工厂（控制器用）。
+    ///
+    /// `None` = 本端不能解 H.265，协商时不会向被控端声明 H.265 能力。
+    pub h265_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
+    /// 是否**优先选择 H.265/HEVC**（默认 `true`，由 GUI 层决定）。
+    ///
+    /// 运行中修改经 [`RemoteManager::set_prefer_h265`]，只对**下一次会话**生效。
+    pub prefer_h265: bool,
 }
 
 /// 正在进行的会话句柄。
@@ -482,6 +495,11 @@ pub struct RemoteManager {
     /// 用原子而不是 `Inner` 锁：由 GUI 的 UI 线程在会话进行中随时调用，会话任务只在**开始**
     /// 时读一次；没必要为一次读抢内部锁。改动只影响下一次会话（编码宽度在协商后固定）。
     native_resolution: AtomicBool,
+    /// 被控端/控制器是否**优先选择 H.265/HEVC**。
+    ///
+    /// 与 [`Self::native_resolution`] 同构：GUI 的 UI 线程随时可改，会话任务只在**开始**时读
+    /// 一次；改动只影响下一次会话（codec 在协商后固定）。
+    prefer_h265: AtomicBool,
     /// 构造时所在的 Tokio 运行时句柄。
     ///
     /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
@@ -527,6 +545,7 @@ impl RemoteManager {
         let out_pump = rt.as_ref().map(|_| Arc::new(Notify::new()));
         let rt_field = rt.clone();
         let native_resolution = cfg.native_resolution;
+        let prefer_h265 = cfg.prefer_h265;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -551,6 +570,7 @@ impl RemoteManager {
             rt: rt_field,
             auto_lock_on_disconnect: Arc::new(AtomicBool::new(false)),
             native_resolution: AtomicBool::new(native_resolution),
+            prefer_h265: AtomicBool::new(prefer_h265),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -730,6 +750,20 @@ impl RemoteManager {
     #[must_use]
     pub fn native_resolution(&self) -> bool {
         self.native_resolution.load(Ordering::Relaxed)
+    }
+
+    /// 设置是否**优先选择 H.265/HEVC**（默认开启）。
+    ///
+    /// 只对**下一次**会话生效：codec 在会话开始、协商完成后确定。任一侧不具备 H.265 能力时
+    /// 该开关不改变结果（自动回退 H.264，再回退 VP9）。
+    pub fn set_prefer_h265(&self, on: bool) {
+        self.prefer_h265.store(on, Ordering::Relaxed);
+    }
+
+    /// 当前的 H.265 优先偏好（UI 镜像）。
+    #[must_use]
+    pub fn prefer_h265(&self) -> bool {
+        self.prefer_h265.load(Ordering::Relaxed)
     }
 
     /// 把本机剪贴板文本发给被控端。
@@ -1457,6 +1491,8 @@ impl RemoteManager {
             mode,
             stats: self.build_stats_reporter(cancel.clone()),
             h264_decoder_factory: self.cfg.h264_decoder_factory.clone(),
+            h265_decoder_factory: self.cfg.h265_decoder_factory.clone(),
+            prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
             reliable,
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
@@ -1698,6 +1734,8 @@ impl RemoteManager {
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
             stats: self.build_stats_reporter(cancel.clone()),
             h264_encoder_factory: self.cfg.h264_encoder_factory.clone(),
+            h265_encoder_factory: self.cfg.h265_encoder_factory.clone(),
+            prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
             lock_on_disconnect: Arc::clone(&self.auto_lock_on_disconnect),
         };
         let clipboard = self
@@ -2298,6 +2336,9 @@ mod tests {
             approval_policy: ApprovalPolicy::Auto,
             h264_encoder_factory: None,
             h264_decoder_factory: None,
+            h265_encoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
         })
     }
 
@@ -2460,6 +2501,9 @@ mod tests {
             approval_policy: ApprovalPolicy::Auto,
             h264_encoder_factory: None,
             h264_decoder_factory: None,
+            h265_encoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
         })
     }
 

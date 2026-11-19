@@ -62,7 +62,8 @@
 //! 就等于每秒制造一次带宽尖峰。因此这里走 `nvEncReconfigureEncoder` 的
 //! **在线重配置**路径：`resetEncoder = 0`、`forceIDR = 0`。
 
-use super::{status_err, status_ok, sys, NvencApi, NvencSession};
+use super::{codec_guid, status_err, status_ok, sys, NvencApi, NvencSession};
+use crate::codec::CodecKind;
 use crate::d3d11::D3d11;
 use crate::WinVideoError;
 use std::ffi::c_void;
@@ -143,10 +144,12 @@ pub struct EncoderConfig {
     pub source_width: u32,
     /// 输入（源）高度；默认等于 `height`。
     pub source_height: u32,
+    /// 编码标准（默认 H.264）。
+    pub codec: CodecKind,
 }
 
 impl EncoderConfig {
-    /// 构造参数并做基本校验（BGRA 输入、源尺寸 = 编码尺寸）。
+    /// 构造参数并做基本校验（BGRA 输入、源尺寸 = 编码尺寸、H.264）。
     ///
     /// # Errors
     /// 尺寸越界/为奇数、帧率为 0 或码率为 0 时返回 [`WinVideoError::Config`]。
@@ -164,9 +167,23 @@ impl EncoderConfig {
             input_format: InputFormat::Bgra,
             source_width: width,
             source_height: height,
+            codec: CodecKind::H264,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// 指定编码标准（H.264 / H.265）。
+    #[must_use]
+    pub fn with_codec(mut self, codec: CodecKind) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// 当前配置的编码标准。
+    #[must_use]
+    pub fn codec(&self) -> CodecKind {
+        self.codec
     }
 
     /// 指定输入通道顺序。
@@ -603,9 +620,10 @@ impl DirectInputCache {
     }
 }
 
-/// 从驱动取 H.264 的 preset 默认配置，再覆盖成本模块要求的固定参数。
+/// 从驱动取指定标准的 preset 默认配置，再覆盖成本模块要求的固定参数。
 fn build_encode_config(
     session: &NvencSession<'_>,
+    kind: CodecKind,
     bitrate_bps: u32,
     fps: u32,
     width: u32,
@@ -643,7 +661,7 @@ fn build_encode_config(
     let status = unsafe {
         get_preset(
             session.handle(),
-            sys::NV_ENC_CODEC_H264_GUID,
+            codec_guid(kind),
             sys::NV_ENC_PRESET_P4_GUID,
             sys::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY,
             &raw mut preset,
@@ -653,7 +671,10 @@ fn build_encode_config(
 
     let mut config = preset.presetCfg;
     config.version = sys::NV_ENC_CONFIG_VER;
-    config.profileGUID = sys::NV_ENC_H264_PROFILE_HIGH_GUID;
+    config.profileGUID = match kind {
+        CodecKind::H264 => sys::NV_ENC_H264_PROFILE_HIGH_GUID,
+        CodecKind::H265 => sys::NV_ENC_HEVC_PROFILE_MAIN_GUID,
+    };
     // 无限 GOP：只有显式 FORCEIDR 才产生关键帧。
     config.gopLength = sys::NVENC_INFINITE_GOPLENGTH;
     // 1 = 只有 P 帧（无 B 帧）。
@@ -690,9 +711,6 @@ fn build_encode_config(
         qpIntra: max_qp.saturating_sub(2).max(1),
     };
 
-    // SAFETY: `encodeCodecConfig` 是 union；本会话固定走 H.264 分支，且 union
-    // 已由 preset 配置按 H.264 初始化。
-    let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
     // **渐进式刷新（intra refresh / GDR）**：每帧把一小条宏块编成 intra，约
     // [`INTRA_REFRESH_SECONDS`] 秒刷完一整屏。替代「周期性 IDR」的刷新职责——参考帧
     // 持续自我修复，且**没有关键帧尖峰**（Moonlight/Sunshine 与 RDP 都这么做）。
@@ -705,10 +723,53 @@ fn build_encode_config(
         .api()
         .cap(
             session,
-            sys::NV_ENC_CODEC_H264_GUID,
+            codec_guid(kind),
             sys::_NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_INTRA_REFRESH,
         )
         .is_ok_and(|value| value > 0);
+
+    // SAFETY: `encodeCodecConfig` 是 union；preset 配置按选中标准的 GUID 初始化，
+    // 这里只访问与 `kind` 一致的那个分支。
+    match kind {
+        CodecKind::H264 => configure_h264_config(&mut config, fps, intra_refresh_supported),
+        CodecKind::H265 => configure_hevc_config(&mut config, fps, intra_refresh_supported),
+    }
+
+    // 真机排障要能确认这两个「画质旋钮」真的生效（每次编码器创建只打一行）。
+    tracing::info!(
+        codec = kind.label(),
+        max_qp,
+        vbv_bits = config.rcParams.vbvBufferSize,
+        intra_refresh = intra_refresh_supported,
+        intra_refresh_frames = intra_refresh_frames(fps),
+        fps,
+        bitrate_bps,
+        "NVENC 编码配置就绪（QP 地板 / 单帧预算 / 渐进刷新）"
+    );
+
+    Ok(config)
+}
+
+/// 写入 BT.709 + limited range 的 VUI 标签（H.264 与 HEVC 共用同一结构）。
+fn configure_bt709_limited_vui(vui: &mut sys::_NV_ENC_CONFIG_H264_VUI_PARAMETERS) {
+    vui.videoSignalTypePresentFlag = 1;
+    vui.videoFormat = sys::_NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+    vui.videoFullRangeFlag = 0;
+    vui.colourDescriptionPresentFlag = 1;
+    vui.colourPrimaries =
+        sys::_NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    vui.transferCharacteristics =
+        sys::_NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    vui.colourMatrix = sys::_NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+}
+
+/// 覆盖 H.264 分支的固定参数（preset 默认值之上）。
+fn configure_h264_config(
+    config: &mut sys::NV_ENC_CONFIG,
+    fps: u32,
+    intra_refresh_supported: bool,
+) {
+    let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
     if intra_refresh_supported {
         h264.set_enableIntraRefresh(1);
         h264.intraRefreshPeriod = intra_refresh_frames(fps);
@@ -725,31 +786,36 @@ fn build_encode_config(
         sys::_NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
     h264.sliceMode = 0;
     h264.sliceModeData = 0;
-    // VUI：BT.709 + limited range。调用方（remote）据此按同一套矩阵解码。
-    h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
-    h264.h264VUIParameters.videoFormat =
-        sys::_NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-    h264.h264VUIParameters.videoFullRangeFlag = 0;
-    h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
-    h264.h264VUIParameters.colourPrimaries =
-        sys::_NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-    h264.h264VUIParameters.transferCharacteristics =
-        sys::_NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-    h264.h264VUIParameters.colourMatrix =
-        sys::_NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    configure_bt709_limited_vui(&mut h264.h264VUIParameters);
+}
 
-    // 真机排障要能确认这两个「画质旋钮」真的生效（每次编码器创建只打一行）。
-    tracing::info!(
-        max_qp,
-        vbv_bits = config.rcParams.vbvBufferSize,
-        intra_refresh = intra_refresh_supported,
-        intra_refresh_frames = intra_refresh_frames(fps),
-        fps,
-        bitrate_bps,
-        "NVENC 编码配置就绪（QP 地板 / 单帧预算 / 渐进刷新）"
-    );
-
-    Ok(config)
+/// 覆盖 HEVC 分支的固定参数（Main profile：8-bit 4:2:0，无限 GOP）。
+fn configure_hevc_config(
+    config: &mut sys::NV_ENC_CONFIG,
+    fps: u32,
+    intra_refresh_supported: bool,
+) {
+    let hevc = unsafe { &mut config.encodeCodecConfig.hevcConfig };
+    if intra_refresh_supported {
+        hevc.set_enableIntraRefresh(1);
+        hevc.intraRefreshPeriod = intra_refresh_frames(fps);
+        hevc.intraRefreshCnt = intra_refresh_frames(fps);
+    } else {
+        tracing::debug!("NVENC HEVC 未声明支持 intra refresh，参考帧刷新退回周期 IDR");
+    }
+    // 0 == NV_ENC_LEVEL_AUTOSELECT / NV_ENC_TIER_MAIN。
+    hevc.level = 0;
+    hevc.tier = 0;
+    hevc.idrPeriod = sys::NVENC_INFINITE_GOPLENGTH;
+    // `pixelBitDepthMinus8 = 0` + `chromaFormatIDC = 1` = Main 8-bit 4:2:0。
+    hevc.set_chromaFormatIDC(1);
+    hevc.set_pixelBitDepthMinus8(0);
+    // 每个 IDR 都重发 VPS/SPS/PPS：控制器按 Annex B 内联参数集解码，不能依赖
+    // 带外参数集。
+    hevc.set_repeatSPSPPS(1);
+    hevc.sliceMode = 0;
+    hevc.sliceModeData = 0;
+    configure_bt709_limited_vui(&mut hevc.hevcVUIParameters);
 }
 
 /// 一个可复用的 NVENC H.264 编码器。
@@ -782,6 +848,8 @@ pub struct NvencEncoder<'a> {
     fps: u32,
     bitrate_bps: u32,
     frame_idx: u32,
+    /// 本会话的编码标准（决定 `encodeGUID` 与码流语法）。
+    codec: CodecKind,
 }
 
 // SAFETY: `NvencEncoder` 独占持有以下资源，且**不实现 `Sync`**，因此同一时刻只有
@@ -797,6 +865,7 @@ unsafe impl Send for NvencEncoder<'_> {}
 impl std::fmt::Debug for NvencEncoder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NvencEncoder")
+            .field("codec", &self.codec)
             .field("size", &(self.width, self.height))
             .field("source_size", &(self.source_width, self.source_height))
             .field("input_format", &self.input_format)
@@ -816,6 +885,10 @@ impl<'a> NvencEncoder<'a> {
     /// # Errors
     /// 参数越界、驱动拒绝会话/初始化、D3D11 纹理创建或资源注册失败时返回
     /// [`WinVideoError`]。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "编码器构造是一条有顺序约束的初始化链（会话 → 配置 → 纹理 → 初始化 → 注册/映射 → 码流缓冲），拆开反而看不清顺序"
+    )]
     pub fn new(
         api: &'a NvencApi,
         d3d: Arc<D3d11>,
@@ -827,6 +900,7 @@ impl<'a> NvencEncoder<'a> {
         let bitrate_bps = kbps_to_bps(config.bitrate_kbps);
         let encode_config = build_encode_config(
             &session,
+            config.codec,
             bitrate_bps,
             config.fps,
             config.width,
@@ -847,7 +921,7 @@ impl<'a> NvencEncoder<'a> {
         // 随后逐字段赋值。
         let mut init: sys::NV_ENC_INITIALIZE_PARAMS = unsafe { std::mem::zeroed() };
         init.version = sys::NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encodeGUID = sys::NV_ENC_CODEC_H264_GUID;
+        init.encodeGUID = codec_guid(config.codec);
         init.presetGUID = sys::NV_ENC_PRESET_P4_GUID;
         init.encodeWidth = config.width;
         init.encodeHeight = config.height;
@@ -870,7 +944,29 @@ impl<'a> NvencEncoder<'a> {
                 WinVideoError::Nvenc("驱动未导出 nvEncInitializeEncoder".to_owned())
             })?;
         // SAFETY: 会话句柄有效；init 指向本栈帧，encodeConfig 指向本地 config。
-        let status = unsafe { initialize(session.handle(), &raw mut init) };
+        let mut status = unsafe { initialize(session.handle(), &raw mut init) };
+        if !status_ok(status)
+            && stored_config.rcParams.multiPass
+                == sys::_NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION
+        {
+            // 个别 GPU/驱动拒绝四分之一分辨率两遍编码。只重试一次单遍：AQ、QP 地板与
+            // VBR 都保留，画质略降但会话能建起来（HEVC 在低端 NVENC 上更常见）。
+            tracing::warn!(
+                codec = config.codec.label(),
+                status = ?status,
+                "NVENC 拒绝四分之一分辨率两遍编码，改用单遍重试"
+            );
+            stored_config.rcParams.multiPass =
+                sys::_NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
+            // SAFETY: 同上次调用；encodeConfig 仍指向 stored_config。
+            status = unsafe { initialize(session.handle(), &raw mut init) };
+            if status_ok(status) {
+                tracing::info!(
+                    codec = config.codec.label(),
+                    "NVENC 已改用单遍编码（驱动拒绝两遍）"
+                );
+            }
+        }
         check(status, "nvEncInitializeEncoder")?;
         // `stored_config` 即将移入结构体，先清掉指向栈上旧地址的指针；
         // 每次重配置都会重新绑定到 `self.config`。
@@ -919,7 +1015,14 @@ impl<'a> NvencEncoder<'a> {
             fps: config.fps,
             bitrate_bps,
             frame_idx: 0,
+            codec: config.codec,
         })
+    }
+
+    /// 本会话的编码标准。
+    #[must_use]
+    pub fn codec(&self) -> CodecKind {
+        self.codec
     }
 
     /// 编码尺寸 `(width, height)`。
