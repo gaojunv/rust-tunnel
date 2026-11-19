@@ -2024,6 +2024,14 @@ pub struct ControlledConfig {
     ///
     /// 这一项只在**会话开始**时读取，运行中改它只影响下一次会话。
     pub prefer_h265: bool,
+    /// 是否**优先 4:4:4（VP9 profile 1）**（默认 `false`）。
+    ///
+    /// 开启后即使控制器也声明 H.264/H.265、本端也有对应编码器，仍优先协商 VP9：VP9 的
+    /// I444 色度不子采样，ClearType 文字的彩边最少（H.264/H.265 都是 4:2:0）。代价是软件
+    /// 编码、CPU 占用更高，4K 不建议开启。优先级**高于** [`Self::prefer_h265`]——文字清晰度
+    /// 的诉求比码率更硬。控制器不提供 VP9 时按原规则回落 H.264/H.265，不会把会话逼死。
+    /// 这一项只在**会话开始**时读取，运行中改它只影响下一次会话。
+    pub prefer_444: bool,
     /// 会话结束后是否**自动锁定本机屏幕**。
     ///
     /// 由收尾守卫（[`AutoLockOnExit`]）在会话结束时**实时读取**，故用户在会话进行中打开设置
@@ -2076,20 +2084,29 @@ enum CodecOfferOutcome {
 
 /// 纯函数：根据 offer 与本端编码能力选 codec。
 ///
-/// 规则（`offer` 是 `(h264, vp9, h265)` 三元组）：
-/// - `prefer_h265 && offer.h265 && 本端有 H.265 编码器` → H.265；
+/// 规则（`offer` 是 `(h264, vp9, h265)` 三元组，顺序重要）：
+/// - `prefer_444 && offer.vp9` → VP9。文字优先：VP9 profile 1 是 4:4:4（色度不子采样），
+///   H.264/H.265 都是 4:2:0。**它压过 H.265**——文字彩边比码率更硬；
+/// - 否则 `prefer_h265 && offer.h265 && 本端有 H.265 编码器` → H.265；
 /// - 否则 `offer.h264 && 本端有 H.264 编码器` → H.264；
 /// - 否则 VP9。超时/关闭（`None`）同样回退 VP9。
 ///
-/// `offer.vp9` 不参与判断：VP9 解码是内置实现，它是双方唯一都必定具备的兜底 codec。
+/// 除 `prefer_444` 那一支外，`offer.vp9` 不参与判断：VP9 解码是内置实现，它是双方唯一都必定
+/// 具备的兜底 codec。`prefer_444` 也不强求——控制器不声明 VP9 时照常回落 H.264/H.265。
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "三个能力位 + 两个偏好位就是协商矩阵的全部输入，拆成结构体只会掩盖优先级顺序"
+)]
 #[must_use]
 fn choose_codec(
     offer: Option<(bool, bool, bool)>,
     has_h264_encoder: bool,
     has_h265_encoder: bool,
     prefer_h265: bool,
+    prefer_444: bool,
 ) -> CodecId {
     match offer {
+        Some((_, true, _)) if prefer_444 => CodecId::Vp9,
         Some((_, _, true)) if prefer_h265 && has_h265_encoder => CodecId::H265,
         Some((true, _, _)) if has_h264_encoder => CodecId::H264,
         _ => CodecId::Vp9,
@@ -2408,6 +2425,7 @@ pub async fn run_controlled(
         config.h264_encoder_factory.is_some(),
         config.h265_encoder_factory.is_some(),
         config.prefer_h265,
+        config.prefer_444,
     );
     // 按协商结果取编码器工厂。`choose_codec` 只在对应工厂存在时才返回该硬件 codec；这里仍是
     // 防御性检查（不 panic），缺失时给出明确的平台错误而不是静默换 codec。
@@ -5698,6 +5716,7 @@ mod tests {
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            prefer_444: false,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -5833,52 +5852,90 @@ mod tests {
 
     /// 协商矩阵：H.265 优先（受 `prefer_h265` 与本端能力约束），其次 H.264，最后 VP9。
     ///
-    /// `offer` 是 `(h264, vp9, h265)`；VP9 能力不参与判断（它始终是兜底）。
+    /// `offer` 是 `(h264, vp9, h265)`；除 4:4:4 那一支外，VP9 能力不参与判断（它始终是兜底）。
+    /// 这里 `prefer_444` 一律传 `false`（4:4:4 的矩阵单独测）。
     #[test]
     fn choose_codec_prefers_h265_then_h264_then_vp9() {
         // 全支持 + 偏好 H.265 + 本端有 H.265 编码器 → H.265。
         assert_eq!(
-            choose_codec(Some((true, true, true)), true, true, true),
+            choose_codec(Some((true, true, true)), true, true, true, false),
             CodecId::H265
         );
         // 本端没有 H.265 编码器 → 退回 H.264（H.264 编码器与对端声明都在）。
         assert_eq!(
-            choose_codec(Some((true, true, true)), true, false, true),
+            choose_codec(Some((true, true, true)), true, false, true, false),
             CodecId::H264
         );
         // 对端没声明 H.265 → H.264。
         assert_eq!(
-            choose_codec(Some((true, true, false)), true, true, true),
+            choose_codec(Some((true, true, false)), true, true, true, false),
             CodecId::H264
         );
         // 偏好关闭（即便双方都有 H.265）→ H.264。
         assert_eq!(
-            choose_codec(Some((true, true, true)), true, true, false),
+            choose_codec(Some((true, true, true)), true, true, false, false),
             CodecId::H264
         );
         // 只有 H.265 能力、偏好关闭、本端无 H.264 编码器 → VP9。
         assert_eq!(
-            choose_codec(Some((false, true, true)), false, true, false),
+            choose_codec(Some((false, true, true)), false, true, false, false),
             CodecId::Vp9
         );
         // 只有 H.265 编码器、对端只声明 H.265，但偏好关闭 → VP9（不降级选 H.264）。
         assert_eq!(
-            choose_codec(Some((true, true, true)), false, true, false),
+            choose_codec(Some((true, true, true)), false, true, false, false),
             CodecId::Vp9
         );
         // 本端没有 H.264 编码器：即便对端支持也不能选 H.264。
         assert_eq!(
-            choose_codec(Some((true, true, false)), false, false, true),
+            choose_codec(Some((true, true, false)), false, false, true, false),
             CodecId::Vp9
         );
         // 对端不支持 H.264：本端有编码器也不选。
         assert_eq!(
-            choose_codec(Some((false, true, false)), true, false, true),
+            choose_codec(Some((false, true, false)), true, false, true, false),
             CodecId::Vp9
         );
         // 超时/关闭（None）一律回退 VP9。
-        assert_eq!(choose_codec(None, true, true, true), CodecId::Vp9);
-        assert_eq!(choose_codec(None, false, false, false), CodecId::Vp9);
+        assert_eq!(choose_codec(None, true, true, true, false), CodecId::Vp9);
+        assert_eq!(
+            choose_codec(None, false, false, false, false),
+            CodecId::Vp9
+        );
+    }
+
+    /// 4:4:4 优先：`prefer_444` 压过 H.265/H.264，但控制器不提供 VP9 时照常回落。
+    #[test]
+    fn choose_codec_prefer_444_wins_over_h265_and_h264() {
+        // 控制器声明 H.264/H.265/VP9 全支持、本端两种硬件编码器都在 + 也偏好 H.265：
+        // 4:4:4 仍压过 H.265（文字彩边比码率更硬）。
+        assert_eq!(
+            choose_codec(Some((true, true, true)), true, true, true, true),
+            CodecId::Vp9
+        );
+        // 只有 H.264 可用时同样选 VP9。
+        assert_eq!(
+            choose_codec(Some((true, true, false)), true, false, true, true),
+            CodecId::Vp9
+        );
+        // 控制器不提供 VP9 且没声明 H.265：`prefer_444` 按原规则回落 H.264——
+        // 4:4:4 是偏好不是硬要求，不能把会话逼死。
+        assert_eq!(
+            choose_codec(Some((true, false, false)), true, true, true, true),
+            CodecId::H264
+        );
+        // 控制器不提供 VP9 且本端只有 H.265 编码器、偏好 H.265 → H.265。
+        assert_eq!(
+            choose_codec(Some((false, false, true)), false, true, true, true),
+            CodecId::H265
+        );
+        // 关闭 4:4:4（`prefer_444 = false`）同一 offer 回到 H.265，行为与原来完全一致。
+        assert_eq!(
+            choose_codec(Some((true, true, true)), true, true, true, false),
+            CodecId::H265
+        );
+        // 超时/关闭同样回退 VP9（默认 codec）。
+        assert_eq!(choose_codec(None, true, true, false, true), CodecId::Vp9);
     }
 
     /// 旧用例（保留其语义）：H.264 需要「本端有编码器」且「控制器声明支持」。
@@ -5886,7 +5943,7 @@ mod tests {
     fn choose_codec_requires_both_sides_to_support_h264() {
         // 对端不支持 H.265（三元组末位 false）+ 本端只有 H.264 → H.264。
         assert_eq!(
-            choose_codec(Some((true, true, false)), true, false, true),
+            choose_codec(Some((true, true, false)), true, false, true, false),
             CodecId::H264
         );
     }

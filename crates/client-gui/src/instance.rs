@@ -139,6 +139,8 @@ pub struct HostSettings {
     pub native_resolution: bool,
     /// 是否优先协商 H.265/HEVC（双方都支持时）。
     pub prefer_h265: bool,
+    /// 是否优先 4:4:4（VP9 profile 1）；优先级高于 `prefer_h265`。
+    pub prefer_444: bool,
     /// 是否输出分阶段延迟诊断日志（默认关闭）。
     pub latency_log: bool,
     /// 延迟诊断日志是否每帧一行（量大；默认只打每秒汇总 + 慢帧）。
@@ -192,6 +194,7 @@ pub fn load_host_config(path: &Path) -> anyhow::Result<HostSettings> {
         auto_lock: extras.auto_lock,
         native_resolution: extras.native_resolution.unwrap_or(true),
         prefer_h265: extras.prefer_h265.unwrap_or(true),
+        prefer_444: extras.prefer_444.unwrap_or(false),
         latency_log: extras.latency_log,
         latency_log_frames: extras.latency_log_frames,
     })
@@ -221,6 +224,13 @@ struct HostExtras {
     /// 把当前选择原样带进来。
     #[serde(default)]
     prefer_h265: Option<bool>,
+    /// 是否优先 **4:4:4（VP9 profile 1）**；缺省 **`false`**。
+    ///
+    /// 与 GUI 的 `remote_prefer_444` 同义：开启后即使双方都支持 H.264/H.265 也优先协商
+    /// VP9（色度不子采样，文字彩边最少）；代价是软件编码、CPU 占用更高。优先级高于
+    /// [`Self::prefer_h265`]。由 GUI「安装并启用」把当前选择原样带进来。
+    #[serde(default)]
+    prefer_444: Option<bool>,
     /// 分阶段延迟诊断日志；缺省 `false`。由 GUI「安装并启用」写入当前选择。
     #[serde(default)]
     latency_log: bool,
@@ -369,6 +379,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         auto_lock,
         native_resolution,
         prefer_h265,
+        prefer_444,
         latency_log,
         latency_log_frames,
     } = host;
@@ -391,6 +402,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         auto_lock,
         native_resolution,
         prefer_h265,
+        prefer_444,
         latency_log,
         latency_log_frames,
         "无头实例启动"
@@ -403,6 +415,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         auto_lock,
         native_resolution,
         prefer_h265,
+        prefer_444,
         opts,
         Arc::clone(&exit),
     );
@@ -413,12 +426,18 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
 }
 
 /// 起后台运行时线程：控制通道 + 远程引擎（无头，不注入 `AppState` / `status_tx`）。
+#[expect(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "参数就是 host.toml 的几组开关，打包成结构体只会让调用点多一层样板"
+)]
 pub(crate) fn spawn_instance_runtime(
     config: ClientConfig,
     approval: ApprovalPolicy,
     auto_lock: bool,
     native_resolution: bool,
     prefer_h265: bool,
+    prefer_444: bool,
     opts: &InstanceOptions,
     exit: Arc<AtomicBool>,
 ) {
@@ -465,6 +484,8 @@ pub(crate) fn spawn_instance_runtime(
                     // 优先 H.265（`host.toml` 缺省 true）。环境变量禁用由 `factories()`
                     // 处理（`RUST_TUNNEL_DISABLE_H265` 会让 h265 编码器工厂保持 None）。
                     prefer_h265,
+                    // 文字优先（`host.toml` 缺省 false）：开启后 VP9（4:4:4）压过 H.264/H.265。
+                    prefer_444,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

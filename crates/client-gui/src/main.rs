@@ -755,6 +755,8 @@ struct ManagerOptions {
     native_resolution: bool,
     /// 是否优先协商 H.265/HEVC（双方都支持时）；不可用则自动回退 H.264/VP9。
     prefer_h265: bool,
+    /// 是否优先 4:4:4（VP9 profile 1）；优先级高于 `prefer_h265`。
+    prefer_444: bool,
     /// 平台实现模式（**必须在构造期选定**，见 [`remote::PlatformMode`]）。
     platform_mode: remote::PlatformMode,
     /// 被控端共享目录（`None` = 不接受文件请求）。
@@ -802,6 +804,8 @@ fn build_remote_manager(
         h265_decoder_factory,
         // 偏好与工厂就位后即按 H.265 优先协商；任一侧缺能力或环境变量禁用则回退 H.264/VP9。
         prefer_h265: opts.prefer_h265,
+        // 文字优先：开启后用 VP9（4:4:4）压过 H.264/H.265（都是 4:2:0）。
+        prefer_444: opts.prefer_444,
     });
     // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
     manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);
@@ -823,6 +827,7 @@ fn gui_manager_options(
     auto_lock_on_disconnect: bool,
     native_resolution: bool,
     prefer_h265: bool,
+    prefer_444: bool,
 ) -> ManagerOptions {
     ManagerOptions {
         enabled,
@@ -830,6 +835,7 @@ fn gui_manager_options(
         auto_lock_on_disconnect,
         native_resolution,
         prefer_h265,
+        prefer_444,
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
@@ -854,6 +860,7 @@ fn spawn_runtime(
     initial_auto_lock: bool,
     initial_native_resolution: bool,
     initial_prefer_h265: bool,
+    initial_prefer_444: bool,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -956,6 +963,7 @@ fn spawn_runtime(
                     initial_auto_lock,
                     initial_native_resolution,
                     initial_prefer_h265,
+                    initial_prefer_444,
                 ),
             );
             app_state.set_remote(Arc::clone(&remote_manager));
@@ -1647,6 +1655,8 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             prefs.remote_native_resolution,
             // H.265 偏好与环境变量禁用合成生效值：环境变量优先（现场排障开关）。
             remote::effective_prefer_h265(prefs.remote_prefer_h265, remote::h265_disabled_by_env()),
+            // 文字优先（4:4:4）：开启后协商优先选 VP9（4:4:4），压过 H.264/H.265。
+            prefs.remote_prefer_444,
         );
     }
 

@@ -359,6 +359,10 @@ fn status_tone(message: &str) -> Tone {
 ///
 /// 原生分辨率的语义有意保守：**只对硬件 H.264/H.265 生效**（VP9 软件解码 4K 在控制器侧
 /// 37–58 ms/帧），且只影响**下一次**会话（运行中的会话不重建编码器、不插 IDR）。
+#[expect(
+    clippy::too_many_lines,
+    reason = "「远程」组的所有开关与说明文字放在一起才看得出彼此取舍，拆函数反而割裂上下文"
+)]
 fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteManager>>) -> bool {
     let p = palette(ui.style());
     let mut changed = false;
@@ -414,6 +418,33 @@ fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteMan
                     "只在双方硬件/系统都支持 H.265 时生效（被控端 NVENC/硬件 MFT 编码，\
                      控制器 HEVC Video Extensions 解码）。任一侧缺能力自动回退 H.264，再不行回退 VP9。\
                      环境变量 RUST_TUNNEL_DISABLE_H265=1 会强制关闭，优先于本开关。",
+                )
+                .size(12.0)
+                .color(p.text_weak),
+            );
+
+            ui.add_space(10.0);
+            // 文字优先（4:4:4）：优先级高于 H.265，用 VP9 profile 1 压过 H.264/H.265。
+            let mut prefer_444 = prefs.remote_prefer_444;
+            if widgets::switch_row(
+                ui,
+                "文字优先（4:4:4，VP9）",
+                Some("色度不子采样，文字彩边最少；VP9 是软件编码，CPU 占用更高，4K 不建议"),
+                &mut prefer_444,
+            ) {
+                prefs.remote_prefer_444 = prefer_444;
+                if let Some(manager) = manager {
+                    manager.set_prefer_444(prefer_444);
+                }
+                tracing::info!("文字优先（4:4:4）:{}", if prefer_444 { "开" } else { "关" });
+                changed = true;
+            }
+            ui.label(
+                RichText::new(
+                    "色度不子采样，ClearType 文字的彩边最少（H.264/H.265 都是 4:2:0）。\
+                     优先级高于 H.265：开启后即使双方都支持 H.264/H.265 也优先协商 VP9。\
+                     代价是 VP9 为软件编码、CPU 占用更高，4K 分辨率不建议开启。\
+                     控制器不支持 VP9 时按原规则回落 H.264/H.265；运行中修改下次会话生效。",
                 )
                 .size(12.0)
                 .color(p.text_weak),
@@ -575,12 +606,17 @@ fn service_page(ui: &mut Ui, prefs: &GuiPrefs, app_state: &Arc<AppState>, servic
                     let prefer_h265 = app_state
                         .remote()
                         .is_some_and(|manager| manager.prefer_h265());
+                    // 4:4:4（VP9）优先也是被控端本机偏好：优先级高于 H.265，同样带进 host.toml。
+                    let prefer_444 = app_state
+                        .remote()
+                        .is_some_and(|manager| manager.prefer_444());
                     HostSeed::from_config(
                         &config,
                         approval,
                         auto_lock,
                         native,
                         prefer_h265,
+                        prefer_444,
                         prefs.remote_latency_log,
                         prefs.remote_latency_log_frames,
                     )

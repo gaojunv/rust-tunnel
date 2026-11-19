@@ -172,6 +172,14 @@ pub struct GuiPrefs {
     /// **下一次会话**生效（引擎在会话建立时读一次）。
     #[serde(default = "default_true")]
     pub remote_prefer_h265: bool,
+    /// 是否**优先 4:4:4（VP9 profile 1）**编码（默认关闭）。
+    ///
+    /// 开启后即使双方都支持 H.264/H.265 也优先协商 VP9：VP9 的 I444 色度不子采样，
+    /// ClearType 文字的彩边最少；代价是软件编码、CPU 占用更高（4K 不建议开启）。
+    /// 优先级高于 [`GuiPrefs::remote_prefer_h265`]。只在**被控端**生效，运行中修改只对
+    /// **下一次会话**生效（引擎在会话建立时读一次）。
+    #[serde(default)]
+    pub remote_prefer_444: bool,
     /// 远程控制**分阶段延迟诊断日志**开关（默认关闭）。
     ///
     /// 打开后引擎每秒输出一行阶段汇总（采集/编码/发送/网络/解码/上屏），慢帧另打明细，
@@ -220,6 +228,8 @@ impl Default for GuiPrefs {
             remote_native_resolution_migrated: false,
             // 与字段上的 `#[serde(default = "default_true")]` 保持一致。
             remote_prefer_h265: true,
+            // `#[serde(default)]` 即 `false`：默认走 H.264 硬件编码（GPU 色度修复路径）。
+            remote_prefer_444: false,
             remote_latency_log: false,
             remote_latency_log_frames: false,
             update_auto_check: true,
@@ -529,6 +539,26 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert!(!reparsed.remote_prefer_h265);
+    }
+
+    /// 4:4:4（VP9）优先默认**关闭**，缺键的旧配置也落到关闭，用户显式打开后能 TOML 往返保留。
+    #[test]
+    fn prefer_444_defaults_off_and_survives_roundtrip() {
+        assert!(
+            !GuiPrefs::default().remote_prefer_444,
+            "全新安装应默认关闭（默认走 H.264 硬件编码）"
+        );
+        // 缺键的旧配置也落到 false（serde default = false）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(!prefs.remote_prefer_444, "旧配置缺该键应默认关闭");
+        // 往返保留用户选择（显式打开）。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_prefer_444: true,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(reparsed.remote_prefer_444);
     }
 
     /// 原生分辨率迁移只跑一次：旧配置（键为 false、无迁移标志）被改成 true 并落标志，

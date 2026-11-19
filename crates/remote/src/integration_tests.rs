@@ -313,6 +313,7 @@ fn manager_with_dirs(
         h265_encoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        prefer_444: false,
     })
 }
 
@@ -654,6 +655,7 @@ async fn wrong_token_is_rejected_by_controlled() {
         h264_encoder_factory: None,
         h265_encoder_factory: None,
         prefer_h265: true,
+        prefer_444: false,
         lock_on_disconnect: Arc::new(AtomicBool::new(false)),
     };
     let ctrl_cfg = ControllerConfig {
@@ -737,6 +739,7 @@ async fn correct_token_completes_handshake_and_streams() {
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            prefer_444: false,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
@@ -1426,6 +1429,7 @@ async fn handshake_against_unregistered_token(
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            prefer_444: false,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
