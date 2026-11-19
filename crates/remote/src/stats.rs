@@ -8,6 +8,7 @@
 //! [`crate::session::SessionMessage::HostStats`]（那是一次显式的版本升级：两端必须同为 v8）；
 //! 收到后由控制器循环转成 [`SessionStats::Host`] 喂进本通道，与本机读数共用同一条 UI 通路。
 
+use crate::audio::{AudioPlaybackStats, AudioState};
 use crate::session::{CodecId, HostStats};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -213,6 +214,10 @@ pub enum SessionStats {
         /// 请求原因。
         reason: KeyframeReason,
     },
+    /// 对端音频状态（控制器收到 `AudioStatus` 时上报）。
+    Audio(AudioState),
+    /// 本端音频播放读数（控制器每秒一次）。
+    AudioPlayback(AudioPlaybackStats),
 }
 
 /// 上报句柄。

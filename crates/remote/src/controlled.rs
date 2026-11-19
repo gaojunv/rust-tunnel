@@ -12,13 +12,15 @@
 //! 采集(spawn_blocking) --有界(1)--> 编码任务(spawn_blocking) --有界(SCREEN_QUEUE)--> 发送(独占 writer)
 //! ```
 //!
-//! # 出站三档队列（阶段 10）
+//! # 出站五档队列（阶段 10 起）
 //!
-//! 写半边由**独立写任务**独占（[`writer_loop`]），主循环只投递帧。队列按优先级分成四档，
-//! 写任务用 `select! { biased; ... }` 固定按 **close → ctrl → screen → file** 取帧：
+//! 写半边由**独立写任务**独占（[`writer_loop`]），主循环只投递帧。队列按优先级分成五档，
+//! 写任务用 `select! { biased; ... }` 固定按 **close → ctrl → audio → screen → file** 取帧：
 //!
 //! - **close**：收尾 `Bye`，无界通道，最高优先，不理会取消令牌；
 //! - **ctrl**（深度 [`CTRL_QUEUE`]）：心跳/输入/QoS/剪贴板/文件协议小消息，可取消地等、绝不丢；
+//! - **audio**（深度 [`AUDIO_QUEUE`]）：`AudioPacket`，只 `try_send`，满则丢最新包（播放侧 PLC
+//!   抹平）。排在画面之前，因为音频对时延更敏感，而 96 kbps 的体量不可能饿死画面；
 //! - **screen**（深度 [`SCREEN_QUEUE`]）：`VideoPacket`/`RegionUpdate`/`ScreenConfig`，可取消地等、
 //!   绝不丢（时域参考链不能断）；
 //! - **file**（深度 [`FILE_QUEUE`]）：只有 `FileChunk` 及其收尾（`FileDone`/`FileError`）。主循环
@@ -121,6 +123,7 @@
 //! - **QoS 闭环在补丁模式下暂停**：控制器此时不解码视频，`decode_ms`/`recv_kbps` 是陈旧值，
 //!   喂给 AIMD 只会制造假拥塞。回到全帧后的下一条 `QosFeedback` 自然恢复闭环。
 
+use crate::audio::{AudioSource, AudioState};
 use crate::auth::{ack_mac, PendingSessions};
 use crate::codec::{vp9_encoder_factory, VideoEncoderApi, VideoEncoderFactory};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
@@ -149,7 +152,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval_at, sleep, timeout, Instant, MissedTickBehavior, Sleep};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
@@ -191,6 +194,13 @@ pub(crate) const SCREEN_QUEUE: usize = 2;
 /// 主循环只在有空位时取下一块，队列容量就是这个方向唯一的背压。
 pub(crate) const FILE_QUEUE: usize = 2;
 
+/// 音频队列深度。
+///
+/// 音频帧 20 ms、约 270 B；8 深 = 160 ms 的抖动吸收窗口。**满则丢最新包**（播放侧用
+/// Opus PLC 抹平），绝不阻塞主循环、也不与画面抢队头——音频排在 ctrl 之后、screen 之前，
+/// 因为它的时延比画面更敏感，而 96 kbps 的体量不可能饿死画面。
+pub(crate) const AUDIO_QUEUE: usize = 8;
+
 /// 编码侧读数的上报间隔（见 [`EncodeStatsWindow`]）。
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -217,6 +227,8 @@ pub(crate) enum OutboundClass {
     Control,
     /// 画面数据（`VideoPacket` / `RegionUpdate` / `ScreenConfig`）：可取消地等空位，**绝不丢**。
     Screen,
+    /// 音频数据（`AudioPacket`）：只 `try_send`，满则**丢最新包**（播放侧 PLC 抹平）。
+    Audio,
     /// 文件数据块与收尾（`FileChunk` / `FileDone` / `FileError`）：只用 `try_send`，满则暂存。
     File,
 }
@@ -234,6 +246,7 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
         SessionMessage::VideoPacket { .. }
         | SessionMessage::RegionUpdate { .. }
         | SessionMessage::ScreenConfig { .. } => OutboundClass::Screen,
+        SessionMessage::AudioPacket { .. } => OutboundClass::Audio,
         SessionMessage::FileChunk { .. }
         | SessionMessage::FileDone { .. }
         | SessionMessage::FileError { .. } => OutboundClass::File,
@@ -258,6 +271,9 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
         | SessionMessage::CodecSelect { .. }
         | SessionMessage::SetFrameRate { .. }
         | SessionMessage::LockScreen
+        // 音频状态与启停：小而关键，**绝不能丢**（丢了控制端会停在旧状态）。
+        | SessionMessage::AudioStatus { .. }
+        | SessionMessage::SetAudioEnabled { .. }
         // 被控端每秒一条的整机遥测：小结构、时延不敏感，但**绝不能丢**，否则控制器的角标
         // 会停在旧读数上——与其它控制帧同档。
         | SessionMessage::HostStats(_)
@@ -278,6 +294,7 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
 /// 写任务不能为了拿到最新值而去等队列。
 pub(crate) struct OutboundQueues {
     ctrl: mpsc::Sender<SessionFrame>,
+    audio: mpsc::Sender<SessionFrame>,
     screen: mpsc::Sender<SessionFrame>,
     file: mpsc::Sender<SessionFrame>,
     close: mpsc::UnboundedSender<SessionFrame>,
@@ -288,6 +305,7 @@ pub(crate) struct OutboundQueues {
 /// [`OutboundQueues`] 的另一半：四个接收端，整体移交给 [`writer_loop`]。
 pub(crate) struct OutboundReceivers {
     ctrl: mpsc::Receiver<SessionFrame>,
+    audio: mpsc::Receiver<SessionFrame>,
     screen: mpsc::Receiver<SessionFrame>,
     file: mpsc::Receiver<SessionFrame>,
     close: mpsc::UnboundedReceiver<SessionFrame>,
@@ -300,6 +318,7 @@ impl OutboundQueues {
     #[must_use]
     pub(crate) fn new() -> (Self, OutboundReceivers) {
         let (ctrl_tx, ctrl_rx) = mpsc::channel(CTRL_QUEUE);
+        let (audio_tx, audio_rx) = mpsc::channel(AUDIO_QUEUE);
         let (screen_tx, screen_rx) = mpsc::channel(SCREEN_QUEUE);
         let (file_tx, file_rx) = mpsc::channel(FILE_QUEUE);
         let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -308,6 +327,7 @@ impl OutboundQueues {
         (
             Self {
                 ctrl: ctrl_tx,
+                audio: audio_tx,
                 screen: screen_tx,
                 file: file_tx,
                 close: close_tx,
@@ -316,6 +336,7 @@ impl OutboundQueues {
             },
             OutboundReceivers {
                 ctrl: ctrl_rx,
+                audio: audio_rx,
                 screen: screen_rx,
                 file: file_rx,
                 close: close_rx,
@@ -341,6 +362,16 @@ impl OutboundQueues {
     /// 画面发送端的克隆（编码任务需要独立持有）。
     pub(crate) fn screen_sender(&self) -> mpsc::Sender<SessionFrame> {
         self.screen.clone()
+    }
+
+    /// 控制队列的克隆（音频监督任务用它上报 `AudioStatus`）。
+    pub(crate) fn ctrl_sender(&self) -> mpsc::Sender<SessionFrame> {
+        self.ctrl.clone()
+    }
+
+    /// 音频队列的克隆（音频采集任务用它投递 `AudioPacket`）。
+    pub(crate) fn audio_sender(&self) -> mpsc::Sender<SessionFrame> {
+        self.audio.clone()
     }
 
     /// 当前画面队列里的在途帧数（QoS 的 `local_backlog` 读数）。
@@ -382,6 +413,7 @@ impl OutboundQueues {
                 Ok(())
             }
             OutboundClass::Control => self.enqueue_ctrl(cancel, frame).await,
+            OutboundClass::Audio => self.try_enqueue_audio(frame),
             OutboundClass::Screen => self.enqueue_screen(cancel, frame).await,
             OutboundClass::File => self.try_enqueue_file(frame.message),
         }
@@ -441,6 +473,20 @@ impl OutboundQueues {
         match self.screen.try_send(frame) {
             Ok(()) => Ok(None),
             Err(mpsc::error::TrySendError::Full(frame)) => Ok(Some(frame)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(link_closed()),
+        }
+    }
+
+    /// **非阻塞**地把一条音频帧投进音频队列；满则**丢新包**（播放侧 Opus PLC 抹平）。
+    ///
+    /// 音频不参与「绝不丢」的承诺：它的时延比完整性更重要，而丢一帧的听感代价远小于
+    /// 阻塞会话循环或把画面挤出去。序号仍递增，播放侧据此知道有断层。
+    ///
+    /// # Errors
+    /// 写任务已结束（通道关闭）时返回错误。
+    pub(crate) fn try_enqueue_audio(&self, frame: SessionFrame) -> RemoteResult<()> {
+        match self.audio.try_send(frame) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(link_closed()),
         }
     }
@@ -1976,7 +2022,7 @@ impl ScreenSendMeter {
 }
 
 /// 被控端会话配置。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlledConfig {
     /// 会话 ID。
     pub session_id: String,
@@ -2029,6 +2075,15 @@ pub struct ControlledConfig {
     /// 由收尾守卫（[`AutoLockOnExit`]）在会话结束时**实时读取**，故用户在会话进行中打开设置
     /// 也立即生效。纯文件传输会话不创建守卫，因此不触发。
     pub lock_on_disconnect: Arc<AtomicBool>,
+    /// 可选的音频采集源（Windows GUI / 无人值守实例注入；其它平台为 `None`）。
+    ///
+    /// `None` 时被控端仍会在握手后上报一条「不可用」的 `AudioStatus`，控制端据此置灰按钮。
+    pub audio: Option<Arc<dyn AudioSource>>,
+    /// 运行期「允许转发声音」开关。
+    ///
+    /// 由用户设置（整机）与本会话的「停止转发声音」按钮共同写入；音频任务每帧读取，
+    /// 置 false 时立即停止采集并上报带原因的状态。**只在会话进行中生效**，不落盘。
+    pub audio_allowed: Arc<AtomicBool>,
 }
 
 /// 会话收尾时按用户偏好锁定屏幕。
@@ -2427,6 +2482,44 @@ pub async fn run_controlled(
         )
         .await?;
     info!("编解码协商完成（被控端） codec={codec:?}");
+
+    // 2.6) 音频：协商完成后先上报一次能力（控制端的扬声器按钮据此可用/置灰），并按需启动
+    // 监督任务。放在 `CodecSelect` **之后**是刻意的：现有单测与会话契约都以「协商后第一帧是
+    // CodecSelect」为准。**绝不在这里开始采集**——只有控制端发 `SetAudioEnabled{true}` 才采。
+    let audio_enabled_tx = if config.mode == RemoteMode::FileTransfer {
+        let state = AudioState::unavailable("仅文件传输会话不转发声音");
+        queues
+            .enqueue_ctrl(&cancel, SessionFrame::control(state.to_message()))
+            .await?;
+        config.stats.report(SessionStats::Audio(state));
+        None
+    } else if let Some(source) = config.audio.as_ref() {
+        let mut state = source.capability();
+        if !config.audio_allowed.load(Ordering::Relaxed) {
+            state.available = false;
+            state.reason = Some("本机已停止转发声音".to_owned());
+        }
+        state.enabled = false;
+        queues
+            .enqueue_ctrl(&cancel, SessionFrame::control(state.to_message()))
+            .await?;
+        config.stats.report(SessionStats::Audio(state));
+        Some(spawn_audio_supervisor(
+            Arc::clone(source),
+            queues.ctrl_sender(),
+            queues.audio_sender(),
+            Arc::clone(&config.audio_allowed),
+            config.stats.clone(),
+            cancel.clone(),
+        ))
+    } else {
+        let state = AudioState::unavailable("本机不支持音频采集");
+        queues
+            .enqueue_ctrl(&cancel, SessionFrame::control(state.to_message()))
+            .await?;
+        config.stats.report(SessionStats::Audio(state));
+        None
+    };
 
     // 本会话的**有效编码宽度上限**：只有硬件 H.264/H.265 + 用户显式开启原生分辨率才放宽到
     // 3840（见 [`effective_max_encode_width`]）。采集侧也按它预缩放——采集实现必须与编码循环用
@@ -3593,8 +3686,17 @@ pub async fn run_controlled(
                                 }
                             }
                         }
-                        SessionMessage::LockScreen => {
-                            // 仅完全控制模式：仅观看/仅文件传输不该改变远端机器状态。
+                        SessionMessage::SetAudioEnabled { enabled } => {
+                            if let Some(tx) = &audio_enabled_tx {
+                                // 监督任务负责真正的启停与 `AudioStatus` 上报；这里只转发意图。
+                                // 本端没有采集源时忽略——握手后那条 `available:false` 已经
+                                // 告诉了控制端原因，重复回状态没有意义。
+                                let _ = tx.send(enabled);
+                            } else {
+                                debug!("本端没有音频采集源，忽略 SetAudioEnabled");
+                            }
+                        }
+                        SessionMessage::LockScreen => {                            // 仅完全控制模式：仅观看/仅文件传输不该改变远端机器状态。
                             if inject {
                                 match input.lock_screen() {
                                     Ok(()) => info!("控制端请求锁定屏幕，已执行"),
@@ -3969,8 +4071,190 @@ pub async fn run_controlled(
     result
 }
 
-/// 计算一帧的 pacing 方案：`(每块字节数, 块间等待)`；`None` = 走原来的整帧发送。
+/// 音频采集监督任务：把「控制端请求启停」翻译成阻塞采集线程的启停。
 ///
+/// 采集是阻塞的（WASAPI 20 ms 一帧），只能跑在 `spawn_blocking` 里；监督任务自己只做
+/// 状态机，不碰设备。返回的 `watch::Sender` 由主循环在收到
+/// [`SessionMessage::SetAudioEnabled`] 时写入。
+fn spawn_audio_supervisor(
+    source: Arc<dyn AudioSource>,
+    ctrl: mpsc::Sender<SessionFrame>,
+    audio: mpsc::Sender<SessionFrame>,
+    allowed: Arc<AtomicBool>,
+    stats: SessionStatsReporter,
+    cancel: CancellationToken,
+) -> watch::Sender<bool> {
+    let (enabled_tx, enabled_rx) = watch::channel(false);
+    tokio::spawn(audio_supervisor(
+        source, ctrl, audio, allowed, stats, enabled_rx, cancel,
+    ));
+    enabled_tx
+}
+
+/// 监督循环：一次只允许一个阻塞采集任务；禁用时置停止位并等它退出。
+async fn audio_supervisor(
+    source: Arc<dyn AudioSource>,
+    ctrl: mpsc::Sender<SessionFrame>,
+    audio: mpsc::Sender<SessionFrame>,
+    allowed: Arc<AtomicBool>,
+    stats: SessionStatsReporter,
+    mut enabled: watch::Receiver<bool>,
+    cancel: CancellationToken,
+) {
+    /// 已完成任务的回收间隔：采集任务自行退出（设备错误）时不阻塞下一次 enable。
+    const REAP_INTERVAL: Duration = Duration::from_millis(200);
+
+    let mut running: Option<(tokio::task::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    let mut reap = interval_at(Instant::now() + REAP_INTERVAL, REAP_INTERVAL);
+    reap.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                if let Some((_, stop)) = running.take() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
+            changed = enabled.changed() => {
+                if changed.is_err() {
+                    if let Some((_, stop)) = running.take() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    return;
+                }
+                if *enabled.borrow() {
+                    if running.is_none() {
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let task = {
+                            let source = Arc::clone(&source);
+                            let ctrl = ctrl.clone();
+                            let audio = audio.clone();
+                            let allowed = Arc::clone(&allowed);
+                            let stats = stats.clone();
+                            let stop = Arc::clone(&stop);
+                            tokio::task::spawn_blocking(move || {
+                                run_audio_capture(
+                                    &*source, &ctrl, &audio, &allowed, &stats, &stop,
+                                );
+                            })
+                        };
+                        running = Some((task, stop));
+                    }
+                } else if let Some((task, stop)) = running.take() {
+                    stop.store(true, Ordering::Relaxed);
+                    // 采集任务每 20 ms 检查一次停止位；这里等它把设备关干净再允许下一次启动。
+                    let _ = task.await;
+                }
+            }
+            _ = reap.tick() => {
+                if running.as_ref().is_some_and(|(task, _)| task.is_finished()) {
+                    if let Some((task, _)) = running.take() {
+                        let _ = task.await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 阻塞采集循环（`spawn_blocking` 内运行）。
+///
+/// 所有状态变化都直接投进控制队列（`blocking_send` 在这个阻塞线程上可接受：控制队列深
+/// 32，而状态消息每个会话只有几次）。
+fn run_audio_capture(
+    source: &dyn AudioSource,
+    ctrl: &mpsc::Sender<SessionFrame>,
+    audio: &mpsc::Sender<SessionFrame>,
+    allowed: &AtomicBool,
+    reporter: &SessionStatsReporter,
+    stop: &AtomicBool,
+) {
+    let capability = source.capability();
+    if !capability.available {
+        send_audio_status(ctrl, reporter, &capability);
+        return;
+    }
+    if !allowed.load(Ordering::Relaxed) {
+        let mut status = capability;
+        status.enabled = false;
+        status.reason = Some("本机已停止转发声音".to_owned());
+        send_audio_status(ctrl, reporter, &status);
+        return;
+    }
+    if let Err(err) = source.start() {
+        warn!(error = %err, "启动音频采集失败");
+        let mut status = capability;
+        status.enabled = false;
+        status.available = false;
+        status.reason = Some(format!("启动音频采集失败: {err}"));
+        send_audio_status(ctrl, reporter, &status);
+        return;
+    }
+
+    let mut status = capability;
+    status.enabled = true;
+    status.reason = None;
+    send_audio_status(ctrl, reporter, &status);
+
+    let mut seq = 0_u64;
+    let mut failure: Option<String> = None;
+    let mut vetoed = false;
+    while !stop.load(Ordering::Relaxed) {
+        // 用户在本会话里点了「停止转发声音」：立刻停，并把原因带回控制端。
+        if !allowed.load(Ordering::Relaxed) {
+            vetoed = true;
+            break;
+        }
+        match source.read_packet(stop) {
+            Ok(Some(packet)) => {
+                seq = seq.wrapping_add(1);
+                let frame = SessionFrame::audio(SessionMessage::AudioPacket {
+                    seq,
+                    capture_ts_us: packet.capture_ts_us,
+                    data: packet.data,
+                });
+                match audio.try_send(frame) {
+                    // 队列满：丢**最新**包（不让延迟累积），播放侧 PLC 抹平。
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+            // 实现内部的等待窗口到期，或 stop 已置位。
+            Ok(None) => {}
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    source.stop();
+
+    status.enabled = false;
+    if let Some(err) = failure {
+        status.available = false;
+        status.reason = Some(format!("音频采集中断: {err}"));
+    } else if vetoed {
+        status.reason = Some("本机已停止转发声音".to_owned());
+    } else {
+        status.reason = None;
+    }
+    send_audio_status(ctrl, reporter, &status);
+}
+
+/// 把一条 [`AudioState`] 作为 `AudioStatus` 投进控制队列（绝不丢、可阻塞发送），
+/// 同时喂本机 UI（被控端状态页的「正在转发声音」）。
+fn send_audio_status(
+    ctrl: &mpsc::Sender<SessionFrame>,
+    reporter: &SessionStatsReporter,
+    status: &AudioState,
+) {
+    let _ = ctrl.blocking_send(SessionFrame::control(status.to_message()));
+    reporter.report(SessionStats::Audio(status.clone()));
+}
+
+/// 计算一帧的 pacing 方案：`(每块字节数, 块间等待)`；`None` = 走原来的整帧发送。
 /// 抽成纯函数便于单测锁定三条上界：
 /// - 单个间隙 ≤ [`PACING_MAX_GAP`]（码率读数离谱时不会把一帧拖成秒级）；
 /// - 全部间隙之和 ≤ [`PACING_MAX_WAIT_FACTOR`] × 该帧自然串行时间；
@@ -4006,10 +4290,10 @@ fn pacing_plan(len: usize, kbps: u32) -> Option<(usize, Duration)> {
     Some((chunk, sleep))
 }
 
-/// 出站写任务：独占写半边，按**四档优先级**从队列取帧写线。
+/// 出站写任务：独占写半边，按**五档优先级**从队列取帧写线。
 ///
-/// 优先级固定为 close → ctrl → screen → file（`select!` 的 `biased`）。close 是收尾 `Bye`
-/// 专用通道，**不理会取消令牌**、限时尽力写出；其余三档在取消后不再发送。
+/// 优先级固定为 close → ctrl → audio → screen → file（`select!` 的 `biased`）。close 是收尾
+/// `Bye` 专用通道，**不理会取消令牌**、限时尽力写出；其余四档在取消后不再发送。
 ///
 /// 取消语义：普通帧的发送同时等取消令牌（[`send_cancellable`]），取消一旦触发就丢弃后续普通帧、
 /// 只等收尾帧——这样「取消能立刻打断被背压卡住的发送」与「收尾 `Bye` 仍能尽力发出」两件事同时成立。
@@ -4043,6 +4327,11 @@ pub(crate) async fn writer_loop(
                 break;
             }
             Some(frame) = rx.ctrl.recv(), if !cancelled => {
+                if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
+                    break;
+                }
+            }
+            Some(frame) = rx.audio.recv(), if !cancelled => {
                 if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
                     break;
                 }
@@ -5699,6 +5988,8 @@ mod tests {
             h265_encoder_factory: None,
             prefer_h265: true,
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+            audio: None,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -9552,9 +9843,29 @@ mod tests {
             // v8：被控端每秒遥测。必须走控制队列：它小、时延不敏感，但**绝不能丢**——
             // 落进画面队列会与帧抢带宽，落进 file 队列则会被暂存/丢弃。
             SessionMessage::HostStats(HostStats::default()),
+            // v11：音频状态与启停。小、关键、绝不能丢——与其它控制帧同档；数据包另有
+            // `Audio` 档（见下面的断言）。
+            SessionMessage::AudioStatus {
+                enabled: false,
+                available: true,
+                reason: None,
+                codec: crate::session::AudioCodec::Opus,
+                sample_rate: 48_000,
+                channels: 2,
+                bitrate_kbps: 96,
+            },
+            SessionMessage::SetAudioEnabled { enabled: true },
         ] {
             assert_eq!(outbound_class(&msg), OutboundClass::Control, "{msg:?}");
         }
+        assert_eq!(
+            outbound_class(&SessionMessage::AudioPacket {
+                seq: 1,
+                capture_ts_us: 0,
+                data: vec![0],
+            }),
+            OutboundClass::Audio
+        );
     }
 
     /// file 队列满时，文件消息只暂存、不阻塞；控制帧必须立刻投得进去。
@@ -9844,5 +10155,172 @@ mod tests {
             &[1, 2, u8::MAX],
             "暂存区必须保持 FIFO：FileDone 不能越过尚未投递的块（实际顺序 {order:?}）"
         );
+    }
+
+    /// 音频采集的假源：按需产出 `packets` 个包，随后返回 `None`（模拟设备暂无数据）。
+    struct FakeAudioSource {
+        packets: usize,
+        capability: AudioState,
+        cursor: std::sync::Mutex<usize>,
+        starts: std::sync::atomic::AtomicUsize,
+        stops: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeAudioSource {
+        fn new(packets: usize) -> Self {
+            Self {
+                packets,
+                capability: AudioState {
+                    enabled: false,
+                    available: true,
+                    reason: None,
+                    codec: crate::session::AudioCodec::Opus,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bitrate_kbps: 96,
+                },
+                cursor: std::sync::Mutex::new(0),
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                stops: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AudioSource for FakeAudioSource {
+        fn capability(&self) -> AudioState {
+            self.capability.clone()
+        }
+
+        fn start(&self) -> RemoteResult<()> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn read_packet(
+            &self,
+            stop: &AtomicBool,
+        ) -> RemoteResult<Option<crate::audio::EncodedAudio>> {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let mut cursor = self
+                .cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *cursor >= self.packets {
+                drop(cursor);
+                // 真实实现会阻塞到下一帧；这里小睡避免把测试线程空转成忙等。
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(None);
+            }
+            *cursor += 1;
+            Ok(Some(crate::audio::EncodedAudio {
+                data: vec![0xAB; 240],
+                capture_ts_us: 1_000,
+            }))
+        }
+
+        fn stop(&self) {
+            self.stops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 音频采集：开启后先上报 `enabled:true`，按序产出 `AudioPacket`，停止后上报
+    /// `enabled:false` 并调用 `stop()`。
+    #[tokio::test]
+    async fn audio_capture_emits_packets_then_reports_stopped() {
+        let source = Arc::new(FakeAudioSource::new(3));
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(8);
+        let (audio_tx, mut audio_rx) = mpsc::channel(8);
+        let allowed = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = tokio::task::spawn_blocking({
+            let source = Arc::clone(&source);
+            let allowed = Arc::clone(&allowed);
+            let stop = Arc::clone(&stop);
+            let ctrl = ctrl_tx.clone();
+            let audio = audio_tx.clone();
+            move || run_audio_capture(&*source, &ctrl, &audio, &allowed, &SessionStatsReporter::noop(), &stop)
+        });
+
+        let first = timeout(Duration::from_secs(1), ctrl_rx.recv())
+            .await
+            .expect("等待启动状态超时")
+            .expect("控制通道关闭");
+        assert!(
+            matches!(
+                first.message,
+                SessionMessage::AudioStatus {
+                    enabled: true,
+                    available: true,
+                    ..
+                }
+            ),
+            "首条状态应为 enabled=true，实得 {:?}",
+            first.message
+        );
+
+        for want in 1..=3_u64 {
+            let frame = timeout(Duration::from_secs(1), audio_rx.recv())
+                .await
+                .expect("等待音频包超时")
+                .expect("音频通道关闭");
+            match frame.message {
+                SessionMessage::AudioPacket { seq, data, .. } => {
+                    assert_eq!(seq, want, "序号必须连续递增");
+                    assert_eq!(data.len(), 240);
+                }
+                other => panic!("期望 AudioPacket，实得 {other:?}"),
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        task.await.expect("阻塞采集任务");
+        let last = ctrl_rx.recv().await.expect("控制通道关闭");
+        match last.message {
+            SessionMessage::AudioStatus { enabled, reason, .. } => {
+                assert!(!enabled);
+                assert!(reason.is_none(), "正常停止不应带原因");
+            }
+            other => panic!("期望 AudioStatus，实得 {other:?}"),
+        }
+        assert_eq!(source.starts.load(Ordering::Relaxed), 1);
+        assert_eq!(source.stops.load(Ordering::Relaxed), 1);
+    }
+
+    /// 本地否决位为 false 时：不启动设备、不产包，只回一条带原因的状态。
+    #[tokio::test]
+    async fn audio_capture_respects_local_veto() {
+        let source = Arc::new(FakeAudioSource::new(3));
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(4);
+        let (audio_tx, mut audio_rx) = mpsc::channel(4);
+        let allowed = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+
+        // 真实路径也在 `spawn_blocking` 里：`blocking_send` 不能在 async worker 上调用。
+        let task = tokio::task::spawn_blocking({
+            let source = Arc::clone(&source);
+            let ctrl = ctrl_tx.clone();
+            let audio = audio_tx.clone();
+            move || run_audio_capture(&*source, &ctrl, &audio, &allowed, &SessionStatsReporter::noop(), &stop)
+        });
+        task.await.expect("阻塞采集任务");
+
+        let msg = ctrl_rx.recv().await.expect("控制通道关闭");
+        match msg.message {
+            SessionMessage::AudioStatus {
+                enabled,
+                available,
+                reason,
+                ..
+            } => {
+                assert!(!enabled);
+                assert!(available);
+                assert_eq!(reason.as_deref(), Some("本机已停止转发声音"));
+            }
+            other => panic!("期望 AudioStatus，实得 {other:?}"),
+        }
+        assert!(audio_rx.try_recv().is_err(), "否决时不应产生音频包");
+        assert_eq!(source.starts.load(Ordering::Relaxed), 0);
     }
 }

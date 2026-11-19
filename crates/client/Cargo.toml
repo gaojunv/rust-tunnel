@@ -20,7 +20,7 @@ name = "rust-tunnel-client"
 # 0.22.0 = 数据面 v10（`CodecId::H265` + `CodecOffer.h265`）：双方支持时自动优先
 #          H.265/HEVC，任一侧缺硬件/系统解码器或建编码器失败时回退 H.264 → VP9。
 #          两端必须同为 0.22.0（0.21 ↔ 0.22 在握手阶段被硬相等校验干净拒绝）。
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"

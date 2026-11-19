@@ -56,6 +56,7 @@
 pub mod approval;
 pub mod auth;
 pub mod clock;
+pub mod audio;
 pub mod codec;
 pub mod controller;
 pub mod controlled;
@@ -81,6 +82,9 @@ pub mod video;
 mod integration_tests;
 
 pub use approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
+pub use audio::{
+    AudioPlaybackStats, AudioSink, AudioSource, AudioState, EncodedAudio, ReceivedAudio,
+};
 pub use codec::{
     vp9_decoder_factory, vp9_encoder_factory, VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi,
     VideoEncoderFactory, Vp9DecoderFactory, Vp9EncoderFactory,
@@ -100,9 +104,9 @@ pub use screen::{
     KeyEvent, MouseButton, QualityPreset, RawFrame, ScreenSource,
 };
 pub use session::{
-    CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, HostActivity, HostStats, LIVENESS_TIMEOUT, Lane,
-    MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd, SessionFrame, SessionMessage,
-    VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
+    AudioCodec, CodecId, ControllerHandshake, HEARTBEAT_INTERVAL, HostActivity, HostStats,
+    LIVENESS_TIMEOUT, Lane, MAX_SESSION_FRAME, SESSION_PROTO_VERSION, SessionEnd, SessionFrame,
+    SessionMessage, VIDEO_FLAG_CONFIG, VIDEO_FLAG_KEYFRAME, plan_controller_handshake,
 };
 pub use stats::{KeyframeReason, SessionStats, SessionStatsReporter, TransportStats};
 pub use transfer::{

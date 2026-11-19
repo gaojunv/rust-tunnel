@@ -37,6 +37,19 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
+/// # 版本 11
+///
+/// 追加了**音频转发**：新 [`Lane::Audio`]（线上字节 3）与 [`SessionMessage`] 末尾的三个
+/// 变体 [`SessionMessage::AudioStatus`]（判别式 30）、[`SessionMessage::AudioPacket`]（31）、
+/// [`SessionMessage::SetAudioEnabled`]（32），另有字段类型 [`AudioCodec`]。
+///
+/// 老端在 bincode 解码时会因未知判别式或未知 lane 值失败，故版本号必须抬，且**两端必须同为
+/// v11**——旧端（v10）会在握手阶段被 `Hello.proto_version` 的硬相等校验干净拒绝（回
+/// `HelloAck{accepted:false}`），不会退化成硬断链。`Hello` / `HelloAck` / `DisplayInfo` 的
+/// 字节形状**一个字都没动**（两条机械锁守着），所以这条拒绝路径仍然成立。
+///
+/// 发布顺序同 v10：**先把携带 v11 的客户端铺开，再部署依赖它的服务端门控**。
+///
 /// # 版本 10
 ///
 /// 为 H.265/HEVC 追加了 [`CodecId::H265`]（判别式 2）与 [`SessionMessage::CodecOffer`] 的
@@ -111,7 +124,7 @@ use tokio_util::codec::{Decoder, Encoder};
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
 /// `MIN_REMOTE_CLIENT_VERSION`）。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 10;
+pub const SESSION_PROTO_VERSION: u16 = 11;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -180,6 +193,8 @@ pub enum Lane {
     Screen = 1,
     /// 文件（阶段 2）。
     File = 2,
+    /// 音频（阶段 3：被控端系统声音 → 控制端）。
+    Audio = 3,
 }
 
 impl Lane {
@@ -196,6 +211,7 @@ impl Lane {
             0 => Some(Self::Control),
             1 => Some(Self::Screen),
             2 => Some(Self::File),
+            3 => Some(Self::Audio),
             _ => None,
         }
     }
@@ -226,8 +242,17 @@ pub enum CodecId {
     H265,
 }
 
-/// [`SessionMessage::VideoPacket::flags`]：本包携带编码器配置变更（编码尺寸/色度格式）。
+/// 音频编解码器标识。
 ///
+/// 它只出现在 [`SessionMessage::AudioStatus`] 里，不是 `SessionMessage` 的新变体，但判别式
+/// 顺序仍是**线上契约**：`Opus = 0`，新值一律追加在末尾。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    /// Opus（RFC 6716），48 kHz 立体声、20 ms 帧。
+    Opus,
+}
+
+/// [`SessionMessage::VideoPacket::flags`]：本包携带编码器配置变更（编码尺寸/色度格式）。///
 /// 收到它意味着后续帧的几何/格式可能与之前不同，解码侧应重建解码器并等待关键帧。
 pub const VIDEO_FLAG_CONFIG: u8 = 0b0000_0001;
 
@@ -560,6 +585,47 @@ pub enum SessionMessage {
         /// 当前形状。
         shape: CursorShape,
     },
+    // ── 音频转发（阶段 3；v11 追加在末尾）──
+    /// 被控端音频状态（可用性 + 启停结果 + 采集格式；被控端 → 控制端，走 `Control` lane）。
+    ///
+    /// 握手加密完成后立即发一条（`enabled: false`），此后只在**可用性或启停状态变化时**
+    /// 重发。控制端据此决定工具条扬声器按钮是否可点、以及在不可用时给出原因。
+    AudioStatus {
+        /// 采集是否**已启动**（仅当 `available && enabled` 时为真）。
+        enabled: bool,
+        /// 本端是否具备音频采集能力（设备存在、设置允许、会话模式允许）。
+        available: bool,
+        /// 不可用/被停止的原因（中文，可直接上 UI）；正常时为 `None`。
+        reason: Option<String>,
+        /// 编解码器。
+        codec: AudioCodec,
+        /// 采样率（Hz）。
+        sample_rate: u32,
+        /// 声道数。
+        channels: u8,
+        /// 目标码率（kbps）。
+        bitrate_kbps: u16,
+    },
+    /// 一段编码后的音频（20 ms 一帧；被控端 → 控制端，走 [`Lane::Audio`]）。
+    ///
+    /// 音频**不参与视频的 `seq`/关键帧体系**：序号只用于播放侧抖动缓冲的重排与丢帧检测。
+    /// 音频帧允许在**发送侧**因队列满而丢弃（播放侧用 Opus PLC 抹平），但不会被可靠层丢弃。
+    AudioPacket {
+        /// 帧序号（被控端递增，从 1 开始；本地丢弃会形成断层）。
+        seq: u64,
+        /// 该帧**采集完成**的时刻（被控端单调时钟，微秒；语义同视频的 `capture_ts_us`）。
+        capture_ts_us: u64,
+        /// 不透明编码数据（当前是 Opus 包）。
+        data: Vec<u8>,
+    },
+    /// 控制端请求启停音频采集（控制端 → 被控端，走 `Control` lane，绝不丢）。
+    ///
+    /// 被控端只在**完全控制 / 仅观看**会话里接受它；仅文件传输会话返回带原因的
+    /// [`SessionMessage::AudioStatus`]。控制端静音时同时发 `enabled: false`，避免白占带宽。
+    SetAudioEnabled {
+        /// `true` = 请求开始转发；`false` = 立即停止（会话保持）。
+        enabled: bool,
+    },
 }
 
 /// 由**变化面积**推出的内容活跃等级（被控端本地 `qos` 的判断，随 [`HostStats`] 上报展示）。
@@ -723,6 +789,15 @@ impl SessionFrame {
     pub fn file(message: SessionMessage) -> Self {
         Self {
             lane: Lane::File,
+            message,
+        }
+    }
+
+    /// 构造一个 `Audio` 通道帧。
+    #[must_use]
+    pub fn audio(message: SessionMessage) -> Self {
+        Self {
+            lane: Lane::Audio,
             message,
         }
     }
@@ -1694,6 +1769,33 @@ mod tests {
                 SessionMessage::CursorShape { shape: CursorShape::IBeam },
                 29,
             ),
+            (
+                "AudioStatus",
+                SessionMessage::AudioStatus {
+                    enabled: true,
+                    available: true,
+                    reason: None,
+                    codec: AudioCodec::Opus,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bitrate_kbps: 96,
+                },
+                30,
+            ),
+            (
+                "AudioPacket",
+                SessionMessage::AudioPacket {
+                    seq: 1,
+                    capture_ts_us: 0,
+                    data: vec![],
+                },
+                31,
+            ),
+            (
+                "SetAudioEnabled",
+                SessionMessage::SetAudioEnabled { enabled: true },
+                32,
+            ),
         ];
         for (name, msg, want) in &cases {
             let bytes = bincode::serialize(msg).unwrap();
@@ -1784,6 +1886,54 @@ mod tests {
             let got = u32::from_le_bytes(bytes[..4].try_into().unwrap());
             assert_eq!(got, want, "CodecId::{codec:?} 的判别式错位");
         }
+    }
+
+    /// **`AudioCodec` 判别式锁**：线上枚举只能追加，不能插入/重排。
+    #[test]
+    fn audio_codec_discriminants_are_stable() {
+        let bytes = bincode::serialize(&AudioCodec::Opus).unwrap();
+        let got = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        assert_eq!(got, 0, "AudioCodec::Opus 的判别式错位");
+    }
+
+    /// **音频消息编解码 + lane 契约**：`AudioPacket` 走 `Audio` lane；状态与启停走 `Control`
+    /// （它们绝不能丢，且与视频/音频数据面无关）。
+    #[test]
+    fn audio_messages_roundtrip() {
+        let cases = vec![
+            (
+                SessionMessage::AudioStatus {
+                    enabled: true,
+                    available: true,
+                    reason: Some("设备切换中".into()),
+                    codec: AudioCodec::Opus,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bitrate_kbps: 96,
+                },
+                Lane::Control,
+            ),
+            (
+                SessionMessage::AudioPacket {
+                    seq: 7,
+                    capture_ts_us: 1_234_567,
+                    data: vec![1, 2, 3, 4],
+                },
+                Lane::Audio,
+            ),
+            (
+                SessionMessage::SetAudioEnabled { enabled: false },
+                Lane::Control,
+            ),
+        ];
+        for (message, lane) in cases {
+            let got = codec_roundtrip(message.clone(), lane);
+            assert_eq!(got.lane, lane, "{message:?}");
+            assert_eq!(got.message, message);
+        }
+        assert_eq!(Lane::from_u8(3), Some(Lane::Audio));
+        assert_eq!(Lane::Audio.as_u8(), 3);
+        assert_eq!(Lane::from_u8(4), None);
     }
 
     /// **`Hello` / `HelloAck` 字节恒等测试**：固定输入编码后比对精确字节向量。

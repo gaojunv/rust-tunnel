@@ -359,12 +359,16 @@ fn status_tone(message: &str) -> Tone {
 ///
 /// 原生分辨率的语义有意保守：**只对硬件 H.264/H.265 生效**（VP9 软件解码 4K 在控制器侧
 /// 37–58 ms/帧），且只影响**下一次**会话（运行中的会话不重建编码器、不插 IDR）。
+#[expect(
+    clippy::too_many_lines,
+    reason = "一个设置卡片按顺序平铺所有远程开关；拆开只会让「哪些项在这里」更难找"
+)]
 fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteManager>>) -> bool {
     let p = palette(ui.style());
     let mut changed = false;
     widgets::card_titled(
         ui,
-        "远程控制 · 编码与诊断",
+        "远程控制 · 编码、声音与诊断",
         Some("本机作为被控端时生效；运行中修改在下次会话生效"),
         |ui| {
             let mut on = prefs.remote_native_resolution;
@@ -414,6 +418,34 @@ fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteMan
                     "只在双方硬件/系统都支持 H.265 时生效（被控端 NVENC/硬件 MFT 编码，\
                      控制器 HEVC Video Extensions 解码）。任一侧缺能力自动回退 H.264，再不行回退 VP9。\
                      环境变量 RUST_TUNNEL_DISABLE_H265=1 会强制关闭，优先于本开关。",
+                )
+                .size(12.0)
+                .color(p.text_weak),
+            );
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            // 被控端声音转发总开关。控制端的「本次会话是否开声/音量」在会话工具条上，
+            // 由 `RemoteView` 镜像并自动落盘（设置页与它共享同一字段会互相覆盖）。
+            let mut audio_allowed = prefs.remote_audio_allowed;
+            if widgets::switch_row(
+                ui,
+                "允许向对端转发本机系统声音",
+                Some("被控端；关闭后不会打开 loopback 设备，对端会看到「本机已停止转发声音」"),
+                &mut audio_allowed,
+            ) {
+                prefs.remote_audio_allowed = audio_allowed;
+                if let Some(manager) = manager {
+                    manager.set_audio_allowed(audio_allowed);
+                }
+                tracing::info!("允许转发系统声音：{}", if audio_allowed { "开" } else { "关" });
+                changed = true;
+            }
+            ui.label(
+                RichText::new(
+                    "只采集默认回放设备的系统声音（不含麦克风）。会话被批准后才可能开始采集，\
+                     控制端可随时静音；声音与画面共用同一条加密会话流。",
                 )
                 .size(12.0)
                 .color(p.text_weak),
@@ -581,6 +613,7 @@ fn service_page(ui: &mut Ui, prefs: &GuiPrefs, app_state: &Arc<AppState>, servic
                         auto_lock,
                         native,
                         prefer_h265,
+                        prefs.remote_audio_allowed,
                         prefs.remote_latency_log,
                         prefs.remote_latency_log_frames,
                     )

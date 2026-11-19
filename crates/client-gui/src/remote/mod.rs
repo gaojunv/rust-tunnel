@@ -43,6 +43,37 @@ pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
 pub use view_scale::{display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER};
 
+// 音频平台适配（WASAPI loopback + Opus 编码 / 播放）；只在 Windows 编译。
+#[cfg(target_os = "windows")]
+mod audio;
+
+/// 本端音频端点：被控端采集源 + 控制端播放器。非 Windows 全为 `None`。
+pub struct AudioEndpoints {
+    /// 被控端音频采集源。
+    pub source: Option<Arc<dyn rust_tunnel_remote::AudioSource>>,
+    /// 控制端音频播放器。
+    pub sink: Option<Arc<dyn rust_tunnel_remote::AudioSink>>,
+}
+
+/// 构造本端音频端点。
+///
+/// Windows 上两端都注入（同一进程既可能是控制器也可能是被控端）；其它平台返回空，
+/// 引擎会向对端上报「本机不支持音频」。
+#[must_use]
+pub fn audio_endpoints() -> AudioEndpoints {
+    #[cfg(target_os = "windows")]
+    {
+        audio::endpoints()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        AudioEndpoints {
+            source: None,
+            sink: None,
+        }
+    }
+}
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -1825,6 +1856,13 @@ pub struct RemoteView {
     pub quality: QualityPreset,
     /// 本会话是否已把画质下发给被控端；会话结束时复位，下一场重新下发。
     quality_sent: bool,
+    /// 控制端是否请求转发声音（持久化镜像，见 `GuiPrefs::remote_audio_enabled`）。
+    ///
+    /// 工具条扬声器改它并调用 `RemoteManager::set_audio_enabled`（同时作用于当前会话与
+    /// 下一次会话）；`GuiApp::sync_display_prefs` 回写 `gui.toml`。
+    pub audio_enabled: bool,
+    /// 本机播放音量（0–100，持久化镜像，见 `GuiPrefs::remote_audio_volume`）。
+    pub audio_volume: u8,
     /// 窗口尺寸档位（持久化镜像）。
     pub window_size: WindowSize,
     /// 当前应下发给子窗口的内尺寸（builder 里带着它，变化时 `patch` 会自动发 `InnerSize`）。
@@ -1935,6 +1973,8 @@ impl RemoteView {
             settings_open: false,
             quality: QualityPreset::default(),
             quality_sent: false,
+            audio_enabled: true,
+            audio_volume: 100,
             window_size: WindowSize::default(),
             inner_size: egui::vec2(960.0, 600.0),
             toolbar_visible: true,
@@ -1993,6 +2033,8 @@ impl RemoteView {
         view.toolbar_collapsed = prefs.remote_toolbar_collapsed;
         view.frame_rate = prefs.remote_frame_rate;
         view.quality = prefs.remote_quality;
+        view.audio_enabled = prefs.remote_audio_enabled;
+        view.audio_volume = prefs.remote_audio_volume.min(100);
         view
     }
 

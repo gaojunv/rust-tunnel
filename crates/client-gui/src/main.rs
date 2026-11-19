@@ -510,6 +510,14 @@ impl GuiApp {
             self.prefs.remote_quality = view.quality;
             changed = true;
         }
+        if self.prefs.remote_audio_enabled != view.audio_enabled {
+            self.prefs.remote_audio_enabled = view.audio_enabled;
+            changed = true;
+        }
+        if self.prefs.remote_audio_volume != view.audio_volume {
+            self.prefs.remote_audio_volume = view.audio_volume;
+            changed = true;
+        }
         drop(view);
         if changed {
             if let Err(e) = prefs::save(&self.prefs) {
@@ -761,6 +769,12 @@ struct ManagerOptions {
     share_dir: Option<PathBuf>,
     /// 控制器下载文件的落盘目录。
     download_dir: PathBuf,
+    /// 控制端会话开始时是否请求转发声音（GUI 取自偏好；实例没有控制器，恒 `false`）。
+    audio_enabled: bool,
+    /// 被控端是否允许转发声音（GUI 取自偏好；实例取自 `host.toml`）。
+    audio_allowed: bool,
+    /// 控制端本地播放音量（0–100）。
+    audio_volume: u8,
 }
 
 /// 构造远程控制引擎（配置就绪后调用一次）。
@@ -783,6 +797,7 @@ fn build_remote_manager(
         h265_encoder: h265_encoder_factory,
         h265_decoder: h265_decoder_factory,
     } = remote::hardware_factories();
+    let audio = remote::audio_endpoints();
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),
         self_client_name: config.name.clone().unwrap_or_default(),
@@ -802,9 +817,17 @@ fn build_remote_manager(
         h265_decoder_factory,
         // 偏好与工厂就位后即按 H.265 优先协商；任一侧缺能力或环境变量禁用则回退 H.264/VP9。
         prefer_h265: opts.prefer_h265,
+        // 音频：Windows 上同时注入采集源与播放器；其它平台为空（引擎会向对端上报不可用）。
+        // 是否真的开始转发由控制端 `SetAudioEnabled` 驱动，构造这里不打开设备。
+        audio_source: audio.source,
+        audio_sink: audio.sink,
+        audio_enabled: opts.audio_enabled,
+        audio_allowed: Arc::new(AtomicBool::new(opts.audio_allowed)),
     });
     // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
     manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);
+    // 播放音量同理：它是本地增益，直接作用于已注入的 AudioSink。
+    manager.set_audio_volume(u32::from(opts.audio_volume));
     // 平台实现在这里**一次性**选定：引擎受理会话时就把 `Arc<dyn ScreenSource>` /
     // `Arc<dyn InputSink>` 克隆走了，之后 `install_platform` 再覆盖对已建立的会话无效。
     let release = remote::install_platform(&manager, opts.platform_mode);
@@ -815,6 +838,7 @@ fn build_remote_manager(
 /// 且与用户的个人目录隔离（用户要换目录只需在这里改一处）。
 #[expect(
     clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
     reason = "参数与 `GuiPrefs` 的开关一一对应，打包成结构体只会让调用点多一层样板"
 )]
 fn gui_manager_options(
@@ -823,6 +847,9 @@ fn gui_manager_options(
     auto_lock_on_disconnect: bool,
     native_resolution: bool,
     prefer_h265: bool,
+    audio_enabled: bool,
+    audio_allowed: bool,
+    audio_volume: u8,
 ) -> ManagerOptions {
     ManagerOptions {
         enabled,
@@ -833,6 +860,10 @@ fn gui_manager_options(
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
+        // 偏好接线：控制端是否请求声音、被控端是否允许采集。
+        audio_enabled,
+        audio_allowed,
+        audio_volume,
     }
 }
 
@@ -854,6 +885,9 @@ fn spawn_runtime(
     initial_auto_lock: bool,
     initial_native_resolution: bool,
     initial_prefer_h265: bool,
+    initial_audio_enabled: bool,
+    initial_audio_allowed: bool,
+    initial_audio_volume: u8,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -956,6 +990,9 @@ fn spawn_runtime(
                     initial_auto_lock,
                     initial_native_resolution,
                     initial_prefer_h265,
+                    initial_audio_enabled,
+                    initial_audio_allowed,
+                    initial_audio_volume,
                 ),
             );
             app_state.set_remote(Arc::clone(&remote_manager));
@@ -1647,6 +1684,9 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             prefs.remote_native_resolution,
             // H.265 偏好与环境变量禁用合成生效值：环境变量优先（现场排障开关）。
             remote::effective_prefer_h265(prefs.remote_prefer_h265, remote::h265_disabled_by_env()),
+            prefs.remote_audio_enabled,
+            prefs.remote_audio_allowed,
+            prefs.remote_audio_volume,
         );
     }
 

@@ -4,6 +4,7 @@
 //! 因此这里**只等 `HelloAck`**。收到后派生会话密钥、装上 [`crate::crypto::Cipher`]，
 //! 之后的帧全部加密。
 
+use crate::audio::{AudioSink, AudioState, ReceivedAudio};
 use crate::auth::verify_ack_mac;
 use crate::clock::{clock_offset_us, elapsed_ms, now_us, UNKNOWN_OFFSET};
 use crate::codec::{vp9_decoder_factory, VideoDecoderApi, VideoDecoderFactory};
@@ -444,6 +445,14 @@ pub enum ControllerCommand {
     File(TransferCommand),
     /// 请求被控端**锁定屏幕**（纯 UI 动作；被控端只在完全控制模式下执行）。
     LockScreen,
+    /// 请求被控端启停音频采集。
+    ///
+    /// `false` 同时是「控制端静音」：停止采集能省下 ~100 kbps，也少一份隐私暴露；
+    /// 控制端本地的音量/静音是另一件事（播放侧增益），不经过协议。
+    SetAudioEnabled {
+        /// 是否请求开启。
+        enabled: bool,
+    },
     /// 立即探测一次延迟（**纯进程内命令，不上线**）。
     ///
     /// **仅当当前无在途心跳样本时**才真正发一次 `Heartbeat`：否则会覆盖既有样本，让那次往返
@@ -452,7 +461,7 @@ pub enum ControllerCommand {
 }
 
 /// 控制器会话配置。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControllerConfig {
     /// 会话 ID。
     pub session_id: String,
@@ -476,6 +485,13 @@ pub struct ControllerConfig {
     pub h265_decoder_factory: Option<Arc<dyn VideoDecoderFactory>>,
     /// 是否**优先接受 H.265/HEVC**（默认 `true`）。`false` 时 offer 里不声明 H.265。
     pub prefer_h265: bool,
+    /// 可选的音频播放目标（控制端注入；`None` = 本端不能播放，不会请求对端采集）。
+    pub audio: Option<Arc<dyn AudioSink>>,
+    /// 会话开始时是否请求转发声音（用户偏好）。
+    ///
+    /// 只在收到被控端 `AudioStatus{available:true}` 后生效；运行中静音走
+    /// [`ControllerCommand::SetAudioEnabled`]。
+    pub audio_enabled: bool,
     /// 数据面可靠层指标句柄（仅 UDP 打洞路径为 `Some`，见
     /// [`crate::transport::EstablishedStream::reliable`]）。
     ///
@@ -741,6 +757,9 @@ pub(crate) async fn run_controller_with_input(
         .find(|d| d.primary)
         .or_else(|| displays.first())
         .map_or(0, |d| d.id);
+    // 是否已经向被控端请求过「开始转发声音」。只在**首次可用**时自动请求一次：被控端
+    // 本地否决后回 `enabled:false`，这里不会反复重发（用户可从工具条显式再开）。
+    let mut audio_requested = false;
     let mut reason = String::from("会话结束");
 
     let result: RemoteResult<SessionEnd> = 'session: loop {
@@ -814,6 +833,10 @@ pub(crate) async fn run_controller_with_input(
             _ = qos_tick.tick() => {
                 // 每秒一条 `QosFeedback`，驱动被控端 AIMD（见 [`crate::qos`]）。**不新增数据面
                 // 变体**——`QosFeedback` 自阶段 2 起就在协议里，阶段 2 只是定义未消费。
+                // 同一节拍顺带上报本端音频播放读数（进程内，不落线）。
+                if let Some(audio) = config.audio.as_ref() {
+                    config.stats.report(SessionStats::AudioPlayback(audio.snapshot()));
+                }
                 let elapsed = qos_window_start.elapsed().as_secs_f64().max(f64::EPSILON);
                 let window_bytes = f64::from(u32::try_from(recv_bytes).unwrap_or(u32::MAX));
                 #[expect(
@@ -1010,6 +1033,18 @@ pub(crate) async fn run_controller_with_input(
                         // v7 的锁屏是控制帧，走控制队列（与其它小控制消息同一优先级）。
                         if let Err(err) = queues
                             .enqueue_ctrl(&cancel, SessionFrame::control(SessionMessage::LockScreen))
+                            .await
+                        {
+                            break Err(err);
+                        }
+                    }
+                    ControllerCommand::SetAudioEnabled { enabled } => {
+                        audio_requested = enabled;
+                        if let Err(err) = queues
+                            .enqueue_ctrl(
+                                &cancel,
+                                SessionFrame::control(SessionMessage::SetAudioEnabled { enabled }),
+                            )
                             .await
                         {
                             break Err(err);
@@ -1543,6 +1578,61 @@ pub(crate) async fn run_controller_with_input(
                                         break Err(send_err);
                                     }
                                 }
+                            }
+                        }
+                        // 被控端音频状态：先交给 UI/播放端，再决定是否请求采集。
+                        SessionMessage::AudioStatus {
+                            enabled,
+                            available,
+                            reason: audio_reason,
+                            codec,
+                            sample_rate,
+                            channels,
+                            bitrate_kbps,
+                        } => {
+                            let state = AudioState {
+                                enabled,
+                                available,
+                                reason: audio_reason,
+                                codec,
+                                sample_rate,
+                                channels,
+                                bitrate_kbps,
+                            };
+                            if let Some(audio) = config.audio.as_ref() {
+                                audio.on_status(&state);
+                            }
+                            config.stats.report(SessionStats::Audio(state.clone()));
+                            let should_request = available
+                                && config.audio_enabled
+                                && !audio_requested
+                                && config.mode != RemoteMode::FileTransfer;
+                            if should_request {
+                                audio_requested = true;
+                                if let Err(err) = queues
+                                    .enqueue_ctrl(
+                                        &cancel,
+                                        SessionFrame::control(SessionMessage::SetAudioEnabled {
+                                            enabled: true,
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    break Err(err);
+                                }
+                            }
+                        }
+                        SessionMessage::AudioPacket {
+                            seq,
+                            capture_ts_us,
+                            data,
+                        } => {
+                            if let Some(audio) = config.audio.as_ref() {
+                                audio.on_packet(ReceivedAudio {
+                                    seq,
+                                    capture_ts_us,
+                                    data,
+                                });
                             }
                         }
                         other => debug!(?other, "控制器收到未处理的消息"),
@@ -2516,6 +2606,8 @@ mod tests {
             h264_decoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_enabled: false,
             reliable: None,
         }
     }

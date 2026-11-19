@@ -33,7 +33,7 @@ use rust_tunnel_remote::{
 };
 use std::collections::HashSet;
 use std::net::{TcpListener as StdTcpListener, UdpSocket as StdUdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -546,6 +546,13 @@ fn manager(
         approval_policy: ApprovalPolicy::Auto,
         h264_encoder_factory: None,
         h264_decoder_factory: None,
+        h265_encoder_factory: None,
+        h265_decoder_factory: None,
+        prefer_h265: true,
+        audio_source: None,
+        audio_sink: None,
+        audio_enabled: false,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
     });
     // 双方先拿到能力通告（设置 params / rd_id），与真实控制通道下发等价。
     mgr.handle_control_message(ControlMessage::RemoteCapability {
@@ -587,6 +594,13 @@ fn manager_lazy(
         approval_policy: ApprovalPolicy::Auto,
         h264_encoder_factory: None,
         h264_decoder_factory: None,
+        h265_encoder_factory: None,
+        h265_decoder_factory: None,
+        prefer_h265: true,
+        audio_source: None,
+        audio_sink: None,
+        audio_enabled: false,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
     });
     mgr.handle_control_message(ControlMessage::RemoteCapability {
         params: Some(params.clone()),
@@ -1418,6 +1432,13 @@ fn control_channel_manager(server_host: &str, name: &str, enabled: bool) -> Arc<
         approval_policy: if enabled { ApprovalPolicy::Confirm } else { ApprovalPolicy::Auto },
         h264_encoder_factory: None,
         h264_decoder_factory: None,
+        h265_encoder_factory: None,
+        h265_decoder_factory: None,
+        prefer_h265: true,
+        audio_source: None,
+        audio_sink: None,
+        audio_enabled: false,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
     })
 }
 

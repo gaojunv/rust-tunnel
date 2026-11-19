@@ -28,6 +28,7 @@
 //! 两者都接受 [`CancellationToken`]，由 [`RemoteManager::abort_active`] 一键中断。
 
 use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
+use crate::audio::{AudioPlaybackStats, AudioSink, AudioSource};
 use crate::auth::{PendingSession, PendingSessions};
 use crate::codec::{VideoDecoderFactory, VideoEncoderFactory};
 use crate::controller::{run_controller_with_input, ControllerCommand, ControllerConfig};
@@ -245,6 +246,20 @@ pub struct RemoteUiState {
     pub jitter_ms: Option<u32>,
     /// 解码队列当前积压（帧；A10）。仅控制器填。
     pub decode_backlog: Option<u32>,
+    /// 对端是否具备音频采集能力（收到 `AudioStatus` 时更新）。
+    pub audio_available: bool,
+    /// 对端是否正在转发声音。
+    pub audio_enabled: bool,
+    /// 对端给出的不可用/停止原因（UI 直接展示）。
+    pub audio_reason: Option<String>,
+    /// 本端播放：累计收到的编码包数。
+    pub audio_received: u64,
+    /// 本端播放：播放队列满而丢弃的包数。
+    pub audio_dropped: u64,
+    /// 本端播放：抖动缓冲欠载次数。
+    pub audio_underruns: u64,
+    /// 本端播放：当前目标缓冲（毫秒）。
+    pub audio_buffer_ms: u32,
     /// 估计出的对端时钟偏差（微秒，正值 = 对端更快；D2 的换算基准）。未知时为 `None`。
     pub clock_offset_us: Option<i64>,
     /// 最近一次**由会话循环观测到**的会话结束信息（session_id + 结束原因），供 UI 提示与断线
@@ -309,10 +324,21 @@ impl RemoteUiState {
         self.jitter_ms = None;
         self.decode_backlog = None;
         self.clock_offset_us = None;
+        self.audio_available = false;
+        self.audio_enabled = false;
+        self.audio_reason = None;
+        self.audio_received = 0;
+        self.audio_dropped = 0;
+        self.audio_underruns = 0;
+        self.audio_buffer_ms = 0;
     }
 }
 
 /// [`RemoteManager`] 的构造参数。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "这些是彼此独立的用户/平台开关（原生分辨率、H.265、音频），合并不是一个布尔位"
+)]
 pub struct RemoteManagerConfig {
     /// 本机连接的服务端 `host:port`（用于补齐留空的 `rendezvous_host`）。
     pub server_host: String,
@@ -361,6 +387,17 @@ pub struct RemoteManagerConfig {
     ///
     /// 运行中修改经 [`RemoteManager::set_prefer_h265`]，只对**下一次会话**生效。
     pub prefer_h265: bool,
+    /// 可选的音频采集源（被控端用；Windows GUI/实例注入，其它平台为 `None`）。
+    pub audio_source: Option<Arc<dyn AudioSource>>,
+    /// 可选的音频播放目标（控制端用；`None` = 本端不请求对端采集声音）。
+    pub audio_sink: Option<Arc<dyn AudioSink>>,
+    /// 控制端会话开始时是否请求转发声音（用户偏好；运行中静音走
+    /// [`RemoteManager::set_audio_enabled`]）。
+    pub audio_enabled: bool,
+    /// 运行期「允许被控端转发声音」开关（用户设置 + 本会话否决位）。
+    ///
+    /// 被控端音频任务每帧读取；置 false 时立即停止采集并上报带原因的状态。
+    pub audio_allowed: Arc<AtomicBool>,
 }
 
 /// 正在进行的会话句柄。
@@ -500,6 +537,11 @@ pub struct RemoteManager {
     /// 与 [`Self::native_resolution`] 同构：GUI 的 UI 线程随时可改，会话任务只在**开始**时读
     /// 一次；改动只影响下一次会话（codec 在协商后固定）。
     prefer_h265: AtomicBool,
+    /// 控制端会话开始时是否请求转发声音（用户偏好）。
+    ///
+    /// 工具条的扬声器开关与设置页共享这一位：开关同时作用于**当前会话**（发
+    /// `SetAudioEnabled`）与**下一次会话**（`ControllerConfig.audio_enabled`）。
+    audio_enabled_pref: AtomicBool,
     /// 构造时所在的 Tokio 运行时句柄。
     ///
     /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
@@ -546,6 +588,7 @@ impl RemoteManager {
         let rt_field = rt.clone();
         let native_resolution = cfg.native_resolution;
         let prefer_h265 = cfg.prefer_h265;
+        let audio_enabled_pref = cfg.audio_enabled;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -571,6 +614,7 @@ impl RemoteManager {
             auto_lock_on_disconnect: Arc::new(AtomicBool::new(false)),
             native_resolution: AtomicBool::new(native_resolution),
             prefer_h265: AtomicBool::new(prefer_h265),
+            audio_enabled_pref: AtomicBool::new(audio_enabled_pref),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -844,6 +888,42 @@ impl RemoteManager {
     /// 请求被控端锁定屏幕（控制器动作；被控端只在完全控制模式下执行）。
     pub fn lock_screen(&self) {
         self.send_command(ControllerCommand::LockScreen);
+    }
+
+    /// 请求被控端启停音频采集（控制器动作）。
+    ///
+    /// `false` 同时是控制端的「静音」：停止采集能省下 ~100 kbps，也少一份隐私暴露。
+    /// 该开关**同时**写偏好原子位——本次会话立即生效，下一次会话也沿用。
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.audio_enabled_pref.store(enabled, Ordering::Relaxed);
+        self.send_command(ControllerCommand::SetAudioEnabled { enabled });
+    }
+
+    /// 当前「会话开始时请求转发声音」偏好。
+    #[must_use]
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled_pref.load(Ordering::Relaxed)
+    }
+
+    /// 设置被控端「允许转发声音」的**本会话**开关（不落盘）。
+    ///
+    /// 置 false 后音频任务会在 20 ms 内停下并上报「本机已停止转发声音」；用户重新允许后
+    /// 需要控制端再发一次 `SetAudioEnabled{true}`。
+    pub fn set_audio_allowed(&self, allowed: bool) {
+        self.cfg.audio_allowed.store(allowed, Ordering::Relaxed);
+    }
+
+    /// 设置控制端**本地播放音量**（百分比，0–200）。不上线。
+    pub fn set_audio_volume(&self, percent: u32) {
+        if let Some(sink) = self.cfg.audio_sink.as_ref() {
+            sink.set_volume(percent);
+        }
+    }
+
+    /// 取控制端播放读数（无播放能力时为 `None`）。
+    #[must_use]
+    pub fn audio_playback_stats(&self) -> Option<AudioPlaybackStats> {
+        self.cfg.audio_sink.as_ref().map(|sink| sink.snapshot())
     }
 
     /// 批准当前待确认的接入请求；`remember` 为真时把该对端加入信任列表（此后免弹窗）。
@@ -1493,6 +1573,8 @@ impl RemoteManager {
             h264_decoder_factory: self.cfg.h264_decoder_factory.clone(),
             h265_decoder_factory: self.cfg.h265_decoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
+            audio: self.cfg.audio_sink.clone(),
+            audio_enabled: self.audio_enabled_pref.load(Ordering::Relaxed),
             reliable,
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
@@ -1737,6 +1819,8 @@ impl RemoteManager {
             h265_encoder_factory: self.cfg.h265_encoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
             lock_on_disconnect: Arc::clone(&self.auto_lock_on_disconnect),
+            audio: self.cfg.audio_source.clone(),
+            audio_allowed: Arc::clone(&self.cfg.audio_allowed),
         };
         let clipboard = self
             .clipboard
@@ -2133,6 +2217,10 @@ async fn pump_session_stats(
 }
 
 /// 把一条统计事件写进 [`RemoteUiState`]。
+#[expect(
+    clippy::too_many_lines,
+    reason = "一条事件一个分支的扁平 match；拆开只会让新增字段时漏改"
+)]
 fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
     match event {
         SessionStats::Rtt(rtt) => {
@@ -2175,8 +2263,7 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
                 s.encode_changed_permille = Some(changed_permille);
             });
         }
-        SessionStats::KeyframeRequest { reason } => {
-            // 按原因累计。UI 跨轮询求差得到每秒速率（见 `RemoteView::poll_keyframe_rate`）。
+        SessionStats::KeyframeRequest { reason } => {            // 按原因累计。UI 跨轮询求差得到每秒速率（见 `RemoteView::poll_keyframe_rate`）。
             let index = reason.index();
             mgr.update_ui(|s| {
                 if let Some(slot) = s.keyframe_requests.get_mut(index) {
@@ -2233,6 +2320,21 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
         }
         SessionStats::Transport(stats) => {
             mgr.update_ui(|s| s.transport_stats = Some(stats));
+        }
+        SessionStats::Audio(state) => {
+            mgr.update_ui(move |s| {
+                s.audio_available = state.available;
+                s.audio_enabled = state.enabled;
+                s.audio_reason.clone_from(&state.reason);
+            });
+        }
+        SessionStats::AudioPlayback(stats) => {
+            mgr.update_ui(move |s| {
+                s.audio_received = stats.received;
+                s.audio_dropped = stats.dropped;
+                s.audio_underruns = stats.underruns;
+                s.audio_buffer_ms = stats.buffer_ms;
+            });
         }
     }
 }
@@ -2339,6 +2441,10 @@ mod tests {
             h265_encoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio_source: None,
+            audio_sink: None,
+            audio_enabled: false,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -2504,6 +2610,10 @@ mod tests {
             h265_encoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio_source: None,
+            audio_sink: None,
+            audio_enabled: false,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
         })
     }
 

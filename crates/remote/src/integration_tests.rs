@@ -313,6 +313,10 @@ fn manager_with_dirs(
         h265_encoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        audio_source: None,
+        audio_sink: None,
+        audio_enabled: false,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
     })
 }
 
@@ -654,6 +658,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         h264_encoder_factory: None,
         h265_encoder_factory: None,
         prefer_h265: true,
+        audio: None,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
         lock_on_disconnect: Arc::new(AtomicBool::new(false)),
     };
     let ctrl_cfg = ControllerConfig {
@@ -665,6 +671,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         h264_decoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        audio: None,
+        audio_enabled: false,
         reliable: None,
     };
 
@@ -737,6 +745,8 @@ async fn correct_token_completes_handshake_and_streams() {
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
@@ -757,6 +767,8 @@ async fn correct_token_completes_handshake_and_streams() {
             h264_decoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_enabled: false,
             reliable: None,
         },
         plan,
@@ -875,6 +887,8 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
             h264_decoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_enabled: false,
             reliable: None,
         },
         plan,
@@ -1426,6 +1440,8 @@ async fn handshake_against_unregistered_token(
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
@@ -1663,3 +1679,192 @@ async fn file_transfer_mode_sends_no_video_but_allows_files() {
     let _ = std::fs::remove_dir_all(&dl);
 }
 
+
+/// 端到端（内存 transport）：控制器收到 `AudioStatus{available}` 后自动请求开启，
+/// 被控端的假采集源产出的音频包按序到达 `AudioSink`。
+#[expect(
+    clippy::too_many_lines,
+    reason = "端到端用例把两个会话配置与断言写在一处，拆开反而看不出完整数据流"
+)]
+#[tokio::test]
+async fn audio_packets_reach_the_controller_when_enabled() {
+    /// 假采集源：产出 `packets` 个包，随后返回 `None`。
+    struct Source {
+        packets: usize,
+        cursor: Mutex<usize>,
+    }
+
+    impl crate::audio::AudioSource for Source {
+        fn capability(&self) -> crate::audio::AudioState {
+            crate::audio::AudioState {
+                enabled: false,
+                available: true,
+                reason: None,
+                codec: crate::session::AudioCodec::Opus,
+                sample_rate: 48_000,
+                channels: 2,
+                bitrate_kbps: 96,
+            }
+        }
+
+        fn start(&self) -> RemoteResult<()> {
+            Ok(())
+        }
+
+        fn read_packet(
+            &self,
+            stop: &AtomicBool,
+        ) -> RemoteResult<Option<crate::audio::EncodedAudio>> {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let mut cursor = self
+                .cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *cursor >= self.packets {
+                drop(cursor);
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(None);
+            }
+            *cursor += 1;
+            Ok(Some(crate::audio::EncodedAudio {
+                data: vec![0xAB; 240],
+                capture_ts_us: 1_000,
+            }))
+        }
+
+        fn stop(&self) {}
+    }
+
+    #[derive(Default)]
+    struct Sink {
+        packets: Mutex<Vec<crate::audio::ReceivedAudio>>,
+        statuses: Mutex<Vec<crate::audio::AudioState>>,
+    }
+
+    impl crate::audio::AudioSink for Sink {
+        fn on_packet(&self, packet: crate::audio::ReceivedAudio) {
+            self.packets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(packet);
+        }
+
+        fn on_status(&self, state: &crate::audio::AudioState) {
+            self.statuses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(state.clone());
+        }
+    }
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let plan = plan_controller_handshake("sess-audio", "TOK", "111111111").unwrap();
+    let pending = Arc::new(PendingSessions::new());
+    pending.insert(crate::auth::PendingSession::new(
+        "sess-audio".to_owned(),
+        "TOK".to_owned(),
+        "home-nas".to_owned(),
+        RemoteMode::ViewOnly,
+    ));
+
+    // 控制器先写出 Hello（生产路径由传输建立阶段流水线写出）。
+    let mut ctrl_stream: BoxDuplex = Box::new(a);
+    ctrl_stream.write_all(&plan.hello_frame).await.unwrap();
+    ctrl_stream.flush().await.unwrap();
+
+    let sink = Arc::new(Sink::default());
+    let source = Arc::new(Source {
+        packets: 3,
+        cursor: Mutex::new(0),
+    });
+    let cancel = CancellationToken::new();
+
+    let ctld_task = tokio::spawn(run_controlled(
+        Box::new(b),
+        ControlledConfig {
+            session_id: "sess-audio".to_owned(),
+            local_rd_id: "222222222".to_owned(),
+            mode: RemoteMode::ViewOnly,
+            pending,
+            encode: EncodeOptions::default(),
+            native_resolution: false,
+            capture_watchdog: CAPTURE_WATCHDOG,
+            unchanged_resend: UNCHANGED_RESEND_INTERVAL,
+            stats: SessionStatsReporter::noop(),
+            h264_encoder_factory: None,
+            h265_encoder_factory: None,
+            prefer_h265: true,
+            audio: Some(source),
+            audio_allowed: Arc::new(AtomicBool::new(true)),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+        },
+        Arc::new(FakeScreen),
+        Arc::new(RecordingInput::default()),
+        None,
+        transfer_hub().0,
+        cancel.clone(),
+    ));
+
+    let (_cmd_tx, cmd_rx) = mpsc::channel(4);
+    let (ctrl_sink, _frame_rx) = RecordingSink::with_notify();
+    let ctrl_task = tokio::spawn(run_controller(
+        ctrl_stream,
+        ControllerConfig {
+            session_id: "sess-audio".to_owned(),
+            token: "TOK".to_owned(),
+            local_rd_id: "111111111".to_owned(),
+            mode: RemoteMode::ViewOnly,
+            stats: SessionStatsReporter::noop(),
+            h264_decoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
+            audio: Some(sink.clone()),
+            audio_enabled: true,
+            reliable: None,
+        },
+        plan,
+        cmd_rx,
+        transfer_hub().0,
+        ctrl_sink,
+        cancel.clone(),
+    ));
+
+    let reached = poll_until(|| {
+        sink.packets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            >= 3
+    })
+    .await;
+    assert!(
+        reached,
+        "控制器应在 5s 内收到 3 个音频包，实际收到 {} 个",
+        sink.packets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    );
+    let seqs: Vec<u64> = sink
+        .packets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|packet| packet.seq)
+        .collect();
+    assert_eq!(&seqs[..3], &[1, 2, 3], "音频序号应从 1 连续递增");
+    assert!(
+        sink.statuses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|state| state.enabled && state.available),
+        "控制器应看到「已启用且可用」的状态"
+    );
+
+    cancel.cancel();
+    let _ = ctld_task.await;
+    let _ = ctrl_task.await;
+}

@@ -21,6 +21,11 @@ fn default_remote_frame_rate() -> u8 {
     rust_tunnel_remote::DEFAULT_FRAME_RATE
 }
 
+/// 控制端播放音量的默认值（100%）。
+fn default_audio_volume() -> u8 {
+    100
+}
+
 /// 把读到的帧率钳到合法范围 `15..=60`。
 ///
 /// UI 当前只提供 30 / 60（后续可能扩到 15），但手改 `gui.toml` 可能写入任意值；
@@ -172,6 +177,21 @@ pub struct GuiPrefs {
     /// **下一次会话**生效（引擎在会话建立时读一次）。
     #[serde(default = "default_true")]
     pub remote_prefer_h265: bool,
+    /// 控制端会话开始时是否请求被控端转发声音。**默认开启**（与「批准即转发」的策略一致）。
+    ///
+    /// 运行中改它由工具条扬声器开关完成：立即作用于当前会话，并作为下一次会话的默认值。
+    #[serde(default = "default_true")]
+    pub remote_audio_enabled: bool,
+    /// 控制端本地播放音量（百分比，0–100；0 = 静音）。**默认 100**。
+    ///
+    /// 这是本地播放增益，不上线；对端采集与否由 `remote_audio_enabled` / 工具条控制。
+    #[serde(default = "default_audio_volume")]
+    pub remote_audio_volume: u8,
+    /// 被控端是否允许向对端转发系统声音。**默认开启**。
+    ///
+    /// 关掉后本机不会打开 loopback 设备，对端会收到「本机已停止转发声音」。
+    #[serde(default = "default_true")]
+    pub remote_audio_allowed: bool,
     /// 远程控制**分阶段延迟诊断日志**开关（默认关闭）。
     ///
     /// 打开后引擎每秒输出一行阶段汇总（采集/编码/发送/网络/解码/上屏），慢帧另打明细，
@@ -220,6 +240,9 @@ impl Default for GuiPrefs {
             remote_native_resolution_migrated: false,
             // 与字段上的 `#[serde(default = "default_true")]` 保持一致。
             remote_prefer_h265: true,
+            remote_audio_enabled: true,
+            remote_audio_volume: default_audio_volume(),
+            remote_audio_allowed: true,
             remote_latency_log: false,
             remote_latency_log_frames: false,
             update_auto_check: true,
