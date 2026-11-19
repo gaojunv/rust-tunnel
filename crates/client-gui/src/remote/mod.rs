@@ -937,6 +937,9 @@ impl InputGate {
     }
 
     /// 滚轮门控：只有指针位于画面内时才转达（避免在文件列表 / 输入框上滚动时误滚远端）。
+    ///
+    /// 参数单位是**行（齿）**，不是 egui 的「点」——两者差 `line_scroll_speed` 倍，
+    /// 由 [`WheelAccumulator`] 负责换算，不要在这里重新解释。
     #[must_use]
     pub fn wheel(pointer_in_image: bool, dx: i32, dy: i32) -> Option<InputEvent> {
         if !pointer_in_image || (dx == 0 && dy == 0) {
@@ -1099,6 +1102,79 @@ impl InputGate {
         self.modifiers_forwarded = 0;
         out
     }
+}
+
+/// egui `line_scroll_speed` 失效时（0 / 非有限值）的兜底换算：一行 = 40 点。
+///
+/// 40 是 egui 在原生 winit 下的默认值（`egui::Options::line_scroll_speed`）。
+const FALLBACK_POINTS_PER_LINE: f32 = 40.0;
+
+/// 滚轮换算：把 egui 的**点**位移折算成注入端要求的**行（齿）**，小数部分累积到下次。
+///
+/// 为什么需要它（2026-11-19 修「滚一下滑出去很远」）：egui 的 `raw_scroll_delta` 单位是
+/// **点**，而 [`InputEvent::Wheel`] 的单位是**行**（注入端每行发 `WHEEL_DELTA` = 120 的
+/// `mouseData`）。Windows 上鼠标滚轮一格是 `LineDelta(0, 1)`，egui 再乘
+/// `line_scroll_speed`（原生默认 40）得到 **40 点**；此前把 40 直接当 40 行转发，远端一次
+/// 就滚 40 格。这里以 egui 自己的 `line_scroll_speed` 为除数，于是**一格本地滚轮 = 一格远端
+/// 滚轮**，与用户在本地控件里看到的滚动距离一致。
+///
+/// 触控板之类的 `PixelDelta` 来源给出的是零碎点数（每帧几个点），不足一行的部分留在
+/// 累积器里，攒够一行才发——直接取整会让慢速小幅度滚动完全不动。反向滚动时丢弃旧余量，
+/// 否则「往上滚一点再往下滚」的第一次会先补发之前的不足一行。
+#[derive(Default)]
+struct WheelAccumulator {
+    /// 横向 / 纵向尚未满一行的余量（单位：行）。
+    x: f32,
+    y: f32,
+}
+
+impl WheelAccumulator {
+    /// 投入本帧的点位移（横向 / 纵向），返回已攒够的整行数（可能为 0）。`points_per_line`
+    /// 取 `egui::Options::line_scroll_speed`。
+    fn push(
+        &mut self,
+        horizontal_points: f32,
+        vertical_points: f32,
+        points_per_line: f32,
+    ) -> (i32, i32) {
+        let per_line = if points_per_line.is_finite() && points_per_line >= 1.0 {
+            points_per_line
+        } else {
+            FALLBACK_POINTS_PER_LINE
+        };
+        (
+            take_whole_lines(&mut self.x, horizontal_points / per_line),
+            take_whole_lines(&mut self.y, vertical_points / per_line),
+        )
+    }
+
+    /// 清空余量（指针离开画面 / 会话结束）。
+    fn reset(&mut self) {
+        self.x = 0.0;
+        self.y = 0.0;
+    }
+}
+
+/// 把 `lines`（可带小数）并入余量并取出整数行。
+///
+/// `trunc` 向零取整：正负两侧都只在「攒够一整行」时才发事件（+0.9 不发、−0.9 也不发），
+/// 不会因为符号而出现半行抖动。
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "滚轮行数是有界小整数；f32→i32 的转换在本平台是饱和的，不会 wrap"
+)]
+fn take_whole_lines(remainder: &mut f32, lines: f32) -> i32 {
+    if !lines.is_finite() || lines == 0.0 {
+        return 0;
+    }
+    if remainder.signum() != lines.signum() {
+        // 反向：旧方向的余量作废（否则第一次反向会是「补偿上一次」的假滚动）。
+        *remainder = 0.0;
+    }
+    *remainder += lines;
+    let whole = remainder.trunc();
+    *remainder -= whole;
+    whole as i32
 }
 
 // ── 屏幕采集（xcap，三平台通用）─────────────────────────────────────
@@ -1690,6 +1766,8 @@ pub struct RemoteView {
     pub(crate) pan_anchor: Option<egui::Pos2>,
     /// 输入门控状态机（按下需门控、抬起按「是否转达过」处理）。
     gate: InputGate,
+    /// 滚轮余量累积器：egui 的点 → 注入端的行（齿），见 [`WheelAccumulator`]。
+    wheel: WheelAccumulator,
     /// 后台读取本机剪贴板的结果槽（非阻塞）；携带发起请求时的「代」编号（见
     /// [`Self::request_local_clipboard`] 与 [`Self::take_clipboard_read`]）。
     clipboard_read: ClipboardReadSlot,
@@ -1817,6 +1895,7 @@ impl RemoteView {
             last_mouse: None,
             pan_anchor: None,
             gate: InputGate::default(),
+            wheel: WheelAccumulator::default(),
             clipboard_read: Arc::new(Mutex::new(None)),
             clipboard_read_gen: 0,
             window_open: false,
@@ -1961,6 +2040,8 @@ impl RemoteView {
         // 平移手势属于上一场会话：锚点留着的话，下一场第一次中键拖动会在没有任何按下时平移。
         self.pan_anchor = None;
         self.gate.reset();
+        // 滚轮余量属于上一场会话（换算基准可能也不同），留着会让新会话首个滚轮多滚半格。
+        self.wheel.reset();
         self.capture_this_frame = false;
         self.selected_display = None;
         // 新会话要重新下发一次帧率偏好（见 `reconcile` 的自动下发）。
@@ -2343,11 +2424,19 @@ impl RemoteView {
         }
         // 滚轮：gate 不变，但「指针是否在画面上」取当前原始指针位置（滚轮事件不带坐标）。
         let pointer_in_image = ui.input(|i| i.pointer.latest_pos()).is_some_and(in_image);
-        // egui 的滚动量为正表示内容上移，enigo 正值为向下滚动 → 取反。
-        if let Some(event) =
-            InputGate::wheel(pointer_in_image, -round_i32(scroll.x), -round_i32(scroll.y))
-        {
-            self.forward_input(manager, event);
+        if pointer_in_image {
+            // egui 的滚动量是**点**，注入端要的是**行（齿）**：除以 egui 自己的
+            // `line_scroll_speed`（一格滚轮 = 一行 = 40 点 → 远端一格），不足一行的余量
+            // 累积到下一帧（见 [`WheelAccumulator`]）。
+            let points_per_line = ui.ctx().options(|o| o.line_scroll_speed);
+            let (dx, dy) = self.wheel.push(scroll.x, scroll.y, points_per_line);
+            // egui 的滚动量为正表示内容上移，enigo 正值为向下滚动 → 取反。
+            if let Some(event) = InputGate::wheel(true, -dx, -dy) {
+                self.forward_input(manager, event);
+            }
+        } else {
+            // 指针不在画面上：不累积。否则在输入框里滚一段再移回画面会补发一大截。
+            self.wheel.reset();
         }
         for event in self.gate.modifiers(mods, keyboard_enabled) {
             self.forward_input(manager, event);
@@ -2866,12 +2955,6 @@ fn scale_axis(offset: f32, extent: f32, max: u32) -> i32 {
     (fraction * max as f32).round() as i32
 }
 
-/// 把滚动量取整为整数（有界小值）。
-#[expect(clippy::cast_possible_truncation, reason = "滚动量为有界小整数")]
-fn round_i32(value: f32) -> i32 {
-    value.round() as i32
-}
-
 /// 远端光标形状 → egui 光标图标（纯函数，单测覆盖全部变体）。
 ///
 /// 语义由用户拍板：
@@ -3054,6 +3137,50 @@ mod tests {
             InputGate::wheel(true, 3, -4),
             Some(InputEvent::Wheel { dx: 3, dy: -4 })
         );
+    }
+
+    // ── 滚轮换算：egui 的点 → 注入端的行（齿）────────────────────────
+
+    #[test]
+    fn wheel_points_convert_to_notches() {
+        let mut wheel = WheelAccumulator::default();
+        // 一格鼠标滚轮 = `line_scroll_speed`(40) 点 → 恰好一行（注入端一次 WHEEL_DELTA）。
+        assert_eq!(wheel.push(0.0, 40.0, 40.0), (0, 1));
+        assert_eq!(wheel.push(0.0, -40.0, 40.0), (0, -1));
+        // 同一帧里连滚两格 / 横向同理。
+        assert_eq!(wheel.push(0.0, 80.0, 40.0), (0, 2));
+        assert_eq!(wheel.push(40.0, 0.0, 40.0), (1, 0));
+        assert_eq!(wheel.push(0.0, 0.0, 40.0), (0, 0));
+    }
+
+    #[test]
+    fn wheel_touchpad_deltas_accumulate_across_frames() {
+        let mut wheel = WheelAccumulator::default();
+        // 触控板每帧 15 点：30 点还不够一行，攒到 45 点发一行、余 5 点。
+        assert_eq!(wheel.push(0.0, 15.0, 40.0), (0, 0));
+        assert_eq!(wheel.push(0.0, 15.0, 40.0), (0, 0));
+        assert_eq!(wheel.push(0.0, 15.0, 40.0), (0, 1));
+        // 余量留到下一帧：再来 35 点正好凑满一行。
+        assert_eq!(wheel.push(0.0, 35.0, 40.0), (0, 1));
+    }
+
+    #[test]
+    fn wheel_reversal_discards_partial_remainder() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.push(0.0, 30.0, 40.0), (0, 0));
+        // 反向：旧的 30 点余量作废，本次 20 点不足一行 → 不发。
+        assert_eq!(wheel.push(0.0, -20.0, 40.0), (0, 0));
+        // 继续反向攒到 40 点 → 发一行。
+        assert_eq!(wheel.push(0.0, -20.0, 40.0), (0, -1));
+    }
+
+    #[test]
+    fn wheel_falls_back_when_points_per_line_invalid() {
+        let mut wheel = WheelAccumulator::default();
+        // 0 / NaN / 负数都退回 40 点一行：绝不能除出 inf 或把滚动吞掉。
+        assert_eq!(wheel.push(0.0, 40.0, 0.0), (0, 1));
+        assert_eq!(wheel.push(0.0, 40.0, f32::NAN), (0, 1));
+        assert_eq!(wheel.push(0.0, 40.0, -5.0), (0, 1));
     }
 
     // ── InputGate：键盘 / 文本 / 修饰键门控 ──────────────────────────
@@ -3564,16 +3691,6 @@ mod tests {
         // 极大 / 极小偏移不 panic、不产生负数或溢出。
         assert!(scale_axis(f32::MAX, 1.0, u32::MAX) > 0);
         assert_eq!(scale_axis(f32::MIN, 1.0, u32::MAX), 0);
-    }
-
-    #[test]
-    fn round_i32_handles_extremes() {
-        assert_eq!(round_i32(0.0), 0);
-        assert_eq!(round_i32(1.4), 1);
-        assert_eq!(round_i32(-1.6), -2);
-        // f32 越界 → 饱和到 i32 边界，不 panic、不 wrap。
-        assert_eq!(round_i32(f32::MAX), i32::MAX);
-        assert_eq!(round_i32(f32::MIN), i32::MIN);
     }
 
     /// 远端光标形状 → egui 图标：**每个变体**都覆盖。
