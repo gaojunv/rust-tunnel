@@ -537,6 +537,11 @@ pub struct RemoteManager {
     /// 与 [`Self::native_resolution`] 同构：GUI 的 UI 线程随时可改，会话任务只在**开始**时读
     /// 一次；改动只影响下一次会话（codec 在协商后固定）。
     prefer_h265: AtomicBool,
+    /// 控制端会话开始时是否请求转发声音（用户偏好）。
+    ///
+    /// 工具条的扬声器开关与设置页共享这一位：开关同时作用于**当前会话**（发
+    /// `SetAudioEnabled`）与**下一次会话**（`ControllerConfig.audio_enabled`）。
+    audio_enabled_pref: AtomicBool,
     /// 构造时所在的 Tokio 运行时句柄。
     ///
     /// [`Self::set_enabled`] 由 GUI 的 UI 线程调用（**不在运行时上下文内**），此时
@@ -583,6 +588,7 @@ impl RemoteManager {
         let rt_field = rt.clone();
         let native_resolution = cfg.native_resolution;
         let prefer_h265 = cfg.prefer_h265;
+        let audio_enabled_pref = cfg.audio_enabled;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -608,6 +614,7 @@ impl RemoteManager {
             auto_lock_on_disconnect: Arc::new(AtomicBool::new(false)),
             native_resolution: AtomicBool::new(native_resolution),
             prefer_h265: AtomicBool::new(prefer_h265),
+            audio_enabled_pref: AtomicBool::new(audio_enabled_pref),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -886,8 +893,16 @@ impl RemoteManager {
     /// 请求被控端启停音频采集（控制器动作）。
     ///
     /// `false` 同时是控制端的「静音」：停止采集能省下 ~100 kbps，也少一份隐私暴露。
+    /// 该开关**同时**写偏好原子位——本次会话立即生效，下一次会话也沿用。
     pub fn set_audio_enabled(&self, enabled: bool) {
+        self.audio_enabled_pref.store(enabled, Ordering::Relaxed);
         self.send_command(ControllerCommand::SetAudioEnabled { enabled });
+    }
+
+    /// 当前「会话开始时请求转发声音」偏好。
+    #[must_use]
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled_pref.load(Ordering::Relaxed)
     }
 
     /// 设置被控端「允许转发声音」的**本会话**开关（不落盘）。
@@ -1559,7 +1574,7 @@ impl RemoteManager {
             h265_decoder_factory: self.cfg.h265_decoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
             audio: self.cfg.audio_sink.clone(),
-            audio_enabled: self.cfg.audio_enabled,
+            audio_enabled: self.audio_enabled_pref.load(Ordering::Relaxed),
             reliable,
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。

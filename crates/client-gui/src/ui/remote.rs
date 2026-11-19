@@ -434,12 +434,24 @@ pub fn controlled_banner(ui: &mut Ui, manager: Option<&Arc<RemoteManager>>) {
     let p = palette(ui.style());
     widgets::info_bar_custom(ui, Tone::Err, |ui| {
         ui.horizontal(|ui| {
+            let title = if state.audio_enabled {
+                format!("正在被「{}」远程控制 · 画面与声音", active.peer_name)
+            } else {
+                format!("正在被「{}」远程控制", active.peer_name)
+            };
             ui.label(
-                RichText::new(format!("正在被「{}」远程控制", active.peer_name))
+                RichText::new(title)
                     .font(icons::heading_font(13.5))
                     .color(p.text),
             );
             widgets::right_row(ui, |ui| {
+                // 声音是独立于画面的权限：用户可以在**不中断会话**的前提下只停声音。
+                // 这同时写会话否决位（`audio_allowed`），被控端音频任务 20 ms 内停下。
+                if state.audio_enabled
+                    && widgets::button(ui, "停止转发声音", None, ButtonKind::Secondary).clicked()
+                {
+                    manager.set_audio_allowed(false);
+                }
                 if widgets::button(ui, "立即中断", None, ButtonKind::Danger).clicked() {
                     manager.abort_active();
                 }

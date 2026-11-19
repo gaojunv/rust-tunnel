@@ -1856,6 +1856,13 @@ pub struct RemoteView {
     pub quality: QualityPreset,
     /// 本会话是否已把画质下发给被控端；会话结束时复位，下一场重新下发。
     quality_sent: bool,
+    /// 控制端是否请求转发声音（持久化镜像，见 `GuiPrefs::remote_audio_enabled`）。
+    ///
+    /// 工具条扬声器改它并调用 `RemoteManager::set_audio_enabled`（同时作用于当前会话与
+    /// 下一次会话）；`GuiApp::sync_display_prefs` 回写 `gui.toml`。
+    pub audio_enabled: bool,
+    /// 本机播放音量（0–100，持久化镜像，见 `GuiPrefs::remote_audio_volume`）。
+    pub audio_volume: u8,
     /// 窗口尺寸档位（持久化镜像）。
     pub window_size: WindowSize,
     /// 当前应下发给子窗口的内尺寸（builder 里带着它，变化时 `patch` 会自动发 `InnerSize`）。
@@ -1966,6 +1973,8 @@ impl RemoteView {
             settings_open: false,
             quality: QualityPreset::default(),
             quality_sent: false,
+            audio_enabled: true,
+            audio_volume: 100,
             window_size: WindowSize::default(),
             inner_size: egui::vec2(960.0, 600.0),
             toolbar_visible: true,
@@ -2024,6 +2033,8 @@ impl RemoteView {
         view.toolbar_collapsed = prefs.remote_toolbar_collapsed;
         view.frame_rate = prefs.remote_frame_rate;
         view.quality = prefs.remote_quality;
+        view.audio_enabled = prefs.remote_audio_enabled;
+        view.audio_volume = prefs.remote_audio_volume.min(100);
         view
     }
 

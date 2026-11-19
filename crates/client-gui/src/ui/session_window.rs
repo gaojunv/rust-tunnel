@@ -515,8 +515,68 @@ fn toolbar_contents(
             v.settings_open = true;
         }
 
+        ui.separator();
+        audio_controls(ui, v, manager, state, &p);
+
         toolbar_actions(ui, v, manager, active, &p);
     });
+}
+
+/// 工具条上的声音控制：扬声器开关 + 本地音量。
+///
+/// - 开关**同时**是本端静音与「让对端停止采集」：停止采集省 ~100 kbps，也少一份隐私暴露；
+/// - 音量是本地播放增益，不上线（对端仍在发流）；
+/// - 对端不可用/被本地否决时按钮置灰，悬停显示原因。
+fn audio_controls(
+    ui: &mut Ui,
+    v: &mut RemoteView,
+    manager: &Arc<RemoteManager>,
+    state: &RemoteUiState,
+    p: &theme::Palette,
+) {
+    let available = state.audio_available;
+    let icon = if state.audio_enabled {
+        Icon::Speaker
+    } else {
+        Icon::SpeakerMuted
+    };
+    let color = (!available).then_some(p.text_disabled);
+    let tip = if available {
+        if state.audio_enabled {
+            "静音（同时停止对端采集，省带宽）"
+        } else {
+            "开启声音转发"
+        }
+    } else {
+        state
+            .audio_reason
+            .as_deref()
+            .unwrap_or("本机或对端没有音频能力")
+    };
+    let response = ui
+        .add_enabled_ui(available, |ui| {
+            widgets::toolbar_icon_colored(ui, icon, tip, color)
+        })
+        .inner;
+    if response.clicked() {
+        v.audio_enabled = !v.audio_enabled;
+        manager.set_audio_enabled(v.audio_enabled);
+    }
+
+    if available && state.audio_enabled {
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = 64.0;
+            let mut volume = v.audio_volume;
+            if ui
+                .add(egui::Slider::new(&mut volume, 0..=100).show_value(false))
+                .on_hover_text("本机播放音量")
+                .changed()
+            {
+                v.audio_volume = volume;
+                manager.set_audio_volume(u32::from(volume));
+            }
+        });
+    }
 }
 
 /// 工具条右侧的动作区：一律用图标按钮（文字按钮在窄窗口下会把工具条撑成两三行）。
@@ -1235,10 +1295,37 @@ fn link_grid(ui: &mut Ui, v: &RemoteView, state: &RemoteUiState, secs: u64) {
             ui.label(opt_or_dash(state.decode_backlog.map(|n| format!("{n} 帧"))));
             ui.end_row();
 
+            stat_label(ui, "音频");
+            ui.label(audio_summary(state));
+            ui.end_row();
+
             stat_label(ui, "时长");
             ui.label(format_duration(secs));
             ui.end_row();
         });
+}
+
+/// 统计角标的音频摘要：可用性/启停/播放读数。
+///
+/// `audio_underruns` / `audio_dropped` 是会话内**累计值**（不换算成每秒），
+/// 因为抖动缓冲的自适应本来就以会话为尺度。
+fn audio_summary(state: &RemoteUiState) -> String {
+    if !state.audio_available {
+        return state
+            .audio_reason
+            .clone()
+            .unwrap_or_else(|| "不可用".to_owned());
+    }
+    if !state.audio_enabled {
+        return state
+            .audio_reason
+            .clone()
+            .unwrap_or_else(|| "未开启".to_owned());
+    }
+    format!(
+        "Opus 96 kbps · 缓冲 {} ms · 欠载累计 {} · 队列丢 {}",
+        state.audio_buffer_ms, state.audio_underruns, state.audio_dropped
+    )
 }
 
 /// 「被控端」组：身份、编码器/采集方式、每秒遥测与 C2/C3/C5 增量。

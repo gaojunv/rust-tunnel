@@ -139,6 +139,8 @@ pub struct HostSettings {
     pub native_resolution: bool,
     /// 是否优先协商 H.265/HEVC（双方都支持时）。
     pub prefer_h265: bool,
+    /// 是否允许向对端转发系统声音（`host.toml` 缺省 `true`）。
+    pub audio: bool,
     /// 是否输出分阶段延迟诊断日志（默认关闭）。
     pub latency_log: bool,
     /// 延迟诊断日志是否每帧一行（量大；默认只打每秒汇总 + 慢帧）。
@@ -192,6 +194,7 @@ pub fn load_host_config(path: &Path) -> anyhow::Result<HostSettings> {
         auto_lock: extras.auto_lock,
         native_resolution: extras.native_resolution.unwrap_or(true),
         prefer_h265: extras.prefer_h265.unwrap_or(true),
+        audio: extras.audio.unwrap_or(true),
         latency_log: extras.latency_log,
         latency_log_frames: extras.latency_log_frames,
     })
@@ -221,6 +224,11 @@ struct HostExtras {
     /// 把当前选择原样带进来。
     #[serde(default)]
     prefer_h265: Option<bool>,
+    /// 是否允许向对端转发系统声音；缺省 **`true`**。
+    ///
+    /// 只控制「被控端是否打开 loopback 设备」；控制端是否请求由对端决定。
+    #[serde(default)]
+    audio: Option<bool>,
     /// 分阶段延迟诊断日志；缺省 `false`。由 GUI「安装并启用」写入当前选择。
     #[serde(default)]
     latency_log: bool,
@@ -369,6 +377,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         auto_lock,
         native_resolution,
         prefer_h265,
+        audio,
         latency_log,
         latency_log_frames,
     } = host;
@@ -391,6 +400,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         auto_lock,
         native_resolution,
         prefer_h265,
+        audio,
         latency_log,
         latency_log_frames,
         "无头实例启动"
@@ -403,6 +413,7 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         auto_lock,
         native_resolution,
         prefer_h265,
+        audio,
         opts,
         Arc::clone(&exit),
     );
@@ -413,12 +424,18 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
 }
 
 /// 起后台运行时线程：控制通道 + 远程引擎（无头，不注入 `AppState` / `status_tx`）。
+#[expect(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "参数与 host.toml 的开关一一对应，打包只会让调用点多一层样板"
+)]
 pub(crate) fn spawn_instance_runtime(
     config: ClientConfig,
     approval: ApprovalPolicy,
     auto_lock: bool,
     native_resolution: bool,
     prefer_h265: bool,
+    audio: bool,
     opts: &InstanceOptions,
     exit: Arc<AtomicBool>,
 ) {
@@ -468,10 +485,11 @@ pub(crate) fn spawn_instance_runtime(
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,
-                    // 实例没有控制器，不会播放声音；采集默认开启（`host.toml` 的 `audio`
-                    // 在 M3 接线，这里先用默认值）。
+                    // 实例没有控制器，不会播放声音；采集由 `host.toml` 的 `audio` 决定。
                     audio_enabled: false,
-                    audio_allowed: true,
+                    audio_allowed: audio,
+                    // 实例没有播放器；音量无意义，传默认值即可。
+                    audio_volume: 100,
                 },
             );
             spawn_session_watcher(Arc::clone(&manager), release);
