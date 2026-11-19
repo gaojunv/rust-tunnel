@@ -522,10 +522,11 @@ fn toolbar_contents(
     });
 }
 
-/// 工具条上的声音控制：扬声器开关 + 本地音量。
+/// 工具条上的声音开关。
 ///
 /// - 开关**同时**是本端静音与「让对端停止采集」：停止采集省 ~100 kbps，也少一份隐私暴露；
-/// - 音量是本地播放增益，不上线（对端仍在发流）；
+/// - 播放音量是「进去改一次」的东西，放在[会话设置](settings_sections)里——工具条每多一个
+///   常驻控件，窄窗口下就多一次折行，声音只占一个图标；
 /// - 对端不可用/被本地否决时按钮置灰，悬停显示原因。
 fn audio_controls(
     ui: &mut Ui,
@@ -568,21 +569,6 @@ fn audio_controls(
     if response.clicked() {
         v.audio_enabled = !v.audio_enabled;
         manager.set_audio_enabled(v.audio_enabled);
-    }
-
-    if available && v.audio_enabled {
-        ui.scope(|ui| {
-            ui.spacing_mut().slider_width = 64.0;
-            let mut volume = v.audio_volume;
-            if ui
-                .add(egui::Slider::new(&mut volume, 0..=100).show_value(false))
-                .on_hover_text("本机播放音量")
-                .changed()
-            {
-                v.audio_volume = volume;
-                manager.set_audio_volume(u32::from(volume));
-            }
-        });
     }
 }
 
@@ -749,7 +735,7 @@ fn settings_modal(
     }
 }
 
-/// 设置弹层的三个小节（画面 / 交互 / 界面）。
+/// 设置弹层的四个小节（画面 / 交互 / 声音 / 界面）。
 ///
 /// 从 [`settings_modal`] 拆出来只为控制函数长度；内容与「逐项改一次」的语义完全对应
 /// （各控件在改动时才下发，不做每帧轮询）。
@@ -831,6 +817,8 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
         );
     });
 
+    audio_section(ui, v, manager);
+
     widgets::section(ui, "界面", |ui| {
         // 收起 = 画面之上只留一枚延迟胶囊。它是**持久化**的显式选择（工具条上的「收起」也改它），
         // 这里是同一状态的第二个入口：收起后工具条虽然不见了，设置里仍看得到、也改得回来。
@@ -865,6 +853,26 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
         // 详细档：三组指标（链路 / 被控端 / 画面）。这里只改**持久化镜像**，由父窗口的
         // `sync_display_prefs` 回写 gui.toml；角标关闭时也可先勾选，打开角标即按详细档渲染。
         widgets::switch_row(ui, "统计角标显示详细指标", None, &mut v.stats_detail);
+    });
+}
+
+/// 「声音」小节：本地播放音量。
+///
+/// 工具条上只留扬声器开关（每多一个常驻控件，窄窗口就多一次折行）；音量是「想起来才调
+/// 一次」的东西，放这里。它是本地增益、不上线，对端仍在发流。
+fn audio_section(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
+    widgets::section(ui, "声音", |ui| {
+        widgets::labeled_row(ui, "播放音量", |ui| {
+            let mut volume = v.audio_volume;
+            if ui
+                .add(egui::Slider::new(&mut volume, 0..=100).suffix("%"))
+                .on_hover_text("本机播放音量，不改变对端采集；静音请用工具条扬声器")
+                .changed()
+            {
+                v.audio_volume = volume;
+                manager.set_audio_volume(u32::from(volume));
+            }
+        });
     });
 }
 
