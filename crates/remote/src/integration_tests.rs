@@ -313,6 +313,10 @@ fn manager_with_dirs(
         h265_encoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        audio_source: None,
+        audio_sink: None,
+        audio_enabled: false,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
     })
 }
 
@@ -654,6 +658,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         h264_encoder_factory: None,
         h265_encoder_factory: None,
         prefer_h265: true,
+        audio: None,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
         lock_on_disconnect: Arc::new(AtomicBool::new(false)),
     };
     let ctrl_cfg = ControllerConfig {
@@ -665,6 +671,8 @@ async fn wrong_token_is_rejected_by_controlled() {
         h264_decoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        audio: None,
+        audio_enabled: false,
         reliable: None,
     };
 
@@ -737,6 +745,8 @@ async fn correct_token_completes_handshake_and_streams() {
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),
@@ -757,6 +767,8 @@ async fn correct_token_completes_handshake_and_streams() {
             h264_decoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_enabled: false,
             reliable: None,
         },
         plan,
@@ -875,6 +887,8 @@ async fn tampered_hello_ack_pubkey_is_rejected() {
             h264_decoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_enabled: false,
             reliable: None,
         },
         plan,
@@ -1426,6 +1440,8 @@ async fn handshake_against_unregistered_token(
             h264_encoder_factory: None,
             h265_encoder_factory: None,
             prefer_h265: true,
+            audio: None,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
             lock_on_disconnect: Arc::new(AtomicBool::new(false)),
         },
         Arc::new(FakeScreen),

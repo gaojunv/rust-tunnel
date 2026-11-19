@@ -802,6 +802,12 @@ fn build_remote_manager(
         h265_decoder_factory,
         // 偏好与工厂就位后即按 H.265 优先协商；任一侧缺能力或环境变量禁用则回退 H.264/VP9。
         prefer_h265: opts.prefer_h265,
+        // 音频数据面在 M2/M3 接入 `crates/win-audio`；在此之前两侧都「不具备音频能力」，
+        // 控制端不会请求采集，被控端也不会打开设备。
+        audio_source: None,
+        audio_sink: None,
+        audio_enabled: false,
+        audio_allowed: Arc::new(AtomicBool::new(true)),
     });
     // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
     manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);

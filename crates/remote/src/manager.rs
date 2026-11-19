@@ -28,6 +28,7 @@
 //! 两者都接受 [`CancellationToken`]，由 [`RemoteManager::abort_active`] 一键中断。
 
 use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVAL_WAIT_TIMEOUT};
+use crate::audio::{AudioSink, AudioSource};
 use crate::auth::{PendingSession, PendingSessions};
 use crate::codec::{VideoDecoderFactory, VideoEncoderFactory};
 use crate::controller::{run_controller_with_input, ControllerCommand, ControllerConfig};
@@ -313,6 +314,10 @@ impl RemoteUiState {
 }
 
 /// [`RemoteManager`] 的构造参数。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "这些是彼此独立的用户/平台开关（原生分辨率、H.265、音频），合并不是一个布尔位"
+)]
 pub struct RemoteManagerConfig {
     /// 本机连接的服务端 `host:port`（用于补齐留空的 `rendezvous_host`）。
     pub server_host: String,
@@ -361,6 +366,17 @@ pub struct RemoteManagerConfig {
     ///
     /// 运行中修改经 [`RemoteManager::set_prefer_h265`]，只对**下一次会话**生效。
     pub prefer_h265: bool,
+    /// 可选的音频采集源（被控端用；Windows GUI/实例注入，其它平台为 `None`）。
+    pub audio_source: Option<Arc<dyn AudioSource>>,
+    /// 可选的音频播放目标（控制端用；`None` = 本端不请求对端采集声音）。
+    pub audio_sink: Option<Arc<dyn AudioSink>>,
+    /// 控制端会话开始时是否请求转发声音（用户偏好；运行中静音走
+    /// [`RemoteManager::set_audio_enabled`]）。
+    pub audio_enabled: bool,
+    /// 运行期「允许被控端转发声音」开关（用户设置 + 本会话否决位）。
+    ///
+    /// 被控端音频任务每帧读取；置 false 时立即停止采集并上报带原因的状态。
+    pub audio_allowed: Arc<AtomicBool>,
 }
 
 /// 正在进行的会话句柄。
@@ -844,6 +860,21 @@ impl RemoteManager {
     /// 请求被控端锁定屏幕（控制器动作；被控端只在完全控制模式下执行）。
     pub fn lock_screen(&self) {
         self.send_command(ControllerCommand::LockScreen);
+    }
+
+    /// 请求被控端启停音频采集（控制器动作）。
+    ///
+    /// `false` 同时是控制端的「静音」：停止采集能省下 ~100 kbps，也少一份隐私暴露。
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.send_command(ControllerCommand::SetAudioEnabled { enabled });
+    }
+
+    /// 设置被控端「允许转发声音」的**本会话**开关（不落盘）。
+    ///
+    /// 置 false 后音频任务会在 20 ms 内停下并上报「本机已停止转发声音」；用户重新允许后
+    /// 需要控制端再发一次 `SetAudioEnabled{true}`。
+    pub fn set_audio_allowed(&self, allowed: bool) {
+        self.cfg.audio_allowed.store(allowed, Ordering::Relaxed);
     }
 
     /// 批准当前待确认的接入请求；`remember` 为真时把该对端加入信任列表（此后免弹窗）。
@@ -1493,6 +1524,8 @@ impl RemoteManager {
             h264_decoder_factory: self.cfg.h264_decoder_factory.clone(),
             h265_decoder_factory: self.cfg.h265_decoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
+            audio: self.cfg.audio_sink.clone(),
+            audio_enabled: self.cfg.audio_enabled,
             reliable,
         };
         // 控制器不提供文件服务（`service: None`），只负责发起与落地。
@@ -1737,6 +1770,8 @@ impl RemoteManager {
             h265_encoder_factory: self.cfg.h265_encoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
             lock_on_disconnect: Arc::clone(&self.auto_lock_on_disconnect),
+            audio: self.cfg.audio_source.clone(),
+            audio_allowed: Arc::clone(&self.cfg.audio_allowed),
         };
         let clipboard = self
             .clipboard
@@ -2339,6 +2374,10 @@ mod tests {
             h265_encoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio_source: None,
+            audio_sink: None,
+            audio_enabled: false,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -2504,6 +2543,10 @@ mod tests {
             h265_encoder_factory: None,
             h265_decoder_factory: None,
             prefer_h265: true,
+            audio_source: None,
+            audio_sink: None,
+            audio_enabled: false,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
         })
     }
 
