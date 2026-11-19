@@ -23,7 +23,11 @@ name = "rust-tunnel-client-gui"
 #          与自动协商（H.265 → H.264 → VP9），并新增设置开关 `remote_prefer_h265`
 #          （默认开）与实例 `host.toml` 的 `prefer_h265`。两端必须同为 0.22.0；
 #          `client` / `win-platform` / `win-service` 同步抬版。
-version = "0.22.0"
+# 0.23.0 = 数据面 v11（音频转发：`Lane::Audio` + `AudioStatus`/`AudioPacket`/
+#          `SetAudioEnabled`）：被控端系统声音经 Opus 96 kbps 送到控制端播放。
+#          新增 `crates/win-audio`（Windows-only，vendored libopus）与设置/工具条
+#          音频控制、实例 `host.toml` 的 `audio`。两端必须同为 0.23.0。
+version = "0.23.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"

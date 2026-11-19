@@ -262,7 +262,7 @@ jobs:
       # 一致、报价/引号、服务状态映射）。测试失败就该拦住发布。
       # （打 tag 之前的同一批测试由 ci.yml 的 windows-tests 兜住。）
       - name: Test Windows-only modules
-        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video
+        run: cargo test -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video -p rust-tunnel-win-audio
 
       - name: Build and upload Windows unattended service
         shell: bash
