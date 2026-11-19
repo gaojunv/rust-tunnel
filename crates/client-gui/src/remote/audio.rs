@@ -9,43 +9,59 @@ use rust_tunnel_remote::{
     ReceivedAudio, RemoteError, RemoteResult,
 };
 use rust_tunnel_win_audio::playback::Playback;
-use rust_tunnel_win_audio::source::{has_output_device, LoopbackEncoder};
-use std::sync::atomic::{AtomicBool, Ordering};
+use rust_tunnel_win_audio::source::LoopbackEncoder;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// 构造本端音频端点（被控端采集源 + 控制端播放器）。
 #[must_use]
 pub fn endpoints() -> AudioEndpoints {
-    let source = WinAudioSource::new().map(|source| Arc::new(source) as Arc<dyn AudioSource>);
+    let source = Some(Arc::new(WinAudioSource::new()) as Arc<dyn AudioSource>);
     let sink = WinAudioSink::start().map(|sink| Arc::new(sink) as Arc<dyn AudioSink>);
     AudioEndpoints { source, sink }
 }
 
 /// 被控端采集源：WASAPI loopback + Opus。
 pub struct WinAudioSource {
-    /// `None` = 编码器创建失败（libopus 不可用）。
+    /// `None` = 编码器创建失败（通常是 MSVC 构建没有内置 libopus）。
     encoder: Mutex<Option<LoopbackEncoder>>,
-    /// 最近一次探测到的设备可用性。
-    available: AtomicBool,
+    /// 编码器创建失败的原因（直接进 `AudioStatus.reason`，避免只报「不支持音频」）。
+    init_error: Option<String>,
 }
 
 impl WinAudioSource {
-    fn new() -> Option<Self> {
-        let encoder = LoopbackEncoder::new().ok()?;
-        Some(Self {
-            encoder: Mutex::new(Some(encoder)),
-            available: AtomicBool::new(has_output_device()),
-        })
+    fn new() -> Self {
+        let (encoder, init_error) = match LoopbackEncoder::new() {
+            Ok(encoder) => (Some(encoder), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        Self {
+            encoder: Mutex::new(encoder),
+            init_error,
+        }
     }
 }
 
 impl AudioSource for WinAudioSource {
     fn capability(&self) -> AudioState {
-        let available = self.available.load(Ordering::Relaxed);
+        let encoder_ok = self
+            .encoder
+            .lock()
+            .is_ok_and(|encoder| encoder.is_some());
+        // **乐观上报**：不在会话开始前探测设备。无人值守实例经常在音频服务就绪之前
+        // 启动；一次探测失败就把 `available` 置 false，会让控制端永远不发
+        // `SetAudioEnabled`，连重试的机会都没有。真正的设备检查交给 `start()`——它失败
+        // 时上报带原因的状态，并由采集任务每 2 秒重试。
         AudioState {
             enabled: false,
-            available,
-            reason: (!available).then(|| "没有可用的音频回放设备".to_owned()),
+            available: encoder_ok,
+            reason: if encoder_ok {
+                None
+            } else {
+                self.init_error
+                    .clone()
+                    .or_else(|| Some("音频编码器不可用".to_owned()))
+            },
             codec: AudioCodec::Opus,
             sample_rate: 48_000,
             channels: 2,
@@ -58,13 +74,16 @@ impl AudioSource for WinAudioSource {
             .encoder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let encoder = guard
-            .as_mut()
-            .ok_or_else(|| RemoteError::Platform("音频编码器不可用".to_owned()))?;
+        let encoder = guard.as_mut().ok_or_else(|| {
+            RemoteError::Platform(
+                self.init_error
+                    .clone()
+                    .unwrap_or_else(|| "音频编码器不可用".to_owned()),
+            )
+        })?;
         encoder
             .start()
             .map_err(|err| RemoteError::Platform(err.to_string()))?;
-        self.available.store(true, Ordering::Relaxed);
         Ok(())
     }
 
