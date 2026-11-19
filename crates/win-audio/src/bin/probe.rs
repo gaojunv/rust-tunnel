@@ -6,6 +6,7 @@
 //! win-audio-probe rt      [秒数] [输出.wav]
 //! win-audio-probe tone    [秒数]
 //! win-audio-probe playtest [秒数]
+//! win-audio-probe bridge  [秒数]   （采集→播放回环，音量 0，验证播放侧收包与抖动）
 //! ```
 
 #[cfg(windows)]
@@ -35,6 +36,7 @@ fn run() -> rust_tunnel_win_audio::AudioResult<()> {
         "rt" => roundtrip(seconds(rest.first(), 5), rest.get(1)),
         "tone" => tone(seconds(rest.first(), 2)),
         "playtest" => playtest(seconds(rest.first(), 2)),
+        "bridge" => bridge(seconds(rest.first(), 5)),
         other => Err(AudioError::Message(format!(
             "未知子命令 {other:?}（devices / capture / rt / tone）"
         ))),
@@ -230,6 +232,36 @@ fn playtest(seconds: u64) -> rust_tunnel_win_audio::AudioResult<()> {
     let stats = playback.snapshot();
     println!(
         "播放自检完成：收包 {}，队列丢包 {}，欠载 {}，目标缓冲 {} ms",
+        stats.received, stats.dropped, stats.underruns, stats.buffer_ms
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn bridge(seconds: u64) -> rust_tunnel_win_audio::AudioResult<()> {
+    use rust_tunnel_win_audio::playback::Playback;
+    use rust_tunnel_win_audio::source::LoopbackEncoder;
+
+    let mut source = LoopbackEncoder::new()?;
+    source.start()?;
+    let playback = Playback::start()?;
+    // 音量 0：只验证「收包 → 抖动缓冲 → 解码 → 写设备」，不让扬声器出声，
+    // 否则 loopback 会把播放声再采回来形成正反馈。
+    playback.set_volume(0);
+    println!("回环自检：loopback 采集 → Opus → 抖动缓冲 → 设备（静音），共 {seconds} 秒……");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut seq = 0_u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        if let Some(frame) = source.read(&stop)? {
+            seq = seq.wrapping_add(1);
+            playback.push(seq, frame.data);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let stats = playback.snapshot();
+    println!(
+        "回环自检完成：产出 {seq} 帧，播放端收包 {}，队列丢 {}，欠载 {}，目标缓冲 {} ms",
         stats.received, stats.dropped, stats.underruns, stats.buffer_ms
     );
     Ok(())

@@ -4163,6 +4163,10 @@ async fn audio_supervisor(
 ///
 /// 所有状态变化都直接投进控制队列（`blocking_send` 在这个阻塞线程上可接受：控制队列深
 /// 32，而状态消息每个会话只有几次）。
+#[expect(
+    clippy::too_many_lines,
+    reason = "启动重试 + 采集循环 + 收尾状态是一段不可拆的状态机，拆开反而看不到停止路径"
+)]
 fn run_audio_capture(
     source: &dyn AudioSource,
     ctrl: &mpsc::Sender<SessionFrame>,
@@ -4172,10 +4176,6 @@ fn run_audio_capture(
     stop: &AtomicBool,
 ) {
     let capability = source.capability();
-    if !capability.available {
-        send_audio_status(ctrl, reporter, &capability);
-        return;
-    }
     if !allowed.load(Ordering::Relaxed) {
         let mut status = capability;
         status.enabled = false;
@@ -4183,24 +4183,62 @@ fn run_audio_capture(
         send_audio_status(ctrl, reporter, &status);
         return;
     }
-    if let Err(err) = source.start() {
-        warn!(error = %err, "启动音频采集失败");
-        let mut status = capability;
-        status.enabled = false;
-        status.available = false;
-        status.reason = Some(format!("启动音频采集失败: {err}"));
-        send_audio_status(ctrl, reporter, &status);
-        return;
+    // 启动失败按 2 秒退避重试，**不永久放弃**：无人值守实例经常在音频服务就绪之前
+    // 启动（服务先于 LogonUI），一次探测失败就退出会让整场会话永远没有声音。
+    // 只用分片睡眠，保持对 stop / 本地否决的响应。
+    let mut reported_failure = false;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if !allowed.load(Ordering::Relaxed) {
+            let mut status = capability.clone();
+            status.enabled = false;
+            status.reason = Some("本机已停止转发声音".to_owned());
+            send_audio_status(ctrl, reporter, &status);
+            return;
+        }
+        match source.start() {
+            Ok(()) => break,
+            Err(err) => {
+                if !reported_failure {
+                    warn!(error = %err, "启动音频采集失败，2 秒后重试");
+                    let mut status = capability.clone();
+                    status.enabled = false;
+                    status.available = false;
+                    status.reason = Some(format!("启动音频采集失败（将重试）: {err}"));
+                    send_audio_status(ctrl, reporter, &status);
+                    reported_failure = true;
+                }
+                let mut waited = 0_u32;
+                while waited < 2_000
+                    && !stop.load(Ordering::Relaxed)
+                    && allowed.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                    waited += 100;
+                }
+            }
+        }
     }
 
     let mut status = capability;
+    status.available = true;
     status.enabled = true;
     status.reason = None;
     send_audio_status(ctrl, reporter, &status);
+    info!(
+        sample_rate = status.sample_rate,
+        channels = status.channels,
+        "音频采集已启动"
+    );
 
     let mut seq = 0_u64;
     let mut failure: Option<String> = None;
     let mut vetoed = false;
+    // 诊断：设备已启动但长时间没有任何数据（无人值守实例的 loopback 可能拿不到音频端点）。
+    let mut last_packet_at = std::time::Instant::now();
+    let mut warned_silent = false;
     while !stop.load(Ordering::Relaxed) {
         // 用户在本会话里点了「停止转发声音」：立刻停，并把原因带回控制端。
         if !allowed.load(Ordering::Relaxed) {
@@ -4210,6 +4248,8 @@ fn run_audio_capture(
         match source.read_packet(stop) {
             Ok(Some(packet)) => {
                 seq = seq.wrapping_add(1);
+                last_packet_at = std::time::Instant::now();
+                warned_silent = false;
                 let frame = SessionFrame::audio(SessionMessage::AudioPacket {
                     seq,
                     capture_ts_us: packet.capture_ts_us,
@@ -4222,7 +4262,14 @@ fn run_audio_capture(
                 }
             }
             // 实现内部的等待窗口到期，或 stop 已置位。
-            Ok(None) => {}
+            Ok(None) => {
+                if !warned_silent && last_packet_at.elapsed() >= Duration::from_secs(3) {
+                    warn!(
+                        "音频采集设备已启动但 3 秒内没有任何数据（无人值守实例可能拿不到音频端点）"
+                    );
+                    warned_silent = true;
+                }
+            }
             Err(err) => {
                 failure = Some(err.to_string());
                 break;
@@ -4241,6 +4288,11 @@ fn run_audio_capture(
         status.reason = None;
     }
     send_audio_status(ctrl, reporter, &status);
+    if let Some(reason) = &status.reason {
+        info!(reason = %reason, "音频采集已停止");
+    } else {
+        info!("音频采集已停止");
+    }
 }
 
 /// 把一条 [`AudioState`] 作为 `AudioStatus` 投进控制队列（绝不丢、可阻塞发送），

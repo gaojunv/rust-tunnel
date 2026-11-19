@@ -1323,8 +1323,11 @@ fn audio_summary(state: &RemoteUiState) -> String {
             .unwrap_or_else(|| "未开启".to_owned());
     }
     format!(
-        "Opus 96 kbps · 缓冲 {} ms · 欠载累计 {} · 队列丢 {}",
-        state.audio_buffer_ms, state.audio_underruns, state.audio_dropped
+        "Opus 96 kbps · 收包 {} · 缓冲 {} ms · 欠载 {} · 队列丢 {}",
+        state.audio_received,
+        state.audio_buffer_ms,
+        state.audio_underruns,
+        state.audio_dropped
     )
 }
 

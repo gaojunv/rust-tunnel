@@ -25,6 +25,13 @@ pub const FRAME_MS: u32 = 20;
 /// 距上次 `push` 超过这个间隔就视为「重新开始」。
 const RESET_GAP: Duration = Duration::from_millis(500);
 
+/// 超过这个间隔没有新包，就**停止播放时间轴**（不再累计欠载）。
+///
+/// 这解决两个真实场景：① 控制端在两次会话之间空闲，播放线程仍在跑；② 对端停止采集后
+/// 永远不再发包。没有它，`underruns` 会以 50/s 的速度一直涨（真机上报到过 2000+），
+/// 把「这一次会话到底有没有收到音频」完全淹没。重新收到包时 `push` 会重新起播。
+const IDLE_STOP: Duration = Duration::from_secs(1);
+
 /// 无欠载持续这么久，`target` 回落一档。
 const RELAX_WINDOW: Duration = Duration::from_millis(8_000);
 
@@ -169,6 +176,18 @@ impl JitterBuffer {
     /// 从未欠载时窗口从起播时刻开始算，所以健康播放 8 秒后也会渐进回落。
     pub fn pull(&mut self, now: Instant) -> Pull {
         self.relax_target(now);
+
+        // 超过 `IDLE_STOP` 没有新包：播放时间轴停摆，**不再累计欠载**。
+        // 下一次 `push`（间隔必然 > `RESET_GAP`）会重新起播。
+        if self.play_at.is_some()
+            && self
+                .last_push_at
+                .is_some_and(|last| now.saturating_duration_since(last) > IDLE_STOP)
+        {
+            self.play_at = None;
+            self.packets.clear();
+            return Pull::Idle;
+        }
 
         let Some(play_at) = self.play_at else {
             // 尚未起播：不产生欠载计数。
@@ -519,5 +538,27 @@ mod tests {
         assert_eq!(jb.pull(at(base, 10_000)), Pull::Idle);
         assert_eq!(jb.underruns(), 0);
         assert_eq!(jb.target_ms(), 80);
+    }
+
+    /// 超过 1 秒没有新包后，欠载计数必须停止增长（真机上报到 2000+ 的根因）。
+    #[test]
+    fn idle_longer_than_one_second_stops_counting_underruns() {
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let base = Instant::now();
+        assert_eq!(jb.push(1, vec![7], base), Push::Stored);
+        assert_eq!(jb.pull(at(base, 80)), Pull::Packet(vec![7]));
+        // 缓冲空了、但仍在 1 秒窗口内：继续累计欠载。
+        assert_eq!(jb.pull(at(base, 100)), Pull::Idle);
+        let counted = jb.underruns();
+        assert!(counted >= 1, "活跃流中的空缓冲应计欠载");
+        // 1 秒后仍在拉：不再增长。
+        for step in 0..100_u64 {
+            let _ = jb.pull(at(base, 1_200 + step * 20));
+        }
+        assert_eq!(
+            jb.underruns(),
+            counted,
+            "空闲超过 1 秒后不得继续累计欠载（跨会话/对端停发会把计数刷爆）"
+        );
     }
 }
