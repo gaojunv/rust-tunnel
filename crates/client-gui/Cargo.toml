@@ -27,7 +27,10 @@ name = "rust-tunnel-client-gui"
 #          `SetAudioEnabled`）：被控端系统声音经 Opus 96 kbps 送到控制端播放。
 #          新增 `crates/win-audio`（Windows-only，vendored libopus）与设置/工具条
 #          音频控制、实例 `host.toml` 的 `audio`。两端必须同为 0.23.0。
-version = "0.24.0"
+# 0.24.0 = 数据面 v12（会话内路径迁移：中继会话可无缝换到打洞/直连路径），两端必须同为 0.24.0。
+# 0.25.0 = 控制端上屏「放大锐化」（CAS-Y，开关 + 强度滑杆）。纯显示侧、协议不变，
+#          与 0.24.0 可互控；`client` / `win-platform` / `win-service` 同步抬版。
+version = "0.25.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -97,6 +100,9 @@ arboard = "3"
 # 才校验着色器，写错一个重载就是「一开会话就 panic」。naga 与 wgpu 同版本（24），
 # 只开 `wgsl-in`（wgpu 本来就会把它编进来，这里不增加实际构建成本）。
 naga = { version = "24", default-features = false, features = ["wgsl-in"] }
+# A/B 截图 harness（`remote::nv12_cas_ab`）合成「桌面」用的 8×8 点阵 ASCII 字体
+# （MIT / public domain）。只给手动 `--ignored` 测试用，不进入发布二进制。
+font8x8 = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

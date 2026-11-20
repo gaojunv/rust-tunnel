@@ -26,6 +26,11 @@ fn default_audio_volume() -> u8 {
     100
 }
 
+/// 放大锐化强度的默认百分比（引用 `nv12_renderer` 的单一事实来源，避免两处各写一个 42）。
+fn default_sharpen_strength() -> u8 {
+    crate::remote::nv12_renderer::CAS_SHARPEN_DEFAULT_PERCENT
+}
+
 /// 把读到的帧率钳到合法范围 `15..=60`。
 ///
 /// UI 当前只提供 30 / 60（后续可能扩到 15），但手改 `gui.toml` 可能写入任意值；
@@ -192,6 +197,18 @@ pub struct GuiPrefs {
     /// **下一次会话**生效（引擎在会话建立时读一次）。
     #[serde(default)]
     pub remote_prefer_444: bool,
+    /// 控制端上屏的**放大锐化**（CAS，只作用于亮度平面；仅在画面被放大时生效）。
+    ///
+    /// **默认开启**：1080p 远端在 4K 屏全屏时是 2× 放大，GPU 双线性插值会把文字明显抹糊。
+    /// 锐化只在本机 GPU 上屏着色器里做，不上线、不影响对端；1:1 与缩小时自动不生效。
+    /// 纯 CPU（Glow / VP9 纹理）路径不经过该着色器，改了也没有效果。
+    #[serde(default = "default_true")]
+    pub remote_sharpen: bool,
+    /// 放大锐化的**强度**（百分比 0–100；默认 42）。只在 `remote_sharpen` 开启、且画面确实被
+    /// 放大时生效；0 等于关闭。用百分比 u8 而非 f32，既避免浮点 serde 的精度/表示问题，也与
+    /// `remote_audio_volume` 的风格一致。
+    #[serde(default = "default_sharpen_strength")]
+    pub remote_sharpen_strength: u8,
     /// 控制端会话开始时是否请求被控端转发声音。**默认开启**（与「批准即转发」的策略一致）。
     ///
     /// 运行中改它由工具条扬声器开关完成：立即作用于当前会话，并作为下一次会话的默认值。
@@ -258,6 +275,10 @@ impl Default for GuiPrefs {
             remote_prefer_h265: true,
             // `#[serde(default)]` 即 `false`：默认走 H.264 硬件编码（GPU 色度修复路径）。
             remote_prefer_444: false,
+            // 与字段上的 `#[serde(default = "default_true")]` 保持一致（放大时默认锐化）。
+            remote_sharpen: true,
+            // 与字段上的 `#[serde(default = "default_sharpen_strength")]` 保持一致。
+            remote_sharpen_strength: default_sharpen_strength(),
             remote_audio_enabled: true,
             remote_audio_volume: default_audio_volume(),
             remote_audio_allowed: true,
@@ -590,6 +611,57 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert!(reparsed.remote_prefer_444);
+    }
+
+    /// 放大锐化默认**开启**（1080p 远端在 4K 全屏是 2× 放大），缺键的旧配置也落到开启，
+    /// 用户显式关掉后能 TOML 往返保留。
+    #[test]
+    fn sharpen_defaults_on_and_survives_roundtrip() {
+        assert!(
+            GuiPrefs::default().remote_sharpen,
+            "全新安装应默认开启放大锐化（否则 2× 放大的文字明显发虚）"
+        );
+        // 缺键的旧配置也落到 true（serde default = default_true）。
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(prefs.remote_sharpen, "旧配置缺该键应默认开启");
+        // 往返保留用户选择（显式关掉）。
+        let saved = toml::to_string(&GuiPrefs {
+            remote_sharpen: false,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(!reparsed.remote_sharpen, "用户显式关闭必须持久化");
+    }
+
+    /// 放大锐化强度：默认 42%、旧配置缺键也是 42、显式 80 能往返；`from_prefs` 把越界值钳到 100。
+    #[test]
+    fn sharpen_strength_defaults_roundtrips_and_clamps() {
+        assert_eq!(
+            GuiPrefs::default().remote_sharpen_strength,
+            42,
+            "全新安装默认强度应 42%"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert_eq!(
+            prefs.remote_sharpen_strength, 42,
+            "旧配置缺该键也应落到 42%"
+        );
+        let saved = toml::to_string(&GuiPrefs {
+            remote_sharpen_strength: 80,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert_eq!(reparsed.remote_sharpen_strength, 80, "往返必须保留用户选择");
+
+        // `from_prefs` 对越界值（手改 gui.toml）钳到 100。
+        let wild = GuiPrefs {
+            remote_sharpen_strength: 150,
+            ..GuiPrefs::default()
+        };
+        let view = crate::remote::RemoteView::from_prefs(&wild, None);
+        assert_eq!(view.sharpen_strength, 100, "越界强度应在播种时钳到 100");
     }
 
     /// 原生分辨率迁移只跑一次：旧配置（键为 false、无迁移标志）被改成 true 并落标志，

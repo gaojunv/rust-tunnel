@@ -2,7 +2,7 @@
 name = "rust-tunnel-win-service"
 # 与 `crates/client-gui` 同一条发布列车（见 `crates/win-platform/Cargo.toml` 的说明）。
 # 自更新会把本 exe 与实例 exe 成对换入，两者版本必须一致。
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 description = "rust-tunnel unattended Windows host: SYSTEM service that launches the client instance into the console session"
 license = "MIT OR Apache-2.0"
