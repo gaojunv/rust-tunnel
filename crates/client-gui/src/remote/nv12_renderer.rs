@@ -495,9 +495,24 @@ pub struct Nv12Callback {
     pub frame: Arc<CompositeFrame>,
     /// 当前 egui 渲染目标格式（决定片元入口与管线格式）。
     pub target_format: wgpu::TextureFormat,
-    /// 上屏锐化强度（CAS 的 `sharpness`）；`0.0` = 关闭。调用方按用户开关传常量，
-    /// 由 `prepare` 写进 binding 3 的 uniform（着色器只在画面被放大时真正使用它）。
+    /// 上屏锐化强度（CAS 的 `sharpness` / RCAS 的 `con`）；`0.0` = 关闭。调用方按用户开关与滑杆
+    /// 传值，由 `prepare` 写进对应的 uniform（着色器只在画面被放大时真正使用它）。
     pub sharpen: f32,
+    /// 是否使用 FSR1（EASU + RCAS）放大路径；`false` 时走既有的单 pass（双线性 + CAS）。
+    pub use_fsr: bool,
+    /// 回调 rect 的**物理像素**尺寸（`(rect.width()*ppp).round()`、高同理）。FSR 的离屏目标按它建；
+    /// 单 pass 路径不用它。
+    pub out_size: (u32, u32),
+}
+
+impl Nv12Callback {
+    /// 本帧是否真的走 FSR：FSR 模式 + 强度 > 0 + 画面处于 1.01×–4× 放大区间。
+    ///
+    /// `prepare` 与 `paint` 都调用它，两边得到相同结论（纯依赖回调字段与帧尺寸，不需要共享状态）。
+    fn fsr_enabled(&self) -> bool {
+        let (iw, ih) = self.frame.dims();
+        crate::remote::nv12_fsr::fsr_active(self.use_fsr, self.sharpen, (iw, ih), self.out_size)
+    }
 }
 
 /// 存在 [`egui_wgpu::CallbackResources`] 里的 GPU 资源（管线、纹理、绑定组）。
@@ -516,12 +531,18 @@ struct Nv12Resources {
     sampler: wgpu::Sampler,
     /// Y 平面纹理（`R8Unorm`，`width × height`）。
     texture_y: Option<wgpu::Texture>,
+    /// Y 平面的视图（FSR 的 EASU pass 需要绑定它；随纹理一起重建）。
+    view_y: Option<wgpu::TextureView>,
     /// UV 平面纹理（`Rg8Unorm`，`width/2 × height/2`）。
     texture_uv: Option<wgpu::Texture>,
+    /// UV 平面的视图（FSR 的 Present pass 需要绑定它做色度采样）。
+    view_uv: Option<wgpu::TextureView>,
     /// 与上面两张纹理对应的绑定组。
     bind_group: Option<wgpu::BindGroup>,
     /// 当前纹理尺寸；变化时重建纹理与绑定组。
     size: Option<(u32, u32)>,
+    /// FSR1 渲染器（首次需要 FSR 时懒建）。目标格式随整组资源重建，故不需要单独失效。
+    fsr: Option<crate::remote::nv12_fsr::FsrRenderer>,
 }
 
 impl Nv12Resources {
@@ -647,9 +668,12 @@ impl Nv12Resources {
             params_buffer,
             sampler,
             texture_y: None,
+            view_y: None,
             texture_uv: None,
+            view_uv: None,
             bind_group: None,
             size: None,
+            fsr: None,
         }
     }
 
@@ -658,21 +682,24 @@ impl Nv12Resources {
     /// 上传内容由 [`CompositeFrame::take_upload`] 决定：全帧到达（或脏区被合并）时整帧上传，
     /// 否则只上传自上次以来累积的脏矩形。任何前置条件不满足（零尺寸/奇数尺寸）都直接跳过——
     /// 保留上一帧比画错或崩溃好。
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &CompositeFrame) {
+    ///
+    /// 返回值：本次是否**重建了纹理**（尺寸变化/首帧）。FSR 侧的绑定组引用了这些纹理的视图，
+    /// 故重建后必须让 FSR 一并重建绑定组。
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &CompositeFrame) -> bool {
         let (width, height) = frame.dims();
         // 4:2:0 要求偶数尺寸；零尺寸无法建纹理。
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return;
+            return false;
         }
         // 纹理重建（尺寸变化 / 首次）后必须整帧上传：新纹理里什么都没有。
         let force_full = self.ensure_textures(device, width, height);
         let (Some(texture_y), Some(texture_uv)) = (self.texture_y.as_ref(), self.texture_uv.as_ref())
         else {
-            return;
+            return force_full;
         };
         // 取脏矩形（锁内只拷贝 staging，锁外上传）。
         let Some(chunk) = frame.take_upload(force_full) else {
-            return;
+            return force_full;
         };
         match chunk {
             UploadChunk::Full { y, uv } => {
@@ -680,6 +707,7 @@ impl Nv12Resources {
             }
             UploadChunk::Rects(rects) => write_rects(queue, texture_y, texture_uv, &rects),
         }
+        force_full
     }
 
     /// 尺寸变化时重建纹理与绑定组；返回是否重建过（重建过 = 必须整帧上传）。
@@ -716,6 +744,8 @@ impl Nv12Resources {
         });
         self.texture_y = Some(texture_y);
         self.texture_uv = Some(texture_uv);
+        self.view_y = Some(view_y);
+        self.view_uv = Some(view_uv);
         self.bind_group = Some(bind_group);
         self.size = Some((width, height));
         true
@@ -871,13 +901,40 @@ impl egui_wgpu::CallbackTrait for Nv12Callback {
             callback_resources.insert(Nv12Resources::new(device, self.target_format));
         }
         if let Some(resources) = callback_resources.get_mut::<Nv12Resources>() {
-            // 每帧写锐化强度：`sharpen` 被钳到 [0,1]（手改偏好/调用方传错值也不会让 CAS 系数跑飞）。
-            // 16 字节 = [sharpen, 0, 0, 0] 的小端字节，前 4 字节即 `Params.sharpness` 的位置。
+            let fsr_on = self.fsr_enabled();
+            // 单 pass 的锐化强度：FSR 模式但本帧不满足放大区间时强制 0（纯双线性回退，绝不
+            // 偷偷退回 CAS）；FSR 模式且启用时单 pass 用不到，写什么都无所谓。
+            let single_pass_sharpen = if self.use_fsr && !fsr_on { 0.0 } else { self.sharpen };
+            // 每帧写锐化强度：`sharpen` 被钳到 [0,1]（手改偏好/调用方传错值也不会让系数跑飞）。
             let mut params = [0u8; 16];
-            params[..4].copy_from_slice(&self.sharpen.clamp(0.0, 1.0).to_le_bytes());
+            params[..4].copy_from_slice(&single_pass_sharpen.clamp(0.0, 1.0).to_le_bytes());
             queue.write_buffer(&resources.params_buffer, 0, &params);
             // 资源刚重建时纹理是空的，必须整帧上传（`upload` 内部按 `size` 判断）。
-            resources.upload(device, queue, &self.frame);
+            // 返回值告诉我们纹理是否重建过——FSR 的绑定组引用这些视图，重建过就得重建绑定组。
+            let rebuilt = resources.upload(device, queue, &self.frame);
+
+            // FSR 路径：满足放大区间才启用。EASU pass 编码进**独立** CommandBuffer 返回，
+            // egui-wgpu 会把它排在主 pass 之前提交，故 `paint` 里能直接采样 EASU 输出。
+            if fsr_on {
+                let (iw, ih) = self.frame.dims();
+                let out = self.out_size;
+                // 拆字段借用：`view_*` 与 `fsr` 是同一结构体的不同字段，需解构才能同时可变/不可变借用。
+                let Nv12Resources {
+                    view_y, view_uv, fsr, ..
+                } = resources;
+                if let (Some(vy), Some(vu)) = (view_y.as_ref(), view_uv.as_ref()) {
+                    let renderer = fsr
+                        .get_or_insert_with(|| crate::remote::nv12_fsr::FsrRenderer::new(device, self.target_format));
+                    renderer.configure(device, queue, vy, vu, (iw, ih), out, self.sharpen, rebuilt);
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("fsr_easu_encoder"),
+                        });
+                    if renderer.encode_easu(&mut encoder) {
+                        return vec![encoder.finish()];
+                    }
+                }
+            }
         }
         Vec::new()
     }
@@ -896,6 +953,18 @@ impl egui_wgpu::CallbackTrait for Nv12Callback {
         if resources.target_format != self.target_format {
             return;
         }
+        // FSR 路径：本帧 prepare 已配置好 Present 绑定组，直接用它的管线画。
+        if self.fsr_enabled() {
+            if let Some(fsr) = resources.fsr.as_ref() {
+                if let Some(bind_group) = fsr.present_bind_group() {
+                    render_pass.set_pipeline(fsr.present_pipeline());
+                    render_pass.set_bind_group(0, bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                    return;
+                }
+            }
+        }
+        // 普通路径：双线性 / 盒式 + 可选 CAS。
         let Some(bind_group) = resources.bind_group.as_ref() else {
             return;
         };

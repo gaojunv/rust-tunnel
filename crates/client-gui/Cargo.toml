@@ -30,7 +30,9 @@ name = "rust-tunnel-client-gui"
 # 0.24.0 = 数据面 v12（会话内路径迁移：中继会话可无缝换到打洞/直连路径），两端必须同为 0.24.0。
 # 0.25.0 = 控制端上屏「放大锐化」（CAS-Y，开关 + 强度滑杆）。纯显示侧、协议不变，
 #          与 0.24.0 可互控；`client` / `win-platform` / `win-service` 同步抬版。
-version = "0.25.0"
+# 0.26.0 = 新增 FSR1（EASU+RCAS）放大算法并设为默认（会话设置「放大算法」可切回
+#          双线性+CAS）。两 pass、仅放大区间生效，协议不变，与 0.25.0 可互控。
+version = "0.26.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
