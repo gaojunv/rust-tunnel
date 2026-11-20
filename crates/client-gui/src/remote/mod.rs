@@ -23,6 +23,9 @@ pub mod encoder_reuse;
 pub mod input_queue;
 mod instance_gpu;
 pub mod nv12_renderer;
+// A/B 截图 harness（CAS 放大锐化的开/关对照）：只在测试里编译，需要真 GPU，手动 `--ignored` 跑。
+#[cfg(test)]
+mod nv12_cas_ab;
 pub mod reconnect;
 pub mod view_scale;
 // 实例（`--instance`）的采集/注入/剪贴板：win-platform 支撑 + 桌面绑定的专用线程。
@@ -1875,6 +1878,12 @@ pub struct RemoteView {
     pub quality: QualityPreset,
     /// 本会话是否已把画质下发给被控端；会话结束时复位，下一场重新下发。
     quality_sent: bool,
+    /// 控制端**放大锐化**开关（持久化镜像，见 `GuiPrefs::remote_sharpen`）。
+    ///
+    /// 只影响本机上屏的 GPU 着色器（CAS-Y），不上线；`GuiApp::sync_display_prefs` 回写 `gui.toml`。
+    pub sharpen: bool,
+    /// 放大锐化**强度**（百分比 0–100，持久化镜像，见 `GuiPrefs::remote_sharpen_strength`）。
+    pub sharpen_strength: u8,
     /// 控制端是否请求转发声音（持久化镜像，见 `GuiPrefs::remote_audio_enabled`）。
     ///
     /// 工具条扬声器改它并调用 `RemoteManager::set_audio_enabled`（同时作用于当前会话与
@@ -1993,6 +2002,8 @@ impl RemoteView {
             settings_open: false,
             quality: QualityPreset::default(),
             quality_sent: false,
+            sharpen: true,
+            sharpen_strength: nv12_renderer::CAS_SHARPEN_DEFAULT_PERCENT,
             audio_enabled: true,
             audio_volume: 100,
             window_size: WindowSize::default(),
@@ -2053,6 +2064,8 @@ impl RemoteView {
         view.toolbar_collapsed = prefs.remote_toolbar_collapsed;
         view.frame_rate = prefs.remote_frame_rate;
         view.quality = prefs.remote_quality;
+        view.sharpen = prefs.remote_sharpen;
+        view.sharpen_strength = prefs.remote_sharpen_strength.min(100);
         view.audio_enabled = prefs.remote_audio_enabled;
         view.audio_volume = prefs.remote_audio_volume.min(100);
         view

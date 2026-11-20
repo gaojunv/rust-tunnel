@@ -47,7 +47,7 @@ use rust_tunnel_remote::DecodedNv12;
 ///
 /// BT.709 limited range 的定点系数与 `win-video` 的 NV12→NV12 颜色转换同源：
 /// `y ∈ [16,235]`、`uv ∈ [16,240]`（按 8 位偏移 128 表达）。
-const NV12_SHADER: &str = r"
+pub(crate) const NV12_SHADER: &str = r"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -56,6 +56,12 @@ struct VertexOutput {
 @group(0) @binding(0) var tex_y: texture_2d<f32>;
 @group(0) @binding(1) var tex_uv: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
+
+// 上屏参数（binding 3）：`sharpen` 是 CAS 锐化强度，0 = 关闭。
+// 其余三个 `_pad` 字段把结构体凑到 16 字节，满足 uniform 缓冲的对齐要求（WebGPU 对 uniform
+// 结构体按 16 字节对齐；只声明一个 f32 会让 min_binding_size 与实际布局对不上）。
+struct Params { sharpen: f32, _pad0: f32, _pad1: f32, _pad2: f32 };
+@group(0) @binding(3) var<uniform> params: Params;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
@@ -75,14 +81,46 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
     return out;
 }
 
+// 采样亮度并转成 BT.709 limited 的 [0,1]。
+//
+// 用 `textureSampleLevel(..., 0.0)` 而不是 `textureSample`：纹理只有 1 个 mip，采样结果不变，
+// 但 `textureSample` 要求**统一控制流**（隐式求导），放进 `if` 分支会被 naga 拒绝；显式给 mip
+// 级别的版本没有这个限制，CAS 才能在锐化分支里安全调用。
 fn sample_y(uv: vec2<f32>) -> f32 {
-    return (textureSample(tex_y, samp, uv).r * 255.0 - 16.0) / 219.0;
+    return (textureSampleLevel(tex_y, samp, uv, 0.0).r * 255.0 - 16.0) / 219.0;
 }
 
 // 一个输出像素在纹理上覆盖多少纹素（放大时 < 1）。
 fn footprint(uv: vec2<f32>) -> f32 {
     let dims = vec2<f32>(textureDimensions(tex_y));
     return max(length(dpdx(uv) * dims), length(dpdy(uv) * dims));
+}
+
+// CAS（Contrast Adaptive Sharpening）对**亮度平面**做 3x3 锐化，`step` 是一个输出像素在 uv 上的
+// 间距。只在放大时调用（见 `sample_rgb`）。
+//
+// 算法来自 AMD FidelityFX CAS 的公开实现（MIT 许可），此处是自写 WGSL，只取它的核心思想：
+//   - `mn`/`mx` 是 8 邻域 + 中心的局部极值，`amp` 度量「这附近有多少已经存在的对比度」：
+//     强边缘处 mn≈0、mx≈1 → `min(mn, 1-mx)≈0` → amp≈0 → 不锐化（不出 halo）；
+//     文字反锯齿的中间灰处 `min(mn,1-mx)` 大 → amp 大 → 正好补回双线性抹平的边缘。
+//   - `peak = -1/(8-3*strength)` 是负的锐化系数（strength∈[0,1] 时落在 -0.125..-0.2）。
+//   - 输出是中心值减去「中心与十字邻域均值的差」的一部分：e > 邻域均值 → 更亮，反之更暗。
+fn cas_y(uv: vec2<f32>, step: vec2<f32>, strength: f32) -> f32 {
+    let e  = sample_y(uv);
+    let n  = sample_y(uv + vec2(0.0, -step.y));
+    let s  = sample_y(uv + vec2(0.0,  step.y));
+    let w  = sample_y(uv + vec2(-step.x, 0.0));
+    let ea = sample_y(uv + vec2( step.x, 0.0));
+    let nw = sample_y(uv + vec2(-step.x, -step.y));
+    let ne = sample_y(uv + vec2( step.x, -step.y));
+    let sw = sample_y(uv + vec2(-step.x,  step.y));
+    let se = sample_y(uv + vec2( step.x,  step.y));
+    let mn = clamp(min(min(min(nw, ne), min(sw, se)), min(min(n, s), min(w, ea))), 0.0, 1.0);
+    let mx = clamp(max(max(max(nw, ne), max(sw, se)), max(max(n, s), max(w, ea))), 0.0, 1.0);
+    let amp  = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, 1e-4), 0.0, 1.0));
+    let peak = -1.0 / (8.0 - 3.0 * clamp(strength, 0.0, 1.0));
+    let k = amp * peak;
+    return clamp((e + k * (n + s + w + ea)) / (1.0 + 4.0 * k), 0.0, 1.0);
 }
 
 // 采样 NV12 并按 BT.709 limited range 转成 gamma 编码的 R'G'B'。
@@ -98,8 +136,22 @@ fn sample_rgb(uv: vec2<f32>, foot: f32) -> vec3<f32> {
         + sample_y(uv + vec2<f32>(step.x, -step.y))
         + sample_y(uv + vec2<f32>(-step.x, step.y))
         + sample_y(uv + vec2<f32>(step.x, step.y))) * 0.25;
-    let yv = mix(sample_y(uv), boxed, smoothstep(1.2, 2.0, foot));
-    let chroma = textureSample(tex_uv, samp, uv).rg;
+    var yv = mix(sample_y(uv), boxed, smoothstep(1.2, 2.0, foot));
+
+    // 放大锐化（CAS-Y）。只在**放大**时生效：1:1 与缩小时双线性/盒式采样已经足够，
+    // 锐化只会放大欠采样噪声。`params.sharpen` 是 uniform，故这个分支是统一控制流；
+    // 导数 `fwidth(uv)` 也在这里**无条件**算好再传进去，避免在分支里求导。
+    //
+    // 过渡带取 `smoothstep(0.90, 0.99, foot)` 而非更靠上的值：1:1 时 `foot` 恰好是 1.0
+    // （`1920 * (1/1920)`），若把过渡带套在 1.0 附近，1:1 也会吃到约 50% 的锐化。整段压到
+    // 1.0 以下，才能保证 1:1 与缩小时「逐字节不变」（放大 1.01× 起才开始介入）。
+    let ostep = fwidth(uv);
+    if (params.sharpen > 0.0) {
+        let sharp = cas_y(uv, ostep, params.sharpen);
+        yv = mix(yv, sharp, 1.0 - smoothstep(0.90, 0.99, foot));
+    }
+
+    let chroma = textureSampleLevel(tex_uv, samp, uv, 0.0).rg;
     let u = (chroma.x * 255.0 - 128.0) / 224.0;
     let v = (chroma.y * 255.0 - 128.0) / 224.0;
     let r = yv + 1.5748 * v;
@@ -419,6 +471,21 @@ pub fn stage_rect(data: &DecodedNv12, frame_width: u32, rect: DirtyRect) -> Opti
     })
 }
 
+/// 放大锐化的默认强度（百分比；0.3–0.5 是桌面文本的合适区间，再高会出描边感）。
+///
+/// 这是**单一事实来源**：`prefs.rs` 的默认值也引用它，改这里即可同时改「全新安装」与「旧配置
+/// 缺键」的默认观感。只作用于控制端本机上屏的亮度平面，不上线、不影响对端。
+pub const CAS_SHARPEN_DEFAULT_PERCENT: u8 = 42;
+
+/// 百分比 → CAS 的 `sharpness`（0.0–1.0，钳到 100）。
+///
+/// 持久化用 0–100 的整数（与 `remote_audio_volume` 一致，避免 f32 serde），只在写 uniform 前
+/// 转成着色器要的浮点；越界值（手改 `gui.toml`）一并收敛。
+#[must_use]
+pub fn cas_sharpen_strength(percent: u8) -> f32 {
+    f32::from(percent.min(100)) / 100.0
+}
+
 /// 一帧 NV12 的绘制回调（`egui_wgpu::Callback` 的数据载体）。
 ///
 /// `frame` 是**共享**的合成缓冲：解码线程原地打补丁，渲染侧每次 `prepare` 取走自上次以来累积的
@@ -428,6 +495,9 @@ pub struct Nv12Callback {
     pub frame: Arc<CompositeFrame>,
     /// 当前 egui 渲染目标格式（决定片元入口与管线格式）。
     pub target_format: wgpu::TextureFormat,
+    /// 上屏锐化强度（CAS 的 `sharpness`）；`0.0` = 关闭。调用方按用户开关传常量，
+    /// 由 `prepare` 写进 binding 3 的 uniform（着色器只在画面被放大时真正使用它）。
+    pub sharpen: f32,
 }
 
 /// 存在 [`egui_wgpu::CallbackResources`] 里的 GPU 资源（管线、纹理、绑定组）。
@@ -438,8 +508,10 @@ struct Nv12Resources {
     target_format: wgpu::TextureFormat,
     /// 渲染管线（片元入口已按 sRGB/非 sRGB 选定）。
     pipeline: wgpu::RenderPipeline,
-    /// 绑定组布局（Y、UV、采样器）。
+    /// 绑定组布局（Y、UV、采样器、锐化参数）。
     bind_group_layout: wgpu::BindGroupLayout,
+    /// 上屏参数（binding 3）：每帧写入 `[sharpen, 0, 0, 0]`。开着才写非零值。
+    params_buffer: wgpu::Buffer,
     /// 采样器：线性过滤 + ClampToEdge（GPU 缩放靠它）。
     sampler: wgpu::Sampler,
     /// Y 平面纹理（`R8Unorm`，`width × height`）。
@@ -454,6 +526,10 @@ struct Nv12Resources {
 
 impl Nv12Resources {
     /// 创建管线、布局与采样器（纹理等尺寸已知时再建）。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "管线/绑定布局/采样器/参数缓冲的创建集中在一处，拆开只会让资源所有权来回传"
+    )]
     fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nv12_shader"),
@@ -487,6 +563,17 @@ impl Nv12Resources {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // binding 3：锐化强度 uniform（16 字节，见着色器里的 `Params`）。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(16),
+                    },
                     count: None,
                 },
             ],
@@ -545,10 +632,19 @@ impl Nv12Resources {
             ..wgpu::SamplerDescriptor::default()
         });
 
+        // 锐化参数缓冲（binding 3）：内容每帧由 `prepare` 覆盖，故只给 UNIFORM | COPY_DST。
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nv12_params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             target_format,
             pipeline,
             bind_group_layout,
+            params_buffer,
             sampler,
             texture_y: None,
             texture_uv: None,
@@ -611,6 +707,10 @@ impl Nv12Resources {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -771,6 +871,11 @@ impl egui_wgpu::CallbackTrait for Nv12Callback {
             callback_resources.insert(Nv12Resources::new(device, self.target_format));
         }
         if let Some(resources) = callback_resources.get_mut::<Nv12Resources>() {
+            // 每帧写锐化强度：`sharpen` 被钳到 [0,1]（手改偏好/调用方传错值也不会让 CAS 系数跑飞）。
+            // 16 字节 = [sharpen, 0, 0, 0] 的小端字节，前 4 字节即 `Params.sharpness` 的位置。
+            let mut params = [0u8; 16];
+            params[..4].copy_from_slice(&self.sharpen.clamp(0.0, 1.0).to_le_bytes());
+            queue.write_buffer(&resources.params_buffer, 0, &params);
             // 资源刚重建时纹理是空的，必须整帧上传（`upload` 内部按 `size` 判断）。
             resources.upload(device, queue, &self.frame);
         }
@@ -822,6 +927,132 @@ mod tests {
         validator
             .validate(&module)
             .expect("NV12 着色器应通过语义校验");
+    }
+
+    /// 百分比 → `sharpness` 的映射（越界钳到 100）。
+    #[test]
+    fn cas_strength_percent_maps_to_sharpness() {
+        assert!(cas_sharpen_strength(0).abs() < f32::EPSILON);
+        assert!((cas_sharpen_strength(42) - 0.42).abs() < 1e-6);
+        assert!((cas_sharpen_strength(100) - 1.0).abs() < f32::EPSILON);
+        assert!(
+            (cas_sharpen_strength(150) - 1.0).abs() < f32::EPSILON,
+            "越界应钳到 100"
+        );
+    }
+
+    /// CAS 公式的**标量版本**，与着色器的 `cas_y` 逐行对应（3×3 网格按 `[行][列]`，`[1][1]`
+    /// 是中心）。这份实现是「规格锁」：GPU 着色器写错时这一侧先拦下，不必等真机看画面。
+    ///
+    /// 变量名（`e/n/s/w/ea/nw/...`）刻意与 WGSL 完全一致，方便逐行比对；故豁免单字母命名。
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "变量名与 WGSL `cas_y` 逐字对应，改名反而破坏逐行比对"
+    )]
+    fn cas_y_scalar(g: [[f32; 3]; 3], strength: f32) -> f32 {
+        let e = g[1][1];
+        let n = g[0][1];
+        let s = g[2][1];
+        let w = g[1][0];
+        let ea = g[1][2];
+        let nw = g[0][0];
+        let ne = g[0][2];
+        let sw = g[2][0];
+        let se = g[2][2];
+        let mn = nw
+            .min(ne)
+            .min(sw)
+            .min(se)
+            .min(n)
+            .min(s)
+            .min(w)
+            .min(ea)
+            .clamp(0.0, 1.0);
+        let mx = nw
+            .max(ne)
+            .max(sw)
+            .max(se)
+            .max(n)
+            .max(s)
+            .max(w)
+            .max(ea)
+            .clamp(0.0, 1.0);
+        let amp = (mn.min(1.0 - mx) / mx.max(1e-4)).clamp(0.0, 1.0).sqrt();
+        let peak = -1.0 / (8.0 - 3.0 * strength.clamp(0.0, 1.0));
+        let k = amp * peak;
+        ((e + k * (n + s + w + ea)) / (1.0 + 4.0 * k)).clamp(0.0, 1.0)
+    }
+
+    /// 着色器**实际生效**的路径：`strength <= 0` 时原样返回中心值，对应 `if (params.sharpen > 0.0)`。
+    ///
+    /// 规格锁必须把这道闸门一起建模：AMD 原式在 strength=0 时 `peak = -1/8` 仍会锐化，
+    /// 让「0 = 关闭」的是候选着色器里的分支，而非公式本身。
+    fn cas_y_applied(g: [[f32; 3]; 3], strength: f32) -> f32 {
+        if strength <= 0.0 {
+            return g[1][1];
+        }
+        cas_y_scalar(g, strength)
+    }
+
+    /// 常数场：DC 增益必须为 1（否则整幅画面的亮度/对比度会被锐化整体推偏）。
+    #[test]
+    fn cas_is_dc_neutral_on_a_constant_field() {
+        let g = [[0.5f32; 3]; 3];
+        let out = cas_y_applied(g, cas_sharpen_strength(CAS_SHARPEN_DEFAULT_PERCENT));
+        assert!((out - 0.5).abs() < 1e-6, "常数场输出应仍为 0.5，实际 {out}");
+    }
+
+    /// 硬边：8 邻域跨满 0..1 时 amp=0，输出严格等于中心——强边缘不出 halo（白边/黑边）。
+    #[test]
+    fn cas_does_not_halo_at_a_hard_edge() {
+        let g = [
+            [0.0, 1.0, 0.0],
+            [1.0, 0.5, 1.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let out = cas_y_applied(g, cas_sharpen_strength(CAS_SHARPEN_DEFAULT_PERCENT));
+        assert!((out - 0.5).abs() < 1e-6, "硬边处应保持中心值 0.5，实际 {out}");
+    }
+
+    /// 软边（0.4–0.6 的缓坡）：中心低于邻域均值处更暗、高于均值处更亮——这才是真正补锐。
+    #[test]
+    fn cas_sharpens_soft_edges_toward_the_local_extremes() {
+        // 中心 0.42，十字邻域全是 0.50，角上是 0.40..0.60 的缓坡：中心低于均值 → 应更暗。
+        let low = [
+            [0.40, 0.50, 0.60],
+            [0.50, 0.42, 0.50],
+            [0.60, 0.50, 0.40],
+        ];
+        let out_low = cas_y_applied(low, cas_sharpen_strength(CAS_SHARPEN_DEFAULT_PERCENT));
+        assert!(
+            out_low < 0.42 - 1e-3,
+            "软边低值应被压得更低（<0.42），实际 {out_low}"
+        );
+
+        // 对称：中心 0.58，高于均值 → 应更亮。
+        let high = [
+            [0.40, 0.50, 0.60],
+            [0.50, 0.58, 0.50],
+            [0.60, 0.50, 0.40],
+        ];
+        let out_high = cas_y_applied(high, cas_sharpen_strength(CAS_SHARPEN_DEFAULT_PERCENT));
+        assert!(
+            out_high > 0.58 + 1e-3,
+            "软边高值应被推得更高（>0.58），实际 {out_high}"
+        );
+    }
+
+    /// strength=0 = 关闭：输出必须逐位等于中心（分支闸门生效，而非公式的 -1/8 底噪）。
+    #[test]
+    fn cas_strength_zero_is_a_no_op() {
+        let g = [
+            [0.0, 1.0, 0.0],
+            [1.0, 0.5, 1.0],
+            [0.0, 1.0, 0.0],
+        ];
+        // 不直接比较 f32 相等（`clippy::float_cmp`）；闸门是原样返回中心值，差值必为 0。
+        let out = cas_y_applied(g, 0.0);
+        assert!((out - 0.5).abs() < f32::EPSILON, "strength=0 必须原样返回中心值，实际 {out}");
     }
 
     /// 8×8 的紧包 NV12：Y = `0..64`、UV = `100..132`（取值便于手算期望字节）。

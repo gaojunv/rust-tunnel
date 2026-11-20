@@ -511,6 +511,14 @@ impl GuiApp {
             self.prefs.remote_quality = view.quality;
             changed = true;
         }
+        if self.prefs.remote_sharpen != view.sharpen {
+            self.prefs.remote_sharpen = view.sharpen;
+            changed = true;
+        }
+        if self.prefs.remote_sharpen_strength != view.sharpen_strength {
+            self.prefs.remote_sharpen_strength = view.sharpen_strength;
+            changed = true;
+        }
         if self.prefs.remote_audio_enabled != view.audio_enabled {
             self.prefs.remote_audio_enabled = view.audio_enabled;
             changed = true;

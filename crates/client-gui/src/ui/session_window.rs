@@ -758,7 +758,12 @@ fn settings_modal(
 /// 设置弹层的四个小节（画面 / 交互 / 声音 / 界面）。
 ///
 /// 从 [`settings_modal`] 拆出来只为控制函数长度；内容与「逐项改一次」的语义完全对应
-/// （各控件在改动时才下发，不做每帧轮询）。
+/// （各控件在改动时才下发，不做每帧轮询）。四个小节顺序展开，再拆只会把共享的 `v`/`manager`
+/// 反复传一遍，故整体豁免行长上限。
+#[expect(
+    clippy::too_many_lines,
+    reason = "四个设置小节顺序展开；再拆分只会把共享的 v/manager 反复传递"
+)]
 fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManager>) {
     widgets::section(ui, "画面", |ui| {
         widgets::labeled_row(ui, "画质", |ui| {
@@ -801,6 +806,22 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
                 _ => "按物理像素，100% = 不缩放；超出窗口时中键拖拽平移",
             };
             ui.label(RichText::new(hint).weak().small());
+        });
+        // 放大锐化：只影响本机 GPU 上屏的亮度平面（CAS），1:1 与缩小时着色器自动不生效。
+        // 改的是**持久化镜像**，由父窗口的 `sync_display_prefs` 回写 gui.toml。
+        widgets::switch_row(
+            ui,
+            "放大时锐化",
+            Some("远端画面被放大时对亮度平面做 CAS 锐化；1:1 与缩小时自动不生效"),
+            &mut v.sharpen,
+        );
+        widgets::labeled_row(ui, "锐化强度", |ui| {
+            // 关闭时滑杆置灰但保留数值：用户下次打开开关不用重调。
+            ui.add_enabled(
+                v.sharpen,
+                egui::Slider::new(&mut v.sharpen_strength, 0..=100).suffix("%"),
+            )
+            .on_hover_text("默认 42%；过高会让文字出现描边感");
         });
         widgets::labeled_row(ui, "窗口尺寸", |ui| {
             let mut picked = v.window_size;
@@ -1080,6 +1101,12 @@ fn paint_image(
                 Nv12Callback {
                     frame: Arc::clone(frame),
                     target_format: *target_format,
+                    // 开关只决定传 0 还是滑杆当前强度；着色器仍只在画面被放大时才真正锐化。
+                    sharpen: if v.sharpen {
+                        crate::remote::nv12_renderer::cas_sharpen_strength(v.sharpen_strength)
+                    } else {
+                        0.0
+                    },
                 },
             ));
         }
