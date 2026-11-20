@@ -12,6 +12,7 @@ mod autostart;
 mod config_store;
 mod fonts;
 mod instance;
+mod mem;
 mod notify;
 mod prefs;
 mod preview;
@@ -797,12 +798,19 @@ fn build_remote_manager(
     let establisher = Arc::new(remote::LazyTransport::new(config.server.clone()));
     // Windows 上探测 NVENC/MFT 的 H.264 与 H.265 编解码器、以及 Media Foundation
     // 解码器；缺失的组合让协商按 H.265 → H.264 → VP9 逐级回退。其他平台四个都是 `None`。
+    // 无人值守实例**永远不发起**控制，解码器工厂 100% 用不到（只有 `controller.rs` 读）。
+    // 这里在**探测之前**就把解码器关掉：能力探测会真实创建 `MSH264DecoderMFT` /
+    // `MSH265DecoderMFT` 再丢弃，Intel 驱动下这份内存不回收（实测两者叠加约 43 MB
+    // working set，占实例启动占用的绝大部分），探测完再把工厂置 `None` 是没用的。
+    // 编码器探测照旧（被控端需要 H.264/H.265 编码）；GUI 路径也照旧（它随时可能去解码
+    // 对端画面）。
+    let probe_decoders = opts.platform_mode != remote::PlatformMode::Instance;
     let remote::HardwareFactories {
         h264_encoder: h264_encoder_factory,
         h264_decoder: h264_decoder_factory,
         h265_encoder: h265_encoder_factory,
         h265_decoder: h265_decoder_factory,
-    } = remote::hardware_factories();
+    } = remote::hardware_factories_with_decoders(probe_decoders);
     let audio = remote::audio_endpoints();
     let manager = RemoteManager::new(RemoteManagerConfig {
         server_host: config.server.clone(),

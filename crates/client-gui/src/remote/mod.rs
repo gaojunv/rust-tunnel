@@ -15,6 +15,10 @@
 
 pub mod clipboard_sync;
 pub mod desktop_follow;
+// 硬件编码器的进程级单槽复用池：Intel MFT 每实例约 15 MB 的驱动侧泄漏靠跨会话复用规避。
+// 只依赖 `rust-tunnel-remote` 的编码器 trait，**不含任何平台 API**，故全平台编译、可在
+// 任意 target 上单测（实际接入点在 Windows 的 `win_video`）。
+pub mod encoder_reuse;
 // 实例 GPU 采集的纯逻辑策略（会话锁存 + 显示器 id 映射）。全平台编译，便于单测。
 pub mod input_queue;
 mod instance_gpu;
@@ -253,14 +257,29 @@ pub(crate) fn gui_platform_handles() -> PlatformHandles {
 /// 构造本平台的硬件编解码工厂（Windows 返回 NVENC/MFT；其他平台都返回 `None`）。
 ///
 /// 每个字段为 `None` 表示该 (方向, 标准) 不参与协商，数据面按 VP9 或 H.264 继续。
+/// `probe_decoders = false` 时**跳过解码器探测**（两个解码器字段保持 `None`）。
+///
+/// # 为什么需要这个开关
+///
+/// 解码器工厂只有控制器（`crates/remote/src/controller.rs`）会读，而无人值守实例
+/// （`--instance`）**永远不发起控制**——它只被控制。可是解码器的能力探测是**真实创建**
+/// 一个 `MSH264DecoderMFT`（64×64）与 `MSH265DecoderMFT`（1280×720）再丢弃；实测在
+/// Intel 核显上每「建→丢」一次都会在驱动侧永久留下十几 MB 的 working set（H.264 约
+/// 23 MB、HEVC 720p 约 34 MB，两者叠加正是实例启动占用的主要部分），而且**探测之后再
+/// 把工厂置 `None` 并不能把这些内存还回来**。
+///
+/// 所以实例路径传 `false`（连探测一起跳过），GUI 路径保持 `true`（它随时可能作为
+/// 控制端去解码对端画面）。编码器探测不受影响：被控端仍需要 H.264/H.265 编码能力。
 #[must_use]
-pub fn hardware_factories() -> HardwareFactories {
+pub fn hardware_factories_with_decoders(probe_decoders: bool) -> HardwareFactories {
     #[cfg(target_os = "windows")]
     {
-        win_video::factories()
+        win_video::factories(probe_decoders)
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // 非 Windows 没有硬件工厂，参数只为保持签名一致。
+        let _ = probe_decoders;
         HardwareFactories::default()
     }
 }

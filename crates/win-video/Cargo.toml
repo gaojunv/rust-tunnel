@@ -36,6 +36,11 @@ path = "src/bin/mft_gpu_probe.rs"
 name = "win-video-patch-probe"
 path = "src/bin/patch_probe.rs"
 
+# 采集/编码/补丁路径的进程内存探针（按阶段打印 working set / commit）。
+[[bin]]
+name = "win-video-mem-probe"
+path = "src/bin/mem_probe.rs"
+
 [[bin]]
 name = "decode-stall-probe"
 path = "src/bin/decode_stall_probe.rs"
@@ -63,6 +68,8 @@ windows = { version = "0.62", features = [
     # ICodecAPI（SetValue 收 VARIANT）：运行期改码率/帧率、强制关键帧
     "Win32_System_Ole",
     "Win32_System_Variant",
+    # 内存探针：GetProcessMemoryInfo（working set / 峰值 / commit）。
+    "Win32_System_ProcessStatus",
     # 探针用 GetProcessTimes 量化软/硬解码的 CPU 时间（wall time 被 CPU 转换掩盖）。
     # 采集探针还用 GetCurrentProcessId/GetCurrentThreadId 报告进程身份。
     "Win32_System_Threading",

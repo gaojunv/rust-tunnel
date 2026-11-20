@@ -131,6 +131,12 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Shutdown",
     # 读取系统强调色（HKCU\...\DWM\AccentColor；见 ui/accent.rs）。
     "Win32_System_Registry",
+    # 内存遥测（`GetProcessMemoryInfo` / `PROCESS_MEMORY_COUNTERS_EX`；见 mem.rs）。
+    # feature 是叠加的，工作区清单里没有这一项，必须在这里显式声明。
+    "Win32_System_ProcessStatus",
+    # 线程数（`CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` + `Thread32First/Next`；
+    # 见 mem.rs）。与 win-platform 的进程枚举用的是同一个 feature。
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

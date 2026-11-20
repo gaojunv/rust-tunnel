@@ -8,6 +8,10 @@
 //!   编码器**同设备**时直接注册给 NVENC（零拷贝，不落 CPU）：尺寸相等就原样直通，尺寸
 //!   不等（4K 采集 → 1920 编码）先用同一块 GPU 上的 VideoProcessor 缩到编码尺寸再直通；
 //!   只有跨设备（混合显卡）或直通在本会话失败过时才回读 BGRA，必要时 CPU 盒式下采样后上传。
+//! - **编码器复用**：硬件 **MFT** 编码器放在 [`super::encoder_reuse`] 的进程级单槽池里跨
+//!   会话复用（Intel MFT 每实例化/销毁一次，驱动永久留下约 15 MB working set；实测数据见
+//!   该模块文档）。键 = 编码标准 + 编码尺寸 + 编码器绑定的采集 D3D11 设备；NVENC 不累积
+//!   泄漏、且适配器带会话级失败锁存，故不池化。
 //! - **解码**：Media Foundation 的 `MSH264DecoderMFT` / `MSH265DecoderMFT`（控制器侧）。
 //!
 //! 平台能力探测在 [`factories`]：NVENC（DLL + NVIDIA 适配器）可用、或 NVENC
@@ -42,12 +46,13 @@ use rust_tunnel_win_video::d3d11;
 use rust_tunnel_win_video::decode::{
     DecodePhaseTimings, H264DecodePath, H264HardwarePreference, H264OutputMode, MfVideoDecoder,
 };
-use rust_tunnel_win_video::mft_encoder::MfVideoEncoder;
+use rust_tunnel_win_video::mft_encoder::{enumerate_encoders, MfVideoEncoder};
 use rust_tunnel_win_video::nvenc::{EncoderConfig, InputFormat, NvencApi, NvencEncoder};
 use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba, scale_rgba_box};
 use rust_tunnel_win_video::scale::TextureScaler;
 use tracing::{debug, info, warn};
 
+use super::encoder_reuse::{EncoderKey, EncoderPool, PooledEncoder, ReusableEncoder};
 use super::XcapScreen;
 
 /// 已缓存采集源的重新校验间隔。
@@ -867,7 +872,7 @@ fn mft_available(codec: CodecKind) -> bool {
         CodecKind::H265 => &MFT_AVAILABLE_H265,
     };
     *slot.get_or_init(|| {
-        let available = MftEncoderFactory { codec }.probe();
+        let available = MftEncoderFactory { codec, pool: None }.probe();
         if available {
             info!("Intel/AMD 硬件 MFT {} 编码可用", codec.label());
         }
@@ -897,10 +902,16 @@ fn nvenc_supported() -> Option<SharedNvencApi> {
 /// 进程级 HEVC 编码能力探测结果（一次，失败不重试）。
 static NVENC_HEVC_PROBED: OnceLock<bool> = OnceLock::new();
 
-/// 探测 NVENC 是否真能开 HEVC 编码会话；返回函数表表示可用。
+/// 探测 NVENC 是否支持 HEVC 编码；返回函数表表示可用。
 ///
-/// **以真实创建为判据**（`supports_codec` 只查能力位）：老 GPU 往往报告 HEVC caps
-/// 却在实际初始化时被驱动拒绝。探测在专用线程上执行（D3D11/NVENC 初始化不占
+/// **只查驱动能力，不建编码器实例**：探测在进程启动时跑，一次「能不能用」的查询不值得
+/// 为它真建一个 1280×720 的 HEVC 编码会话（`NvencEncoder::new` 会分配输入/输出缓冲并
+/// 配置驱动侧编码器状态）。能力查询（`nvEncGetEncodeCaps`）按驱动签名要求一个**编码会话
+/// 句柄**，所以这里只 `open_session` + `supports_codec`，不创建编码器。
+///
+/// 代价：极老 GPU 可能报告 HEVC caps 却在实际初始化时被驱动拒绝。那种情况下真正建编码器
+/// 会失败，由引擎既有的运行时回退（`H.265 → H.264 → VP9`，见 `controlled.rs` 的
+/// `EncodeFallback`）兜底，不会把会话打断。探测在专用线程上执行（D3D11/NVENC 初始化不占
 /// 调用线程），失败**关闭**（不声明 H.265，数据面照旧 H.264）。
 fn nvenc_hevc_supported() -> Option<SharedNvencApi> {
     let api = nvenc_api()?;
@@ -927,14 +938,11 @@ fn nvenc_hevc_supported() -> Option<SharedNvencApi> {
                 let Ok(device) = d3d11::create_nvidia() else {
                     return false;
                 };
-                let Ok(config) = EncoderConfig::new(1280, 720, 30, 2000) else {
-                    return false;
-                };
-                match NvencEncoder::new(api.0, Arc::new(device), config.with_codec(CodecKind::H265))
-                {
-                    Ok(_) => true,
+                // 能力查询需要一个编码会话句柄，但不创建编码器、不分配码流缓冲。
+                match api.0.open_session(&device) {
+                    Ok(session) => api.0.supports_codec(&session, CodecKind::H265),
                     Err(err) => {
-                        info!("NVENC HEVC 编码会话创建失败，不声明 H.265：{err}");
+                        info!("NVENC HEVC 能力查询失败，不声明 H.265：{err}");
                         false
                     }
                 }
@@ -964,9 +972,28 @@ pub struct HardwareEncoderFactory {
     api: Option<SharedNvencApi>,
     /// 本工厂产出的编码标准。
     codec: CodecKind,
+    /// 进程级 **MFT 编码器**单槽复用池（见 [`super::encoder_reuse`]）。
+    ///
+    /// **为什么只池化 MFT、不池化 NVENC**：Intel MFT 每实例化/销毁一次，驱动就永久留下
+    /// 约 15 MB working set（实测，见 `encoder_reuse` 的模块文档），而 NVENC 多轮建/销
+    /// 不累积；且 NVENC 适配器带会话级单向开关（纹理直通/缩放器失败锁存），把上一场的
+    /// 失败状态带进下一场是**行为回归**，为省不存在的内存付这个代价不值得。
+    ///
+    /// 池挂在工厂上而不是全局 `static`：工厂由 `RemoteManagerConfig` 跨会话持有，生命周期
+    /// 天然正确，单测也不会互相串扰。
+    mft_pool: Arc<Mutex<EncoderPool>>,
 }
 
 impl HardwareEncoderFactory {
+    /// 建一个硬件编码器工厂（每个编码标准一个）。
+    fn new(api: Option<SharedNvencApi>, codec: CodecKind) -> Self {
+        Self {
+            api,
+            codec,
+            mft_pool: Arc::new(Mutex::new(EncoderPool::new())),
+        }
+    }
+
     /// 按指定后端创建编码器适配器。
     fn create_backend(
         &self,
@@ -1018,12 +1045,12 @@ impl HardwareEncoderFactory {
                     zero_copy_logged: false,
                 }))
             }
-            Backend::Mft => MftEncoderFactory { codec: self.codec }.create(
-                width,
-                height,
-                target_bitrate_kbps,
-                max_fps,
-            ),
+            // MFT 走进程级复用池（Intel 每实例约 15 MB 驱动侧泄漏，见 `encoder_reuse`）。
+            Backend::Mft => MftEncoderFactory {
+                codec: self.codec,
+                pool: Some(Arc::clone(&self.mft_pool)),
+            }
+            .create(width, height, target_bitrate_kbps, max_fps),
         }
     }
 }
@@ -1402,31 +1429,45 @@ impl VideoEncoderApi for NvencAdapter {
 /// Media Foundation 硬件编码器工厂（Intel QSV / AMD VCE 等），按编码标准实例化。
 ///
 /// 探测是**懒加载**的（见 [`mft_available`]）：NVENC 可用的机器只有在采集设备
-/// 是 Intel/AMD 时才会付 `MftEncoderFactory::probe()` 的启动成本。实际是否可用
-/// 由 `MfVideoEncoder::new_codec` 的硬件 MFT 枚举决定。Intel MFT 不支持运行期改帧率，
-/// 适配器会保持内部帧率，只让采集节奏随 QoS 变化，避免重建编码器/插 IDR。
+/// 是 Intel/AMD 时才会付 `MftEncoderFactory::probe()` 的启动成本。Intel MFT 不支持运行期
+/// 改帧率，适配器会保持内部帧率，只让采集节奏随 QoS 变化，避免重建编码器/插 IDR。
+///
+/// **编码器实例走进程级单槽复用池**（[`super::encoder_reuse`]）：Intel MFT 每实例化/销毁
+/// 一次，驱动就永久留下约 15 MB working set（实测，见该模块文档），而远程控制是单会话，
+/// 池里留一个就够。键 = 编码标准 + 编码宽高 + 编码器实际绑定的采集 D3D11 设备；键不匹配
+/// 才销毁重建（低频）。
 #[derive(Debug)]
 pub struct MftEncoderFactory {
     /// 本工厂产出的编码标准。
     codec: CodecKind,
+    /// 复用池；`None` = 只用于 `probe()` 的临时工厂（不会创建编码器）。
+    pool: Option<Arc<Mutex<EncoderPool>>>,
 }
 
 impl MftEncoderFactory {
     /// 探测是否有可用的、指定标准的硬件编码 MFT（专用线程，避免 COM 套间污染）。
+    ///
+    /// **只枚举、不激活**：`enumerate_encoders` 走 `MFTEnumEx` 列出硬件编码 MFT，不实例化
+    /// 任何编码器。旧实现为了「以真实创建为判据」会建一个 1280×720 编码器再销毁——每做
+    /// 一次就让驱动留下约 15 MB working set（实测数据见 [`super::encoder_reuse`]），启动
+    /// 探测不该付这笔钱。是否真能创建由会话建立时的 `create` 决定；创建失败会走引擎既有的
+    /// 运行时回退（H.265 → H.264 → VP9）。
     #[must_use]
     pub fn probe(&self) -> bool {
         let codec = self.codec;
         let probe = std::thread::Builder::new()
             .name("mft-encoder-probe".to_owned())
-            .spawn(
-                move || match MfVideoEncoder::new_codec(1280, 720, 30, 2000, codec) {
-                    Ok(_) => true,
-                    Err(err) => {
-                        info!(error = %err, "没有可用的硬件 {} 编码 MFT", codec.label());
-                        false
-                    }
-                },
-            )
+            .spawn(move || match enumerate_encoders(codec, true) {
+                Ok(encoders) if !encoders.is_empty() => true,
+                Ok(_) => {
+                    info!("没有可用的硬件 {} 编码 MFT", codec.label());
+                    false
+                }
+                Err(err) => {
+                    info!(error = %err, "没有可用的硬件 {} 编码 MFT", codec.label());
+                    false
+                }
+            })
             .ok();
         match probe.map(std::thread::JoinHandle::join) {
             Some(Ok(ok)) => ok,
@@ -1437,23 +1478,52 @@ impl MftEncoderFactory {
             None => false,
         }
     }
-}
 
-impl VideoEncoderFactory for MftEncoderFactory {
-    fn codec(&self) -> CodecId {
-        match self.codec {
-            CodecKind::H264 => CodecId::H264,
-            CodecKind::H265 => CodecId::H265,
+    /// 尝试从复用池取一个键匹配的编码器（命中时顺带同步 GPU 输入标志并打日志）。
+    ///
+    /// 池为空/键不匹配/实例不可用时返回 `None`，调用方走新建。返回的第二个值是实例
+    /// **创建时**的码率（峰值基准），要原样带进 [`PooledEncoder`]。
+    fn take_pooled(
+        &self,
+        key: EncoderKey,
+        has_capture_device: bool,
+        target_bitrate_kbps: u32,
+        max_fps: u8,
+    ) -> Option<(Box<dyn ReusableEncoder>, u32)> {
+        let pool = self.pool.as_ref()?;
+        let (encoder, created_bitrate_kbps) = pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .acquire(key, target_bitrate_kbps, max_fps)?;
+        let info = encoder.info();
+        // 采集侧据此决定还要不要交 GPU 纹理（复用实例的输入形态不随会话变化，但
+        // `supports_gpu_capture()` 每场都会把标志重置为乐观值）。
+        if has_capture_device {
+            gpu_context().set_encode_gpu_ok(info.gpu_input);
         }
+        // GUI 日志层会丢 tracing 字段，全部内联。
+        info!(
+            "MFT {} 复用上一场的编码器 尺寸={}x{} GPU={} adapter={}",
+            self.codec.label(),
+            key.width,
+            key.height,
+            info.gpu_input,
+            info.adapter
+        );
+        Some((encoder, created_bitrate_kbps))
     }
 
-    fn create(
+    /// 创建（或从复用池取出）一个编码器适配器。
+    ///
+    /// 先按「编码标准 + 尺寸 + 编码器实际绑定的采集设备」查池；命中就清空上一场残留并
+    /// 在线改成新会话的码率/帧率后返回，未命中才真正实例化。
+    fn create_reusable(
         &self,
         width: u32,
         height: u32,
         target_bitrate_kbps: u32,
         max_fps: u8,
-    ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+    ) -> RemoteResult<Box<dyn ReusableEncoder>> {
         let fps = u32::from(max_fps.max(1));
         let codec = self.codec;
         let codec_label = codec.label();
@@ -1469,6 +1539,35 @@ impl VideoEncoderFactory for MftEncoderFactory {
             .as_ref()
             .filter(|device| device.adapter.vendor_id == d3d11::VENDOR_INTEL)
             .cloned();
+        // 键里的设备身份取**编码器实际要绑定的那块**（不是泛指采集设备）：GPU 零拷贝要求
+        // 编码器与采集纹理同设备，`MftAdapter::encode_frame` 会用 `Arc::ptr_eq` 校验。
+        let requested_key = EncoderKey {
+            codec: match codec {
+                CodecKind::H264 => CodecId::H264,
+                CodecKind::H265 => CodecId::H265,
+            },
+            width,
+            height,
+            device: gpu_device
+                .as_ref()
+                .map(|device| Arc::as_ptr(device) as usize),
+        };
+        if let Some((encoder, created_bitrate_kbps)) = self.take_pooled(
+            requested_key,
+            capture_device.is_some(),
+            target_bitrate_kbps,
+            max_fps,
+        ) {
+            // `take_pooled` 只在池存在时返回 `Some`，故这里的 `if let` 必然命中。
+            if let Some(pool) = &self.pool {
+                return Ok(Box::new(PooledEncoder::new(
+                    encoder,
+                    requested_key,
+                    created_bitrate_kbps,
+                    Arc::clone(pool),
+                )));
+            }
+        }
         let (encoder, device) = if let Some(device) = gpu_device {
             let adapter = device.adapter.name.clone();
             match MfVideoEncoder::new_with_device_codec(
@@ -1512,13 +1611,50 @@ impl VideoEncoderFactory for MftEncoderFactory {
         if capture_device.is_some() {
             gpu_context().set_encode_gpu_ok(gpu);
         }
-        Ok(Box::new(MftAdapter {
+        // 建成的实例按**实际**绑定的设备进池：GPU 创建失败回退 CPU 时键也随之变成 `None`，
+        // 下一场不会把 CPU 适配器当成 GPU 适配器复用。
+        let actual_key = EncoderKey {
+            device: device.as_ref().map(|device| Arc::as_ptr(device) as usize),
+            ..requested_key
+        };
+        let adapter = MftAdapter {
             encoder,
             fps,
             frames: 0,
             gpu,
             device,
-        }))
+        };
+        let Some(pool) = &self.pool else {
+            return Ok(Box::new(adapter));
+        };
+        Ok(Box::new(PooledEncoder::new(
+            Box::new(adapter),
+            actual_key,
+            target_bitrate_kbps,
+            Arc::clone(pool),
+        )))
+    }
+}
+
+impl VideoEncoderFactory for MftEncoderFactory {
+    fn codec(&self) -> CodecId {
+        match self.codec {
+            CodecKind::H264 => CodecId::H264,
+            CodecKind::H265 => CodecId::H265,
+        }
+    }
+
+    fn create(
+        &self,
+        width: u32,
+        height: u32,
+        target_bitrate_kbps: u32,
+        max_fps: u8,
+    ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+        // 复用包装器同样实现 `VideoEncoderApi`；这里显式上转，供只关心编码器 trait 的调用方。
+        let encoder: Box<dyn VideoEncoderApi> =
+            self.create_reusable(width, height, target_bitrate_kbps, max_fps)?;
+        Ok(encoder)
     }
 }
 
@@ -1706,6 +1842,17 @@ impl VideoEncoderApi for MftAdapter {
             data: packet.data,
             keyframe: packet.keyframe,
         })
+    }
+}
+
+impl ReusableEncoder for MftAdapter {
+    /// 复用前清空 MFT：上一场可能留下已产出未取走的 output sample 或半截 GOP，直接复用会
+    /// 让新会话（新解码器）先收到一个解不出来的 P 帧。`MFT_MESSAGE_COMMAND_FLUSH` +
+    /// `START_OF_STREAM` 不重建实例，因此**不触发** Intel MFT 每实例约 15 MB 的驱动侧泄漏。
+    fn prepare_reuse(&mut self) -> RemoteResult<()> {
+        self.encoder
+            .prepare_reuse()
+            .map_err(|err| RemoteError::Encode(format!("MFT 复用前清空失败，丢弃实例: {err}")))
     }
 }
 
@@ -1974,8 +2121,15 @@ impl VideoDecoderApi for MfDecoderAdapter {
 /// **编码后端在这里不锁定**：NVENC 可用时只代表「该标准值得声明」，具体用 NVENC 还是
 /// MFT 由 [`HardwareEncoderFactory::create`] 在会话建立时按采集适配器决定（见
 /// [`choose_backend`]）。MFT 探测对 NVENC 可用的机器保持懒加载。
+///
+/// `probe_decoders = false` 时**连解码器探测一起跳过**（工厂保持 `None`）：解码器只有
+/// 控制器会读，而无人值守实例永远不发起控制。探测本身要实例化 `MSH264DecoderMFT`
+/// （64×64）与 `MSH265DecoderMFT`（1280×720），Intel 核显上实测分别留下约 23 MB /
+/// 34 MB 的驱动侧 working set 且不回收，是实例启动占用的主要来源（见
+/// [`super::hardware_factories_with_decoders`]）。编码器探测不受此开关影响——被控端仍
+/// 需要 H.264/H.265 编码能力。
 #[must_use]
-pub fn factories() -> super::HardwareFactories {
+pub fn factories(probe_decoders: bool) -> super::HardwareFactories {
     // 现场诊断开关：怀疑 NVENC/Media Foundation 探测导致启动问题时置 1，
     // 跳过所有硬件探测，数据面完全回退 VP9（GUI 仍应正常启动）。
     if std::env::var_os("RUST_TUNNEL_DISABLE_HWCODEC").is_some() {
@@ -1988,16 +2142,13 @@ pub fn factories() -> super::HardwareFactories {
     let h264_api = nvenc_supported();
     if h264_api.is_some() {
         info!("NVENC H.264 硬件编码已注入（编码后端在会话建立时按采集设备选路）");
-        out.h264_encoder = Some(Arc::new(HardwareEncoderFactory {
-            api: h264_api,
-            codec: CodecKind::H264,
-        }));
+        out.h264_encoder = Some(Arc::new(HardwareEncoderFactory::new(
+            h264_api,
+            CodecKind::H264,
+        )));
     } else if mft_available(CodecKind::H264) {
         info!("Intel/AMD 硬件 MFT H.264 编码已注入");
-        out.h264_encoder = Some(Arc::new(HardwareEncoderFactory {
-            api: None,
-            codec: CodecKind::H264,
-        }));
+        out.h264_encoder = Some(Arc::new(HardwareEncoderFactory::new(None, CodecKind::H264)));
     } else {
         info!("没有可用的硬件 H.264 编码器（NVENC/MFT），回退 VP9");
     }
@@ -2009,30 +2160,35 @@ pub fn factories() -> super::HardwareFactories {
         let h265_api = nvenc_hevc_supported();
         if h265_api.is_some() {
             info!("NVENC H.265 硬件编码已注入（编码后端在会话建立时按采集设备选路）");
-            out.h265_encoder = Some(Arc::new(HardwareEncoderFactory {
-                api: h265_api,
-                codec: CodecKind::H265,
-            }));
+            out.h265_encoder = Some(Arc::new(HardwareEncoderFactory::new(
+                h265_api,
+                CodecKind::H265,
+            )));
         } else if mft_available(CodecKind::H265) {
             info!("Intel/AMD 硬件 MFT H.265 编码已注入");
-            out.h265_encoder = Some(Arc::new(HardwareEncoderFactory {
-                api: None,
-                codec: CodecKind::H265,
-            }));
+            out.h265_encoder = Some(Arc::new(HardwareEncoderFactory::new(None, CodecKind::H265)));
         } else {
             info!("没有可用的硬件 H.265 编码器（NVENC/MFT），协商回退 H.264/VP9");
         }
     }
 
     // ── 解码器（控制器侧，两侧独立探测）──
-    out.h264_decoder = H264DecoderFactory::new()
-        .map(|factory| -> Arc<dyn VideoDecoderFactory> { Arc::new(factory) });
-    // `RUST_TUNNEL_DISABLE_H265` 是**整机**的 H.265 kill switch：解码侧也必须一起关掉，
-    // 否则它在控制器上会照常声明 `CodecOffer.h265`，用户在设置页重新打开偏好后又能协商
-    // 到 H.265——那就不是「强制关闭」了。
-    if !super::h265_disabled_by_env() {
-        out.h265_decoder = H265DecoderFactory::new()
+    //
+    // 实例模式（`probe_decoders == false`）必须**连探测一起**跳过：`H264DecoderFactory::new`
+    // / `H265DecoderFactory::new` 会真实创建 MFT 解码器做能力判断，Intel 驱动下这份
+    // 内存**丢弃实例后也不回收**，事后再把工厂置 `None` 没有任何效果。
+    if probe_decoders {
+        out.h264_decoder = H264DecoderFactory::new()
             .map(|factory| -> Arc<dyn VideoDecoderFactory> { Arc::new(factory) });
+        // `RUST_TUNNEL_DISABLE_H265` 是**整机**的 H.265 kill switch：解码侧也必须一起关掉，
+        // 否则它在控制器上会照常声明 `CodecOffer.h265`，用户在设置页重新打开偏好后又能协商
+        // 到 H.265——那就不是「强制关闭」了。
+        if !super::h265_disabled_by_env() {
+            out.h265_decoder = H265DecoderFactory::new()
+                .map(|factory| -> Arc<dyn VideoDecoderFactory> { Arc::new(factory) });
+        }
+    } else {
+        info!("跳过解码器探测（无人值守实例不发起控制）");
     }
     out
 }
@@ -2237,5 +2393,74 @@ mod tests {
         // 认不出 → 中性名，绝不空串。
         assert_eq!(mft_backend_name("（无名称）"), "MFT");
         assert_eq!(mft_backend_name(""), "MFT");
+    }
+
+    /// 真机验证：MFT 编码器**跨会话复用**后，反复建/销不再逐场抬高 working set。
+    ///
+    /// 这不是纯逻辑测试，需要 Intel/AMD 硬件 MFT，故默认 `#[ignore]`：
+    ///
+    /// ```text
+    /// cargo test --release -p rust-tunnel-client-gui --target x86_64-pc-windows-gnu \
+    ///     --bin rust-tunnel-client-gui mft_pool_soak -- --ignored --nocapture
+    /// ```
+    ///
+    /// 判据：第一场之后取基线（此时池里已经有一个实例），再跑 11 场。若复用池失效，
+    /// 每场都会新建一个 Intel MFT，实测每场 ~15 MB，11 场至少 +165 MB；这里要求增长
+    /// < 16 MB，能明确区分「真复用」与「每场重建」。
+    #[test]
+    #[ignore = "真机内存验证：需要 Intel/AMD 硬件 MFT；用 --release --ignored 手动跑"]
+    fn mft_pool_soak_keeps_working_set_flat() {
+        use rust_tunnel_remote::codec::VideoEncoderFactory;
+        use rust_tunnel_win_video::codec::CodecKind;
+        use std::sync::{Arc, Mutex};
+
+        use crate::remote::encoder_reuse::EncoderPool;
+        use super::MftEncoderFactory;
+
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init();
+
+        let codec = CodecKind::H264;
+        if !super::mft_available(codec) {
+            eprintln!("跳过：没有可用的硬件 H.264 MFT");
+            return;
+        }
+        let pool = Arc::new(Mutex::new(EncoderPool::new()));
+        let factory = MftEncoderFactory {
+            codec,
+            pool: Some(Arc::clone(&pool)),
+        };
+        let rgba = vec![96_u8; 1920 * 1080 * 4];
+        let mut baseline = 0_usize;
+        for cycle in 0..12 {
+            let mut encoder = factory
+                .create(1920, 1080, 6000, 30)
+                .expect("硬件 MFT 应能创建编码器");
+            for index in 0..2 {
+                let _ = encoder
+                    .encode(&rgba, 1920, 1080, index == 0)
+                    .expect("硬件 MFT 应能编码");
+            }
+            // 引擎会话结束时只会 `Drop`；包装器在这里把实例放回池。
+            drop(encoder);
+            assert!(
+                !pool.lock().unwrap().is_empty(),
+                "干净用完的实例应回池（第 {} 场）",
+                cycle + 1
+            );
+            if cycle == 0 {
+                baseline = crate::mem::snapshot().map_or(0, |snap| snap.working_set);
+                eprintln!("第 1 场后基线 working set = {baseline} 字节");
+            }
+        }
+        let after = crate::mem::snapshot().map_or(0, |snap| snap.working_set);
+        let growth = after.saturating_sub(baseline);
+        eprintln!("12 场后 working set = {after} 字节（相对基线增长 {growth} 字节）");
+        assert!(
+            growth < 16 * 1024 * 1024,
+            "复用池应把 11 场会话的 WS 增长压到 16 MB 内，实际增长 {growth} 字节"
+        );
     }
 }

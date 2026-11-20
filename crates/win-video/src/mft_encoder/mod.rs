@@ -67,8 +67,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoFormat_HEVC_ES, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
     MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
     MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_NO_MORE_TYPES,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
@@ -791,6 +791,46 @@ impl MfVideoEncoder {
         Err(WinVideoError::Encode(format!(
             "编码器不支持运行期改帧率（supported={supported}）: {detail}"
         )))
+    }
+
+    /// 复用前清掉上一场会话残留的编码状态（**编码器复用池**用，见 `client-gui` 的
+    /// `remote::encoder_reuse`）。
+    ///
+    /// # 异步 MFT：什么都不做（这是刻意的）
+    ///
+    /// QSV 是事件驱动的异步 MFT：`ProcessOutput` **只能**在 `METransformHaveOutput` 事件之后
+    /// 调用。真机实测在队列为空时直接调 `ProcessOutput` 会返回 `E_UNEXPECTED (0x8000FFFF)`。
+    /// 而引擎的 `encode_async` 在每次编码里已经把事件排空到 `MF_E_NO_EVENTS_AVAILABLE` 才返回，
+    /// 所以会话结束时**不存在**残留输出或残留事件；这里再做任何「清空」动作只会破坏流状态。
+    ///
+    /// 同理**不发 `MFT_MESSAGE_COMMAND_FLUSH`**：实测 flush 之后即使补发
+    /// `BEGIN_STREAMING` + `START_OF_STREAM`，QSV 也**不再产生 `METransformNeedInput`**，
+    /// 复用后第一次编码会一直等到 `EVENT_WAIT_TIMEOUT`——复用池每场都会丢弃实例，等于没修。
+    ///
+    /// 复用后的第一帧由引擎强制 IDR（`crates/remote/src/controlled.rs` 的
+    /// `force_keyframe = true`），编码器内部参考链从这一帧重新开始，与上一场 GOP 无关。
+    ///
+    /// # 同步 MFT：先把已产出的输出取走丢弃
+    ///
+    /// 同步 MFT 没有事件模型，`ProcessOutput` 可以无条件调用；把可能残留的输出丢掉，避免
+    /// 新会话（新解码器）先收到一个解不出来的 P 帧。
+    ///
+    /// # Errors
+    /// 同步路径取残留输出失败时返回错误；调用方应丢弃该实例、重新创建（复用池会这么做）。
+    pub fn prepare_reuse(&mut self) -> Result<(), WinVideoError> {
+        // 编码任务可能在线程池线程上运行：COM 初始化是线程局部的。
+        ensure_com_initialized()?;
+        if self.events.is_none() {
+            let discarded = self.drain_output()?;
+            if !discarded.is_empty() {
+                tracing::debug!(
+                    codec = self.kind.label(),
+                    bytes = discarded.len(),
+                    "丢弃上一场会话残留的编码输出（同步 MFT）"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 同步 MFT 路径（支持同步 ProcessInput/ProcessOutput 的实现）。
