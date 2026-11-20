@@ -46,6 +46,19 @@ use crate::{build_remote_manager, run_client_loop, LoopExit, ManagerOptions};
 /// 永远等不到下一次通告（GUI 那边靠每帧 `maybe_check` 补上这一环）。
 const INSTANCE_UPDATE_CHECK_INTERVAL: Duration = Duration::from_mins(30);
 
+/// 实例内存遥测的采样间隔（写进 `instance.log`，见 [`crate::mem`]）。
+///
+/// 60 秒足够画出「启动 → 会话 → 空闲」的占用曲线，又不会把日志撑大（一次采样一行）。
+const MEM_REPORT_INTERVAL: Duration = Duration::from_mins(1);
+
+/// 实例 tokio 运行时的 worker 线程数。
+///
+/// 默认值 = CPU 核数（本机 36 线程总量里的大头就是它），而实例的常驻任务只有控制通道
+/// 循环、远程引擎、路径迁移、更新 watchdog 这几条，绝大多数时间在等网络/定时器。
+/// 4 个 worker 足以覆盖同时活跃的会话（采集/编码在 spawn_blocking 的池线程上，不在
+/// worker 上），并显著减少每线程的栈预留与运行时初始化开销。
+const INSTANCE_WORKER_THREADS: usize = 4;
+
 /// 实例的路径参数（全部可由命令行 / 环境变量覆盖；默认值**明确落到 `%ProgramData%`**）。
 #[derive(Debug, Clone)]
 pub struct InstanceOptions {
@@ -417,6 +430,9 @@ pub fn run(opts: &InstanceOptions) -> anyhow::Result<()> {
         latency_log_frames,
         "无头实例启动"
     );
+    // 启动基线读数：此时只有主线程 + 日志初始化，是「引擎还没建」的下界。
+    // 与稍后「实例就绪」那条相减，就能看出硬件探测/运行时各自吃掉了多少。
+    crate::mem::log("实例启动（日志就绪）");
 
     let exit = Arc::new(AtomicBool::new(false));
     spawn_instance_runtime(
@@ -458,6 +474,10 @@ pub(crate) fn spawn_instance_runtime(
     let download_dir = opts.download_dir.clone();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+            // 显式钉住 worker 数（见 `INSTANCE_WORKER_THREADS`）：默认按核数起线程，
+            // 无人值守机器上纯属白占。阻塞线程池保持默认（按需增长）——采集/编码/注入
+            // 都在 `spawn_blocking` 上，它们要的是「按需」而不是固定 4 个。
+            .worker_threads(INSTANCE_WORKER_THREADS)
             .enable_all()
             .build()
         else {
@@ -511,6 +531,10 @@ pub(crate) fn spawn_instance_runtime(
                 },
             );
             spawn_session_watcher(Arc::clone(&manager), release);
+            // 「实例就绪」：硬件探测、平台安装、音频端点与运行时线程都已建好，是现场
+            // 最需要的那条读数（任务管理器里的 working set 应与它同量级）。
+            crate::mem::log("实例就绪（引擎已构造）");
+            spawn_mem_reporter();
             // 控制通道循环与 Ctrl+C 竞速：任一结束即收尾退出。
             //
             // `service_owner` 传 `None`：实例**就是**服务的孩子，它必须始终注册——身份归属
@@ -535,6 +559,19 @@ pub(crate) fn spawn_instance_runtime(
     });
 }
 
+/// 每 [`MEM_REPORT_INTERVAL`] 记一条内存读数（见 [`crate::mem`]）。
+///
+/// 现场问题「启动就 200 MB」常常在会话结束后才变严重（编码器/解码器、采集管线、
+/// 线程池都只会在会话里被创建），定期采样才能分清「启动占用」与「会话后不回收」。
+fn spawn_mem_reporter() {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MEM_REPORT_INTERVAL).await;
+            crate::mem::log("实例运行中");
+        }
+    });
+}
+
 /// 监视会话结束，补发一次「全部抬起」。
 ///
 /// 控制器侧的 `InputGate::release_all` 在会话结束时会把抬起事件发过线来，但**链路被硬
@@ -552,6 +589,9 @@ fn spawn_session_watcher(manager: Arc<RemoteManager>, release: Option<Arc<dyn Se
             if was_active && !active {
                 tracing::info!("会话结束，补发一次「全部抬起」");
                 release.release_all();
+                // 会话结束的读数专门记一条：会话里新建的编码器/采集管线是否被释放，
+                // 与「上一次会话前」的数字对比即可判断（现场最常见的「越用越大」）。
+                crate::mem::log("会话结束");
             }
             was_active = active;
         }

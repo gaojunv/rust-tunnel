@@ -10,14 +10,17 @@ use rust_tunnel_remote::{
 };
 use rust_tunnel_win_audio::playback::Playback;
 use rust_tunnel_win_audio::source::LoopbackEncoder;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// 构造本端音频端点（被控端采集源 + 控制端播放器）。
+///
+/// **播放器不在这里启动**（见 [`WinAudioSink`]）：无人值守实例没有控制器、永远收不到
+/// `AudioPacket`，却会在启动时白开一个 WASAPI 线程与默认输出设备。
 #[must_use]
 pub fn endpoints() -> AudioEndpoints {
     let source = Some(Arc::new(WinAudioSource::new()) as Arc<dyn AudioSource>);
-    let sink = WinAudioSink::start().map(|sink| Arc::new(sink) as Arc<dyn AudioSink>);
+    let sink = Some(Arc::new(WinAudioSink::new()) as Arc<dyn AudioSink>);
     AudioEndpoints { source, sink }
 }
 
@@ -117,19 +120,88 @@ impl AudioSource for WinAudioSource {
 }
 
 /// 控制端播放器：抖动缓冲 + Opus 解码 + WASAPI 输出（独立线程）。
+///
+/// # 为什么懒启动
+///
+/// 构造本端音频端点发生在**进程启动**（`build_remote_manager`），而在无人值守实例里
+/// 它是纯浪费：`Playback::start()` 会立刻起一个 `rt-audio-play` 线程，那个线程第一拍就
+/// 去 `Render::open_default_output()`——实例没有控制器、永远收不到 `AudioPacket`，这个
+/// 线程与 WASAPI 客户端会一直空转到进程退出。控制端则相反：只有真的收到第一段音频包
+/// 才有播放的意义（`SetAudioEnabled{true}` 之后才有包）。
+///
+/// # 取舍：为什么在线程里同步启动而不是丢给后台线程
+///
+/// `Playback::start()` 本身**不打开设备**（设备在播放线程的首拍里打开），它只建一个
+/// 通道并 `thread::spawn`，耗时是几十微秒量级的一次性开销；再套一层后台线程反而要多
+/// 一次线程创建、还要处理「启动完成前的包怎么办」。真正的设备枚举/打开仍在播放线程上，
+/// 不会占用引擎的 async 线程（`AudioSink::on_packet` 的非阻塞要求仍然成立）。
 pub struct WinAudioSink {
-    playback: Playback,
+    /// 惰性创建的播放器。`None` = 尚未收到第一个音频包。
+    state: Mutex<SinkState>,
+    /// 播放音量（0–200）。
+    ///
+    /// 引擎在**构造时**就会调一次 `set_audio_volume`（见 `build_remote_manager`），那时
+    /// 播放器还不存在，所以音量必须独立保存、在真正启动时回填。
+    volume: AtomicU32,
+}
+
+/// [`WinAudioSink`] 的惰性状态。
+#[derive(Default)]
+struct SinkState {
+    /// 播放器（第一个包到达时创建）。
+    playback: Option<Playback>,
+    /// 启动已失败过：只记一次日志，之后丢包，不再每包重试。
+    ///
+    /// `Playback::start()` 失败只可能是线程创建失败（解码器创建失败发生在播放线程内部）
+    /// ——那通常是资源耗尽，按包重试只会变成日志/线程创建风暴。
+    start_failed: bool,
 }
 
 impl WinAudioSink {
-    fn start() -> Option<Self> {
-        Playback::start().ok().map(|playback| Self { playback })
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SinkState::default()),
+            volume: AtomicU32::new(100),
+        }
+    }
+
+    /// 确保播放器已启动；返回它是否可用。
+    fn ensure_started(&self, state: &mut SinkState) -> bool {
+        if state.playback.is_some() {
+            return true;
+        }
+        if state.start_failed {
+            return false;
+        }
+        match Playback::start() {
+            Ok(playback) => {
+                // 回填构造期设置过的音量：`set_volume` 可能早于本函数很多。
+                playback.set_volume(self.volume.load(Ordering::Relaxed));
+                tracing::info!("首个音频包到达，音频播放器已启动");
+                state.playback = Some(playback);
+                true
+            }
+            Err(err) => {
+                state.start_failed = true;
+                tracing::warn!(error = %err, "音频播放器启动失败，本进程不再播放声音（音频包丢弃）");
+                false
+            }
+        }
     }
 }
 
 impl AudioSink for WinAudioSink {
     fn on_packet(&self, packet: ReceivedAudio) {
-        self.playback.push(packet.seq, packet.data);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.ensure_started(&mut state) {
+            return;
+        }
+        if let Some(playback) = state.playback.as_ref() {
+            playback.push(packet.seq, packet.data);
+        }
     }
 
     fn on_status(&self, _state: &AudioState) {
@@ -138,11 +210,21 @@ impl AudioSink for WinAudioSink {
     }
 
     fn set_volume(&self, percent: u32) {
-        self.playback.set_volume(percent);
+        // 先记下来（启动前调用是常态），再在播放器存在时就地应用。
+        self.volume.store(percent.min(200), Ordering::Relaxed);
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(playback) = state.playback.as_ref() {
+            playback.set_volume(percent);
+        }
     }
 
     fn snapshot(&self) -> AudioPlaybackStats {
-        let stats = self.playback.snapshot();
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(playback) = guard.playback.as_ref() else {
+            // 尚未播放：与「无播放能力」同口径的全 0（控制端 UI 不需要特判）。
+            return AudioPlaybackStats::default();
+        };
+        let stats = playback.snapshot();
         AudioPlaybackStats {
             received: stats.received,
             dropped: stats.dropped,
