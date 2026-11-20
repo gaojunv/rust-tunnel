@@ -53,7 +53,7 @@ const TOOLBAR_HOT: f32 = 6.0;
 /// 工具条现在是**浮层**、不再参与布局，因此这个值只用于「指针是否停在工具条上」的几何判据；
 /// 实测矩形一到（见 [`RemoteView::toolbar_rect`]）就不再使用它。它也不再承担任何占位职责——
 /// 浮层不影响中央面板的可用区域，画面不会因工具条隐现而位移。
-const TOOLBAR_FALLBACK_HEIGHT: f32 = 48.0;
+const TOOLBAR_FALLBACK_HEIGHT: f32 = widgets::PILL_HEIGHT;
 
 /// 取会话窗口的锁（中毒时取回内部值：一个视图锁中毒不该拖垮整个 UI）。
 fn lock(view: &Arc<Mutex<RemoteView>>) -> MutexGuard<'_, RemoteView> {
@@ -183,11 +183,9 @@ fn session_viewport_ui(
         v.release_input(manager);
     }
 
-    // 工具条可见时给一个定时重绘，否则静止画面下它永远不会淡出（画面静止时引擎不唤醒重绘）。
-    // 收起态同样需要：那枚延迟胶囊是唯一读数，心跳更新时视图未必会被重绘唤醒。
-    if v.toolbar_visible || v.toolbar_collapsed {
-        ctx.request_repaint_after(Duration::from_millis(400));
-    }
+    // 延迟胶囊恒可见、每秒都在刷新读数，所以**总是**安排定时重绘：否则静止画面下心跳更新
+    // 不会唤醒视图，胶囊上的延迟会停在上一次重绘的时刻。工具条可见时同理需要它按时淡出。
+    ctx.request_repaint_after(Duration::from_millis(400));
 }
 
 /// 本端快捷键：`F11` 切全屏；全屏时 `Esc` 退出全屏（非全屏的 `Esc` 照常透传给远端，见
@@ -209,8 +207,9 @@ fn handle_shortcuts(ctx: &egui::Context, v: &mut RemoteView) {
 /// 工具条自动隐藏：指针移动、位于工具条**实测矩形**内、或指针按下时显示并重置计时；静止超时后隐藏。
 /// 设置弹层打开期间**恒可见**——否则用户改完设置一抬头，工具条已经消失了。
 ///
-/// 热区判据分两态：**可见时**用工具条浮层上一帧的实测矩形（[`RemoteView::toolbar_rect`]）；
-/// **隐藏时**只认上缘窄带 [`TOOLBAR_HOT`]（移到窗口上缘召回）。
+/// 热区判据分两态：**可见时**用工具条浮层上一帧的实测矩形（[`RemoteView::toolbar_rect`]，
+/// 展开时是贴顶面板、收起/隐藏时是那枚胶囊）；**隐藏时**认上缘窄带 [`TOOLBAR_HOT`]、以及
+/// 那枚可见的胶囊本身（隐藏态的实测矩形就是胶囊）。
 ///
 /// # 为什么用上一帧的矩形
 ///
@@ -219,8 +218,8 @@ fn handle_shortcuts(ctx: &egui::Context, v: &mut RemoteView) {
 /// [`toolbar_fallback_rect`] 兜底。
 fn update_toolbar_visibility(ctx: &egui::Context, v: &mut RemoteView, autohide: bool) {
     if v.toolbar_collapsed {
-        // 收起态只画一枚延迟胶囊：它已经小到不挡画面，**不参与**自动隐藏——淡出之后用户就看不到
-        // 本来就只想看的那条延迟了。展开态可见性留给 [`RemoteView::expand_toolbar`] 重新起算。
+        // 收起态 = 顶部只留胶囊：**不参与**自动隐藏——胶囊小到不挡画面，淡出反而让
+        // 「只看延迟」落空。展开态可见性留给 [`RemoteView::expand_toolbar`] 重新起算。
         v.toolbar_visible = false;
         return;
     }
@@ -262,6 +261,7 @@ struct ToolbarInputs {
     /// 指针当前位置（不在窗口内时为 `None`）。
     pointer: Option<egui::Pos2>,
     /// 工具条**上一帧**的实测矩形（见 [`update_toolbar_visibility`] 对一帧延迟的说明）。
+    /// 展开时是贴顶面板，收起/隐藏时是那枚小胶囊。
     toolbar_rect: egui::Rect,
     /// 本帧指针是否移动。
     moved: bool,
@@ -306,8 +306,8 @@ fn decide_toolbar_visibility(i: ToolbarInputs) -> ToolbarDecision {
             // 可见时：整条**实测**矩形都算热区（含折行后的第二、三行）。
             i.toolbar_rect.contains(p)
         } else {
-            // 隐藏时：只认上缘窄带。
-            p.y <= TOOLBAR_HOT
+            // 隐藏时：上缘窄带，或指针停在那枚胶囊上（隐藏态的实测矩形就是胶囊，见 `render`）。
+            p.y <= TOOLBAR_HOT || i.toolbar_rect.contains(p)
         }
     });
     if i.moved || hot || i.down {
@@ -345,6 +345,15 @@ fn toolbar_fallback_rect() -> egui::Rect {
 /// 只由窗口尺寸与缩放档位决定。于是工具条隐现既不改变 `Fit` 档的画面尺寸，也不上移固定档的画面
 /// 原点——过去 `TopBottomPanel` 一注册就从中央区域扣掉自身高度，隐藏时占位为 0，画面会跳动；
 /// 那套「缓存高度常驻占位」的机制随浮层一并删除了。**别再改回面板**。
+///
+/// # 顶部延迟胶囊 ↔ 贴顶面板
+///
+/// 窗口上缘**只画一个**浮层，两者互斥、上缘位置完全一致（都贴 y = 0、都上角直角）：
+/// - 收起 / 自动隐藏 → 一枚小胶囊（只有延迟读数 + 下拉箭头），点它展开；
+/// - 展开 → 一条贴顶面板（状态 + 延迟 + 档位 + 声音 + 动作），收起靠面板上的 `ChevronUp`。
+///
+/// 不要把两者同时画出来：延迟会在胶囊和面板里各出现一次，而且「小胶囊 + 大面板」两截叠在
+/// 一起既重复又不成形状。
 fn render(
     v: &mut RemoteView,
     ctx: &egui::Context,
@@ -385,45 +394,41 @@ fn render(
         .frame(theme::scene_frame(&ctx.style()))
         .show(ctx, |ui| scene(ui, v, manager, active));
 
-    if v.toolbar_collapsed {
-        // 收起态：**只有**一枚延迟胶囊（点它展开）。刻意不套 `toolbar_frame`——一层底板 + 内边距
-        // 会把这块放大到原来的三分之一，而「不挡画面」正是收起的全部意义。
-        let bar = egui::Area::new(egui::Id::new("session_toolbar_collapsed"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
-            .show(ctx, |ui| collapsed_pill(ui, v, state));
-        v.toolbar_rect = Some(bar.response.rect);
-    } else if v.toolbar_visible {
-        // 浮在画面上缘居中：圆角半透明卡片，只留「状态 + 质量 + 当前档位 + 六个动作」。
+    // 顶部只画**一个**浮层，二者互斥：
+    // - 面板开着（`!collapsed && visible`）→ 一条贴顶面板，延迟等读数在它自己里面；
+    // - 收起 / 自动隐藏 → 一枚同样贴顶的小胶囊，它既是唯一读数，也是重新展开的入口。
+    // 两截同时出现既重复显示延迟，又会变成「小胶囊 + 大面板」的怪形状。
+    let panel_open = !v.toolbar_collapsed && v.toolbar_visible;
+    let rect = if panel_open {
         let bar = egui::Area::new(egui::Id::new("session_toolbar"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
+            // 贴顶：锚点 y = 0，上缘不留缝（面板上角是直角，见 `toolbar_frame_top`）。
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                theme::toolbar_frame(ui.style()).show(ui, |ui| {
+                theme::toolbar_frame_top(ui.style()).show(ui, |ui| {
                     toolbar_contents(ui, v, manager, state, active);
                 });
             });
-        v.toolbar_rect = Some(bar.response.rect);
+        bar.response.rect
     } else {
-        // 隐藏时只在上缘留一条 28×3 的细提示（不可交互）：告诉用户工具条还在、上缘可召回，
-        // 但 3px 的高度不会挡住画面，也不会吃掉点击。
-        let p = theme::palette(&ctx.style());
-        egui::Area::new(egui::Id::new("session_toolbar_hint"))
+        // 点胶囊即展开（`expand_toolbar`），计时也随之重置。
+        let pill = egui::Area::new(egui::Id::new("session_toolbar_pill"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 4.0))
-            .interactable(false)
-            .show(ctx, |ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 3.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(2), p.stroke_strong);
-            });
-    }
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| collapsed_pill(ui, v, state));
+        pill.response.rect
+    };
+    // 热区 = 当前那一个浮层的实测矩形（面板或胶囊）。
+    v.toolbar_rect = Some(rect);
 
     // 重连提示浮在工具条下方（同为浮层：它出现/消失也不该挪动画面）。
     if v.reconnect_note.is_some() {
         egui::Area::new(egui::Id::new("session_reconnect"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                egui::vec2(0.0, widgets::PILL_HEIGHT + 44.0),
+            )
             .show(ctx, |ui| {
                 theme::card_frame(ui.style()).show(ui, |ui| {
                     reconnect_strip(ui, v, manager);
@@ -598,7 +603,7 @@ fn toolbar_actions(
     {
         manager.trigger_migration();
     }
-    if widgets::toolbar_icon(ui, Icon::ChevronUp, "收起到只显示延迟（点延迟胶囊可展开）").clicked()
+    if widgets::toolbar_icon(ui, Icon::ChevronUp, "收起成顶部延迟胶囊（点胶囊展开下拉）").clicked()
     {
         v.collapse_toolbar();
     }
@@ -666,17 +671,20 @@ fn toolbar_actions(
     }
 }
 
-/// 收起态的唯一内容：一枚延迟胶囊，点它展开工具条。
+/// 顶部延迟胶囊（工具条面板的收起形态）：一枚贴着上缘的小胶囊，显示当前链路延迟。
 ///
 /// 「只显示延迟」是用户的原话，所以这里**不**再放状态点、路径、档位摘要——多一个字符就多挡一点
 /// 画面。延迟未知时显示 `延迟 —`，形状与有值时一致（收起的工具条不会因为一次心跳丢包而跳大小）。
+///
+/// 点它 = 展开面板（[`RemoteView::expand_toolbar`]）。面板展开时**不再画胶囊**——延迟在面板里
+/// 已经有一份，两截同显既重复又难看；收起是面板上的「收起」按钮（`ChevronUp`）或自动隐藏。
 fn collapsed_pill(ui: &mut Ui, v: &mut RemoteView, state: &RemoteUiState) {
     let p = theme::palette(ui.style());
     let (text, color) = state.latency_ms.map_or_else(
         || ("延迟 —".to_owned(), p.text_weak),
         |ms| (format!("{ms} ms"), latency_color(ms)),
     );
-    if widgets::pill_button(ui, &text, color, "点击展开工具条").clicked() {
+    if widgets::pill_button(ui, &text, color, "展开工具条").clicked() {
         v.expand_toolbar();
     }
 }
@@ -2153,6 +2161,26 @@ mod tests {
             Duration::from_secs(10),
         ));
         assert!(d.visible);
+    }
+
+    /// 可见的延迟胶囊也算热区（自动隐藏后指针停在胶囊上，y 超出 6px 的上缘窄带也要重新展开）。
+    /// 隐藏态的实测矩形就是胶囊（见 `render`）。
+    #[test]
+    fn pointer_on_latency_pill_recalls_hidden_toolbar() {
+        let mut i = inputs(
+            true,
+            false,
+            Some(egui::pos2(500.0, 12.0)),
+            widgets::PILL_HEIGHT,
+            Duration::from_secs(10),
+        );
+        i.toolbar_rect = egui::Rect::from_min_size(
+            egui::pos2(460.0, 0.0),
+            egui::vec2(80.0, widgets::PILL_HEIGHT),
+        );
+        let d = decide_toolbar_visibility(i);
+        assert!(d.visible, "指针停在可见的延迟胶囊上应展开面板");
+        assert!(d.reset_activity);
     }
 
     #[test]

@@ -823,21 +823,51 @@ pub fn modal_title(ui: &mut Ui, title: &str) -> bool {
     .inner
 }
 
-/// 可点击的胶囊按钮（会话工具条收起态：只显示延迟，点它展开）。
+/// 会话顶部延迟胶囊的固定高度（逻辑点）。
+///
+/// 胶囊只用固定高度（不由字体撑），这样它和展开后的贴顶面板在垂直方向上完全一致——
+/// 收/展切换时上缘位置不动。它同时也是「隐藏态」兜底热区的高度。
+pub const PILL_HEIGHT: f32 = 20.0;
+
+/// 可点击的胶囊按钮（会话顶部收起态：只显示延迟，点它展开工具条面板）。
+///
+/// 视觉上**紧贴窗口上缘**：上角直角、下角圆角，读起来像从窗口边沿垂下来的一枚小舌片；
+/// 右侧带一枚向下箭头（"点我展开"）。刻意做得比普通按钮小一号（[`PILL_HEIGHT`] 固定高、
+/// 横向内边距 8），因为它长期盖在画面上。
 pub fn pill_button(ui: &mut Ui, text: &str, fg: Color32, tip: &str) -> Response {
     let p = palette(ui.style());
     let font = egui::TextStyle::Small.resolve(ui.style());
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
-    let padding = Vec2::new(10.0, 5.0);
-    let size = galley.size() + padding * 2.0;
+    let pad_x = 8.0;
+    let caret = 10.0;
+    let size = Vec2::new(galley.size().x + pad_x * 2.0 + caret + 4.0, PILL_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let bg = if resp.hovered() {
         p.surface_raised
     } else {
         p.surface
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
-    ui.painter().galley(rect.min + padding, galley, fg);
+    // 上缘贴齐窗口边沿：上角不圆，才不会露出两道缝。
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 7,
+            se: 7,
+        },
+        bg,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + pad_x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        fg,
+    );
+    let caret_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - pad_x - caret / 2.0, rect.center().y),
+        Vec2::splat(caret),
+    );
+    icons::paint(ui.painter(), caret_rect, Icon::ChevronDown, p.text_weak, 1.3);
     resp.on_hover_text(tip)
 }
 

@@ -1875,16 +1875,17 @@ pub struct RemoteView {
     ///
     /// 工具条上的开关改它，`GuiApp::sync_display_prefs` 每帧比对后回写 `gui.toml`。
     pub toolbar_autohide: bool,
-    /// 工具条是否**手动收起**（只保留一枚延迟胶囊；**持久化镜像**，见
+    /// 工具条是否**手动收起**（顶部只留一枚延迟胶囊；**持久化镜像**，见
     /// `GuiPrefs::remote_toolbar_collapsed`）。
     ///
     /// 与 [`Self::toolbar_visible`] 是两件事：后者是自动隐藏**算出来**的运行时结果，前者是用户的
-    /// 显式选择。收起态根本不参与自动隐藏——它已经小到不挡画面，再淡出反而让「只看延迟」落空。
+    /// 显式选择。收起态根本不参与自动隐藏——胶囊已经小到不挡画面，再淡出反而让「只看延迟」落空。
     pub toolbar_collapsed: bool,
     /// 工具条浮层**上一帧**的实测矩形（热区判据：指针是否停在工具条上）。
     ///
     /// 工具条是浮在画面之上的 `egui::Area`，隐现不影响布局；但「指针是否停在按钮上」仍要用实测
-    /// 矩形，而不是硬编码高度。首帧尚未测得时为 `None`（用兜底矩形）。
+    /// 矩形，而不是硬编码高度。展开时是贴顶面板，收起/隐藏时是那枚小胶囊。首帧尚未测得时为
+    /// `None`（用兜底矩形）。
     pub toolbar_rect: Option<egui::Rect>,
     /// 统计角标是否常显（持久化镜像）。
     pub stats_overlay: bool,
@@ -2200,7 +2201,7 @@ impl RemoteView {
         manager.set_quality(preset);
     }
 
-    /// 收起悬浮工具条：画面之上只留一枚延迟胶囊（见 `ui::session_window` 的 `collapsed_pill`）。
+    /// 收起顶部工具条：画面之上只留一枚延迟胶囊（见 `ui::session_window` 的 `collapsed_pill`）。
     ///
     /// 用户嫌工具条挡画面时用；收起是**显式选择**，跨会话保留（`GuiPrefs::remote_toolbar_collapsed`）。
     pub fn collapse_toolbar(&mut self) {
