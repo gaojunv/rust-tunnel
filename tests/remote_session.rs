@@ -549,10 +549,13 @@ fn manager(
         h265_encoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        prefer_444: false,
         audio_source: None,
         audio_sink: None,
         audio_enabled: false,
         audio_allowed: Arc::new(AtomicBool::new(true)),
+        // 这些用例不测会话内迁移（部分用真实 RustDeskTransport，但默认关闭宏以免影响既有断言）。
+        punch_migration: false,
     });
     // 双方先拿到能力通告（设置 params / rd_id），与真实控制通道下发等价。
     mgr.handle_control_message(ControlMessage::RemoteCapability {
@@ -597,10 +600,13 @@ fn manager_lazy(
         h265_encoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        prefer_444: false,
         audio_source: None,
         audio_sink: None,
         audio_enabled: false,
         audio_allowed: Arc::new(AtomicBool::new(true)),
+        // 这些用例不测会话内迁移（部分用真实 RustDeskTransport，但默认关闭宏以免影响既有断言）。
+        punch_migration: false,
     });
     mgr.handle_control_message(ControlMessage::RemoteCapability {
         params: Some(params.clone()),
@@ -1435,10 +1441,12 @@ fn control_channel_manager(server_host: &str, name: &str, enabled: bool) -> Arc<
         h265_encoder_factory: None,
         h265_decoder_factory: None,
         prefer_h265: true,
+        prefer_444: false,
         audio_source: None,
         audio_sink: None,
         audio_enabled: false,
         audio_allowed: Arc::new(AtomicBool::new(true)),
+        punch_migration: false,
     })
 }
 

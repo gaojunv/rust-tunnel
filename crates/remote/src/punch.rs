@@ -51,6 +51,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// `conn_id` 派生时使用的域分隔标签。
 const CONN_ID_LABEL: &[u8] = b"rt-punch-v1";
 
+/// 会话内路径迁移（v12）派生 `conn_id` 时使用的域分隔标签。
+const MIGRATE_CONN_ID_LABEL: &[u8] = b"rt-migrate-v1";
+
+/// 会话内路径迁移的**直连前导**派生密钥时使用的域分隔标签。
+const MIGRATE_HELLO_LABEL: &[u8] = b"rt-migrate-hello-v1";
+
 /// `conn_id = HMAC-SHA256(token, b"rt-punch-v1")[..8]`，**大端 u64**。
 ///
 /// `token` 是服务端经**加密控制通道**下发的一次性会话 token。hbbs 的会合流量是**明文
@@ -69,6 +75,52 @@ pub(crate) fn conn_id_from_token(token: &str) -> u64 {
     let mut first8 = [0u8; 8];
     first8.copy_from_slice(&digest[..8]);
     u64::from_be_bytes(first8)
+}
+
+/// `conn_id = HMAC-SHA256(token, "rt-migrate-v1" ‖ attempt_u32 BE)[..8]`（大端 u64）。
+///
+/// 会话内路径迁移每次尝试都必须换一个 `attempt`：`register_punch_session` 的注销任务按
+/// `conn_id` 删除且**没有代数检查**，复用同一个 `conn_id` 会让旧尝试的清理任务把新的登记删掉，
+/// 新流随后收不到任何数据报（静默半死）。
+#[must_use]
+pub(crate) fn conn_id_for_migration(token: &str, attempt: u32) -> u64 {
+    let Ok(mut mac) = HmacSha256::new_from_slice(token.as_bytes()) else {
+        return 0;
+    };
+    mac.update(MIGRATE_CONN_ID_LABEL);
+    mac.update(&attempt.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut first8 = [0u8; 8];
+    first8.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first8)
+}
+
+/// `hello_key = HMAC-SHA256(token, b"rt-migrate-hello-v1")`（32 字节）。
+///
+/// # 为什么直连迁移需要它（打洞路径不需要）
+///
+/// 打洞路径的新流身份由可靠层 `conn_id` 绑定（[`conn_id_for_migration`]）：可靠层只对「`conn_id`
+/// 命中已登记会话」的数据报建连，因此第三方既建不起流、也抢不了会话。**同内网直连没有这层**——
+/// 它只是对目标端监听端口的一次裸 TCP 连接，任何能到这端口的机器都能连上。若不在 `install`
+/// 之前证明「这条 TCP 连接确实来自持有会话 token 的那一端」，一个无关连接就会被当成迁移流装进
+/// 会话，随后首帧 AEAD 认证失败、会话直接断掉。
+///
+/// 故直连迁移在裸 TCP 上先交换一个极小的前导帧（`RTMG` 魔数 + 版本 + 角色 + attempt + MAC），
+/// 密钥就是本函数派生出的值：只有同时持有 token 与 attempt 的两端算得出 MAC，被控端据此可以
+/// **拒掉不匹配的连接并继续等下一条**，而不是被迫接受第一条。
+///
+/// 与 [`conn_id_for_migration`] 用**不同**的域分隔标签：`conn_id` 会出现在 UDP 段头里（明文），
+/// 而前导 MAC 的密钥绝不能与之有任何可推导关系。
+#[must_use]
+pub(crate) fn migration_hello_key(token: &str) -> [u8; 32] {
+    let Ok(mut mac) = HmacSha256::new_from_slice(token.as_bytes()) else {
+        return [0u8; 32];
+    };
+    mac.update(MIGRATE_HELLO_LABEL);
+    let digest = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
 }
 
 /// 从数据报里取 `conn_id`：只读前 12 个字节。
@@ -244,6 +296,36 @@ mod tests {
                 "token={token:?} 的 conn_id 应与手工 HMAC 一致"
             );
         }
+    }
+
+    /// 迁移用的 `conn_id`：确定性、按 attempt 互异、且与初始会话的 conn_id 不同域。
+    #[test]
+    fn migration_conn_id_is_deterministic_and_attempt_scoped() {
+        let a1 = conn_id_for_migration("tok-1", 1);
+        assert_eq!(a1, conn_id_for_migration("tok-1", 1), "同 token + attempt 必须同值");
+        assert_ne!(a1, conn_id_for_migration("tok-1", 2), "不同 attempt 必须不同值");
+        assert_ne!(a1, conn_id_for_migration("tok-2", 1), "不同 token 必须不同值");
+        // 与初始会话的 conn_id 域分隔：绝不能让迁移流复用会话流的登记项。
+        assert_ne!(a1, conn_id_from_token("tok-1"), "迁移必须与初始打洞不同域");
+    }
+
+    /// 直连迁移前导密钥：确定性、按 token 互异、且与两种 `conn_id` 派生**不同域**。
+    #[test]
+    fn migration_hello_key_is_deterministic_and_domain_separated() {
+        assert_eq!(migration_hello_key("tok-1"), migration_hello_key("tok-1"), "同 token 必须同值");
+        assert_ne!(migration_hello_key("tok-1"), migration_hello_key("tok-2"), "不同 token 必须不同值");
+
+        // 与迁移 conn_id / 初始 conn_id 都不同域：conn_id 是明文出现在 UDP 段头里的值，
+        // 前导密钥若与它有可推导关系，等于把秘密漏到数据面上。
+        let key = migration_hello_key("tok-1");
+        assert_ne!(&key[..8], &conn_id_for_migration("tok-1", 1).to_be_bytes());
+        assert_ne!(&key[..8], &conn_id_from_token("tok-1").to_be_bytes());
+
+        // 逐字节等于手工算出的 HMAC-SHA256（独立于被测实现）。
+        let mut mac = HmacSha256::new_from_slice(b"tok-1").unwrap();
+        mac.update(b"rt-migrate-hello-v1");
+        let expected: [u8; 32] = mac.finalize().into_bytes()[..].try_into().unwrap();
+        assert_eq!(key, expected, "应与手工 HMAC 逐字节一致");
     }
 
     #[test]

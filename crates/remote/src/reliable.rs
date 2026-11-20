@@ -116,6 +116,14 @@ const SEND_BUFFER_LIMIT: usize = MAX_PAYLOAD * 16;
 /// 返回给应用的 `DuplexStream` 缓冲区大小。
 const DUPLEX_CAPACITY: usize = 64 * 1024;
 
+/// **会话内路径迁移**专用桥接缓冲（每方向 512 KiB）。
+///
+/// 迁移的切点不是对称的：被控端先把写方向切到新流（`PathFrozen` flush 之后），控制器要等
+/// 收到 `PathFrozen` 才切读方向——中间隔着约一个**旧路径单程延迟**。这段时间里被控端的
+/// 画面/音频帧只能堆在可靠层的应用侧管道里；默认 64 KiB 在 10 Mbps 下只够 ~50 ms，会反压
+/// 到写任务（连带心跳短暂停摆）。512 KiB 足以吸收数百毫秒，代价只是迁移连接多占 ~1 MiB。
+pub(crate) const MIGRATION_DUPLEX_CAPACITY: usize = 512 * 1024;
+
 /// 零窗口 persist 探测间隔。
 const PERSIST_INTERVAL: Duration = RTO_MIN;
 
@@ -1224,8 +1232,8 @@ impl Conn {
 }
 
 /// 起协议任务、返回应用侧那一半流与指标句柄。
-fn spawn_conn(conn: Conn, rx: DatagramRx) -> ReliableStream {
-    let (app_side, task_side) = tokio::io::duplex(DUPLEX_CAPACITY);
+fn spawn_conn(conn: Conn, rx: DatagramRx, capacity: usize) -> ReliableStream {
+    let (app_side, task_side) = tokio::io::duplex(capacity);
     let metrics = Arc::clone(&conn.metrics);
     tokio::spawn(run_conn(conn, task_side, rx));
     ReliableStream {
@@ -1297,9 +1305,25 @@ async fn run_conn(mut conn: Conn, task_side: DuplexStream, mut rx: DatagramRx) {
 pub(crate) async fn connect(
     link: Arc<dyn DatagramSender>,
     conn_id: u64,
+    rx: DatagramRx,
+    peer: SocketAddr,
+    budget: Duration,
+) -> RemoteResult<ReliableStream> {
+    connect_with_capacity(link, conn_id, rx, peer, budget, DUPLEX_CAPACITY).await
+}
+
+/// 同 [`connect`]，但指定应用侧桥接缓冲容量（迁移用
+/// [`MIGRATION_DUPLEX_CAPACITY`]）。
+///
+/// # Errors
+/// 同 [`connect`]。
+pub(crate) async fn connect_with_capacity(
+    link: Arc<dyn DatagramSender>,
+    conn_id: u64,
     mut rx: DatagramRx,
     peer: SocketAddr,
     budget: Duration,
+    capacity: usize,
 ) -> RemoteResult<ReliableStream> {
     let deadline = Instant::now() + budget;
     loop {
@@ -1326,7 +1350,7 @@ pub(crate) async fn connect(
                 Some(from) => {
                     let mut conn = Conn::new(link, conn_id, from);
                     conn.update_rtt(Instant::now().saturating_duration_since(sent_at));
-                    return Ok(spawn_conn(conn, rx));
+                    return Ok(spawn_conn(conn, rx, capacity));
                 }
                 None => return Err(RemoteError::Signaling("打洞 demux 通道已关闭".into())),
             },
@@ -1347,8 +1371,23 @@ pub(crate) async fn connect(
 pub(crate) async fn accept(
     link: Arc<dyn DatagramSender>,
     conn_id: u64,
+    rx: DatagramRx,
+    budget: Duration,
+) -> RemoteResult<ReliableStream> {
+    accept_with_capacity(link, conn_id, rx, budget, DUPLEX_CAPACITY).await
+}
+
+/// 同 [`accept`]，但指定应用侧桥接缓冲容量（迁移用
+/// [`MIGRATION_DUPLEX_CAPACITY`]）。
+///
+/// # Errors
+/// 同 [`accept`]。
+pub(crate) async fn accept_with_capacity(
+    link: Arc<dyn DatagramSender>,
+    conn_id: u64,
     mut rx: DatagramRx,
     budget: Duration,
+    capacity: usize,
 ) -> RemoteResult<ReliableStream> {
     let deadline = Instant::now() + budget;
     let wait = async {
@@ -1377,7 +1416,7 @@ pub(crate) async fn accept(
                 let _ = link.send_datagram(&syn_ack, from).await;
                 // 被动方没有握手 RTT 样本（不回等 ACK），RTO 用下限起步。
                 let conn = Conn::new(link, conn_id, from);
-                Ok(spawn_conn(conn, rx))
+                Ok(spawn_conn(conn, rx, capacity))
             }
             None => Err(RemoteError::Signaling("打洞 demux 通道已关闭".into())),
         },

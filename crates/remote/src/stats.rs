@@ -10,6 +10,7 @@
 
 use crate::audio::{AudioPlaybackStats, AudioState};
 use crate::session::{CodecId, HostStats};
+use crate::transport::TransportPath;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -218,6 +219,17 @@ pub enum SessionStats {
     Audio(AudioState),
     /// 本端音频播放读数（控制器每秒一次）。
     AudioPlayback(AudioPlaybackStats),
+    /// 会话运行中**数据面路径发生变化**（v12 会话内迁移成功后上报一次）。
+    ///
+    /// 建立时的路径由 `RemoteManager::mark_active` 写入；本事件只负责「迁移后更新」。
+    /// 管理器必须按 `session_id` 守卫后再写 UI——统计事件与 `active` 不是原子绑定的，
+    /// 迟到的旧事件会把**下一场**会话标成错误的路径（与 `mark_active` 的守卫同理）。
+    TransportPath {
+        /// 发生变化的会话。
+        session_id: String,
+        /// 迁移后的实际路径（必须如实上报，见 [`crate::transport::TransportPath`] 的契约）。
+        path: TransportPath,
+    },
 }
 
 /// 上报句柄。

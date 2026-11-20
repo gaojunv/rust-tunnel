@@ -498,6 +498,8 @@ pub(crate) fn spawn_instance_runtime(
                     prefer_h265,
                     // 文字优先（`host.toml` 缺省 false）：开启后 VP9（4:4:4）压过 H.264/H.265。
                     prefer_444,
+                    // 实例不发起会话，只在控制端请求迁移时配合；恒开启（提交点之前失败无害）。
+                    punch_migration: true,
                     platform_mode: PlatformMode::Instance,
                     share_dir: Some(share_dir),
                     download_dir,

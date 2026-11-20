@@ -323,7 +323,8 @@ impl TestHarness {
         let client_config = self.client_config_for(client_name, false);
 
         let handle = tokio::spawn(async move {
-            let _ = run_client_with_status(client_config, None, None, Some(bridge)).await;
+            // 第 5 个参数是自更新桥；本测试场景不需要，传 `None` 保持原有行为。
+            let _ = run_client_with_status(client_config, None, None, Some(bridge), None).await;
         });
         let abort = handle.abort_handle();
         self.client_tasks.push(handle);

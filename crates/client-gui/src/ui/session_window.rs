@@ -518,7 +518,7 @@ fn toolbar_contents(
         ui.separator();
         audio_controls(ui, v, manager, state, &p);
 
-        toolbar_actions(ui, v, manager, active, &p);
+        toolbar_actions(ui, v, manager, active, state.transport, &p);
     });
 }
 
@@ -583,9 +583,21 @@ fn toolbar_actions(
     v: &mut RemoteView,
     manager: &Arc<RemoteManager>,
     active: &ActiveSessionInfo,
+    transport: Option<TransportPath>,
     p: &theme::Palette,
 ) {
     ui.add_space(4.0);
+    // 只在中继会话上出现：再点一次也只是「再试一次打洞」，不会打断会话。
+    if transport == Some(TransportPath::Relay)
+        && widgets::toolbar_icon(
+            ui,
+            Icon::Route,
+            "立即尝试把会话升级到 P2P（当前走中继；失败不影响会话）",
+        )
+        .clicked()
+    {
+        manager.trigger_migration();
+    }
     if widgets::toolbar_icon(ui, Icon::ChevronUp, "收起到只显示延迟（点延迟胶囊可展开）").clicked()
     {
         v.collapse_toolbar();

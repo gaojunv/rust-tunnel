@@ -31,10 +31,11 @@ use crate::approval::{ApprovalPolicy, PendingApproval, APPROVAL_TIMEOUT, APPROVA
 use crate::audio::{AudioPlaybackStats, AudioSink, AudioSource};
 use crate::auth::{PendingSession, PendingSessions};
 use crate::codec::{VideoDecoderFactory, VideoEncoderFactory};
-use crate::controller::{run_controller_with_input, ControllerCommand, ControllerConfig};
+use crate::controller::{run_controller_inner, ControllerCommand, ControllerConfig};
 use crate::controlled::{
-    run_controlled, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
+    run_controlled_inner, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
 };
+use crate::migrate::{MigrateRuntime, MigrateTiming};
 use crate::error::{RemoteError, RemoteResult};
 use crate::file::FileService;
 use crate::input_buffer::InputBuffer;
@@ -405,6 +406,12 @@ pub struct RemoteManagerConfig {
     ///
     /// 被控端音频任务每帧读取；置 false 时立即停止采集并上报带原因的状态。
     pub audio_allowed: Arc<AtomicBool>,
+    /// 是否允许**会话内路径迁移**（中继 → P2P 打洞，协议 v12；默认 `true`，由 GUI 层决定）。
+    ///
+    /// 只在建立时实际走了**中继**、且本端建立器
+    /// [`TransportEstablisher::migration_supported`] 为真时才可能发生；运行中修改经
+    /// [`RemoteManager::set_punch_migration`]，只对**下一次会话**生效。
+    pub punch_migration: bool,
 }
 
 /// 正在进行的会话句柄。
@@ -564,6 +571,11 @@ pub struct RemoteManager {
     /// 在 `Drop` 里**实时读取**，用户在会话进行中打开设置也必须生效。UI 侧另有
     /// [`RemoteUiState::auto_lock_on_disconnect`] 供显示。
     auto_lock_on_disconnect: Arc<AtomicBool>,
+    /// 是否允许会话内路径迁移（中继 → P2P 打洞）。
+    ///
+    /// 与 [`Self::native_resolution`] 同构：会话任务只在**开始**时读一次（迁移运行时在数据面
+    /// 建立后构造），运行中修改只影响下一次会话。
+    punch_migration: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteManager {
@@ -601,6 +613,7 @@ impl RemoteManager {
         let prefer_h265 = cfg.prefer_h265;
         let prefer_444 = cfg.prefer_444;
         let audio_enabled_pref = cfg.audio_enabled;
+        let punch_migration = cfg.punch_migration;
         let mgr = Arc::new_cyclic(|weak| Self {
             cfg,
             upstream: Mutex::new(None),
@@ -628,6 +641,7 @@ impl RemoteManager {
             prefer_h265: AtomicBool::new(prefer_h265),
             prefer_444: AtomicBool::new(prefer_444),
             audio_enabled_pref: AtomicBool::new(audio_enabled_pref),
+            punch_migration: AtomicBool::new(punch_migration),
         });
         // 泵在构造**之后**启动：它需要 `Arc` 的弱指针，且必须在运行时内 spawn。
         if let (Some(rt), Some(notify)) = (rt, mgr.out_pump.clone()) {
@@ -836,6 +850,27 @@ impl RemoteManager {
     #[must_use]
     pub fn prefer_444(&self) -> bool {
         self.prefer_444.load(Ordering::Relaxed)
+    }
+
+    /// 设置是否允许**会话内路径迁移**（中继 → P2P 打洞，默认开启）。
+    ///
+    /// 只对**下一次**会话生效：迁移运行时在数据面建立后按当时的开关决定是否构造。
+    pub fn set_punch_migration(&self, on: bool) {
+        self.punch_migration.store(on, Ordering::Relaxed);
+    }
+
+    /// 当前的会话内迁移开关（UI 镜像）。
+    #[must_use]
+    pub fn punch_migration(&self) -> bool {
+        self.punch_migration.load(Ordering::Relaxed)
+    }
+
+    /// 立即尝试一次会话内路径迁移（中继 → P2P 打洞）。
+    ///
+    /// 供 UI 的「立即尝试 P2P」按钮使用。只在**当前有控制器会话、会话仍在中继上、且本会话
+    /// 构造了迁移运行时**时生效；其余情况静默无操作（见 [`ControllerCommand::MigrateNow`]）。
+    pub fn trigger_migration(&self) {
+        self.send_command(ControllerCommand::MigrateNow);
     }
 
     /// 把本机剪贴板文本发给被控端。
@@ -1570,6 +1605,9 @@ impl RemoteManager {
     ) -> RemoteResult<SessionEnd> {
         let local_rd_id = self.local_rd_id();
         let handshake = plan_controller_handshake(&session_id, &token, &local_rd_id)?;
+        // 迁移运行时需要这些；`request` 会把它们 move 走。
+        let migrate_params = params.clone();
+        let migrate_peer = target_rd_id.clone();
         let request = EstablishRequest {
             session_id: session_id.clone(),
             local_rd_id: local_rd_id.clone(),
@@ -1582,11 +1620,27 @@ impl RemoteManager {
             punch_cookie: crate::punch::conn_id_from_token(&token).to_be_bytes(),
         };
         let established = self.establish_guarded(request, Role::Controller, &cancel).await?;
-        // 记录实际路径（打洞 / 直连 / 中继），供 UI 展示。
-        self.mark_active(&session_id, established.path);
+        // 记录实际路径（打洞 / 直连 / 中继），供 UI 展示。迁移运行时也按它决定是否构造。
+        let path = established.path;
+        self.mark_active(&session_id, path);
         // 可靠层指标句柄（仅打洞路径）：会话循环每秒与上一份快照求差，上报重传/乱序增量。
         let reliable = established.reliable;
         let duplex = established.stream;
+        // 会话内迁移：只有中继会话才值得尝试。控制器侧 token **预置好**（迁移 `conn_id` 由它
+        // 派生）；统计上报端与会话循环共用同一个句柄。
+        let stats = self.build_stats_reporter(cancel.clone());
+        let migration = self.build_migration_runtime(
+            Role::Controller,
+            &session_id,
+            path,
+            migrate_params,
+            migrate_peer,
+            stats.clone(),
+            cancel.clone(),
+        );
+        if let Some(rt) = migration.as_ref() {
+            rt.set_token(&token);
+        }
         // 落地目录可能还不存在（首次使用）；建不出来就让下载直接失败，别让它到 99% 才炸。
         if let Err(err) = tokio::fs::create_dir_all(&self.cfg.download_dir).await {
             warn!(error = %err, dir = %self.cfg.download_dir.display(), "创建下载目录失败");
@@ -1597,7 +1651,7 @@ impl RemoteManager {
             token,
             local_rd_id,
             mode,
-            stats: self.build_stats_reporter(cancel.clone()),
+            stats,
             h264_decoder_factory: self.cfg.h264_decoder_factory.clone(),
             h265_decoder_factory: self.cfg.h265_decoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
@@ -1610,7 +1664,7 @@ impl RemoteManager {
         // 输入走独立的缓冲（合并移动、抬起不丢）；`cmd_rx` 仍承载其它命令。管理器与会话循环
         // 共享同一个 `Arc`，`send_input` 直接 `push` + 唤醒，不再经过容量 256 的 `try_send`。
         let input = Arc::clone(&self.input);
-        run_controller_with_input(
+        run_controller_inner(
             duplex,
             config,
             handshake,
@@ -1619,6 +1673,7 @@ impl RemoteManager {
             transfer,
             self.frame_sink_arc(),
             cancel,
+            migration,
         )
         .await
     }
@@ -1652,6 +1707,49 @@ impl RemoteManager {
             });
         }
         SessionStatsReporter::new(tx)
+    }
+
+    /// 按数据面建立结果构造会话内迁移运行时。
+    ///
+    /// 只有三个条件同时成立才构造（否则返回 `None`，会话循环的迁移路径零开销）：
+    /// ① 实际路径是**中继**（打洞/直连没有可迁移的目标）；② 用户开关打开；
+    /// ③ 本端建立器声明支持迁移（`always_use_relay`/对称 NAT 下不白付预算）。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "这些参数一一对应会话上下文（角色/会话/token/参数/统计/取消），打包无收益"
+    )]
+    fn build_migration_runtime(
+        &self,
+        role: Role,
+        session_id: &str,
+        path: TransportPath,
+        params: RemoteParams,
+        peer_rd_id: String,
+        stats: SessionStatsReporter,
+        cancel: CancellationToken,
+    ) -> Option<Arc<MigrateRuntime>> {
+        if path != TransportPath::Relay
+            || !self.punch_migration.load(Ordering::Relaxed)
+            || params.always_use_relay
+            || !self.cfg.establisher.migration_supported()
+        {
+            return None;
+        }
+        Some(Arc::new(MigrateRuntime {
+            role,
+            establisher: Arc::clone(&self.cfg.establisher),
+            params,
+            session_id: session_id.to_owned(),
+            local_rd_id: self.local_rd_id(),
+            peer_rd_id,
+            // 控制器在构造后立刻 `set_token`；被控端的 token 只有 `authorize` 之后才有，
+            // 由 `run_controlled_inner` 填写。
+            token: std::sync::OnceLock::new(),
+            initial_path: path,
+            stats,
+            cancel,
+            timing: MigrateTiming::default(),
+        }))
     }
 
     /// 处理 `RemoteSessionIncoming`（被控端）。
@@ -1772,6 +1870,10 @@ impl RemoteManager {
     }
 
     /// 被控端会话任务体。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "握手 + 建立 + 会话循环 + 收尾是一段不可分割的控制流，拆开会丢掉时序全貌"
+    )]
     async fn controlled_task(
         self: &Arc<Self>,
         session_id: String,
@@ -1782,11 +1884,13 @@ impl RemoteManager {
         cancel: CancellationToken,
     ) -> RemoteResult<SessionEnd> {
         let pending = Arc::clone(&self.lock_inner().pending);
+        // 迁移运行时需要一份 params；`request` 会把它 move 走。
+        let params = self.current_params()?;
         let request = EstablishRequest {
             session_id: session_id.clone(),
             local_rd_id: self.local_rd_id(),
             peer_rd_id: String::new(),
-            params: self.current_params()?,
+            params: params.clone(),
             prefer_direct: true,
             early: Vec::new(),
             // 与被控端 token 同源的打洞会话标识（在 `accept_incoming` 里、token 被 move 前算出）。
@@ -1833,6 +1937,18 @@ impl RemoteManager {
         });
         self.mark_active(&session_id, path);
         let duplex = established.stream;
+        // 会话内迁移：只有中继会话才值得尝试。被控端的 token 只有 `authorize` 之后才有，
+        // 由 `run_controlled_inner` 填入运行时；统计上报端与会话循环共用同一个句柄。
+        let stats = self.build_stats_reporter(cancel.clone());
+        let migration = self.build_migration_runtime(
+            Role::Controlled,
+            &session_id,
+            path,
+            params,
+            String::new(),
+            stats.clone(),
+            cancel.clone(),
+        );
         let config = ControlledConfig {
             session_id,
             local_rd_id: self.local_rd_id(),
@@ -1842,7 +1958,7 @@ impl RemoteManager {
             native_resolution: self.native_resolution.load(Ordering::Relaxed),
             capture_watchdog: CAPTURE_WATCHDOG,
             unchanged_resend: UNCHANGED_RESEND_INTERVAL,
-            stats: self.build_stats_reporter(cancel.clone()),
+            stats,
             h264_encoder_factory: self.cfg.h264_encoder_factory.clone(),
             h265_encoder_factory: self.cfg.h265_encoder_factory.clone(),
             prefer_h265: self.prefer_h265.load(Ordering::Relaxed),
@@ -1871,7 +1987,10 @@ impl RemoteManager {
             .as_ref()
             .map_or_else(|| self.cfg.download_dir.clone(), |s| s.path.clone());
         let transfer = self.build_transfer_hub(service, local_root, cancel.clone());
-        let result = run_controlled(duplex, config, screen, input, clipboard, transfer, cancel).await;
+        let result = run_controlled_inner(
+            duplex, config, screen, input, clipboard, transfer, cancel, migration,
+        )
+        .await;
         if let Some(handle) = reliable_logger {
             handle.abort();
         }
@@ -2365,6 +2484,15 @@ fn apply_session_stats(mgr: &RemoteManager, event: SessionStats) {
                 s.audio_buffer_ms = stats.buffer_ms;
             });
         }
+        SessionStats::TransportPath { session_id, path } => {
+            // **按会话守卫**：统计事件与 `active` 不是原子绑定的，迟到的旧事件会把下一场
+            // 会话标成错误的路径。判据与 `mark_active` 完全一致。
+            mgr.update_ui(move |s| {
+                if s.active.as_ref().is_some_and(|a| a.session_id == session_id) {
+                    s.transport = Some(path);
+                }
+            });
+        }
     }
 }
 
@@ -2475,6 +2603,7 @@ mod tests {
             audio_sink: None,
             audio_enabled: false,
             audio_allowed: Arc::new(AtomicBool::new(true)),
+            punch_migration: false,
         })
     }
 
@@ -2645,6 +2774,7 @@ mod tests {
             audio_sink: None,
             audio_enabled: false,
             audio_allowed: Arc::new(AtomicBool::new(true)),
+            punch_migration: false,
         })
     }
 

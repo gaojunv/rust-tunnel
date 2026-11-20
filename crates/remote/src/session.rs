@@ -37,6 +37,25 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// 会话协议版本；不匹配的 `Hello` 一律拒绝。
 ///
+/// # 版本 12
+///
+/// 追加了**会话内数据面路径迁移**：末尾六个变体（判别式 33–38）
+/// [`SessionMessage::PathMigratePrepare`] / [`SessionMessage::PathMigrateReady`] /
+/// [`SessionMessage::PathFreeze`] / [`SessionMessage::PathFrozen`] /
+/// [`SessionMessage::PathCommit`] / [`SessionMessage::PathAbort`]。它们只走 Control 车道，
+/// 让一场已经建立的中继会话把底层字节流无缝换到 P2P 打洞路径，**不重新握手、不重建会话
+/// 编解码器**——AEAD 计数器靠「屏障帧是旧流上的最后一条字节」保持连续（见 [`crate::migrate`]）。
+///
+/// 新变体对老端是未知判别式：bincode 解码失败，故版本号必须抬，且**两端必须同为 v12**。
+/// 旧端（v11）在握手阶段被 `Hello.proto_version` 的硬相等校验干净拒绝（回
+/// `HelloAck{accepted:false}`），不会退化成硬断链。`Hello` / `HelloAck` / `DisplayInfo`
+/// 的字节形状**一个字都没动**（两条机械锁守着）。
+///
+/// **提交点规则**：`PathFreeze` 一旦由控制器入队，迁移即不可回退；之前的任何失败都可以用
+/// `PathAbort` 安全放弃，之后只能按会话故障处理（交给既有断线重连）。
+///
+/// 发布顺序同 v11：**先把携带 v12 的客户端铺开，再部署依赖它的服务端门控**。
+///
 /// # 版本 11
 ///
 /// 追加了**音频转发**：新 [`Lane::Audio`]（线上字节 3）与 [`SessionMessage`] 末尾的三个
@@ -124,7 +143,7 @@ use tokio_util::codec::{Decoder, Encoder};
 ///
 /// **配套的第二道门控在服务端**（`crates/agent/src/runner/version_gate.rs` 的
 /// `MIN_REMOTE_CLIENT_VERSION`）。故此处刻意只动本常量。
-pub const SESSION_PROTO_VERSION: u16 = 11;
+pub const SESSION_PROTO_VERSION: u16 = 12;
 
 /// 单帧载荷上限（16 MiB）。
 pub const MAX_SESSION_FRAME: usize = 16 * 1024 * 1024;
@@ -625,6 +644,53 @@ pub enum SessionMessage {
     SetAudioEnabled {
         /// `true` = 请求开始转发；`false` = 立即停止（会话保持）。
         enabled: bool,
+    },
+    /// 会话内路径迁移：控制器请被控端为 `attempt` 起一个迁移接入端（v12，控制器 → 被控端）。
+    ///
+    /// 收到后对端会为派生出的 `conn_id` 起一个 `reliable::accept`，就绪后回
+    /// [`SessionMessage::PathMigrateReady`]。本帧本身不动任何数据流。
+    PathMigratePrepare {
+        /// 迁移尝试编号（会话内单调递增，从 1 开始）。
+        attempt: u32,
+    },
+    /// 迁移接入端已就绪，控制器可以发打洞信令（v12，被控端 → 控制器）。
+    PathMigrateReady {
+        /// 迁移尝试编号。
+        attempt: u32,
+    },
+    /// **提交点**：控制器已建好新流，要求把会话切过去（v12，控制器 → 被控端）。
+    ///
+    /// 一旦本帧入队，迁移就**不可回退**：被控端收到后会先把写方向切到新流、再回
+    /// [`SessionMessage::PathFrozen`]。此后任何失败都按会话故障处理，**不做回滚**——
+    /// 回滚无法让两端的 AEAD 计数器重新对齐（见 [`crate::migrate`] 的模块文档）。
+    PathFreeze {
+        /// 迁移尝试编号。
+        attempt: u32,
+    },
+    /// 被控端已完成写方向切换（v12，被控端 → 控制器）。
+    ///
+    /// 它是被控端在旧流上写出的**最后一条字节**；控制器收到后切读方向并发出
+    /// [`SessionMessage::PathCommit`]。
+    PathFrozen {
+        /// 迁移尝试编号。
+        attempt: u32,
+    },
+    /// 控制器已完成写方向切换（v12，控制器 → 被控端）。
+    ///
+    /// 它是控制器在旧流上写出的**最后一条字节**；被控端收到后切读方向，迁移完成。
+    PathCommit {
+        /// 迁移尝试编号。
+        attempt: u32,
+    },
+    /// 放弃一次迁移尝试（v12，双向）。**只在提交点之前合法**。
+    ///
+    /// 提交点（[`SessionMessage::PathFreeze`] 入队）之后收到它一律忽略——那时两端可能已经
+    /// 各自切了一个方向，回退只会把字节流撕成两半。
+    PathAbort {
+        /// 迁移尝试编号。
+        attempt: u32,
+        /// 放弃原因（仅日志/诊断用，不上 UI）。
+        reason: String,
     },
 }
 
@@ -1566,6 +1632,25 @@ mod tests {
                 SessionMessage::CursorShape { shape: CursorShape::Hidden },
                 Lane::Control,
             ),
+            // 会话内路径迁移（v12）。
+            (
+                SessionMessage::PathMigratePrepare { attempt: 1 },
+                Lane::Control,
+            ),
+            (
+                SessionMessage::PathMigrateReady { attempt: 1 },
+                Lane::Control,
+            ),
+            (SessionMessage::PathFreeze { attempt: 1 }, Lane::Control),
+            (SessionMessage::PathFrozen { attempt: 1 }, Lane::Control),
+            (SessionMessage::PathCommit { attempt: 1 }, Lane::Control),
+            (
+                SessionMessage::PathAbort {
+                    attempt: 1,
+                    reason: "打洞失败".into(),
+                },
+                Lane::Control,
+            ),
         ];
         for (message, lane) in cases {
             let got = codec_roundtrip(message.clone(), lane);
@@ -1795,6 +1880,39 @@ mod tests {
                 "SetAudioEnabled",
                 SessionMessage::SetAudioEnabled { enabled: true },
                 32,
+            ),
+            (
+                "PathMigratePrepare",
+                SessionMessage::PathMigratePrepare { attempt: 1 },
+                33,
+            ),
+            (
+                "PathMigrateReady",
+                SessionMessage::PathMigrateReady { attempt: 1 },
+                34,
+            ),
+            (
+                "PathFreeze",
+                SessionMessage::PathFreeze { attempt: 1 },
+                35,
+            ),
+            (
+                "PathFrozen",
+                SessionMessage::PathFrozen { attempt: 1 },
+                36,
+            ),
+            (
+                "PathCommit",
+                SessionMessage::PathCommit { attempt: 1 },
+                37,
+            ),
+            (
+                "PathAbort",
+                SessionMessage::PathAbort {
+                    attempt: 1,
+                    reason: String::new(),
+                },
+                38,
             ),
         ];
         for (name, msg, want) in &cases {

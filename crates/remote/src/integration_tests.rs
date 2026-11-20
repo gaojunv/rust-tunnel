@@ -5,9 +5,9 @@
 
 use crate::approval::ApprovalPolicy;
 use crate::auth::PendingSessions;
-use crate::controller::{run_controller, ControllerConfig};
+use crate::controller::{run_controller, run_controller_inner, ControllerConfig};
 use crate::controlled::{
-    run_controlled, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
+    run_controlled, run_controlled_inner, ControlledConfig, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
 };
 use crate::transfer::{TransferEvent, TransferHub};
 use crate::error::{RemoteError, RemoteResult};
@@ -18,7 +18,9 @@ use crate::screen::{
 };
 use crate::session::{plan_controller_handshake, SessionCodec, SessionEnd, SessionMessage};
 use crate::stats::SessionStatsReporter;
-use crate::transport::{BoxDuplex, EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
+use crate::transport::{
+    BoxDuplex, EstablishedStream, EstablishRequest, MigrateRequest, Role, TransportEstablisher, TransportPath,
+};
 use async_trait::async_trait;
 use rust_tunnel_common::protocol::{ControlMessage, RemoteMode, RemoteParams};
 use rust_tunnel_common::remote_bridge::RemoteBridge as _;
@@ -318,6 +320,8 @@ fn manager_with_dirs(
         audio_sink: None,
         audio_enabled: false,
         audio_allowed: Arc::new(AtomicBool::new(true)),
+        // 既有用例都不涉及会话内迁移（建立器替身也不支持）。
+        punch_migration: false,
     })
 }
 
@@ -1872,4 +1876,335 @@ async fn audio_packets_reach_the_controller_when_enabled() {
     cancel.cancel();
     let _ = ctld_task.await;
     let _ = ctrl_task.await;
+}
+
+// ───────────────────── 会话内路径迁移（协议 v12） ─────────────────────
+
+/// 两次建立共用的内存建立器：`establish` 给初始（中继）流，`migrate` 给打洞流。
+///
+/// 迁移的两端各取自己那一半；`migrate_fails` 用来模拟打洞失败（此时会话必须继续走中继）。
+struct PairedMigrationEstablisher {
+    initial_ctrl: Mutex<Option<BoxDuplex>>,
+    initial_ctld: Mutex<Option<BoxDuplex>>,
+    migrate_ctrl: Mutex<Option<BoxDuplex>>,
+    migrate_ctld: Mutex<Option<BoxDuplex>>,
+    migrate_fails: bool,
+}
+
+impl PairedMigrationEstablisher {
+    fn new(
+        relay: (tokio::io::DuplexStream, tokio::io::DuplexStream),
+        punch: (tokio::io::DuplexStream, tokio::io::DuplexStream),
+        migrate_fails: bool,
+    ) -> Self {
+        Self {
+            initial_ctrl: Mutex::new(Some(Box::new(relay.0))),
+            initial_ctld: Mutex::new(Some(Box::new(relay.1))),
+            migrate_ctrl: Mutex::new(Some(Box::new(punch.0))),
+            migrate_ctld: Mutex::new(Some(Box::new(punch.1))),
+            migrate_fails,
+        }
+    }
+
+    fn take(slot: &Mutex<Option<BoxDuplex>>) -> RemoteResult<BoxDuplex> {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| RemoteError::Signaling("测试已无可用流".to_owned()))
+    }
+}
+
+#[async_trait]
+impl TransportEstablisher for PairedMigrationEstablisher {
+    async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream> {
+        let slot = match role {
+            Role::Controller => &self.initial_ctrl,
+            Role::Controlled => &self.initial_ctld,
+        };
+        let mut duplex = Self::take(slot)?;
+        if role == Role::Controller && !request.early.is_empty() {
+            duplex.write_all(&request.early).await?;
+            duplex.flush().await?;
+        }
+        Ok(EstablishedStream {
+            stream: duplex,
+            path: TransportPath::Relay,
+            reliable: None,
+        })
+    }
+
+    fn migration_supported(&self) -> bool {
+        true
+    }
+
+    async fn migrate(&self, _request: MigrateRequest, role: Role) -> RemoteResult<EstablishedStream> {
+        if self.migrate_fails {
+            return Err(RemoteError::Signaling("测试：打洞失败".to_owned()));
+        }
+        let slot = match role {
+            Role::Controller => &self.migrate_ctrl,
+            Role::Controlled => &self.migrate_ctld,
+        };
+        Ok(EstablishedStream {
+            stream: Self::take(slot)?,
+            path: TransportPath::Punch,
+            reliable: None,
+        })
+    }
+}
+
+fn migration_runtime(
+    role: Role,
+    establisher: Arc<dyn TransportEstablisher>,
+    session_id: &str,
+    stats: SessionStatsReporter,
+) -> Arc<crate::migrate::MigrateRuntime> {
+    let rt = Arc::new(crate::migrate::MigrateRuntime {
+        role,
+        establisher,
+        params: params(),
+        session_id: session_id.to_owned(),
+        local_rd_id: match role {
+            Role::Controller => "111111111".to_owned(),
+            Role::Controlled => "222222222".to_owned(),
+        },
+        peer_rd_id: match role {
+            Role::Controller => "222222222".to_owned(),
+            Role::Controlled => String::new(),
+        },
+        token: std::sync::OnceLock::new(),
+        initial_path: TransportPath::Relay,
+        stats,
+        cancel: CancellationToken::new(),
+        timing: crate::migrate::MigrateTiming {
+            first_delay: Duration::from_secs(30),
+            retry_backoff: Vec::new(),
+            // 这些用例靠 `MigrateNow` 手动触发，自动尝试一律不参与。
+            max_attempts: 1,
+            establish_timeout: Duration::from_secs(2),
+            state_timeout: Duration::from_secs(2),
+        },
+    });
+    if role == Role::Controller {
+        rt.set_token("MIG-TOK");
+    }
+    rt
+}
+
+/// 起一对内存会话，返回（控制器任务, 被控端任务, 取消令牌, 录制 sink, 命令行, 两侧统计）。
+#[allow(clippy::type_complexity)]
+async fn spawn_migration_pair(
+    migrate_fails: bool,
+) -> (
+    tokio::task::JoinHandle<RemoteResult<SessionEnd>>,
+    tokio::task::JoinHandle<RemoteResult<SessionEnd>>,
+    CancellationToken,
+    Arc<RecordingSink>,
+    mpsc::Sender<crate::controller::ControllerCommand>,
+    mpsc::UnboundedReceiver<crate::stats::SessionStats>,
+    mpsc::UnboundedReceiver<crate::stats::SessionStats>,
+) {
+    let session_id = "sess-migrate";
+    let token = "MIG-TOK";
+    let (relay_ctrl, relay_ctld) = tokio::io::duplex(256 * 1024);
+    let (punch_ctrl, punch_ctld) = tokio::io::duplex(256 * 1024);
+    let establisher = Arc::new(PairedMigrationEstablisher::new(
+        (relay_ctrl, relay_ctld),
+        (punch_ctrl, punch_ctld),
+        migrate_fails,
+    ));
+
+    let (ctrl_stats_tx, ctrl_stats_rx) = mpsc::unbounded_channel();
+    let (ctld_stats_tx, ctld_stats_rx) = mpsc::unbounded_channel();
+    let ctrl_rt = migration_runtime(
+        Role::Controller,
+        Arc::clone(&establisher) as Arc<dyn TransportEstablisher>,
+        session_id,
+        SessionStatsReporter::new(ctrl_stats_tx),
+    );
+    let ctld_rt = migration_runtime(
+        Role::Controlled,
+        Arc::clone(&establisher) as Arc<dyn TransportEstablisher>,
+        session_id,
+        SessionStatsReporter::new(ctld_stats_tx),
+    );
+
+    let plan = plan_controller_handshake(session_id, token, "111111111").unwrap();
+    let pending = Arc::new(PendingSessions::new());
+    pending.insert(crate::auth::PendingSession::new(
+        session_id.to_owned(),
+        token.to_owned(),
+        "home-nas".to_owned(),
+        RemoteMode::ViewOnly,
+    ));
+
+    // 会话循环直接拿初始流（本用例不经过 `establish`）：控制器侧要先流水线写出 Hello，
+    // 被控端侧直接交给 `run_controlled_inner`。`migrate_*` 槽位留给后面的 `migrate` 调用。
+    let mut ctrl_stream: BoxDuplex = PairedMigrationEstablisher::take(&establisher.initial_ctrl).unwrap();
+    ctrl_stream.write_all(&plan.hello_frame).await.unwrap();
+    ctrl_stream.flush().await.unwrap();
+    let ctld_stream: BoxDuplex = PairedMigrationEstablisher::take(&establisher.initial_ctld).unwrap();
+
+    let cancel = CancellationToken::new();
+    let (sink, _frame_rx) = RecordingSink::with_notify();
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+
+    let ctld_task = tokio::spawn(run_controlled_inner(
+        ctld_stream,
+        ControlledConfig {
+            session_id: session_id.to_owned(),
+            local_rd_id: "222222222".to_owned(),
+            mode: RemoteMode::ViewOnly,
+            pending,
+            encode: EncodeOptions::default(),
+            native_resolution: false,
+            capture_watchdog: CAPTURE_WATCHDOG,
+            unchanged_resend: UNCHANGED_RESEND_INTERVAL,
+            stats: SessionStatsReporter::noop(),
+            h264_encoder_factory: None,
+            h265_encoder_factory: None,
+            prefer_h265: true,
+            prefer_444: false,
+            audio: None,
+            audio_allowed: Arc::new(AtomicBool::new(true)),
+            lock_on_disconnect: Arc::new(AtomicBool::new(false)),
+        },
+        Arc::new(FakeScreen),
+        Arc::new(RecordingInput::default()),
+        None,
+        transfer_hub().0,
+        cancel.clone(),
+        Some(ctld_rt),
+    ));
+    let ctrl_task = tokio::spawn(run_controller_inner(
+        ctrl_stream,
+        ControllerConfig {
+            session_id: session_id.to_owned(),
+            token: token.to_owned(),
+            local_rd_id: "111111111".to_owned(),
+            mode: RemoteMode::ViewOnly,
+            stats: SessionStatsReporter::noop(),
+            h264_decoder_factory: None,
+            h265_decoder_factory: None,
+            prefer_h265: true,
+            audio: None,
+            audio_enabled: false,
+            reliable: None,
+        },
+        plan,
+        cmd_rx,
+        Arc::new(crate::input_buffer::InputBuffer::new()),
+        transfer_hub().0,
+        sink.clone(),
+        cancel.clone(),
+        Some(ctrl_rt),
+    ));
+
+    (ctrl_task, ctld_task, cancel, sink, cmd_tx, ctrl_stats_rx, ctld_stats_rx)
+}
+
+/// 会话内迁移的正向用例：中继会话收到 `MigrateNow` 后**无缝**切到打洞路径，
+/// 画面不中断、两侧都上报 `TransportPath::Punch`、会话本身不结束。
+#[tokio::test]
+async fn in_session_migration_switches_to_punch_without_interrupting_frames() {
+    let (ctrl_task, ctld_task, cancel, sink, cmd_tx, mut ctrl_stats, mut ctld_stats) =
+        spawn_migration_pair(false).await;
+
+    tokio::time::timeout(WAIT, async {
+        while sink.frames.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("等首帧超时");
+    let before = sink.frames.load(Ordering::Relaxed);
+
+    cmd_tx
+        .send(crate::controller::ControllerCommand::MigrateNow)
+        .await
+        .unwrap();
+
+    let mut ctrl_punch = false;
+    let mut ctld_punch = false;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !(ctrl_punch && ctld_punch) {
+        assert!(tokio::time::Instant::now() <= deadline, "等两侧迁移上报超时");
+        tokio::select! {
+            ev = ctrl_stats.recv(), if !ctrl_punch => {
+                if matches!(ev, Some(crate::stats::SessionStats::TransportPath { path: TransportPath::Punch, .. })) {
+                    ctrl_punch = true;
+                }
+            }
+            ev = ctld_stats.recv(), if !ctld_punch => {
+                if matches!(ev, Some(crate::stats::SessionStats::TransportPath { path: TransportPath::Punch, .. })) {
+                    ctld_punch = true;
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+
+    // 迁移完成后画面必须继续（新流上照常出帧）。
+    tokio::time::timeout(WAIT, async {
+        while sink.frames.load(Ordering::Relaxed) <= before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("迁移后画面应继续");
+
+    cancel.cancel();
+    let ctrl_result = tokio::time::timeout(WAIT, ctrl_task).await.unwrap().unwrap();
+    let _ = tokio::time::timeout(WAIT, ctld_task).await.unwrap().unwrap();
+    assert!(ctrl_result.is_ok(), "迁移不应结束会话：{ctrl_result:?}");
+}
+
+/// 提交点之前失败：会话必须**继续走中继**、照常出帧，且不上报打洞路径。
+#[tokio::test]
+async fn migration_failure_keeps_the_relay_session_alive() {
+    let (ctrl_task, ctld_task, cancel, sink, cmd_tx, mut ctrl_stats, _ctld_stats) =
+        spawn_migration_pair(true).await;
+
+    tokio::time::timeout(WAIT, async {
+        while sink.frames.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("等首帧超时");
+
+    cmd_tx
+        .send(crate::controller::ControllerCommand::MigrateNow)
+        .await
+        .unwrap();
+
+    // 给状态机足够时间走完「建立失败 → Abort → 回到空闲」。
+    let mut saw_punch = false;
+    let until = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < until {
+        let event = tokio::time::timeout(Duration::from_millis(20), ctrl_stats.recv()).await;
+        if let Ok(Some(crate::stats::SessionStats::TransportPath {
+            path: TransportPath::Punch,
+            ..
+        })) = event
+        {
+            saw_punch = true;
+        }
+    }
+    assert!(!saw_punch, "失败的打洞尝试不得上报打洞路径");
+
+    // 中继会话仍在出帧。
+    let before = sink.frames.load(Ordering::Relaxed);
+    tokio::time::timeout(WAIT, async {
+        while sink.frames.load(Ordering::Relaxed) <= before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("失败后中继会话应继续出帧");
+
+    cancel.cancel();
+    let ctrl_result = tokio::time::timeout(WAIT, ctrl_task).await.unwrap().unwrap();
+    let _ = tokio::time::timeout(WAIT, ctld_task).await.unwrap().unwrap();
+    assert!(ctrl_result.is_ok(), "迁移失败不应结束会话：{ctrl_result:?}");
 }
