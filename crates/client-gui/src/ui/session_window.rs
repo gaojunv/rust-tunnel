@@ -807,14 +807,23 @@ fn settings_sections(ui: &mut Ui, v: &mut RemoteView, manager: &Arc<RemoteManage
             };
             ui.label(RichText::new(hint).weak().small());
         });
-        // 放大锐化：只影响本机 GPU 上屏的亮度平面（CAS），1:1 与缩小时着色器自动不生效。
+        // 放大增强：只影响本机 GPU 上屏（FSR1 或 双线性+CAS），1:1 与缩小时着色器自动不生效。
         // 改的是**持久化镜像**，由父窗口的 `sync_display_prefs` 回写 gui.toml。
         widgets::switch_row(
             ui,
-            "放大时锐化",
-            Some("远端画面被放大时对亮度平面做 CAS 锐化；1:1 与缩小时自动不生效"),
+            "放大时增强",
+            Some("远端画面被放大时做 FSR1 / CAS 增强；1:1 与缩小时自动不生效"),
             &mut v.sharpen,
         );
+        widgets::labeled_row(ui, "放大算法", |ui| {
+            egui::ComboBox::from_id_salt("session_upscale_mode")
+                .selected_text(v.upscale_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::prefs::UpscaleMode::ALL {
+                        ui.selectable_value(&mut v.upscale_mode, mode, mode.label());
+                    }
+                });
+        });
         widgets::labeled_row(ui, "锐化强度", |ui| {
             // 关闭时滑杆置灰但保留数值：用户下次打开开关不用重调。
             ui.add_enabled(
@@ -1081,7 +1090,8 @@ fn paint_image(
 ) {
     // 绘制矩形对齐到物理像素网格：起点/尺寸是小数时，双线性采样的相位落在纹素之间，
     // 整幅画面（尤其文字）会各向异性发虚。
-    let rect = snap_to_physical(rect, ui.ctx().pixels_per_point());
+    let ppp = ui.ctx().pixels_per_point();
+    let rect = snap_to_physical(rect, ppp);
     match image {
         FramePaint::Texture { id, .. } => {
             ui.painter().image(
@@ -1102,16 +1112,19 @@ fn paint_image(
                     frame: Arc::clone(frame),
                     target_format: *target_format,
                     // 开关只决定传 0 还是滑杆当前强度；着色器仍只在画面被放大时才真正锐化。
+                    // FSR 模式下它是 RCAS 的 `con`，CAS 模式下是 CAS 的 `sharpness`，语义一致。
                     sharpen: if v.sharpen {
                         crate::remote::nv12_renderer::cas_sharpen_strength(v.sharpen_strength)
                     } else {
                         0.0
                     },
+                    use_fsr: v.upscale_mode == crate::prefs::UpscaleMode::Fsr,
+                    out_size: physical_size(rect, ppp),
                 },
             ));
         }
     }
-    v.view_scale_permille = view_scale_permille(rect, image.size(), ui.ctx().pixels_per_point());
+    v.view_scale_permille = view_scale_permille(rect, image.size(), ppp);
     // 只有「完全控制」模式捕获输入：仅观看 / 仅文件传输不该注入键鼠。
     if active.mode == RemoteMode::Control {
         // 坐标按所选显示器的尺寸映射（由 `capture_input` 内部取），与纹理是否缩放无关。
@@ -1154,6 +1167,21 @@ fn snap_to_physical(rect: egui::Rect, pixels_per_point: f32) -> egui::Rect {
     let min_px = (rect.min.to_vec2() * ppp).round();
     let size_px = (rect.size() * ppp).round().max(egui::Vec2::splat(1.0));
     egui::Rect::from_min_size((min_px / ppp).to_pos2(), size_px / ppp)
+}
+
+/// 回调 rect 的**物理像素**尺寸（FSR 的离屏目标按它建）。
+///
+/// `snap_to_physical` 已把 rect 对齐到整物理像素，故这里 round 只是消掉浮点尾差；
+/// `max(1.0)` 保证不会出现 0 尺寸纹理（窗口被压到 0 时也安全）。
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "尺寸有界（屏幕远小于 u32 上限），max(1.0) 后非负，仅用于建纹理"
+)]
+fn physical_size(rect: egui::Rect, ppp: f32) -> (u32, u32) {
+    let w = (rect.width() * ppp).round().max(1.0) as u32;
+    let h = (rect.height() * ppp).round().max(1.0) as u32;
+    (w, h)
 }
 
 /// 统计角标（右上角悬浮）。简洁 / 详细两档，数据全部来自本端读数与被控端每秒上报的

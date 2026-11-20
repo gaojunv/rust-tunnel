@@ -22,6 +22,8 @@ pub mod encoder_reuse;
 // 实例 GPU 采集的纯逻辑策略（会话锁存 + 显示器 id 映射）。全平台编译，便于单测。
 pub mod input_queue;
 mod instance_gpu;
+// FSR1（EASU + RCAS）放大路径：两 pass、仅控制端本机上屏；供 `nv12_renderer` 与 A/B harness 共用。
+mod nv12_fsr;
 pub mod nv12_renderer;
 // A/B 截图 harness（CAS 放大锐化的开/关对照）：只在测试里编译，需要真 GPU，手动 `--ignored` 跑。
 #[cfg(test)]
@@ -1884,6 +1886,8 @@ pub struct RemoteView {
     pub sharpen: bool,
     /// 放大锐化**强度**（百分比 0–100，持久化镜像，见 `GuiPrefs::remote_sharpen_strength`）。
     pub sharpen_strength: u8,
+    /// 放大增强算法（持久化镜像，见 `GuiPrefs::remote_upscale_mode`）。
+    pub upscale_mode: crate::prefs::UpscaleMode,
     /// 控制端是否请求转发声音（持久化镜像，见 `GuiPrefs::remote_audio_enabled`）。
     ///
     /// 工具条扬声器改它并调用 `RemoteManager::set_audio_enabled`（同时作用于当前会话与
@@ -2004,6 +2008,7 @@ impl RemoteView {
             quality_sent: false,
             sharpen: true,
             sharpen_strength: nv12_renderer::CAS_SHARPEN_DEFAULT_PERCENT,
+            upscale_mode: crate::prefs::UpscaleMode::default(),
             audio_enabled: true,
             audio_volume: 100,
             window_size: WindowSize::default(),
@@ -2066,6 +2071,7 @@ impl RemoteView {
         view.quality = prefs.remote_quality;
         view.sharpen = prefs.remote_sharpen;
         view.sharpen_strength = prefs.remote_sharpen_strength.min(100);
+        view.upscale_mode = prefs.remote_upscale_mode;
         view.audio_enabled = prefs.remote_audio_enabled;
         view.audio_volume = prefs.remote_audio_volume.min(100);
         view

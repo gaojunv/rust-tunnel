@@ -22,7 +22,9 @@ name = "rust-tunnel-client"
 #          两端必须同为 0.22.0（0.21 ↔ 0.22 在握手阶段被硬相等校验干净拒绝）。
 # 0.25.0 = 控制端上屏「放大锐化」（CAS-Y）+ 开关/强度设置。纯显示侧、不上线：
 #          数据面仍是 v12、线上帧逐字节不变，0.24.0 ↔ 0.25.0 可互控。
-version = "0.25.0"
+# 0.26.0 = 控制端放大增强新增 FSR1（EASU+RCAS）算法，默认；仍纯显示侧、协议不变，
+#          0.25.0 ↔ 0.26.0 可互控。
+version = "0.26.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"

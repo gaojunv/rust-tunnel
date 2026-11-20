@@ -84,6 +84,32 @@ impl ThemePref {
     }
 }
 
+/// 放大增强算法（控制端本机上屏；仅画面被**放大**时生效，1:1 / 缩小都回退双线性）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UpscaleMode {
+    /// FSR1（EASU + RCAS）：边缘自适应放大 + 对比度自适应锐化。默认。
+    #[default]
+    #[serde(rename = "fsr")]
+    Fsr,
+    /// 双线性 + CAS：旧的放大 + 仅亮度平面锐化。
+    #[serde(rename = "cas")]
+    Cas,
+}
+
+impl UpscaleMode {
+    /// 全部选项（设置页下拉顺序）。
+    pub const ALL: [Self; 2] = [Self::Fsr, Self::Cas];
+
+    /// 中文标签（设置页下拉）。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fsr => "FSR1（EASU+RCAS）",
+            Self::Cas => "双线性 + CAS",
+        }
+    }
+}
+
 /// GUI 偏好根结构（serde(default) 保证前向兼容）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[expect(
@@ -209,6 +235,9 @@ pub struct GuiPrefs {
     /// `remote_audio_volume` 的风格一致。
     #[serde(default = "default_sharpen_strength")]
     pub remote_sharpen_strength: u8,
+    /// 放大增强算法（FSR1 / 双线性+CAS）。默认 FSR1；缺键的旧配置也落到 FSR1。
+    #[serde(default)]
+    pub remote_upscale_mode: UpscaleMode,
     /// 控制端会话开始时是否请求被控端转发声音。**默认开启**（与「批准即转发」的策略一致）。
     ///
     /// 运行中改它由工具条扬声器开关完成：立即作用于当前会话，并作为下一次会话的默认值。
@@ -279,6 +308,8 @@ impl Default for GuiPrefs {
             remote_sharpen: true,
             // 与字段上的 `#[serde(default = "default_sharpen_strength")]` 保持一致。
             remote_sharpen_strength: default_sharpen_strength(),
+            // `#[serde(default)]` = `UpscaleMode::default()` = Fsr。
+            remote_upscale_mode: UpscaleMode::default(),
             remote_audio_enabled: true,
             remote_audio_volume: default_audio_volume(),
             remote_audio_allowed: true,
@@ -662,6 +693,25 @@ mod tests {
         };
         let view = crate::remote::RemoteView::from_prefs(&wild, None);
         assert_eq!(view.sharpen_strength, 100, "越界强度应在播种时钳到 100");
+    }
+
+    /// 放大算法默认 FSR1，旧配置缺键也落到 FSR1，用户选 CAS 后能 TOML 往返保留。
+    #[test]
+    fn upscale_mode_defaults_fsr_and_roundtrips() {
+        assert_eq!(
+            GuiPrefs::default().remote_upscale_mode,
+            UpscaleMode::Fsr,
+            "全新安装默认 FSR1"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert_eq!(prefs.remote_upscale_mode, UpscaleMode::Fsr, "旧配置缺键默认 FSR1");
+        let saved = toml::to_string(&GuiPrefs {
+            remote_upscale_mode: UpscaleMode::Cas,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert_eq!(reparsed.remote_upscale_mode, UpscaleMode::Cas, "往返保留 CAS");
     }
 
     /// 原生分辨率迁移只跑一次：旧配置（键为 false、无迁移标志）被改成 true 并落标志，
