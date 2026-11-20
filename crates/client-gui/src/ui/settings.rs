@@ -451,6 +451,32 @@ fn remote_page(ui: &mut Ui, prefs: &mut GuiPrefs, manager: Option<&Arc<RemoteMan
             );
 
             ui.add_space(10.0);
+            // 中继 → P2P 自动升级（协议 v12 会话内路径迁移）。
+            let mut p2p_upgrade = prefs.remote_p2p_upgrade;
+            if widgets::switch_row(
+                ui,
+                "中继会话自动升级到 P2P",
+                Some("会话在中继上时后台尝试打洞，成功后无缝换流（不中断画面）；可随时关闭"),
+                &mut p2p_upgrade,
+            ) {
+                prefs.remote_p2p_upgrade = p2p_upgrade;
+                if let Some(manager) = manager {
+                    manager.set_punch_migration(p2p_upgrade);
+                }
+                tracing::info!("中继会话自动升级 P2P：{}", if p2p_upgrade { "开" } else { "关" });
+                changed = true;
+            }
+            ui.label(
+                RichText::new(
+                    "会话跑在 hbbr 中继上时，每 30 秒尝试一次 UDP 打洞；成功后把数据面无缝换到 \
+                     P2P，画面/文件/音频都不中断。尝试失败只会让会话继续留在中继，不产生任何影响。\
+                     强制中继（always_use_relay）或对称 NAT 时不会尝试。两端都要升到支持该协议的版本。",
+                )
+                .size(12.0)
+                .color(p.text_weak),
+            );
+
+            ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
             // 被控端声音转发总开关。控制端的「本次会话是否开声/音量」在会话工具条上，

@@ -13,6 +13,10 @@ use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
 use crate::input_buffer::InputBuffer;
 use crate::latency::{self, LatencyWindow, Stage};
+use crate::migrate::{
+    execute_actions, ActionContext, MigrateAction, MigrateEvent, MigrateHandle, MigrateMachine,
+    MigrateRuntime, MigratableDuplex,
+};
 use crate::reliable::{ReliableMetrics, ReliableSnapshot};
 use crate::screen::{
     DecodedFrame, DecodedPatch, DecoderInfo, FrameSink, InputEvent, QualityPreset, ScreenPatch,
@@ -24,7 +28,7 @@ use crate::session::{
 };
 use crate::stats::{KeyframeReason, SessionStats, SessionStatsReporter, TransportStats};
 use crate::transfer::{TransferCommand, TransferHub, CHUNK_PAUSE};
-use crate::transport::BoxDuplex;
+use crate::transport::{BoxDuplex, Role, TransportPath};
 use crate::video::MAX_FRAME_DIM;
 use futures_util::StreamExt as _;
 use rust_tunnel_common::protocol::RemoteMode;
@@ -76,6 +80,13 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
 
 /// 在途心跳时刻队列的上限（1s 探测、10s 可信上限 ⇒ 8 个足够覆盖任何可信延迟）。
 const HEARTBEAT_SENT_CAP: usize = 8;
+
+/// 会话内路径迁移的驱动节拍。
+///
+/// 迁移状态机的每个等待态超时是 2 s（[`crate::migrate::MigrateTiming::state_timeout`]），
+/// 必须明显小于 [`LIVENESS_TIMEOUT`]（4 s）才不会把一次迁移卡顿误判成链路死亡。200 ms 的
+/// tick 让超时判定最多晚 200 ms 生效，同时足够便宜（没有迁移时可迁移会话里也只是一次空转）。
+const MIGRATE_TICK: Duration = Duration::from_millis(200);
 
 /// QoS 反馈间隔（秒级）。每秒向被控端发一条 `QosFeedback`（含 RTT / 收码率 / 解码耗时 / 积压），
 /// 驱动被控端的 AIMD 闭环（见 [`crate::qos`]）。同时按同一节拍把解码侧读数经进程内
@@ -458,6 +469,11 @@ pub enum ControllerCommand {
     /// **仅当当前无在途心跳样本时**才真正发一次 `Heartbeat`：否则会覆盖既有样本，让那次往返
     /// 的读数作废。用户切到会话窗口时 UI 可据此立刻刷一个读数，不必等下一个 [`HEARTBEAT_INTERVAL`]。
     Ping,
+    /// 立即尝试一次会话内路径迁移（中继 → P2P 打洞；**纯进程内命令，不上线**）。
+    ///
+    /// 忽略自动尝试的首次延迟与退避，只在迁移状态机空闲时生效；当前路径不是中继、或本会话
+    /// 没有迁移运行时时静默无操作（见 [`crate::migrate`]）。
+    MigrateNow,
 }
 
 /// 控制器会话配置。
@@ -498,6 +514,87 @@ pub struct ControllerConfig {
     /// 主循环每秒取一份快照与上一份求差，上报 [`SessionStats::Transport`]（A7 的重传/乱序
     /// 读数）。直连/中继路径没有本端可靠层，为 `None` 时**不发**该事件（没有数据就不该显示 0）。
     pub reliable: Option<Arc<ReliableMetrics>>,
+}
+
+/// 等一次迁移驱动 tick；没有迁移运行时时**永不就绪**（分支同时被 `if` 守卫关掉，不会被轮询）。
+async fn tick_migrate(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(tick) => {
+            tick.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// 等一条迁移事件；没有迁移运行时时永不就绪。
+async fn recv_migrate_event(
+    rx: &mut Option<mpsc::UnboundedReceiver<MigrateEvent>>,
+) -> Option<MigrateEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 执行迁移状态机动作，并把其中的控制帧按动作顺序投进控制队列。
+///
+/// 返回 `(致命错误, 迁移后上报的路径)`。`execute_actions` 的入队回调是**同步**的，而控制队列
+/// 需要可取消地等空位；故先把 `Send` 动作收集起来，执行完同步动作后再统一入队——这与其它控制
+/// 帧走的是同一条通道、同一优先级。**读方向激活已经在 `execute_actions` 里同步完成**，收集
+/// 阶段不会推迟它（顺序不变量见 [`crate::migrate`] 的模块文档）。
+async fn apply_migration_actions(
+    actions: Vec<MigrateAction>,
+    runtime: &Arc<MigrateRuntime>,
+    handle: Option<&MigrateHandle>,
+    evt_tx: &mpsc::UnboundedSender<MigrateEvent>,
+    queues: &mut OutboundQueues,
+    cancel: &CancellationToken,
+) -> (Option<RemoteError>, Option<TransportPath>) {
+    let reported = actions.iter().find_map(|action| match action {
+        MigrateAction::ReportPath(path) => Some(*path),
+        _ => None,
+    });
+    // `install_pending` 只接受**已登记**的 attempt（防陈旧的建立任务污染新尝试）；登记由
+    // `execute_actions` 在 spawn 之前统一完成，这里无需重复。
+    let mut outbound = Vec::new();
+    let ctx = ActionContext {
+        session_id: &runtime.session_id,
+        handle,
+        evt_tx,
+        runtime,
+    };
+    let fatal = execute_actions(actions, &ctx, |msg| outbound.push(msg));
+    for msg in outbound {
+        if let Err(err) = queues
+            .enqueue_ctrl(cancel, SessionFrame::control(msg))
+            .await
+        {
+            return (Some(err), reported);
+        }
+    }
+    (fatal, reported)
+}
+
+/// 迁移成功后的路径与可靠层指标收尾（四个动作执行点共用）。
+///
+/// - 记录新路径：`current_path` 决定还要不要继续自动尝试（只有 `Relay` 才值得）；
+/// - 清掉旧可靠层快照：换流之后旧快照不可比，首个差分会下溢；
+/// - 把可靠层句柄换成新流的（中继路径原本是 `None`，打洞路径有）。
+fn apply_path_report(
+    reported: Option<TransportPath>,
+    handle: Option<&MigrateHandle>,
+    current_path: &mut TransportPath,
+    reliable_metrics: &mut Option<Arc<ReliableMetrics>>,
+    last_transport: &mut Option<ReliableSnapshot>,
+) {
+    let Some(reported) = reported else { return };
+    // 以包装层**实际装好**的路径为准：`ReportPath` 只是状态机的事件，两者不一致说明有 bug。
+    // 这里选择相信包装层，避免 UI/后续决策拿到一条从未真正切换的路径。
+    *current_path = handle.and_then(MigrateHandle::pending_path).unwrap_or(reported);
+    *last_transport = None;
+    if let Some(metrics) = handle.and_then(MigrateHandle::pending_metrics) {
+        *reliable_metrics = Some(metrics);
+    }
 }
 
 /// 跑一次控制器会话，直到取消、对端关闭或出错（**不注入外部输入来源**）。
@@ -541,6 +638,44 @@ pub async fn run_controller(
 /// 握手被拒、编解码失败、IO 失败时返回 [`RemoteError`]；正常结束（收到 `Bye` / 对端关闭 /
 /// 取消 / 心跳超时）返回 `Ok(`[`SessionEnd`]`)`，由调用方据此判定是否需要自动重连。
 #[expect(
+    clippy::too_many_arguments,
+    reason = "会话循环需要完整上下文；输入缓冲与命令通道必须分开（见 `InputBuffer`）"
+)]
+pub(crate) async fn run_controller_with_input(
+    duplex: BoxDuplex,
+    config: ControllerConfig,
+    handshake: ControllerHandshake,
+    cmd_rx: mpsc::Receiver<ControllerCommand>,
+    input: Arc<InputBuffer>,
+    transfer: TransferHub,
+    sink: std::sync::Arc<dyn FrameSink>,
+    cancel: CancellationToken,
+) -> RemoteResult<SessionEnd> {
+    // 兼容入口：不启用会话内路径迁移。生产路径（`manager`）在会话确实跑在中继上时直接调
+    // [`run_controller_inner`] 并传入迁移运行时。
+    run_controller_inner(
+        duplex,
+        config,
+        handshake,
+        cmd_rx,
+        input,
+        transfer,
+        sink,
+        cancel,
+        None,
+    )
+    .await
+}
+
+/// 控制器会话循环本体（带可选的会话内路径迁移运行时）。
+///
+/// `migration` 为 `Some` 时：把 duplex 包进 [`MigratableDuplex`]，并在 `select!` 里增加迁移
+/// 状态机的驱动分支；为 `None` 时**不建通道、不建定时器、不包流**，行为与迁移引入前逐字节一致。
+///
+/// # Errors
+/// 同 [`run_controller_with_input`]；迁移在提交点之后超时/失败会以 [`RemoteError::Signaling`]
+/// 结束会话（交给既有自动重连），绝不回滚旧流。
+#[expect(
     clippy::too_many_lines,
     reason = "握手校验 + 画面/输入/剪贴板/文件/心跳的单会话循环，拆开反而丢失控制流全貌"
 )]
@@ -548,7 +683,7 @@ pub async fn run_controller(
     clippy::too_many_arguments,
     reason = "会话循环需要完整上下文；输入缓冲与命令通道必须分开（见 `InputBuffer`）"
 )]
-pub(crate) async fn run_controller_with_input(
+pub(crate) async fn run_controller_inner(
     duplex: BoxDuplex,
     config: ControllerConfig,
     handshake: ControllerHandshake,
@@ -557,10 +692,32 @@ pub(crate) async fn run_controller_with_input(
     mut transfer: TransferHub,
     sink: std::sync::Arc<dyn FrameSink>,
     cancel: CancellationToken,
+    migration: Option<Arc<MigrateRuntime>>,
 ) -> RemoteResult<SessionEnd> {
+    // 迁移包装：新旧流的切换由包装内部在各自的 poll 里应用，外层 `tokio::io::split` 保持不变
+    // （嵌套 split 安全；读/写半仍各归 `FramedRead` / `writer_loop` 独占）。
+    let (duplex, mig_handle) = match migration.as_ref() {
+        Some(rt) => {
+            let (wrapped, handle) = MigratableDuplex::new(duplex, rt.role);
+            (Box::new(wrapped) as BoxDuplex, Some(handle))
+        }
+        None => (duplex, None),
+    };
     let (read_half, write_half) = tokio::io::split(duplex);
     let mut reader = FramedRead::new(read_half, SessionCodec::new());
     let mut writer = FramedWrite::new(write_half, SessionCodec::new());
+
+    // 迁移状态机（纯状态机，无 I/O）与「建立任务 / 写任务 → 会话循环」的事件通道。
+    // `migration` 为 `None` 时两者都不存在：不建通道意味着事件分支永不就绪，也不会有额外唤醒。
+    let mut machine = migration
+        .as_ref()
+        .map(|rt| MigrateMachine::new(rt.role, rt.timing.clone()));
+    let (mig_evt_tx, mut mig_evt_rx) = if migration.is_some() {
+        let (tx, rx) = mpsc::unbounded_channel::<MigrateEvent>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     // 1) 等 HelloAck（Hello 已由建立阶段流水线写出）。
     let ack = match timeout(HANDSHAKE_TIMEOUT, reader.next()).await {
@@ -653,6 +810,9 @@ pub(crate) async fn run_controller_with_input(
         None,
         // 控制器不产生 IDR（它只发输入/心跳/文件消息），IDR 去重是**被控端**的发送侧策略。
         None,
+        // 迁移句柄：写任务据此在屏障帧（本端是 `PathCommit`）flush 之后切换写方向。
+        mig_handle.clone(),
+        mig_evt_tx.clone(),
     ));
 
     // 解码任务：解码是 CPU 密集的**同步**调用，放在会话 `select!` 的分支里执行会让输入转发
@@ -730,6 +890,26 @@ pub(crate) async fn run_controller_with_input(
     let mut reported_dims: Option<(u32, u32)> = None;
     // 可靠层上一份快照（每秒求差 → `SessionStats::Transport`）。
     let mut last_transport: Option<ReliableSnapshot> = None;
+    // 可靠层指标句柄。建立时取一次，但**迁移成功后必须换掉**：中继路径没有本端可靠层（`None`），
+    // 切换到打洞路径后会多出一个。旧实现直接读 `config.reliable`，迁移后就永远看不到新路径的
+    // 重传/乱序读数。切换时把 `last_transport` 一并清掉，避免跨流求差。
+    let mut reliable_metrics = config.reliable.clone();
+    // 迁移：本端角色与「值不值得迁」的初值。真正允许发起还要求 `current_path == Relay`
+    // （迁移的目标就是脱离中继；打洞/直连会话不需要迁移）。
+    let mig_role = migration.as_ref().map(|rt| rt.role);
+    let mig_initial_relay = migration
+        .as_ref()
+        .is_some_and(|rt| rt.initial_path == TransportPath::Relay);
+    // 当前数据面路径。初值取建立时报告的路径，`ReportPath` 动作执行后更新。
+    let mut current_path = migration
+        .as_ref()
+        .map_or(TransportPath::Relay, |rt| rt.initial_path);
+    // 迁移驱动节拍。只在迁移运行时存在时才创建（为 `None` 时不引入任何定时器）。
+    let mut migrate_tick = migration.as_ref().map(|_| {
+        let mut tick = interval_at(Instant::now() + MIGRATE_TICK, MIGRATE_TICK);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tick
+    });
     // 最近一次收到画面帧的时刻（「长时间无帧」看门狗用）。
     let mut last_frame_at = Instant::now();
     // 最近一次请求关键帧的时刻（限频，避免静止桌面上刷屏）。语义是**无帧看门狗**的 3s 限频。
@@ -907,7 +1087,8 @@ pub(crate) async fn run_controller_with_input(
                     }
                 }
                 // 可靠层每秒增量（A7）。只有打洞路径有句柄；直连/中继不发（见 `ControllerConfig`）。
-                if let Some(metrics) = &config.reliable {
+                // 用局部句柄而不是 `config.reliable`：迁移成功后路径会变（见 `reliable_metrics`）。
+                if let Some(metrics) = &reliable_metrics {
                     let now_snapshot = metrics.snapshot();
                     if let Some(prev) = last_transport {
                         config.stats.report(SessionStats::Transport(transport_delta(prev, now_snapshot)));
@@ -1089,6 +1270,44 @@ pub(crate) async fn run_controller_with_input(
                             }
                         }
                     }
+                    ControllerCommand::MigrateNow => {
+                        // 手动「立即尝试 P2P」：忽略首次延迟与退避，但仍在空闲且**确实走中继**时
+                        // 才发起（打洞/直连会话没有可迁移的目标）。
+                        let migrate_ok = migration.is_some()
+                            && mig_initial_relay
+                            && current_path == TransportPath::Relay;
+                        if migrate_ok {
+                            if let Some(machine) = machine.as_mut() {
+                                let now = Instant::now();
+                                let actions = machine.force_start(now);
+                                if let (Some(rt), Some(tx)) =
+                                    (migration.as_ref(), mig_evt_tx.as_ref())
+                                {
+                                    let (fatal, reported) = apply_migration_actions(
+                                        actions,
+                                        rt,
+                                        mig_handle.as_ref(),
+                                        tx,
+                                        &mut queues,
+                                        &cancel,
+                                    )
+                                    .await;
+                                    apply_path_report(
+                                        reported,
+                                        mig_handle.as_ref(),
+                                        &mut current_path,
+                                        &mut reliable_metrics,
+                                        &mut last_transport,
+                                    );
+                                    if let Some(err) = fatal {
+                                        break Err(err);
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!("当前不在中继路径或未启用迁移，忽略手动迁移请求");
+                        }
+                    }
                 }
             }
             // 解码任务的通知：参考链断了（需要一张 IDR）/ 关键帧已解出（等待结束）。
@@ -1166,9 +1385,115 @@ pub(crate) async fn run_controller_with_input(
                     }
                 }
             }
+            // 会话内路径迁移：周期 tick（到点自动尝试 + 各状态超时）。仅在**会话仍在中继上**
+            // 时启用——迁移的目标就是脱离中继，打洞/直连会话无需尝试。
+            () = tick_migrate(&mut migrate_tick),
+                if match mig_role {
+                    Some(Role::Controller) => {
+                        mig_initial_relay
+                            && current_path == TransportPath::Relay
+                            // 只在「还在等下一次尝试」或「有进行中的尝试」时 tick；一次都
+                            // 不重试的空闲态（失败已退避/次数用尽）不再产生 200 ms 唤醒。
+                            && machine.as_ref().is_some_and(|m| {
+                                !m.is_done() && (m.next_attempt_at().is_some() || !m.is_idle())
+                            })
+                    }
+                    // 被控端没有「自动发起」，但仍要 tick 来判各状态的超时；空闲时一律不碰
+                    // （否则 `on_tick` 会在空闲态替它「发起」一次，见 `MigrateMachine::on_tick`）。
+                    Some(Role::Controlled) => {
+                        machine.as_ref().is_some_and(|m| !m.is_idle() && !m.is_done())
+                    }
+                    None => false,
+                } =>
+            {
+                let now = Instant::now();
+                let actions = machine.as_mut().map_or_else(Vec::new, |m| m.on_tick(now));
+                if let (Some(rt), Some(tx)) = (migration.as_ref(), mig_evt_tx.as_ref()) {
+                    let (fatal, reported) = apply_migration_actions(
+                        actions,
+                        rt,
+                        mig_handle.as_ref(),
+                        tx,
+                        &mut queues,
+                        &cancel,
+                    )
+                    .await;
+                    apply_path_report(
+                        reported,
+                        mig_handle.as_ref(),
+                        &mut current_path,
+                        &mut reliable_metrics,
+                        &mut last_transport,
+                    );
+                    if let Some(err) = fatal {
+                        break Err(err);
+                    }
+                }
+            }
+            // 迁移建立任务 / 写任务的事件（进程内，不上线）。
+            Some(ev) = recv_migrate_event(&mut mig_evt_rx), if migration.is_some() => {
+                let now = Instant::now();
+                let actions = machine
+                    .as_mut()
+                    .map_or_else(Vec::new, |m| m.on_event(ev, now));
+                if let (Some(rt), Some(tx)) = (migration.as_ref(), mig_evt_tx.as_ref()) {
+                    let (fatal, reported) = apply_migration_actions(
+                        actions,
+                        rt,
+                        mig_handle.as_ref(),
+                        tx,
+                        &mut queues,
+                        &cancel,
+                    )
+                    .await;
+                    apply_path_report(
+                        reported,
+                        mig_handle.as_ref(),
+                        &mut current_path,
+                        &mut reliable_metrics,
+                        &mut last_transport,
+                    );
+                    if let Some(err) = fatal {
+                        break Err(err);
+                    }
+                }
+            }
             incoming = reader.next() => {
                 match incoming {
-                    Some(Ok(frame)) => match frame.message {
+                    Some(Ok(frame)) => {
+                        // 迁移消息优先：六个 `Path*` 变体只由状态机消费，其余原样落到下面的既有
+                        // 处理。动作在这里**同步执行**——`ActivateRead` 必须在本轮 `reader.next()`
+                        // 之前生效，否则下一次读还会从旧流取值（对端已经切到新流上写了）。
+                        if let Some(machine) = machine.as_mut() {
+                            let now = Instant::now();
+                            if let Some(actions) = machine.on_message(&frame.message, now) {
+                                if let (Some(rt), Some(tx)) =
+                                    (migration.as_ref(), mig_evt_tx.as_ref())
+                                {
+                                    let (fatal, reported) = apply_migration_actions(
+                                        actions,
+                                        rt,
+                                        mig_handle.as_ref(),
+                                        tx,
+                                        &mut queues,
+                                        &cancel,
+                                    )
+                                    .await;
+                                    apply_path_report(
+                                        reported,
+                                        mig_handle.as_ref(),
+                                        &mut current_path,
+                                        &mut reliable_metrics,
+                                        &mut last_transport,
+                                    );
+                                    if let Some(err) = fatal {
+                                        break Err(err);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        match frame.message {
                         SessionMessage::VideoPacket {
                             display,
                             seq,
@@ -1649,7 +1974,8 @@ pub(crate) async fn run_controller_with_input(
                             }
                         }
                         other => debug!(?other, "控制器收到未处理的消息"),
-                    },
+                        }
+                    }
                     Some(Err(err)) => break Err(RemoteError::Codec(err.to_string())),
                     None => {
                         "对端已关闭连接".clone_into(&mut reason);

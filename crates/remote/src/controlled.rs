@@ -129,6 +129,10 @@ use crate::codec::{vp9_encoder_factory, VideoEncoderApi, VideoEncoderFactory};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
 use crate::latency::{self, LatencyWindow, Stage};
+use crate::migrate::{
+    execute_actions, ActionContext, MigrateAction, MigrateEvent, MigrateHandle, MigrateMachine,
+    MigrateRuntime, MigratableDuplex,
+};
 use crate::qos::{Feedback, QosAction, RateController};
 use crate::screen::{
     bitrate_permille_for_pixels, scale_bitrate, CaptureInfo, CapturedPatches, Clipboard,
@@ -142,7 +146,7 @@ use crate::session::{
 };
 use crate::stats::{SessionStats, SessionStatsReporter};
 use crate::transfer::{TransferHub, CHUNK_PAUSE};
-use crate::transport::BoxDuplex;
+use crate::transport::{BoxDuplex, TransportPath};
 use crate::video::{encode_dimensions, EncodedVideo, MAX_ENCODE_WIDTH, NATIVE_MAX_ENCODE_WIDTH};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_tunnel_common::protocol::RemoteMode;
@@ -203,6 +207,11 @@ pub(crate) const AUDIO_QUEUE: usize = 8;
 
 /// 编码侧读数的上报间隔（见 [`EncodeStatsWindow`]）。
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 会话内路径迁移的驱动节拍（与控制器侧同一取值，见 `controller.rs` 的 `MIGRATE_TICK`）。
+///
+/// 被控端不主动发起迁移，tick 只用来判各等待态的超时；2 s 的状态超时因此最多晚 200 ms 生效。
+const MIGRATE_TICK: Duration = Duration::from_millis(200);
 
 /// 显示器枚举的复查间隔。
 ///
@@ -279,7 +288,15 @@ pub(crate) fn outbound_class(msg: &SessionMessage) -> OutboundClass {
         | SessionMessage::HostStats(_)
         // 远端光标形状：极小、**时延敏感**（拖过链接/输入框时用户立刻能看出图标没跟上），
         // 且丢一条就会让控制端一直显示旧光标直到下次变化——绝不能丢，与其它控制帧同档。
-        | SessionMessage::CursorShape { .. } => OutboundClass::Control,
+        | SessionMessage::CursorShape { .. }
+        // 会话内路径迁移（v12）：数量极少、**顺序至关重要**（屏障帧必须是旧流上的最后一条
+        // 字节），与其它控制帧同档，绝不能被 screen/audio/file 队列插队。
+        | SessionMessage::PathMigratePrepare { .. }
+        | SessionMessage::PathMigrateReady { .. }
+        | SessionMessage::PathFreeze { .. }
+        | SessionMessage::PathFrozen { .. }
+        | SessionMessage::PathCommit { .. }
+        | SessionMessage::PathAbort { .. } => OutboundClass::Control,
     }
 }
 
@@ -2321,16 +2338,99 @@ fn build_host_stats(
     }
 }
 
+/// 等一次迁移驱动 tick；没有迁移运行时时**永不就绪**（分支同时被 `if` 守卫关掉）。
+async fn tick_migrate(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(tick) => {
+            tick.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// 等一条迁移事件；没有迁移运行时时永不就绪。
+async fn recv_migrate_event(
+    rx: &mut Option<mpsc::UnboundedReceiver<MigrateEvent>>,
+) -> Option<MigrateEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 执行迁移状态机动作，并把其中的控制帧按动作顺序投进控制队列（与其它控制帧同一通道）。
+///
+/// 返回 `(致命错误, 迁移后上报的路径)`。读方向激活已在 `execute_actions` 里同步完成，
+/// 这里只负责把 `Send` 动作投出去。
+async fn apply_migration_actions(
+    actions: Vec<MigrateAction>,
+    runtime: &Arc<MigrateRuntime>,
+    handle: Option<&MigrateHandle>,
+    evt_tx: &mpsc::UnboundedSender<MigrateEvent>,
+    queues: &mut OutboundQueues,
+    cancel: &CancellationToken,
+) -> (Option<RemoteError>, Option<TransportPath>) {
+    let reported = actions.iter().find_map(|action| match action {
+        MigrateAction::ReportPath(path) => Some(*path),
+        _ => None,
+    });
+    // `install_pending` 只接受**已登记**的 attempt（防陈旧的建立任务污染新尝试）；登记由
+    // `execute_actions` 在 spawn 之前统一完成，这里无需重复。
+    let mut outbound = Vec::new();
+    let ctx = ActionContext {
+        session_id: &runtime.session_id,
+        handle,
+        evt_tx,
+        runtime,
+    };
+    let fatal = execute_actions(actions, &ctx, |msg| outbound.push(msg));
+    for msg in outbound {
+        if let Err(err) = queues
+            .enqueue_ctrl(cancel, SessionFrame::control(msg))
+            .await
+        {
+            return (Some(err), reported);
+        }
+    }
+    (fatal, reported)
+}
+
 /// 跑一次被控端会话，直到取消、对端关闭或出错。
 ///
 /// # Errors
 /// 握手被拒（版本不符、鉴权失败）、编解码/IO 失败时返回 [`RemoteError`]；正常结束返回
 /// `Ok(`[`SessionEnd`]`)`，由调用方据此判定是否需要自动重连。
+pub async fn run_controlled(
+    duplex: BoxDuplex,
+    config: ControlledConfig,
+    screen: Arc<dyn ScreenSource>,
+    input: Arc<dyn InputSink>,
+    clipboard: Option<Arc<dyn Clipboard>>,
+    transfer: TransferHub,
+    cancel: CancellationToken,
+) -> RemoteResult<SessionEnd> {
+    // 兼容入口：不启用会话内路径迁移。生产路径（`manager`）在会话确实跑在中继上时直接调
+    // [`run_controlled_inner`] 并传入迁移运行时。
+    run_controlled_inner(duplex, config, screen, input, clipboard, transfer, cancel, None).await
+}
+
+/// 被控端会话循环本体（带可选的会话内路径迁移运行时）。
+///
+/// `migration` 为 `Some` 时：把 duplex 包进 [`MigratableDuplex`]，授权成功后把一次性 token
+/// 填进运行时（迁移 `conn_id` 由它派生），并在 `select!` 里增加迁移状态机的驱动分支；
+/// 为 `None` 时**不建通道、不建定时器、不包流**，行为与迁移引入前逐字节一致。
+///
+/// # Errors
+/// 同 [`run_controlled`]；迁移在提交点之后超时/失败会以 [`RemoteError::Signaling`] 结束会话。
 #[expect(
     clippy::too_many_lines,
     reason = "握手 + 采集 + 注入 + 心跳的单会话循环，拆开反而丢失控制流全貌"
 )]
-pub async fn run_controlled(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "会话循环需要完整上下文；平台实现与传输必须分开注入"
+)]
+pub(crate) async fn run_controlled_inner(
     duplex: BoxDuplex,
     config: ControlledConfig,
     screen: Arc<dyn ScreenSource>,
@@ -2338,7 +2438,16 @@ pub async fn run_controlled(
     clipboard: Option<Arc<dyn Clipboard>>,
     mut transfer: TransferHub,
     cancel: CancellationToken,
+    migration: Option<Arc<MigrateRuntime>>,
 ) -> RemoteResult<SessionEnd> {
+    // 迁移包装：只有调用方给了运行时（会话确实跑在中继上）才启用；否则原样使用。
+    let (duplex, mig_handle) = match migration.as_ref() {
+        Some(rt) => {
+            let (wrapped, handle) = MigratableDuplex::new(duplex, rt.role);
+            (Box::new(wrapped) as BoxDuplex, Some(handle))
+        }
+        None => (duplex, None),
+    };
     let (read_half, write_half) = tokio::io::split(duplex);
     let mut reader = FramedRead::new(read_half, SessionCodec::new());
     let mut writer = FramedWrite::new(write_half, SessionCodec::new());
@@ -2391,6 +2500,12 @@ pub async fn run_controlled(
             }
         };
 
+    // 迁移 `conn_id` 由会话 token 派生；被控端**只有这里**持有 token（`authorize` 返回的 pending
+    // 会话）。填入运行时供建立任务读取；重复调用无害（`OnceLock` 只保留第一次）。
+    if let Some(rt) = migration.as_ref() {
+        rt.set_token(&pending.token);
+    }
+
     // 2) 生成临时密钥并回 HelloAck（明文），随后装上加密。
     let keypair = EphemeralKeyPair::generate();
     let responder_pub = keypair.public_bytes().to_vec();
@@ -2431,6 +2546,23 @@ pub async fn run_controlled(
     // ——否则写侧被背压卡住时（对端停读、中继停走），输入/心跳分支完全得不到轮询，形成队头阻塞。
     // 协商阶段的 `HeartbeatAck` / `CodecSelect` 也走这些队列，故先把它起来。
     let (mut queues, receivers) = OutboundQueues::new();
+    // 迁移状态机（纯状态机，无 I/O）与「建立任务 / 写任务 → 会话循环」的事件通道。
+    // `migration` 为 `None` 时两者都不存在：不建通道意味着事件分支永不就绪，也没有额外唤醒。
+    let mut machine = migration
+        .as_ref()
+        .map(|rt| MigrateMachine::new(rt.role, rt.timing.clone()));
+    let (mig_evt_tx, mut mig_evt_rx) = if migration.is_some() {
+        let (tx, rx) = mpsc::unbounded_channel::<MigrateEvent>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    // 迁移驱动节拍：被控端不主动发起，只用来判各等待态的超时。
+    let mut migrate_tick = migration.as_ref().map(|_| {
+        let mut tick = interval_at(Instant::now() + MIGRATE_TICK, MIGRATE_TICK);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tick
+    });
     // IDR 在途/刚写出的共享观测点：编码任务登记、写任务销账、会话循环据此吸收重复的
     // 关键帧请求（见 [`keyframe_request_is_redundant`]）。只在本端参与调度，**不上线**。
     let idr_tracker = IdrTracker::new();
@@ -2444,6 +2576,9 @@ pub async fn run_controlled(
         cancel.clone(),
         Some(Arc::clone(&latency_window)),
         Some(Arc::clone(&idr_tracker)),
+        // 迁移句柄：写任务据此在屏障帧（本端是 `PathFrozen`）flush 之后切换写方向。
+        mig_handle.clone(),
+        mig_evt_tx.clone(),
     ));
 
     // 2.5) 编解码协商：**必须先拿到 `CodecOffer` 才能开始采集/编码**——否则首帧可能用了控制器
@@ -3641,6 +3776,49 @@ pub async fn run_controlled(
                     }
                 }
             }
+            // 会话内路径迁移：周期 tick 只负责各等待态的超时。被控端没有「自动发起」，
+            // 故空闲态一律不 tick（否则 `on_tick` 会替它「发起」一次，见 `MigrateMachine`）。
+            () = tick_migrate(&mut migrate_tick),
+                if machine.as_ref().is_some_and(|m| !m.is_idle() && !m.is_done()) =>
+            {
+                let now = Instant::now();
+                let actions = machine.as_mut().map_or_else(Vec::new, |m| m.on_tick(now));
+                if let (Some(rt), Some(tx)) = (migration.as_ref(), mig_evt_tx.as_ref()) {
+                    let (fatal, _reported) = apply_migration_actions(
+                        actions,
+                        rt,
+                        mig_handle.as_ref(),
+                        tx,
+                        &mut queues,
+                        &cancel,
+                    )
+                    .await;
+                    if let Some(err) = fatal {
+                        break Err(err);
+                    }
+                }
+            }
+            // 迁移建立任务 / 写任务的事件（进程内，不上线）。
+            Some(ev) = recv_migrate_event(&mut mig_evt_rx), if migration.is_some() => {
+                let now = Instant::now();
+                let actions = machine
+                    .as_mut()
+                    .map_or_else(Vec::new, |m| m.on_event(ev, now));
+                if let (Some(rt), Some(tx)) = (migration.as_ref(), mig_evt_tx.as_ref()) {
+                    let (fatal, _reported) = apply_migration_actions(
+                        actions,
+                        rt,
+                        mig_handle.as_ref(),
+                        tx,
+                        &mut queues,
+                        &cancel,
+                    )
+                    .await;
+                    if let Some(err) = fatal {
+                        break Err(err);
+                    }
+                }
+            }
             incoming = reader.next() => {
                 // 出码窗口推进器：每收到一条 `QosFeedback` 推进一次（无论这条反馈会不会被
                 // 补丁模式忽略），窗口因此恰好是「上一条反馈 → 本条反馈」，与控制器
@@ -3656,7 +3834,33 @@ pub async fn run_controlled(
                     sample
                 };
                 match incoming {
-                    Some(Ok(frame)) => match frame.message {
+                    Some(Ok(frame)) => {
+                        // 迁移消息优先：六个 `Path*` 变体只由状态机消费，其余原样落到下面的既有
+                        // 处理。动作在这里**同步执行**——`ActivateRead` 必须在下一轮 `reader.next()`
+                        // 之前生效，否则下一次读还会从旧流取值（控制器已切到新流上写）。
+                        if let Some(machine) = machine.as_mut() {
+                            let now = Instant::now();
+                            if let Some(actions) = machine.on_message(&frame.message, now) {
+                                if let (Some(rt), Some(tx)) =
+                                    (migration.as_ref(), mig_evt_tx.as_ref())
+                                {
+                                    let (fatal, _reported) = apply_migration_actions(
+                                        actions,
+                                        rt,
+                                        mig_handle.as_ref(),
+                                        tx,
+                                        &mut queues,
+                                        &cancel,
+                                    )
+                                    .await;
+                                    if let Some(err) = fatal {
+                                        break Err(err);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        match frame.message {
                         SessionMessage::Input(event) => {
                             input_events = input_events.saturating_add(1);
                             // `InputSink::apply` 是 enigo 注入，快操作（微秒级），留在 async worker
@@ -4041,7 +4245,8 @@ pub async fn run_controlled(
                             }
                         }
                         other => debug!(?other, "被控端收到未处理的消息"),
-                    },
+                        }
+                    }
                     Some(Err(err)) => break Err(RemoteError::Codec(err.to_string())),
                     None => {
                         "对端已关闭连接".clone_into(&mut reason);
@@ -4375,6 +4580,10 @@ fn pacing_plan(len: usize, kbps: u32) -> Option<(usize, Duration)> {
 /// [`PACING_MAX_TOTAL_WAIT`]（20 ms）约束（[`pacing_plan`] / [`PacingBudget`]）。分块只是
 /// 「别一次性灌进传输层」，20 ms 预算保证一帧最多多花 20 ms——限速交给传输层，不在应用层
 /// 按静态码率重复做。小帧、ctrl、file、close 全部走原路径，行为不变。
+#[expect(
+    clippy::too_many_lines,
+    reason = "五档优先级的取帧/写出/迁移屏障/延迟诊断是一段不可分割的循环，拆开反而要来回传状态"
+)]
 pub(crate) async fn writer_loop(
     mut writer: FramedWrite<tokio::io::WriteHalf<BoxDuplex>, SessionCodec>,
     mut rx: OutboundReceivers,
@@ -4384,6 +4593,11 @@ pub(crate) async fn writer_loop(
     // IDR 在途/刚写出观测点；控制器侧传 `None`（它不产生 IDR）。被控端在**写完**一帧
     // 关键帧时销账并置「刚写出」时间戳，会话循环据此吸收重复的关键帧请求。
     idr_tracker: Option<Arc<IdrTracker>>,
+    // 迁移句柄：写任务据此识别**本方向的屏障帧**（被控端 `PathFrozen` / 控制器 `PathCommit`），
+    // 并在它整帧 flush 之后切换写方向。`None` = 本会话不迁移，行为与从前一致。
+    mig_handle: Option<MigrateHandle>,
+    // 迁移事件通道：写方向切好后通知会话循环（`WriteActivated`）。
+    mig_evt_tx: Option<mpsc::UnboundedSender<MigrateEvent>>,
 ) {
     // 取消后不再写普通帧，只等收尾帧。
     let mut cancelled = false;
@@ -4397,14 +4611,29 @@ pub(crate) async fn writer_loop(
                 break;
             }
             Some(frame) = rx.ctrl.recv(), if !cancelled => {
+                // 屏障帧只可能出现在控制车道（`PathFrozen` / `PathCommit` 都归 `Control`）。
+                let barrier = mig_handle.as_ref().and_then(|h| h.write_barrier(&frame.message));
                 if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
                     break;
                 }
+                activate_write_after_barrier(
+                    barrier,
+                    mig_handle.as_ref(),
+                    mig_evt_tx.as_ref(),
+                    cancelled,
+                );
             }
             Some(frame) = rx.audio.recv(), if !cancelled => {
+                let barrier = mig_handle.as_ref().and_then(|h| h.write_barrier(&frame.message));
                 if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
                     break;
                 }
+                activate_write_after_barrier(
+                    barrier,
+                    mig_handle.as_ref(),
+                    mig_evt_tx.as_ref(),
+                    cancelled,
+                );
             }
             Some(frame) = rx.screen.recv(), if !cancelled => {
                 let pacing_kbps = rx.screen_pacing_kbps.load(Ordering::Relaxed);
@@ -4419,9 +4648,18 @@ pub(crate) async fn writer_loop(
                     &frame.message,
                     SessionMessage::VideoPacket { flags, .. } if flags & VIDEO_FLAG_KEYFRAME != 0
                 );
+                // 屏障帧不会走画面车道，但同款处理保证「任何一次完整 flush 之后」都有切换点
+                // （`write_paced` 的激活必须在最后一 chunk flush 之后，本函数返回即满足）。
+                let barrier = mig_handle.as_ref().and_then(|h| h.write_barrier(&frame.message));
                 if !write_screen(&mut writer, &cancel, frame, &mut cancelled, pacing_kbps).await {
                     break;
                 }
+                activate_write_after_barrier(
+                    barrier,
+                    mig_handle.as_ref(),
+                    mig_evt_tx.as_ref(),
+                    cancelled,
+                );
                 // 只有**完整写完**才算「刚写出」：pacing 中途被取消的那一帧没有完整上线，
                 // 会话也正在收尾，不需要再吸收任何请求。
                 if wrote_idr && !cancelled {
@@ -4461,13 +4699,47 @@ pub(crate) async fn writer_loop(
                 }
             }
             Some(frame) = rx.file.recv(), if !cancelled => {
+                let barrier = mig_handle.as_ref().and_then(|h| h.write_barrier(&frame.message));
                 if !write_ordinary(&mut writer, &cancel, frame, &mut cancelled).await {
                     break;
                 }
+                activate_write_after_barrier(
+                    barrier,
+                    mig_handle.as_ref(),
+                    mig_evt_tx.as_ref(),
+                    cancelled,
+                );
             }
             // 所有通道都已关闭（或普通通道在取消后被禁用）：任务收场。
             else => break,
         }
+    }
+}
+
+/// 在**整帧 flush 成功之后**决定是否把写方向切到新流（迁移的写激活点）。
+///
+/// # 为什么只能在这里切
+///
+/// `write_paced` 一帧要多次 `poll_write`；从会话循环（或任何其它任务）切写会把一帧撕到两条
+/// 流上，对端按长度前缀恢复帧边界时会直接错位。本函数只在 `send` / `write_paced` **返回成功**
+/// 后调用，此时屏障帧的最后一个字节已经 flush。屏障帧（被控端 `PathFrozen`、控制器 `PathCommit`）
+/// 是旧流上**本方向**的最后一条字节，因此两端的 AEAD 计数器在新旧流之间严格连续。
+///
+/// 取消/写失败（`cancelled == true`）时不切：那一帧可能只写了一部分，会话正在收尾。
+fn activate_write_after_barrier(
+    barrier: Option<u32>,
+    handle: Option<&MigrateHandle>,
+    evt_tx: Option<&mpsc::UnboundedSender<MigrateEvent>>,
+    cancelled: bool,
+) {
+    let (Some(attempt), Some(handle), Some(evt_tx)) = (barrier, handle, evt_tx) else {
+        return;
+    };
+    if cancelled {
+        return;
+    }
+    if handle.activate_write(attempt) {
+        let _ = evt_tx.send(MigrateEvent::WriteActivated { attempt });
     }
 }
 

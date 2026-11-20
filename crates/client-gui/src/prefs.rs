@@ -137,6 +137,13 @@ pub struct GuiPrefs {
     /// 断线自动重连。默认开启：会话因断线（非主动结束）时按退避重试，用户可随时停止。
     #[serde(default = "default_true")]
     pub remote_auto_reconnect: bool,
+    /// 中继会话**自动尝试升级到 P2P 打洞**。**默认开启**。
+    ///
+    /// 会话跑在 hbbr 中继上时，后台每 30 s 尝试一次打洞；成功后把数据面**无缝**换到 P2P
+    /// （协议 v12 的会话内路径迁移）。提交点（`PathFreeze`）之前的失败完全无害——会话照常
+    /// 走中继；提交点之后的失败按会话故障处理（走既有自动重连）。关闭后会话一直留在中继。
+    #[serde(default = "default_true")]
+    pub remote_p2p_upgrade: bool,
     /// 会话窗口内的统计角标（延迟 / 路径 / 分辨率 / 帧率 / 时长）是否常显。
     #[serde(default)]
     pub remote_stats_overlay: bool,
@@ -239,6 +246,7 @@ impl Default for GuiPrefs {
             // 「配置文件缺键」，全新安装/没有配置文件走的是这里。两处不一致会让「文档说默认开、
             // 实际默认关」，断线后不重连。
             remote_auto_reconnect: true,
+            remote_p2p_upgrade: true,
             remote_stats_overlay: false,
             remote_stats_detail: false,
             remote_frame_rate: default_remote_frame_rate(),
@@ -623,6 +631,25 @@ mod tests {
         .unwrap();
         let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
         assert!(!reparsed.remote_auto_reconnect);
+    }
+
+    /// 中继→P2P 自动升级的缺省：同样要求两条路径一致（全新安装与旧配置缺键都默认开启），
+    /// 否则会出现「文档说会升级、实际永远不升」。
+    #[test]
+    fn p2p_upgrade_defaults_to_true_in_both_paths() {
+        assert!(
+            GuiPrefs::default().remote_p2p_upgrade,
+            "全新安装应默认开启中继→P2P 自动升级"
+        );
+        let prefs: GuiPrefs = toml::from_str("theme = \"system\"\n").unwrap();
+        assert!(prefs.remote_p2p_upgrade, "旧配置缺该键也应默认开启");
+        let saved = toml::to_string(&GuiPrefs {
+            remote_p2p_upgrade: false,
+            ..GuiPrefs::default()
+        })
+        .unwrap();
+        let reparsed: GuiPrefs = toml::from_str(&saved).unwrap();
+        assert!(!reparsed.remote_p2p_upgrade, "用户显式关闭必须持久化");
     }
 
     /// 画质档位的缺省与往返：与帧率同理，旧配置缺键落到 `Balanced`，用户选择跨重启保留。

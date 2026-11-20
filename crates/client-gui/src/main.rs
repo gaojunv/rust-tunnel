@@ -765,6 +765,10 @@ struct ManagerOptions {
     prefer_h265: bool,
     /// 是否优先 4:4:4（VP9 profile 1）；优先级高于 `prefer_h265`。
     prefer_444: bool,
+    /// 中继会话是否自动尝试升级到 P2P 打洞（协议 v12 会话内路径迁移）。
+    ///
+    /// GUI 取自偏好；无人值守实例恒 `true`（它不发起会话，只在对端请求时配合）。
+    punch_migration: bool,
     /// 平台实现模式（**必须在构造期选定**，见 [`remote::PlatformMode`]）。
     platform_mode: remote::PlatformMode,
     /// 被控端共享目录（`None` = 不接受文件请求）。
@@ -827,6 +831,9 @@ fn build_remote_manager(
         audio_sink: audio.sink,
         audio_enabled: opts.audio_enabled,
         audio_allowed: Arc::new(AtomicBool::new(opts.audio_allowed)),
+        // 会话内路径迁移：中继会话后台尝试打洞，成功后无缝换流（见 `crates/remote` 的
+        // `migrate` 模块）。`always_use_relay` 时建立器自己会拒绝，不必在这里判断。
+        punch_migration: opts.punch_migration,
     });
     // 自动锁屏偏好不在 `RemoteManagerConfig` 里（那个结构是数据面/平台参数），构造后单独设置。
     manager.set_auto_lock_on_disconnect(opts.auto_lock_on_disconnect);
@@ -852,6 +859,7 @@ fn gui_manager_options(
     native_resolution: bool,
     prefer_h265: bool,
     prefer_444: bool,
+    punch_migration: bool,
     audio_enabled: bool,
     audio_allowed: bool,
     audio_volume: u8,
@@ -863,6 +871,7 @@ fn gui_manager_options(
         native_resolution,
         prefer_h265,
         prefer_444,
+        punch_migration,
         platform_mode: remote::PlatformMode::Gui,
         share_dir: Some(remote::share_dir()),
         download_dir: remote::download_dir(),
@@ -892,6 +901,7 @@ fn spawn_runtime(
     initial_native_resolution: bool,
     initial_prefer_h265: bool,
     initial_prefer_444: bool,
+    initial_punch_migration: bool,
     initial_audio_enabled: bool,
     initial_audio_allowed: bool,
     initial_audio_volume: u8,
@@ -998,6 +1008,7 @@ fn spawn_runtime(
                     initial_native_resolution,
                     initial_prefer_h265,
                     initial_prefer_444,
+                    initial_punch_migration,
                     initial_audio_enabled,
                     initial_audio_allowed,
                     initial_audio_volume,
@@ -1694,6 +1705,7 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
             remote::effective_prefer_h265(prefs.remote_prefer_h265, remote::h265_disabled_by_env()),
             // 文字优先（4:4:4）：开启后协商优先选 VP9（4:4:4），压过 H.264/H.265。
             prefs.remote_prefer_444,
+            prefs.remote_p2p_upgrade,
             prefs.remote_audio_enabled,
             prefs.remote_audio_allowed,
             prefs.remote_audio_volume,

@@ -42,9 +42,12 @@ use crate::error::{RemoteError, RemoteResult};
 use crate::nat::{classify, NatCache, NatClass, NAT_PROBE_TIMEOUT};
 use crate::punch::{self, PunchRegistry, PUNCH_BUDGET};
 use crate::reliable::{self, DatagramRx, ReliableStream};
-use crate::transport::{EstablishedStream, EstablishRequest, Role, TransportEstablisher, TransportPath};
+use crate::transport::{
+    EstablishedStream, EstablishRequest, MigrateRequest, Role, TransportEstablisher, TransportPath,
+};
 use async_trait::async_trait;
 use bytes::BytesMut;
+use hmac::{Hmac, Mac};
 use rust_tunnel_common::protocol::RemoteParams;
 use rust_tunnel_rustdesk::addr;
 use rust_tunnel_rustdesk::frame::{frame, FrameCodec};
@@ -54,6 +57,7 @@ use rust_tunnel_rustdesk::proto::{
     FetchLocalAddr, LocalAddr, ProstMessage, PunchHole, PunchHoleRequest, PunchHoleSent, RegisterPeer, RegisterPk,
     RendezvousMessage, RequestRelay, TestNatRequest,
 };
+use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +81,23 @@ const RELAY_WAIT: Duration = Duration::from_secs(25);
 
 /// 直连尝试的连接超时。
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 迁移直连前导帧的魔数（`RTMG`）。
+const MIGRATION_HELLO_MAGIC: [u8; 4] = *b"RTMG";
+
+/// 迁移直连前导帧的协议版本。
+const MIGRATION_HELLO_VERSION: u8 = 1;
+
+/// 迁移直连前导帧长度：魔数(4) + 版本(1) + 角色(1) + attempt(4) + MAC(32)。
+const MIGRATION_HELLO_LEN: usize = 4 + 1 + 1 + 4 + 32;
+
+/// 迁移直连前导交换的超时（写入与读取共享一个窗口）。
+///
+/// 本端先写、再读对端的前导，两端**都先写**，所以不会互相等（全双工）。
+const MIGRATION_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// HMAC-SHA256 类型别名。
+type HmacSha256 = Hmac<Sha256>;
 
 /// 等待 `PunchHoleResponse` 的超时（**不是** [`RELAY_WAIT`]，见下）。
 ///
@@ -216,6 +237,119 @@ enum Candidate {
     Direct(TcpStream),
     /// 中继推送到达（后续再连 hbbr）。
     Relay,
+}
+
+// ───────────────────────── 迁移直连前导（v12 阶段 B） ─────────────────────────
+
+/// 前导帧里的角色字节（0=控制器，1=被控端）。**线上契约，别改既有取值。**
+const fn role_byte(role: Role) -> u8 {
+    match role {
+        Role::Controller => 0,
+        Role::Controlled => 1,
+    }
+}
+
+/// 本端角色的对端角色。
+const fn peer_role(role: Role) -> Role {
+    match role {
+        Role::Controller => Role::Controlled,
+        Role::Controlled => Role::Controller,
+    }
+}
+
+/// `mac = HMAC-SHA256(hello_key, MAGIC ‖ version ‖ role ‖ attempt_be)`。
+///
+/// 覆盖魔数与版本是必须的：否则同一把密钥下，把帧头改成另一个版本/魔数的重放也能通过（MAC
+/// 只看 attempt 与 role 时）。这里不引入 nonce——attempt 每次尝试唯一、且密钥本就不上数据面，
+/// 重放一条**同 attempt** 的旧连接没有额外收益（它对应的正是同一轮迁移）。
+fn migration_hello_mac(key: &[u8; 32], role: Role, attempt: u32) -> [u8; 32] {
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        // HMAC 接受任意长度密钥，构造失败实际不可能；返回全零必然通不过校验（fail-closed）。
+        return [0u8; 32];
+    };
+    mac.update(&MIGRATION_HELLO_MAGIC);
+    mac.update(&[MIGRATION_HELLO_VERSION]);
+    mac.update(&[role_byte(role)]);
+    mac.update(&attempt.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// 组装一条前导帧：
+/// `"RTMG"(4) | version=1(1) | role(1) | attempt BE(4) | mac(32)`。
+fn migration_hello_frame(key: &[u8; 32], role: Role, attempt: u32) -> [u8; MIGRATION_HELLO_LEN] {
+    let mut frame = [0u8; MIGRATION_HELLO_LEN];
+    frame[..4].copy_from_slice(&MIGRATION_HELLO_MAGIC);
+    frame[4] = MIGRATION_HELLO_VERSION;
+    frame[5] = role_byte(role);
+    frame[6..10].copy_from_slice(&attempt.to_be_bytes());
+    frame[10..].copy_from_slice(&migration_hello_mac(key, role, attempt));
+    frame
+}
+
+/// 校验一条对端前导帧：魔数、版本、**对端角色**、**期望的 attempt**、MAC（常数时间）。
+///
+/// 任何一项不符都返回 `false`：被控端据此丢弃这条 TCP 连接并继续等下一条，而不是把无关连接
+/// 当成迁移流装进会话（那会让会话在提交点之前就因首帧 AEAD 失败而断掉）。
+fn verify_migration_hello(bytes: &[u8], key: &[u8; 32], expect_attempt: u32, expect_peer_role: Role) -> bool {
+    if bytes.len() != MIGRATION_HELLO_LEN || bytes[..4] != MIGRATION_HELLO_MAGIC {
+        return false;
+    }
+    if bytes[4] != MIGRATION_HELLO_VERSION {
+        return false;
+    }
+    let role = match bytes[5] {
+        0 => Role::Controller,
+        1 => Role::Controlled,
+        _ => return false,
+    };
+    if role != expect_peer_role {
+        return false;
+    }
+    let Ok(attempt) = <[u8; 4]>::try_from(&bytes[6..10]) else {
+        return false;
+    };
+    if u32::from_be_bytes(attempt) != expect_attempt {
+        return false;
+    }
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        return false;
+    };
+    // MAC 的输入恰是帧头 10 字节（魔数 ‖ 版本 ‖ 角色 ‖ attempt）。
+    mac.update(&bytes[..10]);
+    // `verify_slice` 是常数时间比对且自带长度校验（与 `crate::auth` 一致）。
+    mac.verify_slice(&bytes[10..]).is_ok()
+}
+
+/// 在一条裸 TCP 上交换迁移前导：先写本端帧，再读并校验对端帧。
+///
+/// # 为什么直连需要它
+///
+/// 直连监听端口对任何能到达它的机器都是敞开的（同内网、甚至被端口转发到公网）。若不先证明
+/// 「这条连接确实来自持有会话 token 的对端」，任何一条无关连接都会被 `install_pending` 当成
+/// 迁移流，随后会话在首帧 AEAD 上失败——而**这个问题在提交点之前就会把会话搞死**，与
+/// 「迁移失败可安全放弃」的不变量直接冲突。前导把流绑定到 `token` + `attempt`，让被控端能在
+/// 装流之前拒掉不匹配的连接。
+///
+/// 写与读共享 [`MIGRATION_HELLO_TIMEOUT`] 一个窗口；两端都先写，所以全双工下不会互相等。
+async fn exchange_migration_hello(stream: &mut TcpStream, req: &MigrateRequest, role: Role) -> RemoteResult<()> {
+    let frame = migration_hello_frame(&req.hello_key, role, req.attempt);
+    let exchange = async {
+        stream.write_all(&frame).await?;
+        stream.flush().await?;
+        let mut peer = [0u8; MIGRATION_HELLO_LEN];
+        stream.read_exact(&mut peer).await?;
+        if !verify_migration_hello(&peer, &req.hello_key, req.attempt, peer_role(role)) {
+            return Err(RemoteError::Signaling("迁移直连前导校验失败".to_owned()));
+        }
+        Ok(())
+    };
+    match timeout(MIGRATION_HELLO_TIMEOUT, exchange).await {
+        Ok(res) => res,
+        Err(_) => Err(RemoteError::Signaling("迁移直连前导交换超时".to_owned())),
+    }
 }
 
 /// RustDesk 客户端传输建立器。
@@ -586,6 +720,189 @@ impl RustDeskTransport {
         }
     }
 
+    /// 迁移前置检查：`always_use_relay` 下两侧都无望，直接报错（不白付预算）。
+    ///
+    /// **对称 NAT 不再在这里一刀切**：直连（同内网 TCP）迁移与 NAT 分类无关，对称 NAT 下
+    /// 照样可能成功。打洞分支的对称 NAT 判据下放到 [`Self::migrate_controller`] /
+    /// [`Self::migrate_controlled`]——只有那里才知道这次尝试到底会走打洞还是直连。
+    ///
+    /// **为什么要显式检查而不是复用 `migration_supported`**：这里要给用户一条说得清的中文原因，
+    /// 而 `migration_supported` 只有一个 `bool`。两侧共用同一套判据，语义必须一致。
+    fn migration_guard(&self) -> RemoteResult<()> {
+        if self.cfg.always_use_relay {
+            return Err(RemoteError::Signaling(
+                "迁移不可用：本端强制走中继（always_use_relay）".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 控制器侧的会话内路径迁移：**只走打洞或同内网直连**，绝不回退中继。
+    ///
+    /// # 为什么单独一套逻辑、不复用 [`Self::establish`]
+    ///
+    /// `establish` 会在打洞/直连失败时发 `RequestRelay` 并连 hbbr——但迁移的**语义前提**是
+    /// 「当前会话本来就在中继上，现在试着换到更好的路径」，回退中继等于什么都没做（白写一帧
+    /// 信令、还可能与既有中继连接抢配对 uuid）。故这里只接受 `PunchHoleResponse` 的两条
+    /// 非中继分支：[`PunchSignal::Punch`]（UDP 打洞）与 [`PunchSignal::Local`]（同内网 TCP）。
+    ///
+    /// # 直连分支的鉴权
+    ///
+    /// 裸 TCP 连接本身不携带身份，必须先过 [`exchange_migration_hello`] 才返回（见该函数的
+    /// 文档）：否则一个打错端口的连接可能被当成迁移流。
+    ///
+    /// # 为什么不碰 `NatCache`
+    ///
+    /// 会话落中继**往往正是**因为初始打洞失败被记了 10 分钟失败账（[`Self::try_punch`] 会
+    /// `record_failure`）。迁移若去查 [`crate::nat::NatCache::should_punch`]，就会永远不尝试；
+    /// 若失败后再 `record_failure`，又会把「这个对端打不了洞」的错误结论扩散给后续的**全新**
+    /// 会话。所以迁移与这张表完全隔离：查不查它、写不写它，都不在本函数的职责里。
+    async fn migrate_controller(&self, req: &MigrateRequest) -> RemoteResult<EstablishedStream> {
+        self.migration_guard()?;
+        match self.signal_punch(&req.peer_rd_id).await {
+            Some(PunchSignal::Punch(addr)) => {
+                // 打洞分支：本端对称 NAT 下无望，直接给一条说得清的原因（省掉白付的握手预算）。
+                if self.nat_class == NatClass::Symmetric {
+                    return Err(RemoteError::Signaling(
+                        "迁移打洞不可用：本端是对称 NAT（无法预测映射，打洞无望）".to_owned(),
+                    ));
+                }
+                let conn_id = u64::from_be_bytes(req.punch_cookie);
+                let rx = self.register_punch_session(conn_id).await;
+                // 迁移桥接缓冲用 512 KiB（见 `reliable::MIGRATION_DUPLEX_CAPACITY`）：切写与切读
+                // 之间有一个 RTT 的窗口，64 KiB 的应用侧缓冲在高速链路上会短暂阻塞写任务。
+                let stream = reliable::connect_with_capacity(
+                    self.udp.clone(),
+                    conn_id,
+                    rx,
+                    addr,
+                    req.timeout,
+                    reliable::MIGRATION_DUPLEX_CAPACITY,
+                )
+                .await?;
+                Ok(EstablishedStream {
+                    stream: Box::new(stream.stream),
+                    path: TransportPath::Punch,
+                    reliable: Some(stream.metrics),
+                })
+            }
+            Some(PunchSignal::Local(addr)) => {
+                let mut stream = match timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(err)) => {
+                        return Err(RemoteError::Signaling(format!("迁移直连失败（{addr}）：{err}")));
+                    }
+                    Err(_) => return Err(RemoteError::Signaling(format!("迁移直连超时（{addr}）"))),
+                };
+                let _ = stream.set_nodelay(true);
+                exchange_migration_hello(&mut stream, req, Role::Controller).await?;
+                Ok(EstablishedStream {
+                    stream: Box::new(stream),
+                    path: TransportPath::Direct,
+                    reliable: None,
+                })
+            }
+            // 无应答/被拒：迁移不能回退中继，只能失败（状态机据此退避重试）。
+            None => Err(RemoteError::Signaling(
+                "迁移不可用：会合服务器无应答或拒绝了打洞请求".to_owned(),
+            )),
+        }
+    }
+
+    /// 被控端侧的会话内路径迁移：**打洞与直连两个候选并发竞争**，先成者胜。
+    ///
+    /// 与 [`Self::migrate_controller`] 对称：**绝不**走 [`Self::establish_controlled`]——那条路
+    /// 会并发等中继推送，迁移必须只有「打洞/直连成功」与「失败」两种结局。同样不碰
+    /// [`crate::nat::NatCache`]（被控端 `peer_rd_id` 为空串，用空串当 key 会抑制所有对端）。
+    ///
+    /// # 直连候选为什么要循环
+    ///
+    /// 直连监听端口是**共享**的：前面可能排着别的连接（新会话建立、旁路扫描、上一次迁移的残留）。
+    /// 所以每接受一条就过一遍 [`exchange_migration_hello`]，不匹配的**直接丢弃并取下一条**，
+    /// 直到整轮预算（`req.timeout`）用完。这样一条无关连接不会让本轮迁移白失败，也不会被装进
+    /// 会话。
+    async fn migrate_controlled(&self, req: &MigrateRequest) -> RemoteResult<EstablishedStream> {
+        self.migration_guard()?;
+        let conn_id = u64::from_be_bytes(req.punch_cookie);
+        // 打洞候选只在非对称 NAT 下启用：本端对称 NAT 下打洞无望，省下握手预算。
+        let punch_enabled = self.nat_class != NatClass::Symmetric;
+        let punch_fut = async {
+            if punch_enabled {
+                let rx = self.register_punch_session(conn_id).await;
+                reliable::accept_with_capacity(
+                    self.udp.clone(),
+                    conn_id,
+                    rx,
+                    req.timeout,
+                    reliable::MIGRATION_DUPLEX_CAPACITY,
+                )
+                .await
+            } else {
+                // 由 `punch_active` 守卫，本分支永不被轮询；仅用于统一类型。
+                std::future::pending().await
+            }
+        };
+        let direct_fut = async {
+            loop {
+                let mut stream = self.next_direct().await?;
+                let _ = stream.set_nodelay(true);
+                match exchange_migration_hello(&mut stream, req, Role::Controlled).await {
+                    Ok(()) => return Ok::<TcpStream, RemoteError>(stream),
+                    Err(err) => {
+                        debug!(error = %err, "直连迁移前导校验失败，丢弃该连接并等下一条");
+                    }
+                }
+            }
+        };
+        // 与 `establish_controlled` 同样的纪律：future 只建一次并 pin，跨轮 `select!` 复用。
+        tokio::pin!(punch_fut, direct_fut);
+
+        let race = async {
+            let mut punch_active = punch_enabled;
+            let mut direct_active = true;
+            loop {
+                tokio::select! {
+                    res = &mut punch_fut, if punch_active => match res {
+                        Ok(stream) => break Ok(Candidate::Punch(stream)),
+                        Err(err) => {
+                            debug!(error = %err, "迁移打洞 accept 失败，继续等直连");
+                            punch_active = false;
+                        }
+                    },
+                    res = &mut direct_fut, if direct_active => match res {
+                        Ok(stream) => break Ok(Candidate::Direct(stream)),
+                        Err(err) => {
+                            debug!(error = %err, "迁移直连接入通道已关闭");
+                            direct_active = false;
+                        }
+                    },
+                    else => break Err(RemoteError::Signaling(
+                        "迁移建立失败：打洞与直连均不可用".to_owned(),
+                    )),
+                }
+            }
+        };
+
+        let candidate = timeout(req.timeout, race)
+            .await
+            .map_err(|_| RemoteError::Signaling("迁移建立超时：打洞与直连均无结果".to_owned()))??;
+
+        Ok(match candidate {
+            Candidate::Punch(stream) => EstablishedStream {
+                stream: Box::new(stream.stream),
+                path: TransportPath::Punch,
+                reliable: Some(stream.metrics),
+            },
+            Candidate::Direct(stream) => EstablishedStream {
+                stream: Box::new(stream),
+                path: TransportPath::Direct,
+                reliable: None,
+            },
+            // `race` 不会产出 Relay（迁移绝不回退中继）；真出现就是逻辑错误。
+            Candidate::Relay => return Err(RemoteError::Signaling("迁移不允许走中继".to_owned())),
+        })
+    }
+
     /// 被控端的建立：`always_use_relay` 时直接走中继；否则三个候选**并发竞争**。
     ///
     /// `always_use_relay` 是**两侧**的 kill switch。补上被控端这一侧（旧实现忽略它，导致规则
@@ -737,6 +1054,22 @@ impl TransportEstablisher for RustDeskTransport {
                 })
             }
             Role::Controlled => self.establish_controlled(&request).await,
+        }
+    }
+
+    /// 迁移能力判据：只受强制中继（kill switch）约束。
+    ///
+    /// **对称 NAT 不再一票否决**：直连（同内网 TCP）迁移与 NAT 分类无关。打洞分支在
+    /// [`Self::migrate_controller`] / [`Self::migrate_controlled`] 里自行规避对称 NAT。
+    fn migration_supported(&self) -> bool {
+        !self.cfg.always_use_relay
+    }
+
+    /// 会话内路径迁移（v12）：只建立打洞/直连流，绝不回退中继、不碰 `NatCache`。
+    async fn migrate(&self, request: MigrateRequest, role: Role) -> RemoteResult<EstablishedStream> {
+        match role {
+            Role::Controller => self.migrate_controller(&request).await,
+            Role::Controlled => self.migrate_controlled(&request).await,
         }
     }
 }
@@ -995,6 +1328,13 @@ pub struct LazyTransport {
     server_host: String,
     /// 已构造的传输及其对应的本端 `rd_id`。
     inner: Mutex<Option<(String, std::sync::Arc<RustDeskTransport>)>>,
+    /// 内层传输最近一次上报的迁移能力。
+    ///
+    /// `migration_supported()` 是**同步**方法，不能去锁 `inner`（`tokio::sync::Mutex` 需要
+    /// `.await`）。故在构造/重建内层传输时把结论缓存到这里：管理器据此决定是否为一场中继
+    /// 会话构造迁移运行时，避免在强制中继（kill switch）下白做一次 `PunchHoleRequest` 与一次
+    /// 10 秒的 accept。首次构造之前是 `false`（保守），而管理器只会在会话建立**之后**问它。
+    migration_ok: std::sync::atomic::AtomicBool,
 }
 
 impl LazyTransport {
@@ -1004,6 +1344,7 @@ impl LazyTransport {
         Self {
             server_host,
             inner: Mutex::new(None),
+            migration_ok: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1026,6 +1367,11 @@ impl LazyTransport {
         }
         let config = SignalingConfig::from_params(params, local_rd_id.to_owned(), &self.server_host);
         let transport = RustDeskTransport::new(config).await?;
+        // 缓存内层的迁移能力（同步 `migration_supported` 不能锁 `inner`，见字段文档）。
+        self.migration_ok.store(
+            transport.migration_supported(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         *guard = Some((local_rd_id.to_owned(), std::sync::Arc::clone(&transport)));
         Ok(transport)
     }
@@ -1051,6 +1397,19 @@ impl TransportEstablisher for LazyTransport {
     async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream> {
         let transport = self.transport_for(&request.params, &request.local_rd_id).await?;
         transport.establish(request, role).await
+    }
+
+    /// 返回**内层传输最近一次上报的能力**（构造时缓存，见 `migration_ok`）。
+    ///
+    /// 不用 `true` 一了百了：强制中继下真去尝试会白做一次 `PunchHoleRequest` 和一次 10 秒的
+    /// accept。管理器只会在会话建立之后问它，此时缓存必然是新鲜的。
+    fn migration_supported(&self) -> bool {
+        self.migration_ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn migrate(&self, request: MigrateRequest, role: Role) -> RemoteResult<EstablishedStream> {
+        let transport = self.transport_for(&request.params, &request.local_rd_id).await?;
+        transport.migrate(request, role).await
     }
 }
 
@@ -1794,6 +2153,133 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m.union, Some(Union::PunchHoleRequest(_)))),
             "强制中继时不应发出 PunchHoleRequest"
+        );
+    }
+
+    // ───────────────────────────── 会话内迁移（v12） ─────────────────────────────
+
+    fn dummy_migrate_request(peer_rd_id: &str, timeout: Duration) -> MigrateRequest {
+        MigrateRequest {
+            session_id: "sess-migrate".to_owned(),
+            local_rd_id: "111111111".to_owned(),
+            peer_rd_id: peer_rd_id.to_owned(),
+            params: RemoteParams {
+                rendezvous_host: "127.0.0.1".into(),
+                rendezvous_port: 21116,
+                relay_port: 21117,
+                relay_server: String::new(),
+                public_key: String::new(),
+                always_use_relay: false,
+            },
+            punch_cookie: conn_id_from_token("migrate-token").to_be_bytes(),
+            attempt: 1,
+            hello_key: crate::punch::migration_hello_key("migrate-token"),
+            timeout,
+        }
+    }
+
+    /// `migration_supported` 只受强制中继（kill switch）约束；对称 NAT 不再一票否决。
+    #[tokio::test]
+    async fn migration_supported_only_gated_by_always_use_relay() {
+        let hbbs = FakeHbbs::start().await;
+
+        let normal = hbbs.make_transport().await;
+        assert!(normal.migration_supported(), "默认（cone NAT）应支持迁移");
+
+        let forced_relay = hbbs.make_transport_with(true).await;
+        assert!(
+            !forced_relay.migration_supported(),
+            "always_use_relay 时不应尝试迁移（两侧 kill switch）"
+        );
+
+        // 对称 NAT 由构造期的 `probe_nat` 判定，故必须在 `make_transport` 之前设置。
+        hbbs.state.symmetric_nat.store(true, Ordering::SeqCst);
+        let symmetric = hbbs.make_transport().await;
+        assert_eq!(
+            symmetric.nat_class_for_test(),
+            NatClass::Symmetric,
+            "前置条件：假 hbbs 应让本端被判为对称 NAT"
+        );
+        assert!(
+            symmetric.migration_supported(),
+            "对称 NAT 下直连迁移仍可能成功，不应一票否决"
+        );
+    }
+
+    /// 直连迁移前导：合法帧通过，attempt / 角色 / 密钥不符或截断一律拒绝。
+    #[test]
+    fn migration_hello_frame_verifies_and_rejects_tampering() {
+        let key = crate::punch::migration_hello_key("migrate-token");
+        let frame = migration_hello_frame(&key, Role::Controller, 3);
+        assert_eq!(frame.len(), MIGRATION_HELLO_LEN, "前导帧长度是线上契约");
+        assert_eq!(&frame[..4], b"RTMG");
+        assert!(verify_migration_hello(&frame, &key, 3, Role::Controller), "合法帧必须通过");
+
+        // attempt 不符（陈旧/重放的连接）。
+        assert!(!verify_migration_hello(&frame, &key, 4, Role::Controller), "attempt 不符必须拒绝");
+        // 角色不符（两端都发同方向的前导 = 有人在冒充）。
+        assert!(!verify_migration_hello(&frame, &key, 3, Role::Controlled), "角色不符必须拒绝");
+        // 密钥不符（不持有会话 token 的第三方）。
+        let other = crate::punch::migration_hello_key("other-token");
+        assert!(!verify_migration_hello(&frame, &other, 3, Role::Controller), "密钥不符必须拒绝");
+
+        // 篡改被 MAC 覆盖的字段：即使把期望值一起改成新值也必须拒绝。
+        let mut tampered = frame;
+        tampered[6..10].copy_from_slice(&4u32.to_be_bytes());
+        assert!(
+            !verify_migration_hello(&tampered, &key, 4, Role::Controller),
+            "MAC 必须覆盖 attempt 字段"
+        );
+        let mut tampered = frame;
+        tampered[4] = 2;
+        assert!(
+            !verify_migration_hello(&tampered, &key, 3, Role::Controller),
+            "版本不符必须拒绝（且 MAC 覆盖版本）"
+        );
+
+        // 截断 / 空帧。
+        assert!(!verify_migration_hello(&frame[..MIGRATION_HELLO_LEN - 1], &key, 3, Role::Controller));
+        assert!(!verify_migration_hello(&[], &key, 3, Role::Controller));
+
+        // 对端角色：被控端发的是 role=1，控制器侧应期望它。
+        let peer = migration_hello_frame(&key, Role::Controlled, 3);
+        assert!(verify_migration_hello(&peer, &key, 3, Role::Controlled));
+        assert!(!verify_migration_hello(&peer, &key, 3, Role::Controller));
+    }
+
+    /// 假 hbbs **永不回** `PunchHoleResponse` 时，迁移必须在有界时间内失败，且**绝不**回退到
+    /// 中继（不消费 `wait_relay_push`、不发 `RequestRelay`）。
+    #[tokio::test]
+    async fn migrate_controller_without_punch_signal_fails_fast() {
+        let hbbs = FakeHbbs::start().await;
+        // 默认 `punch_response = None` → 假 hbbs 对 `PunchHoleRequest` 保持沉默。
+        let transport = hbbs.make_transport().await;
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            transport.migrate(dummy_migrate_request("222222222", Duration::from_secs(1)), Role::Controller),
+        )
+        .await
+        .expect("迁移不应拖到中继等待窗口");
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("无打洞信令时迁移必须失败，而不是回退中继");
+        assert!(matches!(err, RemoteError::Signaling(_)), "应是信令类错误，实际 {err:?}");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "必须在有界时间内失败，实测 {elapsed:?}"
+        );
+        assert!(
+            elapsed < RELAY_WAIT,
+            "绝不能等满中继窗口 RELAY_WAIT({RELAY_WAIT:?})，实测 {elapsed:?}"
+        );
+        assert!(
+            !hbbs
+                .received()
+                .iter()
+                .any(|m| matches!(m.union, Some(Union::RequestRelay(_)))),
+            "迁移失败不得发出中继请求"
         );
     }
 

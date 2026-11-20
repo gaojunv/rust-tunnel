@@ -17,11 +17,12 @@
 //!   差一个数量级，UI 需要据实展示；「回退中继」尤其不能谎报成直连，`Punch` 也**绝不能**是
 //!   「打洞失败后凑出来的」——**谎报路径等于骗用户**。
 
-use crate::error::RemoteResult;
+use crate::error::{RemoteError, RemoteResult};
 use crate::reliable::ReliableMetrics;
 use async_trait::async_trait;
 use rust_tunnel_common::protocol::RemoteParams;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 一条双向字节流（中继连接 / 直连连接 / 内存替身）。
@@ -114,6 +115,38 @@ pub struct EstablishRequest {
     pub punch_cookie: [u8; 8],
 }
 
+/// 会话内路径迁移的建立请求（**Rust 内部类型、不上线**）。
+///
+/// 与 [`EstablishRequest`] 的区别：迁移**只建立一条直连/打洞流**，绝不回退中继、绝不消费
+/// `wait_relay_push`、也绝不碰 [`crate::nat::NatCache`]——中继会话之所以在中继上，往往正是
+/// 因为初始打洞失败被记了账，拿那张表来判断会让迁移永远不尝试。
+#[derive(Debug, Clone)]
+pub struct MigrateRequest {
+    /// 会话 ID（仅日志/诊断用；迁移不重做会话握手）。
+    pub session_id: String,
+    /// 本端 RustDesk ID。
+    pub local_rd_id: String,
+    /// 对端 RustDesk ID（被控端为空）。
+    pub peer_rd_id: String,
+    /// 会合/中继参数。
+    pub params: RemoteParams,
+    /// 本次尝试的 `conn_id`（大端 8 字节；两端由会话 token + attempt 各自派生）。
+    pub punch_cookie: [u8; 8],
+    /// 本次尝试的 attempt 号。
+    ///
+    /// 打洞路径不用它（可靠层的 `conn_id` 已经把身份与本次尝试绑定）；**直连路径**用它把
+    /// 前导帧的 MAC 绑定到本次尝试，使陈旧/重放的连接无法被装进新一轮迁移。
+    pub attempt: u32,
+    /// 直连迁移前导的 HMAC 密钥 = [`crate::punch::migration_hello_key`]`(token)`（32 字节）。
+    ///
+    /// **只有 Direct（同内网 TCP）迁移路径用它**：打洞路径的新流身份由可靠层 `conn_id` 绑定，
+    /// 不需要额外的应用层证明。直连监听端口对任何能到达它的机器都是敞开的，故必须先证明
+    /// 「这条 TCP 连接来自持有会话 token 的对端」才能 `install`（详见 [`crate::punch`]）。
+    pub hello_key: [u8; 32],
+    /// 建立预算（含 hbbs 信令与打洞握手）。
+    pub timeout: Duration,
+}
+
 /// 数据面建立器。
 #[async_trait]
 pub trait TransportEstablisher: Send + Sync + 'static {
@@ -154,4 +187,30 @@ pub trait TransportEstablisher: Send + Sync + 'static {
     /// # Errors
     /// 信令失败、连接超时、参数缺失时返回 [`crate::error::RemoteError`]。
     async fn establish(&self, request: EstablishRequest, role: Role) -> RemoteResult<EstablishedStream>;
+
+    /// 本端是否支持**会话内路径迁移**（v12）。
+    ///
+    /// 默认 `false`：测试替身、以及没有打洞能力的实现无需关心。真正实现应当同时检查
+    /// `always_use_relay` 与本端 NAT 分类（对称 NAT 下迁移无望，不必白付预算）。
+    fn migration_supported(&self) -> bool {
+        false
+    }
+
+    /// 为一次会话内迁移建立一条新流。
+    ///
+    /// # 契约（比 [`Self::establish`] 更严）
+    ///
+    /// - **只走直连/打洞**：不允许回退中继，也不允许等待 `RequestRelay` 推送；
+    /// - 返回的 [`EstablishedStream::path`] 必须是 `Punch` 或 `Direct`，绝不能是 `Relay`；
+    /// - 不写 [`crate::nat::NatCache`]（迁移失败不代表「这个对端打不了洞」）。
+    ///
+    /// 默认实现直接返回 [`RemoteError::Unavailable`]。
+    ///
+    /// # Errors
+    ///
+    /// 信令失败、打洞握手超时、本端不支持时返回 [`crate::error::RemoteError`]。
+    async fn migrate(&self, request: MigrateRequest, role: Role) -> RemoteResult<EstablishedStream> {
+        let _ = (request, role);
+        Err(RemoteError::Unavailable("本端建立器不支持会话内路径迁移".to_owned()))
+    }
 }

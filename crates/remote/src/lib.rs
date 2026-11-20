@@ -66,6 +66,7 @@ pub mod file;
 pub(crate) mod input_buffer;
 pub mod latency;
 pub mod manager;
+pub(crate) mod migrate;
 pub(crate) mod nat;
 pub(crate) mod punch;
 pub mod qos;
