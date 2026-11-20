@@ -415,6 +415,29 @@ pub fn toolbar_frame(style: &egui::Style) -> egui::Frame {
         })
 }
 
+/// 会话顶部的**贴顶**工具条：与 [`toolbar_frame`] 同色同边，但上缘两角为直角、下缘圆角，
+/// 读起来像从窗口上沿垂下来的一条面板（收起态换成一枚同样贴顶的小胶囊，见
+/// [`crate::ui::widgets::pill_button`]）。
+pub fn toolbar_frame_top(style: &egui::Style) -> egui::Frame {
+    let p = palette(style);
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(egui::Stroke::new(1.0_f32, p.stroke_strong))
+        .corner_radius(egui::CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 10,
+            se: 10,
+        })
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 16,
+            spread: 0,
+            color: p.shadow,
+        })
+}
+
 /// 画面容器：场景底色，无描边（不抢视频画面的注意力）。
 pub fn scene_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::new().fill(palette(style).bg)
