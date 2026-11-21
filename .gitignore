@@ -47,3 +47,6 @@ nohup.out
 crates/wiki-serve/binaries/
 !crates/wiki-serve/binaries/.gitkeep
 !crates/wiki-serve/binaries/codex-app-server-x86_64-unknown-linux-gnu
+
+# loopback_bench 压测原始输出（本地诊断用，不入库）
+bench-results/

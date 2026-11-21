@@ -273,19 +273,108 @@ impl Stage {
 }
 
 /// 单个阶段的累计读数。
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `values` 保留这一秒的原始样本，用于算分位；关闭诊断时调用方根本不进入这里，开启后
+/// 每秒最多几十到几百个样本（60 fps × 各阶段），排序成本可忽略。
+#[derive(Debug, Clone, Default)]
 struct Sample {
-    /// 采样次数。
+    /// 采样次数（含因窗口上限而未保留原始值的样本）。
     count: u64,
     /// 累计耗时（微秒，饱和加法）。
     sum_us: u64,
     /// 单次最大值（微秒）。
     max_us: u64,
+    /// 原始样本（仅保留前 [`MAX_SAMPLES_PER_STAGE`] 个）。
+    values: Vec<u32>,
 }
 
-/// 每个阶段一份累计/最大值的滑窗（由调用方每秒取走并清空）。
+/// 单个阶段每秒最多保留多少原始样本。
 ///
-/// 固定长度数组，无分配；`record` 只做三次整数运算，关闭诊断时调用方根本不进入这里。
+/// 正常峰值是 60 fps（编码/解码/出队各一份），远低于此值。上限只防御「某个错误循环
+/// 每秒打几十万次」这类病态场景：超出后仍计数/求和/取最大，只是分位基于已保留的样本。
+const MAX_SAMPLES_PER_STAGE: usize = 8192;
+
+/// 一个阶段在某个统计窗口内的分布。
+///
+/// 分位用**微秒**给出（不是毫秒），调用方自己决定显示精度；`p99` 是判断「偶发波动」的
+/// 主读数——均值/最大值都会把一次 300 ms 的尖峰淹没或放大成孤例，p99 才看得出尾部。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageReport {
+    /// 采样次数。
+    pub count: u64,
+    /// 均值（微秒）。
+    pub mean_us: u64,
+    /// 中位数（微秒）。
+    pub p50_us: u64,
+    /// 90 分位（微秒）。
+    pub p90_us: u64,
+    /// 99 分位（微秒）。
+    pub p99_us: u64,
+    /// 最大值（微秒）。
+    pub max_us: u64,
+}
+
+/// 一次窗口汇总（由 [`LatencyWindow::take`] 产出）。
+///
+/// 保留**已排序**的原始样本，压测程序可以把多个窗口的样本拼起来算整场会话的分位；
+/// 生产日志只需要 [`Self::summary`]。
+#[derive(Debug, Clone, Default)]
+pub struct WindowReport {
+    /// 每个阶段一份。
+    stages: [StageReport; Stage::COUNT],
+    /// 每个阶段已排序的原始样本。
+    values: [Vec<u32>; Stage::COUNT],
+}
+
+impl WindowReport {
+    /// 某个阶段的分布（无样本时全零）。
+    #[must_use]
+    pub fn stage(&self, stage: Stage) -> StageReport {
+        self.stages[stage.index()]
+    }
+
+    /// 某个阶段已排序的原始样本（微秒）。
+    #[must_use]
+    pub fn samples(&self, stage: Stage) -> &[u32] {
+        &self.values[stage.index()]
+    }
+
+    /// 是否一个样本都没有。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stages.iter().all(|stage| stage.count == 0)
+    }
+
+    /// 汇总成一行紧凑文本：`cap=8.4/9.1/12.0ms`（均值/p99/最大）。
+    ///
+    /// 只输出有样本的阶段；毫秒取一位小数（整数运算，避免浮点 lint 与精度抖动）。
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut out = String::new();
+        for stage in Stage::ALL {
+            let report = self.stage(stage);
+            if report.count == 0 {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(stage.key());
+            out.push('=');
+            push_ms(&mut out, report.mean_us);
+            out.push('/');
+            push_ms(&mut out, report.p99_us);
+            out.push('/');
+            push_ms(&mut out, report.max_us);
+            out.push_str("ms");
+        }
+        out
+    }
+}
+
+/// 每个阶段一份累计值的滑窗（由调用方每秒取走）。
+///
+/// 只在延迟诊断打开时被写入；关闭后 `record` 不会被调用。
 #[derive(Debug, Clone)]
 pub struct LatencyWindow {
     /// 每个阶段一份。
@@ -295,7 +384,7 @@ pub struct LatencyWindow {
 impl Default for LatencyWindow {
     fn default() -> Self {
         Self {
-            samples: [Sample::default(); Stage::COUNT],
+            samples: std::array::from_fn(|_| Sample::default()),
         }
     }
 }
@@ -313,11 +402,14 @@ impl LatencyWindow {
         sample.count = sample.count.saturating_add(1);
         sample.sum_us = sample.sum_us.saturating_add(us);
         sample.max_us = sample.max_us.max(us);
+        if sample.values.len() < MAX_SAMPLES_PER_STAGE {
+            sample.values.push(u32::try_from(us).unwrap_or(u32::MAX));
+        }
     }
 
     /// 清空全部累计（每秒汇总之后调用）。
     pub fn clear(&mut self) {
-        self.samples = [Sample::default(); Stage::COUNT];
+        self.samples = std::array::from_fn(|_| Sample::default());
     }
 
     /// 是否一个样本都没有。
@@ -326,29 +418,50 @@ impl LatencyWindow {
         self.samples.iter().all(|sample| sample.count == 0)
     }
 
-    /// 汇总成一行紧凑文本：`cap_wait=2.1/5.0ms cap=8.4/12.0ms`（平均/最大）。
+    /// 取走并清空本窗口，算出每个阶段的分布。
     ///
-    /// 只输出有样本的阶段；毫秒取一位小数（整数运算，避免浮点 lint 与精度抖动）。
+    /// 排序在这里做（每秒一次），不在热路径上。
+    #[must_use]
+    pub fn take(&mut self) -> WindowReport {
+        let stages = std::array::from_fn(|index| {
+            let sample = &mut self.samples[index];
+            if sample.count == 0 {
+                return StageReport::default();
+            }
+            sample.values.sort_unstable();
+            StageReport {
+                count: sample.count,
+                mean_us: sample.sum_us / sample.count,
+                p50_us: percentile(&sample.values, 50),
+                p90_us: percentile(&sample.values, 90),
+                p99_us: percentile(&sample.values, 99),
+                max_us: sample.max_us.max(u64::from(sample.values.last().copied().unwrap_or(0))),
+            }
+        });
+        let values = std::array::from_fn(|index| std::mem::take(&mut self.samples[index].values));
+        self.clear();
+        WindowReport { stages, values }
+    }
+
+    /// 只汇总、不清空（单测/调试用）。
     #[must_use]
     pub fn summary(&self) -> String {
-        let mut out = String::new();
-        for stage in Stage::ALL {
-            let sample = &self.samples[stage.index()];
-            if sample.count == 0 {
-                continue;
-            }
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(stage.key());
-            out.push('=');
-            push_ms(&mut out, sample.sum_us / sample.count);
-            out.push('/');
-            push_ms(&mut out, sample.max_us);
-            out.push_str("ms");
-        }
-        out
+        let mut clone = self.clone();
+        clone.take().summary()
     }
+}
+
+/// 取 `sorted` 的 `percent` 分位（0..=100；空切片返回 0）。
+///
+/// 用最近秩（nearest-rank），对 30 个样本的 p99 就是最大值——这正是我们想要的语义：
+/// **尾部指标不能被平均掉**。
+fn percentile(sorted: &[u32], percent: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let last = sorted.len() - 1;
+    let index = last.saturating_mul(percent).div_ceil(100);
+    u64::from(sorted[index.min(last)])
 }
 
 /// 往 `out` 追加「毫秒，一位小数」（整数运算，截断而非四舍五入）。
@@ -359,6 +472,46 @@ fn push_ms(out: &mut String, us: u64) {
     let _ = write!(out, "{whole}.{tenth}");
 }
 
+/// 会话的哪一侧在产生读数（只用于区分同一个进程里的两条会话循环）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// 被控端（采集 → 编码 → 写出）。
+    Controlled,
+    /// 控制器（收包 → 解码 → 上屏）。
+    Controller,
+}
+
+impl Side {
+    /// 短键名（日志/压测报告用）。
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Controlled => "controlled",
+            Self::Controller => "controller",
+        }
+    }
+}
+
+/// 进程内观察者：每次窗口汇总时收到一份结构化报告。
+///
+/// 生产路径不安装它（零开销）；`examples/loopback_bench.rs` 用它把整场会话的分阶段
+/// 样本聚合成 p50/p95/p99，而不必解析日志文本。
+pub trait Observer: Send + Sync {
+    /// 收到某一侧的窗口汇总。
+    fn on_window(&self, side: Side, report: &WindowReport);
+}
+
+/// 全局观察者（`None` = 未安装）。
+static OBSERVER: std::sync::RwLock<Option<std::sync::Arc<dyn Observer>>> =
+    std::sync::RwLock::new(None);
+
+/// 安装/卸载进程内观察者（压测程序用；生产路径保持未安装）。
+pub fn set_observer(observer: Option<std::sync::Arc<dyn Observer>>) {
+    *OBSERVER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+}
+
 /// 在共享窗口里记一次采样（中毒时恢复内部数据：本模块不 panic，中毒只可能来自外部）。
 pub fn record(window: &Mutex<LatencyWindow>, stage: Stage, us: u64) {
     window
@@ -367,17 +520,27 @@ pub fn record(window: &Mutex<LatencyWindow>, stage: Stage, us: u64) {
         .record(stage, us);
 }
 
-/// 取出并清空共享窗口的一份汇总；窗口为空（这一秒没有任何画面）时返回 `None`。
-pub fn take_summary(window: &Mutex<LatencyWindow>) -> Option<String> {
-    let mut guard = window
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.is_empty() {
-        return None;
+/// 取出并清空共享窗口的一份报告；窗口为空（这一秒没有任何画面）时返回 `None`。
+///
+/// 同时把报告交给已安装的 [`Observer`]（在窗口锁之外调用，观察者可以安全地再取别的锁）。
+pub fn take_report(window: &Mutex<LatencyWindow>, side: Side) -> Option<WindowReport> {
+    let report = {
+        let mut guard = window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_empty() {
+            return None;
+        }
+        guard.take()
+    };
+    let observer = OBSERVER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(observer) = observer {
+        observer.on_window(side, &report);
     }
-    let summary = guard.summary();
-    guard.clear();
-    Some(summary)
+    Some(report)
 }
 
 #[cfg(test)]
@@ -400,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn window_aggregates_average_and_max() {
+    fn window_aggregates_average_p99_and_max() {
         let mut window = LatencyWindow::new();
         assert!(window.is_empty());
         assert_eq!(window.summary(), "");
@@ -410,12 +573,42 @@ mod tests {
         assert!(!window.is_empty());
         assert_eq!(
             window.summary(),
-            "cap=2.0/3.0ms enc=12.0/12.0ms",
-            "平均/最大 + 一位毫秒小数"
+            "cap=2.0/3.0/3.0ms enc=12.0/12.0/12.0ms",
+            "均值/p99/最大 + 一位毫秒小数"
         );
         window.clear();
         assert!(window.is_empty());
         assert_eq!(window.summary(), "");
+    }
+
+    #[test]
+    fn percentiles_expose_the_tail() {
+        let mut window = LatencyWindow::new();
+        // 99 个 1 ms + 1 个 500 ms：均值被稀释到 ~6 ms，但 p99 必须看到尾部。
+        for _ in 0..99 {
+            window.record(Stage::Decode, 1_000);
+        }
+        window.record(Stage::Decode, 500_000);
+        let report = window.take();
+        let decode = report.stage(Stage::Decode);
+        assert_eq!(decode.count, 100);
+        assert_eq!(decode.p50_us, 1_000);
+        assert_eq!(decode.p99_us, 500_000, "p99 必须落在尾部样本上");
+        assert_eq!(decode.max_us, 500_000);
+        assert_eq!(report.samples(Stage::Decode).len(), 100);
+        // 报告保留数据，被取走的窗口才应清空（`take_clears_the_window` 也锁这一点）。
+        assert!(!report.is_empty(), "报告本身必须保留样本");
+        assert!(window.is_empty(), "take 之后窗口应清空");
+    }
+
+    #[test]
+    fn take_clears_the_window() {
+        let mut window = LatencyWindow::new();
+        window.record(Stage::Write, 2_000);
+        let report = window.take();
+        assert_eq!(report.stage(Stage::Write).p50_us, 2_000);
+        assert!(window.is_empty());
+        assert!(window.take().is_empty());
     }
 
     #[test]

@@ -7,8 +7,15 @@
 //!
 //! # 与真机的差异（**必须知道**）
 //!
-//! - 传输用一对 `tokio::io::duplex` + 每方向固定延迟（`--delay-ms`，默认 8 ms，即 RTT≈16 ms），
-//!   **不是** RustDesk UDP 打洞可靠层：没有丢包/乱序/重传，也**没有带宽上限**。
+//! - 传输是一条**字节流**链路（`tokio::io::duplex` + 中间的调度管道），不是 RustDesk UDP
+//!   打洞的可靠层。链路可以注入**单向固定延迟**（`--delay-ms`，默认 8 ms，即 RTT≈16 ms）、
+//!   **随机抖动**（`--jitter-ms`）、**周期性停顿**（`--stall-ms`/`--stall-every-ms`）与
+//!   **单向带宽上限**（`--bandwidth-kbps`），三者都按 **8 KiB 字节块**注入（块再小会让
+//!   调度开销盖过模型本身，再大则失去串行化粒度）。
+//! - 仍然**没有丢包与乱序**：字节流的顺序天然保持，链路模型也只做排队（截止时间单调），
+//!   不重排。丢包/重传/拥塞窗口是可靠层（`crates/remote/src/reliable.rs`）的职责，那条
+//!   路径由单测的虚拟时钟覆盖（`start_paused` + 内存链路替身），不在本压测里。
+//!   因此本压测看到的是「**链路有延迟/抖动/停顿/带宽上限，但没有丢包**」这一类抖动源。
 //! - 两端在**同一进程**、同一个 `clock::now_us()` 时钟起点上，故端到端延迟可以直接
 //!   `now_us - capture_ts_us`，不需要跨端时钟偏差估计（真机两者都有误差）。
 //! - 不注入真实输入（`NullInputSink`）、不做文件传输、没有服务端控制通道与会合服务器。
@@ -17,11 +24,31 @@
 //!   加密 / 编解码协商 / 补丁模式 / QoS 闭环全部是真代码**，跳过的只有 `RemoteManager`
 //!   到传输建立那一层（信令、中继、打洞）。
 //!
-//! # 负载
+//! # 负载（`--scenario`）
 //!
-//! 主显示器上创建 1280×720 置顶窗口，用 GDI 以 30 Hz 重绘「滚动文字 + 移动色块」。
-//! 窗口必须真的可见（DXGI 采的是合成后的桌面）。除此之外桌面应保持静止，否则其它窗口的
-//! 动画会混进指标。
+//! 主显示器上创建 1280×720 置顶窗口，用 GDI 以 30 Hz 重绘。四种植入的负载：
+//!
+//! - `steady`：滚动文字 + 移动色块（持续运动，原有行为）。
+//! - `idle`：静态画面，只有一个 8×16 的小方块每 500 ms 换色（压保活 + 补丁模式）。
+//! - `burst`：其余时间静止，每 2 秒整屏切换一次图案（压关键帧/大帧尖峰与恢复）。
+//!   `--switch-ms N` 把切换周期改成 N 毫秒（≥1 tick），用来复现「快速切换应用」：
+//!   整屏重绘密集到关键帧/补丁模式来不及收敛时，链路最容易出现冻结。
+//! - `mixed`：以 10 秒为周期循环 5 s steady → 3 s idle → 2 s burst（综合）。
+//!
+//! 窗口必须真的可见（DXGI/WGC 采的都是合成后的桌面）。除此之外桌面应保持静止，否则其它
+//! 窗口的动画会混进指标；跑测时也不要动鼠标键盘。
+//!
+//! # 高压旋钮
+//!
+//! - `--hz N`（默认 30）：窗口重绘频率（1..=120），与 `--fps`（引擎采集/编码上限）分开。
+//! - `--fullscreen`：客户区铺满目标显示器（4K 下约 3840×2160，无边框置顶）。
+//! - `--native`：`native_resolution = true`，编码宽度放宽到 3840（否则默认 1920）。
+//! - `--switch-ms N`：`burst` 的整屏切换周期（毫秒；0 = 缺省 2 秒）。500 就是「每秒
+//!   整屏翻两次」，用来压快速应用切换。
+//!
+//! 3D 绘制由 GDI 完成，4K@120 下**painter 本身可能才是瓶颈**。汇总里的「窗口重绘实测」
+//! 与「显示器刷新」就是用来区分「负载/显示器上限」与「管线上限」：前者达不到 `--hz` 时，
+//! 那一场的读数不是该刷新率的有效数据。
 //!
 //! # 跑法
 //!
@@ -29,7 +56,14 @@
 //! export PATH="/c/msys64/mingw64/bin:$PATH"
 //! cargo build -p rust-tunnel-remote --example loopback_bench --target x86_64-pc-windows-gnu
 //! ./target/x86_64-pc-windows-gnu/debug/examples/loopback_bench.exe --seconds 60 --delay-ms 8
+//! ./target/x86_64-pc-windows-gnu/debug/examples/loopback_bench.exe --capture wgc \
+//!     --seconds 30 --scenario mixed --stall-ms 300 --stall-every-ms 5000
 //! ```
+//!
+//! 收尾汇总里有两张**分阶段**表（被控端 `cap_wait/cap/enc_q/enc/out_q/send_q/write`，
+//! 控制器 `recv_q/dec/e2e`），由 `latency::Observer` 直接聚合引擎窗口报告得到，不需要解析
+//! 日志文本。`inject` / `input_to_*` / `input_q` / `present` 在本压测里没有样本：它不注入真实
+//! 输入（`NullInputSink`），也没有 GUI 上屏与重绘调度。
 //!
 //! # 采集后端（`--capture`）
 //!
@@ -74,7 +108,7 @@ mod bench {
     use std::collections::HashMap;
     use std::io;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
@@ -89,6 +123,7 @@ mod bench {
         run_controlled, ControlledConfig, NullInputSink, CAPTURE_WATCHDOG, UNCHANGED_RESEND_INTERVAL,
     };
     use rust_tunnel_remote::controller::{run_controller, ControllerConfig};
+    use rust_tunnel_remote::latency::{self, Observer, Side, Stage, WindowReport};
     use rust_tunnel_remote::screen::{
         CaptureInfo, CapturedPatches, DecodedFrame, DecodedPatch, DecoderInfo, DisplayInfo,
         EncoderInfo, EncodeOptions, FrameSink, GpuFrame, RawFrame, ScreenPatch, ScreenSource,
@@ -118,9 +153,9 @@ mod bench {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-        DeleteObject, EndPaint, FillRect, GetStockObject, InvalidateRect, SelectObject, SetBkMode,
-        SetTextColor, TextOutW, UpdateWindow, DEFAULT_GUI_FONT, HBRUSH, HBITMAP, HDC, HGDIOBJ,
-        PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+        DeleteObject, EndPaint, EnumDisplaySettingsW, FillRect, GetStockObject, InvalidateRect,
+        SelectObject, SetBkMode, SetTextColor, TextOutW, UpdateWindow, DEFAULT_GUI_FONT, DEVMODEW,
+        ENUM_CURRENT_SETTINGS, HBRUSH, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::{
@@ -130,20 +165,23 @@ mod bench {
         AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetClientRect, LoadCursorW, MSG, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
         SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_OWNDC, IDC_ARROW, PM_REMOVE,
-        WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_QUIT, WNDCLASSW,
-        WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_QUIT, WNDCLASSW, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW, WS_POPUP,
     };
 
     /// 压测窗口的客户区尺寸（题目要求 1280×720）。
     const WINDOW_W: i32 = 1280;
     /// 压测窗口的客户区高度。
     const WINDOW_H: i32 = 720;
-    /// 负载动画节拍（Hz）。
+    /// 负载动画的**默认**节拍（Hz）；实际值由 `--hz` 在运行期覆盖。
     const ANIMATION_HZ: u64 = 30;
     /// 链路单方向缓冲（每个 `duplex` 端点）。
     const LINK_BUF: usize = 1024 * 1024;
-    /// 延迟管道每次搬运的块大小。
-    const PIPE_CHUNK: usize = 64 * 1024;
+    /// 链路管道每次搬运的块大小。
+    ///
+    /// 带宽上限按块串行化，块越大突发越粗：64 KiB 在 10 Mbps 上是 52 ms 的整块突发，
+    /// 会把「带宽」变成「方波」。8 KiB 在 10 Mbps 上是 6.6 ms 的粒度，足够细。
+    const PIPE_CHUNK: usize = 8 * 1024;
     /// 延迟管道的队列深度（块数）：满了就回压到写端，模拟链路背压。
     const PIPE_QUEUE: usize = 256;
     /// 预热时最多尝试几次 DXGI 首帧（每次内部等 `FIRST_FRAME_TIMEOUT` = 2 s）。
@@ -169,20 +207,140 @@ mod bench {
         Wgc,
     }
 
+    /// 负载场景（窗口线程按它决定每帧画什么）。
+    ///
+    /// 压测的价值不在「一直满速运动」——那条路径早就优化过了。真正要压的是**变化模式切换**：
+    /// 静止 → 拖动 → 整屏重绘，各阶段的队列与关键帧策略在这些边界上最容易暴露尖峰。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Scenario {
+        /// 持续运动（原有行为：滚动文字 + 移动色块）。
+        Steady,
+        /// 基本静止，只有一个小光标闪烁（压保活/补丁模式）。
+        Idle,
+        /// 静止为主，每 2 秒整屏切换一次（压关键帧/大帧尖峰与恢复）。
+        Burst,
+        /// 5s 运动 → 3s 静止 → 2s 整屏切换循环（综合场景）。
+        Mixed,
+    }
+
+    impl Scenario {
+        /// 命令行取值 → 枚举。
+        fn parse(raw: &str) -> Self {
+            match raw {
+                "steady" => Self::Steady,
+                "idle" => Self::Idle,
+                "burst" => Self::Burst,
+                "mixed" => Self::Mixed,
+                other => panic!("--scenario 只接受 steady / idle / burst / mixed，实得 {other}"),
+            }
+        }
+
+        /// 稳定下标（写进全局原子）。
+        fn index(self) -> u8 {
+            match self {
+                Self::Steady => 0,
+                Self::Idle => 1,
+                Self::Burst => 2,
+                Self::Mixed => 3,
+            }
+        }
+
+        /// 由下标还原。
+        fn from_index(raw: u8) -> Self {
+            match raw {
+                1 => Self::Idle,
+                2 => Self::Burst,
+                3 => Self::Mixed,
+                _ => Self::Steady,
+            }
+        }
+
+        /// 面向输出的名称。
+        fn key(self) -> &'static str {
+            match self {
+                Self::Steady => "steady",
+                Self::Idle => "idle",
+                Self::Burst => "burst",
+                Self::Mixed => "mixed",
+            }
+        }
+    }
+
+    /// 窗口线程读取的场景（全局，避免把状态穿过 Win32 消息）。
+    static SCENARIO: AtomicU8 = AtomicU8::new(0);
+
+    /// 运行期窗口重绘频率（`--hz`，1..=120；窗口线程与绘制函数都读它）。
+    static ANIMATION_HZ_RUNTIME: AtomicU64 = AtomicU64::new(ANIMATION_HZ);
+
+    /// 当前重绘频率（已钳到合法区间）。
+    fn animation_hz() -> u64 {
+        ANIMATION_HZ_RUNTIME.load(Ordering::Relaxed).clamp(1, 120)
+    }
+
+    /// `burst` 的整屏切换周期（tick 数；0 = 用缺省的 2 秒）。
+    static SWITCH_PERIOD_TICKS: AtomicU64 = AtomicU64::new(0);
+
+    /// `--switch-ms` → tick 数（至少 1 tick；0 = 不覆盖，原样返回 0）。
+    ///
+    /// 换算用**运行期** `--hz`，所以 `--switch-ms` 与 `--hz` 的顺序无关——两者都只在
+    /// [`run`] 里写、窗口线程只读。
+    fn switch_period_ticks(switch_ms: u64) -> u64 {
+        if switch_ms == 0 {
+            return 0;
+        }
+        switch_ms
+            .saturating_mul(animation_hz())
+            .div_ceil(1000)
+            .max(1)
+    }
+
+    /// 缺省的整屏切换周期（2 秒；`mixed` 的 burst 相位固定用它，不受 `--switch-ms` 影响）。
+    fn default_burst_period_ticks() -> u64 {
+        (animation_hz() * 2).max(1)
+    }
+
+    /// `burst` 场景实际使用的整屏切换周期：`--switch-ms` 覆盖时用它，否则 2 秒。
+    fn burst_period_ticks() -> u64 {
+        let ticks = SWITCH_PERIOD_TICKS.load(Ordering::Relaxed);
+        if ticks > 0 {
+            ticks
+        } else {
+            default_burst_period_ticks()
+        }
+    }
+
     /// 命令行参数。
     struct Args {
         /// 会话持续秒数。
         seconds: u64,
         /// 每方向固定延迟（毫秒）。
         delay_ms: u64,
+        /// 每方向额外随机抖动上限（毫秒；0 = 关闭）。
+        jitter_ms: u64,
+        /// 周期性链路停顿长度（毫秒；0 = 关闭）。
+        stall_ms: u64,
+        /// 链路停顿周期（毫秒；与 `stall_ms` 配合）。
+        stall_every_ms: u64,
+        /// 单向带宽上限（kbps；0 = 不限）。
+        bandwidth_kbps: u32,
+        /// 负载场景。
+        scenario: Scenario,
         /// 编码目标码率（kbps）。
         bitrate_kbps: u32,
         /// 编码/采集帧率上限。
         fps: u8,
+        /// 窗口重绘频率（Hz；1..=120）。
+        hz: u64,
+        /// 编码宽度放宽到显示器原生分辨率（3840，压 4K 编码）。
+        native: bool,
+        /// 负载窗口客户区铺满目标显示器（4K 下约 3840×2160）。
+        fullscreen: bool,
         /// 采集后端。
         capture: CaptureMode,
         /// 采集/建窗的目标显示器序号（`None` = 主显示器）。
         display: Option<u32>,
+        /// `burst` 场景的整屏切换周期（毫秒；0 = 缺省 2 秒）。
+        switch_ms: u64,
         /// 是否安装 tracing 订阅器（默认关；排查丢帧原因时配合
         /// `RUST_TUNNEL_LATENCY_LOG=1` 打开，引擎会打 `controller_drop reason=...`）。
         log: bool,
@@ -193,16 +351,25 @@ mod bench {
             Self {
                 seconds: 30,
                 delay_ms: 8,
+                jitter_ms: 0,
+                stall_ms: 0,
+                stall_every_ms: 0,
+                bandwidth_kbps: 0,
+                scenario: Scenario::Steady,
                 bitrate_kbps: 10_000,
                 fps: 30,
+                hz: ANIMATION_HZ,
+                native: false,
+                fullscreen: false,
                 capture: CaptureMode::Dxgi,
                 display: None,
+                switch_ms: 0,
                 log: false,
             }
         }
     }
 
-    /// 解析 `--seconds N --delay-ms N --bitrate-kbps N --fps N --capture dxgi|wgc --display N`。
+    /// 解析命令行参数。
     fn parse_args() -> Args {
         let mut args = Args::default();
         let mut rest = std::env::args().skip(1);
@@ -216,10 +383,24 @@ mod bench {
             match flag.as_str() {
                 "--seconds" => args.seconds = next_number().max(1),
                 "--delay-ms" => args.delay_ms = next_number(),
+                "--jitter-ms" => args.jitter_ms = next_number(),
+                "--stall-ms" => args.stall_ms = next_number(),
+                "--stall-every-ms" => args.stall_every_ms = next_number(),
+                "--bandwidth-kbps" => {
+                    args.bandwidth_kbps = u32::try_from(next_number()).unwrap_or(0);
+                }
+                "--scenario" => {
+                    let value = rest.next().unwrap_or_else(|| panic!("{flag} 缺少取值"));
+                    args.scenario = Scenario::parse(&value);
+                }
                 "--bitrate-kbps" => {
                     args.bitrate_kbps = u32::try_from(next_number()).unwrap_or(10_000);
                 }
                 "--fps" => args.fps = u8::try_from(next_number().clamp(1, 120)).unwrap_or(30),
+                "--hz" => args.hz = next_number().clamp(1, 120),
+                "--switch-ms" => args.switch_ms = next_number(),
+                "--native" => args.native = true,
+                "--fullscreen" => args.fullscreen = true,
                 "--display" => {
                     args.display = Some(u32::try_from(next_number()).unwrap_or(0));
                 }
@@ -234,7 +415,10 @@ mod bench {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "loopback_bench [--seconds N] [--delay-ms N] [--bitrate-kbps N] [--fps N] \
+                        "loopback_bench [--seconds N] [--delay-ms N] [--jitter-ms N] \
+                         [--stall-ms N --stall-every-ms N] [--bandwidth-kbps N] \
+                         [--scenario steady|idle|burst|mixed] [--switch-ms N] [--bitrate-kbps N] [--fps N] \
+                         [--hz N] [--native] [--fullscreen] \
                          [--capture dxgi|wgc] [--display N] [--log]"
                     );
                     std::process::exit(0);
@@ -244,6 +428,12 @@ mod bench {
                     std::process::exit(2);
                 }
             }
+        }
+        // 停顿必须「有间隔、且间隔大于停顿本身」，否则链路永远醒不过来。
+        if args.stall_ms > 0
+            && (args.stall_every_ms == 0 || args.stall_every_ms <= args.stall_ms)
+        {
+            panic!("--stall-ms 需要 --stall-every-ms 且周期必须大于停顿长度");
         }
         args
     }
@@ -257,6 +447,17 @@ mod bench {
             rust_tunnel_common::logging::init_logging_with_level("info");
         }
         print_build_banner(&args);
+        // 分阶段延迟：打开汇总模式（`enabled()` 为真，引擎才会采阶段样本），并安装观察者把
+        // 每秒的窗口报告聚合进本进程。没装 tracing 订阅器时引擎打的 latency 日志行会被直接
+        // 丢弃，不会刷屏（`--log` 时才会真的打印）。
+        latency::set_mode(latency::Mode::Summary);
+        let stages = Arc::new(StageCollector::default());
+        latency::set_observer(Some(stages.clone()));
+        // 窗口线程读这里决定每帧画什么、以多快的节奏重绘；必须在建窗之前写好。
+        SCENARIO.store(args.scenario.index(), Ordering::Relaxed);
+        ANIMATION_HZ_RUNTIME.store(args.hz, Ordering::Relaxed);
+        // `--switch-ms` 在这里一次性换算成 tick（窗口线程只读原子，不做毫秒换算）。
+        SWITCH_PERIOD_TICKS.store(switch_period_ticks(args.switch_ms), Ordering::Relaxed);
         // DPI 感知必须在建窗与枚举显示器之前声明，否则 150% 缩放的 4K 屏会被报成 2560×1440。
         // SAFETY: 无指针参数；失败只意味着已设置过，沿用当前感知级别。
         unsafe {
@@ -293,17 +494,36 @@ mod bench {
             i32::try_from(requested.width).unwrap_or(1920),
             i32::try_from(requested.height).unwrap_or(1080),
         );
+        let (client_w, client_h) = if args.fullscreen {
+            (window_area.2, window_area.3)
+        } else {
+            (WINDOW_W, WINDOW_H)
+        };
+        let monitor_hz = monitor_refresh_hz(&display.name);
         println!(
-            "显示器: #{} {} {}x{}{} · 窗口 {}x{} @ {} Hz",
+            "显示器: #{} {} {}x{}{} · 显示器刷新 {} Hz · 窗口 {}x{} @ {} Hz{}",
             display.id,
             display.name,
             display.width,
             display.height,
             if display.primary { " (主)" } else { "" },
-            WINDOW_W,
-            WINDOW_H,
-            ANIMATION_HZ
+            if monitor_hz == 0 {
+                "未知".to_owned()
+            } else {
+                format!("{monitor_hz}")
+            },
+            client_w,
+            client_h,
+            args.hz,
+            if args.fullscreen { "（全屏无边框）" } else { "" },
         );
+        if monitor_hz != 0 && args.hz > u64::from(monitor_hz) {
+            println!(
+                "⚠ --hz {} 高于显示器刷新 {monitor_hz} Hz：重绘节拍会被合成器/显示器截断，\
+                 本场测到的不是 {} Hz 数据",
+                args.hz, args.hz
+            );
+        }
         println!(
             "采集后端: {}{}",
             match args.capture {
@@ -320,8 +540,8 @@ mod bench {
         // 硬编/硬解先探测：缺失就直接失败——不能悄悄换成 VP9/软件编码，那会丢掉「模式一致」。
         probe_codecs();
 
-        let mut window =
-            spawn_window(window_area).unwrap_or_else(|err| panic!("创建负载窗口失败: {err}"));
+        let mut window = spawn_window(window_area, args.fullscreen)
+            .unwrap_or_else(|err| panic!("创建负载窗口失败: {err}"));
         // 让动画先真的跑起来：DXGI Desktop Duplication 的首帧依赖桌面发生过更新，
         // 静止桌面下 `AcquireNextFrame` 会一直超时（本机实测）。
         std::thread::sleep(WINDOW_SETTLE);
@@ -335,14 +555,22 @@ mod bench {
             .enable_all()
             .build()
             .expect("创建 tokio 运行时");
-        let summary = runtime.block_on(run_session(&args, &display));
+        // 实际重绘速率：与窗口线程共用同一个计数器，只取会话期间的增量。
+        let ticks_before = ANIMATION_TICKS.load(Ordering::Relaxed);
+        let summary = runtime.block_on(run_session(&args, &display, &stages));
+        let ticks_after = ANIMATION_TICKS.load(Ordering::Relaxed);
+        latency::set_observer(None);
 
         window.stop();
         unsafe {
             let _ = windows_sys::Win32::Media::timeEndPeriod(1);
         }
         match summary {
-            Ok(accumulator) => print_summary(&args, &display, &accumulator),
+            Ok(mut accumulator) => {
+                accumulator.repaint_ticks = ticks_after.saturating_sub(ticks_before);
+                accumulator.monitor_hz = monitor_hz;
+                print_summary(&args, &display, &accumulator);
+            }
             Err(err) => {
                 eprintln!("压测失败: {err}");
                 std::process::exit(1);
@@ -374,16 +602,33 @@ mod bench {
             env!("CARGO_PKG_VERSION"),
         );
         println!(
-            "参数: seconds={} delay={}ms(单向, RTT≈{}ms) bitrate={}kbps fps={} capture={:?} display={}",
+            "参数: seconds={} delay={}ms(单向, RTT≈{}ms) jitter={}ms \
+             stall={}ms/{}ms 带宽={} scenario={} bitrate={}kbps fps={} hz={} native={} \
+             fullscreen={} capture={:?} display={}",
             args.seconds,
             args.delay_ms,
             args.delay_ms.saturating_mul(2),
+            args.jitter_ms,
+            args.stall_ms,
+            args.stall_every_ms,
+            if args.bandwidth_kbps == 0 {
+                "不限".to_owned()
+            } else {
+                format!("{}kbps", args.bandwidth_kbps)
+            },
+            args.scenario.key(),
             args.bitrate_kbps,
             args.fps,
+            args.hz,
+            args.native,
+            args.fullscreen,
             args.capture,
             args.display.map_or_else(|| "primary".to_owned(), |id| id.to_string()),
         );
-        println!("本机回环：无丢包/乱序/带宽上限，e2e 用同进程时钟直减（详见文件头注释）");
+        println!(
+            "本机回环：字节流链路（无丢包/乱序；抖动与停顿按字节块注入），\
+             e2e 用同进程时钟直减（详见文件头注释）"
+        );
     }
 
     /// 在专用线程里探测硬件 MFT 编码器与 MF H.264 解码器（COM 套间只初始化在那条一次性线程）。
@@ -412,6 +657,67 @@ mod bench {
 
     // ─────────────────────────── 指标容器 ───────────────────────────
 
+    /// 停顿结束后多久之内出帧才算「恢复」（`stall_recovery_ms` 的取样窗口）。
+    const STALL_RECOVERY_WINDOW: Duration = Duration::from_secs(2);
+
+    /// 两侧各阶段累计的原始样本（微秒）。
+    struct StageSamples {
+        /// 被控端阶段样本。
+        controlled: [Vec<u32>; Stage::COUNT],
+        /// 控制器阶段样本。
+        controller: [Vec<u32>; Stage::COUNT],
+    }
+
+    impl Default for StageSamples {
+        fn default() -> Self {
+            Self {
+                controlled: std::array::from_fn(|_| Vec::new()),
+                controller: std::array::from_fn(|_| Vec::new()),
+            }
+        }
+    }
+
+    impl StageSamples {
+        /// 取某一侧的样本数组。
+        fn side(&self, side: Side) -> &[Vec<u32>; Stage::COUNT] {
+            match side {
+                Side::Controlled => &self.controlled,
+                Side::Controller => &self.controller,
+            }
+        }
+    }
+
+    /// [`latency::Observer`] 实现：把每个窗口报告的原始样本按侧、按阶段累积起来。
+    ///
+    /// 引擎每秒最多产出几百个样本（30 fps × 各阶段），30 秒也就几万个 `u32`；
+    /// 整场会话的分位因此直接基于**全量样本**算，不需要近似直方图。
+    #[derive(Default)]
+    struct StageCollector {
+        /// 累积样本（`take` 时整体取走）。
+        samples: Mutex<StageSamples>,
+    }
+
+    impl StageCollector {
+        /// 取走全部已累积的样本。
+        fn take(&self) -> StageSamples {
+            let mut guard = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        }
+    }
+
+    impl Observer for StageCollector {
+        fn on_window(&self, side: Side, report: &WindowReport) {
+            let mut guard = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+            let target = match side {
+                Side::Controlled => &mut guard.controlled,
+                Side::Controller => &mut guard.controller,
+            };
+            for stage in Stage::ALL {
+                target[stage.index()].extend_from_slice(report.samples(stage));
+            }
+        }
+    }
+
     /// 会一直增长到被取走的样本直方图（单位由调用方约定）。
     #[derive(Debug, Default)]
     struct Histogram {
@@ -438,6 +744,8 @@ mod bench {
     /// 控制器侧自采指标（sink + 解码适配器共同写入）。
     #[derive(Debug, Default)]
     struct CtrlMetrics {
+        /// 链路模型（只用来判断「停顿刚刚结束」，不参与任何调度）。
+        link: LinkProfile,
         /// 解出并交给 sink 的帧数。
         frames: AtomicU64,
         /// 收到的补丁批数。
@@ -468,6 +776,10 @@ mod bench {
         e2e_second: Histogram,
         /// 本秒的解码样本。
         decode_second: Histogram,
+        /// 「链路停顿结束后多久重新出帧」（毫秒；每场停顿只记第一帧）。
+        stall_recovery_ms: Histogram,
+        /// 上一次已记录的停顿结束时刻（同一场停顿不重复取样）。
+        last_stall_end: Mutex<Option<Instant>>,
     }
 
     impl CtrlMetrics {
@@ -488,6 +800,30 @@ mod bench {
                 }
                 self.max_gap_us.fetch_max(gap, Ordering::Relaxed);
             }
+            self.record_stall_recovery();
+        }
+
+        /// 如果最近 [`STALL_RECOVERY_WINDOW`] 内有过一次链路停顿刚结束，记下「恢复出帧」耗时。
+        ///
+        /// 每场停顿只记**第一帧**（否则恢复窗口内 30 fps 会灌进 60 个重复样本，
+        /// 把分布压向「恢复很快」的假象）。
+        fn record_stall_recovery(&self) {
+            let now = Instant::now();
+            let Some(end) = self.link.recent_stall_end(now, STALL_RECOVERY_WINDOW) else {
+                return;
+            };
+            let mut last = self
+                .last_stall_end
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if last.is_some_and(|previous| previous == end) {
+                return;
+            }
+            *last = Some(end);
+            drop(last);
+            let as_millis = now.saturating_duration_since(end).as_millis();
+            self.stall_recovery_ms
+                .record(u32::try_from(as_millis).unwrap_or(u32::MAX));
         }
 
         /// 记一帧解码（毫秒）与 DXVA 回读分段。
@@ -1431,16 +1767,140 @@ mod bench {
         }
     }
 
-    /// 建立带固定单向延迟的双向链路。
-    fn delayed_link(delay: Duration) -> LinkEnds {
-        // 控制器 → 被控端：控制器写 ctrl_write，管道从 peer 端读、延迟后写进 c2s_write。
+    /// 链路模型：固定延迟 + 随机抖动 + 周期性停顿 + 单向带宽上限。
+    ///
+    /// 全部用**字节块**注入，顺序严格保持（`last_due` 单调）——它模拟的是一条会把包排队的
+    /// 链路，而不是会重排/丢包的 UDP。丢包与重传是可靠层（`crates/remote/src/reliable.rs`）
+    /// 的职责，那条路径由单测的虚拟时钟覆盖，不在本压测里。
+    #[derive(Debug, Clone, Copy)]
+    struct LinkProfile {
+        /// 单向基础延迟。
+        base_delay: Duration,
+        /// 每个字节块额外叠加的 `[0, jitter]` 随机延迟。
+        jitter: Duration,
+        /// 停顿周期（`ZERO` = 关闭）。
+        stall_every: Duration,
+        /// 每次停顿时长。
+        stall_len: Duration,
+        /// 单向带宽（bit/s；0 = 不限）。
+        rate_bps: u64,
+        /// 链路起点（停顿窗口的相位基准，两侧共用）。
+        start: std::time::Instant,
+    }
+
+    impl Default for LinkProfile {
+        fn default() -> Self {
+            Self {
+                base_delay: Duration::ZERO,
+                jitter: Duration::ZERO,
+                stall_every: Duration::ZERO,
+                stall_len: Duration::ZERO,
+                rate_bps: 0,
+                start: std::time::Instant::now(),
+            }
+        }
+    }
+
+    impl LinkProfile {
+        /// 由命令行参数构造（`start` 为此刻）。
+        fn from_args(args: &Args) -> Self {
+            Self {
+                base_delay: Duration::from_millis(args.delay_ms),
+                jitter: Duration::from_millis(args.jitter_ms),
+                stall_every: Duration::from_millis(args.stall_every_ms),
+                stall_len: Duration::from_millis(args.stall_ms),
+                rate_bps: u64::from(args.bandwidth_kbps).saturating_mul(1000),
+                start: std::time::Instant::now(),
+            }
+        }
+
+        /// 如果 `at` 落在某个停顿窗口内，返回该窗口的结束时刻。
+        fn stall_end_after(&self, at: std::time::Instant) -> Option<std::time::Instant> {
+            if self.stall_every.is_zero() || self.stall_len.is_zero() {
+                return None;
+            }
+            let elapsed = at.saturating_duration_since(self.start);
+            let every_us = self.stall_every.as_micros().max(1);
+            let index = elapsed.as_micros() / every_us;
+            let window_start = self.start + self.stall_every * u32::try_from(index).unwrap_or(u32::MAX);
+            let window_end = window_start + self.stall_len;
+            (at < window_end).then_some(window_end)
+        }
+
+        /// 最近一次已经结束的停顿（`now - end <= window` 时返回结束时刻）。
+        ///
+        /// 用于测量「停顿结束后多久恢复出帧」：被控端/控制器都不需要知道链路的注入细节。
+        fn recent_stall_end(
+            &self,
+            now: std::time::Instant,
+            window: Duration,
+        ) -> Option<std::time::Instant> {
+            if self.stall_every.is_zero() || self.stall_len.is_zero() {
+                return None;
+            }
+            let elapsed = now.saturating_duration_since(self.start);
+            let every_us = self.stall_every.as_micros().max(1);
+            let index = elapsed.as_micros() / every_us;
+            let window_start = self.start + self.stall_every * u32::try_from(index).unwrap_or(u32::MAX);
+            let end = window_start + self.stall_len;
+            (now >= end && now.duration_since(end) <= window).then_some(end)
+        }
+
+        /// 一个字节块在链路上的串行化时长。
+        fn serialization(&self, bytes: usize) -> Duration {
+            if self.rate_bps == 0 {
+                return Duration::ZERO;
+            }
+            Duration::from_secs_f64(bytes as f64 * 8.0 / self.rate_bps as f64)
+        }
+    }
+
+    /// 单方向的排队状态（顺序保持 + 速率串行化）。
+    struct PipeSchedule {
+        /// 上一块的最早送达时刻（保证单调）。
+        last_due: std::time::Instant,
+        /// 链路空闲时刻（带宽上限用）。
+        rate_free: std::time::Instant,
+        /// 确定性伪随机（xorshift64），避免给压测再引一个 RNG 依赖。
+        rng: u64,
+    }
+
+    impl PipeSchedule {
+        /// 计算本块的送达时刻，并推进内部状态。
+        fn schedule(&mut self, profile: &LinkProfile, bytes: usize) -> std::time::Instant {
+            let now = std::time::Instant::now();
+            let jitter = if profile.jitter.is_zero() {
+                Duration::ZERO
+            } else {
+                self.rng ^= self.rng << 13;
+                self.rng ^= self.rng >> 7;
+                self.rng ^= self.rng << 17;
+                let span = u64::try_from(profile.jitter.as_micros()).unwrap_or(u64::MAX).max(1);
+                Duration::from_micros(self.rng % span)
+            };
+            let mut due = (now + profile.base_delay + jitter).max(self.last_due);
+            if profile.rate_bps > 0 {
+                self.rate_free = self.rate_free.max(due) + profile.serialization(bytes);
+                due = self.rate_free;
+            }
+            if let Some(end) = profile.stall_end_after(due) {
+                due = due.max(end);
+            }
+            self.last_due = due;
+            due
+        }
+    }
+
+    /// 建立带延迟/抖动/停顿/带宽上限的双向链路。
+    fn emulated_link(profile: LinkProfile) -> LinkEnds {
+        // 控制器 → 被控端：控制器写 ctrl_write，管道从 peer 端读、按模型调度后写进 c2s_write。
         let (ctrl_write, ctrl_pipe_read) = tokio::io::duplex(LINK_BUF);
         let (c2s_write, ctld_read) = tokio::io::duplex(LINK_BUF);
-        spawn_delay_pipe(ctrl_pipe_read, c2s_write, delay);
+        spawn_link_pipe(ctrl_pipe_read, c2s_write, profile, 0x9e37_79b9_7f4a_7c15);
         // 被控端 → 控制器：同上，反向。
         let (ctld_write, ctld_pipe_read) = tokio::io::duplex(LINK_BUF);
         let (s2c_write, ctrl_read) = tokio::io::duplex(LINK_BUF);
-        spawn_delay_pipe(ctld_pipe_read, s2c_write, delay);
+        spawn_link_pipe(ctld_pipe_read, s2c_write, profile, 0x2545_f491_4f6c_dd1d);
 
         let video_write = Arc::new(WriteStats::default());
         LinkEnds {
@@ -1456,19 +1916,29 @@ mod bench {
         }
     }
 
-    /// 延迟管道：读 → 带截止时间的队列 → 睡到截止时间 → 写对端。
+    /// 链路管道：读 → 按模型算出截止时间 → 睡到截止时间 → 写对端。
     ///
     /// 队列有界，对端不读时背压会一路传回写端；所有块的截止时间按入队顺序单调递增，
     /// 因此顺序天然保持（不需要重排缓冲）。
-    fn spawn_delay_pipe(mut from: DuplexStream, mut to: DuplexStream, delay: Duration) {
-        let (tx, mut rx) = mpsc::channel::<(tokio::time::Instant, Vec<u8>)>(PIPE_QUEUE);
+    fn spawn_link_pipe(
+        mut from: DuplexStream,
+        mut to: DuplexStream,
+        profile: LinkProfile,
+        seed: u64,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<(std::time::Instant, Vec<u8>)>(PIPE_QUEUE);
         tokio::spawn(async move {
             let mut buf = vec![0u8; PIPE_CHUNK];
+            let mut schedule = PipeSchedule {
+                last_due: std::time::Instant::now(),
+                rate_free: std::time::Instant::now(),
+                rng: seed,
+            };
             loop {
                 match from.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
-                        let deadline = tokio::time::Instant::now() + delay;
+                        let deadline = schedule.schedule(&profile, read);
                         if tx.send((deadline, buf[..read].to_vec())).await.is_err() {
                             break;
                         }
@@ -1478,7 +1948,7 @@ mod bench {
         });
         tokio::spawn(async move {
             while let Some((deadline, data)) = rx.recv().await {
-                tokio::time::sleep_until(deadline).await;
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
                 if to.write_all(&data).await.is_err() {
                     break;
                 }
@@ -1662,6 +2132,12 @@ mod bench {
         encode: Vec<u32>,
         /// 链路写阻塞样本（微秒）。
         write_stall_us: Vec<u32>,
+        /// 停顿结束 → 重新出帧的样本（毫秒）。
+        stall_recovery_ms: Vec<u32>,
+        /// 心跳 RTT 样本（毫秒，控制器口径，逐个保存用于分位/尾部）。
+        rtt: Vec<u32>,
+        /// 两侧各阶段样本（由 [`StageCollector`] 聚合）。
+        stages: StageSamples,
         /// 帧间隔 ≥500 ms 的次数。
         gaps_ge_500: u64,
         /// 帧间隔 ≥100 ms 的次数。
@@ -1684,6 +2160,10 @@ mod bench {
         closed: Option<String>,
         /// 会话任务提前结束的原因。
         session_errors: Vec<String>,
+        /// 会话期间窗口线程实际重绘次数（`ANIMATION_TICKS` 增量）。
+        repaint_ticks: u64,
+        /// 目标显示器当前刷新率（Hz；0 = 读不到）。
+        monitor_hz: u32,
     }
 
     /// 计算分位（`percent` 为 0..=100，样本必须已排序）。
@@ -1710,6 +2190,64 @@ mod bench {
             return 0;
         }
         u32::try_from(host.patch_seconds.saturating_mul(100) / host.host_seconds).unwrap_or(0)
+    }
+
+    /// 微秒 → 毫秒文本（两位小数）。
+    fn ms2(us: u32) -> String {
+        format!("{:.2}", f64::from(us) / 1000.0)
+    }
+
+    /// 被控端侧的阶段表顺序（只列本压测真的会产出样本的阶段）。
+    const CONTROLLED_STAGES: [Stage; 7] = [
+        Stage::CaptureWait,
+        Stage::Capture,
+        Stage::EncodeQueue,
+        Stage::Encode,
+        Stage::OutQueue,
+        Stage::SendQueue,
+        Stage::Write,
+    ];
+
+    /// 控制器侧的阶段表顺序。
+    const CONTROLLER_STAGES: [Stage; 3] = [Stage::RecvQueue, Stage::Decode, Stage::CaptureToDecode];
+
+    /// 打印一侧的分阶段表（只列有样本的阶段，顺序由 `order` 决定）。
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "样本数远小于 u32::MAX；格式化为文本，截断无意义"
+    )]
+    fn print_stage_table(title: &str, samples: &[Vec<u32>; Stage::COUNT], order: &[Stage]) {
+        let rows: Vec<(Stage, Vec<u32>)> = order
+            .iter()
+            .filter_map(|stage| {
+                let mut values = samples[stage.index()].clone();
+                if values.is_empty() {
+                    return None;
+                }
+                values.sort_unstable();
+                Some((*stage, values))
+            })
+            .collect();
+        if rows.is_empty() {
+            println!("\n{title}: 无样本");
+            return;
+        }
+        println!("\n{title}");
+        println!(
+            "{:<12}{:>7}{:>9}{:>9}{:>9}{:>9}",
+            "阶段", "n", "p50", "p95", "p99", "max"
+        );
+        for (stage, values) in &rows {
+            println!(
+                "{:<12}{:>7}{:>9}{:>9}{:>9}{:>9}",
+                stage.key(),
+                values.len(),
+                ms2(percentile(values, 50)),
+                ms2(percentile(values, 95)),
+                ms2(percentile(values, 99)),
+                ms2(values.last().copied().unwrap_or(0)),
+            );
+        }
     }
 
     /// 每秒一行 + 收尾后返回累积结果。
@@ -1804,10 +2342,12 @@ mod bench {
                 previous_stall_us = stall_us;
                 previous_keyframe_requests = keyframe_requests;
 
+                let rtt_max = accumulator.rtt.iter().copied().max().unwrap_or(0);
                 println!(
                     "[{:>4}s] ctrl 帧 {delta_frames}/s e2e p50 {} p95 {} p99 {} max {} ms | \
                      dec p50 {} p95 {} max {} ms | 停顿 {} 收包 {delta_packets} 丢 {delta_dropped} \
-                     补丁 {delta_patches} 关键帧请求 {delta_keyframe_requests} 积压 {} | ctld 编码 {} fps enc {:.1} ms \
+                     补丁 {delta_patches} 关键帧请求 {delta_keyframe_requests} 积压 {} 心跳 {} / max {} ms \
+                     | ctld 编码 {} fps enc {:.1} ms \
                      cap {:.1} ms {}/{} kbps 补丁 {}% IDR {} 张 {} KB | 写阻塞 {:.1} ms/s(max {:.1})",
                     accumulator.seconds,
                     percentile(&e2e_sorted, 50),
@@ -1819,6 +2359,8 @@ mod bench {
                     decode_sorted.last().copied().unwrap_or(0),
                     decode_sorted.iter().filter(|value| **value >= 100).count(),
                     accumulator.controller.backlog,
+                    accumulator.controller.rtt_ms,
+                    rtt_max,
                     accumulator.host.fps,
                     mean(&encode_sorted),
                     f64::from(accumulator.host.capture_us) / 1000.0,
@@ -1849,6 +2391,7 @@ mod bench {
             accumulator.capture_to_encode = ctrl_metrics.capture_to_encode_ms.take();
             accumulator.encode_to_sink = ctrl_metrics.encode_to_sink_ms.take();
             accumulator.write_stall_us = video_write.stall_samples.take();
+            accumulator.stall_recovery_ms = ctrl_metrics.stall_recovery_ms.take();
             accumulator.gaps_ge_500 = ctrl_metrics.gaps_ge_500.load(Ordering::Relaxed);
             accumulator.gaps_ge_100 = ctrl_metrics.gaps_ge_100.load(Ordering::Relaxed);
             accumulator.max_gap_us = ctrl_metrics.max_gap_us.load(Ordering::Relaxed);
@@ -1912,8 +2455,9 @@ mod bench {
                 }
                 SessionStats::Codec { codec } => accumulator.controller.codec = Some(*codec),
                 SessionStats::Rtt(rtt) => {
-                    accumulator.controller.rtt_ms =
-                        u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
+                    let rtt_ms = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
+                    accumulator.controller.rtt_ms = rtt_ms;
+                    accumulator.rtt.push(rtt_ms);
                 }
                 _ => {}
             }
@@ -1926,10 +2470,16 @@ mod bench {
     // ─────────────────────────── 会话编排 ───────────────────────────
 
     /// 跑完整条回路。
-    async fn run_session(args: &Args, display: &DisplayInfo) -> Result<Accumulator, String> {
+    async fn run_session(
+        args: &Args,
+        display: &DisplayInfo,
+        stages: &Arc<StageCollector>,
+    ) -> Result<Accumulator, String> {
         let screen = Arc::new(BenchScreen::new(args.capture));
         screen.warmup(display.id)?;
-        let mut link = delayed_link(Duration::from_millis(args.delay_ms));
+        // 链路相位从会话即将开始处起算（预热可能花几秒，早算会让停顿窗口对不上）。
+        let profile = LinkProfile::from_args(args);
+        let mut link = emulated_link(profile);
         let plan = plan_controller_handshake(SESSION_ID, TOKEN, "111111111")
             .map_err(|err| format!("构造控制器握手失败: {err}"))?;
         // 真实链路里 `Hello` 由建立方在 `RequestRelay` 之后流水线写出；这里没有中继帧，
@@ -1951,7 +2501,10 @@ mod bench {
             RemoteMode::Control,
         ));
 
-        let ctrl_metrics = Arc::new(CtrlMetrics::default());
+        let ctrl_metrics = Arc::new(CtrlMetrics {
+            link: profile,
+            ..Default::default()
+        });
         let ctld_metrics = Arc::new(CtldMetrics::default());
         let (ctrl_stats_tx, ctrl_stats_rx) = mpsc::unbounded_channel();
         let (ctld_stats_tx, ctld_stats_rx) = mpsc::unbounded_channel();
@@ -2003,7 +2556,7 @@ mod bench {
                     scale: 1.0,
                     max_fps: args.fps,
                 },
-                native_resolution: false,
+                native_resolution: args.native,
                 capture_watchdog: CAPTURE_WATCHDOG,
                 unchanged_resend: UNCHANGED_RESEND_INTERVAL,
                 stats: SessionStatsReporter::new(ctld_stats_tx),
@@ -2037,19 +2590,29 @@ mod bench {
         tokio::pin!(deadline);
         let mut session_errors = Vec::new();
         println!("会话开始（{} 秒）…", args.seconds);
+        // 谁先结束要记住：`select!` 里被 poll 完的那个 `JoinHandle` 已经完成，收尾时再
+        // `timeout(.., &mut handle)` 会 panic（"JoinHandle polled after completion"）。
+        let mut controller_finished = false;
+        let mut host_finished = false;
         tokio::select! {
             () = &mut deadline => println!("到点，取消会话"),
             result = &mut controller_join => {
+                controller_finished = true;
                 session_errors.push(format!("控制器提前结束: {result:?}"));
             }
             result = &mut host_join => {
+                host_finished = true;
                 session_errors.push(format!("被控端提前结束: {result:?}"));
             }
         }
         cancel.cancel();
-        // 两个任务都应在取消后很快收尾；给 10 秒兜底。
-        let _ = tokio::time::timeout(Duration::from_secs(10), &mut controller_join).await;
-        let _ = tokio::time::timeout(Duration::from_secs(10), &mut host_join).await;
+        // 只等还没完成的那一侧；两个任务都应在取消后很快收尾，给 10 秒兜底。
+        if !controller_finished {
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut controller_join).await;
+        }
+        if !host_finished {
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut host_join).await;
+        }
         let closed = sink
             .closed
             .lock()
@@ -2060,6 +2623,8 @@ mod bench {
             .map_err(|err| format!("打印机任务失败: {err}"))?;
         accumulator.closed = closed;
         accumulator.session_errors = session_errors;
+        // 引擎任务都已收尾，观察者不会再有新窗口；整场样本在这里取走。
+        accumulator.stages = stages.take();
         drop(cmd_tx);
         Ok(accumulator)
     }
@@ -2084,6 +2649,10 @@ mod bench {
         capture_to_encode.sort_unstable();
         let mut encode_to_sink = accumulator.encode_to_sink.clone();
         encode_to_sink.sort_unstable();
+        let mut stall_recovery = accumulator.stall_recovery_ms.clone();
+        stall_recovery.sort_unstable();
+        let mut rtt = accumulator.rtt.clone();
+        rtt.sort_unstable();
 
         let seconds = accumulator.seconds.max(1);
         let frames = u64::try_from(accumulator.e2e.len()).unwrap_or(0);
@@ -2108,6 +2677,48 @@ mod bench {
             display.id, display.width, display.height, args.delay_ms
         );
         println!(
+            "链路: 单向延迟 {} ms + 抖动 ≤{} ms · 停顿 {} ms / 每 {} ms · 单向带宽 {} · 场景 {} \
+             · 采集 {}",
+            args.delay_ms,
+            args.jitter_ms,
+            args.stall_ms,
+            args.stall_every_ms,
+            if args.bandwidth_kbps == 0 {
+                "不限".to_owned()
+            } else {
+                format!("{}kbps", args.bandwidth_kbps)
+            },
+            args.scenario.key(),
+            match args.capture {
+                CaptureMode::Dxgi => "DXGI",
+                CaptureMode::Wgc => "WGC（CPU 回读，补丁关闭）",
+            },
+        );
+        // 负载侧的两个读数：窗口线程的**实际**重绘速率 + 显示器**当前模式**的刷新率。
+        // 两者都不代表管线能力，只是用来判断「这一场的上限到底卡在哪」。
+        let repaint_hz = accumulator.repaint_ticks as f64 / seconds as f64;
+        let monitor_target = if accumulator.monitor_hz == 0 {
+            args.hz
+        } else {
+            args.hz.min(u64::from(accumulator.monitor_hz))
+        };
+        println!(
+            "负载: 窗口重绘实测 {repaint_hz:.1} Hz（目标 {} Hz）· 显示器刷新 {} · {}",
+            args.hz,
+            if accumulator.monitor_hz == 0 {
+                "未知".to_owned()
+            } else {
+                format!("{} Hz", accumulator.monitor_hz)
+            },
+            if repaint_hz < monitor_target as f64 * 0.9 {
+                "⚠ 重绘达不到目标：本场数字受 GDI 绘制/窗口线程上限约束，不是管线能力"
+            } else if monitor_target < args.hz {
+                "⚠ 显示器不足 --hz：本场不是该刷新率的有效数据"
+            } else {
+                "重绘未受限"
+            },
+        );
+        println!(
             "控制器: 解出帧 {frames}（{:.1} fps）· 收包 {} · 丢包 {}（{drop_rate:.1}%）· 补丁批 {}",
             frames as f64 / seconds as f64,
             controller.packets,
@@ -2128,6 +2739,14 @@ mod bench {
             accumulator.gaps_ge_100,
             accumulator.gaps_ge_500,
             accumulator.max_gap_us as f64 / 1000.0,
+        );
+        let rtt_over_300 = accumulator.rtt.iter().filter(|value| **value >= 300).count();
+        println!(
+            "心跳 RTT(ms): p50 {} p95 {} max {} · ≥300ms {rtt_over_300} 次 ({} 样本)",
+            percentile(&rtt, 50),
+            percentile(&rtt, 95),
+            rtt.last().copied().unwrap_or(0),
+            rtt.len(),
         );
         println!(
             "解码(ms): p50 {} p95 {} max {} · 停顿(≥100ms) {decode_stalls} 次（{stalls_per_30s:.2} 次/30s）\
@@ -2186,6 +2805,17 @@ mod bench {
             f64::from(percentile(&write_stall, 95)) / 1000.0,
             f64::from(write_stall.last().copied().unwrap_or(0)) / 1000.0,
         );
+        if stall_recovery.is_empty() {
+            println!("停顿恢复: 本场没有注入停顿（--stall-ms 0）");
+        } else {
+            println!(
+                "停顿恢复（链路停顿结束 → 重新出帧）: {} 场 · p50 {} ms · p95 {} ms · max {} ms",
+                stall_recovery.len(),
+                percentile(&stall_recovery, 50),
+                percentile(&stall_recovery, 95),
+                stall_recovery.last().copied().unwrap_or(0),
+            );
+        }
         if let Some(reason) = &accumulator.closed {
             println!("会话关闭: {reason}");
         }
@@ -2232,6 +2862,24 @@ mod bench {
             gate(encode_fps >= 25.0),
             gate(f64::from(percentile(&write_stall, 95)) / 1000.0 < 50.0),
             f64::from(percentile(&write_stall, 95)) / 1000.0,
+        );
+
+        // ── 分阶段延迟（全量样本，来自 latency::Observer） ──
+        // `input_*` / `inject` / `input_q` / `present` 在本压测里没有样本（无真实输入、无 GUI 上屏），
+        // 故不列在表里，也不强凑 0。
+        print_stage_table(
+            "分阶段（被控端，ms）",
+            accumulator.stages.side(Side::Controlled),
+            &CONTROLLED_STAGES,
+        );
+        print_stage_table(
+            "分阶段（控制器，ms）",
+            accumulator.stages.side(Side::Controller),
+            &CONTROLLER_STAGES,
+        );
+        println!(
+            "注: p99 是尾部主读数；`e2e` 控制器侧 = 采集完成 → 解码完成（同进程时钟直减）。\
+             停顿/抖动/带宽都按 8 KiB 块注入，无丢包与重排。"
         );
     }
 
@@ -2306,6 +2954,24 @@ mod bench {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// 目标显示器当前模式的刷新率（Hz；读不到时返回 0）。
+    ///
+    /// 用 `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` 的 `dmDisplayFrequency`：它读的是
+    /// **系统当前模式**，而不是窗口的重绘节拍——两者混在一起就分不清「painter 达不到 120」
+    /// 与「面板本来就是 60 Hz」。
+    fn monitor_refresh_hz(device_name: &str) -> u32 {
+        let name = wide(device_name);
+        // SAFETY: DEVMODEW 是 POD，先清零再写 dmSize；设备名是 NUL 结尾的 UTF-16。
+        let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+        mode.dmSize = u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0);
+        let ok = unsafe { EnumDisplaySettingsW(name.as_ptr(), ENUM_CURRENT_SETTINGS, &raw mut mode) };
+        if ok == 0 {
+            0
+        } else {
+            mode.dmDisplayFrequency
+        }
+    }
+
     /// 颜色（`COLORREF` 是 `0x00BBGGRR`）。
     fn rgb(red: u8, green: u8, blue: u8) -> u32 {
         u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16)
@@ -2323,13 +2989,14 @@ mod bench {
         "00112233445566778899 AABBCCDDEEFF",
     ];
 
-    /// 创建负载窗口（30 Hz 重绘）并返回句柄。`area` = 目标显示器的 `(left, top, width, height)`。
-    fn spawn_window(area: (i32, i32, i32, i32)) -> Result<BenchWindow, String> {
+    /// 创建负载窗口（默认 30 Hz 重绘）并返回句柄。`area` = 目标显示器的
+    /// `(left, top, width, height)`；`fullscreen` 时客户区铺满该显示器（无边框置顶）。
+    fn spawn_window(area: (i32, i32, i32, i32), fullscreen: bool) -> Result<BenchWindow, String> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         let thread = std::thread::Builder::new()
             .name("bench-window".to_owned())
             .spawn(move || {
-                if let Err(err) = window_thread(&tx, area) {
+                if let Err(err) = window_thread(&tx, area, fullscreen) {
                     eprintln!("窗口线程失败: {err}");
                 }
             })
@@ -2343,10 +3010,11 @@ mod bench {
         })
     }
 
-    /// 窗口线程：注册类、建窗、30 Hz 消息循环。
+    /// 窗口线程：注册类、建窗、按 `--hz` 的消息循环。
     fn window_thread(
         tx: &std::sync::mpsc::Sender<Result<usize, String>>,
         area: (i32, i32, i32, i32),
+        fullscreen: bool,
     ) -> Result<(), String> {
         let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
         // 类名必须活到进程结束（系统会保留指向它的引用）。
@@ -2373,34 +3041,44 @@ mod bench {
                 io::Error::last_os_error()
             ));
         }
-        // 客户区 1280×720 → 外层窗口尺寸。
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: WINDOW_W,
-            bottom: WINDOW_H,
-        };
-        // SAFETY: rect 合法；样式与建窗时一致。
-        unsafe {
-            let _ = AdjustWindowRect(&raw mut rect, WS_OVERLAPPEDWINDOW, 0);
-        }
-        let outer_w = rect.right - rect.left;
-        let outer_h = rect.bottom - rect.top;
-        // 放在目标显示器中央（目标由 `--display` 选定，默认主显示器）。
+        // 客户区 1280×720 → 外层窗口尺寸；`--fullscreen` 时无边框铺满目标显示器
+        // （客户区 == 显示器区域，4K 下约 3840×2160）。
         let (left, top, area_w, area_h) = area;
-        let x = left + (area_w - outer_w) / 2;
-        let y = top + (area_h - outer_h) / 2;
+        let (style, x, y, window_w, window_h) = if fullscreen {
+            (WS_POPUP, left, top, area_w, area_h)
+        } else {
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: WINDOW_W,
+                bottom: WINDOW_H,
+            };
+            // SAFETY: rect 合法；样式与建窗时一致。
+            unsafe {
+                let _ = AdjustWindowRect(&raw mut rect, WS_OVERLAPPEDWINDOW, 0);
+            }
+            let outer_w = rect.right - rect.left;
+            let outer_h = rect.bottom - rect.top;
+            // 放在目标显示器中央（目标由 `--display` 选定，默认主显示器）。
+            (
+                WS_OVERLAPPEDWINDOW,
+                left + (area_w - outer_w) / 2,
+                top + (area_h - outer_h) / 2,
+                outer_w,
+                outer_h,
+            )
+        };
         // SAFETY: 类已注册；参数都是本进程持有的有效句柄/指针。
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST,
                 class_name.as_ptr(),
                 window_title.as_ptr(),
-                WS_OVERLAPPEDWINDOW,
+                style,
                 x,
                 y,
-                outer_w,
-                outer_h,
+                window_w,
+                window_h,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinstance,
@@ -2421,7 +3099,7 @@ mod bench {
         }
         let _ = tx.send(Ok(hwnd as usize));
 
-        let frame_time = Duration::from_millis(1000 / ANIMATION_HZ);
+        let frame_time = Duration::from_secs_f64(1.0 / animation_hz() as f64);
         let mut next_frame = Instant::now();
         loop {
             // 处理所有待处理消息。
@@ -2464,7 +3142,23 @@ mod bench {
         }
     }
 
-    /// 绘制一帧负载：滚动文字 + 移动色块 + 计数。
+    /// 在内存 DC 上画一行文字（`color` 是 `COLORREF`）。
+    fn text_out(dc: HDC, x: i32, y: i32, text: &str, color: u32) {
+        let text = wide(text);
+        // SAFETY: dc 由 `WindowState` 持有；text 是 NUL 结尾的本栈缓冲区。
+        unsafe {
+            SetTextColor(dc, color);
+            TextOutW(
+                dc,
+                x,
+                y,
+                text.as_ptr(),
+                i32::try_from(text.len().saturating_sub(1)).unwrap_or(0),
+            );
+        }
+    }
+
+    /// 绘制一帧负载：按 `--scenario` 分派，统一从内存位图 BitBlt 到窗口。
     fn paint(hwnd: HWND) {
         let mut paint_struct = PAINTSTRUCT::default();
         // SAFETY: hwnd 有效；paint_struct 是栈上的合法结构。
@@ -2479,67 +3173,41 @@ mod bench {
                 let height = state.height;
                 let tick = state.tick;
                 let dc = state.back_dc;
-                let clamp = |value: u64, limit: i32| -> i32 {
-                    i32::try_from(value % u64::try_from(limit.max(1)).unwrap_or(1)).unwrap_or(0)
+                let background = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
                 };
                 // SAFETY: dc 是本对象持有的内存 DC；GDI 句柄都来自本对象。
                 unsafe {
-                    let background = RECT {
-                        left: 0,
-                        top: 0,
-                        right: width,
-                        bottom: height,
-                    };
                     FillRect(dc, &raw const background, state.background);
                     SelectObject(dc, state.font);
                     SetBkMode(dc, TRANSPARENT.cast_signed());
-                    // 滚动文字：每条以不同相位向上滚，铺满整个高度。
-                    let scroll = clamp(tick * 5, height + 80);
-                    for (index, line) in TEXT_LINES.iter().enumerate() {
-                        let offset = clamp(u64::try_from(index * 90).unwrap_or(0), height + 80);
-                        let y = (scroll + offset) % (height + 80) - 80;
-                        let text = wide(&format!("{line}  #{tick}"));
-                        SetTextColor(
-                            dc,
-                            rgb(
-                                200,
-                                u8::try_from(120 + index * 15).unwrap_or(200),
-                                u8::try_from(255 - index * 12).unwrap_or(120),
-                            ),
-                        );
-                        TextOutW(
-                            dc,
-                            24,
-                            y,
-                            text.as_ptr(),
-                            i32::try_from(text.len().saturating_sub(1)).unwrap_or(0),
-                        );
+                }
+                match Scenario::from_index(SCENARIO.load(Ordering::Relaxed)) {
+                    Scenario::Steady => paint_steady(state, dc, width, height, tick),
+                    Scenario::Idle => paint_idle(state, dc, width, height, tick),
+                    Scenario::Burst => {
+                        paint_burst(state, dc, width, height, tick, burst_period_ticks());
                     }
-                    // 移动色块。
-                    let block_w = 220;
-                    let block_h = 160;
-                    let bx = clamp(tick * 17, width - block_w);
-                    let by = 60 + clamp(tick * 9, height - 240);
-                    let rect = RECT {
-                        left: bx,
-                        top: by,
-                        right: bx + block_w,
-                        bottom: by + block_h,
-                    };
-                    let brush = state.blocks[usize::try_from(tick % 3).unwrap_or(0)];
-                    FillRect(dc, &raw const rect, brush);
-                    // 右下角的帧计数（保证每帧都有像素变化）。
-                    SetTextColor(dc, rgb(255, 255, 255));
-                    let counter = wide(&format!("FRAME {tick}  {ANIMATION_HZ} Hz"));
-                    TextOutW(
-                        dc,
-                        width - 260,
-                        height - 40,
-                        counter.as_ptr(),
-                        i32::try_from(counter.len().saturating_sub(1)).unwrap_or(0),
-                    );
+                    // 10 秒周期：5 s 运动 → 3 s 静止 → 2 s 整屏切换。
+                    Scenario::Mixed => match (tick / animation_hz()) % 10 {
+                        0..=4 => paint_steady(state, dc, width, height, tick),
+                        5..=7 => paint_idle(state, dc, width, height, tick),
+                        _ => paint_burst(
+                            state,
+                            dc,
+                            width,
+                            height,
+                            tick,
+                            default_burst_period_ticks(),
+                        ),
+                    },
+                }
+                // SAFETY: 两个 DC 都有效；把整块内存位图拷到窗口。
+                unsafe {
                     SelectObject(dc, state.old_font);
-                    // SAFETY: 两个 DC 都有效；把整块内存位图拷到窗口。
                     BitBlt(target, 0, 0, width, height, dc, 0, 0, SRCCOPY);
                 }
             }
@@ -2547,6 +3215,120 @@ mod bench {
         // SAFETY: 与 BeginPaint 配对。
         unsafe {
             EndPaint(hwnd, &raw const paint_struct);
+        }
+    }
+
+    /// `steady`：滚动文字 + 移动色块 + 帧计数（原有行为）。
+    fn paint_steady(state: &WindowState, dc: HDC, width: i32, height: i32, tick: u64) {
+        let clamp = |value: u64, limit: i32| -> i32 {
+            i32::try_from(value % u64::try_from(limit.max(1)).unwrap_or(1)).unwrap_or(0)
+        };
+        // SAFETY: dc 与所有 GDI 句柄都由 `WindowState` 持有（`text_out` 同理）。
+        unsafe {
+            // 滚动文字：每条以不同相位向上滚，铺满整个高度。
+            let scroll = clamp(tick * 5, height + 80);
+            for (index, line) in TEXT_LINES.iter().enumerate() {
+                let offset = clamp(u64::try_from(index * 90).unwrap_or(0), height + 80);
+                let y = (scroll + offset) % (height + 80) - 80;
+                text_out(
+                    dc,
+                    24,
+                    y,
+                    &format!("{line}  #{tick}"),
+                    rgb(
+                        200,
+                        u8::try_from(120 + index * 15).unwrap_or(200),
+                        u8::try_from(255 - index * 12).unwrap_or(120),
+                    ),
+                );
+            }
+            // 移动色块。
+            let block_w = 220;
+            let block_h = 160;
+            let bx = clamp(tick * 17, width - block_w);
+            let by = 60 + clamp(tick * 9, height - 240);
+            let rect = RECT {
+                left: bx,
+                top: by,
+                right: bx + block_w,
+                bottom: by + block_h,
+            };
+            let brush = state.blocks[usize::try_from(tick % 3).unwrap_or(0)];
+            FillRect(dc, &raw const rect, brush);
+            // 右下角的帧计数（保证每帧都有像素变化）。
+            text_out(
+                dc,
+                width - 260,
+                height - 40,
+                &format!("FRAME {tick}  {} Hz", animation_hz()),
+                rgb(255, 255, 255),
+            );
+        }
+    }
+
+    /// `idle`：静态画面 + 一个 8×16 小方块每 500 ms 换色（30 Hz 下每 15 tick）。
+    ///
+    /// 文字里**不带** tick——整屏除了那个小方块之外必须逐像素相同，否则压不出
+    /// 「静止保活 / 补丁模式」的目标。
+    fn paint_idle(state: &WindowState, dc: HDC, width: i32, height: i32, tick: u64) {
+        let half_second = (animation_hz() / 2).max(1);
+        let bright = (tick / half_second).is_multiple_of(2);
+        // SAFETY: dc 与所有 GDI 句柄都由 `WindowState` 持有。
+        unsafe {
+            let brush = if bright {
+                state.blocks[1]
+            } else {
+                state.blocks[0]
+            };
+            let dot = RECT {
+                left: width / 2,
+                top: height / 2,
+                right: width / 2 + 8,
+                bottom: height / 2 + 16,
+            };
+            FillRect(dc, &raw const dot, brush);
+        }
+        text_out(dc, 40, 60, TEXT_LINES[0], rgb(205, 215, 235));
+        text_out(dc, 40, 100, TEXT_LINES[3], rgb(150, 170, 200));
+        text_out(dc, 40, height - 60, "IDLE · 8x16 dot flips every 500 ms", rgb(120, 140, 170));
+    }
+
+    /// `burst`：其余时间静止，每 `period` tick 整屏切换一次两种明显不同的图案。
+    ///
+    /// 切换 tick 上的整屏重绘会触发大帧（通常是 IDR）；其余 tick 逐像素相同。
+    /// `period` 缺省是 2 秒的 tick 数，`--switch-ms` 可把它压到几百毫秒（快速切应用）。
+    fn paint_burst(
+        state: &WindowState,
+        dc: HDC,
+        width: i32,
+        height: i32,
+        tick: u64,
+        period: u64,
+    ) {
+        let first = (tick / period.max(1)).is_multiple_of(2);
+        // SAFETY: dc 与所有 GDI 句柄都由 `WindowState` 持有。
+        unsafe {
+            let full = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            let brush = if first {
+                state.blocks[2]
+            } else {
+                state.blocks[0]
+            };
+            FillRect(dc, &raw const full, brush);
+        }
+        if first {
+            text_out(dc, 40, 40, TEXT_LINES[0], rgb(16, 16, 16));
+            text_out(dc, 40, height / 2, TEXT_LINES[1], rgb(255, 255, 255));
+            text_out(dc, 40, height - 80, TEXT_LINES[4], rgb(240, 240, 240));
+        } else {
+            text_out(dc, width - 460, 60, TEXT_LINES[2], rgb(0, 0, 0));
+            text_out(dc, width / 3, height / 3, TEXT_LINES[5], rgb(255, 250, 210));
+            text_out(dc, 80, height - 100, TEXT_LINES[6], rgb(20, 20, 20));
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "rust-tunnel-win-video"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Windows 远程控制数据面：NVENC H.264 4:2:0 硬件编码 + WGC/DXGI 采集"
 license = "MIT OR Apache-2.0"

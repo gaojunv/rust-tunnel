@@ -27,6 +27,17 @@
 //! 不强制 IDR；MFT 不支持时返回明确错误，不假装成功。**码率控制默认用峰值受限 VBR
 //! 而不是 CBR**：Intel QSV 的 CBR 会给静止画面插填充把码流灌到目标码率（实测
 //! 1080p@30fps、目标 8 Mbps 时静止帧仍是 ~21.6 KB/帧），远程桌面一静止就白占链路。
+//!
+//! # 无限 GOP（不周期插 IDR）
+//!
+//! 初始化时把 `CODECAPI_AVEncMPVGOPSize` 设成 `0xFFFFFFFF`（并在输出类型上声明
+//! `MF_MT_MAX_KEYFRAME_SPACING` 兜底），见 [`configure_gop`]。QSV MFT 的默认 GOP 是 ~120 帧
+//! （本机实测 82–128 帧一张 IDR，与墙钟无关），1080p 单张 ~500 KB、**4K 单张 3–4 MB**；
+//! 引擎本身已按需发 IDR（首帧 / `RequestKeyframe` / 切显示器·画质 / 几何变化）+ 10 s 周期
+//! 兜底，NVENC 侧还有 intra refresh。留着默认 GOP 只会给「网络稳定」的会话平添每 2–5 秒一次
+//! 的 3–4 MB 尖峰（压测实测 IDR 占出码 30–32%）。显式强制关键帧（`AVEncVideoForceKeyFrame`）
+//! 与首个 IDR 不受影响。属性支持度按尽力而为处理：设不进去只记 `debug`，绝不因此让编码器
+//! 创建失败。
 
 mod bitstream;
 // 纯 RGBA→NV12 转换：补丁模式（`capture::patches`）复用它，故对 crate 内可见。
@@ -58,7 +69,7 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncH265VProfile_Main_420_8, CODECAPI_AVEncCommonBufferSize,
     CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncVideoMaxQP,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoMaxQP,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMaxFrameRate,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoOutputFrameRate, ICodecAPI, IMFActivate,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformHaveOutput,
@@ -73,8 +84,9 @@ use windows::Win32::Media::MediaFoundation::{
     MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_NO_MORE_TYPES,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
+    MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
     MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
@@ -1274,6 +1286,51 @@ fn apply_rate_control(
     Ok(())
 }
 
+/// 「无限 GOP」的约定值：`CODECAPI_AVEncMPVGOPSize` 与 `MF_MT_MAX_KEYFRAME_SPACING` 都接受
+/// `0xFFFFFFFF`，含义是「不要按 GOP 周期插 IDR」（与 NVENC 路径的无限 GOP 对齐）。
+///
+/// 只在真机上才能验证硬件 MFT 是否接受这个值（COM 属性无法在单测里断言），单测只锁这个
+/// 常量的语义。
+const GOP_SIZE_INFINITE: u32 = u32::MAX;
+
+/// 关闭编码器的**周期 IDR**（GOP = 无限）。
+///
+/// # 为什么必须关
+///
+/// QSV MFT 的默认 GOP 是 ~120 帧——本机压测实测 **82–128 帧一张 IDR，与墙钟无关**（原语生成
+/// 场景里 0 次关键帧请求的 steady 会话同样每 ~117 帧一张）。1080p 单张 IDR ~500 KB，
+/// **4K 单张 3–4 MB**。它和本工程的 IDR 策略完全重复：引擎已按需发 IDR（首帧 /
+/// `RequestKeyframe` / 切显示器·画质 / 几何变化），另有 10 s 周期兜底，NVENC 侧还会用
+/// intra refresh 自愈——却额外制造「网络完全稳定时每隔 2–5 秒一个 3–4 MB 尖峰」，
+/// 在 8 Mbps 一类链路上就是一次 ~1 s 的排队。压测实测 IDR 占出码：1080p **30%**、
+/// 4K/30 Mbps **32%**。
+///
+/// NVENC 路径早已是无限 GOP，这里是对齐。
+///
+/// 显式 IDR 不受影响：`CODECAPI_AVEncVideoForceKeyFrame`（[`MfVideoEncoder::force_keyframe`]）
+/// 与 MFT 自身的首个 IDR 仍照常产生关键帧。
+///
+/// 支持度按「尽力而为」处理：`IsSupported` 不通过、或 `SetValue` 被拒都只记 `debug`，
+/// 用驱动默认 GOP 继续——不能让一个带宽优化把编码器整体拖死。媒体类型侧的
+/// `MF_MT_MAX_KEYFRAME_SPACING` 是同一语义的兜底（有些 MFT 只读输出类型）。
+fn configure_gop(codec: &ICodecAPI) {
+    // SAFETY: `codec` 有效；`IsSupported` 只查询能力。
+    match unsafe { codec.IsSupported(&CODECAPI_AVEncMPVGOPSize) } {
+        Ok(()) => match set_codec_u32(codec, &CODECAPI_AVEncMPVGOPSize, GOP_SIZE_INFINITE) {
+            Ok(()) => tracing::debug!(gop = GOP_SIZE_INFINITE, "编码器 GOP：无限（不周期插 IDR）"),
+            Err(err) => tracing::debug!(
+                %err,
+                "编码器拒绝无限 GOP（AVEncMPVGOPSize），按驱动默认 GOP 继续；\
+                 输出类型上的 MF_MT_MAX_KEYFRAME_SPACING 仍已声明无限"
+            ),
+        },
+        Err(err) => tracing::debug!(
+            %err,
+            "编码器不支持 AVEncMPVGOPSize，GOP 仅由输出类型的 MF_MT_MAX_KEYFRAME_SPACING 声明"
+        ),
+    }
+}
+
 /// 设置编码器的默认参数（码率控制、低延迟、无 B 帧）；失败只记 debug。
 fn configure_codec_defaults(
     codec: &ICodecAPI,
@@ -1285,6 +1342,8 @@ fn configure_codec_defaults(
     if let Err(err) = apply_rate_control(codec, bitrate_bps, fps, width, height) {
         tracing::debug!(%err, "编码器拒绝码率控制参数，按 MFT 默认值继续");
     }
+    // 无限 GOP：见 [`configure_gop`]。H.264 / H.265 同一个属性，不区分 codec。
+    configure_gop(codec);
     // `AVEncCommonQuality` 是 0..100 的**质量优先**提示（越高越照顾画质）。硬件 MFT 默认
     // 往往落在「速度优先」一侧，桌面文本的高频细节（笔画边缘）会先被量化掉。取 70：
     // 明确偏向画质，又不到 100 那种可能明显增加编码耗时的程度。驱动不支持时只记 debug。
@@ -1329,27 +1388,44 @@ fn configure_media_types(
     let input = build_input_type(width, height, fps)?;
     let target_bps = bitrate_kbps.saturating_mul(1000);
     let mut errors = Vec::new();
-    for subtype in encoder_output_subtypes(codec) {
-        let output = build_output_type(codec, width, height, fps, target_bps, subtype)?;
-        // SAFETY: 两个媒体类型与 transform 都有效。
-        let output_first = unsafe {
-            transform
-                .SetOutputType(0, &output, 0)
-                .and_then(|()| transform.SetInputType(0, &input, 0))
-        };
-        match output_first {
-            Ok(()) => return Ok(()),
-            Err(err) => errors.push(format!("输出优先: {err}")),
+    // 先带「无限 GOP」试一轮；整轮都失败再退回驱动默认 GOP 重试——**绝不能因为一个带宽
+    // 优化让编码器创建失败**（那会静默回退 VP9，丢掉硬件路径）。
+    for infinite_gop in [true, false] {
+        for subtype in encoder_output_subtypes(codec) {
+            let output = build_output_type(
+                codec,
+                width,
+                height,
+                fps,
+                target_bps,
+                subtype,
+                infinite_gop,
+            )?;
+            // SAFETY: 两个媒体类型与 transform 都有效。
+            let output_first = unsafe {
+                transform
+                    .SetOutputType(0, &output, 0)
+                    .and_then(|()| transform.SetInputType(0, &input, 0))
+            };
+            match output_first {
+                Ok(()) => return Ok(()),
+                Err(err) => errors.push(format!("输出优先: {err}")),
+            }
+            // SAFETY: 同上；改用输入优先的顺序重试。
+            let input_first = unsafe {
+                transform
+                    .SetInputType(0, &input, 0)
+                    .and_then(|()| transform.SetOutputType(0, &output, 0))
+            };
+            match input_first {
+                Ok(()) => return Ok(()),
+                Err(err) => errors.push(format!("输入优先: {err}")),
+            }
         }
-        // SAFETY: 同上；改用输入优先的顺序重试。
-        let input_first = unsafe {
-            transform
-                .SetInputType(0, &input, 0)
-                .and_then(|()| transform.SetOutputType(0, &output, 0))
-        };
-        match input_first {
-            Ok(()) => return Ok(()),
-            Err(err) => errors.push(format!("输入优先: {err}")),
+        if infinite_gop {
+            tracing::debug!(
+                "输出类型声明无限 GOP（MF_MT_MAX_KEYFRAME_SPACING）被拒，退回驱动默认 GOP 重试"
+            );
         }
     }
     Err(WinVideoError::Encode(format!(
@@ -1370,6 +1446,7 @@ fn build_output_type(
     fps: u32,
     bitrate_bps: u32,
     subtype: &GUID,
+    infinite_gop: bool,
 ) -> Result<IMFMediaType, WinVideoError> {
     let media_type = mfplat::create_media_type()?;
     let progressive = u32::try_from(MFVideoInterlace_Progressive.0).unwrap_or_default();
@@ -1396,6 +1473,17 @@ fn build_output_type(
         media_type
             .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))
             .map_err(|err| encode_err("输出类型 MF_MT_PIXEL_ASPECT_RATIO", &err))?;
+    }
+    if infinite_gop {
+        // 无限 GOP（见 [`configure_gop`] 的文档）：媒体类型这一层是兜底——有些 MFT 只读输出
+        // 类型、不认 `CODECAPI_AVEncMPVGOPSize`。`windows` 0.58 未导出
+        // `MF_MT_MPEG2_KEYFRAME_RATE`，`MF_MT_MAX_KEYFRAME_SPACING`（单位：帧）是同一语义。
+        // 设不进去只记 debug：调用方还有「整轮失败后不带该属性重试」的兜底。
+        // SAFETY: `media_type` 有效。
+        if let Err(err) = unsafe { media_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, GOP_SIZE_INFINITE) }
+        {
+            tracing::debug!(%err, "编码器拒绝 MF_MT_MAX_KEYFRAME_SPACING，按默认 GOP 继续");
+        }
     }
     if codec.is_hevc() {
         // H.265 Main profile（4:2:0 8-bit）。失败不致命：多数 MFT 从 subtype 自行推断。
@@ -1690,5 +1778,50 @@ mod tests {
         assert_eq!(vbv_bits(1, 0, 0, 0), 6);
         assert_eq!(vbv_bits(0, 30, 0, 0), 1);
         assert!(vbv_bits(u32::MAX, 1, u32::MAX, u32::MAX) > 0);
+    }
+
+    /// 输出类型必须声明「无限 GOP」（`MF_MT_MAX_KEYFRAME_SPACING = u32::MAX`）。
+    ///
+    /// 硬件 MFT 是否真的接受 `CODECAPI_AVEncMPVGOPSize` 只能靠真机压测验证（COM 属性
+    /// 设不进去在本机无法断言）；这里锁住我们能控制的那一半：媒体类型上的声明，以及
+    /// 「默认 GOP 重试路径不残留半套参数」。
+    #[allow(
+        clippy::expect_used,
+        reason = "单测：Media Foundation 初始化/类型构造失败就应当立刻带着原因失败"
+    )]
+    #[test]
+    fn output_type_declares_infinite_gop() {
+        mfplat::ensure_started().expect("本机应有 Media Foundation（mfplat.dll）");
+        let infinite = build_output_type(
+            CodecKind::H264,
+            640,
+            360,
+            30,
+            4_000_000,
+            &MFVideoFormat_H264,
+            true,
+        )
+        .expect("构造 H.264 输出类型");
+        // SAFETY: `infinite` 有效。
+        let spacing = unsafe { infinite.GetUINT32(&MF_MT_MAX_KEYFRAME_SPACING) }
+            .expect("应能读回 MF_MT_MAX_KEYFRAME_SPACING");
+        assert_eq!(spacing, GOP_SIZE_INFINITE);
+        assert_eq!(GOP_SIZE_INFINITE, u32::MAX, "0xFFFFFFFF 是「无限」的约定值");
+
+        let default_gop = build_output_type(
+            CodecKind::H264,
+            640,
+            360,
+            30,
+            4_000_000,
+            &MFVideoFormat_H264,
+            false,
+        )
+        .expect("构造 H.264 输出类型（驱动默认 GOP）");
+        // SAFETY: `default_gop` 有效；未设置的属性应读回错误。
+        assert!(
+            unsafe { default_gop.GetUINT32(&MF_MT_MAX_KEYFRAME_SPACING) }.is_err(),
+            "重试路径不能再带无限 GOP 属性"
+        );
     }
 }

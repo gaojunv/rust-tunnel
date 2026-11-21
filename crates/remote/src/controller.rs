@@ -12,7 +12,7 @@ use crate::controlled::{send_cancellable, writer_loop, OutboundQueues};
 use crate::crypto::{derive_session_keys, Cipher};
 use crate::error::{RemoteError, RemoteResult};
 use crate::input_buffer::InputBuffer;
-use crate::latency::{self, LatencyWindow, Stage};
+use crate::latency::{self, LatencyWindow, Side, Stage};
 use crate::migrate::{
     execute_actions, ActionContext, MigrateAction, MigrateEvent, MigrateHandle, MigrateMachine,
     MigrateRuntime, MigratableDuplex,
@@ -77,6 +77,18 @@ const DECODE_QUEUE: usize = 4;
 /// 有意的——Punch 路径有用户态可靠层（ARQ）保交付、直连/中继是 TCP，IDR 本身丢包不是常见
 /// 故障；把周期压到窗口以内只会把「偶尔的重发」变成常态化的 IDR 风暴。
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
+
+/// 关键帧重试的退避上限（400 → 800 → 1600 → 2400）。
+///
+/// 等待期间每次重试都会让被控端再编一张 IDR；固定 400 ms 时新 IDR 会与在途 IDR 抢同一条
+/// 链路（编码吞吐 + 上行带宽），而一张 IDR 本身就要几百毫秒到 1 秒才到——重试比它到达还快，
+/// 于是每个重试都是一张真 IDR（对端 1.2 s 去重窗口只吸收得了前两次）。本机 release 压测：
+/// `bandwidth` 组 5 次请求换 4 张 IDR，`4k60-mixed` 的 IDR 占出码 29%。
+///
+/// 2.4 s 的依据：覆盖「4K IDR 编码 ~31–90 ms + 写 3.4 MB / 30 Mbps ≈ 0.9 s + RTT 40 ms +
+/// 解码 30 ms」的最坏情况并留余量，同时足够小，使参考链真正无法恢复时仍能在 ~2.4 s 内再试。
+/// 退避**只影响重试**：首个断链事件（以及参考链恢复后的下一次断链）仍立刻发。
+const KEYFRAME_REQUEST_MAX_INTERVAL: Duration = Duration::from_millis(2400);
 
 /// 在途心跳时刻队列的上限（1s 探测、10s 可信上限 ⇒ 8 个足够覆盖任何可信延迟）。
 const HEARTBEAT_SENT_CAP: usize = 8;
@@ -1067,7 +1079,9 @@ pub(crate) async fn run_controller_inner(
                 // 诊断：每秒一行分阶段延迟汇总（**只在延迟诊断打开时**）。
                 // 与上面的 `SessionStats::Decode` 分开：那条是 UI 角标读数，这条是逐段拆解。
                 if latency::enabled() {
-                    if let Some(summary) = latency::take_summary(&decode_shared.latency) {
+                    if let Some(report) =
+                        latency::take_report(&decode_shared.latency, Side::Controller)
+                    {
                         // 全部信息塞进 message：GUI 日志面板 / 服务端日志只保留 `message` 字段。
                         //
                         // `flushed` 是 `queue_full` 的子集：队列满时被**按参考链截断**丢掉的
@@ -1082,7 +1096,7 @@ pub(crate) async fn run_controller_inner(
                             window_drop_queue_full,
                             window_flushed,
                             last_rtt_ms.unwrap_or(0),
-                            summary
+                            report.summary()
                         );
                     }
                 }
@@ -1335,8 +1349,9 @@ pub(crate) async fn run_controller_inner(
                             }
                         }
                     }
-                    // IDR 已解出：本次等待事件结束，清空重试状态（下一次断链会立刻重发）。
-                    DecodeNotice::Satisfied => keyframe_gate.satisfied(),
+                    // 只有参考链确实恢复才算结束等待：`Satisfied` 可能来自闸门关闭之前
+                    // 就已取出的那张 IDR（见 [`KeyframeGate::satisfied`]）。
+                    DecodeNotice::Satisfied => keyframe_gate.satisfied(chain.is_broken()),
                 }
             }
             // 等待 IDR 期间的定时重试：**保证只要还在等就一定有请求在路上**。
@@ -2144,6 +2159,15 @@ impl ChainGate {
     fn should_drop(self, keyframe: bool) -> bool {
         self.broken && !keyframe
     }
+
+    /// 参考链是否仍处于断开状态（P 帧继续被丢弃）。
+    ///
+    /// [`KeyframeGate::satisfied`] 用它区分「IDR 解出来了」与「参考链真的恢复了」：
+    /// 只有后者才允许结束关键帧等待，否则重试节拍会停摆（见该函数的文档）。
+    #[must_use]
+    fn is_broken(self) -> bool {
+        self.broken
+    }
 }
 
 /// 关键帧请求闸门：**单飞 + 去重 + 超时重试**（主循环独占，纯决策 → 可单测）。
@@ -2157,12 +2181,16 @@ impl ChainGate {
 ///
 /// 新模型只有一处状态：
 /// - 每个「断链」事件只更新 `desired`（**按显示器/原因去重**），并且只在距上次发送已满
-///   [`KEYFRAME_REQUEST_INTERVAL`] 时才真的发；
-/// - 等待期间主循环的 `keyframe_tick` 按同一间隔重试，直到 IDR 解码成功（[`Self::satisfied`]）；
-/// - 一次等待事件最多换回一张 IDR：重试周期（400 ms）**不小于**被控端的关键帧去重窗口
-///   （`KEYFRAME_DEDUP_WINDOW = 350 ms`，见 `crates/remote/src/controlled.rs`），在途 IDR
-///   期间到达的重试会被对端吸收。
-#[derive(Debug, Default)]
+///   当前重试间隔时才真的发；
+/// - 等待期间主循环的 `keyframe_tick` 按**指数退避**的间隔重试，直到参考链**确实恢复**
+///   （[`Self::satisfied`]）：400 ms → 800 → 1600 → 2400（封顶）。
+///
+/// **为什么要退避**：固定 400 ms 重试时，一张 IDR 在同一条链路上要几百毫秒到 1 秒才编完/
+/// 传完；每个重试都会诱使被控端再编一张 IDR，新 IDR 与旧 IDR 抢同一条链路（编码吞吐与上行
+/// 带宽），形成正反馈。被控端的 `KEYFRAME_DEDUP_WINDOW = 1.2 s` 只能吸收窗口内的那几次，
+/// 之后每个重试都是一张真 IDR——本机 release 压测里 `bandwidth` 组 5 次请求换 4 张 IDR、
+/// `4k60-mixed` 的 IDR 占出码 29%。退避后同样的等待事件只换回 1–2 张。
+#[derive(Debug)]
 struct KeyframeGate {
     /// 是否在等 IDR（一次「等待事件」）。
     waiting: bool,
@@ -2170,20 +2198,40 @@ struct KeyframeGate {
     desired: Option<(u32, KeyframeReason)>,
     /// 上一次真正发出的时刻。
     last_sent: Option<Instant>,
+    /// 当前重试间隔（每次重试成功后翻倍，封顶 [`KEYFRAME_REQUEST_MAX_INTERVAL`]）。
+    interval: Duration,
+}
+
+impl Default for KeyframeGate {
+    fn default() -> Self {
+        Self {
+            waiting: false,
+            desired: None,
+            last_sent: None,
+            interval: KEYFRAME_REQUEST_INTERVAL,
+        }
+    }
 }
 
 impl KeyframeGate {
     /// 断链事件：记录目标，并在窗口允许时立刻发一次。
     ///
     /// 返回 `Some` 表示调用方**现在就要**把这条 `RequestKeyframe` 发出去。
+    ///
+    /// 只有**从「不在等待」进入「等待」**时才把退避重置为基础间隔：等待期间同一事件簇会
+    /// 源源不断地报告断链（队列每截断一次就一条），若每次都重置，退避就永远长不上去。
     fn on_break(
         &mut self,
         display: u32,
         reason: KeyframeReason,
         now: Instant,
     ) -> Option<(u32, KeyframeReason)> {
+        let was_waiting = self.waiting;
         self.waiting = true;
         self.desired = Some((display, reason));
+        if !was_waiting {
+            self.interval = KEYFRAME_REQUEST_INTERVAL;
+        }
         if self.due(now) {
             self.last_sent = Some(now);
             return self.desired;
@@ -2191,20 +2239,33 @@ impl KeyframeGate {
         None
     }
 
-    /// 定时重试：仍在等待且已过一个窗口 → 再发一次；否则 `None`。
+    /// 定时重试：仍在等待且已过当前间隔 → 再发一次，并把间隔翻倍（封顶）。
+    ///
+    /// 首次 `on_break` 的那一发不翻倍：它只是「立刻发一次」，真正的退避从第一次重试开始，
+    /// 这样恢复链路正常时（一次重试就够）的时序与旧实现完全一致。
     fn on_tick(&mut self, now: Instant) -> Option<(u32, KeyframeReason)> {
         if !self.waiting || !self.due(now) {
             return None;
         }
         self.last_sent = Some(now);
+        self.interval = (self.interval * 2).min(KEYFRAME_REQUEST_MAX_INTERVAL);
         self.desired
     }
 
-    /// IDR 已解出：本次等待事件结束（下一次断链会立刻重发）。
-    fn satisfied(&mut self) {
+    /// IDR 已解出。只有参考链**确实恢复**（没有待补的缺口）时才结束等待。
+    ///
+    /// `Satisfied` 可能来自**闸门关闭之前就已取出**的那张 IDR：它解出并不代表后来
+    /// 因队列截断丢掉的帧被补上了。若此时清掉 `waiting`，`keyframe_tick` 会因
+    /// `if is_waiting()` 守卫停止重试，而 `ChainGate` 仍关着 → P 帧被无限丢弃，
+    /// 直到 10 s 周期 IDR。真机/本机压测都复现过 6–11 s 零帧。
+    fn satisfied(&mut self, chain_broken: bool) {
+        if chain_broken {
+            return;
+        }
         self.waiting = false;
         self.desired = None;
         self.last_sent = None;
+        self.interval = KEYFRAME_REQUEST_INTERVAL;
     }
 
     #[must_use]
@@ -2214,7 +2275,7 @@ impl KeyframeGate {
 
     fn due(&self, now: Instant) -> bool {
         self.last_sent
-            .is_none_or(|sent| now.saturating_duration_since(sent) >= KEYFRAME_REQUEST_INTERVAL)
+            .is_none_or(|sent| now.saturating_duration_since(sent) >= self.interval)
     }
 }
 
@@ -4319,12 +4380,15 @@ mod tests {
         // 正常：全放行。
         assert!(!gate.should_drop(false));
         assert!(!gate.should_drop(true));
+        assert!(!gate.is_broken());
         // 丢了一帧：P 帧被闸门挡下，关键帧仍放行（否则永远恢复不了）。
         gate.on_drop();
         assert!(gate.should_drop(false), "断链后 P 帧必须丢");
         assert!(!gate.should_drop(true), "关键帧永远放行");
+        assert!(gate.is_broken(), "is_broken 必须如实反映闸门状态");
         // **IDR 入队**：紧跟着的 P 帧必须放行（它们排在 IDR 后面，可以正常解码）。
         gate.on_keyframe_enqueued();
+        assert!(!gate.is_broken());
         assert!(
             !gate.should_drop(false),
             "IDR 一入队，后续 P 帧就必须放行——不能等它解码成功"
@@ -4362,14 +4426,100 @@ mod tests {
         // 重试也受同一窗口约束。
         assert_eq!(gate.on_tick(due), None);
 
-        // IDR 解出：清空；下一次断链立刻重发（不残留节流状态）。
-        gate.satisfied();
+        // IDR 解出且参考链已恢复：清空；下一次断链立刻重发（不残留节流状态）。
+        gate.satisfied(false);
         assert!(!gate.is_waiting());
         assert_eq!(gate.on_tick(due), None);
         assert_eq!(
             gate.on_break(0, KeyframeReason::DecodeError, due),
             Some((0, KeyframeReason::DecodeError))
         );
+    }
+
+    /// **`Satisfied` 只结束等待的前提是参考链确实恢复。**
+    ///
+    /// 旧实现无条件清 `waiting`：队列截断（`chain.on_drop()`）之后，闸门关闭之前就已取出的
+    /// 那张旧 IDR 一旦解码成功，就会把 `waiting` 清掉，而 `ChainGate` 仍关着 ——
+    /// `keyframe_tick` 的 `if is_waiting()` 守卫随之停止轮询，P 帧被无限丢弃直到 10 s
+    /// 周期 IDR。本机压测复现过 6–11 s 零帧（`reason=awaiting` 连丢、`max gap` 10997 ms）。
+    #[test]
+    fn satisfied_does_not_clear_waiting_while_chain_broken() {
+        let t0 = Instant::now();
+        let mut gate = KeyframeGate::default();
+        assert!(gate
+            .on_break(0, KeyframeReason::QueueOverflow, t0)
+            .is_some());
+        // 闸门关着时解出的那张 IDR：不是恢复信号。
+        gate.satisfied(true);
+        assert!(gate.is_waiting(), "链还断着就必须继续等");
+        assert!(
+            gate.on_tick(t0 + KEYFRAME_REQUEST_INTERVAL).is_some(),
+            "必须继续重试——否则只剩 10 s 周期 IDR 兜底"
+        );
+        // 链真正恢复（新 IDR 已入队 → 随后解码成功）才结束本次等待。
+        gate.satisfied(false);
+        assert!(!gate.is_waiting(), "链恢复后等待才结束");
+        assert_eq!(gate.on_tick(t0 + KEYFRAME_REQUEST_INTERVAL * 4), None);
+    }
+
+    /// **重试间隔指数退避**：400 → 800 → 1600 → 2400（封顶），首个断链事件不翻倍。
+    ///
+    /// 实际发送时刻（相对 t0）：0、+400、+1200、+2800、+5200 ms。固定 400 ms 时 10 s 的
+    /// 等待会发 ~25 次、换回多张 IDR；退避后同样的等待只发 4–5 次（见
+    /// [`KEYFRAME_REQUEST_MAX_INTERVAL`] 的文档）。
+    #[test]
+    fn keyframe_retries_back_off_exponentially() {
+        let base = KEYFRAME_REQUEST_INTERVAL;
+        let t0 = Instant::now();
+        let mut gate = KeyframeGate::default();
+        let at = |millis: u64| t0 + Duration::from_millis(millis);
+
+        assert!(gate.on_break(0, KeyframeReason::QueueOverflow, t0).is_some());
+        assert_eq!(gate.interval, base, "首发的间隔仍是基础值");
+        // +400：第一次重试（之后间隔 800）。
+        assert!(gate.on_tick(at(400)).is_some(), "+400 应重试");
+        assert_eq!(gate.interval, base * 2);
+        // +800：距上次仅 400 ms，未到 800。
+        assert_eq!(gate.on_tick(at(800)), None, "+800 不应发（下次 +1200）");
+        // +1200：距上次 800 → 发；间隔 1600。
+        assert!(gate.on_tick(at(1200)).is_some(), "+1200 应重试");
+        assert_eq!(gate.interval, base * 4);
+        // +1600：距上次 400，未到 1600。
+        assert_eq!(gate.on_tick(at(1600)), None, "+1600 不应发（下次 +2800）");
+        // +2800：距上次 1600 → 发；间隔封顶 2400。
+        assert!(gate.on_tick(at(2800)).is_some(), "+2800 应重试");
+        assert_eq!(gate.interval, KEYFRAME_REQUEST_MAX_INTERVAL, "间隔封顶");
+        // +3600：距上次 800，未到 2400。
+        assert_eq!(gate.on_tick(at(3600)), None);
+        // +5200：距上次 2400 → 再发，间隔保持封顶值。
+        assert!(gate.on_tick(at(5200)).is_some());
+        assert_eq!(gate.interval, KEYFRAME_REQUEST_MAX_INTERVAL);
+    }
+
+    /// 等待期间的重复 `on_break` **不得**重置退避（事件簇会连续报告断链，重置会让退避失效）；
+    /// 只有参考链恢复后的下一次断链才回到基础间隔。
+    #[test]
+    fn new_break_resets_backoff_only_when_not_waiting() {
+        let base = KEYFRAME_REQUEST_INTERVAL;
+        let t0 = Instant::now();
+        let mut gate = KeyframeGate::default();
+        assert!(gate
+            .on_break(0, KeyframeReason::SeqGap, t0)
+            .is_some());
+        assert!(gate.on_tick(t0 + base).is_some(), "第一次重试");
+        assert_eq!(gate.interval, base * 2);
+        // 仍在等待：重复断链事件不重置退避。
+        assert_eq!(
+            gate.on_break(0, KeyframeReason::QueueOverflow, t0 + base + base / 2),
+            None
+        );
+        assert_eq!(gate.interval, base * 2, "等待中的 on_break 不得重置退避");
+        // 参考链恢复：间隔回到基础值，下一次断链立刻发。
+        gate.satisfied(false);
+        assert_eq!(gate.interval, base);
+        let later = t0 + Duration::from_secs(10);
+        assert!(gate.on_break(0, KeyframeReason::SeqGap, later).is_some());
+        assert_eq!(gate.interval, base);
     }
 
     /// 序号语义：**关键帧永远不算断层**（它本身就是新参考链的起点）。

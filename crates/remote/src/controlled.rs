@@ -128,7 +128,7 @@ use crate::auth::{ack_mac, PendingSessions};
 use crate::codec::{vp9_encoder_factory, VideoEncoderApi, VideoEncoderFactory};
 use crate::crypto::{derive_session_keys, Cipher, EphemeralKeyPair};
 use crate::error::{RemoteError, RemoteResult};
-use crate::latency::{self, LatencyWindow, Stage};
+use crate::latency::{self, LatencyWindow, Side, Stage};
 use crate::migrate::{
     execute_actions, ActionContext, MigrateAction, MigrateEvent, MigrateHandle, MigrateMachine,
     MigrateRuntime, MigratableDuplex,
@@ -3066,7 +3066,9 @@ pub(crate) async fn run_controlled_inner(
                 // 与上面的 `debug!` 分开：那条是既有遥测（debug 级），这条是给「切标签为什么
                 // 慢」用的拆解（info 级、默认完全静默）。窗口由主循环/编码任务/写任务共写。
                 if latency::enabled() {
-                    if let Some(summary) = latency::take_summary(&latency_window) {
+                    if let Some(report) =
+                        latency::take_report(&latency_window, Side::Controlled)
+                    {
                         // 全部信息塞进 message：GUI 的日志面板 / 服务端日志只保留 `message`
                         // 字段（结构化字段会被丢掉），文件与 stdout 则两种都完整。
                         info!(
@@ -3074,7 +3076,7 @@ pub(crate) async fn run_controlled_inner(
                             "controlled fps={} patches={} {}",
                             host.fps,
                             host.patch_mode,
-                            summary
+                            report.summary()
                         );
                     }
                 }

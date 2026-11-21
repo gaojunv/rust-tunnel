@@ -136,6 +136,7 @@
 //!   地板不该成为默认运行点。
 
 use crate::screen::{EncodeOptions, EncodeRates};
+use std::time::{Duration, Instant};
 
 /// 尚无 RTT 基线时的**绝对**健康阈值（毫秒）。
 ///
@@ -149,6 +150,46 @@ const ABSOLUTE_FAST_THRESHOLD_MS: u32 = 80;
 /// 尖峰抬高几十到几百毫秒；拿瞬时值比基线等于把**抖动**当**拥塞**。平滑后单条尖峰只看得到
 /// 三成幅度，连续两 tick 才越过判据（见 [`QosParams::rtt_congestion_ticks`]）。
 const RTT_EWMA_ALPHA: f64 = 0.3;
+
+/// 触发「严重拥塞」的 RTT 绝对下限（毫秒）：一条心跳样本达到它，说明链路里此刻至少排了
+/// 这么多视频。再要求它是会话基线（地理/路径固定开销）的 3 倍以上，避免高延迟中继上的
+/// 正常抖动被当成严重拥塞。
+///
+/// 正常拥塞按每秒 ×0.8 逐级下降；但编码器的目标码率可能远高于链路真实容量（4K 原生档位
+/// 起步就是 24–60 Mbps），等 5–8 个 tick 才降到容量以下时，链路里已经堆了 1–2 秒的视频。
+/// 这条路径直接按控制器实测的接收码率重定目标。
+const SEVERE_RTT_FLOOR_MS: u64 = 800;
+
+/// 出/收码率比达到它、且本地写队列已满时，判「严重拥塞」。
+///
+/// 这是比 RTT 更早的信号：RTT 要等排队真的传到心跳才抬升，而 `sent > recv` 说明**本窗口
+/// 交给传输层的字节已经多于链路送出的字节**——队列正在增长。写队列满时 1.2 倍就够；
+/// 没有写队列证据时要求更高的 1.5 倍（见 `on_feedback` 的 `queue_overrun`），避免把一次
+/// 关键帧造成的窗口错位误判成拥塞。
+const SEVERE_SENT_OVER_RECV: f64 = 1.2;
+
+/// 一步降档时对控制器实测收码率打的折扣（留 10% 余量，避免刚好压在容量上反复过冲）。
+const SEVERE_CAPACITY_MARGIN: f64 = 0.9;
+
+/// 会话刚开始、还没有任何交付样本时的「初始链路能力」估计（kbps）。
+///
+/// 档位码率是**上限**，不是链路承诺：4K 原生「均衡」档起步就是 24 Mbps、「高清」40 Mbps，
+/// 而家用上行常见 10–20 Mbps。若第一张整屏帧按上限的 VBV 编出来（0.35 s × 24–40 Mbps ≈
+/// 1–1.7 MB），链路要 1–2 秒才送完，用户连上后切第一个窗口就卡住，并且这段积压会拖累
+/// 后续几秒。这里用一个保守起点（8 Mbps，封顶 10 Mbps）让首帧先探路；拿到真实活跃流量后
+/// 每秒按实测交付速率 ×1.5 向上探，正常链路几秒内就回到档位上限。
+///
+/// 1080p 的三档上限（2/6/10 Mbps）都 ≤ 12 Mbps，因此对 1080p 会话没有实际影响。
+const INITIAL_DELIVERED_PEAK_KBPS: u32 = 8_000;
+
+/// 「从安静回到活跃」的判定间隔：距上一张整屏级变化帧超过它，才认为用户是**重新开始操作**
+/// （切窗口/开文件夹），需要对这一帧做突发封顶。
+///
+/// 取 250 ms：30 fps 的帧间隔是 33 ms、静止保活是 66 ms，持续运动/拖窗时永远不会触发；
+/// 而「每 0.5–1 秒切一次窗口」的典型节奏每次都触发。持续切换时若用更长的间隔（如 1 s），
+/// 会漏掉一半切换；若完全不看间隔（每帧都封顶），低复杂度内容（滚动文字）的实测交付速率
+/// 只有几百 kbps，会把目标码率永久钉在它的 1.5 倍，画质再也上不去。
+const ACTIVE_RESUME_QUIET: Duration = Duration::from_millis(250);
 
 /// 控制器回报的 QoS 观测量（[`crate::session::SessionMessage::QosFeedback`] 的引擎内表示）。
 ///
@@ -409,6 +450,22 @@ pub struct RateController {
     content_cap_kbps: Option<u32>,
     /// 内容驱动的帧率上限；语义同 [`Self::content_cap_kbps`]。
     content_cap_fps: Option<u8>,
+    /// 最近一次**活跃期间**实测交付速率（kbps）的衰减峰值，用于「重新开始操作」第一帧的突发保护。
+    ///
+    /// 补丁模式/静止桌面会让 AIMD 长时间停在档位上限（闭环暂停或没有字节可送），此时链路
+    /// 真实容量可能远低于上限。用户一切窗口，第一张整屏帧按上限的 VBV 编出来，链路要花
+    /// 几百毫秒到一秒送完——这就是「切窗口卡一下」。这一帧用峰值给码率封顶，就不会远超链路；
+    /// 峰值随每秒反馈更新（实测峰值含 50% 余量；初始估计用更紧的 25%），链路变快时会逐次向上探。
+    delivered_peak_kbps: Option<u32>,
+    /// 上一张整屏级变化帧的时刻（见 [`ACTIVE_RESUME_QUIET`]）。
+    last_active_at: Option<Instant>,
+    /// 突发封顶前保存的 AIMD 码率；下一帧开始时恢复（封顶只作用于「重新开始操作」的第一帧）。
+    burst_restore_kbps: Option<u32>,
+    /// [`Self::delivered_peak_kbps`] 是否已经来自真实活跃流量（而不是初始估计）。
+    ///
+    /// 初始估计用更紧的 1.25 倍封顶（首帧只是探针）；实测峰值用 1.5 倍，给 AIMD 留出向上
+    /// 爬的空间，避免低复杂度内容把目标码率钉在交付速率附近。
+    delivered_peak_measured: bool,
     /// 内容上限的**面积倍数**（千分比，1080p = 1000）。
     ///
     /// 面积上限的语义是「只改了一小块，别为整帧花光预算」。但同样的**比例**面积在更高
@@ -447,6 +504,10 @@ impl RateController {
             quiet_streak: 0,
             content_cap_kbps: None,
             content_cap_fps: None,
+            delivered_peak_kbps: Some(INITIAL_DELIVERED_PEAK_KBPS),
+            last_active_at: None,
+            burst_restore_kbps: None,
+            delivered_peak_measured: false,
             content_area_permille: 1000,
         }
     }
@@ -560,11 +621,39 @@ impl RateController {
     /// **只升不降**：降档仍由 `observe_activity` 按 [`QosParams::cap_hold_ticks`] 迟滞处理，
     /// 所以单个 Active 帧不会被立刻收回，单个静止帧也不会把上限压死。
     pub fn promote_activity(&mut self, changed_permille: u16) {
+        // 上一帧的突发封顶只作用于那一帧：先恢复 AIMD 码率（见下方 `burst_restore_kbps`）。
+        if let Some(saved) = self.burst_restore_kbps.take() {
+            self.bitrate_kbps = saved;
+        }
         let observed = self.activity_of(changed_permille);
         if observed > self.activity {
             self.activity = observed;
             self.quiet_streak = 0;
             self.recompute_content_caps();
+        }
+        // **重新开始操作时的突发保护**：距上一张整屏级变化帧超过 [`ACTIVE_RESUME_QUIET`]
+        // （补丁模式/静止桌面后切窗口、开文件夹）时，把**这一帧**的目标码率压到「上次活跃期间
+        // 实测交付速率 × 1.5（初始估计 × 1.25）」以内；下一帧立即恢复 AIMD 值。
+        // 持续运动/连续切换不触发——否则低复杂度内容的实测交付速率会把目标码率永久钉住
+        // （滚动文字实测 1–3 Mbps）。
+        if observed == Activity::Active {
+            let now = Instant::now();
+            let resumed = self
+                .last_active_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= ACTIVE_RESUME_QUIET);
+            self.last_active_at = Some(now);
+            if resumed {
+                if let Some(peak) = self.delivered_peak_kbps {
+                    let factor = if self.delivered_peak_measured { 3 } else { 5 };
+                    let divisor = if self.delivered_peak_measured { 2 } else { 4 };
+                    let cap = (peak.saturating_mul(factor) / divisor)
+                        .max(self.params.min_bitrate_kbps);
+                    if cap < self.bitrate_kbps {
+                        self.burst_restore_kbps = Some(self.bitrate_kbps);
+                        self.bitrate_kbps = cap;
+                    }
+                }
+            }
         }
     }
 
@@ -738,6 +827,21 @@ impl RateController {
         }
         let delivery_bad_sustained = self.delivery_bad_streak >= self.params.delivery_ratio_ticks;
 
+        // 交付速率峰值（见 [`Self::delivered_peak_kbps`]）：只在确实有量时采样，并把样本钳到
+        // `sent`——同一个窗口里不可能「收得比发得多」，钳掉窗口错位造成的虚高。5%/tick 衰减
+        // 让很久以前的峰值逐渐失效，但补丁模式里 `on_feedback` 被跳过，峰值会原样保留到下次
+        // 活跃（这正是我们要记住的「上一次活跃时的链路能力」）。
+        if let Some(sent) = sent_kbps {
+            if sent >= 500 && fb.recv_kbps > 0 {
+                let sample = fb.recv_kbps.min(sent);
+                let decayed = self
+                    .delivered_peak_kbps
+                    .map_or(0, |peak| peak.saturating_mul(19) / 20);
+                self.delivered_peak_kbps = Some(decayed.max(sample));
+                self.delivered_peak_measured = true;
+            }
+        }
+
         // 拥塞 = 平滑 RTT 相对基线显著抬升 **或** 持续积压 **或** 投递率持续过低。
         // 尚无基线时退回绝对地板。绝对地板保证基线很低时仍不允许高延迟。
         let congestion_threshold = self.baseline_rtt_ms.map_or(self.params.delay_threshold_ms, |baseline| {
@@ -754,6 +858,28 @@ impl RateController {
         }
         let rtt_congested = self.rtt_congested_streak >= self.params.rtt_congestion_ticks;
         let congested = rtt_congested || self.backlog_streak >= self.params.backlog_ticks || delivery_bad_sustained;
+        // **严重拥塞**（见 [`SEVERE_RTT_FLOOR_MS`] / [`SEVERE_SENT_OVER_RECV`]）：排队已经以秒计，
+        // 或本窗口交出去的字节已明显多于链路送出的字节。正常阶梯每秒 ×0.8 要 5–8 秒才追上
+        // 一个远超容量的目标码率，这段时间链路里堆满视频——用户看到的就是「切窗口后卡一两秒」。
+        //
+        // RTT 判据用**瞬时样本**而不是 EWMA：平滑值在队列排空后还会余温好几秒，期间继续
+        // 「严重降档」会把码率一路砍到地板（实测 24 Mbps → 300 kbps）。一条 ≥800 ms 的
+        // 心跳样本本身就是「此刻链路里至少排了 800 ms」的直接证据，不需要再平滑。
+        let severe_rtt = fb.rtt_ms > 0
+            && fb.rtt_ms >= u32::try_from(SEVERE_RTT_FLOOR_MS).unwrap_or(u32::MAX)
+            && u64::from(fb.rtt_ms)
+                >= u64::from(self.baseline_rtt_ms.unwrap_or(0)).saturating_mul(3);
+        let queue_overrun = sent_kbps.is_some_and(|sent| {
+            sent >= 1_000
+                && fb.recv_kbps > 0
+                && (sent >= 3_000
+                    && fb.recv_kbps >= 1_000
+                    && f64::from(sent) >= f64::from(fb.recv_kbps) * 1.5
+                    || (local_backlog >= self.params.local_backlog_frames
+                        && f64::from(sent)
+                            >= f64::from(fb.recv_kbps) * SEVERE_SENT_OVER_RECV))
+        });
+        let severe = severe_rtt || queue_overrun;
         // 健康 = RTT 贴着基线（无基线时按绝对阈值）**且**两侧队列都没到积压门槛，**且**解码
         // 未饱和、投递率未恶化。
         // `rtt_ms == 0` 是未知哨兵：既不算拥塞，也绝不能算健康（否则会一边「无样本」一边升码率）。
@@ -769,6 +895,8 @@ impl RateController {
         // 顺序：解码饱和优先。它说明瓶颈在控制器解码器，降码率只会让画面更糊而不减轻解码负担。
         if self.decode_bound_streak >= self.params.decode_bound_ticks {
             self.decide_decrease_decode()
+        } else if severe {
+            self.decide_decrease_severe(fb.recv_kbps, fb.decode_ms)
         } else if congested {
             self.decide_decrease_network(fb.decode_ms)
         } else if healthy {
@@ -817,6 +945,36 @@ impl RateController {
             }
         }
         self.decision(force_keyframe)
+    }
+
+    /// 严重拥塞路径：一步把目标码率压到「当前的一半」与「实测收码率 × 0.9」中较小者。
+    ///
+    /// 为什么不只按 `recv_kbps`：控制器的统计窗口可能因为事件循环延迟而短于 1 秒，窗口里
+    /// 恰好排空了一段积压时 `recv_kbps` 会**高于**链路真实容量。取「当前一半」作为上界，
+    /// 保证即使读数偏高也只降一半；连续两个 tick 都严重时最多降到 1/4。
+    ///
+    /// 只动码率，不动帧率/分辨率：这条路径的病因是「字节太多」，降帧率不减少总字节
+    /// （VBR 会把预算摊到更少的帧上），改几何更要重建编码器 + 强制 IDR。**码率已经在地板**
+    /// 时退回正常网络阶梯（继续降帧率），否则 200 kbps × 60 fps 的画面比 15 fps 更没法看。
+    fn decide_decrease_severe(&mut self, recv_kbps: u32, decode_ms: u32) -> QosDecision {
+        let current = self.bitrate_kbps;
+        let mut target = self.scaled_bitrate(0.5);
+        if recv_kbps >= self.params.min_bitrate_kbps {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "收码率是有界正数，折扣后取整仍落在 u32 内"
+            )]
+            let measured = (f64::from(recv_kbps) * SEVERE_CAPACITY_MARGIN).round() as u32;
+            target = target.min(measured.max(self.params.min_bitrate_kbps));
+        }
+        if target >= current {
+            // 码率已经降不下去：交给正常阶梯（帧率 → 分辨率）。
+            return self.decide_decrease_network(decode_ms);
+        }
+        self.bitrate_kbps = target;
+        self.last_action = QosAction::Decrease;
+        self.decision(false)
     }
 
     /// 网络拥塞路径：码率 → 帧率 → 分辨率，**每一级都有门槛**。
@@ -926,9 +1084,14 @@ impl RateController {
         self.fps.min(cap).clamp(min_fps, ceiling_fps)
     }
 
+    /// 测试专用：把「上一张整屏级变化帧」的时刻往回拨，模拟一段安静期。
+    #[cfg(test)]
+    fn set_last_active_ago(&mut self, ago: Duration) {
+        self.last_active_at = Some(Instant::now().checked_sub(ago).unwrap_or_else(Instant::now));
+    }
+
     /// 组装决策结果。
-    fn decision(&self, force_keyframe: bool) -> QosDecision {
-        QosDecision {
+    fn decision(&self, force_keyframe: bool) -> QosDecision {        QosDecision {
             rates: self.current(),
             force_keyframe,
             action: self.last_action,
@@ -1025,6 +1188,127 @@ mod tests {
         // 帧率/分辨率不受影响（还没到地板）。
         assert_eq!(d.rates.fps, 30);
         assert!((d.rates.scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// **严重拥塞（RTT 以秒计）一步降到实测容量**：4K 原生档位起步 60 Mbps、链路只有 12 Mbps
+    /// 时，正常 ×0.8 阶梯要 5–8 秒才追上，链路里会堆 1–2 秒视频。这里要求一个 tick 内降到位。
+    #[test]
+    fn severe_rtt_drops_to_measured_capacity_in_one_tick() {
+        let mut c = RateController::new(EncodeOptions {
+            target_bitrate_kbps: 60_000,
+            scale: 1.0,
+            max_fps: 30,
+        });
+        prime(&mut c);
+        let d = c.on_feedback(
+            Feedback {
+                rtt_ms: 2000,
+                recv_kbps: 12_000,
+                decode_ms: 10,
+                backlog: 0,
+            },
+            2,
+            Some(30_000),
+        );
+        assert_eq!(d.action, QosAction::Decrease);
+        // 瞬时 2000 ms ≥ 800 且 ≥ 基线 50 的 3 倍 → 严重；
+        // min(60000/2, 12000×0.9) = 10800。
+        assert_eq!(d.rates.bitrate_kbps, 10_800);
+        assert_eq!(d.rates.fps, 30, "严重拥塞只动码率");
+        assert!((d.rates.scale - 1.0).abs() < f32::EPSILON, "不降分辨率");
+        assert!(!d.force_keyframe, "普通码率步进绝不插 IDR");
+    }
+
+    /// **出码率明显高于收码率 + 写队列满** 是比 RTT 更早的严重拥塞信号：不必等排队传到心跳。
+    #[test]
+    fn severe_queue_overrun_drops_before_rtt_rises() {
+        let mut c = balanced();
+        prime(&mut c); // 基线 50，当前 6000
+        let d = c.on_feedback(
+            Feedback {
+                rtt_ms: 50, // RTT 还正常
+                recv_kbps: 10_000,
+                decode_ms: 10,
+                backlog: 0,
+            },
+            2, // 写队列满
+            Some(14_000),
+        );
+        assert_eq!(d.action, QosAction::Decrease);
+        // min(6000/2, 10000×0.9) = 3000。
+        assert_eq!(d.rates.bitrate_kbps, 3000);
+        assert_eq!(d.rates.fps, 30);
+        assert!(!d.force_keyframe);
+    }
+
+    /// 写队列没满、或出/收码率接近时**不得**走严重路径（否则流水线正常深度会被误判）。
+    #[test]
+    fn severe_path_needs_full_local_queue_or_second_scale_rtt() {
+        let mut c = balanced();
+        prime(&mut c);
+        // 出/收码率比 1.4，但写队列只有 1 帧（未满）：不严重，按正常判据走（Hold）。
+        let d = c.on_feedback(
+            Feedback {
+                rtt_ms: 50,
+                recv_kbps: 10_000,
+                decode_ms: 10,
+                backlog: 0,
+            },
+            1,
+            Some(14_000),
+        );
+        assert_eq!(d.action, QosAction::Hold);
+        assert_eq!(d.rates.bitrate_kbps, 6000);
+        // 单条 300 ms 样本未到 800 → 不严重；正常判据也要连续 tick。
+        let d = c.on_feedback(fb(300, 10, 0), 0, None);
+        assert_eq!(d.action, QosAction::Hold);
+    }
+
+    /// **安静 → 活跃的第一帧按上次实测交付速率封顶**：补丁模式/静止桌面期间 AIMD 停在上限，
+    /// 一切窗口就按上限编出整屏帧，链路若只有 10 Mbps 就会被堵几百毫秒。封顶只作用于这一帧的
+    /// 起点，之后 AIMD 照常向上探。
+    #[test]
+    fn activity_burst_is_capped_by_last_delivered_rate() {
+        let mut c = RateController::new(EncodeOptions {
+            target_bitrate_kbps: 24_000,
+            scale: 1.0,
+            max_fps: 30,
+        });
+        // 上一次活跃期间链路实际交付 10 Mbps（发多少收多少，健康）。
+        c.on_feedback(
+            Feedback {
+                rtt_ms: 50,
+                recv_kbps: 10_000,
+                decode_ms: 10,
+                backlog: 0,
+            },
+            0,
+            Some(10_000),
+        );
+        assert_eq!(c.current().bitrate_kbps, 24_000, "健康时保持在上限");
+        // 补丁模式里 `observe_activity` 不跑、活跃档会停在 Active；这里**不依赖跳变**：
+        // 距上一张整屏帧超过 `ACTIVE_RESUME_QUIET` 就按上次交付峰值封顶这一帧。
+        c.promote_activity(1000);
+        assert_eq!(c.current().bitrate_kbps, 15_000, "10 Mbps × 1.5");
+        // 下一帧立即恢复 AIMD 值：封顶只作用于「重新开始操作」的第一帧。
+        c.promote_activity(1000);
+        assert_eq!(c.current().bitrate_kbps, 24_000);
+        // 安静一段时间后再次操作：重新封顶。
+        c.set_last_active_ago(ACTIVE_RESUME_QUIET * 2);
+        c.promote_activity(1000);
+        assert_eq!(c.current().bitrate_kbps, 15_000);
+
+        // 会话刚开始（还没有任何交付样本）：用保守初始峰值 8 Mbps → 首帧封顶 10 Mbps（1.25×），
+        // 让它作为探针；之后每秒按实测交付速率 ×1.5 向上探。
+        let mut fresh = RateController::new(EncodeOptions {
+            target_bitrate_kbps: 24_000,
+            scale: 1.0,
+            max_fps: 30,
+        });
+        fresh.observe_activity(0);
+        fresh.observe_activity(0);
+        fresh.promote_activity(1000);
+        assert_eq!(fresh.current().bitrate_kbps, 10_000);
     }
 
     #[test]

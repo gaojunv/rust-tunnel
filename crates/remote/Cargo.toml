@@ -1,6 +1,6 @@
 [package]
 name = "rust-tunnel-remote"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "rust-tunnel remote-control engine: session protocol, screen codec, transport orchestration (pure protocol, no platform/UI deps)"
 license = "MIT OR Apache-2.0"
