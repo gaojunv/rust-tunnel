@@ -23,6 +23,11 @@
 //!   绝不能留在调用线程上。`Default` 桌面的 WGC/DXGI 混合采集**不**走这条线程
 //!   （它由 `win_hybrid` 在引擎的采集线程上做），所以 GPU 采集再慢也不会堵住注入。
 //!
+//!   例外是**安全桌面的实验性 DXGI 采集**（[`SecureDxgi`]，环境变量
+//!   `RUST_TUNNEL_SECURE_DXGI`，默认关）：DXGI 的 duplication 也绑定调用线程所在的
+//!   桌面，所以只可能在这条已挂到 `Winlogon`/`Screen-saver` 的线程上试。它只做 CPU
+//!   回读，失败即回 `BitBlt`，并在本 worker 内限次放弃。
+//!
 //! 桌面变化是**低频事件**（锁屏/解锁/切换用户），故「销毁+重建」的开销可以忽略；真正要
 //! 守住的是「切换期间绝不丢抬起事件」（见下）。当前挂载的桌面与显示器几何经
 //! [`Shared`] 发布给 `win_hybrid`，后者据此在 GPU 快路径与 BitBlt 兜底之间分流。
@@ -42,10 +47,11 @@
 //! [`super::SessionRelease`]，由实例运行时在观察到会话结束时触发。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rust_tunnel_remote::screen::CaptureInfo;
 use rust_tunnel_remote::{
@@ -57,9 +63,14 @@ use rust_tunnel_win_platform::desktop::{self, InputDesktop};
 use rust_tunnel_win_platform::inject::{self, InjectButton, InjectStep};
 use rust_tunnel_win_platform::monitor::{self, Monitor, VirtualScreen};
 use rust_tunnel_win_platform::WinError;
+// 别名：本模块顶部的 `rust_tunnel_win_platform::capture`（GDI BitBlt）与 win-video 的
+// `capture`（WGC/DXGI）重名，二者都在这条线程上被用到。
+use rust_tunnel_win_video::capture as video_capture;
+use rust_tunnel_win_video::pixels::{bgra_to_rgba, scale_bgra_to_rgba};
 
 use super::desktop_follow::{self, FollowAction, FollowDesktop};
 use super::input_queue::{HeldInputs, InputQueue, PushOutcome};
+use super::instance_gpu::{self, Geometry};
 use super::{keycode, PlatformHandles, SessionRelease};
 
 /// 监管线程的桌面探测间隔（≤4Hz）。桌面变化是低频事件，按事件频率探测会白烧 CPU。
@@ -73,6 +84,15 @@ const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// 注入队列容量（满时只丢 `MouseMove`，见 [`super::input_queue`]）。
 const INPUT_QUEUE_CAP: usize = 256;
+/// 安全桌面 DXGI 实验路径连续失败多少次就放弃（本 worker 生命周期内不再尝试）。
+const SECURE_DXGI_MAX_FAILURES: u32 = 3;
+/// 安全桌面 DXGI 失败后的重试间隔。
+const SECURE_DXGI_RETRY: Duration = Duration::from_secs(2);
+/// 「慢失败」阈值：单次 `capture()` 超过它即视为首帧超时/重建等待，**立即**放弃本 worker。
+///
+/// 这条 worker 同时承担注入，连续几次 2 秒的阻塞会让登录界面打字反复卡顿；
+/// 快失败（`ACCESS_DENIED` 之类）仍按 [`SECURE_DXGI_MAX_FAILURES`] 限次重试。
+const SECURE_DXGI_SLOW_FAILURE: Duration = Duration::from_secs(1);
 
 // ── 请求类型 ────────────────────────────────────────────────────────
 
@@ -153,6 +173,11 @@ pub(super) struct Shared {
     inner: Mutex<IoInner>,
     /// 有新活/停止信号时唤醒 worker。
     cv: Condvar,
+    /// worker 最近一帧**实际**的采集后端：`0` = GDI `BitBlt`（默认），`1` = 实验性 DXGI
+    /// 安全桌面采集（见 [`SecureDxgi`]）。
+    ///
+    /// 刻意不放进 [`IoInner`]：`capture_info()` 由 1 Hz 心搏调用，必须无锁、非阻塞。
+    secure_backend: AtomicU8,
 }
 
 impl Shared {
@@ -170,6 +195,7 @@ impl Shared {
                 release_requested: false,
             }),
             cv: Condvar::new(),
+            secure_backend: AtomicU8::new(0),
         });
         let for_thread = Arc::clone(&shared);
         if let Err(err) = std::thread::Builder::new()
@@ -217,6 +243,24 @@ impl Shared {
     /// 当前 worker 实际挂着的桌面（`None` = 尚未挂载）。
     pub(super) fn desktop_kind(&self) -> Option<FollowDesktop> {
         self.lock().desktop
+    }
+
+    /// 发布最近一帧的采集后端（`true` = 实验性 DXGI，`false` = GDI `BitBlt`）。
+    fn set_secure_backend(&self, dxgi: bool) {
+        self.secure_backend.store(u8::from(dxgi), Ordering::Relaxed);
+    }
+
+    /// 最近一帧是否来自实验性 DXGI 采集。默认 `false`（BitBlt）。
+    fn secure_backend(&self) -> bool {
+        self.secure_backend.load(Ordering::Relaxed) != 0
+    }
+
+    /// 是否有**待注入**的输入事件（非阻塞，只读队列长度）。
+    ///
+    /// `serve_capture` 用它决定本轮要不要跳过实验性 DXGI：那条路径的首帧/重建可能
+    /// 阻塞 worker 线程 2 秒以上，而这条线程同时承担注入——登录界面打字的手感优先。
+    fn has_pending_input(&self) -> bool {
+        !self.lock().inject.is_empty()
     }
 
     /// 请当前 worker 停止（它会先补发「全部抬起」）。
@@ -464,6 +508,9 @@ fn attach_with_retry(shared: &Shared, target: FollowDesktop) -> Option<InputDesk
     reason = "桌面 worker 的完整生命周期（挂载 → 服务 → 收尾补发抬起 → 回收句柄），拆开反而看不清线程归属"
 )]
 fn worker_loop(shared: &Shared, target: FollowDesktop) {
+    // 遥测口径先复位：必须在挂载之前做——旧 worker 可能刚用 DXGI 采过帧，而新 worker
+    // 挂载失败/重试期间不该继续上报旧口径。第一帧 DXGI 真正成功之前它就是 BitBlt。
+    shared.set_secure_backend(false);
     let Some(mut desktop) = attach_with_retry(shared, target) else {
         tracing::info!(desktop = target.as_str(), "worker 未挂载即被要求停止");
         return;
@@ -480,6 +527,8 @@ fn worker_loop(shared: &Shared, target: FollowDesktop) {
     shared.set_monitors(monitors.clone());
 
     let mut held = HeldInputs::default();
+    // 安全桌面的实验性 DXGI 采集（`Default` 桌面不启用：那条路径由 `win_hybrid` 管）。
+    let mut secure = SecureDxgi::for_worker(target);
     loop {
         if shared.stop_requested() {
             // 切换桌面 / 退出前补发一次「全部抬起」——在**当前**桌面上，否则旧桌面残留卡键。
@@ -502,7 +551,7 @@ fn worker_loop(shared: &Shared, target: FollowDesktop) {
             inject_events(&work.inject, &monitors, &vs);
         }
         for req in work.captures {
-            serve_capture(&monitors, req);
+            serve_capture(&monitors, &mut secure, shared, req);
         }
         for req in work.clipboard {
             serve_clipboard(req);
@@ -652,27 +701,301 @@ fn inject_button(button: MouseButton) -> InjectButton {
 }
 
 /// 服务一次采集请求（在本线程的桌面上 `BitBlt`）。
-fn serve_capture(monitors: &[Monitor], req: CaptureRequest) {
+///
+/// 先试实验性 DXGI（仅安全桌面 worker 启用，见 [`SecureDxgi`]）；未启用/失败才回退
+/// GDI `BitBlt`——后者在安全桌面上是唯一**可靠**的路径，因此永远是兜底。
+fn serve_capture(
+    monitors: &[Monitor],
+    secure: &mut SecureDxgi,
+    shared: &Shared,
+    req: CaptureRequest,
+) {
     // 解构取走 `reply`（`Sender::send` 只借 `&self`，不解构的话 `req` 不会被消耗）。
     let CaptureRequest { display, reply } = req;
-    let result = match monitors.iter().find(|m| m.id == display) {
-        Some(monitor) => capture::capture_monitor(monitor)
-            .map(|frame| RawFrame {
-                display,
-                width: frame.width,
-                height: frame.height,
-                rgba: frame.rgba(),
-                gpu: None,
-                // GDI `BitBlt` 没有合成器变化信号，按旧语义恒为「可能变化」。
-                changed: true,
-                // 也没有便宜的像素级变化面积：按满帧处理（不压制码率）。
-                changed_permille: 1000,
-            })
-            .map_err(platform_err),
-        None => Err(RemoteError::Platform(format!("显示器 {display} 不存在"))),
+    let Some(monitor) = monitors.iter().find(|m| m.id == display) else {
+        let _ = reply.send(Err(RemoteError::Platform(format!(
+            "显示器 {display} 不存在"
+        ))));
+        return;
     };
+    // 有输入待注入时**本轮不试 DXGI**：这条 worker 同时承担注入，而 DXGI 的首帧/重建
+    // 可能阻塞 2 秒以上（见 [`SecureDxgi`]）——登录界面打字的手感优先，下一拍没输入
+    // 时再回到 DXGI。
+    let dxgi = if shared.has_pending_input() {
+        None
+    } else {
+        secure.capture(display, monitors)
+    };
+    if let Some(frame) = dxgi {
+        // 遥测如实：这一帧真的来自 DXGI。
+        shared.set_secure_backend(true);
+        let _ = reply.send(Ok(frame));
+        return;
+    }
+    // 回退帧（包括「实验开关没开」的常态）：口径回到 BitBlt。
+    shared.set_secure_backend(false);
+    let result = capture::capture_monitor(monitor)
+        .map(|frame| RawFrame {
+            display,
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.rgba(),
+            gpu: None,
+            // GDI `BitBlt` 没有合成器变化信号，按旧语义恒为「可能变化」。
+            changed: true,
+            // 也没有便宜的像素级变化面积：按满帧处理（不压制码率）。
+            changed_permille: 1000,
+        })
+        .map_err(platform_err);
     // 接收端可能已超时放弃（`recv_timeout`）；发送失败不是错误。
     let _ = reply.send(result);
+}
+
+/// 安全桌面（`Winlogon` / `Screen-saver`）上的**实验性** DXGI 采集。
+///
+/// # 为什么是「实验性、机会主义」
+///
+/// 安全桌面上 WGC 不可用（捕获项依赖会话的合成器），而 DXGI Desktop Duplication
+/// 能不能用取决于驱动与系统：公开实现里有人成功，也有人一律
+/// `DXGI_ERROR_ACCESS_DENIED`。所以这里**只在显式打开开关时**尝试
+/// （`RUST_TUNNEL_SECURE_DXGI`，默认关），任何失败立刻回 GDI `BitBlt`，并在本
+/// worker 生命周期内限次放弃——它不能让「登录界面本来就慢」变得更慢。
+///
+/// # 明确的范围
+///
+/// 只做 **CPU 回读**（[`video_capture::CaptureSource::capture`] → BGRA），**不碰**
+/// GPU 纹理 / 零拷贝：安全桌面上没有可用的硬件编码路径，这条路径的收益只是
+/// 「DXGI 回读比 GDI `BitBlt` 快」，不是编码链路升级。因此 `RawFrame.gpu` 恒为
+/// `None`，引擎的 `gpu_capture` 也保持 `false`。
+///
+/// # 状态归属
+///
+/// 全部字段都属于**这一条 worker 线程**（不跨线程、不加锁）：worker 在桌面切换时
+/// 本来就会被销毁重建，下次锁屏会重新给 DXGI 一次机会。
+struct SecureDxgi {
+    /// 本 worker 是否启用（开关打开 **且** 目标桌面不是 `Default`）。
+    enabled: bool,
+    /// 已打开的 DXGI 采集源（懒打开）。
+    source: Option<Box<dyn video_capture::CaptureSource>>,
+    /// 当前源绑定的实例显示器 id（控制器切显示器时必须重开）。
+    display: Option<u32>,
+    /// 连续失败次数（成功一帧清零）。
+    failures: u32,
+    /// 重试退避截止时刻：之前不再尝试（避免每次采集都去撞同一个失败）。
+    retry_at: Option<Instant>,
+    /// 连续失败到上限后置位：本 worker 剩余生命周期内不再尝试。
+    disabled: bool,
+}
+
+impl SecureDxgi {
+    /// 由目标桌面构造（**每个 worker 启动时读一次环境变量**）。
+    fn for_worker(target: FollowDesktop) -> Self {
+        // `Default` 桌面不启用：那条路径由 `win_hybrid` 的 WGC/DXGI + GPU 纹理负责，
+        // 这里再叠一层只会打架。
+        let enabled = target != FollowDesktop::Default && env_flag("RUST_TUNNEL_SECURE_DXGI");
+        if enabled {
+            tracing::info!(
+                desktop = target.as_str(),
+                "安全桌面 DXGI 采集已开启（实验性：CPU 回读，失败回退 GDI BitBlt）"
+            );
+        }
+        Self {
+            enabled,
+            source: None,
+            display: None,
+            failures: 0,
+            retry_at: None,
+            disabled: false,
+        }
+    }
+
+    /// 尝试用 DXGI 采一帧；任何失败（或不该尝试）都返回 `None`，由调用方回 BitBlt。
+    fn capture(&mut self, display_id: u32, monitors: &[Monitor]) -> Option<RawFrame> {
+        if !self.enabled || self.disabled {
+            return None;
+        }
+        // 控制器切了显示器：旧源绑的是另一块 DXGI 输出，必须重开。失败计数与退避
+        // 按显示器重新记账（那是另一块屏的账），但 `disabled` **刻意不重置**——
+        // 它是 **worker 级**的「这条实验路径已经卡过太久，本 worker 内不再试」，
+        // 换显示器不该让登录界面再挨一次 2 秒的阻塞。
+        if self.display != Some(display_id) {
+            self.source = None;
+            self.display = Some(display_id);
+            self.failures = 0;
+            self.retry_at = None;
+        }
+        if self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return None;
+        }
+        if self.source.is_none() {
+            match Self::open(display_id, monitors) {
+                Ok(source) => self.source = Some(source),
+                Err(err) => {
+                    self.record_failure(display_id, &err);
+                    return None;
+                }
+            }
+        }
+        let source = self.source.as_mut()?;
+        let started = Instant::now();
+        match source.capture() {
+            Ok(frame) => {
+                // 成功一帧：清零失败计数与退避。
+                self.failures = 0;
+                self.retry_at = None;
+                Some(secure_frame(display_id, &frame))
+            }
+            Err(err) => {
+                let elapsed = started.elapsed();
+                if elapsed >= SECURE_DXGI_SLOW_FAILURE {
+                    // **慢失败立即放弃**：`capture()` 只在首帧超时（2s）或设备丢失后
+                    // 重建等待时才会卡这么久。这条 worker 同时承担注入，再来两次
+                    // 意味着登录界面打字被反复卡 2 秒——本 worker 内直接不再试。
+                    self.source = None;
+                    if !self.disabled {
+                        self.disabled = true;
+                        tracing::warn!(
+                            display_id,
+                            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                            error = %err,
+                            "安全桌面 DXGI 采集慢失败，本 worker 剩余生命周期回退 GDI BitBlt"
+                        );
+                    }
+                } else {
+                    self.record_failure(display_id, &err.to_string());
+                }
+                None
+            }
+        }
+    }
+
+    /// 懒打开目标显示器的 DXGI 采集源。
+    fn open(
+        display_id: u32,
+        monitors: &[Monitor],
+    ) -> Result<Box<dyn video_capture::CaptureSource>, String> {
+        let enumerated = video_capture::enumerate_monitors()
+            .map_err(|err| format!("win-video 枚举显示器失败: {err}"))?;
+        let info = match_video_monitor(display_id, monitors, &enumerated)
+            .ok_or_else(|| format!("显示器 {display_id} 没有对应的 DXGI 输出"))?;
+        video_capture::open_dxgi(info).map_err(|err| format!("打开 DXGI 采集源失败: {err}"))
+    }
+
+    /// 记一次失败：丢源、退避、累计到上限后放弃（本 worker 内）。
+    fn record_failure(&mut self, display_id: u32, error: &str) {
+        self.source = None;
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(Instant::now() + SECURE_DXGI_RETRY);
+        if self.failures >= SECURE_DXGI_MAX_FAILURES {
+            if !self.disabled {
+                self.disabled = true;
+                tracing::warn!(
+                    display_id,
+                    failures = self.failures,
+                    error,
+                    "安全桌面 DXGI 采集连续失败，本 worker 剩余生命周期回退 GDI BitBlt"
+                );
+            }
+        } else {
+            tracing::debug!(
+                display_id,
+                failures = self.failures,
+                error,
+                "安全桌面 DXGI 采集失败，本帧回退 GDI BitBlt"
+            );
+        }
+    }
+}
+
+/// 读一个布尔型现场开关：**未设置 / 空串 / `"0"` 为关闭**，其它值为开启。
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| {
+        let text = value.to_string_lossy();
+        let text = text.trim();
+        !text.is_empty() && text != "0"
+    })
+}
+
+/// 实例显示器 id → win-video 的显示器枚举项（**几何匹配优先、枚举下标兜底**）。
+///
+/// 两套枚举都源自 `EnumDisplayMonitors` 且跑在同一个进程（DPI 感知上下文一致），
+/// 几何通常逐值相同；复用 [`instance_gpu::map_display_ids`] 保证与 `win_hybrid` 的
+/// id 映射规则完全一致（包括「同一条候选只能被一个显示器认领」）。
+fn match_video_monitor<'a>(
+    display_id: u32,
+    monitors: &[Monitor],
+    candidates: &'a [video_capture::MonitorInfo],
+) -> Option<&'a video_capture::MonitorInfo> {
+    let platform: Vec<(u32, Geometry)> = monitors
+        .iter()
+        .map(|monitor| {
+            (
+                monitor.id,
+                Geometry {
+                    x: monitor.origin_x,
+                    y: monitor.origin_y,
+                    width: monitor.width,
+                    height: monitor.height,
+                },
+            )
+        })
+        .collect();
+    let video: Vec<(u32, Geometry)> = candidates
+        .iter()
+        .filter_map(|monitor| {
+            Some((
+                u32::try_from(monitor.index).ok()?,
+                Geometry {
+                    x: monitor.left,
+                    y: monitor.top,
+                    width: monitor.width,
+                    height: monitor.height,
+                },
+            ))
+        })
+        .collect();
+    let mapped = instance_gpu::map_display_ids(&platform, &video)
+        .get(&display_id)
+        .copied()?;
+    candidates
+        .iter()
+        .find(|monitor| u32::try_from(monitor.index).ok() == Some(mapped))
+}
+
+/// DXGI 帧 → 引擎帧：按与 BitBlt 路径**一致**的规则封顶到
+/// [`MAX_ENCODE_WIDTH`](rust_tunnel_remote::video::MAX_ENCODE_WIDTH) 并转 RGBA。
+///
+/// 尺寸一律走 [`instance_gpu::clamp_dims`]（整数除法 + 偶数对齐）：`win_hybrid` 的
+/// BitBlt 路径用的是同一个纯函数，两条路径逐像素一致——否则来回切换时尺寸差 1–2 像素
+/// 会触发编码器重建 + IDR。
+///
+/// 缩放失败（极少见）时按**原始尺寸**交付：两个返回尺寸必须与 `rgba` 的实际长度
+/// 一致，否则编码器会按错尺寸解像素——宁可慢，不可错。
+fn secure_frame(display_id: u32, frame: &video_capture::CapturedFrame) -> RawFrame {
+    let max = rust_tunnel_remote::video::MAX_ENCODE_WIDTH;
+    let (width, height) = instance_gpu::clamp_dims(frame.width, frame.height, max);
+    let (width, height, rgba) = if (width, height) == (frame.width, frame.height) {
+        (width, height, bgra_to_rgba(&frame.bgra))
+    } else {
+        match scale_bgra_to_rgba(&frame.bgra, frame.width, frame.height, width, height) {
+            Ok(rgba) => (width, height, rgba),
+            Err(err) => {
+                tracing::debug!(error = %err, "安全桌面 DXGI 帧缩放失败，按原尺寸交付");
+                (frame.width, frame.height, bgra_to_rgba(&frame.bgra))
+            }
+        }
+    };
+    RawFrame {
+        display: display_id,
+        width,
+        height,
+        rgba,
+        // 明确：这条路径只有 CPU 回读，没有零拷贝。
+        gpu: None,
+        // DXGI 回读没有合成器变化信号（也省掉逐帧 memcmp），按「可能变化」处理。
+        changed: true,
+        changed_permille: 1000,
+    }
 }
 
 /// 服务一次剪贴板请求（在**本线程**上读写本机剪贴板）。
@@ -760,12 +1083,18 @@ impl ScreenSource for WinScreen {
         self.io.capture(display)
     }
 
-    /// 被控端遥测口径：**这条源只负责 BitBlt**（安全桌面与所有回退场景），没有
-    /// GPU 采集也没有适配器可言。`Default` 桌面的 WGC/DXGI 遥测由
+    /// 被控端遥测口径：这条源负责 `BitBlt`（安全桌面与所有回退场景），**除了**
+    /// 实验性安全桌面 DXGI 真正产出过帧的情况——那时如实报 `DXGI`（仍是 CPU 回读，
+    /// 没有零拷贝，`gpu_capture` 保持 `false`）。`Default` 桌面的 WGC/DXGI 遥测由
     /// `win_hybrid` 按最近一帧的实际来源选择。
     fn capture_info(&self) -> CaptureInfo {
+        let backend = if self.io.secure_backend() {
+            "DXGI"
+        } else {
+            "BitBlt"
+        };
         CaptureInfo {
-            backend: "BitBlt".to_owned(),
+            backend: backend.to_owned(),
             ..CaptureInfo::default()
         }
     }

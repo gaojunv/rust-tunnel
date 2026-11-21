@@ -16,8 +16,11 @@
 //! 1. **安全桌面绝不尝试 GPU**。那里 WGC/DXGI 拿不到帧或返回
 //!    `DXGI_ERROR_ACCESS_LOST`；实例走的是严格版采集 API（失败不写进程级禁用），
 //!    但白试只会浪费帧并污染遥测。
-//! 2. **会话级锁存**（见 [`super::instance_gpu`]）：编码器在第一次编码时按当时的
-//!    采集设备定型。第一帧没拿到 GPU 纹理，本会话就再也不能交 GPU 帧。
+//! 2. **会话级锁存要区分「桌面阻塞」与「真实失败」**（见 [`super::instance_gpu`]）：
+//!    编码器在第一次编码时按当时的采集设备定型，所以「真实失败后绝不交 GPU 帧」这条
+//!    仍然无条件成立；但「会话建立时人还没登录」只是**没机会试**，登录回到 `Default`
+//!    后由 [`HybridScreen::gpu_capture_ready`] 让引擎在**同一场会话**里升级到 GPU
+//!    采集（编码任务在首张 GPU 帧上丢弃 CPU 输入编码器、重建并强制 IDR）。
 //! 3. **如实上报**：`capture_info()` 只报**最近一帧真正用过**的后端；BitBlt 帧
 //!    之后不能继续显示 WGC/DXGI 或 `gpu_capture = true`。
 //!
@@ -34,10 +37,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rust_tunnel_remote::screen::{CaptureInfo, CapturedPatches, CursorShape};
-use rust_tunnel_remote::{DisplayInfo, RawFrame, RemoteError, RemoteResult, ScreenSource};
+use rust_tunnel_remote::{DisplayInfo, RawFrame, RemoteResult, ScreenSource};
 
 use super::desktop_follow::FollowDesktop;
-use super::instance_gpu::{self, DesktopSlot, Geometry, LastSource, SessionGpu};
+use super::instance_gpu::{self, DesktopSlot, Geometry, GpuRetryBudget, LastSource, SessionGpu};
 use super::win_desktop::{Shared, WinScreen};
 use super::win_video::WinVideoScreen;
 
@@ -49,13 +52,6 @@ const XCAP_MAP_TTL: Duration = Duration::from_secs(2);
 
 /// GPU 采集失败日志的限频间隔（失败路径可能每帧触发，不能刷屏）。
 const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
-
-/// 第一帧显示器 id 映射失败时的短重试次数。
-///
-/// 前两次**返回错误**而不是交 CPU 帧：编码器还没创建，让引擎跳过这一帧、下一帧
-/// 重试；一旦交了 CPU 帧，编码器就会按 CPU 输入定型，本会话再也回不到 GPU
-/// （见 [`SessionGpu`] 的锁存规则）。超过上限才 latch 成 `Disabled` 并回退 BitBlt。
-const MAP_RETRY_LIMIT: u32 = 3;
 
 /// 混合采集源（实例模式）。
 pub(super) struct HybridScreen {
@@ -83,8 +79,11 @@ struct HybridState {
     xcap_monitor_count: usize,
     /// 上次 GPU 失败日志的时刻（限频）。
     last_error_log: Option<Instant>,
-    /// 连续「显示器 id 映射不到 xcap」的次数（见 [`MAP_RETRY_LIMIT`]）。
-    map_failures: u32,
+    /// `Unknown` 状态下 GPU 失败的短重试预算（见 [`GpuRetryBudget`]）。
+    ///
+    /// 登录后刚切回 `Default` 的第一拍很容易失败，一次就锁死会让引擎（它此时
+    /// `gpu_capture` 已是 true、不再轮询 `gpu_capture_ready()`）永久停在 BitBlt。
+    retry: GpuRetryBudget,
     /// **最近一帧/一批**实际由哪个源产出。`capture_info()` 据此避免虚报后端。
     last_source: LastSource,
 }
@@ -100,7 +99,7 @@ impl Default for HybridState {
             xcap_checked: None,
             xcap_monitor_count: 0,
             last_error_log: None,
-            map_failures: 0,
+            retry: GpuRetryBudget::new(),
             last_source: LastSource::BitBlt,
         }
     }
@@ -138,10 +137,12 @@ impl HybridScreen {
         (kind, DesktopSlot::from_follow(kind))
     }
 
-    /// 观察桌面变化；离开 `Default` 时释放 WGC/DXGI 采集源。
+    /// 观察桌面变化；离开 `Default` 时释放 WGC/DXGI 采集源，回到 `Default` 时
+    /// 重新武装「只是桌面阻塞」的会话。
     ///
-    /// **会话锁存不在这里改**：已经 `Enabled` 的会话要活过「锁屏 → 解锁」，而
-    /// 第一帧就加密的决定由 [`SessionGpu::on_attempt_blocked`] 负责。
+    /// 已经 `Enabled` 的会话要活过「锁屏 → 解锁」，这里不动它；第一帧就加密的决定由
+    /// [`SessionGpu::on_attempt_blocked`] 负责。`rearm` 只把 [`SessionGpu::DesktopBlocked`]
+    /// 放回 `Unknown`（幂等），真实失败（`Disabled`）绝不受影响。
     fn observe_desktop(&self, state: &mut HybridState, kind: Option<FollowDesktop>) {
         if state.last_desktop == kind {
             return;
@@ -159,6 +160,14 @@ impl HybridScreen {
                 );
             }
             (_, Some(FollowDesktop::Default)) => {
+                // 回到 Default：把「会话建立时人还没登录、根本没试过 GPU」的会话放回
+                // 可尝试状态，引擎随后经 `gpu_capture_ready` 在**同一场会话**里升级。
+                // 启动竞态（会话建立时 worker 还没发布桌面 → `begin(.., Secure)`）也靠
+                // 这条恢复：`last_desktop` 从 `None` 走到 `Some(Default)` 同样命中这里。
+                state.session.rearm(DesktopSlot::Default);
+                // 换了一个桌面阶段，重试预算从头开始（此前在 Default 上耗尽的失败
+                // 不该拖累新的解锁周期）。
+                state.retry.reset();
                 tracing::info!("输入桌面回到 Default，实例采集启用 WGC/DXGI（采集源懒惰重开）");
             }
             _ => {}
@@ -222,7 +231,7 @@ impl HybridScreen {
             state.xcap_ids = instance_gpu::map_display_ids(&monitors, &candidates);
             state.xcap_monitor_count = monitors.len();
             // 枚举失败（空表）不缓存：下一帧立刻重试，别让一次瞬时失败把整个
-            // 会话锁成 CPU（调用方还有 [`MAP_RETRY_LIMIT`] 的短重试）。
+            // 会话锁成 CPU（调用方有 [`GpuRetryBudget`] 的短重试）。
             state.xcap_checked = (!candidates.is_empty()).then(Instant::now);
         }
         state.xcap_ids.get(&display).copied()
@@ -260,25 +269,30 @@ fn enumerate_xcap() -> Vec<(u32, Geometry)> {
 /// 但 BitBlt 是纯 CPU 路径，4K 每帧 33 MB 的 RGBA 上传/转换/编码换不来任何画质收益
 /// （安全桌面是静止画面）。缩到 1920 既保住文字可读性，又让 CPU 侧成本回到 1080p 量级。
 ///
+/// 尺寸一律走 [`instance_gpu::clamp_dims`]：安全桌面的实验性 DXGI 路径用的是同一个纯函数，
+/// 两条路径必须逐像素一致——否则来回切换会因尺寸差 1–2 像素触发编码器重建 + IDR。
+///
 /// GPU 帧与已经不超过上限的帧原样返回；缩放失败时也原样返回（宁可慢，不可丢画面）。
 fn clamp_bitblt_frame(frame: RawFrame) -> RawFrame {
     let max = rust_tunnel_remote::video::MAX_ENCODE_WIDTH;
-    if frame.gpu.is_some() || frame.rgba.is_empty() || frame.width <= max {
+    if frame.gpu.is_some() || frame.rgba.is_empty() {
         return frame;
     }
-    let height = u32::try_from(
-        u64::from(frame.height).saturating_mul(u64::from(max)) / u64::from(frame.width.max(1)),
-    )
-    .unwrap_or(frame.height)
-    .max(2)
-    & !1;
-    let Ok(rgba) =
-        rust_tunnel_win_video::pixels::scale_rgba_box(&frame.rgba, frame.width, frame.height, max, height)
-    else {
+    let (width, height) = instance_gpu::clamp_dims(frame.width, frame.height, max);
+    if (width, height) == (frame.width, frame.height) {
+        return frame;
+    }
+    let Ok(rgba) = rust_tunnel_win_video::pixels::scale_rgba_box(
+        &frame.rgba,
+        frame.width,
+        frame.height,
+        width,
+        height,
+    ) else {
         return frame;
     };
     RawFrame {
-        width: max,
+        width,
         height,
         rgba,
         ..frame
@@ -306,7 +320,13 @@ impl ScreenSource for HybridScreen {
     fn capture(&self, display_id: u32) -> RemoteResult<RawFrame> {
         // 进程级 GPU 路径被禁用（环境变量 `RUST_TUNNEL_DISABLE_GPU_CAPTURE` 或一次
         // 真实失败）时连 WGC 的 CPU 回读也不走——现场需要一个**确定**的 BitBlt 兜底。
-        if !self.gpu.supports_gpu_capture() {
+        //
+        // 这里用**无副作用**的 `gpu_path_available()`：`supports_gpu_capture()` 会把
+        // `encode_gpu_ok` 重置为 `true`，那是「会话开始、重新乐观尝试」的语义，只有
+        // [`Self::supports_gpu_capture`] 每会话调一次时才允许用；在逐帧路径上调用会把
+        // 编码任务刚写下的「只能 CPU 输入」结论冲掉，实例路径会陷入
+        // 「编码失败 → 重建 → 再交 GPU 帧 → 再失败」的循环。
+        if !self.gpu.gpu_path_available() {
             return self.blit(display_id);
         }
         let (kind, slot) = self.current();
@@ -349,15 +369,43 @@ impl ScreenSource for HybridScreen {
     /// 会话开始时的 GPU 能力判定（引擎每会话调用一次）。
     ///
     /// 只有「平台支持 **且** 当前在 `Default`」才返回 true；返回 true 时把会话
-    /// 状态置为 `Unknown`，等第一帧的实际结果把它定格。
+    /// 状态置为 `Unknown`，等第一帧的实际结果把它定格。**登录界面上的会话**返回
+    /// false（状态是 `DesktopBlocked`），由 [`Self::gpu_capture_ready`] 在登录后
+    /// 唤醒——不必重连。
+    ///
+    /// **这是唯一允许重置 `encode_gpu_ok` 的地方**（`self.gpu.supports_gpu_capture()`
+    /// 会把它置回 `true`）。逐帧路径（`capture` / `capture_gpu` / `gpu_capture_ready`）
+    /// 一律用无副作用的 [`WinVideoScreen::gpu_path_available`]，否则编码任务写下的
+    /// 「只能 CPU 输入」结论会被每帧冲掉。
     fn supports_gpu_capture(&self) -> bool {
         let (kind, slot) = self.current();
         let capable = self.gpu.supports_gpu_capture();
         let mut state = self.lock();
         self.observe_desktop(&mut state, kind);
         state.session = SessionGpu::begin(capable, slot);
-        state.map_failures = 0;
+        // 新会话：重试预算从头开始。
+        state.retry.reset();
         capable && slot == DesktopSlot::Default
+    }
+
+    /// 会话**中途**能否升级到 GPU 采集（引擎逐拍轮询，必须无副作用）。
+    ///
+    /// **绝不能**在这里调 `self.gpu.supports_gpu_capture()`：它会重置
+    /// `encode_gpu_ok`（那是「会话开始，重新乐观尝试」的语义），逐拍调用会把编码任务
+    /// 刚写下的「只能 CPU 输入」结论冲掉。这里只用无副作用的
+    /// [`WinVideoScreen::gpu_path_available`] 与进程内 hint。
+    ///
+    /// 结果只有在会话状态是 `Unknown`/`Enabled`（`rearm` 之后）、当前桌面是
+    /// `Default`、且 GPU 路径与 GPU 纹理输入都可用时才为 true。
+    fn gpu_capture_ready(&self) -> bool {
+        let (kind, slot) = self.current();
+        let ready = {
+            let mut state = self.lock();
+            // 先更新桌面：从安全桌面回到 `Default` 的那一拍会 `rearm` 到 `Unknown`。
+            self.observe_desktop(&mut state, kind);
+            state.session.should_attempt(slot)
+        };
+        ready && self.gpu.gpu_path_available() && super::win_video::encode_gpu_input_available()
     }
 
     /// GPU 纹理采集（H.264 + 会话允许时由引擎调用）。
@@ -368,7 +416,10 @@ impl ScreenSource for HybridScreen {
             self.observe_desktop(&mut state, kind);
             // 进程级 GPU 路径可能在会话中途被禁用（环境变量/一次真实失败）。那时
             // 编码器下一次重建会按 CPU 输入创建，绝不能再交 GPU 帧。
-            if !self.gpu.supports_gpu_capture() {
+            //
+            // **只读** `gpu_path_available()`：这里也是逐帧路径，不能调
+            // `supports_gpu_capture()`（它会重置 `encode_gpu_ok`，见 `capture()` 的说明）。
+            if !self.gpu.gpu_path_available() {
                 if state.session != SessionGpu::Disabled {
                     tracing::info!("GPU 采集路径已被进程级禁用，实例本会话回退 GDI BitBlt");
                 }
@@ -384,23 +435,21 @@ impl ScreenSource for HybridScreen {
                 state.session = SessionGpu::Disabled;
             }
             if state.session.should_attempt(slot) {
-                if let Some(mapped) = self.xcap_id_with(&mut state, display_id) {
-                    state.map_failures = 0;
+                // `Unknown` 的短重试冷却期：本帧直接 BitBlt，不去撞同一个失败。
+                // 登录后刚回到 Default 时采集源需要几拍才稳定；一次失败就锁死会让
+                // 本场会话永久停在 BitBlt（引擎此时 `gpu_capture` 已是 true，不会再
+                // 轮询 `gpu_capture_ready()`）。
+                if state.session == SessionGpu::Unknown && !state.retry.allowed(Instant::now()) {
+                    None
+                } else if let Some(mapped) = self.xcap_id_with(&mut state, display_id) {
                     Some(mapped)
                 } else {
-                    state.map_failures = state.map_failures.saturating_add(1);
-                    if state.session == SessionGpu::Unknown && state.map_failures < MAP_RETRY_LIMIT
+                    // 映射不到显示器：与采集失败同属「本拍不可用」。`Unknown` 走短重试
+                    // 预算（耗尽才锁死），`Enabled` 只本帧回 BitBlt。
+                    if state.session == SessionGpu::Unknown
+                        && state.retry.note_failure(Instant::now())
                     {
-                        // 第一帧还没交出去：返回错误让引擎跳过这一帧、下一帧重试。
-                        // 绝不能交 CPU 帧——那会让编码器按 CPU 输入定型，本会话再也
-                        // 回不到 GPU。
-                        return Err(RemoteError::Platform(
-                            "显示器 id 映射暂不可用，下一帧重试".to_owned(),
-                        ));
-                    }
-                    // 重试耗尽（或已经 Enabled）：latch 成 CPU / 本帧回退 BitBlt。
-                    if state.session == SessionGpu::Unknown {
-                        state.session = SessionGpu::Disabled;
+                        state.session.on_gpu_failure();
                     }
                     tracing::debug!(
                         display_id,
@@ -424,6 +473,7 @@ impl ScreenSource for HybridScreen {
                 frame.display = display_id;
                 let mut state = self.lock();
                 state.session.on_gpu_success();
+                state.retry.note_success();
                 state.last_error_log = None;
                 state.last_source = LastSource::GpuSource;
                 Ok(frame)
@@ -431,7 +481,16 @@ impl ScreenSource for HybridScreen {
             Err(err) => {
                 let log = {
                     let mut state = self.lock();
-                    state.session.on_gpu_failure();
+                    // `Unknown`（登录后第一拍）走短重试预算：几次失败内保持 `Unknown`、
+                    // 本帧回 BitBlt，耗尽才锁成 `Disabled`；`Enabled` 的偶发失败不降级
+                    // （编码器已按 GPU 设备建好，下一帧继续试）。
+                    if state.session == SessionGpu::Unknown {
+                        if state.retry.note_failure(Instant::now()) {
+                            state.session.on_gpu_failure();
+                        }
+                    } else {
+                        state.session.on_gpu_failure();
+                    }
                     let log = state
                         .last_error_log
                         .is_none_or(|at| at.elapsed() >= ERROR_LOG_INTERVAL);
