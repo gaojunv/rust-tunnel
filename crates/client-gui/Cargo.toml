@@ -32,7 +32,11 @@ name = "rust-tunnel-client-gui"
 #          与 0.24.0 可互控；`client` / `win-platform` / `win-service` 同步抬版。
 # 0.26.0 = 新增 FSR1（EASU+RCAS）放大算法并设为默认（会话设置「放大算法」可切回
 #          双线性+CAS）。两 pass、仅放大区间生效，协议不变，与 0.25.0 可互控。
-version = "0.26.0"
+# 0.27.0 = 频繁切换应用时的画面冻结/延迟尖峰修复（关键帧闸门死锁、QSV 无限 GOP、
+#          QoS 严重拥塞一步降档 + 重新操作突发封顶）。数据面仍是 v12、线上帧逐字节
+#          不变，0.26.0 ↔ 0.27.0 可互控；`client` / `win-platform` / `win-service`
+#          同步抬版。
+version = "0.27.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
