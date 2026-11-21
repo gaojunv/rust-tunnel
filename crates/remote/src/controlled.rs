@@ -2698,6 +2698,16 @@ pub(crate) async fn run_controlled_inner(
     // 会话循环只在看到它之后才切补丁模式（顺序不变量，见模块文档）。基准帧是 P 帧，
     // 所以信号不能只看 `keyframe`（见 [`encode_loop`]）。
     let base_frame_sent = Arc::new(AtomicBool::new(false));
+    // 「会话中途升级到 GPU 采集，编码器需要按新的采集设备重建」的信号。
+    //
+    // 不能只靠编码器自报的 `gpu_input`：NVENC 适配器恒报 `true`（它**能**吃纹理），但升级前
+    // 创建的那个实例绑的是 `gpu_context().device()` 当时的值（None 或旧会话的设备）；
+    // 首张 GPU 帧到达时 `NvencAdapter::is_same_device` 为 false，会永久走回读——
+    // 本场会话再也拿不到零拷贝。MFT 因 `gpu_input == false` 本来就会重建，但这里要覆盖两条。
+    //
+    // 只在**GPU 帧**上消费（见 [`encode_loop`]）：升级前编码队列里可能还压着 BitBlt 的
+    // CPU 帧，在那些帧上重建会用一个「还没有新采集设备」的时机。
+    let encoder_reset = Arc::new(AtomicBool::new(false));
     // 最近一次**真正编码出关键帧**的时刻（本端单调时钟微秒，见 [`crate::clock::now_us`]）。
     // 由编码任务写、主循环读，用来做周期性 IDR 兜底（[`PERIODIC_KEYFRAME_INTERVAL`]）。
     // 初值 0 = 「还没有关键帧」：主循环据此跳过判断，等首帧 IDR 把值写上。
@@ -2734,6 +2744,7 @@ pub(crate) async fn run_controlled_inner(
         Arc::clone(&screen_send_meter),
         Arc::clone(&base_frame_sent),
         Arc::clone(&last_keyframe_us),
+        Arc::clone(&encoder_reset),
         max_encode_width,
         Arc::clone(&encode_snapshot),
         Arc::clone(&latency_window),
@@ -3638,6 +3649,30 @@ pub(crate) async fn run_controlled_inner(
                 schedule_capture(&mut capture_tick, &mut next_capture_at, scheduled);
                 // 串行采集：上一次还没回来就跳过本轮，避免把阻塞线程池堆满。
                 if capture_deadline.is_none() {
+                    // 会话中途「GPU 采集自动升级」（Windows 无人值守实例的登录解锁）：
+                    // 会话建立时可能还在安全桌面（Winlogon），只有 GDI `BitBlt`；用户登录
+                    // 回到 Default 后采集侧才具备 WGC/DXGI 能力，这里让同一场会话切过去，
+                    // 不必重连。
+                    //
+                    // **只做 false → true 的升级**：`gpu_capture_ready()` 的默认实现恒 false，
+                    // 若无条件赋值（而不是只在 false 时查一次）会把别处刚打开的 GPU 采集打掉。
+                    // 首张 GPU 帧会由编码任务按新采集设备重建编码器并以 IDR 编码
+                    // （见 `encode_loop` 的 `encoder_reset` 一次性重建）。
+                    if !gpu_capture
+                        && matches!(codec, CodecId::H264 | CodecId::H265)
+                        && screen.gpu_capture_ready()
+                    {
+                        gpu_capture = true;
+                        // GPU 采集可用后补丁模式的前提（GPU 纹理 + 变化网格）才成立。
+                        if !patch_capable {
+                            patch_capable = screen.supports_patches();
+                        }
+                        // 升级前建的编码器可能绑着 `None`/旧会话的采集设备（NVENC 恒报
+                        // `gpu_input == true`，无法据此判断）：让编码任务在首张 GPU 帧上
+                        // 按新设备重建一次（`encoder_reset` 一次性信号）。
+                        encoder_reset.store(true, Ordering::Relaxed);
+                        info!("采集源已具备 GPU 能力，本会话切换为 GPU 纹理采集");
+                    }
                     capture_request_us = Some(crate::clock::now_us());
                     capture_generation = capture_generation.wrapping_add(1);
                     capture_deadline = Some(Instant::now() + config.capture_watchdog);
@@ -5488,6 +5523,9 @@ async fn encode_loop(
     base_frame_sent: Arc<AtomicBool>,
     // 最近一次真正编码出关键帧的时刻（微秒；0 = 还没有）。主循环据此做周期 IDR 兜底。
     last_keyframe_us: Arc<AtomicU64>,
+    // 「采集路径刚升级到 GPU，编码器必须按新采集设备重建」的一次性信号（主循环置位）。
+    // 只在 GPU 帧上消费一次，见循环体开头的说明。
+    encoder_reset: Arc<AtomicBool>,
     // 本会话的编码宽度上限（1920 或原生 3840，见 [`effective_max_encode_width`]）。
     // 与平台采集侧用的是**同一个值**，否则补丁尺寸与全帧尺寸会对不上。回退到 VP9 后
     // 这里会被本循环就地压回 [`MAX_ENCODE_WIDTH`]（主循环随后也会同步）。
@@ -5569,6 +5607,30 @@ async fn encode_loop(
             pending_keyframe |= force_keyframe;
             pending_encode |= force_encode && !force_keyframe;
             continue;
+        }
+        // **采集路径升级到 GPU 后重建编码器**（主循环在 `gpu_capture` false→true 时置位）。
+        //
+        // 为什么必须显式重建：升级前建的编码器可能绑着 `gpu_context().device() == None`
+        // （或旧会话的设备），而 NVENC 适配器恒报 `gpu_input == true`——之后
+        // `NvencAdapter::is_same_device` 一直为 false，本场会话永远退回回读、拿不回零拷贝。
+        //
+        // **不要用 `encoder_info.gpu_input` 当判据**：它的语义是「编码器绑定在 GPU 设备上」
+        // （遥测口径），不是「能不能吃 GPU 帧」。例如 `loopback_bench` 的 `MftAdapter` 在
+        // `gpu == false` 时会走回读编码并如实上报 false，按它丢帧只会变成隔帧丢弃 + 隔帧重建 +
+        // 全 IDR 风暴。真实的「吃不了纹理」由平台编码器自己的 `encode_frame` 返回 Err 处理
+        // （既有错误路径会丢编码器、下一帧重建）。
+        //
+        // **只在 GPU 帧上消费**：升级瞬间编码队列里可能还压着 BitBlt 的 CPU 帧，在那些帧上
+        // 重建会用「还没有新采集设备」的时机。**不要 `continue`**：让这一帧直接走下面的
+        // `encoder.is_none()` 创建路径，用刚采到的设备重建（NVENC 因此复用采集设备、恢复
+        // 零拷贝），并以 IDR 编码本帧（`pending_keyframe`）。
+        //
+        // 同一个原子 `swap` 只消费一次；GPU→CPU→GPU（锁屏/解锁）不会因它反复重建——
+        // 升级在会话内只发生一次。
+        if is_gpu && encoder_reset.swap(false, Ordering::Relaxed) {
+            encoder = None;
+            prev_rgba = None;
+            pending_keyframe = true;
         }
         // 变化判据分两条路：
         // - GPU：采集层已经做过**像素级**变化检测（`RawFrame::changed`），不做 CPU 读回比较。
@@ -6428,6 +6490,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -7138,6 +7202,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -7227,6 +7293,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -7390,6 +7458,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -7464,6 +7534,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -7957,6 +8029,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -8061,6 +8135,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -8161,6 +8237,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -8248,6 +8326,8 @@ mod tests {
             Arc::new(ScreenSendMeter::new()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            // 升级信号：测试里默认不置位（需要时各自构造并传入）。
+            Arc::new(AtomicBool::new(false)),
             MAX_ENCODE_WIDTH,
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
@@ -8304,6 +8384,139 @@ mod tests {
                 "第 {index} 帧保活补编必须是普通 P 帧（不得带出 IDR）"
             );
         }
+
+        drop(job_tx);
+        let _ = tokio::time::timeout(WAIT, task)
+            .await
+            .expect("编码任务应结束");
+    }
+
+    /// 计数工厂：每次 `create` 自增，编码器行为与 [`FakeH264Encoder`] 相同。
+    #[derive(Debug)]
+    struct CountingEncoderFactory {
+        created: Arc<AtomicU64>,
+    }
+
+    impl VideoEncoderFactory for CountingEncoderFactory {
+        fn codec(&self) -> CodecId {
+            CodecId::H264
+        }
+
+        fn create(
+            &self,
+            width: u32,
+            height: u32,
+            target_bitrate_kbps: u32,
+            max_fps: u8,
+        ) -> RemoteResult<Box<dyn VideoEncoderApi>> {
+            self.created.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(FakeH264Encoder {
+                width,
+                height,
+                bitrate: target_bitrate_kbps,
+                fps: u32::from(max_fps),
+                log: None,
+            }))
+        }
+    }
+
+    /// **升级信号只消费一次**：采集从 BitBlt 切到 GPU 后，编码任务必须在**首张 GPU 帧**上
+    /// 重建编码器（NVENC 恒报 `gpu_input == true`，不会被 CPU 输入兜底重建；它绑着的可能是
+    /// 升级前的 `None`/旧设备，不重建就永远回读、拿不回零拷贝），并且此后不再反复重建
+    /// （锁屏/解锁的 GPU→CPU→GPU 不该每轮重插 IDR）。
+    #[tokio::test]
+    async fn gpu_upgrade_rebuilds_encoder_exactly_once_on_the_first_gpu_frame() {
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(8);
+        let (job_tx, job_rx) = mpsc::channel::<EncodeJob>(4);
+        let cancel = CancellationToken::new();
+        let created = Arc::new(AtomicU64::new(0));
+        let reset = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(encode_loop(
+            job_rx,
+            out_tx,
+            cancel.clone(),
+            SessionStatsReporter::noop(),
+            CodecId::H264,
+            Arc::new(CountingEncoderFactory {
+                created: Arc::clone(&created),
+            }),
+            Duration::from_secs(3600),
+            Arc::new(ScreenSendMeter::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&reset),
+            MAX_ENCODE_WIDTH,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(latency::LatencyWindow::new())),
+            IdrTracker::new(),
+            no_fallback(CodecId::H264),
+        ));
+        let rates = EncodeRates::ceiling(EncodeOptions::default());
+        let job = |gpu: bool| EncodeJob {
+            display: 0,
+            rates,
+            keyframe_bitrate_kbps: rates.bitrate_kbps,
+            force_keyframe: false,
+            force_encode: false,
+            capture_us: 0,
+            capture_wait_us: None,
+            capture_ts_us: 0,
+            input_to_capture_us: None,
+            input_to_change_us: None,
+            frame: RawFrame {
+                display: 0,
+                width: 64,
+                height: 48,
+                rgba: if gpu {
+                    Vec::new()
+                } else {
+                    vec![0_u8; 64 * 48 * 4]
+                },
+                gpu: gpu.then(|| Arc::new(DummyGpuFrame) as Arc<dyn GpuFrame>),
+                changed: true,
+                changed_permille: 1000,
+            },
+        };
+
+        // 升级前：BitBlt 的 CPU 帧按 CPU 输入建编码器（第 1 个实例）。
+        job_tx.send(job(false)).await.expect("投递 CPU 帧");
+        assert!(
+            matches!(
+                out_rx.recv().await,
+                Some(SessionFrame {
+                    message: SessionMessage::ScreenConfig { .. },
+                    ..
+                })
+            ),
+            "首帧前应先下发 ScreenConfig"
+        );
+        let _ = next_video(&mut out_rx).await;
+        assert_eq!(created.load(Ordering::Relaxed), 1, "CPU 帧应建一个编码器");
+
+        // 主循环观察到采集升级：置位后，**首张 GPU 帧**上重建，并以 IDR 编码这一帧。
+        reset.store(true, Ordering::Relaxed);
+        job_tx
+            .send(job(true))
+            .await
+            .expect("投递升级后的首张 GPU 帧");
+        let (flags, ..) = next_video(&mut out_rx).await;
+        assert!(flags & VIDEO_FLAG_KEYFRAME != 0, "重建后的首帧必须是 IDR");
+        assert_eq!(
+            created.load(Ordering::Relaxed),
+            2,
+            "升级后必须按新采集设备重建一次编码器"
+        );
+        assert!(!reset.load(Ordering::Relaxed), "升级信号只消费一次");
+
+        // 后续 GPU 帧（锁屏/解锁再回到 GPU 也一样）：不再重建，也不再插 IDR。
+        job_tx.send(job(true)).await.expect("投递后续 GPU 帧");
+        let (flags, ..) = next_video(&mut out_rx).await;
+        assert_eq!(flags & VIDEO_FLAG_KEYFRAME, 0, "后续 GPU 帧应是普通 P 帧");
+        assert_eq!(
+            created.load(Ordering::Relaxed),
+            2,
+            "升级信号已消费，不得反复重建"
+        );
 
         drop(job_tx);
         let _ = tokio::time::timeout(WAIT, task)

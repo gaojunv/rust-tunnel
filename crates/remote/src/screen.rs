@@ -613,6 +613,31 @@ pub trait ScreenSource: Send + Sync + 'static {
         self.capture(display)
     }
 
+    /// 本采集源**现在**是否已能为本次会话改用 GPU 采集（默认 `false`）。
+    ///
+    /// # 与会话开始的 [`ScreenSource::supports_gpu_capture`] 的区别
+    ///
+    /// `supports_gpu_capture` 只在会话建立时调用**一次**，实现可以借机重置会话级状态
+    /// （例如 `WinVideoScreen` 会把「编码器能否吃 GPU 纹理」的 hint 重置为乐观值）。
+    /// **本方法由会话循环逐拍轮询，必须无副作用**：不得重置任何能力标志、不得打开
+    /// 设备、不得做阻塞调用。默认实现恒 `false` 表示「不支持会话中途升级」。
+    ///
+    /// # 引擎怎么用它
+    ///
+    /// 引擎只在当前 `gpu_capture == false`、codec 是 H.264/H.265 时调用它，且**只做
+    /// false → true 的升级**（绝不反向关闭已打开的 GPU 采集）：升级后下一拍起改走
+    /// [`ScreenSource::capture_gpu`]。
+    ///
+    /// # 典型场景
+    ///
+    /// Windows 无人值守实例在登录界面（`Winlogon` 安全桌面）建立会话时只有 GDI
+    /// `BitBlt`；用户登录回到 `Default` 桌面后本方法转为 `true`，**同一场会话**不必
+    /// 重连就能切到 WGC/DXGI + GPU 纹理（编码器由编码任务在首张 GPU 帧上按新采集设备
+    /// 重建一次）。
+    fn gpu_capture_ready(&self) -> bool {
+        false
+    }
+
     /// 本采集源是否支持**脏矩形补丁**（默认 `false`）。
     ///
     /// 引擎只在协商到 H.264、且本方法为真、且画面活跃度足够低时才进入补丁模式。VP9 路径

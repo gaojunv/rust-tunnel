@@ -56,6 +56,19 @@ SCM ──启动──> rust-tunnel-client-service.exe --run        (SYSTEM / �
 > 遥测会如实显示最近一帧的后端（`采集方式` / `采集耗时` / `GPU 零拷贝（采集）`）。
 > 现场需要**强制回 BitBlt** 时，给实例进程设 `RUST_TUNNEL_DISABLE_GPU_CAPTURE=1`
 > （服务模式下写进服务环境/重启服务；它会同时关掉 GPU 纹理与 WGC 的 CPU 回读）。
+>
+> **登录后自动升级（2026-11-21）**：会话在登录界面建立时只有 BitBlt，但「桌面不对」
+> 不再等于「整个会话放弃 GPU」。用户登录回到 `Default` 后，引擎经
+> `ScreenSource::gpu_capture_ready` 把**同一场会话**切到 WGC/DXGI + GPU 纹理
+> （编码任务在首张 GPU 帧上丢弃按 CPU 输入建好的编码器、重建并强制 IDR）；
+> **真实失败与平台不支持仍然永久锁死**，只有「只是没机会试」才恢复。
+>
+> **安全桌面实验开关 `RUST_TUNNEL_SECURE_DXGI`（默认关）**：置任意非空且非 `0`
+> 的值后，挂在 `Winlogon`/`Screen-saver` 上的 worker 会**机会主义地**试 DXGI
+> Desktop Duplication（**CPU 回读，没有零拷贝**）以替代 GDI BitBlt。能否成功取决于
+> 驱动/系统（公开实现里有人成功、也有人一律 `ACCESS_DENIED`）；打开/采集失败 2 秒
+> 后重试，连续失败 3 次即在本 worker 内放弃并回 BitBlt，遥测的「采集方式」会如实显示
+> `DXGI` 或 `BitBlt`。**尚未在真机上验证**，默认关闭。
 
 **装它（推荐：一个 zip + GUI 里点一下）**：
 

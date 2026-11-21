@@ -311,6 +311,22 @@ impl WinVideoScreen {
         self.max_encode_width.load(Ordering::Relaxed)
     }
 
+    /// GPU 路径是否仍可用（**无副作用**）。
+    ///
+    /// 与 [`ScreenSource::supports_gpu_capture`] 的区别：后者是「会话开始，把
+    /// `encode_gpu_ok` 重置为乐观值再回答」，只能每会话调一次；本方法只读进程级
+    /// 禁用标志，可以逐拍轮询（见 `ScreenSource::gpu_capture_ready`）。
+    ///
+    /// 取 `&self` 是为了和 `ScreenSource` 上的其余能力判定保持同一套调用形态
+    /// （调用方手里总是 `&WinVideoScreen`），实现本身不需要实例字段。
+    #[expect(
+        clippy::unused_self,
+        reason = "按能力判定的调用形态保留 &self，与 ScreenSource 的 supports_* 一致"
+    )]
+    pub(crate) fn gpu_path_available(&self) -> bool {
+        !gpu_context().is_disabled()
+    }
+
     /// 在缓存/重建好的采集源上执行一次操作。
     ///
     /// 采集源缓存命中且校验未过期时**不枚举任何显示器**，直接调用；否则重新
@@ -661,6 +677,16 @@ impl ScreenSource for WinVideoScreen {
         gpu_context().set_encode_gpu_ok(true);
         // 环境变量在 `gpu_context()` 初始化时已折算进 `disabled`。
         !gpu_context().is_disabled()
+    }
+
+    /// 会话中途能否升级到 GPU 采集（引擎逐拍轮询）。
+    ///
+    /// GUI 路径在会话开始时 `supports_gpu_capture` 已经乐观地打开了 GPU 采集，所以
+    /// 这里通常只是重复回答；真正用得到它的是实例混合采集（它另有一层桌面/会话
+    /// 锁存，见 `remote::win_hybrid`）。**绝不能**调 `supports_gpu_capture`——那会
+    /// 逐拍重置 `encode_gpu_ok`，把编码任务的「只能 CPU 输入」结论冲掉。
+    fn gpu_capture_ready(&self) -> bool {
+        self.gpu_path_available() && encode_gpu_input_available()
     }
 
     fn capture_gpu(&self, display_id: u32) -> RemoteResult<RawFrame> {
