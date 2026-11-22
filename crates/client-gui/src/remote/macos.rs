@@ -1,7 +1,7 @@
 //! macOS 平台层：权限探测与系统设置跳转。
 //!
-//! 截屏（`xcap`）与输入注入（`enigo`）的实体是三平台通用的（见 [`super::XcapScreen`] /
-//! [`super::EnigoInput`]），本模块只补 macOS 特有的两件事：
+//! 屏幕采集走 ScreenCaptureKit（`mac_capture`），输入注入走 `enigo`
+//! （[`super::EnigoInput`]）；本模块只补 macOS 特有的两件事：
 //!
 //! - **权限探测**：屏幕录制（`CGPreflightScreenCaptureAccess`）与辅助功能
 //!   （`AXIsProcessTrusted`）。缺失时不能静默黑屏，UI 必须提示并引导授权。

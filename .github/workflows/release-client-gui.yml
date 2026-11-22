@@ -172,6 +172,10 @@ jobs:
   build-gui-macos:
     needs: version
     runs-on: macos-latest
+    env:
+      # 远程控制最低支持 macOS 14（ScreenCaptureKit 音频 + H.265/VideoToolbox）。
+      # 显式抬高部署目标，避免链接 12.3+ 的 ScreenCaptureKit 时与 rustc 默认 11.0 冲突。
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

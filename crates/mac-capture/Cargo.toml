@@ -1,0 +1,28 @@
+[package]
+name = "rust-tunnel-mac-capture"
+version = "0.1.0"
+edition = "2021"
+description = "macOS 远程控制采集：ScreenCaptureKit 流式采集、变化检测、脏矩形补丁、远端光标"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+# 所有平台编译：纯逻辑（显示器几何/变化检测辅助）可单测；ScreenCaptureKit 只在
+# macOS 下编译，故 Windows/Linux 构建不带 objc2 依赖。
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+rust-tunnel-mac-video = { path = "../mac-video" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6"
+dispatch2 = "0.3.1"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"

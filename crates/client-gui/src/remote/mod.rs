@@ -3,8 +3,9 @@
 //! # 职责
 //!
 //! - **平台分派**：[`macos`] / [`windows`] / [`linux`] 只放各平台差异（权限探测、系统设置
-//!   跳转、平台名）。截屏（`xcap`）与输入注入（`enigo`）本身已由各自 crate 内部处理平台差异，
-//!   故实现为三平台通用代码，放在本模块（[`XcapScreen`] / [`EnigoInput`]）。
+//!   跳转、平台名）。输入注入三平台都是 [`EnigoInput`]（`enigo` 内部消化差异）；采集
+//!   按平台分派：Windows 用户会话走 `win_video`，macOS 走 `mac_capture`（ScreenCaptureKit），
+//!   其余平台走本模块的 [`XcapScreen`]。
 //! - **帧 → UI 通道**：[`GuiFrameSink`] 在引擎的运行时线程被调用，只把**已解码**帧塞进共享槽
 //!   并 `request_repaint`，绝不在该线程做解码/缩放。
 //! - **会话视图状态**：[`RemoteView`] 持有 egui 纹理与输入捕获的边沿状态（上一鼠标位置、
@@ -16,8 +17,10 @@
 pub mod clipboard_sync;
 pub mod desktop_follow;
 // 硬件编码器的进程级单槽复用池：Intel MFT 每实例约 15 MB 的驱动侧泄漏靠跨会话复用规避。
-// 只依赖 `rust-tunnel-remote` 的编码器 trait，**不含任何平台 API**，故全平台编译、可在
-// 任意 target 上单测（实际接入点在 Windows 的 `win_video`）。
+// 只依赖 `rust-tunnel-remote` 的编码器 trait、**不含任何平台 API**；唯一接入点是 Windows
+// 的 `win_video`，故只在 Windows 编译（macOS/Linux 上没有使用点，编进来只会产生
+// dead_code 警告，而 CI 的 macOS clippy 是 `-D warnings`）。
+#[cfg(target_os = "windows")]
 pub mod encoder_reuse;
 // 实例 GPU 采集的纯逻辑策略（会话锁存 + 显示器 id 映射）。全平台编译，便于单测。
 pub mod input_queue;
@@ -47,14 +50,23 @@ mod win_hybrid;
 // （见 `win_hybrid`），安全桌面与回退场景仍走 `win-platform` 的 BitBlt。
 #[cfg(target_os = "windows")]
 pub mod win_video;
+// macOS 的 VideoToolbox 硬件编解码适配（H.264/H.265）。
+#[cfg(target_os = "macos")]
+mod mac_video;
+// macOS 的 ScreenCaptureKit 采集 + 变化检测/脏矩形补丁/光标形状适配。
+#[cfg(target_os = "macos")]
+mod mac_capture;
 
 pub use clipboard_sync::{ClipboardAction, ClipboardSync};
 pub use reconnect::{ReconnectState, ReconnectStep, ReconnectTarget};
 pub use view_scale::{display_size, initial_window_size, ViewScale, WindowSize, MIN_INNER};
 
-// 音频平台适配（WASAPI loopback + Opus 编码 / 播放）；只在 Windows 编译。
+// 音频平台适配：Windows 是 WASAPI loopback，macOS 是 ScreenCaptureKit 系统声音 +
+// AudioQueue；两者都经 Opus 编解码。
 #[cfg(target_os = "windows")]
 mod audio;
+#[cfg(target_os = "macos")]
+mod mac_audio;
 
 /// 本端音频端点：被控端采集源 + 控制端播放器。非 Windows 全为 `None`。
 pub struct AudioEndpoints {
@@ -66,15 +78,19 @@ pub struct AudioEndpoints {
 
 /// 构造本端音频端点。
 ///
-/// Windows 上两端都注入（同一进程既可能是控制器也可能是被控端）；其它平台返回空，
-/// 引擎会向对端上报「本机不支持音频」。
+/// Windows / macOS 上两端都注入（同一进程既可能是控制器也可能是被控端）；其它平台
+/// 返回空，引擎会向对端上报「本机不支持音频」。
 #[must_use]
 pub fn audio_endpoints() -> AudioEndpoints {
     #[cfg(target_os = "windows")]
     {
         audio::endpoints()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        mac_audio::endpoints()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         AudioEndpoints {
             source: None,
@@ -93,19 +109,24 @@ use enigo::{Keyboard as _, Mouse as _};
 use rust_tunnel_remote::Clipboard as _;
 use rust_tunnel_remote::{
     DecodedFrame, DecodedNv12, DisplayInfo, FrameSink, InputEvent, InputSink, KeyEvent,
-    MouseButton, QualityPreset, RawFrame, RemoteError, RemoteManager, RemoteResult, RemoteUiState,
+    MouseButton, QualityPreset, RemoteError, RemoteManager, RemoteResult, RemoteUiState,
     ScreenSource, SessionRole, VideoDecoderFactory, VideoEncoderFactory, DEFAULT_FRAME_RATE,
 };
 // 补丁相关类型未在 crate 根 re-export（`screen` 是公开模块），直接按模块路径引入。
-use rust_tunnel_remote::screen::{CaptureInfo, CursorShape, DecodedPatch};
+use rust_tunnel_remote::screen::{CursorShape, DecodedPatch};
+// 只有非 macOS 的 `XcapScreen` 用到这两个类型（macOS 走 `mac_capture`）。
+#[cfg(not(target_os = "macos"))]
+use rust_tunnel_remote::screen::CaptureInfo;
+#[cfg(not(target_os = "macos"))]
+use rust_tunnel_remote::RawFrame;
 
 use nv12_renderer::CompositeFrame;
 
 // ── 平台模块分派 ─────────────────────────────────────────────────────
 //
 // 每个平台模块提供：`NAME` / `permissions()` / `open_settings()` /
-// `screen_and_input(mode)`。GUI 模式下截屏与注入的实体在三个平台完全一致
-// （xcap/enigo 内部消化差异），故仅权限与设置跳转按平台分派；`PlatformMode::Instance`
+// `screen_and_input(mode)`。输入注入三平台都是 `enigo`；采集按平台分派——Windows
+// 用户会话走 WGC/DXGI，macOS 走 ScreenCaptureKit，其余走 xcap。`PlatformMode::Instance`
 // 只有 Windows 有对应实现（见 `win_desktop`），其余平台按 GUI 那套返回。
 #[cfg(target_os = "linux")]
 mod linux;
@@ -176,7 +197,8 @@ pub fn open_permission_settings(kind: PermissionKind) {
 /// - H.264 两侧都不可用 → 数据面回退 VP9；
 /// - H.265 任一侧不可用 → 协商阶段自动回退 H.264。
 ///
-/// 非 Windows 平台恒为 [`Default`]（四个 `None`），行为与从前完全一致。
+/// 没有硬件编解码能力的平台恒为 [`Default`]（四个 `None`），行为与从前完全一致。
+/// Windows 注入 NVENC/MFT，macOS 注入 VideoToolbox。
 #[derive(Default)]
 pub struct HardwareFactories {
     /// H.264 编码器工厂（被控端）。
@@ -245,11 +267,13 @@ pub fn install_platform(
 /// 构造 GUI 路径的默认平台三件套（`xcap` + `enigo` + `arboard`，无收尾钩子）。
 #[must_use]
 pub(crate) fn gui_platform_handles() -> PlatformHandles {
-    // Windows 上采集优先走 WGC/DXGI（失败会逐帧回退 xcap）；输入与剪贴板不变——
-    // `EnigoInput` 的编号查询也来自 xcap，换掉采集源才不会让坐标体系分叉。
+    // Windows 上采集优先走 WGC/DXGI（失败会逐帧回退 xcap）；macOS 走 ScreenCaptureKit。
+    // 输入与剪贴板不变——`EnigoInput` 的编号查询来自 xcap，换掉采集源才不会让坐标体系分叉。
     #[cfg(target_os = "windows")]
     let screen: Arc<dyn ScreenSource> = Arc::new(win_video::screen());
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let screen: Arc<dyn ScreenSource> = Arc::new(mac_capture::screen());
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let screen: Arc<dyn ScreenSource> = Arc::new(XcapScreen);
     PlatformHandles {
         screen,
@@ -259,7 +283,8 @@ pub(crate) fn gui_platform_handles() -> PlatformHandles {
     }
 }
 
-/// 构造本平台的硬件编解码工厂（Windows 返回 NVENC/MFT；其他平台都返回 `None`）。
+/// 构造本平台的硬件编解码工厂（Windows 返回 NVENC/MFT，macOS 返回 VideoToolbox；
+/// 其他平台都返回 `None`）。
 ///
 /// 每个字段为 `None` 表示该 (方向, 标准) 不参与协商，数据面按 VP9 或 H.264 继续。
 /// `probe_decoders = false` 时**跳过解码器探测**（两个解码器字段保持 `None`）。
@@ -281,9 +306,13 @@ pub fn hardware_factories_with_decoders(probe_decoders: bool) -> HardwareFactori
     {
         win_video::factories(probe_decoders)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        // 非 Windows 没有硬件工厂，参数只为保持签名一致。
+        mac_video::factories(probe_decoders)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // 其余平台没有硬件工厂，参数只为保持签名一致。
         let _ = probe_decoders;
         HardwareFactories::default()
     }
@@ -1265,11 +1294,13 @@ fn take_whole_lines(remainder: &mut f32, lines: f32) -> i32 {
 
 /// 基于 `xcap` 的屏幕采集源。
 ///
-/// 注意：macOS 需「屏幕录制」权限，缺失时 [`xcap::Monitor::all`] 可能返回空或
-/// [`ScreenSource::capture`] 报错；UI 侧应先经 [`permissions`] 提示。
+/// 只在非 macOS 平台编译：macOS 用 ScreenCaptureKit（`mac_capture`），Windows 用户会话
+/// 用 WGC/DXGI（`win_video` 内部把本类型当作 CPU 回退）。
+#[cfg(not(target_os = "macos"))]
 pub struct XcapScreen;
 
 /// 把 xcap 显示器转成引擎的 [`DisplayInfo`]（字段读取失败时给保守回退值）。
+#[cfg(not(target_os = "macos"))]
 fn monitor_info(monitor: &xcap::Monitor, fallback_id: u32) -> DisplayInfo {
     DisplayInfo {
         id: monitor.id().unwrap_or(fallback_id),
@@ -1282,8 +1313,9 @@ fn monitor_info(monitor: &xcap::Monitor, fallback_id: u32) -> DisplayInfo {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl ScreenSource for XcapScreen {
-    /// 统计角标里的采集方式：xcap（CPU 截屏，三平台通用）。
+    /// 统计角标里的采集方式：xcap（CPU 截屏，非 macOS 平台通用）。
     ///
     /// 其余字段保持默认——xcap 没有 GPU 零拷贝、没有可枚举的适配器，也没有源内计数器；
     /// Windows 用户会话的硬件采集走 `win_video::WinVideoScreen`，那份 `capture_info` 会填全。
