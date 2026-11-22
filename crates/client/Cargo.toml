@@ -28,7 +28,10 @@ name = "rust-tunnel-client"
 #          QoS 严重拥塞一步降档 + 重新操作突发封顶）。数据面仍是 v12、线上帧逐字节
 #          不变，0.26.0 ↔ 0.27.0 可互控；`client` / `client-gui` / `win-service` /
 #          `win-platform` 必须同版本一起发。
-version = "0.27.0"
+# 0.28.0 = macOS 远程控制对齐（VideoToolbox H.264/H.265 + ScreenCaptureKit 采集/脏矩形
+#          补丁/光标 + SCK 音频 + AudioQueue 播放）。纯新增平台实现，数据面仍是 v12、
+#          线上帧逐字节不变，0.27.0 ↔ 0.28.0 可互控；四个 crate 同版本一起发。
+version = "0.28.0"
 edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT OR Apache-2.0"

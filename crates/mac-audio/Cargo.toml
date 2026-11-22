@@ -1,0 +1,33 @@
+[package]
+name = "rust-tunnel-mac-audio"
+version = "0.1.0"
+edition = "2021"
+description = "macOS 远程控制音频数据面：ScreenCaptureKit 系统声音采集 + AudioQueue 播放 + Opus"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["opus"]
+# Opus 需要在本机用 CMake 构建 vendored libopus（audiopus_sys）。交叉类型检查
+# （Windows 上 `--target aarch64-apple-darwin`）可关掉它，只验证其余 macOS 代码。
+opus = ["dep:audiopus_sys"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6"
+dispatch2 = "0.3.1"
+# AudioQueue 在 AudioToolbox.framework（不是 CoreAudio.framework）：播放端用它。
+# 不要误以为 objc2-core-audio 里有 AudioQueueNewOutput（那个 crate 只有 AudioHardware）。
+objc2-audio-toolbox = { version = "0.3.2", features = ["AudioQueue"] }
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"
+audiopus_sys = { version = "0.2.2", features = ["static"], optional = true }

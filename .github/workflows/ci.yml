@@ -32,6 +32,11 @@ name: CI
 # 说明：全部命令用 `-p` 指定 crate，**绝不用 `--workspace`**——后者会把第三方
 # qdrant-edge 依赖拖进来，又慢又脆。这里也**不**构建/测试 rust-tunnel-server
 # （它需要 `--features rag` 与 qdrant-edge，超出本工作流的范围且耗时）。
+#
+# macOS 平台层（VideoToolbox / ScreenCaptureKit / AudioQueue）由 `macos-check` 覆盖：
+# 它在 macos-latest 上编译 `mac-video` / `mac-capture` / `mac-audio` / `client-gui`
+# 并运行纯逻辑单测。这类代码在 Windows/Linux 上根本不编译，没有这个 job 就只能等到
+# `gui-v*` 发布才第一次暴露回归。真机行为（硬件会话、SCK 流、AudioQueue）仍不在 CI。
 
 on:
   push:
@@ -129,3 +134,49 @@ jobs:
         run: |
           cargo check  --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video -p rust-tunnel-win-audio -p rust-tunnel-client-gui
           cargo clippy --target x86_64-pc-windows-gnu -p rust-tunnel-win-platform -p rust-tunnel-win-service -p rust-tunnel-win-video -p rust-tunnel-win-audio -p rust-tunnel-client-gui -- -D warnings
+
+  # macOS 平台层的编译与纯逻辑测试门禁。
+  #
+  # 为什么需要它：VideoToolbox / ScreenCaptureKit / AudioQueue 的代码只在 macOS 上
+  # 编译，而开发机可能是 Windows（连 `cargo check --target aarch64-apple-darwin`
+  # 都需要额外搭 zig 垫片）。没有这个 job，这类代码要到 `gui-v*` 发布时才第一次
+  # 被编译，回归暴露得太晚。
+  #
+  # 覆盖范围与边界：
+  # - `rust-tunnel-mac-video`：全部编译 + 纯逻辑单测（Annex B / 颜色 / 变化检测）。
+  #   VideoToolbox 的**运行时**行为（硬件可用性、HEVC、延迟）仍只能在真 Mac 上验收。
+  # - `rust-tunnel-mac-capture` / `rust-tunnel-mac-audio` / `client-gui`：类型检查。
+  # - `rust-tunnel-mac-audio` 的默认 feature 会经 CMake 构建 vendored libopus；
+  #   macos-latest runner 自带 CMake 与 Apple 工具链。
+  macos-check:
+    name: macOS typecheck + pure tests
+    runs-on: macos-latest
+    env:
+      # macOS 远程控制的最低支持版本（ScreenCaptureKit 音频需要 13+，登录窗口采集 14.4+）。
+      # 显式抬高部署目标，避免链接 12.3+ 的 ScreenCaptureKit 时与默认 11.0 冲突。
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+
+      # 纯逻辑测试：Annex B / 颜色 / 变化检测 / 抖动缓冲 / Opus 往返 / PCM 交错。
+      # 真机行为（VT 会话、SCK 流、AudioQueue）仍只能在 Mac 上验收。
+      - name: Test macOS pure logic
+        run: cargo test -p rust-tunnel-mac-video -p rust-tunnel-mac-audio -p rust-tunnel-mac-capture --lib
+
+      - name: Type-check macOS crates
+        run: |
+          cargo check -p rust-tunnel-mac-video -p rust-tunnel-mac-capture -p rust-tunnel-mac-audio -p rust-tunnel-client-gui
+          cargo clippy -p rust-tunnel-mac-video -p rust-tunnel-mac-capture -p rust-tunnel-mac-audio -p rust-tunnel-client-gui -- -D warnings

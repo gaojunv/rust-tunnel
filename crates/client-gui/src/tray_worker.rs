@@ -13,7 +13,10 @@
 //!
 //! 窗口可见时这条路径同样有效（只是「下一帧」来得很快），所以不存在两套逻辑。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+// HWND 镜像只在 Windows 使用；macOS/Linux 上该字段与导入都不存在。
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicIsize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 

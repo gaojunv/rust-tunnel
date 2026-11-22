@@ -36,7 +36,10 @@ name = "rust-tunnel-client-gui"
 #          QoS 严重拥塞一步降档 + 重新操作突发封顶）。数据面仍是 v12、线上帧逐字节
 #          不变，0.26.0 ↔ 0.27.0 可互控；`client` / `win-platform` / `win-service`
 #          同步抬版。
-version = "0.27.0"
+# 0.28.0 = macOS 远程控制对齐（VideoToolbox H.264/H.265、ScreenCaptureKit 采集/补丁/
+#          光标、SCK 系统音频 + AudioQueue 播放）。纯新增平台实现，数据面仍是 v12，
+#          0.27.0 ↔ 0.28.0 可互控；四个 crate 同版本一起发。
+version = "0.28.0"
 edition = "2021"
 description = "rust-tunnel desktop tray client (winit + tray-icon + eframe)"
 license = "MIT OR Apache-2.0"
@@ -112,6 +115,13 @@ font8x8 = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# 硬件编解码（VideoToolbox）。`remote` 不依赖它：引擎只认工厂 trait，平台实现
+# 由本 crate 注入（与 Windows 的 win-video 同构）。
+rust-tunnel-mac-video = { path = "../mac-video" }
+# 屏幕采集（ScreenCaptureKit）+ 变化检测/脏矩形/光标。
+rust-tunnel-mac-capture = { path = "../mac-capture" }
+# 系统音频（ScreenCaptureKit 音频 + AudioQueue + Opus）。
+rust-tunnel-mac-audio = { path = "../mac-audio" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
