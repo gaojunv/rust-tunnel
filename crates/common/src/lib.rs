@@ -7,7 +7,8 @@
 pub mod crypto;
 /// 统一错误类型与结果别名。
 pub mod error;
-/// 统一出站 HTTP 客户端工厂。
+/// 统一出站 HTTP 客户端工厂（`http-client` feature；无头控制器不启用）。
+#[cfg(feature = "http-client")]
 pub mod http_client;
 /// 日志初始化。
 pub mod logging;

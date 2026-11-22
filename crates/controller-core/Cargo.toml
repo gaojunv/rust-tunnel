@@ -1,0 +1,18 @@
+[package]
+name = "rust-tunnel-controller-core"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-independent headless controller host for rust-tunnel remote control (Android/JNI-friendly)"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# 无默认 feature：不带 SQLite / reqwest / tree-sitter / portable-pty。
+rust-tunnel-common = { path = "../common", default-features = false }
+rust-tunnel-remote = { path = "../remote" }
+rust-tunnel-client = { path = "../client", default-features = false, features = [] }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

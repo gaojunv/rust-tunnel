@@ -137,7 +137,7 @@ impl Default for ClientConfig {
             tls_server_name: None,
             tls_insecure: true, // Accept self-signed certs by default (TOFU mode)
             enable_agent: false,
-            agent_pty_port: crate::pty::DEFAULT_PTY_PORT,
+            agent_pty_port: rust_tunnel_common::DEFAULT_PTY_PORT,
             log: "info".to_string(),
         }
     }
@@ -392,7 +392,7 @@ mod tests {
         assert!(config.name.is_none());
         assert!(config.tls); // TLS enabled by default
         assert!(config.tls_insecure); // Accept self-signed certs by default
-        assert_eq!(config.agent_pty_port, crate::pty::DEFAULT_PTY_PORT);
+        assert_eq!(config.agent_pty_port, rust_tunnel_common::DEFAULT_PTY_PORT);
         assert_eq!(config.log, "info");
     }
 
@@ -614,7 +614,10 @@ mod tests {
 
         // 未指定时回落到默认端口
         let default_cfg = ClientConfig::default();
-        assert_eq!(default_cfg.agent_pty_port, crate::pty::DEFAULT_PTY_PORT);
+        assert_eq!(
+            default_cfg.agent_pty_port,
+            rust_tunnel_common::DEFAULT_PTY_PORT
+        );
     }
 
     #[test]

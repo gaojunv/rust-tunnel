@@ -1,0 +1,15 @@
+# Gradle / Android Studio 缓存与产物
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+
+# 原生库由 scripts/build-android-apk.sh 从 target/ 复制，不进仓库
+app/src/main/jniLibs/**/*.so
+!app/src/main/jniLibs/**/.gitkeep

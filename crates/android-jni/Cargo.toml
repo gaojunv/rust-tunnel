@@ -1,0 +1,33 @@
+[package]
+name = "rust-tunnel-android-jni"
+version = "0.1.0"
+edition = "2021"
+description = "JNI bridge and EGL/GLES renderer exposing the headless rust-tunnel controller host to Android"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# 产物必须是 libandroid_jni.so（Kotlin 侧 System.loadLibrary("android_jni")）。
+name = "android_jni"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-tunnel-controller-core = { path = "../controller-core" }
+# MediaCodec H.264/H.265 硬解（仅 Android 编译真实 FFI；宿主上只剩纯逻辑）。
+rust-tunnel-android-video = { path = "../android-video" }
+rust-tunnel-remote = { path = "../remote" }
+rust-tunnel-common = { path = "../common", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk = "0.9"
+khronos-egl = { version = "6", features = ["dynamic", "1_4"] }
+glow = "0.16"
+libloading = "0.8"
