@@ -15,8 +15,8 @@
 //! 支持四类消费方式：
 //!
 //! - [`MacCapture::capture`]：整帧 RGBA（按 `max_encode_width` 在采集层一步封顶）；
-//! - [`MacCapture::capture_gpu`]：**零拷贝**路径——完整物理帧的 `CVPixelBuffer` 直接
-//!   交给 VideoToolbox 编码（缩放/转 420v 全在 GPU 上完成）；
+//! - [`MacCapture::capture_gpu`]：**零拷贝**路径——ScreenCaptureKit 按 `max_encode_width`
+//!   直接输出编码尺寸的 `CVPixelBuffer`（GPU 内缩放），编码器原样直通 VideoToolbox；
 //! - [`MacCapture::capture_patches`]：脏矩形补丁（目标编码坐标系的紧包 NV12；
 //!   只按脏矩形从源缓冲读取，不做整帧拷贝）；
 //! - [`MacCapture::cursor_shape`]：远端光标**形状**（位置仍由控制端本机系统光标渲染）。
@@ -83,12 +83,14 @@ pub type GpuFrameBuffer = objc2_core_foundation::CFRetained<objc2_core_video::CV
 #[cfg(not(target_os = "macos"))]
 pub type GpuFrameBuffer = std::convert::Infallible;
 
-/// 一帧 **GPU 直通**采集结果：完整物理帧的 `CVPixelBuffer`，不落 CPU。
+/// 一帧 **GPU 直通**采集结果：ScreenCaptureKit 输出的 `CVPixelBuffer`，不落 CPU。
 ///
-/// `width`/`height` 是**逻辑编码尺寸**（按 [`MacCapture::set_max_encode_width`] 封顶后的
-/// 值），与缓冲的物理尺寸（`source_width`/`source_height`，Retina/4K 下更大）分开：
-/// 编码器按逻辑尺寸配置，像素缓冲保持原始分辨率，缩放交给 GPU
-/// （`VTPixelTransferSession`）。
+/// SCK 的 `SCStreamConfiguration.width/height` 在**建流时**就按 [`MacCapture::set_max_encode_width`]
+/// 的宽度上限配置（GPU 内缩放，几乎零成本），因此 `source_width/source_height` 通常已等于
+/// `width/height`：编码器拿到同尺寸的 IOSurface 后**零拷贝直通**，不再每帧做一次
+/// 4K→1080p 的 `VTPixelTransferSession`（真机实测 ~3 ms/帧）。两者仍分开表达：
+/// `width/height` 是逻辑编码尺寸，`source_*` 是缓冲实际尺寸（显示器物理尺寸小于上限时
+/// 二者相等；上限变化会触发采集流重建）。
 ///
 /// `changed`/`changed_permille` 由采集层如实填写：SCK 样本附件报告「零脏矩形」时直接
 /// 采信（这是平台给的权威信号）；否则把帧缩到 320×180 后做像素级比较，首帧/检测不可用
@@ -100,11 +102,11 @@ pub struct CapturedGpuFrame {
     pub width: u32,
     /// 逻辑编码高度（像素，偶数）。
     pub height: u32,
-    /// 缓冲的物理宽度（像素）。
+    /// 缓冲的实际宽度（像素；已按编码宽度上限封顶）。
     pub source_width: u32,
-    /// 缓冲的物理高度（像素）。
+    /// 缓冲的实际高度（像素；已按编码宽度上限封顶）。
     pub source_height: u32,
-    /// 完整物理帧的像素缓冲（引用计数，不拷贝像素）。
+    /// 采集输出的像素缓冲（引用计数，不拷贝像素）。
     pub buffer: GpuFrameBuffer,
     /// 采集层是否判定画面**有可见变化**。
     pub changed: bool,
@@ -142,6 +144,29 @@ pub struct DisplayInfo {
 #[must_use]
 pub fn display_physical_size(display_id: u32) -> Option<(u32, u32)> {
     sck::physical_size(display_id)
+}
+
+/// 枚举当前显示器（**不经过采集实例**，CoreGraphics 同步枚举，亚毫秒级）。
+///
+/// 引擎每 5 秒在会话循环里内联调用一次 `displays()`：这里必须足够快，绝不能用
+/// ScreenCaptureKit 的异步内容枚举（真机 70–80 ms，会把输入注入与采集节拍冻住）。
+/// `DisplayInfo.width/height` 是 **macOS 全局逻辑点**，控制端输入映射用。
+///
+/// # Errors
+/// CoreGraphics 枚举失败或没有任何活动显示器时返回错误（**不检查**「屏幕录制」权限：
+/// 枚举本身不需要它，缺权限由采集路径报错）。
+#[cfg(target_os = "macos")]
+pub fn displays() -> MacCaptureResult<Vec<DisplayInfo>> {
+    sck::list_displays()
+}
+
+/// 枚举当前显示器（非 macOS 恒为空）。
+///
+/// # Errors
+/// 占位实现不会失败。
+#[cfg(not(target_os = "macos"))]
+pub fn displays() -> MacCaptureResult<Vec<DisplayInfo>> {
+    Ok(Vec::new())
 }
 
 /// 一帧采集结果（未编码）。

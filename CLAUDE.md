@@ -238,12 +238,43 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
   AVCC 转 Annex B，关键帧前置 SPS/PPS(/VPS)；`MaxAllowedFrameQP = 20` 对齐 Windows 画质
   地板；在线改码率/帧率只调 `VTSessionSetProperty`，**不重建、不插 IDR**；`RUST_TUNNEL_DISABLE_H265`
   与 `RUST_TUNNEL_DISABLE_HWCODEC` 两条排障开关与 Windows 同义。
-- **GPU 零拷贝**：`mac-capture` 的 `capture_gpu` 把完整物理帧的 `CVPixelBuffer` 直接交给
-  `VtEncoder::encode_pixel_buffer`；源尺寸/格式与编码配置一致时**不落 CPU**，4K→1920 用复用的
-  `VTPixelTransferSession` 在 GPU 上缩放并转 `420v`（BT.709 limited）。变化检测优先用 SCK 的
-  `SCStreamFrameInfoDirtyRects` 附件，否则用 320×180 降采样只锁约 225 KB；补丁路径按
-  `scale_bgra_region_strided` 只读脏矩形区间，不再拷整帧。GPU 失败回退 CPU `capture()`，
-  `CaptureInfo.gpu_capture` 按最近一帧如实上报。
+- **VT 编码走异步流水线（原生 4K 的关键）**：`VtEncoder` 用 `submit_only` /
+  `next_packet` / `flush` 组成异步流水线，适配层每次 `encode_frame` **提交本帧、取回最老
+  的一帧**（码流顺序与参考链不变）。同步「提交→等完成」把流水线延迟当吞吐：真机
+  1080p ~10 ms/帧、**4K ~35 ms/帧**（与码率/QP/H.264·H.265 全无关），4K 同步只有 ~28 fps。
+  在途深度由 `pipeline_depth()` 自适应：**H.265 或 ≤1080p 用 1**（4K H.265 实测 ~47 fps、
+  1080p ~188 fps），**4K H.264 用 2**（深度 1 只有 ~28–33 fps，深度 2 ~33 fps，深度 3 ~39
+  但多两帧延迟）。三条硬规则：① **IDR 走精确同步路径**——先 `discard_pending` 泵掉在途
+  P 帧（IDR 不引用它们，且从未交给上层，控制端看不到序号断层），再同步编码并取回本帧，
+  保证 `force_keyframe`、`last_keyframe_us`、补丁基准 `base_frame_sent` 的语义精确；
+  ② **起流水时返回空包**（引擎支持 `EncodedVideo::is_empty`）来填满在途深度，空包不上线；
+  ③ **在途帧绝不能复用输入/转换缓冲**：`submit_pixel_buffer` / `submit_bgra` 每帧新建
+  缓冲（VT 会 retain 到编码完成），只有同步路径才复用。
+- **原生分辨率必须用「采集像素」算码率与补丁尺寸**：macOS 的 `DisplayInfo` 是**逻辑点**
+  （4K 屏报 1920×1080），而采集/编码是 3840×2160。引擎新增
+  `ScreenSource::encode_pixels()`（macOS 返回 `display_physical_size`，Windows 默认
+  `None` 表示与 `DisplayInfo` 相同），`native_bitrate_permille` 与补丁目标帧缓冲都按它算
+  ——否则原生 4K 只拿到 1080p 的 6 Mbps，且补丁尺寸永远与全帧对不上（每拍退全帧）。
+- **GPU 零拷贝**：SCK 的 `SCStreamConfiguration.width/height` **建流时就按
+  `max_encode_width` 输出**（GPU 内缩放，默认 1920、原生分辨率 3840），所以
+  `capture_gpu` 给出的 `CVPixelBuffer` 通常已等于编码尺寸，`VtEncoder::encode_pixel_buffer`
+  **零拷贝直通**（不要退回「采集 4K、每帧用 `VTPixelTransferSession` 缩到 1080p」：
+  真机实测多付 ~3 ms/帧，且 4K 缓冲 33 MB 的拷贝/带宽全白花；编码宽度上限变化会重建
+  采集流）。变化检测优先用 SCK 的 `SCStreamFrameInfoDirtyRects` 附件，否则用 320×180
+  降采样只锁约 225 KB；补丁路径按 `scale_bgra_region_strided` 只读脏矩形区间，不再拷整帧。
+  GPU 失败回退 CPU `capture()`，`CaptureInfo.gpu_capture` 按最近一帧如实上报。
+- **`displays()` 必须走 CoreGraphics，绝不能用 `SCShareableContent` 异步枚举**：引擎每 5 秒
+  在会话 `select!` 循环里**内联**调用一次 `ScreenSource::displays()`（热插拔/分辨率复查），
+  而真机实测一次 `getShareableContentWithCompletionHandler` 要 **70–80 ms**（XPC +
+  WindowServer），等于每 5 秒把输入注入、采集节拍、心跳一起冻住一次——这是「Windows→Windows
+  不卡、Windows→macOS 明显卡顿」最容易被忽略的一条（Windows 的 `EnumDisplayMonitors` 是
+  亚毫秒）。现在用 `CGGetActiveDisplayList` + `CGDisplayBounds`（首次 ~35 ms 建立显示列表，
+  之后 **~0.13 ms**），并且**不查 TCC**（`CGPreflightScreenCaptureAccess` 每次要走 TCC XPC，
+  几十毫秒；缺权限由采集路径报错）。`display_physical_size`（编码用物理像素）与
+  `DisplayInfo`（输入映射用逻辑点）仍是两套坐标系。
+- **`capture_info()` 只读快照，不抢采集锁**：会话循环每秒内联读一次，而采集任务会在同一把
+  `Mutex` 里阻塞最多一个 `FRAME_WAIT`（20 ms）；读取侧改成锁内顺手刷新的 `telemetry` 快照，
+  避免每秒白送一次 20 ms 冻结。
 - **音频**：SCK 系统声音（`capturesAudio`，排除本进程）+ AudioQueue 播放 + Opus 96 kbps；
   能力/启停仍走既有 `AudioStatus`/`SetAudioEnabled`。`audiopus_sys` 用 CMake 构建 vendored
   libopus（`--features` 默认开 `opus`；CI 的 macOS runner 自带 CMake）。

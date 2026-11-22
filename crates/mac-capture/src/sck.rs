@@ -13,8 +13,10 @@
 //!
 //! # 三条消费路径
 //!
-//! - [`MacCapture::capture_gpu`]：GPU 直通。样本缓冲原样交给编码器（零拷贝），变化检测
-//!   只用 SCK 的脏矩形附件或一块 320×180 的降采样缓冲；
+//! - [`MacCapture::capture_gpu`]：GPU 直通。**SCK 建流时就按 `max_encode_width` 输出**
+//!   （GPU 内缩放），所以缓冲通常已经等于编码尺寸，编码器零拷贝直通，不再每帧做
+//!   4K→1080p 的 `VTPixelTransferSession`；变化检测只用 SCK 的脏矩形附件或一块
+//!   320×180 的降采样缓冲；
 //! - [`MacCapture::capture_patches`]：脏矩形补丁。变化网格来自同一块 320×180 缓冲，
 //!   源像素只按矩形覆盖区间用带行跨度读取，整帧 BGRA 从不拷贝；
 //! - [`MacCapture::capture`]：整帧 CPU 回读（VP9 回退路径），像素拷贝发生在这里。
@@ -52,8 +54,8 @@ use objc2::{define_class, msg_send, AnyThread, ClassType, DefinedClass};
 use objc2_app_kit::NSCursor;
 use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
 use objc2_core_graphics::{
-    CGDisplayCopyDisplayMode, CGDisplayIsMain, CGDisplayMode, CGDisplayPixelsHigh,
-    CGDisplayPixelsWide,
+    CGDisplayBounds, CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayIsMain, CGDisplayMode,
+    CGDisplayPixelsHigh, CGDisplayPixelsWide, CGError, CGGetActiveDisplayList, CGMainDisplayID,
 };
 use objc2_core_media::{CMGetAttachment, CMSampleBuffer, CMTime};
 use objc2_core_video::{
@@ -319,6 +321,11 @@ struct StreamSession {
     output: Retained<StreamOutput>,
     /// 建流时使用的显示器物理尺寸；`None` = 当时查不到（退化到点尺寸），不做几何复查。
     geometry: Option<(u32, u32)>,
+    /// 建流时配置的**采集输出尺寸**（= 按 `max_encode_width` 封顶后的尺寸）。
+    ///
+    /// 引擎在会话中可能改编码宽度上限（codec 回退），那时必须重建流——SCK 的
+    /// `width/height` 只在建流时生效。
+    output_size: (u32, u32),
     /// 回调队列必须比 `SCStream` 活得久（`addStreamOutput` 只是弱持有）。
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
 }
@@ -331,6 +338,10 @@ struct Worker {
     shared: Arc<Shared>,
     /// 建流时使用的显示器物理尺寸（`None` = 未知，不复查）。
     geometry: Option<(u32, u32)>,
+    /// 建流时配置的采集输出尺寸（见 [`StreamSession::output_size`]）。
+    output_size: (u32, u32),
+    /// 建流时生效的编码宽度上限（变化即需重建，比较不需要查询显示器）。
+    max_encode_width: u32,
     /// 上一次复查显示器几何的时刻（分辨率/旋转变化时重建流）。
     checked_at: Instant,
 }
@@ -454,8 +465,9 @@ impl MacCapture {
 
     /// 设置本会话的编码宽度上限（引擎在会话开始时调用一次）。
     ///
-    /// 与 Windows 侧同一口径：钳到 `[1920, 3840]` 并对齐偶数；采集侧按它一步缩到目标
-    /// 宽度，避免整帧 33 MB（4K）的中间缓冲。
+    /// 与 Windows 侧同一口径：钳到 `[1920, 3840]` 并对齐偶数。**SCK 的采集流直接按它
+    /// 输出**（建流时写进 `SCStreamConfiguration`，GPU 内缩放），所以 GPU 直通路径拿到
+    /// 的就是编码尺寸的缓冲；上限变化会重建采集流（见 `ensure_worker`）。
     pub fn set_max_encode_width(&mut self, width: u32) {
         self.max_encode_width = width.clamp(DEFAULT_MAX_ENCODE_WIDTH, MAX_ENCODE_WIDTH_LIMIT) & !1;
     }
@@ -508,10 +520,11 @@ impl MacCapture {
         true
     }
 
-    /// 采集一帧 **GPU 直通**画面：完整物理帧的 `CVPixelBuffer`，不在 CPU 上缩放或转换。
+    /// 采集一帧 **GPU 直通**画面：SCK 输出的 `CVPixelBuffer`，不在 CPU 上缩放或转换。
     ///
-    /// 引擎把这块缓冲直接交给 VideoToolbox（`VtEncoder::encode_pixel_buffer`）——尺寸/
-    /// 格式与编码配置一致时零拷贝，否则在 GPU 上一步缩放并转 `420v`。
+    /// 流的输出尺寸在建流时已按 [`Self::set_max_encode_width`] 封顶（GPU 内缩放），
+    /// 因此缓冲尺寸通常等于编码尺寸：引擎把这块缓冲直接交给 VideoToolbox
+    /// （`VtEncoder::encode_pixel_buffer`）即**零拷贝直通**。
     ///
     /// 变化检测与 CPU 路径同源：SCK 样本附件报告「零脏矩形」时直接采信（平台给的权威
     /// 信号）；否则把帧缩到 320×180 后做逐像素比较。**绝不回读整帧**。
@@ -935,10 +948,26 @@ impl MacCapture {
                 restart = true;
             }
         }
-        // 显示器几何（分辨率/旋转）变化时重建：输出尺寸是建流时按物理像素配置的。
+        // 显示器几何（分辨率/旋转）**或编码宽度上限**变化时重建：SCK 的输出尺寸是
+        // 建流时定死的。输出尺寸按 `max_encode_width` 在**采集侧**直接封顶，这样
+        // `capture_gpu` 交出的就是编码尺寸的缓冲，编码器零拷贝直通——不再每帧做一次
+        // 4K→1080p 的 `VTPixelTransferSession`（真机实测 ~3 ms/帧，且随帧率放大）。
+        //
+        // **宽度上限的比较不查显示器**：本函数每拍都跑，`physical_size` 是 CoreGraphics
+        // 调用，不能每帧付一次。宽度上限只在建流/切 codec 时变，直接比缓存值即可；
+        // 分辨率变化的复查仍是每 [`GEOMETRY_RECHECK`] 一次。
         if !restart {
             if let Some(worker) = self.worker.as_mut() {
-                if worker.checked_at.elapsed() >= GEOMETRY_RECHECK {
+                if worker.max_encode_width != self.max_encode_width {
+                    tracing::info!(
+                        "显示器 {} 编码宽度上限变化（{} → {}），重建采集流",
+                        worker.display,
+                        worker.max_encode_width,
+                        self.max_encode_width
+                    );
+                    restart = true;
+                }
+                if !restart && worker.checked_at.elapsed() >= GEOMETRY_RECHECK {
                     worker.checked_at = Instant::now();
                     if let Some(current) = physical_size(display) {
                         if worker
@@ -951,6 +980,24 @@ impl MacCapture {
                                 "显示器 {display_id} 几何变化（{previous:?} → {current:?}），重建采集流"
                             );
                             restart = true;
+                        } else {
+                            // 分辨率没变也要确认输出尺寸与当前上限一致（显示器热的
+                            // 分辨率/旋转组合可能改变点缩放比而 `physical_size` 不变）。
+                            let desired = geometry::encode_dimensions(
+                                current.0,
+                                current.1,
+                                1.0,
+                                self.max_encode_width,
+                            );
+                            if desired != worker.output_size {
+                                tracing::info!(
+                                    "显示器 {} 采集输出尺寸变化（{:?} → {:?}），重建采集流",
+                                    worker.display,
+                                    worker.output_size,
+                                    desired
+                                );
+                                restart = true;
+                            }
                         }
                     }
                 }
@@ -1012,18 +1059,23 @@ impl MacCapture {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (stop_tx, stop_rx) = mpsc::sync_channel(1);
         let thread_shared = Arc::clone(&shared);
+        let output_size = desired_output_size(display, self.max_encode_width);
         let thread = std::thread::Builder::new()
             .name("rt-mac-capture".to_owned())
-            .spawn(move || worker_thread(display, thread_shared, stop_rx, ready_tx))
+            .spawn(move || {
+                worker_thread(display, output_size, thread_shared, stop_rx, ready_tx);
+            })
             .map_err(|err| MacCaptureError::Message(format!("创建采集线程失败: {err}")))?;
         match ready_rx.recv_timeout(READY_TIMEOUT) {
-            Ok(Ok(geometry)) => {
+            Ok(Ok(started)) => {
                 self.worker = Some(Worker {
                     display,
                     stop: stop_tx,
                     thread,
                     shared,
-                    geometry,
+                    geometry: started.geometry,
+                    output_size: started.output_size,
+                    max_encode_width: self.max_encode_width,
                     checked_at: Instant::now(),
                 });
                 Ok(())
@@ -1049,6 +1101,24 @@ impl Drop for MacCapture {
     }
 }
 
+/// 采集线程建流成功后回报给调用方的两套尺寸。
+struct StreamStarted {
+    /// 显示器物理尺寸（几何复查用）。
+    geometry: Option<(u32, u32)>,
+    /// 实际配置的采集输出尺寸（编码宽度上限封顶后的值）。
+    output_size: (u32, u32),
+}
+
+/// 本次会话期望的采集输出尺寸：物理尺寸按 `max_encode_width` 封顶（保持宽高比、偶数对齐）。
+///
+/// 在**采集侧**直接按编码尺寸出帧，`capture_gpu` 交出的 `CVPixelBuffer` 就与编码器配置
+/// 尺寸一致 ⇒ `VtEncoder::encode_pixel_buffer` 走零拷贝直通，不再每帧做 4K→1080p 的
+/// `VTPixelTransferSession`（真机实测 ~3 ms/帧）。
+fn desired_output_size(display: u32, max_encode_width: u32) -> Option<(u32, u32)> {
+    physical_size(display)
+        .map(|(width, height)| geometry::encode_dimensions(width, height, 1.0, max_encode_width))
+}
+
 /// 采集线程：建流 → 等停止/失败信号 → 清理。
 ///
 /// 所有 ObjC 对象（`SCStream` / `SCContentFilter` / `StreamOutput`）都在本线程创建与
@@ -1059,18 +1129,22 @@ impl Drop for MacCapture {
 )]
 fn worker_thread(
     display: u32,
+    output_size: Option<(u32, u32)>,
     shared: Arc<Shared>,
     stop: Receiver<()>,
-    ready: SyncSender<MacCaptureResult<Option<(u32, u32)>>>,
+    ready: SyncSender<MacCaptureResult<StreamStarted>>,
 ) {
-    let session = match start_stream(display, &shared) {
+    let session = match start_stream(display, output_size, &shared) {
         Ok(session) => session,
         Err(err) => {
             let _ = ready.try_send(Err(err));
             return;
         }
     };
-    let _ = ready.try_send(Ok(session.geometry));
+    let _ = ready.try_send(Ok(StreamStarted {
+        geometry: session.geometry,
+        output_size: session.output_size,
+    }));
     loop {
         match stop.recv_timeout(WORKER_POLL) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
@@ -1093,7 +1167,11 @@ fn worker_thread(
 }
 
 /// 在采集线程内完成「权限 → 枚举 → 建流 → 启采」。
-fn start_stream(display_id: u32, shared: &Arc<Shared>) -> MacCaptureResult<StreamSession> {
+fn start_stream(
+    display_id: u32,
+    output_size: Option<(u32, u32)>,
+    shared: &Arc<Shared>,
+) -> MacCaptureResult<StreamSession> {
     ensure_screen_recording()?;
     let content = fetch_shareable_content(CONTENT_TIMEOUT)?;
     // SAFETY: `content` 由本函数借用，`displays` 只读。
@@ -1121,7 +1199,8 @@ fn start_stream(display_id: u32, shared: &Arc<Shared>) -> MacCaptureResult<Strea
             &NSArray::<SCWindow>::from_slice(&[]),
         )
     };
-    let (width, height) = capture_geometry(display_id, display, &filter);
+    let (fallback_width, fallback_height) = capture_geometry(display_id, display, &filter);
+    let (width, height) = output_size.unwrap_or((fallback_width, fallback_height));
     let config = build_configuration(width, height);
     let output = StreamOutput::new(Arc::clone(shared));
     let queue = DispatchQueue::new("rust-tunnel.mac-capture.screen", None);
@@ -1150,6 +1229,7 @@ fn start_stream(display_id: u32, shared: &Arc<Shared>) -> MacCaptureResult<Strea
         stream,
         output,
         geometry: physical_size(display_id),
+        output_size: (width, height),
         _queue: queue,
     };
     if let Err(err) = capture_completion(&session.stream, CAPTURE_TIMEOUT, true) {
@@ -1165,7 +1245,10 @@ fn start_stream(display_id: u32, shared: &Arc<Shared>) -> MacCaptureResult<Strea
     Ok(session)
 }
 
-/// 采集输出的物理像素尺寸：优先 CoreGraphics 的像素宽高，退化到「点尺寸 × 缩放比」。
+/// 采集输出的**退化**尺寸：优先 CoreGraphics 的物理像素，退化到「点尺寸 × 缩放比」。
+///
+/// 正常路径由 [`desired_output_size`]（物理尺寸按编码宽度上限封顶）决定；只有查不到
+/// 物理尺寸时才用这里的值。
 fn capture_geometry(display_id: u32, display: &SCDisplay, filter: &SCContentFilter) -> (u32, u32) {
     if let Some((width, height)) = physical_size(display_id) {
         return (width, height);
@@ -1219,7 +1302,10 @@ pub(crate) fn physical_size(display_id: u32) -> Option<(u32, u32)> {
     Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }
 
-/// 采集流配置：物理像素尺寸、32BGRA、不烧光标、最多 [`MAX_FPS`]。
+/// 采集流配置：**编码尺寸输出**（GPU 内缩放）、32BGRA、不烧光标、最多 [`MAX_FPS`]。
+///
+/// `width/height` 由调用方按 `max_encode_width` 封顶后传入（见 [`desired_output_size`]），
+/// 不是显示器物理尺寸——这样编码器拿到的缓冲就是编码尺寸，可零拷贝直通。
 fn build_configuration(width: u32, height: u32) -> Retained<SCStreamConfiguration> {
     // SAFETY: `new` 是 NSObject 的标准构造；下面的 setter 都是标量参数。
     let config = unsafe { SCStreamConfiguration::new() };
@@ -1281,44 +1367,80 @@ fn fetch_shareable_content(timeout: Duration) -> MacCaptureResult<Retained<SCSha
     })?
 }
 
-/// 枚举所有显示器（物理像素尺寸 + 是否主显示器）。
-fn list_displays() -> MacCaptureResult<Vec<DisplayInfo>> {
-    ensure_screen_recording()?;
-    let content = fetch_shareable_content(CONTENT_TIMEOUT)?;
-    // SAFETY: `content` 由本函数借用，`displays` 只读。
-    let displays = unsafe { content.displays() }.to_vec();
-    let mut out = Vec::with_capacity(displays.len());
-    for display in &displays {
-        // SAFETY: `SCDisplay` 由 SCK 持有，两个查询都只读。
-        let id = unsafe { display.displayID() };
-        // 两套坐标系数值不同，用途也不同：
-        // - **采集/编码**用 [`physical_size`]（当前显示模式的 `pixelWidth/Height`，
-        //   4K 屏是 3840×2160），`build_configuration` / 几何复查都用它；
-        // - [`DisplayInfo`] 是发给控制端做「窗口 → 远端坐标」映射的，必须是 **macOS
-        //   全局逻辑点**（enigo / `CGEvent` 绝对坐标的单位，同一块 4K 屏是 1920×1080
-        //   点）。这里若报物理像素，控制端会按 3840 发坐标、被控端按点注入，光标就会
-        //   放大/偏移。
-        let (point_w, point_h) = unsafe { (display.width(), display.height()) };
-        let (width, height) = if point_w > 0 && point_h > 0 {
-            (
-                u32::try_from(point_w).unwrap_or(1),
-                u32::try_from(point_h).unwrap_or(1),
-            )
-        } else {
-            // 退化：SCK 没给出点尺寸时只能用物理像素兜底（至少不为 0）。
-            physical_size(id).unwrap_or((1, 1))
-        };
-        // SAFETY: `CGDisplayIsMain` 只读全局显示配置（objc2 里是安全函数）。
-        let primary = CGDisplayIsMain(id);
+/// 枚举所有显示器（**CoreGraphics 同步枚举**，亚毫秒级）。
+///
+/// 引擎在会话循环里每 5 秒内联调用一次 `ScreenSource::displays()`（看热插拔/分辨率变化），
+/// 它直接跑在 tokio worker 上。**绝不能用 `SCShareableContent` 的异步枚举**：真机实测
+/// 一次 `getShareableContentWithCompletionHandler` 要 **70–80 ms**（XPC + WindowServer），
+/// 每 5 秒把整个会话循环（输入注入、采集节拍、心跳）冻住一次，表现为周期性卡顿。
+/// Windows 的 `EnumDisplayMonitors` 是亚毫秒，这也是「Windows→Windows 不卡、Windows→macOS
+/// 卡」最容易被忽略的一条。
+///
+/// 尺寸语义与旧实现一致：`DisplayInfo` 是 **macOS 全局逻辑点**（`CGDisplayBounds` 的单位），
+/// 控制端输入映射用；采集/编码仍用 [`physical_size`] 的物理像素。
+pub(crate) fn list_displays() -> MacCaptureResult<Vec<DisplayInfo>> {
+    // **不查 TCC**：`CGGetActiveDisplayList` 不需要「屏幕录制」权限，而
+    // `CGPreflightScreenCaptureAccess` 在真机上要走一次 TCC XPC（实测几十毫秒）——
+    // 它同样会拖慢每 5 秒一次的会话循环内联枚举。缺权限的报错由采集路径给出。
+    let mut count: u32 = 0;
+    // SAFETY: `active_displays` 传空指针 = 只问数量（CoreGraphics 文档允许）。
+    let status = unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &raw mut count) };
+    if status != CGError::Success {
+        return Err(MacCaptureError::Message(format!(
+            "CGGetActiveDisplayList（计数）失败：{}",
+            status.0
+        )));
+    }
+    if count == 0 {
+        return Err(MacCaptureError::Platform(
+            "CoreGraphics 没有枚举到任何活动显示器".to_owned(),
+        ));
+    }
+    let mut ids = vec![0 as CGDirectDisplayID; count as usize];
+    let mut actual = count;
+    // SAFETY: `ids` 至少有 `count` 个元素，`actual` 是合法可写指针。
+    let status = unsafe { CGGetActiveDisplayList(count, ids.as_mut_ptr(), &raw mut actual) };
+    if status != CGError::Success {
+        return Err(MacCaptureError::Message(format!(
+            "CGGetActiveDisplayList 失败：{}",
+            status.0
+        )));
+    }
+    let main_display = CGMainDisplayID();
+    let mut out = Vec::with_capacity(actual as usize);
+    for id in ids.into_iter().take(actual as usize) {
+        // `CGDisplayBounds` 的单位是全局显示坐标空间的**点**（4K 屏“看起来像 1920×1080”
+        // 时就是 1920×1080），正是控制端输入映射要的坐标系。
+        let bounds = CGDisplayBounds(id);
+        let width = logical_points(bounds.size.width);
+        let height = logical_points(bounds.size.height);
         out.push(DisplayInfo {
             id,
             width,
             height,
             name: format!("显示器 {id}"),
-            primary,
+            // SAFETY: `CGDisplayIsMain` 只读全局显示配置。
+            primary: id == main_display || CGDisplayIsMain(id),
         });
     }
     Ok(out)
+}
+
+/// `CGFloat` 点尺寸 → 非零 `u32`（非法/非有限值退回 1，避免整块列表被一台怪显示器作废）。
+fn logical_points(value: f64) -> u32 {
+    let points = if value.is_finite() && value > 0.0 {
+        value.round()
+    } else {
+        1.0
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "已钳到正数；显示器点尺寸远小于 u32 上限"
+    )]
+    {
+        points.clamp(1.0, f64::from(u32::MAX)) as u32
+    }
 }
 
 /// 把 SCK 的 completion handler 变成同步等待。

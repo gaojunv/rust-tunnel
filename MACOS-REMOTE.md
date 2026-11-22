@@ -46,6 +46,11 @@ aarch64-apple-darwin 交叉 clippy 均通过（见 3.1 的本机 ABI 桩做法�
 - 关键帧：`kVTEncodeFrameOptionKey_ForceKeyFrame`；`MaxKeyFrameInterval` 设大，避免周期性 IDR。
 - 输出 AVCC → Annex B；关键帧前置 SPS/PPS(/VPS)。
 - 质量地板：`MaxAllowedFrameQP = 20`（对齐 Windows `MAX_QP`）。
+- **异步流水线（原生 4K 的关键）**：VT 的单帧「提交 → 等完成」延迟（真机 4K **~35 ms**，
+  与码率/QP/H.264·H.265 无关）只有 ~28 fps。`submit_only` + `next_packet` 提交本帧、取回
+  最老一帧后：4K **H.265 ~47 fps（深度 1）**、4K **H.264 ~33 fps（深度 2）**、1080p ~188 fps。
+  深度由 `pipeline_depth()` 自适应；IDR 仍走精确同步路径（先丢掉在途 P 帧），起流水时
+  返回空包；**在途帧每帧新建输入/转换缓冲，绝不复用**。
 - 纯逻辑模块（Annex B / 颜色 / 变化检测）在 Windows 上可直接单测。
 
 验收：
@@ -59,18 +64,37 @@ aarch64-apple-darwin 交叉 clippy 均通过（见 3.1 的本机 ABI 桩做法�
 
 - `SCStream` 持续采集：CVPixelBuffer/IOSurface（BGRA），多显示器。
 - 变化检测 320×180 网格，`changed` / `changed_permille`；静止时跳过编码。
-- **GPU 零拷贝**：`capture_gpu` 把完整物理帧的 `CVPixelBuffer` 直接交给
-  `VtEncoder::encode_pixel_buffer`；尺寸/格式不一致时用复用的 `VTPixelTransferSession`
-  在 GPU 上缩放并转 `420v`（BT.709 limited），不做整帧 CPU 拷贝。
+- **GPU 零拷贝**：`SCStreamConfiguration.width/height` **建流时就按 `max_encode_width`
+  输出**（GPU 内缩放：默认 1920、原生分辨率 3840），`capture_gpu` 给出的 `CVPixelBuffer`
+  通常已等于编码尺寸，`VtEncoder::encode_pixel_buffer` **零拷贝直通**；编码宽度上限变化
+  （如 codec 回退到 VP9）会重建采集流。不要退回「采集 4K、每帧再做一次
+  `VTPixelTransferSession` 缩到 1080p」：真机（M4 + 4K TV）实测多付 ~3 ms/帧。
 - 变化检测走 SCK 的 `SCStreamFrameInfoDirtyRects` 附件（有则用），否则用复用的
   `VTPixelTransferSession` 缩到 **320×180**，只锁约 225 KB；补丁路径按矩形
   `scale_bgra_region_strided` 只读脏区间，不再拷整帧。
 - GPU 失败/不可用时回退 CPU `capture()`；`CaptureInfo.gpu_capture` 按最近一帧如实上报。
 - 脏矩形：网格 → 连通域 → 合并 → 目标坐标 NV12 补丁；进入 H.264/H.265 补丁模式。
 - `NSCursor.currentSystemCursor` 形状映射（协议 v9 的 `CursorShape`）。
-- `capture_info`：后端 `"ScreenCaptureKit"`、是否 GPU 路径、回退计数。
+- `capture_info` 只读**快照**（`MacCaptureScreen::telemetry`），不再抢采集锁——会话循环
+  每秒内联读一次，而采集任务在锁内最多阻塞一个 `FRAME_WAIT`（20 ms）。
+- **`displays()` 用 CoreGraphics 同步枚举**（`CGGetActiveDisplayList` + `CGDisplayBounds`）：
+  引擎每 5 秒在 `select!` 里内联调用；SCK 的 `SCShareableContent` 枚举实测 **70–80 ms**，
+  会把输入注入/采集节拍每 5 秒冻住一次（Windows 的 `EnumDisplayMonitors` 是亚毫秒）。
+  首次调用 ~35 ms（建立显示列表，一次性），之后 **~0.13 ms**；**不查 TCC**（预检本身
+  每次也要几十毫秒），缺权限由采集路径报错。
+- **原生分辨率按采集像素算码率与补丁尺寸**：`DisplayInfo` 是输入映射用的**逻辑点**
+  （4K 屏 1920×1080），采集像素是 3840×2160。适配层实现
+  `ScreenSource::encode_pixels()` 返回 `display_physical_size`（2 秒缓存）；引擎据此给
+  原生 4K 档位码率 ×4、补丁目标帧缓冲用同一尺寸，否则补丁每拍「尺寸不符，回到全帧」。
 
 验收：真 Mac 上 1080p/4K 帧率、静止带宽、补丁模式进出门槛、双显示器坐标。
+
+本机真机读数（M4 + Mi TV 4K，`capture-probe`，release）：`list` 第 2 次起 **0.13 ms**
+（改前每拍 70–80 ms）；`gpu 4 1920` 采集 **~3.4–4.1 ms/帧**、VT 编码 **~13 ms/帧**
+（H.264/H.265 接近），每帧 ~16–17 ms；4K 原生用流水线（`stream`）：H.265 深度 1
+**~47 fps**、H.264 深度 2 **~33 fps**（同步路径只有 ~28 fps）；4K 采集 ~4.6 ms/帧。
+4K 原生会话的档位码率按采集像素 ×4（Balanced 24 Mbps / Hd 40 Mbps），设置项
+`remote_native_resolution` 默认关闭，4K 面板上开启后现在也能跑满 30 fps。
 
 ### 阶段 C：系统音频（已完成，真机待验）
 

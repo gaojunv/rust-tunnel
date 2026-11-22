@@ -206,8 +206,19 @@ struct EncodedOutput {
 /// 编码回调与编码线程之间的交接槽。
 #[derive(Debug)]
 struct OutputSlot {
-    /// 本次调用的结果；`None` 表示回调还没来。
-    output: Option<MacVideoResult<EncodedOutput>>,
+    /// 已完成的输出，按产出顺序排队（异步流水线用）。
+    outputs: std::collections::VecDeque<MacVideoResult<EncodedOutput>>,
+    /// 已提交、尚未取回的帧数（异步流水线的在途深度）。
+    in_flight: usize,
+}
+
+impl OutputSlot {
+    fn new() -> Self {
+        Self {
+            outputs: std::collections::VecDeque::new(),
+            in_flight: 0,
+        }
+    }
 }
 
 /// 回调共享状态（`refCon` 指向它；用 `Arc` 保证生命周期覆盖会话）。
@@ -280,7 +291,7 @@ impl VtEncoder {
         config.validate()?;
         let shared = Arc::new(SharedOutput {
             codec: config.codec,
-            slot: Mutex::new(OutputSlot { output: None }),
+            slot: Mutex::new(OutputSlot::new()),
             ready: Condvar::new(),
         });
         let ref_con = Arc::as_ptr(&shared).cast_mut().cast::<c_void>();
@@ -581,14 +592,43 @@ impl VtEncoder {
         buffer: &CVPixelBuffer,
         force_keyframe: bool,
     ) -> MacVideoResult<EncodedPacket> {
-        // 提交前清空交接槽（上一帧已取走；这里防御性地再清一次）。
+        // 同步语义：提交前清空交接槽（上一帧已取走；这里防御性地再清一次）。
         {
             let mut slot = self
                 .shared
                 .slot
                 .lock()
                 .map_err(|_| MacVideoError::Encode("编码交接槽锁已中毒".to_owned()))?;
-            slot.output = None;
+            slot.outputs.clear();
+            slot.in_flight = 0;
+        }
+        self.submit_only(buffer, force_keyframe)?;
+        // 与旧行为一致：`CompleteFrames` 失败只记日志，继续等输出（真失败会在
+        // `wait_for_output` 超时并标 failed）。
+        if let Err(err) = self.flush() {
+            debug!(error = %err, "VTCompressionSessionCompleteFrames 失败");
+        }
+        self.next_packet()
+    }
+
+    /// **异步提交**一帧：只调用 `VTCompressionSessionEncodeFrame`，不等待编码完成。
+    ///
+    /// 硬件编码器是流水线式的：单帧「提交 → 等完成」的延迟在 1080p 约 12–20 ms、4K 约
+    /// 35 ms（且与码率/QP/编码标准无关），但吞吐远高于此。逐帧同步等待把**流水线延迟
+    /// 当成吞吐**——4K 下每帧都付满延迟，30 fps 直接掉到 ~28 fps。异步提交让多帧同时在飞，
+    /// 输出按提交顺序经 [`Self::next_packet`] 取回。
+    ///
+    /// # Errors
+    /// 编码器已失效、`VTCompressionSessionEncodeFrame` 报错或丢帧时返回错误。
+    pub fn submit_only(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> MacVideoResult<()> {
+        if self.failed {
+            return Err(MacVideoError::Encode(
+                "编码器已失效（上次编码超时/故障），需要重建".to_owned(),
+            ));
         }
         let fps = i32::try_from(self.config.fps.max(1)).unwrap_or(1);
         let presentation_time = unsafe { CMTime::new(self.frame_index, fps) };
@@ -623,12 +663,50 @@ impl VtEncoder {
                 "VideoToolbox 丢弃了输入帧".to_owned(),
             ));
         }
-        // 硬件编码器可能有一帧流水线延迟：强制把已提交的帧全部吐出来，回调才会到达。
-        // `kCMTimeInvalid` = 完成所有挂起帧（不是「不完成」）。
-        let complete = unsafe { self.session.complete_frames(kCMTimeInvalid) };
-        if complete != 0 {
-            debug!(status = complete, "VTCompressionSessionCompleteFrames 失败");
+        let mut slot = self
+            .shared
+            .slot
+            .lock()
+            .map_err(|_| MacVideoError::Encode("编码交接槽锁已中毒".to_owned()))?;
+        slot.in_flight = slot.in_flight.saturating_add(1);
+        Ok(())
+    }
+
+    /// 已提交、尚未取回的帧数（异步流水线的在途深度）。
+    ///
+    /// 在途的帧**不能被覆盖式复用同一块输入缓冲**：`submit_pixel_buffer` /
+    /// `submit_bgra` 每帧新建缓冲，正是为此。
+    #[must_use]
+    pub fn pending_frames(&self) -> usize {
+        self.shared
+            .slot
+            .lock()
+            .map_or(0, |slot| slot.in_flight)
+    }
+
+    /// 把所有在途帧泵出来并**丢弃**。
+    ///
+    /// 只在一个场景使用：即将提交一个 **IDR**。IDR 不引用任何旧帧，丢掉在途的 P 帧
+    /// 不会破坏解码（这些帧从未交给上层，控制端看不到序号断层）。
+    ///
+    /// # Errors
+    /// `CompleteFrames` 失败或取输出超时时返回错误（调用方应丢弃编码器）。
+    pub fn discard_pending(&mut self) -> MacVideoResult<()> {
+        if self.pending_frames() == 0 {
+            return Ok(());
         }
+        self.flush()?;
+        while self.pending_frames() > 0 {
+            let _ = self.wait_for_output()?;
+        }
+        Ok(())
+    }
+
+    /// 取下一帧编码输出（异步提交后使用）；输出顺序与提交顺序一致（已关闭帧重排）。
+    ///
+    /// # Errors
+    /// 回调报错、超时或交接槽锁中毒时返回错误。
+    pub fn next_packet(&mut self) -> MacVideoResult<EncodedPacket> {
         let output = self.wait_for_output()?;
         Ok(EncodedPacket {
             data: output.data,
@@ -636,6 +714,157 @@ impl VtEncoder {
             width: self.config.width,
             height: self.config.height,
         })
+    }
+
+    /// 把编码器当前挂起的所有帧泵出来（同步路径与异步流水线收尾用）。
+    ///
+    /// # Errors
+    /// `VTCompressionSessionCompleteFrames` 返回错误时报告。
+    pub fn flush(&self) -> MacVideoResult<()> {
+        let status = unsafe { self.session.complete_frames(kCMTimeInvalid) };
+        if status != 0 {
+            return Err(MacVideoError::os_status(
+                "VTCompressionSessionCompleteFrames",
+                status,
+            ));
+        }
+        Ok(())
+    }
+
+    /// **异步提交**一帧平台原生 `CVPixelBuffer`（尺寸/格式不匹配时新建转换目标）。
+    ///
+    /// 与同步的 [`Self::encode_pixel_buffer`] 的区别只有两点：不等输出、**不复用**
+    /// 转换目标——在途帧可能还没被编码器读完，覆盖同一块缓冲会把画面改脏。VT 会 retain
+    /// 输入缓冲直到编码完成，所以本函数返回后调用方即可释放自己的引用。
+    ///
+    /// 输出按提交顺序经 [`Self::next_packet`] 取回；配套用法见
+    /// `client-gui/src/remote/mac_video.rs` 的一帧深流水线。
+    ///
+    /// # Errors
+    /// 尺寸非法、转换失败、编码器已失效或 `VTCompressionSessionEncodeFrame` 报错时返回错误。
+    pub fn submit_pixel_buffer(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> MacVideoResult<()> {
+        let result = self.submit_pixel_buffer_fresh(buffer, force_keyframe);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn submit_pixel_buffer_fresh(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> MacVideoResult<()> {
+        if self.failed {
+            return Err(MacVideoError::Encode(
+                "编码器已失效（上次编码超时/故障），需要重建".to_owned(),
+            ));
+        }
+        // SAFETY: 只读查询。
+        let (src_width, src_height) = (
+            CVPixelBufferGetWidth(buffer),
+            CVPixelBufferGetHeight(buffer),
+        );
+        let (Ok(src_width), Ok(src_height)) = (u32::try_from(src_width), u32::try_from(src_height))
+        else {
+            return Err(MacVideoError::Config("源像素缓冲尺寸溢出".to_owned()));
+        };
+        if src_width < 2
+            || src_height < 2
+            || src_width > MAX_FRAME_DIM
+            || src_height > MAX_FRAME_DIM
+        {
+            return Err(MacVideoError::Config(format!(
+                "源像素缓冲尺寸非法：{src_width}x{src_height}（上限 {MAX_FRAME_DIM}）"
+            )));
+        }
+        // SAFETY: 只读查询。
+        let format = CVPixelBufferGetPixelFormatType(buffer);
+        let direct = (src_width, src_height) == (self.config.width, self.config.height)
+            && pixel_transfer::is_encoder_input_format(format);
+        if direct {
+            return self.submit_only(buffer, force_keyframe);
+        }
+        // 每帧新建目标：在途帧不能共享同一块转换缓冲。
+        let target = pixel_transfer::create_pixel_buffer(
+            self.config.width,
+            self.config.height,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            true,
+        )?;
+        self.ensure_transfer()?;
+        let transfer = self
+            .transfer
+            .as_ref()
+            .ok_or_else(|| MacVideoError::Encode("像素转换会话未就绪".to_owned()))?;
+        transfer.transfer(buffer, &target)?;
+        self.submit_only(&target, force_keyframe)
+    }
+
+    /// **异步提交**一帧紧包 BGRA（源尺寸可与编码尺寸不同，CPU 侧盒式下采样）。
+    ///
+    /// 每帧新建输入缓冲（不复用），原因见 [`Self::submit_pixel_buffer`]。
+    ///
+    /// # Errors
+    /// 输入长度与源尺寸不符、下采样失败、缓冲创建失败或编码失败时返回错误。
+    pub fn submit_bgra(
+        &mut self,
+        bgra: &[u8],
+        src_width: u32,
+        src_height: u32,
+        force_keyframe: bool,
+    ) -> MacVideoResult<()> {
+        let result = self.submit_bgra_fresh(bgra, src_width, src_height, force_keyframe);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn submit_bgra_fresh(
+        &mut self,
+        bgra: &[u8],
+        src_width: u32,
+        src_height: u32,
+        force_keyframe: bool,
+    ) -> MacVideoResult<()> {
+        if self.failed {
+            return Err(MacVideoError::Encode(
+                "编码器已失效（上次编码超时/故障），需要重建".to_owned(),
+            ));
+        }
+        let expected = usize::try_from(src_width)
+            .ok()
+            .and_then(|w| usize::try_from(src_height).ok().map(|h| (w, h)))
+            .and_then(|(w, h)| w.checked_mul(h))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| MacVideoError::Config("源帧尺寸溢出".to_owned()))?;
+        if bgra.len() != expected {
+            return Err(MacVideoError::Config(format!(
+                "BGRA 长度 {} 与源尺寸 {src_width}x{src_height} 不符（应为 {expected}）",
+                bgra.len()
+            )));
+        }
+        let scaled;
+        let source = if (src_width, src_height) == (self.config.width, self.config.height) {
+            bgra
+        } else {
+            scaled = crate::color::scale_bgra_box(
+                bgra,
+                src_width,
+                src_height,
+                self.config.width,
+                self.config.height,
+            )?;
+            &scaled
+        };
+        let buffer = self.create_input_buffer()?;
+        self.upload_into(&buffer, source)?;
+        self.submit_only(&buffer, force_keyframe)
     }
 
     /// 取（或创建）编码尺寸的 `420v` 转换目标（BT.709 limited、IOSurface 背书）。
@@ -662,10 +891,19 @@ impl VtEncoder {
     }
 
     /// 把 BGRA 拷进一个 `32BGRA` 的 `CVPixelBuffer`（按需创建/复用）。
+    ///
+    /// **只用于同步路径**：复用的缓冲在编码器读完之前不能被下一帧覆盖，而同步路径在
+    /// 返回前已经等到了输出。
     fn upload(&mut self, bgra: &[u8]) -> MacVideoResult<CFRetained<CVPixelBuffer>> {
         let buffer = self.input_buffer()?;
+        self.upload_into(&buffer, bgra)?;
+        Ok(buffer)
+    }
+
+    /// 把 BGRA 逐行拷进指定的 `32BGRA` 缓冲（缓冲尺寸必须是编码尺寸）。
+    fn upload_into(&self, buffer: &CVPixelBuffer, bgra: &[u8]) -> MacVideoResult<()> {
         let lock_status =
-            unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
+            unsafe { CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags(0)) };
         if lock_status != 0 {
             return Err(MacVideoError::os_status(
                 "CVPixelBufferLockBaseAddress",
@@ -677,10 +915,10 @@ impl VtEncoder {
             .and_then(|w| w.checked_mul(4))
             .ok_or_else(|| MacVideoError::Config("编码行宽溢出".to_owned()))?;
         let height = usize::try_from(self.config.height).unwrap_or(0);
-        let base = CVPixelBufferGetBaseAddress(&buffer).cast::<u8>();
-        let pitch = CVPixelBufferGetBytesPerRow(&buffer);
+        let base = CVPixelBufferGetBaseAddress(buffer).cast::<u8>();
+        let pitch = CVPixelBufferGetBytesPerRow(buffer);
         if base.is_null() || pitch < row_bytes {
-            unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
+            unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags(0)) };
             return Err(MacVideoError::Encode(format!(
                 "像素缓冲不可写（base 空或 pitch {pitch} < 行宽 {row_bytes}）"
             )));
@@ -689,7 +927,7 @@ impl VtEncoder {
             let src_start = row.saturating_mul(row_bytes);
             let dst_start = row.saturating_mul(pitch);
             let Some(src_row) = bgra.get(src_start..src_start.saturating_add(row_bytes)) else {
-                unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
+                unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags(0)) };
                 return Err(MacVideoError::Encode("BGRA 行越界".to_owned()));
             };
             // SAFETY: `base + dst_start` 在 pitch×height 的缓冲内（pitch ≥ row_bytes，
@@ -699,13 +937,38 @@ impl VtEncoder {
             }
         }
         let unlock_status =
-            unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
+            unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags(0)) };
         if unlock_status != 0 {
             return Err(MacVideoError::os_status(
                 "CVPixelBufferUnlockBaseAddress",
                 unlock_status,
             ));
         }
+        Ok(())
+    }
+
+    /// 新建一块编码尺寸的 `32BGRA` 输入缓冲（**不复用**；异步流水线每帧一块）。
+    fn create_input_buffer(&self) -> MacVideoResult<CFRetained<CVPixelBuffer>> {
+        let attributes = pixel_buffer_attributes(self.config.width, self.config.height)?;
+        let mut buffer_ptr: *mut CVPixelBuffer = ptr::null_mut();
+        let status = unsafe {
+            CVPixelBufferCreate(
+                None,
+                usize::try_from(self.config.width).unwrap_or(0),
+                usize::try_from(self.config.height).unwrap_or(0),
+                kCVPixelFormatType_32BGRA,
+                Some(&attributes),
+                NonNull::from(&mut buffer_ptr),
+            )
+        };
+        if status != 0 {
+            return Err(MacVideoError::os_status("CVPixelBufferCreate", status));
+        }
+        let buffer = unsafe {
+            CFRetained::from_raw(NonNull::new(buffer_ptr).ok_or_else(|| {
+                MacVideoError::Encode("CVPixelBufferCreate 返回空缓冲".to_owned())
+            })?)
+        };
         Ok(buffer)
     }
 
@@ -747,7 +1010,8 @@ impl VtEncoder {
             .lock()
             .map_err(|_| MacVideoError::Encode("编码交接槽锁已中毒".to_owned()))?;
         loop {
-            if let Some(result) = slot.output.take() {
+            if let Some(result) = slot.outputs.pop_front() {
+                slot.in_flight = slot.in_flight.saturating_sub(1);
                 return result;
             }
             let now = Instant::now();
@@ -794,7 +1058,7 @@ unsafe extern "C-unwind" fn compression_output_callback(
         build_output(shared.codec, unsafe { &*sample_buffer })
     };
     if let Ok(mut slot) = shared.slot.lock() {
-        slot.output = Some(result);
+        slot.outputs.push_back(result);
     }
     shared.ready.notify_all();
 }

@@ -10,6 +10,7 @@
 //! CPU `capture()`**（与 Windows 语义一致），会话不会因为一次 GPU 失败而中断。
 
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rust_tunnel_mac_capture::{
     CaptureInfo as MacCaptureInfo, CapturedFrame, CapturedGpuFrame, CursorShape as MacCursorShape,
@@ -20,17 +21,17 @@ use rust_tunnel_remote::screen::{
 };
 use rust_tunnel_remote::{DisplayInfo, RawFrame, RemoteError, RemoteResult, ScreenSource};
 
-/// 引擎侧 [`RawFrame::gpu`] 的 macOS 载体：一块 SCK 的 `CVPixelBuffer`（完整物理帧）。
+/// 引擎侧 [`RawFrame::gpu`] 的 macOS 载体：一块 SCK 的 `CVPixelBuffer`。
 ///
-/// `frame.width/height`（逻辑编码尺寸）可能小于缓冲的物理尺寸（4K 采集先按会话上限
-/// 封顶：默认 1920，原生分辨率下就是 3840），故这里同时保留 `source_width/source_height`
-/// 供编码器在 GPU 上缩放。
+/// SCK 的采集流建流时已按 `max_encode_width` 输出（GPU 内缩放），所以缓冲尺寸通常就是
+/// 逻辑编码尺寸；`source_width/source_height` 仍单独保留（显示器比上限小时两者相等，
+/// 上限变化会重建采集流）。
 pub(crate) struct MacGpuFrame {
     /// 采集帧的像素缓冲（引用计数，不拷贝像素）。
     pub(crate) buffer: GpuFrameBuffer,
-    /// 缓冲的物理宽度。
+    /// 缓冲的实际宽度。
     pub(crate) source_width: u32,
-    /// 缓冲的物理高度。
+    /// 缓冲的实际高度。
     pub(crate) source_height: u32,
 }
 
@@ -49,8 +50,23 @@ unsafe impl Sync for MacGpuFrame {}
 ///
 /// `MacCapture` 在第一次使用时惰性创建：构造发生在 GUI 启动阶段，那时可能还没授予
 /// 屏幕录制权限；把失败推迟到真正采集，会话能给出准确错误而不是启动即失败。
+/// 显示器物理尺寸的短缓存项：`(显示器 id, 物理像素, 取样时刻)`。
+type PhysicalCache = Option<(u32, (u32, u32), Instant)>;
+
 pub struct MacCaptureScreen {
     inner: Mutex<Option<MacCapture>>,
+    /// 最近一次采集/操作后的平台读数快照。
+    ///
+    /// `capture_info()` 每秒被会话循环内联调用一次；它**绝不能**去抢 `inner`
+    /// ——采集任务会在那把锁里阻塞最多一个帧等待窗口（`FRAME_WAIT` 20 ms），
+    /// 每秒因此冻住输入注入/心跳 20 ms 是白送的卡顿。快照在锁内顺手刷新，读取只抢
+    /// 这把几乎不持有的锁。
+    telemetry: Mutex<CaptureInfo>,
+    /// 显示器 → 物理像素尺寸的短缓存（`encode_pixels` 用）。
+    ///
+    /// `display_physical_size` 是 CoreGraphics 调用；引擎在补丁模式下每拍都会问一次，
+    /// 没必要每帧付一次。显示器几何复查本身就是 2 秒一次，缓存 2 秒足够。
+    physical_cache: Mutex<PhysicalCache>,
 }
 
 impl MacCaptureScreen {
@@ -59,6 +75,11 @@ impl MacCaptureScreen {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(None),
+            telemetry: Mutex::new(CaptureInfo {
+                backend: "ScreenCaptureKit".to_owned(),
+                ..CaptureInfo::default()
+            }),
+            physical_cache: Mutex::new(None),
         }
     }
 
@@ -77,7 +98,14 @@ impl MacCaptureScreen {
         let capture = guard
             .as_mut()
             .ok_or_else(|| RemoteError::Platform("ScreenCaptureKit 未初始化".to_owned()))?;
-        f(capture)
+        let result = f(capture);
+        // 平台读数只读几个原子/缓存字段，代价可忽略；顺手刷新快照让 `capture_info()`
+        // 永远不必抢这把可能被采集阻塞的锁。
+        *self
+            .telemetry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = capture_info(capture.info());
+        result
     }
 }
 
@@ -89,8 +117,31 @@ impl Default for MacCaptureScreen {
 
 impl ScreenSource for MacCaptureScreen {
     fn displays(&self) -> Vec<DisplayInfo> {
-        self.with_capture(|capture| Ok(display_list(capture.displays())))
+        // **不经过 `MacCapture` 实例**：引擎每 5 秒在会话循环里内联调用本方法，
+        // `displays()` 因此必须是亚毫秒的 CoreGraphics 同步枚举（SCK 的异步内容枚举
+        // 实测 70–80 ms，会周期性地冻住输入注入与采集节拍）。
+        rust_tunnel_mac_capture::displays()
+            .map(display_list)
             .unwrap_or_default()
+    }
+
+    /// 采集/编码**物理像素**尺寸（引擎据此算原生码率倍率与补丁目标帧缓冲）。
+    ///
+    /// `DisplayInfo` 报的是输入映射用的**逻辑点**（4K 屏 1920×1080），与采集像素
+    /// （3840×2160）差一个缩放比。这里缓存 2 秒，避免补丁模式每拍一次 CoreGraphics 调用。
+    fn encode_pixels(&self, display: u32) -> Option<(u32, u32)> {
+        let mut cache = self
+            .physical_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_id, size, at)) = *cache {
+            if cached_id == display && at.elapsed() < Duration::from_secs(2) {
+                return Some(size);
+            }
+        }
+        let size = rust_tunnel_mac_capture::display_physical_size(display)?;
+        *cache = Some((display, size, Instant::now()));
+        Some(size)
     }
 
     fn capture(&self, display: u32) -> RemoteResult<RawFrame> {
@@ -157,11 +208,11 @@ impl ScreenSource for MacCaptureScreen {
     }
 
     fn capture_info(&self) -> CaptureInfo {
-        self.with_capture(|capture| Ok(capture_info(capture.info())))
-            .unwrap_or_else(|_| CaptureInfo {
-                backend: "ScreenCaptureKit".to_owned(),
-                ..CaptureInfo::default()
-            })
+        // 只读快照，**不抢采集锁**（见 `telemetry` 的说明）。
+        self.telemetry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn cursor_shape(&self) -> Option<CursorShape> {

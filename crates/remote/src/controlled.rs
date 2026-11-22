@@ -1488,12 +1488,28 @@ fn session_encode_options(options: EncodeOptions, permille: u32) -> EncodeOption
 }
 
 /// 某台显示器在原生分辨率会话里的码率倍数（千分比）；非原生会话恒 1000。
-fn native_bitrate_permille(display: Option<&DisplayInfo>, native_active: bool) -> u32 {
+///
+/// `pixels` 必须是**采集/编码像素**（见 [`ScreenSource::encode_pixels`]），不是
+/// [`DisplayInfo`] 的输入坐标系尺寸：macOS 的 `DisplayInfo` 是逻辑点，4K 原生会话
+/// 直接按它算会让 3840×2160 只拿到 1080p 的码率。
+fn native_bitrate_permille(pixels: Option<(u32, u32)>, native_active: bool) -> u32 {
     if !native_active {
         return 1000;
     }
-    display.map_or(NATIVE_BITRATE_FACTOR * 1000, |display| {
-        bitrate_permille_for_pixels(u64::from(display.width) * u64::from(display.height))
+    pixels.map_or(NATIVE_BITRATE_FACTOR * 1000, |(width, height)| {
+        bitrate_permille_for_pixels(u64::from(width) * u64::from(height))
+    })
+}
+
+/// 平台采集/编码像素尺寸；平台不单独上报时退回 [`DisplayInfo`]（Windows 的物理像素）。
+fn display_encode_pixels(
+    screen: &dyn ScreenSource,
+    display: Option<&DisplayInfo>,
+) -> Option<(u32, u32)> {
+    display.map(|display| {
+        screen
+            .encode_pixels(display.id)
+            .unwrap_or((display.width, display.height))
     })
 }
 
@@ -2783,7 +2799,7 @@ pub(crate) async fn run_controlled_inner(
         .or_else(|| displays.first());
     let mut rate = RateController::new(session_encode_options(
         config.encode,
-        native_bitrate_permille(initial_display, native_active),
+        native_bitrate_permille(display_encode_pixels(&*screen, initial_display), native_active),
     ));
     // 内容面积上限按**编码器类型**开关：VP9 是 CBR（静止画面也会把目标码率灌满，需要这层
     // 省带宽）；H.264/H.265 是峰值受限 VBR（没有残差时只发几 KB），上限只会压低 VBV 单帧
@@ -3302,9 +3318,12 @@ pub(crate) async fn run_controlled_inner(
                                         .iter()
                                         .find(|d| d.id == display_id)
                                         .map_or((0, 0), |d| {
+                                            let (width, height) = screen
+                                                .encode_pixels(d.id)
+                                                .unwrap_or((d.width, d.height));
                                             encode_target_dims(
-                                                d.width,
-                                                d.height,
+                                                width,
+                                                height,
                                                 encode.scale,
                                                 max_encode_width,
                                             )
@@ -3990,7 +4009,10 @@ pub(crate) async fn run_controlled_inner(
                             rate.set_ceiling(session_encode_options(
                                 preset.options(),
                                 native_bitrate_permille(
-                                    displays.iter().find(|d| d.id == display_id),
+                                    display_encode_pixels(
+                                        &*screen,
+                                        displays.iter().find(|d| d.id == display_id),
+                                    ),
                                     native_active,
                                 ),
                             ));
@@ -9633,6 +9655,14 @@ mod tests {
         }
         // 非原生（`native_active == false`）恒 1000。
         assert_eq!(native_bitrate_permille(None, false), 1000);
+        // 原生会话按**采集像素**放大：4K = 4000‰，1080p = 1000‰。
+        //
+        // macOS 的 `DisplayInfo` 是逻辑点（4K 屏报 1920×1080），所以引擎必须用
+        // `ScreenSource::encode_pixels` 的物理尺寸，不能拿 `DisplayInfo` 算——否则
+        // 原生 4K 只拿到 1080p 的码率。
+        assert_eq!(native_bitrate_permille(Some((3840, 2160)), true), 4000);
+        assert_eq!(native_bitrate_permille(Some((1920, 1080)), true), 1000);
+        assert_eq!(native_bitrate_permille(Some((3840, 2160)), false), 1000);
     }
 
     /// 内容上限的面积倍数：1080p = 1000‰，4K = 4000‰，与编码尺寸同口径。

@@ -576,6 +576,19 @@ pub trait ScreenSource: Send + Sync + 'static {
     /// 当前所有显示器。
     fn displays(&self) -> Vec<DisplayInfo>;
 
+    /// 平台**采集/编码像素尺寸**（可选；默认 `None` = 与 [`DisplayInfo`] 相同）。
+    ///
+    /// [`DisplayInfo`] 是**控制端输入映射坐标系**：macOS 上报的是全局逻辑点（4K 屏为
+    /// 1920×1080 点），而采集/编码像素是它的整数倍（3840×2160）。原生码率倍率
+    /// （[`crate::screen::bitrate_permille_for_pixels`]）与补丁目标帧缓冲必须按**采集
+    /// 像素**算，否则 4K 原生会话会拿到 1080p 的码率、补丁尺寸也会与全帧对不上。
+    ///
+    /// Windows 等平台的 `DisplayInfo` 本来就是物理像素，返回 `None` 即可。
+    fn encode_pixels(&self, display: u32) -> Option<(u32, u32)> {
+        let _ = display;
+        None
+    }
+
     /// 采集指定显示器的一帧。
     ///
     /// # Errors
