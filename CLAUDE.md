@@ -238,20 +238,31 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
   AVCC 转 Annex B，关键帧前置 SPS/PPS(/VPS)；`MaxAllowedFrameQP = 20` 对齐 Windows 画质
   地板；在线改码率/帧率只调 `VTSessionSetProperty`，**不重建、不插 IDR**；`RUST_TUNNEL_DISABLE_H265`
   与 `RUST_TUNNEL_DISABLE_HWCODEC` 两条排障开关与 Windows 同义。
+- **GPU 零拷贝**：`mac-capture` 的 `capture_gpu` 把完整物理帧的 `CVPixelBuffer` 直接交给
+  `VtEncoder::encode_pixel_buffer`；源尺寸/格式与编码配置一致时**不落 CPU**，4K→1920 用复用的
+  `VTPixelTransferSession` 在 GPU 上缩放并转 `420v`（BT.709 limited）。变化检测优先用 SCK 的
+  `SCStreamFrameInfoDirtyRects` 附件，否则用 320×180 降采样只锁约 225 KB；补丁路径按
+  `scale_bgra_region_strided` 只读脏矩形区间，不再拷整帧。GPU 失败回退 CPU `capture()`，
+  `CaptureInfo.gpu_capture` 按最近一帧如实上报。
 - **音频**：SCK 系统声音（`capturesAudio`，排除本进程）+ AudioQueue 播放 + Opus 96 kbps；
   能力/启停仍走既有 `AudioStatus`/`SetAudioEnabled`。`audiopus_sys` 用 CMake 构建 vendored
   libopus（`--features` 默认开 `opus`；CI 的 macOS runner 自带 CMake）。
 - **权限**：屏幕录制（采集 + 系统音频）与辅助功能（注入）都是 TCC 授权，已有 `macos::permissions()`
   探测与设置跳转；无权限时必须显式报错，不能静默黑屏。
-- **验证**：`ci.yml` 的 `macos-check` 在 `macos-latest` 上编译全部 macOS crate 并跑
-  `mac-video` 纯逻辑单测。本机 Windows 交叉 `cargo check --target aarch64-apple-darwin`
-  需 zig 垫片；`client-gui` 会卡在 `mac-notification-sys` 的 Cocoa.h（zig 不带 Apple SDK），
-  该层只能靠 macOS CI。真机探针：`mac-video-probe` / `capture-probe` / `mac-audio-probe`。
+- **验证**：`ci.yml` 的 `macos-check` 在 `macos-latest` 上编译全部 macOS crate 并跑纯逻辑
+  单测。本机 Windows 交叉 `cargo check --target aarch64-apple-darwin` 需 zig 垫片；`client-gui`
+  可再用两个仓库外桩（通知 crate 的 build.rs + audiopus ABI）做完整 clippy，做法见
+  `MACOS-REMOTE.md` 3.1；链接 Apple 框架与运行期行为仍只能靠 macOS CI/真机。真机探针：
+  `mac-video-probe` / `capture-probe` / `mac-audio-probe`。
 - **无人值守**：macOS 的「登录界面」不能照搬 Windows 安全桌面模型。结论与依据见根目录
   `MACOS-UNATTENDED.md`：锁屏可控；登录窗口画面需 `LoginWindow` LaunchAgent + macOS 14.4+
   的 SCK（root LaunchDaemon 够不着 WindowServer）；**登录窗口注入不可靠、不作为产品承诺**；
   FileVault 开机解锁平台外；长期无人值守还依赖 Apple 审批的
-  `com.apple.developer.persistent-content-capture`。
+  `com.apple.developer.persistent-content-capture`。**P1 已实现**：用
+  `--install-login-agent` / `--login-agent` 安装并运行 LoginWindow LaunchAgent（root-only
+  helper + host.toml 0600）；引擎 `RemoteManager::set_read_only(true)` 在
+  `RemoteSessionIncoming` 阶段只放行 `ViewOnly`，平台层再装空注入器与无剪贴板实现。
+  安装/验证/限制见 `MACOS-LOGIN-AGENT.md`。
 - **发布**：功能完成时把 `client`/`client-gui`/`win-platform`/`win-service` 同步抬到
   **0.28.0**（`v0.28.0` 与 `gui-v0.28.0` 同一版本）；服务端门控无需改动。
 

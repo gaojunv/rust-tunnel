@@ -3,20 +3,47 @@
 //! 与 Windows 的 `win_video` 的 `WinVideoScreen` 同构：`rust-tunnel-mac-capture` 负责
 //! SCK 流、变化检测与补丁提取，本模块只做类型映射与惰性初始化。
 //!
-//! # 阶段 B 的边界
+//! # GPU 零拷贝
 //!
-//! 采集仍是 CPU 回读：`mac-capture` 把 `CVPixelBuffer` 拷成 BGRA 再转 RGBA。GPU 零拷贝
-//! （`CVPixelBuffer` 直接喂 VideoToolbox）是后续优化，故这里 `supports_gpu_capture()`
-//! 恒为 `false`，引擎会走普通 `capture()`。
+//! SCK 的帧本来就是 `IOSurface` 背书的 `CVPixelBuffer`：`capture_gpu` 把它原样交给
+//! 引擎（[`RawFrame::gpu`]），编码器适配器再直通给 VideoToolbox。采集失败时**回退到
+//! CPU `capture()`**（与 Windows 语义一致），会话不会因为一次 GPU 失败而中断。
 
 use std::sync::{Mutex, PoisonError};
 
 use rust_tunnel_mac_capture::{
-    CaptureInfo as MacCaptureInfo, CapturedFrame, CursorShape as MacCursorShape,
-    DisplayInfo as MacDisplay, MacCapture,
+    CaptureInfo as MacCaptureInfo, CapturedFrame, CapturedGpuFrame, CursorShape as MacCursorShape,
+    DisplayInfo as MacDisplay, GpuFrameBuffer, MacCapture,
 };
-use rust_tunnel_remote::screen::{CaptureInfo, CapturedPatches, CursorShape, ScreenPatch};
+use rust_tunnel_remote::screen::{
+    CaptureInfo, CapturedPatches, CursorShape, GpuFrame, ScreenPatch,
+};
 use rust_tunnel_remote::{DisplayInfo, RawFrame, RemoteError, RemoteResult, ScreenSource};
+
+/// 引擎侧 [`RawFrame::gpu`] 的 macOS 载体：一块 SCK 的 `CVPixelBuffer`（完整物理帧）。
+///
+/// `frame.width/height`（逻辑编码尺寸）可能小于缓冲的物理尺寸（4K 采集先按会话上限
+/// 封顶：默认 1920，原生分辨率下就是 3840），故这里同时保留 `source_width/source_height`
+/// 供编码器在 GPU 上缩放。
+pub(crate) struct MacGpuFrame {
+    /// 采集帧的像素缓冲（引用计数，不拷贝像素）。
+    pub(crate) buffer: GpuFrameBuffer,
+    /// 缓冲的物理宽度。
+    pub(crate) source_width: u32,
+    /// 缓冲的物理高度。
+    pub(crate) source_height: u32,
+}
+
+impl GpuFrame for MacGpuFrame {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// SAFETY: `CVPixelBuffer` 是不可变、引用计数的 CF 对象，文档契约允许在任意线程 lock
+// 读取；SCK 在回调之外不再改写这一帧，我们只持有引用。`source_width/height` 是普通整数。
+unsafe impl Send for MacGpuFrame {}
+unsafe impl Sync for MacGpuFrame {}
 
 /// 基于 ScreenCaptureKit 的采集源。
 ///
@@ -75,17 +102,38 @@ impl ScreenSource for MacCaptureScreen {
         })
     }
 
+    /// `CVPixelBuffer` 直通（零拷贝）在 macOS 上恒可用：SCK 的帧本来就是 GPU 侧缓冲。
+    fn supports_gpu_capture(&self) -> bool {
+        true
+    }
+
+    /// 采集一帧 GPU 直通画面；失败时回退 CPU 采集（与 Windows 语义一致）。
+    fn capture_gpu(&self, display: u32) -> RemoteResult<RawFrame> {
+        let gpu = self.with_capture(|capture| {
+            capture
+                .capture_gpu(display)
+                .map(gpu_raw_frame)
+                .map_err(|err| {
+                    RemoteError::Platform(format!("ScreenCaptureKit GPU 采集失败: {err}"))
+                })
+        });
+        match gpu {
+            Ok(frame) => Ok(frame),
+            Err(err) => {
+                // 一次失败的 GPU 采集（权限、流重建、转换会话）不该让会话来一刀切：
+                // 下一拍走 CPU 路径，画面继续。
+                tracing::warn!(error = %err, "GPU 采集失败，本拍回退 CPU 采集");
+                self.capture(display)
+            }
+        }
+    }
+
     fn set_max_encode_width(&self, width: u32) {
         // 失败只记日志：下一拍采集仍按默认上限工作，会话继续。
         let _ = self.with_capture(|capture| {
             capture.set_max_encode_width(width);
             Ok(())
         });
-    }
-
-    /// 阶段 B 走 CPU 回读；GPU 纹理直通是后续优化。
-    fn supports_gpu_capture(&self) -> bool {
-        false
     }
 
     fn supports_patches(&self) -> bool {
@@ -150,6 +198,23 @@ fn raw_frame(frame: CapturedFrame) -> RawFrame {
         height: frame.height,
         rgba: frame.rgba,
         gpu: None,
+        changed: frame.changed,
+        changed_permille: frame.changed_permille,
+    }
+}
+
+/// GPU 直通帧：`width`/`height` 是**逻辑编码尺寸**，缓冲保持原始物理分辨率。
+fn gpu_raw_frame(frame: CapturedGpuFrame) -> RawFrame {
+    RawFrame {
+        display: frame.display,
+        width: frame.width,
+        height: frame.height,
+        rgba: Vec::new(),
+        gpu: Some(std::sync::Arc::new(MacGpuFrame {
+            buffer: frame.buffer,
+            source_width: frame.source_width,
+            source_height: frame.source_height,
+        })),
         changed: frame.changed,
         changed_permille: frame.changed_permille,
     }

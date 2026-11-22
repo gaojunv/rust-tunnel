@@ -12,6 +12,7 @@ mod autostart;
 mod config_store;
 mod fonts;
 mod instance;
+mod login_agent;
 mod mem;
 mod notify;
 mod prefs;
@@ -816,7 +817,10 @@ fn build_remote_manager(
     // working set，占实例启动占用的绝大部分），探测完再把工厂置 `None` 是没用的。
     // 编码器探测照旧（被控端需要 H.264/H.265 编码）；GUI 路径也照旧（它随时可能去解码
     // 对端画面）。
-    let probe_decoders = opts.platform_mode != remote::PlatformMode::Instance;
+    let probe_decoders = !matches!(
+        opts.platform_mode,
+        remote::PlatformMode::Instance | remote::PlatformMode::LoginWindow
+    );
     let remote::HardwareFactories {
         h264_encoder: h264_encoder_factory,
         h264_decoder: h264_decoder_factory,
@@ -1288,6 +1292,15 @@ enum LaunchMode {
     /// 自更新收尾：等待旧进程退出后把当前 exe 复制到目标路径并重启
     /// （Windows 专用；由 `update::apply_and_restart` 以内建参数拉起）。
     ApplyUpdate(PathBuf),
+    /// 登录窗口只读 agent（macOS，由 LaunchAgent 以 `--login-agent` 拉起）。
+    LoginAgent(login_agent::LoginAgentOptions),
+    /// 安装登录窗口 LaunchAgent（macOS，需要 root）。
+    InstallLoginAgent {
+        /// 要安装的 host.toml；`None` = 使用 root-only 默认路径。
+        config: Option<PathBuf>,
+    },
+    /// 卸载登录窗口 LaunchAgent（macOS，需要 root）。
+    UninstallLoginAgent,
 }
 
 /// 解析命令行。
@@ -1300,9 +1313,106 @@ enum LaunchMode {
 ///
 /// # Errors
 ///
-/// 未知参数、缺参数值、或 `--config` 未与 `--instance` 同用时返回错误文本。
+/// 未知参数、缺参数值、多个模式同时出现、或 `--config` 未与支持它的模式同用时返回错误文本。
 fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMode, String> {
-    const USAGE: &str = "\
+    let mut instance = false;
+    let mut login_agent = false;
+    let mut install_login_agent = false;
+    let mut uninstall_login_agent = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut share_dir: Option<PathBuf> = None;
+    let mut download_dir: Option<PathBuf> = None;
+    let mut apply_update: Option<PathBuf> = None;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--instance" => instance = true,
+            "--login-agent" => login_agent = true,
+            "--install-login-agent" => install_login_agent = true,
+            "--uninstall-login-agent" => uninstall_login_agent = true,
+            "--config" | "--share" | "--download" | "--apply-update" => {
+                let Some(value) = iter.next() else {
+                    return Err(format!("{arg} 需要一个路径参数\n\n{USAGE}"));
+                };
+                let slot = match arg.as_str() {
+                    "--config" => &mut config_path,
+                    "--share" => &mut share_dir,
+                    "--apply-update" => &mut apply_update,
+                    _ => &mut download_dir,
+                };
+                *slot = Some(PathBuf::from(value));
+            }
+            other => return Err(format!("未知参数：{other}\n\n{USAGE}")),
+        }
+    }
+
+    let mode_count = u8::from(instance)
+        + u8::from(login_agent)
+        + u8::from(install_login_agent)
+        + u8::from(uninstall_login_agent)
+        + u8::from(apply_update.is_some());
+    if mode_count > 1 {
+        return Err(format!(
+            "--instance / --login-agent / --install-login-agent / --uninstall-login-agent / \
+             --apply-update 不能同时使用\n\n{USAGE}"
+        ));
+    }
+
+    if let Some(target) = apply_update {
+        if config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
+            return Err(format!(
+                "--apply-update 是内部自更新模式，不能与其他参数一起用\n\n{USAGE}"
+            ));
+        }
+        return Ok(LaunchMode::ApplyUpdate(target));
+    }
+    if instance {
+        return Ok(LaunchMode::Instance(instance::InstanceOptions::resolve(
+            config_path,
+            share_dir,
+            download_dir,
+        )));
+    }
+    if login_agent {
+        if share_dir.is_some() || download_dir.is_some() {
+            return Err(format!(
+                "--share / --download 与 --login-agent 无关\n\n{USAGE}"
+            ));
+        }
+        return Ok(LaunchMode::LoginAgent(login_agent::LoginAgentOptions {
+            config_path: config_path.unwrap_or_else(login_agent::default_config_path),
+        }));
+    }
+    if install_login_agent {
+        if share_dir.is_some() || download_dir.is_some() {
+            return Err(format!(
+                "--share / --download 与 --install-login-agent 无关\n\n{USAGE}"
+            ));
+        }
+        return Ok(LaunchMode::InstallLoginAgent {
+            config: config_path,
+        });
+    }
+    if uninstall_login_agent {
+        if config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
+            return Err(format!(
+                "--uninstall-login-agent 不接受 --config / --share / --download\n\n{USAGE}"
+            ));
+        }
+        return Ok(LaunchMode::UninstallLoginAgent);
+    }
+    if config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
+        return Err(format!(
+            "--config / --share / --download 只能与 --instance / --login-agent / \
+             --install-login-agent 一起用\n\n{USAGE}"
+        ));
+    }
+    Ok(LaunchMode::Gui)
+}
+
+/// 命令行用法（模块级常量，避免 `parse_launch_mode` 因嵌入长字符串触发 `too_many_lines`）。
+const USAGE: &str = "\
 用法：
   rust-tunnel-client-gui
       启动桌面托盘客户端（默认）。
@@ -1320,56 +1430,18 @@ fn parse_launch_mode<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchMo
 
   rust-tunnel-client-gui --apply-update <target>
       自更新收尾（内部使用）：等待 target 被释放后复制当前 exe 过去并重启。
-      由新版客户端在替换 Windows 上正在运行的程序时自动拉起，不要手工调用。";
+      由新版客户端在替换 Windows 上正在运行的程序时自动拉起，不要手工调用。
 
-    let mut instance = false;
-    let mut config_path: Option<PathBuf> = None;
-    let mut share_dir: Option<PathBuf> = None;
-    let mut download_dir: Option<PathBuf> = None;
-    let mut apply_update: Option<PathBuf> = None;
+  rust-tunnel-client-gui --login-agent [--config <host.toml>]
+      登录窗口只读 agent（macOS）：由 /Library/LaunchAgents 在 LoginWindow 会话拉起。
+      只接受「仅观看」；完全控制与文件传输会被拒绝。
 
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--instance" => instance = true,
-            "--config" | "--share" | "--download" | "--apply-update" => {
-                let Some(value) = iter.next() else {
-                    return Err(format!("{arg} 需要一个路径参数\n\n{USAGE}"));
-                };
-                let slot = match arg.as_str() {
-                    "--config" => &mut config_path,
-                    "--share" => &mut share_dir,
-                    "--apply-update" => &mut apply_update,
-                    _ => &mut download_dir,
-                };
-                *slot = Some(PathBuf::from(value));
-            }
-            other => return Err(format!("未知参数：{other}\n\n{USAGE}")),
-        }
-    }
+  rust-tunnel-client-gui --install-login-agent [--config <host.toml>]
+      安装登录窗口 LaunchAgent（macOS，需要 sudo）。--config 省略时使用
+      /Library/Application Support/rust-tunnel/host.toml（它已是目标则校验后原地加固）。
 
-    if let Some(target) = apply_update {
-        if instance || config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
-            return Err(format!(
-                "--apply-update 是内部自更新模式，不能与其他参数一起用\n\n{USAGE}"
-            ));
-        }
-        return Ok(LaunchMode::ApplyUpdate(target));
-    }
-    if instance {
-        Ok(LaunchMode::Instance(instance::InstanceOptions::resolve(
-            config_path,
-            share_dir,
-            download_dir,
-        )))
-    } else if config_path.is_some() || share_dir.is_some() || download_dir.is_some() {
-        Err(format!(
-            "--config / --share / --download 只能与 --instance 一起用\n\n{USAGE}"
-        ))
-    } else {
-        Ok(LaunchMode::Gui)
-    }
-}
+  rust-tunnel-client-gui --uninstall-login-agent
+      卸载登录窗口 LaunchAgent（macOS，需要 sudo）。";
 
 /// 启动期诊断：把 panic/启动错误写到 `%LOCALAPPDATA%\rust-tunnel\gui-startup.log`。
 ///
@@ -1649,6 +1721,12 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // 走到托盘/eframe 就会起窗口（那是它明确不该做的事）。
     match parse_launch_mode(std::env::args().skip(1)) {
         Ok(LaunchMode::Instance(opts)) => return instance::run(&opts),
+        // 登录窗口只读 agent：launchd 以 root 拉起，不能碰 eframe/托盘。
+        Ok(LaunchMode::LoginAgent(opts)) => return login_agent::run(&opts),
+        Ok(LaunchMode::InstallLoginAgent { config }) => {
+            return login_agent::install(config.as_deref());
+        }
+        Ok(LaunchMode::UninstallLoginAgent) => return login_agent::uninstall(),
         // 自更新收尾：无窗口、无桌面要求，必须在托盘/eframe 之前分派。
         Ok(LaunchMode::ApplyUpdate(target)) => {
             return update::run_apply_update(&target);

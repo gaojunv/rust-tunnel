@@ -17,6 +17,8 @@ pub const NAME: &str = "macos";
 extern "C" {
     /// 是否已获得屏幕录制权限（macOS 10.15+；不弹授权框）。
     fn CGPreflightScreenCaptureAccess() -> u8;
+    /// 请求屏幕录制权限（可能弹一次系统授权框）。
+    fn CGRequestScreenCaptureAccess() -> u8;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -38,6 +40,16 @@ pub fn permissions() -> super::Permissions {
     }
 }
 
+/// 请求屏幕录制权限；返回调用后是否已授予。
+///
+/// 只在登录窗口 agent 缺权限时调用：已授权时直接返回 `true`，未授权时可能弹一次框
+/// （登录窗口下通常无人能点，长期无人值守依赖 `persistent-content-capture`）。
+#[must_use]
+pub fn request_screen_capture() -> bool {
+    // SAFETY: 无参数、无副作用（只触发系统授权流程并返回当前状态）。
+    unsafe { CGRequestScreenCaptureAccess() != 0 }
+}
+
 /// 打开对应的「系统设置 → 隐私与安全性」面板。
 pub fn open_settings(kind: super::PermissionKind) {
     let url = match kind {
@@ -55,9 +67,14 @@ pub fn open_settings(kind: super::PermissionKind) {
 
 /// 构造平台实现三件套。
 ///
-/// macOS 上 `--instance` 是无头模式且不可用（Windows 专用），故 `mode` 一律走 GUI 那套
-/// （`xcap` + `enigo` + `arboard`）。
+/// - [`super::PlatformMode::Gui`]：ScreenCaptureKit + `enigo` + `arboard`。
+/// - [`super::PlatformMode::LoginWindow`]：ScreenCaptureKit + **空注入器** + 无剪贴板
+///   （登录窗口只读 agent）。
+/// - [`super::PlatformMode::Instance`] 是 Windows 专用；macOS 上按 GUI 处理（不会走到）。
 #[must_use]
-pub fn screen_and_input(_mode: super::PlatformMode) -> super::PlatformHandles {
-    super::gui_platform_handles()
+pub fn screen_and_input(mode: super::PlatformMode) -> super::PlatformHandles {
+    match mode {
+        super::PlatformMode::LoginWindow => super::login_window_handles(),
+        super::PlatformMode::Gui | super::PlatformMode::Instance => super::gui_platform_handles(),
+    }
 }

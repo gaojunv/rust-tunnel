@@ -6,8 +6,8 @@
 //! [`MacCaptureError::Unsupported`]。
 
 use crate::{
-    CaptureInfo, CapturedFrame, CapturedPatches, CursorShape, DisplayInfo, MacCaptureError,
-    MacCaptureResult,
+    CaptureInfo, CapturedFrame, CapturedGpuFrame, CapturedPatches, CursorShape, DisplayInfo,
+    MacCaptureError, MacCaptureResult,
 };
 
 /// ScreenCaptureKit 采集源的占位实现（非 macOS）。
@@ -54,6 +54,22 @@ impl MacCapture {
     ) -> MacCaptureResult<Option<CapturedPatches>> {
         Err(MacCaptureError::Unsupported(
             "仅 macOS 支持 ScreenCaptureKit 采集",
+        ))
+    }
+
+    /// 本采集源是否支持 GPU 直通采集（非 macOS 恒 `false`）。
+    #[must_use]
+    pub fn supports_gpu_capture(&self) -> bool {
+        false
+    }
+
+    /// 采集一帧 GPU 直通画面（非 macOS 恒失败）。
+    ///
+    /// # Errors
+    /// 恒返回 [`MacCaptureError::Unsupported`]。
+    pub fn capture_gpu(&mut self, _display: u32) -> MacCaptureResult<CapturedGpuFrame> {
+        Err(MacCaptureError::Unsupported(
+            "仅 macOS 支持 ScreenCaptureKit GPU 采集",
         ))
     }
 

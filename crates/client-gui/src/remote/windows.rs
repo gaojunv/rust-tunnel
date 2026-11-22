@@ -36,7 +36,11 @@ pub fn open_settings(_kind: super::PermissionKind) {}
 #[must_use]
 pub fn screen_and_input(mode: super::PlatformMode) -> super::PlatformHandles {
     match mode {
-        super::PlatformMode::Gui => super::gui_platform_handles(),
+        // 登录窗口 agent 是 macOS 专用；Windows 上不存在这条路径，按 GUI 处理仅为了
+        // 让 `PlatformMode` 的 match 保持穷举。
+        super::PlatformMode::Gui | super::PlatformMode::LoginWindow => {
+            super::gui_platform_handles()
+        }
         super::PlatformMode::Instance => super::win_desktop::screen_and_input(),
     }
 }

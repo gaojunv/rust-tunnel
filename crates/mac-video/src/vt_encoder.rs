@@ -2,10 +2,17 @@
 //!
 //! # 输入与输出
 //!
-//! 编码输入是 `kCVPixelFormatType_32BGRA` 的 `CVPixelBuffer`，逐行 `memcpy` 拷进去，
-//! 由 VideoToolbox 内部转 4:2:0（**不要**自己先转 NV12——多一次 CPU 往返且丢掉
-//! VT 的硬件色彩转换）。编码输出是 AVCC，本模块转成 Annex B 后返回；关键帧额外从
-//! `CMVideoFormatDescription` 取参数集前置。
+//! 两种输入路径，终点是同一次 [`VtEncoder::submit`]：
+//!
+//! - [`VtEncoder::encode_bgra`]：CPU 帧。逐行 `memcpy` 进 `kCVPixelFormatType_32BGRA` 的
+//!   `CVPixelBuffer`，由 VideoToolbox 内部转 4:2:0（**不要**自己先转 NV12——多一次 CPU
+//!   往返且丢掉 VT 的硬件色彩转换）。
+//! - [`VtEncoder::encode_pixel_buffer`]：平台原生 `CVPixelBuffer`（ScreenCaptureKit 直通）。
+//!   尺寸/格式与编码配置一致时**直接提交、零拷贝**；否则经 `VTPixelTransferSession`
+//!   在 GPU 上缩放并转成 `420v`（BT.709 limited）。
+//!
+//! 编码输出是 AVCC，本模块转成 Annex B 后返回；关键帧额外从 `CMVideoFormatDescription`
+//! 取参数集前置。
 //!
 //! # 会话属性（低延迟）
 //!
@@ -33,6 +40,7 @@ use crate::annexb;
 use crate::codec::CodecKind;
 use crate::color;
 use crate::error::{MacVideoError, MacVideoResult};
+use crate::pixel_transfer::{self, PixelTransfer};
 use objc2_core_foundation::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean, CFDictionary,
     CFNumber, CFRetained, CFString, CFType,
@@ -43,9 +51,10 @@ use objc2_core_video::{
     kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
     kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVPixelBufferHeightKey,
     kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
-    kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
-    CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer,
+    CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
@@ -222,6 +231,13 @@ pub struct VtEncoder {
     shared: Arc<SharedOutput>,
     /// 复用的输入像素缓冲（每次 `encode` 都覆盖；编码是同步的，VT 用完才返回）。
     input: Option<CFRetained<CVPixelBuffer>>,
+    /// 复用的 GPU 缩放/转换目标缓冲（编码尺寸的 `420v`；懒建）。
+    ///
+    /// 只在源缓冲的尺寸或格式不能被编码器直接吃下时才用到（见
+    /// [`Self::encode_pixel_buffer`]）。
+    converted: Option<CFRetained<CVPixelBuffer>>,
+    /// GPU 缩放 + 格式转换会话（懒建；与 `converted` 配套）。
+    transfer: Option<PixelTransfer>,
     /// 单调递增的显示时间戳。
     frame_index: i64,
     /// 「强制关键帧」的帧属性字典（创建一次复用）。
@@ -320,6 +336,8 @@ impl VtEncoder {
             hardware,
             shared,
             input: None,
+            converted: None,
+            transfer: None,
             frame_index: 0,
             force_keyframe_properties,
             failed: false,
@@ -471,6 +489,97 @@ impl VtEncoder {
             &scaled
         };
         let buffer = self.upload(source)?;
+        self.submit(&buffer, force_keyframe)
+    }
+
+    /// 编码一帧**平台原生**的 `CVPixelBuffer`（ScreenCaptureKit 直通）。
+    ///
+    /// 源缓冲的尺寸/格式与编码配置一致时**直接提交，不做任何像素拷贝**——这是
+    /// macOS 被控端的零拷贝路径：SCK 的 `IOSurface` 帧一路到 VideoToolbox。
+    ///
+    /// 不一致时的处理：
+    /// - 尺寸不同（典型：4K 采集、1920 编码）或格式不是编码器输入格式（`32BGRA` /
+    ///   `420v`）→ 用 [`PixelTransfer`] 在 GPU 上一步「缩放 + BGRA→`420v`」进一块按
+    ///   编码尺寸预建并复用的目标缓冲，再提交；
+    /// - 目标缓冲固定 `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange` + BT.709
+    ///   limited，**绝不**是全范围。
+    ///
+    /// # Errors
+    /// 源缓冲尺寸为零/超上限、转换失败、编码器已失效、VideoToolbox 返回错误或回调
+    /// 超时时返回错误。失败会把编码器标成「已失效」（与 CPU 路径一致），调用方应丢弃
+    /// 实例重建。
+    pub fn encode_pixel_buffer(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> MacVideoResult<EncodedPacket> {
+        let result = self.encode_pixel_buffer_inner(buffer, force_keyframe);
+        if result.is_err() {
+            // 与 CPU 路径同一口径：任何失败都把编码器标成不可恢复，调用方丢弃实例重建。
+            // 「一次转换失败后继续用同一个会话」会让错误反复出现且无法定位。
+            self.failed = true;
+        }
+        result
+    }
+
+    /// [`Self::encode_pixel_buffer`] 的实现体（失败语义由外层统一置 `failed`）。
+    fn encode_pixel_buffer_inner(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> MacVideoResult<EncodedPacket> {
+        if self.failed {
+            return Err(MacVideoError::Encode(
+                "编码器已失效（上次编码超时/故障），需要重建".to_owned(),
+            ));
+        }
+        // SAFETY: 两个查询只读，`buffer` 由调用方保证有效（SCK 回调期间持有）。
+        let (src_width, src_height) = (
+            CVPixelBufferGetWidth(buffer),
+            CVPixelBufferGetHeight(buffer),
+        );
+        let (Ok(src_width), Ok(src_height)) = (u32::try_from(src_width), u32::try_from(src_height))
+        else {
+            return Err(MacVideoError::Config("源像素缓冲尺寸溢出".to_owned()));
+        };
+        if src_width < 2
+            || src_height < 2
+            || src_width > MAX_FRAME_DIM
+            || src_height > MAX_FRAME_DIM
+        {
+            return Err(MacVideoError::Config(format!(
+                "源像素缓冲尺寸非法：{src_width}x{src_height}（上限 {MAX_FRAME_DIM}）"
+            )));
+        }
+        // SAFETY: 只读查询。
+        let format = CVPixelBufferGetPixelFormatType(buffer);
+        let direct = (src_width, src_height) == (self.config.width, self.config.height)
+            && pixel_transfer::is_encoder_input_format(format);
+        if direct {
+            return self.submit(buffer, force_keyframe);
+        }
+
+        // 慢路径：GPU 缩放 + 转换到编码尺寸的 420v 缓冲（建一次、每帧复用）。
+        let target = self.converted_buffer()?;
+        self.ensure_transfer()?;
+        let transfer = self
+            .transfer
+            .as_ref()
+            .ok_or_else(|| MacVideoError::Encode("像素转换会话未就绪".to_owned()))?;
+        transfer.transfer(buffer, &target)?;
+        self.submit(&target, force_keyframe)
+    }
+
+    /// 提交一帧已就绪的像素缓冲并等待编码回调（`encode_bgra` 与
+    /// `encode_pixel_buffer` 共用）。
+    ///
+    /// 时间戳、强制关键帧、`CompleteFrames` 泵送、超时/失败语义都在这里，两条输入
+    /// 路径**逐字节一致**。
+    fn submit(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        force_keyframe: bool,
+    ) -> MacVideoResult<EncodedPacket> {
         // 提交前清空交接槽（上一帧已取走；这里防御性地再清一次）。
         {
             let mut slot = self
@@ -492,7 +601,7 @@ impl VtEncoder {
         let mut info_flags = VTEncodeInfoFlags(0);
         let status = unsafe {
             self.session.encode_frame(
-                &buffer,
+                buffer,
                 presentation_time,
                 duration,
                 properties,
@@ -526,6 +635,29 @@ impl VtEncoder {
             width: self.config.width,
             height: self.config.height,
         })
+    }
+
+    /// 取（或创建）编码尺寸的 `420v` 转换目标（BT.709 limited、IOSurface 背书）。
+    fn converted_buffer(&mut self) -> MacVideoResult<CFRetained<CVPixelBuffer>> {
+        if let Some(buffer) = &self.converted {
+            return Ok(buffer.clone());
+        }
+        let buffer = pixel_transfer::create_pixel_buffer(
+            self.config.width,
+            self.config.height,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            true,
+        )?;
+        self.converted = Some(buffer.clone());
+        Ok(buffer)
+    }
+
+    /// 懒建 GPU 缩放/转换会话。
+    fn ensure_transfer(&mut self) -> MacVideoResult<()> {
+        if self.transfer.is_none() {
+            self.transfer = Some(PixelTransfer::new()?);
+        }
+        Ok(())
     }
 
     /// 把 BGRA 拷进一个 `32BGRA` 的 `CVPixelBuffer`（按需创建/复用）。
