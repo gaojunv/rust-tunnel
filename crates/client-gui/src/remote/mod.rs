@@ -191,6 +191,16 @@ pub fn open_permission_settings(kind: PermissionKind) {
     platform::open_settings(kind);
 }
 
+/// 请求「屏幕录制」授权（macOS；可能弹一次系统框，已授予时直接返回 `true`）。
+///
+/// 登录窗口 agent 在没有权限时调用它——虽然那个会话里通常没人能点确认，
+/// 但已通过 `persistent-content-capture` 或之前授权过时会直接成功。
+/// 非 macOS 恒 `true`（没有这类运行时授权模型）。
+#[cfg(target_os = "macos")]
+pub(crate) fn request_screen_capture() -> bool {
+    platform::request_screen_capture()
+}
+
 /// 硬件编解码工厂：按编码标准各持一对（被控端用编码器、控制器用解码器）。
 ///
 /// 任一字段为 `None` 表示该 (方向, 标准) 不参与协商：
@@ -221,11 +231,21 @@ pub struct HardwareFactories {
 /// 必须在构造 `RemoteManager` 的那一次调用里定下来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformMode {
-    /// 用户会话里的常规 GUI 路径：`xcap` 采集 + `enigo` 注入。
+    /// 用户会话里的常规 GUI 路径：Windows WGC/DXGI、macOS ScreenCaptureKit、其余 xcap；
+    /// 输入注入统一走 `enigo`。
     Gui,
     /// SYSTEM 服务拉进控制台会话的无头实例：`win-platform` 注入/剪贴板 + 桌面跟随，
     /// 采集按桌面混合（`Default` → WGC/DXGI，安全桌面 → BitBlt）。
     Instance,
+    /// macOS 登录窗口只读 agent：ScreenCaptureKit 采集 + **不注入**的空输入器 + 无剪贴板。
+    ///
+    /// 协议层由 `RemoteManager::set_read_only(true)` 拒绝「完全控制 / 仅文件传输」；
+    /// 本模式只是平台侧的纵深防御。登录窗口没有可靠注入路径（见 `MACOS-UNATTENDED.md`）。
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "只有 macOS 登录窗口 agent 构造它")
+    )]
+    LoginWindow,
 }
 
 /// 被控端平台在会话结束时的收尾钩子：补发一次「全部抬起」。
@@ -252,8 +272,9 @@ pub struct PlatformHandles {
 
 /// 安装平台实现到引擎（截屏 + 输入注入 + 剪贴板），返回会话收尾钩子（仅实例模式）。
 ///
-/// `mode` 决定用哪一套实现；GUI 路径传 [`PlatformMode::Gui`]，实例传
-/// [`PlatformMode::Instance`]（见 [`PlatformMode`] 关于「构造期选定」的说明）。
+/// `mode` 决定用哪一套实现；GUI 路径传 [`PlatformMode::Gui`]，Windows 实例传
+/// [`PlatformMode::Instance`]，macOS 登录窗口 agent 传 [`PlatformMode::LoginWindow`]
+/// （见 [`PlatformMode`] 关于「构造期选定」的说明）。
 pub fn install_platform(
     manager: &Arc<RemoteManager>,
     mode: PlatformMode,
@@ -280,6 +301,70 @@ pub(crate) fn gui_platform_handles() -> PlatformHandles {
         input: Arc::new(EnigoInput::new()),
         clipboard: Arc::new(SystemClipboard),
         release: None,
+    }
+}
+
+/// 登录窗口只读平台三件套（macOS）：ScreenCaptureKit + **空注入器** + 无剪贴板。
+///
+/// 输入不返回错误而是静默忽略：控制器的鼠标移动按帧发送，逐条报错只会把日志刷爆；
+/// 真正的「只读」保证在引擎的 `RemoteManager::set_read_only(true)`（协议层直接拒绝
+/// 完全控制/文件传输），这里只是纵深防御。
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn login_window_handles() -> PlatformHandles {
+    PlatformHandles {
+        screen: Arc::new(mac_capture::screen()),
+        input: Arc::new(ReadOnlyInput),
+        clipboard: Arc::new(NoClipboard),
+        release: None,
+    }
+}
+
+/// 登录窗口的输入目标：所有注入都是空操作（只读）。
+#[cfg(target_os = "macos")]
+struct ReadOnlyInput;
+
+#[cfg(target_os = "macos")]
+impl InputSink for ReadOnlyInput {
+    fn mouse_move(&self, _x: i32, _y: i32, _display: u32) -> RemoteResult<()> {
+        Ok(())
+    }
+
+    fn mouse_button(&self, _button: MouseButton, _pressed: bool) -> RemoteResult<()> {
+        Ok(())
+    }
+
+    fn wheel(&self, _dx: i32, _dy: i32) -> RemoteResult<()> {
+        Ok(())
+    }
+
+    fn key(&self, _event: KeyEvent) -> RemoteResult<()> {
+        Ok(())
+    }
+
+    fn lock_screen(&self) -> RemoteResult<()> {
+        Err(RemoteError::Platform(
+            "登录窗口 agent 不会锁定屏幕".to_owned(),
+        ))
+    }
+}
+
+/// 登录窗口不提供剪贴板（避免读到登录界面的敏感内容）。
+#[cfg(target_os = "macos")]
+struct NoClipboard;
+
+#[cfg(target_os = "macos")]
+impl rust_tunnel_remote::Clipboard for NoClipboard {
+    fn get(&self) -> RemoteResult<String> {
+        Err(RemoteError::Platform(
+            "登录窗口 agent 不提供剪贴板".to_owned(),
+        ))
+    }
+
+    fn set(&self, _text: &str) -> RemoteResult<()> {
+        Err(RemoteError::Platform(
+            "登录窗口 agent 不提供剪贴板".to_owned(),
+        ))
     }
 }
 

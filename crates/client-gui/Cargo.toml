@@ -122,6 +122,11 @@ rust-tunnel-mac-video = { path = "../mac-video" }
 rust-tunnel-mac-capture = { path = "../mac-capture" }
 # 系统音频（ScreenCaptureKit 音频 + AudioQueue + Opus）。
 rust-tunnel-mac-audio = { path = "../mac-audio" }
+# GPU 零拷贝：`MacGpuFrame` 需要命名 `CVPixelBuffer`（mac-capture 暴露的
+# `CapturedGpuFrame.buffer` 就是这个类型）。
+objc2-core-video = "0.3.2"
+# 登录窗口 LaunchAgent 安装器：`geteuid` 判 root、`chown` 加固文件属主。
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

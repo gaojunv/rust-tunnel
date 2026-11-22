@@ -7,8 +7,9 @@
 //! # 与 Windows 的差异
 //!
 //! - 没有「采集设备厂商 → 后端选路」：macOS 只有一个 VideoToolbox，硬件/软件由系统选。
-//! - 没有零拷贝路径（阶段 A）：采集仍是 `xcap` 的 RGBA，适配器负责 RGBA→BGRA 后交给
-//!   VideoToolbox；阶段 B 接入 ScreenCaptureKit 后再加 CVPixelBuffer 直通。
+//! - 零拷贝载体是 `CVPixelBuffer` 而不是 D3D11 纹理：采集帧（ScreenCaptureKit）原样
+//!   交给 VT；尺寸/格式不一致时由 `mac-video` 的 `VTPixelTransferSession` 在 GPU 上
+//!   缩放并转 4:2:0（见 [`VtEncoder::encode_pixel_buffer`]）。
 //! - 在线重配置同样走属性设置（不重建、不插 IDR），见 `mac-video` 的 `set_bitrate` /
 //!   `set_fps`。
 
@@ -18,12 +19,13 @@ use rust_tunnel_mac_video::{CodecKind, EncodeConfig, VtDecoder, VtEncoder};
 use rust_tunnel_remote::codec::{
     VideoDecoderApi, VideoDecoderFactory, VideoEncoderApi, VideoEncoderFactory,
 };
-use rust_tunnel_remote::screen::{DecoderInfo, EncoderInfo};
+use rust_tunnel_remote::screen::{DecoderInfo, EncoderInfo, RawFrame};
 use rust_tunnel_remote::{
     CodecId, DecodedNv12, DecodedVideoFrame, EncodedVideo, RemoteError, RemoteResult,
 };
 use tracing::info;
 
+use super::mac_capture::MacGpuFrame;
 use super::HardwareFactories;
 
 /// 与 Windows 版 `MAX_QP` 对齐的画质地板（H.264 视觉近无损区间）。
@@ -207,6 +209,39 @@ impl VideoEncoderApi for VtEncoderAdapter {
             .inner
             .encode_bgra(&bgra, src_width, src_height, force_keyframe)
             .map_err(|err| RemoteError::Encode(format!("VideoToolbox 编码失败: {err}")))?;
+        Ok(EncodedVideo {
+            data: packet.data,
+            keyframe: packet.keyframe,
+        })
+    }
+
+    /// 编码一帧平台画面：GPU 帧（`CVPixelBuffer`）直通 VideoToolbox，CPU 帧走原路径。
+    ///
+    /// GPU 帧的载体**必须**是 [`MacGpuFrame`]；认不出来说明上游接错了模块，直接报错
+    /// ——绝不静默编码空帧（那会给控制端送去一帧黑屏）。
+    fn encode_frame(
+        &mut self,
+        frame: &RawFrame,
+        force_keyframe: bool,
+    ) -> RemoteResult<EncodedVideo> {
+        let Some(gpu) = frame.gpu.as_deref() else {
+            return self.encode(&frame.rgba, frame.width, frame.height, force_keyframe);
+        };
+        let gpu_frame = gpu
+            .as_any()
+            .downcast_ref::<MacGpuFrame>()
+            .ok_or_else(|| RemoteError::Encode("VideoToolbox 收到无法识别的 GPU 帧".to_owned()))?;
+        // 物理尺寸为零说明采集侧给了坏帧：直接报错，别把空缓冲交给 VT。
+        if gpu_frame.source_width == 0 || gpu_frame.source_height == 0 {
+            return Err(RemoteError::Encode(format!(
+                "GPU 帧物理尺寸非法：{}x{}",
+                gpu_frame.source_width, gpu_frame.source_height
+            )));
+        }
+        let packet = self
+            .inner
+            .encode_pixel_buffer(&gpu_frame.buffer, force_keyframe)
+            .map_err(|err| RemoteError::Encode(format!("VideoToolbox 像素缓冲编码失败: {err}")))?;
         Ok(EncodedVideo {
             data: packet.data,
             keyframe: packet.keyframe,

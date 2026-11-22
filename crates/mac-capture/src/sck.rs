@@ -9,7 +9,15 @@
 //!
 //! 样本槽里放的是 `CFRetain` 过的 `CVPixelBuffer`，不是像素拷贝：SCK 的 `stream:
 //! didOutputSampleBuffer:ofType:` 回调跑在 SCK 自己的派发队列上，那里拷 4K 一帧
-//! （33 MB）会直接把采集节拍拖垮。像素拷贝发生在调用 [`MacCapture::capture`] 的线程。
+//! （33 MB）会直接把采集节拍拖垮。
+//!
+//! # 三条消费路径
+//!
+//! - [`MacCapture::capture_gpu`]：GPU 直通。样本缓冲原样交给编码器（零拷贝），变化检测
+//!   只用 SCK 的脏矩形附件或一块 320×180 的降采样缓冲；
+//! - [`MacCapture::capture_patches`]：脏矩形补丁。变化网格来自同一块 320×180 缓冲，
+//!   源像素只按矩形覆盖区间用带行跨度读取，整帧 BGRA 从不拷贝；
+//! - [`MacCapture::capture`]：整帧 CPU 回读（VP9 回退路径），像素拷贝发生在这里。
 //!
 //! # 失败、空闲与重建
 //!
@@ -42,29 +50,31 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_app_kit::NSCursor;
-use objc2_core_foundation::CFRetained;
+use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
 use objc2_core_graphics::{CGDisplayIsMain, CGDisplayPixelsHigh, CGDisplayPixelsWide};
-use objc2_core_media::{CMSampleBuffer, CMTime};
+use objc2_core_media::{CMGetAttachment, CMSampleBuffer, CMTime};
 use objc2_core_video::{
     kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferGetBaseAddress,
     CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
     CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
     CVPixelBufferUnlockBaseAddress,
 };
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSValue};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCStreamDelegate, SCStreamFrameInfoDirtyRects, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 use rust_tunnel_mac_video::change::{
-    extract_rects, ChangeDetector, ChangeReport, DirtyGrid, RectParams,
+    extract_rects, ChangeDetector, ChangeOutcome, ChangeReport, DirtyGrid, RectParams, GRID_HEIGHT,
+    GRID_WIDTH,
 };
 use rust_tunnel_mac_video::color::{bgra_to_nv12, bgra_to_rgba, scale_bgra_box};
+use rust_tunnel_mac_video::pixel_transfer::{self, PixelTransfer};
 
 use crate::geometry::{self, TargetRect};
 use crate::{
-    CaptureInfo, CapturedFrame, CapturedPatches, CursorShape, DisplayInfo, MacCaptureError,
-    MacCaptureResult, PatchRect,
+    CaptureInfo, CapturedFrame, CapturedGpuFrame, CapturedPatches, CursorShape, DisplayInfo,
+    GpuFrameBuffer, MacCaptureError, MacCaptureResult, PatchRect,
 };
 
 /// 等待 SCK 枚举可共享内容的上限（首次可能触发「屏幕录制」授权）。
@@ -127,6 +137,21 @@ struct Sample {
     width: u32,
     height: u32,
     seq: u64,
+    /// SCK 样本附件里的脏矩形摘要；`None` = 附件不可用（旧系统/格式不支持）。
+    dirty: Option<DirtyHint>,
+}
+
+/// SCK 样本附件 `SCStreamFrameInfoDirtyRects` 的摘要。
+///
+/// 只保留「矩形个数」与「这些矩形覆盖多少物理像素」——采集层**不需要**矩形本身：
+/// 变化报告只回答「变了没有 / 面积多大」，补丁矩形仍由 320×180 的像素级网格提取，
+/// 这样两条路径（GPU 直通与补丁）对「变化」的判断完全一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirtyHint {
+    /// 脏矩形个数（0 = 平台权威地告诉我们这一帧没有变化）。
+    rects: u32,
+    /// 脏矩形覆盖的物理像素总数（未裁剪到帧边界，只用于千分比估算）。
+    area_pixels: u64,
 }
 
 // SAFETY: CoreVideo 的 pixel buffer 是不可变、引用计数的 CF 对象；`lock/unlock`
@@ -189,11 +214,13 @@ impl Shared {
             .seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        let dirty = sample_dirty_hint(sample_buffer);
         self.store(Sample {
             buffer,
             width,
             height,
             seq,
+            dirty,
         });
     }
 
@@ -312,40 +339,81 @@ struct Failure {
     message: String,
 }
 
-/// 上一帧（同时缓存源 BGRA、缩放后的 BGRA 与 RGBA，避免静止画面反复重算）。
+/// 上一帧（缓存缩放后的 BGRA 与 RGBA，避免静止画面反复重算）。
 struct LastFrame {
     display: u32,
     seq: u64,
-    src_width: u32,
-    src_height: u32,
-    source: Arc<Vec<u8>>,
     dst_width: u32,
     dst_height: u32,
     scaled: Arc<Vec<u8>>,
     rgba: Option<Arc<Vec<u8>>>,
 }
 
-/// 一次 `prepare` 的结果（`capture` 与 `capture_patches` 共用）。
+/// 一次 `prepare` 的结果（CPU 整帧路径）。
 struct Prepared {
     fresh: bool,
-    src_width: u32,
-    src_height: u32,
     width: u32,
     height: u32,
-    source: Arc<Vec<u8>>,
     scaled: Arc<Vec<u8>>,
     report: ChangeReport,
-    grid: Option<DirtyGrid>,
 }
+
+/// GPU 直通路径的「上一帧」（无新样本时按它复用，并据此判定序号）。
+struct GpuLast {
+    display: u32,
+    seq: u64,
+    width: u32,
+    height: u32,
+    sample: Sample,
+}
+
+/// 补丁路径的「上一帧」几何与序号（无新样本时据此产出保活）。
+#[derive(Clone, Copy)]
+struct PatchLast {
+    display: u32,
+    seq: u64,
+    src_width: u32,
+    src_height: u32,
+}
+
+/// 变化检测用的 GPU 降采样器：把任意尺寸的 `CVPixelBuffer` 缩成 320×180 BGRA。
+///
+/// 只锁 320×180（约 225 KB）的暂存缓冲做像素比较，**绝不回读整帧 33 MB**。
+/// 转换会话与目标缓冲都只建一次、跨帧复用。
+struct ChangeScaler {
+    transfer: PixelTransfer,
+    /// 320×180 的 `32BGRA` 目标（IOSurface 背书）。
+    target: CFRetained<CVPixelBuffer>,
+    /// 复用的紧包 BGRA 暂存（`GRID_WIDTH * GRID_HEIGHT * 4`）。
+    pixels: Vec<u8>,
+}
+
+// SAFETY: 两个 CF 句柄都是不可变、引用计数的核心视频对象（`CVPixelBuffer` 的文档契约
+// 允许任意线程 lock/读取）；`PixelTransfer` 只在持有 `&mut MacCapture` 的调用线程上使用
+// （引擎把采集器放在任务里独占调用，适配层再用 `Mutex` 串行化）。因此跨线程移交安全。
+unsafe impl Send for ChangeScaler {}
+unsafe impl Sync for ChangeScaler {}
 
 /// macOS 屏幕采集源（ScreenCaptureKit）。
 pub struct MacCapture {
     worker: Option<Worker>,
     last: Option<LastFrame>,
     detector: ChangeDetector,
+    /// GPU 直通路径的上一帧（独立序号跟踪，与 CPU 路径互不影响）。
+    gpu_last: Option<GpuLast>,
+    /// 补丁路径的上一帧。
+    patch_last: Option<PatchLast>,
+    /// GPU 路径与补丁路径**共用**的变化检测器：两者都喂 320×180 网格，因此切换路径
+    /// 不会产生虚假的「整帧变化」。
+    gpu_detector: ChangeDetector,
+    /// 懒建的 GPU 降采样器（变化检测用）。
+    change_scaler: Option<ChangeScaler>,
     max_encode_width: u32,
     no_new_frame: u64,
     failure: Option<Failure>,
+    /// **最近一帧**是否真的走了 `CVPixelBuffer` 直通（`capture_gpu` 成功时为真；
+    /// CPU 的 `capture` 与补丁路径为假）。只影响统计角标，不参与任何决策。
+    last_was_gpu: bool,
 }
 
 impl MacCapture {
@@ -358,9 +426,14 @@ impl MacCapture {
             worker: None,
             last: None,
             detector: ChangeDetector::new(),
+            gpu_last: None,
+            patch_last: None,
+            gpu_detector: ChangeDetector::new(),
+            change_scaler: None,
             max_encode_width: DEFAULT_MAX_ENCODE_WIDTH,
             no_new_frame: 0,
             failure: None,
+            last_was_gpu: false,
         })
     }
 
@@ -414,6 +487,7 @@ impl MacCapture {
                 (*rgba).clone()
             }
         };
+        self.last_was_gpu = false;
         Ok(CapturedFrame {
             display,
             width: prepared.width,
@@ -424,10 +498,104 @@ impl MacCapture {
         })
     }
 
+    /// 本采集源是否支持 **GPU 直通**采集（macOS 恒 `true`：SCK 的帧本来就是
+    /// `IOSurface` 背书的 `CVPixelBuffer`）。
+    #[must_use]
+    pub fn supports_gpu_capture(&self) -> bool {
+        true
+    }
+
+    /// 采集一帧 **GPU 直通**画面：完整物理帧的 `CVPixelBuffer`，不在 CPU 上缩放或转换。
+    ///
+    /// 引擎把这块缓冲直接交给 VideoToolbox（`VtEncoder::encode_pixel_buffer`）——尺寸/
+    /// 格式与编码配置一致时零拷贝，否则在 GPU 上一步缩放并转 `420v`。
+    ///
+    /// 变化检测与 CPU 路径同源：SCK 样本附件报告「零脏矩形」时直接采信（平台给的权威
+    /// 信号）；否则把帧缩到 320×180 后做逐像素比较。**绝不回读整帧**。
+    ///
+    /// 无新帧时最多等 [`FRAME_WAIT`]，之后复用上一帧缓冲并报 `changed = false`；首帧
+    /// 最多等 [`FIRST_FRAME_TIMEOUT`]。
+    ///
+    /// # Errors
+    /// 缺权限、显示器不存在、流启动/重建退避、首帧超时等返回对应错误（中文）。
+    pub fn capture_gpu(&mut self, display: u32) -> MacCaptureResult<CapturedGpuFrame> {
+        self.ensure_worker(display)?;
+        if self
+            .gpu_last
+            .as_ref()
+            .is_some_and(|last| last.display != display)
+        {
+            // 切显示器：上一帧缓冲、补丁状态与检测基准全部作废。
+            self.gpu_last = None;
+            self.patch_last = None;
+            self.gpu_detector.reset();
+        }
+        let shared = self.shared()?;
+        let after = self.gpu_last.as_ref().map(|last| last.seq);
+        let timeout = if after.is_some() {
+            FRAME_WAIT
+        } else {
+            FIRST_FRAME_TIMEOUT
+        };
+        let sample = shared.wait_newer(after, timeout);
+        let Some(sample) = sample else {
+            if let Some(message) = shared.error() {
+                return Err(MacCaptureError::Platform(message));
+            }
+            self.no_new_frame = self.no_new_frame.saturating_add(1);
+            let Some(last) = self.gpu_last.as_ref() else {
+                return Err(MacCaptureError::Timeout("等待 ScreenCaptureKit 首帧"));
+            };
+            // 复用上一帧缓冲（引用计数克隆，不拷像素）。
+            return Ok(CapturedGpuFrame {
+                display,
+                width: last.width,
+                height: last.height,
+                source_width: last.sample.width,
+                source_height: last.sample.height,
+                buffer: GpuFrameBuffer::clone(&last.sample.buffer),
+                changed: false,
+                changed_permille: 0,
+            });
+        };
+        let (width, height) =
+            geometry::encode_dimensions(sample.width, sample.height, 1.0, self.max_encode_width);
+        let report = match self.observe_gpu_frame(&sample) {
+            Ok(outcome) => outcome.report,
+            Err(err) => {
+                // 检测失败绝不能丢帧：按满面积处理（保守地不压制码率/帧率）。
+                tracing::debug!(error = %err, "GPU 变化检测失败，本帧按满面积处理");
+                ChangeReport::changed_all()
+            }
+        };
+        self.gpu_last = Some(GpuLast {
+            display,
+            seq: sample.seq,
+            width,
+            height,
+            sample: sample.clone(),
+        });
+        self.last_was_gpu = true;
+        Ok(CapturedGpuFrame {
+            display,
+            width,
+            height,
+            source_width: sample.width,
+            source_height: sample.height,
+            buffer: sample.buffer.clone(),
+            changed: report.changed,
+            changed_permille: report.changed_permille,
+        })
+    }
+
     /// 采集一帧并产出**脏矩形补丁**（目标编码坐标系，紧包 NV12）。
     ///
+    /// 源像素**只按脏矩形读取**：变化网格由 320×180 的 GPU 降采样得出，随后对样本的
+    /// `CVPixelBuffer` 加一次读锁，按每个矩形覆盖的源区间做带行跨度的区域缩放——
+    /// 整帧 BGRA（4K 33 MB）从不被拷贝。
+    ///
     /// 返回 `Ok(None)` 表示「本拍不适合补丁」：变化网格缺失（首帧/检测器不可用）、
-    /// 矩形数/面积超限、或矩形映射失败——引擎据此回到全帧视频并强制关键帧。
+    /// 矩形数/面积超限、或矩形映射/读源失败——引擎据此回到全帧视频并强制关键帧。
     /// 没有新帧或没有变化时返回 `Ok(Some(空 rects))` 作为保活。
     ///
     /// # Errors
@@ -438,75 +606,81 @@ impl MacCapture {
         scale: f32,
         max_width: u32,
     ) -> MacCaptureResult<Option<CapturedPatches>> {
-        let prepared = self.prepare(display)?;
-        // 与引擎/Windows 侧同一套双重换算：先按 max_width 把源封顶，再施加 scale。
-        let max_width = max_width.max(2);
-        let (cap_width, cap_height) =
-            geometry::encode_dimensions(prepared.src_width, prepared.src_height, 1.0, max_width);
-        let (width, height) = geometry::encode_dimensions(cap_width, cap_height, scale, max_width);
-        let keepalive = CapturedPatches {
-            display,
-            width,
-            height,
-            changed_permille: 0,
-            rects: Vec::new(),
-        };
-        if !prepared.fresh {
-            // 没有新帧：合法的保活（不是「检测器不可用」）。
-            return Ok(Some(keepalive));
+        self.ensure_worker(display)?;
+        if self
+            .patch_last
+            .as_ref()
+            .is_some_and(|last| last.display != display)
+        {
+            self.patch_last = None;
+            self.gpu_last = None;
+            self.gpu_detector.reset();
         }
-        let Some(grid) = prepared.grid else {
-            // 首帧/检测器不可用：有变化就只能回退全帧。
-            if prepared.report.changed {
-                tracing::debug!("变化网格缺失（首帧或检测器不可用），回退全帧");
+        let shared = self.shared()?;
+        let after = self.patch_last.as_ref().map(|last| last.seq);
+        let timeout = if after.is_some() {
+            FRAME_WAIT
+        } else {
+            FIRST_FRAME_TIMEOUT
+        };
+        let max_width = max_width.max(2);
+        let sample = shared.wait_newer(after, timeout);
+        let Some(sample) = sample else {
+            if let Some(message) = shared.error() {
+                return Err(MacCaptureError::Platform(message));
+            }
+            self.no_new_frame = self.no_new_frame.saturating_add(1);
+            let Some(last) = self.patch_last else {
+                return Err(MacCaptureError::Timeout("等待 ScreenCaptureKit 首帧"));
+            };
+            let (cap_width, cap_height) =
+                geometry::encode_dimensions(last.src_width, last.src_height, 1.0, max_width);
+            let (width, height) =
+                geometry::encode_dimensions(cap_width, cap_height, scale, max_width);
+            return Ok(Some(keepalive_patches(display, width, height)));
+        };
+        // 与引擎/Windows 侧同一套双重换算：先按 max_width 把源封顶，再施加 scale。
+        let (cap_width, cap_height) =
+            geometry::encode_dimensions(sample.width, sample.height, 1.0, max_width);
+        let (width, height) = geometry::encode_dimensions(cap_width, cap_height, scale, max_width);
+        self.patch_last = Some(PatchLast {
+            display,
+            seq: sample.seq,
+            src_width: sample.width,
+            src_height: sample.height,
+        });
+        self.last_was_gpu = false;
+        let outcome = match self.observe_gpu_frame(&sample) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::debug!(error = %err, "补丁变化检测失败，回退全帧");
                 return Ok(None);
             }
-            return Ok(Some(keepalive));
+        };
+        if !outcome.report.changed {
+            return Ok(Some(keepalive_patches(display, width, height)));
+        }
+        let Some(grid) = outcome.grid else {
+            // 首帧/检测器不可用：有变化就只能回退全帧。
+            tracing::debug!("变化网格缺失（首帧或检测器不可用），回退全帧");
+            return Ok(None);
         };
         let Some(rects) = extract_rects(&grid, (width, height), &RectParams::default()) else {
             tracing::debug!("脏矩形超限（数量/面积），回退全帧");
             return Ok(None);
         };
         if rects.is_empty() {
-            return Ok(Some(keepalive));
+            return Ok(Some(keepalive_patches(display, width, height)));
         }
-        let mut patches = Vec::with_capacity(rects.len());
-        for rect in rects {
-            let target = TargetRect {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-            };
-            // 绝对坐标区域缩放：只搬矩形范围内的源像素，且与整帧路径逐像素一致。
-            let Some(bgra) = geometry::scale_bgra_region(
-                &prepared.source,
-                prepared.src_width,
-                prepared.src_height,
-                target,
-                width,
-                height,
-            ) else {
-                tracing::debug!(?target, "补丁矩形非法，回退全帧");
-                return Ok(None);
-            };
-            let Ok(nv12) = bgra_to_nv12(&bgra, target.width, target.height) else {
-                tracing::debug!(?target, "补丁转 NV12 失败，回退全帧");
-                return Ok(None);
-            };
-            patches.push(PatchRect {
-                x: target.x,
-                y: target.y,
-                width: target.width,
-                height: target.height,
-                nv12,
-            });
-        }
+        let Some(patches) = extract_patches_from_sample(&sample, &rects, (width, height))? else {
+            tracing::debug!("按脏矩形读取源像素失败，回退全帧");
+            return Ok(None);
+        };
         Ok(Some(CapturedPatches {
             display,
             width,
             height,
-            changed_permille: prepared.report.changed_permille,
+            changed_permille: outcome.report.changed_permille,
             rects: patches,
         }))
     }
@@ -542,13 +716,16 @@ impl MacCapture {
         Some(CursorShape::Unknown)
     }
 
-    /// 采集源的平台信息（`backend = "ScreenCaptureKit"`，CPU 回读故 `gpu_capture = false`）。
+    /// 采集源的平台信息（`backend = "ScreenCaptureKit"`）。
+    ///
+    /// `gpu_capture` 按**最近一帧**是否真的走了 `CVPixelBuffer` 直通上报：GPU 编解码
+    /// 会话在 `capture_gpu` 路径下为真，CPU/补丁路径为假。
     #[must_use]
     pub fn info(&self) -> CaptureInfo {
         CaptureInfo {
             backend: "ScreenCaptureKit".to_owned(),
             adapter: String::new(),
-            gpu_capture: false,
+            gpu_capture: self.last_was_gpu,
             gpu_disabled: false,
             gpu_disabled_reason: String::new(),
             fallbacks: 0,
@@ -560,8 +737,33 @@ impl MacCapture {
     /// 停止采集并释放 SCK 资源（幂等）。
     pub fn stop(&mut self) {
         self.stop_worker();
+        self.reset_pipelines();
+    }
+
+    /// 丢弃所有「上一帧/检测基准」（停流、切显示器、几何变化后调用）。
+    fn reset_pipelines(&mut self) {
         self.last = None;
+        self.gpu_last = None;
+        self.patch_last = None;
         self.detector.reset();
+        self.gpu_detector.reset();
+        // 降采样器本身与流无关（只是转换会话 + 目标缓冲），保留可避免重建成本；
+        // 但它的像素基准随检测器一起作废。
+        self.last_was_gpu = false;
+    }
+
+    /// 取当前采集线程的共享槽，并刷新空闲看门狗计时。
+    fn shared(&self) -> MacCaptureResult<Arc<Shared>> {
+        let shared = Arc::clone(
+            &self
+                .worker
+                .as_ref()
+                .ok_or_else(|| MacCaptureError::Platform("采集线程不存在".to_owned()))?
+                .shared,
+        );
+        // 每次采集都刷新空闲计时：5 s 没有任何采集调用，采集线程会自行停流退出。
+        shared.touch();
+        Ok(shared)
     }
 
     /// 取最新一帧并完成「拷贝 → 缩放 → 变化检测」。
@@ -576,15 +778,7 @@ impl MacCapture {
             self.last = None;
             self.detector.reset();
         }
-        let shared = Arc::clone(
-            &self
-                .worker
-                .as_ref()
-                .ok_or_else(|| MacCaptureError::Platform("采集线程不存在".to_owned()))?
-                .shared,
-        );
-        // 每次采集都刷新空闲计时：5 s 没有任何采集调用，采集线程会自行停流退出。
-        shared.touch();
+        let shared = self.shared()?;
         let after = self.last.as_ref().map(|last| last.seq);
         let timeout = if after.is_some() {
             FRAME_WAIT
@@ -615,9 +809,6 @@ impl MacCapture {
         self.last = Some(LastFrame {
             display,
             seq: sample.seq,
-            src_width: sample.width,
-            src_height: sample.height,
-            source: Arc::clone(&source),
             dst_width,
             dst_height,
             scaled: Arc::clone(&scaled),
@@ -625,14 +816,10 @@ impl MacCapture {
         });
         Ok(Prepared {
             fresh: true,
-            src_width: sample.width,
-            src_height: sample.height,
             width: dst_width,
             height: dst_height,
-            source,
             scaled,
             report,
-            grid: outcome.grid,
         })
     }
 
@@ -646,15 +833,73 @@ impl MacCapture {
         }
         Ok(Prepared {
             fresh: false,
-            src_width: last.src_width,
-            src_height: last.src_height,
             width: last.dst_width,
             height: last.dst_height,
-            source: Arc::clone(&last.source),
             scaled: Arc::clone(&last.scaled),
             report: ChangeReport::unchanged(),
-            grid: None,
         })
+    }
+
+    /// 观测一帧 GPU 样本，返回变化报告与脏网格。
+    ///
+    /// 快路径：SCK 样本附件报告**零个**脏矩形，且检测器已有基准 ⇒ 平台已经权威地
+    /// 告诉我们「这一帧与上一帧逐像素相同」，直接报未变化（网格给全 0），**不碰任何
+    /// 像素**。其余情况把帧缩到 320×180 后做一次逐像素比较（约 225 KB 的 CPU 侧读取）。
+    fn observe_gpu_frame(&mut self, sample: &Sample) -> MacCaptureResult<ChangeOutcome> {
+        if sample.dirty.is_some_and(|dirty| dirty.rects == 0) && self.gpu_detector.has_baseline() {
+            return Ok(ChangeOutcome {
+                report: ChangeReport::unchanged(),
+                grid: Some(DirtyGrid::empty()),
+            });
+        }
+        self.downscale_for_change(sample)?;
+        let Some(scaler) = self.change_scaler.as_ref() else {
+            return Err(MacCaptureError::Platform(
+                "变化检测降采样器未就绪".to_owned(),
+            ));
+        };
+        // 与网格同尺寸（320×180）：`ChangeDetector` 内部再降采样时每个格点恰好 1 像素。
+        Ok(self
+            .gpu_detector
+            .observe(&scaler.pixels, GRID_WIDTH, GRID_HEIGHT))
+    }
+
+    /// 把样本帧在 GPU 上缩到 320×180 BGRA，锁目标缓冲后拷进复用的暂存。
+    fn downscale_for_change(&mut self, sample: &Sample) -> MacCaptureResult<()> {
+        let scaler = self.change_scaler()?;
+        scaler.downscale(&sample.buffer)
+    }
+
+    /// 取（或懒建）变化检测降采样器。
+    fn change_scaler(&mut self) -> MacCaptureResult<&mut ChangeScaler> {
+        if self.change_scaler.is_none() {
+            let transfer = PixelTransfer::new()
+                .map_err(|err| MacCaptureError::Platform(format!("像素转换会话创建失败：{err}")))?;
+            let target = pixel_transfer::create_pixel_buffer(
+                GRID_WIDTH,
+                GRID_HEIGHT,
+                kCVPixelFormatType_32BGRA,
+                false,
+            )
+            .map_err(|err| MacCaptureError::Platform(format!("变化检测目标缓冲创建失败：{err}")))?;
+            let row_bytes = usize::try_from(GRID_WIDTH)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .and_then(|row| {
+                    usize::try_from(GRID_HEIGHT)
+                        .ok()
+                        .and_then(|height| row.checked_mul(height))
+                })
+                .ok_or_else(|| MacCaptureError::Platform("变化检测缓冲尺寸溢出".to_owned()))?;
+            self.change_scaler = Some(ChangeScaler {
+                transfer,
+                target,
+                pixels: vec![0; row_bytes],
+            });
+        }
+        self.change_scaler
+            .as_mut()
+            .ok_or_else(|| MacCaptureError::Platform("变化检测降采样器未就绪".to_owned()))
     }
 
     /// 确保当前显示器的采集线程在跑；需要时重建（带退避）。
@@ -721,8 +966,7 @@ impl MacCapture {
         match self.start_worker(display) {
             Ok(()) => {
                 self.failure = None;
-                self.last = None;
-                self.detector.reset();
+                self.reset_pipelines();
                 Ok(())
             }
             Err(err) => {
@@ -1159,6 +1403,215 @@ impl Drop for PixelLock<'_> {
         // SAFETY: 与 `CVPixelBufferLockBaseAddress` 的 ReadOnly 标志严格成对。
         let _ = unsafe { CVPixelBufferUnlockBaseAddress(self.0, CVPixelBufferLockFlags::ReadOnly) };
     }
+}
+
+impl ChangeScaler {
+    /// 把 `source` 缩到 320×180 并拷进复用的暂存（只锁 225 KB 的目标缓冲）。
+    fn downscale(&mut self, source: &CVPixelBuffer) -> MacCaptureResult<()> {
+        self.transfer
+            .transfer(source, &self.target)
+            .map_err(|err| MacCaptureError::Platform(format!("变化检测降采样失败：{err}")))?;
+        let row_bytes = usize::try_from(GRID_WIDTH)
+            .ok()
+            .and_then(|width| width.checked_mul(crate::geometry::BYTES_PER_PIXEL))
+            .ok_or_else(|| MacCaptureError::Platform("变化检测行宽溢出".to_owned()))?;
+        let height = usize::try_from(GRID_HEIGHT)
+            .map_err(|_| MacCaptureError::Platform("变化检测高度溢出".to_owned()))?;
+        // SAFETY: 目标缓冲由本类型独占持有；锁定/解锁成对（`PixelLock` 保证解锁），
+        // 且转换已在本线程完成，没有其它线程写它。
+        let status =
+            unsafe { CVPixelBufferLockBaseAddress(&self.target, CVPixelBufferLockFlags::ReadOnly) };
+        if status != 0 {
+            return Err(MacCaptureError::Platform(format!(
+                "锁定变化检测缓冲失败：CVReturn {status}"
+            )));
+        }
+        let _lock = PixelLock(&self.target);
+        let base = CVPixelBufferGetBaseAddress(&self.target);
+        if base.is_null() {
+            return Err(MacCaptureError::Platform("变化检测缓冲基址为空".to_owned()));
+        }
+        let pitch = CVPixelBufferGetBytesPerRow(&self.target);
+        if pitch < row_bytes {
+            return Err(MacCaptureError::Platform(format!(
+                "变化检测缓冲行跨度 {pitch} 小于 {row_bytes}"
+            )));
+        }
+        let total = pitch
+            .checked_mul(height)
+            .ok_or_else(|| MacCaptureError::Platform("变化检测缓冲尺寸溢出".to_owned()))?;
+        // SAFETY: 锁定后基址指向至少 `pitch * height` 字节（CVPixelBuffer 的行跨度语义）。
+        let all = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), total) };
+        let pixels = &mut self.pixels;
+        if pitch == row_bytes {
+            if pixels.len() != total {
+                pixels.resize(total, 0);
+            }
+            pixels.copy_from_slice(all);
+        } else {
+            if pixels.len() != row_bytes.saturating_mul(height) {
+                pixels.resize(row_bytes.saturating_mul(height), 0);
+            }
+            for row in 0..height {
+                let src_start = row.saturating_mul(pitch);
+                let dst_start = row.saturating_mul(row_bytes);
+                pixels[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&all[src_start..src_start + row_bytes]);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 构造一条「没有变化」的补丁结果（保活用，空 rects）。
+fn keepalive_patches(display: u32, width: u32, height: u32) -> CapturedPatches {
+    CapturedPatches {
+        display,
+        width,
+        height,
+        changed_permille: 0,
+        rects: Vec::new(),
+    }
+}
+
+/// 在样本的 `CVPixelBuffer` 上**一次加读锁**，按脏矩形逐个读取源区间并转 NV12。
+///
+/// 与整帧路径逐像素一致（走 [`geometry::scale_bgra_region_strided`] 的同一套取整规则），
+/// 但只碰矩形覆盖的源行——补丁模式下整帧 BGRA 一个字节都不拷。
+///
+/// 返回 `Ok(None)` 表示本拍不适合补丁（像素格式不是 32BGRA、基址为空、矩形非法、
+/// 转 NV12 失败）；`Err` 只用于加锁失败这类真错误。
+fn extract_patches_from_sample(
+    sample: &Sample,
+    rects: &[rust_tunnel_mac_video::change::Rect],
+    dst: (u32, u32),
+) -> MacCaptureResult<Option<Vec<PatchRect>>> {
+    // SAFETY: 只读查询。
+    let format = CVPixelBufferGetPixelFormatType(&sample.buffer);
+    if format != kCVPixelFormatType_32BGRA {
+        tracing::debug!(
+            format = format_string(format),
+            "补丁路径只支持 32BGRA 源缓冲，回退全帧"
+        );
+        return Ok(None);
+    }
+    let height = usize::try_from(sample.height)
+        .map_err(|_| MacCaptureError::Platform("补丁源高度溢出".to_owned()))?;
+    // SAFETY: 锁定/解锁成对（`PixelLock` 保证解锁），且 SCK 不会在回调之外改写这一帧。
+    let status =
+        unsafe { CVPixelBufferLockBaseAddress(&sample.buffer, CVPixelBufferLockFlags::ReadOnly) };
+    if status != 0 {
+        return Err(MacCaptureError::Platform(format!(
+            "锁定采集帧失败：CVReturn {status}"
+        )));
+    }
+    let _lock = PixelLock(&sample.buffer);
+    let base = CVPixelBufferGetBaseAddress(&sample.buffer);
+    if base.is_null() {
+        return Ok(None);
+    }
+    let pitch = CVPixelBufferGetBytesPerRow(&sample.buffer);
+    let total = pitch
+        .checked_mul(height)
+        .ok_or_else(|| MacCaptureError::Platform("补丁源尺寸溢出".to_owned()))?;
+    // SAFETY: 锁定后基址指向至少 `pitch * height` 字节。
+    let all = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), total) };
+    let mut patches = Vec::with_capacity(rects.len());
+    for rect in rects {
+        let target = TargetRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        };
+        let Some(bgra) = geometry::scale_bgra_region_strided(
+            all,
+            sample.width,
+            sample.height,
+            pitch,
+            target,
+            dst.0,
+            dst.1,
+        ) else {
+            tracing::debug!(?target, "补丁矩形读源失败，回退全帧");
+            return Ok(None);
+        };
+        let Ok(nv12) = bgra_to_nv12(&bgra, target.width, target.height) else {
+            tracing::debug!(?target, "补丁转 NV12 失败，回退全帧");
+            return Ok(None);
+        };
+        patches.push(PatchRect {
+            x: target.x,
+            y: target.y,
+            width: target.width,
+            height: target.height,
+            nv12,
+        });
+    }
+    Ok(Some(patches))
+}
+
+/// 读取 SCK 样本附件里的脏矩形摘要（不可用时返回 `None`）。
+///
+/// `SCStreamFrameInfoDirtyRects` 是 `NS_TYPED_ENUM(NSString)`，附件值是
+/// `CFArray<NSValue(CGRect)>`（单位：物理像素）。这里只统计矩形个数与覆盖面积；数组里
+/// 任何一个元素读不出来就整体当作「附件不可用」——宁可多做一次像素比较，也不能把
+/// 「读不懂」当成「没有变化」。
+fn sample_dirty_hint(sample: &CMSampleBuffer) -> Option<DirtyHint> {
+    // SAFETY: SCK 把帧元数据作为 CF 附件挂在 sample buffer 上；该静态量是 NSString，
+    // 与 CFString 是 toll-free bridged（CoreFoundation 文档保证同构）。
+    let key: &CFString =
+        unsafe { &*std::ptr::from_ref(SCStreamFrameInfoDirtyRects).cast::<CFString>() };
+    // SAFETY: 只读查询附件；`key` 是有效的 CFString，模式出参传空。
+    let value = unsafe { CMGetAttachment(sample, key, std::ptr::null_mut()) }?;
+    // SAFETY: 文档保证该键的附件是 CFArray（元素为 NSValue 包装的 CGRect）。
+    let array = unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(value) };
+    let mut hint = DirtyHint {
+        rects: 0,
+        area_pixels: 0,
+    };
+    for index in 0..array.len() {
+        let item = array.get(index)?;
+        // SAFETY: 元素是 NSValue（CGRect 包装）；`item` 在本次循环内保持存活。
+        let raw = CFRetained::as_ptr(&item).cast::<NSValue>();
+        // SAFETY: `raw` 由 `item`（活着的 CFRetained）保证有效。
+        let value: &NSValue = unsafe { &*raw.as_ptr() };
+        // SAFETY: 元素确实包装的是 CGRect（文档契约）。
+        let rect = unsafe { value.rectValue() };
+        hint.rects = hint.rects.saturating_add(1);
+        hint.area_pixels = hint
+            .area_pixels
+            .saturating_add(rect_area_pixels(rect.size.width, rect.size.height));
+    }
+    Some(hint)
+}
+
+/// `CGRect` 的宽高（`CGFloat`）转成像素面积，非法/非有限值按 0 处理。
+fn rect_area_pixels(width: f64, height: f64) -> u64 {
+    let width = if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        0.0
+    };
+    let height = if height.is_finite() && height > 0.0 {
+        height
+    } else {
+        0.0
+    };
+    let area = (width * height).min(f64::from(u32::MAX));
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "已钳到 0..=u32::MAX 且非负，截断不改变有效范围"
+    )]
+    {
+        area as u64
+    }
+}
+
+/// 像素格式码 → 便于日志阅读的十六进制串。
+fn format_string(format: u32) -> String {
+    format!("{format:#010x}")
 }
 
 /// 取锁；中毒时取回内部值（采集路径不能因为一次 panic 永久停摆）。

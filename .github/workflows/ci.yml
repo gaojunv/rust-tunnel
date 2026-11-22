@@ -176,6 +176,11 @@ jobs:
       - name: Test macOS pure logic
         run: cargo test -p rust-tunnel-mac-video -p rust-tunnel-mac-audio -p rust-tunnel-mac-capture --lib
 
+      # 登录窗口 agent 的只读策略（macOS 上链接 vendored libvpx；只跑这一条，避免
+      # 把依赖本机 UDP 环境的 NAT 测试带进 CI）。
+      - name: Test login-agent read-only policy
+        run: cargo test -p rust-tunnel-remote --lib read_only
+
       - name: Type-check macOS crates
         run: |
           cargo check -p rust-tunnel-mac-video -p rust-tunnel-mac-capture -p rust-tunnel-mac-audio -p rust-tunnel-client-gui

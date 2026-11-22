@@ -7,6 +7,7 @@
 //! | NVENC / MFT H.264·H.265 编码 | VideoToolbox `VTCompressionSession` |
 //! | MSH264DecoderMFT / MSH265DecoderMFT | `VTDecompressionSession` |
 //! | WGC/DXGI BGRA 帧 | 由 `rust-tunnel-mac-capture`（ScreenCaptureKit）提供 |
+//! | VideoProcessor 纹理缩放（GPU 零拷贝） | `pixel_transfer`（`VTPixelTransferSession`） |
 //! | `pixels.rs` / `change.rs` / 脏矩形 | [`color`] / [`change`] |
 //! | Annex B NAL 解析（`mft_encoder/bitstream.rs`） | [`annexb`] |
 //!
@@ -28,6 +29,8 @@ pub mod color;
 pub mod error;
 
 #[cfg(target_os = "macos")]
+pub mod pixel_transfer;
+#[cfg(target_os = "macos")]
 pub mod vt_decoder;
 #[cfg(target_os = "macos")]
 pub mod vt_encoder;
@@ -35,6 +38,8 @@ pub mod vt_encoder;
 pub use codec::CodecKind;
 pub use error::{MacVideoError, MacVideoResult};
 
+#[cfg(target_os = "macos")]
+pub use pixel_transfer::PixelTransfer;
 #[cfg(target_os = "macos")]
 pub use vt_decoder::{DecodedNv12Frame, VtDecoder};
 #[cfg(target_os = "macos")]

@@ -8,13 +8,17 @@
 //!
 //! `SCStream`（ScreenCaptureKit，macOS 14+）在**专用线程**上创建与释放，画面按
 //! `kCVPixelFormatType_32BGRA` 送进 [`SCStreamOutput`] 回调；回调只做 `CFRetain`
-//! 与一次覆盖式入槽（不做像素拷贝，4K 一帧 33 MB 的拷贝会阻塞 SCK 的派发队列），
-//! 真正按 `bytesPerRow` 拷成紧包 BGRA 的工作发生在调用方线程的 [`MacCapture::capture`]。
+//! 与一次覆盖式入槽（不做像素拷贝，4K 一帧 33 MB 的拷贝会阻塞 SCK 的派发队列）。
+//! 之后按消费方式分流：GPU 直通原样交出缓冲；补丁路径只按脏矩形读取源区间；只有
+//! CPU 整帧路径才按 `bytesPerRow` 拷成紧包 BGRA。
 //!
-//! 支持三类消费方式：
+//! 支持四类消费方式：
 //!
 //! - [`MacCapture::capture`]：整帧 RGBA（按 `max_encode_width` 在采集层一步封顶）；
-//! - [`MacCapture::capture_patches`]：脏矩形补丁（目标编码坐标系的紧包 NV12）；
+//! - [`MacCapture::capture_gpu`]：**零拷贝**路径——完整物理帧的 `CVPixelBuffer` 直接
+//!   交给 VideoToolbox 编码（缩放/转 420v 全在 GPU 上完成）；
+//! - [`MacCapture::capture_patches`]：脏矩形补丁（目标编码坐标系的紧包 NV12；
+//!   只按脏矩形从源缓冲读取，不做整帧拷贝）；
 //! - [`MacCapture::cursor_shape`]：远端光标**形状**（位置仍由控制端本机系统光标渲染）。
 //!
 //! # 为什么变化检测在采集层
@@ -67,6 +71,46 @@ pub use sck::MacCapture;
 pub use stub::MacCapture;
 
 pub use error::{MacCaptureError, MacCaptureResult};
+
+/// GPU 采集帧的像素缓冲句柄（macOS 上是引用计数的 `CVPixelBuffer`）。
+///
+/// 非 macOS 用 [`std::convert::Infallible`]：占位实现永远不会产出 GPU 帧，
+/// 采集调用恒返回 [`MacCaptureError::Unsupported`]。这样 [`CapturedGpuFrame`] 只需一份
+/// 定义，适配层也不必按平台分叉类型。
+#[cfg(target_os = "macos")]
+pub type GpuFrameBuffer = objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>;
+/// 非 macOS 的 GPU 帧句柄（不可能存在）。
+#[cfg(not(target_os = "macos"))]
+pub type GpuFrameBuffer = std::convert::Infallible;
+
+/// 一帧 **GPU 直通**采集结果：完整物理帧的 `CVPixelBuffer`，不落 CPU。
+///
+/// `width`/`height` 是**逻辑编码尺寸**（按 [`MacCapture::set_max_encode_width`] 封顶后的
+/// 值），与缓冲的物理尺寸（`source_width`/`source_height`，Retina/4K 下更大）分开：
+/// 编码器按逻辑尺寸配置，像素缓冲保持原始分辨率，缩放交给 GPU
+/// （`VTPixelTransferSession`）。
+///
+/// `changed`/`changed_permille` 由采集层如实填写：SCK 样本附件报告「零脏矩形」时直接
+/// 采信（这是平台给的权威信号）；否则把帧缩到 320×180 后做像素级比较，首帧/检测不可用
+/// 时保守给 `true` + `1000`。
+pub struct CapturedGpuFrame {
+    /// 来源显示器编号。
+    pub display: u32,
+    /// 逻辑编码宽度（像素，偶数）。
+    pub width: u32,
+    /// 逻辑编码高度（像素，偶数）。
+    pub height: u32,
+    /// 缓冲的物理宽度（像素）。
+    pub source_width: u32,
+    /// 缓冲的物理高度（像素）。
+    pub source_height: u32,
+    /// 完整物理帧的像素缓冲（引用计数，不拷贝像素）。
+    pub buffer: GpuFrameBuffer,
+    /// 采集层是否判定画面**有可见变化**。
+    pub changed: bool,
+    /// 变化面积（千分比，`0..=1000`）；`changed == false` 时恒为 `0`。
+    pub changed_permille: u16,
+}
 
 /// 一台显示器的元信息（与 `remote::screen::DisplayInfo` 形状一致，由适配器逐字段搬运）。
 ///
@@ -190,9 +234,11 @@ pub struct CaptureInfo {
     pub backend: String,
     /// 采集适配器（CPU 采集没有显卡名，恒为空串）。
     pub adapter: String,
-    /// **最近一帧**是否真的走了 GPU 纹理路径（本阶段走 CPU 回读，恒 `false`）。
+    /// **最近一帧**是否真的走了 `CVPixelBuffer` 直通：GPU 编解码会话的 `capture_gpu`
+    /// 路径为 `true`，CPU `capture()` 与补丁路径为 `false`。
     pub gpu_capture: bool,
-    /// GPU 路径是否已被永久禁用（本阶段没有 GPU 路径，恒 `false`）。
+    /// GPU 路径是否已被永久禁用（本 crate 没有「永久禁用」语义：GPU 失败只回退单帧，
+    /// 恒 `false`）。
     pub gpu_disabled: bool,
     /// GPU 被禁用的原因（未禁用时为空串）。
     pub gpu_disabled_reason: String,

@@ -141,6 +141,9 @@ pub fn is_valid_patch_rect(rect: TargetRect, dst_width: u32, dst_height: u32) ->
 /// 与「先把整帧缩到目标尺寸再裁剪」逐像素一致（单测 `region_scale_matches_full_frame_crop`
 /// 钉住），但只搬矩形范围内的像素——补丁模式下其余像素一个字节都不碰。
 ///
+/// 源图按**紧包**（`bytes_per_row == src_width * 4`）解释；带行填充的源请用
+/// [`scale_bgra_region_strided`]。
+///
 /// # Errors
 ///
 /// 源尺寸/长度不符、矩形非法（奇数/越界）、尺寸溢出时返回 `None`。调用方按
@@ -154,14 +157,52 @@ pub fn scale_bgra_region(
     dst_width: u32,
     dst_height: u32,
 ) -> Option<Vec<u8>> {
+    let stride = usize::try_from(src_width)
+        .ok()?
+        .checked_mul(BYTES_PER_PIXEL)?;
+    scale_bgra_region_strided(
+        src, src_width, src_height, stride, rect, dst_width, dst_height,
+    )
+}
+
+/// [`scale_bgra_region`] 的带行跨度版本：`src_stride` 是源图**每行字节数**。
+///
+/// 采集层的 `CVPixelBuffer` 常常带行填充（`bytesPerRow > width * 4`，IOSurface 对齐），
+/// 补丁路径按 `LockBaseAddress` 拿到的基址 + 真实行跨度读取，**只碰矩形覆盖的源区间**，
+/// 不做整帧拷贝。
+///
+/// 取整规则与 [`scale_bgra_region`] 完全一致（后者就是 `src_stride == src_width * 4`
+/// 的薄包装），因此两条路径逐像素相同。
+///
+/// # Errors
+///
+/// 源尺寸/长度不符、`src_stride < src_width * 4`、矩形非法（奇数/越界）、尺寸溢出时
+/// 返回 `None`。
+#[must_use]
+pub fn scale_bgra_region_strided(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    rect: TargetRect,
+    dst_width: u32,
+    dst_height: u32,
+) -> Option<Vec<u8>> {
     if !is_valid_patch_rect(rect, dst_width, dst_height) || src_width == 0 || src_height == 0 {
         return None;
     }
-    let expected = usize::try_from(src_width)
+    let stride_min = usize::try_from(src_width)
         .ok()?
-        .checked_mul(usize::try_from(src_height).ok()?)?
         .checked_mul(BYTES_PER_PIXEL)?;
-    if src.len() != expected {
+    let rows = usize::try_from(src_height).ok()?;
+    if src_stride < stride_min {
+        return None;
+    }
+    // 最后一行只需要 `width * 4` 字节，所以要求的长度比 `stride * height` 略小。
+    let required = src_stride
+        .checked_mul(rows.saturating_sub(1))?
+        .checked_add(stride_min)?;
+    if src.len() < required {
         return None;
     }
     let out_len = usize::try_from(rect.width)
@@ -176,13 +217,10 @@ pub fn scale_bgra_region(
             let mut sums = [0_u64; BYTES_PER_PIXEL];
             let mut count = 0_u64;
             for sy in sy0..sy1 {
-                let row_start = usize::try_from(sy)
-                    .ok()?
-                    .saturating_mul(usize::try_from(src_width).ok()?)
-                    .saturating_mul(BYTES_PER_PIXEL);
+                let row_start = usize::try_from(sy).ok()?.checked_mul(src_stride)?;
                 for sx in sx0..sx1 {
                     let offset = row_start
-                        .saturating_add(usize::try_from(sx).ok()?.saturating_mul(BYTES_PER_PIXEL));
+                        .checked_add(usize::try_from(sx).ok()?.saturating_mul(BYTES_PER_PIXEL))?;
                     let pixel = src.get(offset..offset.saturating_add(BYTES_PER_PIXEL))?;
                     for (channel, sum) in sums.iter_mut().enumerate() {
                         *sum = sum.saturating_add(u64::from(*pixel.get(channel)?));
@@ -414,6 +452,78 @@ mod tests {
                 x: 0,
                 y: 0,
                 width: 2,
+                height: 2
+            },
+            dw,
+            dh
+        )
+        .is_none());
+    }
+
+    /// 带行跨度的区域缩放与紧包版本逐字节一致（`CVPixelBuffer` 的行填充场景）。
+    #[test]
+    fn strided_region_matches_contiguous() {
+        let (sw, sh) = (40u32, 12u32);
+        let (dw, dh) = (20u32, 6u32);
+        let stride = (sw as usize) * BYTES_PER_PIXEL;
+        let mut padded = vec![0_u8; stride * sh as usize + 7];
+        for y in 0..sh as usize {
+            for x in 0..sw as usize {
+                let offset = y * stride + x * BYTES_PER_PIXEL;
+                padded[offset..offset + 4].copy_from_slice(&[
+                    u8::try_from((x * 7 + y) % 256).unwrap(),
+                    u8::try_from((x + y * 3) % 256).unwrap(),
+                    u8::try_from((x * 11 + y * 5) % 256).unwrap(),
+                    255,
+                ]);
+            }
+        }
+        // 紧包切片：只取前 `stride * sh` 字节（额外尾部不参与）。
+        let contiguous = &padded[..stride * sh as usize];
+        for rect in [
+            TargetRect {
+                x: 0,
+                y: 0,
+                width: dw,
+                height: dh,
+            },
+            TargetRect {
+                x: 2,
+                y: 2,
+                width: 6,
+                height: 4,
+            },
+        ] {
+            let tight = scale_bgra_region(contiguous, sw, sh, rect, dw, dh).expect("紧包区域");
+            let strided =
+                scale_bgra_region_strided(&padded, sw, sh, stride, rect, dw, dh).expect("带跨度");
+            assert_eq!(tight, strided, "矩形 {rect:?} 两条路径不一致");
+        }
+        // 行跨度小于 `width * 4`、缓冲长度不足 → None（防御，不 panic）。
+        assert!(scale_bgra_region_strided(
+            contiguous,
+            sw,
+            sh,
+            stride - 4,
+            TargetRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2
+            },
+            dw,
+            dh
+        )
+        .is_none());
+        assert!(scale_bgra_region_strided(
+            &contiguous[..stride],
+            sw,
+            sh,
+            stride,
+            TargetRect {
+                x: 0,
+                y: 0,
+                width: 4,
                 height: 2
             },
             dw,

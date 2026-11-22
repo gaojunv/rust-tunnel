@@ -78,6 +78,22 @@ pub struct DirtyGrid {
     pub cells: Vec<u8>,
 }
 
+impl DirtyGrid {
+    /// 一张全 0 的网格（「本拍没有变化」），尺寸固定为 [`GRID_WIDTH`]×[`GRID_HEIGHT`]。
+    ///
+    /// 供给「采集层已从平台拿到『零脏矩形』的权威信号、不必再跑像素比较」的调用方：
+    /// 空网格喂给 [`extract_rects`] 会合法地返回空矩形列表（保活），与「真的比较过、
+    /// 没有任何格点变化」完全等价。
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            width: GRID_WIDTH,
+            height: GRID_HEIGHT,
+            cells: vec![0; grid_len()],
+        }
+    }
+}
+
 /// 一次观测的结果：报告 + 可选的脏网格。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeOutcome {
@@ -120,6 +136,16 @@ impl ChangeDetector {
     /// 丢弃基准（采集源重建/尺寸变化后调用，下一帧按首帧处理）。
     pub fn reset(&mut self) {
         self.previous.clear();
+    }
+
+    /// 是否已经建立了比较基准（至少成功观测过一帧）。
+    ///
+    /// 采集层在拿到平台级「零脏矩形」信号时可以据此跳过像素比较：基准存在 ⇒ 上一次
+    /// 失败观测过的画面与当前帧逐像素相同，直接报「未变化」是安全的；基准不存在 ⇒
+    /// 仍要观测一帧（首帧必须按满面积处理）。
+    #[must_use]
+    pub fn has_baseline(&self) -> bool {
+        !self.previous.is_empty()
     }
 
     /// 观测一帧 BGRA，返回变化报告与脏网格。
@@ -595,6 +621,32 @@ mod tests {
         let outcome = detector.observe(&solid(64, 48, 0), 64, 48);
         assert_eq!(outcome.report, ChangeReport::changed_all());
         assert!(outcome.grid.is_none());
+    }
+
+    /// `has_baseline` 只在成功观测后为真；`reset` 之后回到「无基准」。
+    #[test]
+    fn has_baseline_tracks_detector_state() {
+        let mut detector = ChangeDetector::new();
+        assert!(!detector.has_baseline());
+        let _ = detector.observe(&solid(32, 32, 7), 32, 32);
+        assert!(detector.has_baseline());
+        detector.reset();
+        assert!(!detector.has_baseline());
+        // 非法输入同样把基准清掉。
+        let _ = detector.observe(&[0; 4], 32, 32);
+        assert!(!detector.has_baseline());
+    }
+
+    /// 空网格是「无变化」的合法输入：`extract_rects` 返回空列表，尺寸为 320×180。
+    #[test]
+    fn empty_grid_is_well_formed() {
+        let grid = DirtyGrid::empty();
+        assert_eq!((grid.width, grid.height), (GRID_WIDTH, GRID_HEIGHT));
+        assert_eq!(grid.cells.len(), (GRID_WIDTH * GRID_HEIGHT) as usize);
+        assert!(grid.cells.iter().all(|&cell| cell == 0));
+        let rects =
+            extract_rects(&grid, (1920, 1080), &RectParams::default()).expect("空网格不是失败");
+        assert!(rects.is_empty());
     }
 
     /// 完全相同两帧：无变化、面积 0、网格全 0。

@@ -488,6 +488,12 @@ struct Inner {
     approval_wait_timeout: Duration,
     /// 建立数据面的整体超时（默认 [`ESTABLISH_TIMEOUT`]，测试可注入）。
     establish_timeout: Duration,
+    /// 只读模式：拒绝「完全控制 / 仅文件传输」，只接受「仅观看」。
+    ///
+    /// 由 macOS 登录窗口 agent 打开（见 `RemoteManager::set_read_only`）：登录窗口没有
+    /// 可用的注入通道，也绝不能回传文件；与其让控制器以为拿到了完全控制，不如在
+    /// `RemoteSessionIncoming` 阶段就明确拒绝。
+    read_only: bool,
 }
 
 /// 已安装的平台实现。
@@ -931,6 +937,16 @@ impl RemoteManager {
     #[must_use]
     pub fn approval_policy(&self) -> ApprovalPolicy {
         self.ui_tx.borrow().approval_policy
+    }
+
+    /// 设置只读模式（默认关闭）。
+    ///
+    /// 只读模式下 [`Self::handle_incoming`] 会在 `RemoteSessionIncoming` 阶段直接拒绝
+    /// 「完全控制」与「仅文件传输」，只接受 [`RemoteMode::ViewOnly`]。macOS 登录窗口
+    /// agent 用它把「登录窗口没有注入通道」这件事变成协议层的明确拒绝，而不是让控制器
+    /// 以为拿到了完全控制、输入却全部落空。
+    pub fn set_read_only(&self, read_only: bool) {
+        self.lock_inner().read_only = read_only;
     }
 
     /// 设置「被控端会话结束后自动锁定屏幕」。
@@ -1760,6 +1776,13 @@ impl RemoteManager {
     fn handle_incoming(&self, session_id: String, token: String, from_name: String, mode: RemoteMode) {
         if !self.ui_tx.borrow().enabled {
             self.send(rejection(session_id, "被控端未开启远程控制"));
+            return;
+        }
+        if self.lock_inner().read_only && mode != RemoteMode::ViewOnly {
+            self.send(rejection(
+                session_id,
+                "被控端处于只读模式（登录窗口），只接受「仅观看」",
+            ));
             return;
         }
         let Some((screen, input)) = self.platform_arc() else {
@@ -3015,6 +3038,53 @@ mod tests {
         match rx.try_recv().expect("应回一条拒绝") {
             ControlMessage::RemoteSessionResponse { accepted, .. } => assert!(!accepted),
             other => panic!("应为 RemoteSessionResponse，实得 {other:?}"),
+        }
+    }
+
+    /// 只读模式（macOS 登录窗口）只接受「仅观看」：完全控制/文件传输在
+    /// `RemoteSessionIncoming` 阶段就被明确拒绝，而不是让控制器拿到会话后输入全落空。
+    #[test]
+    fn read_only_accepts_view_only_and_rejects_control_and_file_transfer() {
+        let mgr = manager(true);
+        mgr.set_read_only(true);
+        let (tx, mut rx) = mpsc::channel(8);
+        mgr.attach(tx);
+        for mode in [RemoteMode::Control, RemoteMode::FileTransfer] {
+            mgr.handle_control_message(ControlMessage::RemoteSessionIncoming {
+                session_id: "s1".into(),
+                token: "t".into(),
+                from_name: "peer".into(),
+                mode,
+            });
+            match rx.try_recv().expect("只读模式下应拒绝") {
+                ControlMessage::RemoteSessionResponse {
+                    accepted,
+                    reason: Some(reason),
+                    ..
+                } => {
+                    assert!(!accepted);
+                    assert!(reason.contains("只读"), "拒绝原因应说明只读：{reason}");
+                }
+                other => panic!("应为带原因的拒绝，实得 {other:?}"),
+            }
+        }
+        // ViewOnly 不被只读策略拦下；这里没有安装平台实现，落到「缺少屏幕/输入实现」。
+        mgr.handle_control_message(ControlMessage::RemoteSessionIncoming {
+            session_id: "s1".into(),
+            token: "t".into(),
+            from_name: "peer".into(),
+            mode: RemoteMode::ViewOnly,
+        });
+        match rx.try_recv().expect("无平台实现仍应拒绝") {
+            ControlMessage::RemoteSessionResponse {
+                accepted,
+                reason: Some(reason),
+                ..
+            } => {
+                assert!(!accepted);
+                assert!(!reason.contains("只读"), "ViewOnly 不应被只读策略拒绝：{reason}");
+            }
+            other => panic!("应为带原因的拒绝，实得 {other:?}"),
         }
     }
 

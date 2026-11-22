@@ -31,10 +31,11 @@
 
 ## 2. 分期与验收
 
-**当前状态（2026-11-21）**：阶段 A/B/C 已完成，58 个纯逻辑测试通过；三个 macOS crate 与
-`client-gui`（含真实 `opus` 模块）的 aarch64-apple-darwin 交叉 clippy 均通过（见 3.1
-的本机 ABI 桩做法）。真正链接 Apple 框架/VT/SCK/libopus 的构建仍只能在 Mac 或 CI 上做。
-阶段 D 结论已出（见下），**未实现登录窗口 agent 打包**。
+**当前状态（2026-11-22）**：阶段 A/B/C、**GPU 零拷贝**与 **P1 登录窗口只读 agent** 已完成，
+61 个纯逻辑测试通过；三个 macOS crate 与 `client-gui`（含真实 `opus` 模块）的
+aarch64-apple-darwin 交叉 clippy 均通过（见 3.1 的本机 ABI 桩做法）。真正链接 Apple
+框架/VT/SCK/libopus 的构建与运行期行为仍只能在 Mac 或 CI 上验证。
+登录窗口**输入**仍未实现（平台不可行，见阶段 D）。
 
 ### 阶段 A：VideoToolbox 硬件编解码（已完成）
 
@@ -56,8 +57,15 @@
 
 产物：`crates/mac-capture`、`client-gui` 的 `ScreenSource` 适配
 
-- `SCStream` 持续采集：BGRA（或 CVPixelBuffer/IOSurface），多显示器。
-- 变化检测 ≥320×180 网格，`changed` / `changed_permille`；静止时跳过编码。
+- `SCStream` 持续采集：CVPixelBuffer/IOSurface（BGRA），多显示器。
+- 变化检测 320×180 网格，`changed` / `changed_permille`；静止时跳过编码。
+- **GPU 零拷贝**：`capture_gpu` 把完整物理帧的 `CVPixelBuffer` 直接交给
+  `VtEncoder::encode_pixel_buffer`；尺寸/格式不一致时用复用的 `VTPixelTransferSession`
+  在 GPU 上缩放并转 `420v`（BT.709 limited），不做整帧 CPU 拷贝。
+- 变化检测走 SCK 的 `SCStreamFrameInfoDirtyRects` 附件（有则用），否则用复用的
+  `VTPixelTransferSession` 缩到 **320×180**，只锁约 225 KB；补丁路径按矩形
+  `scale_bgra_region_strided` 只读脏区间，不再拷整帧。
+- GPU 失败/不可用时回退 CPU `capture()`；`CaptureInfo.gpu_capture` 按最近一帧如实上报。
 - 脏矩形：网格 → 连通域 → 合并 → 目标坐标 NV12 补丁；进入 H.264/H.265 补丁模式。
 - `NSCursor.currentSystemCursor` 形状映射（协议 v9 的 `CursorShape`）。
 - `capture_info`：后端 `"ScreenCaptureKit"`、是否 GPU 路径、回退计数。
@@ -92,6 +100,9 @@
   唯一正规解法是 Apple 审批的 `com.apple.developer.persistent-content-capture`
   （「远程桌面」权限）。没有它就只能做到「锁屏可控 + 登录窗口只读（需人工点一次授权）」。
 - 推荐路线：P0 锁屏 → P1 登录窗口只读 + 登录交接 → P2 RFB 输入桥 → P3 entitlement/公证 pkg。
+- **P1 已实现**：`--install-login-agent` / `--login-agent`，即 LoginWindow LaunchAgent + 只读
+  协议策略 + root-only helper/config；安装、验证、安全与限制见
+  [`MACOS-LOGIN-AGENT.md`](MACOS-LOGIN-AGENT.md)。**登录窗口输入仍未实现**（平台不可行）。
 
 ## 2.5 真机验收清单（本机 Windows 无法验证的部分）
 
@@ -99,6 +110,8 @@
 |---|---|
 | `mac-video` | `is_hardware()` 是否如实；H.265 在 Intel/Apple Silicon 上的可用性；1080p/4K 每帧耗时；首帧是否能落在 2s 超时内；在线改码率/帧率**不插 IDR**；解码输出是否宏块对齐（1080→1088 需按 clean aperture 裁剪）；BT.709 limited 的黑/白端点；patch NV12 与 VT 全帧的颜色一致性 |
 | `mac-capture` | 屏幕录制权限首次弹框与拒绝路径；SCK 实际帧率（60fps 配置 vs 引擎 30/60 采集）；静止画面 `changed=false`；补丁模式进/出门槛；多显示器切换与坐标；空闲自动停流（录屏指示熄灭）；`NSCursor` 形状映射 |
+| GPU 零拷贝 | 1080p+1920 上限时确实走直通（源 32BGRA、尺寸相等，无整帧 CPU 拷贝）；4K 时 `VTPixelTransferSession` 缩放后的颜色/文字边缘与耗时；`SCStreamFrameInfoDirtyRects` 是否真的存在且静止为空；补丁按脏矩形读回的耗时与边缘接缝；GPU/CPU 回退时 `CaptureInfo.gpu_capture` 如实翻转；HEVC 会话同一路径 |
+| 登录窗口 agent | `--install-login-agent` 后文件属主/权限；注销到 LoginWindow 后 `launchctl print loginwindow/com.rust-tunnel.loginagent`；控制器只能选「仅观看」、完全控制/文件传输被拒；登录后 agent 退出、GUI 接管同一客户端名；屏幕录制授权状态 |
 | `mac-audio` | SCK 系统音频的 ASBD（应为 48 kHz/32-bit float；44.1k 会被拒绝并写 `last_error`）；AudioQueue 设备延迟；拔耳机/切设备重建；欠载/PLC 计数与听感；与画面的音画同步 |
 | 整体 | 两端 0.28.0 互控；macOS 作为控制端解码 Windows H.264/H.265；macOS 作为被控端被 Windows 控制；`RUST_TUNNEL_DISABLE_H265/HWCODEC` 排障开关 |
 
