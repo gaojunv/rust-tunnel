@@ -887,6 +887,34 @@ pub async fn run_client_with_status(
         shared_log_buffer,
         remote_bridge,
         update_bridge,
+        None,
+    )
+    .await
+}
+
+/// 与 [`run_client_with_status`] 相同，但可经 `shutdown` 优雅中断。
+///
+/// `shutdown` 变为 `true` 时（连接建立阶段或消息循环中）本函数按「通道正常关闭」
+/// 走完整收尾：停心跳/写任务、清隧道表、通知远程桥接断开、把状态置为离线。
+/// 无头控制器（`crates/controller-core`）用它实现 `stop()`。
+///
+/// # Errors
+/// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
+pub async fn run_client_with_status_shutdown(
+    config: ClientConfig,
+    status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
+    shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
+    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
+    update_bridge: Option<std::sync::Arc<dyn ClientUpdateBridge>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> TunnelResult<()> {
+    run_client_inner(
+        config,
+        status_tx,
+        shared_log_buffer,
+        remote_bridge,
+        update_bridge,
+        Some(shutdown),
     )
     .await
 }
@@ -898,25 +926,23 @@ pub async fn run_client_with_status(
 /// # Errors
 /// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
 pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
-    run_client_inner(config, None, None, None, None).await
+    run_client_inner(config, None, None, None, None, None).await
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分"
-)]
-async fn run_client_inner(
-    config: ClientConfig,
-    status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
-    shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
-    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
-    update_bridge: Option<std::sync::Arc<dyn ClientUpdateBridge>>,
-) -> TunnelResult<()> {
-    // Connect to server with or without TLS
-    let (mut reader, mut writer): (
-        Box<dyn AsyncRead + Unpin + Send>,
-        Box<dyn AsyncWrite + Unpin + Send>,
-    ) = if config.tls {
+/// 建立控制通道的底层字节流（TLS 或明文 TCP）。
+///
+/// 抽成独立函数是为了让调用方能把「连接」与「停止信号」一起 `select!`：
+/// 连接阶段还没有派生任务，放弃 future 是安全的。
+///
+/// # Errors
+/// TLS/TCP 连接失败时返回底层错误。
+async fn connect_control_transport(
+    config: &ClientConfig,
+) -> TunnelResult<(
+    Box<dyn AsyncRead + Unpin + Send>,
+    Box<dyn AsyncWrite + Unpin + Send>,
+)> {
+    if config.tls {
         info!(
             "Connecting to server {} with TLS (insecure mode - accepting self-signed certs)",
             config.server
@@ -934,13 +960,53 @@ async fn run_client_inner(
         let tls_stream = connect_tls_insecure(&config.server, tls_server_name).await?;
         info!("TLS connection established successfully");
         let (r, w) = tokio::io::split(tls_stream);
-        (Box::new(r), Box::new(w))
+        Ok((Box::new(r), Box::new(w)))
     } else {
         info!("Connecting to server {} without TLS", config.server);
         let stream = TcpStream::connect(&config.server).await?;
         info!("TCP connection established");
         let (r, w) = tokio::io::split(stream);
-        (Box::new(r), Box::new(w))
+        Ok((Box::new(r), Box::new(w)))
+    }
+}
+
+/// 等待停止信号变为 `true`；发送端被丢弃时永不 resolve（把「监督方没了」与
+/// 「要求停止」区分开，避免一次通道关闭被误判成停止请求）。
+async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分"
+)]
+async fn run_client_inner(
+    config: ClientConfig,
+    status_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClientStatus>>>,
+    shared_log_buffer: Option<std::sync::Arc<LogBuffer>>,
+    remote_bridge: Option<std::sync::Arc<dyn RemoteBridge>>,
+    update_bridge: Option<std::sync::Arc<dyn ClientUpdateBridge>>,
+    mut shutdown: Option<watch::Receiver<bool>>,
+) -> TunnelResult<()> {
+    // Connect to server with or without TLS. 连接阶段也响应停止信号：此时尚未派生任何
+    // 任务，直接放弃 future 不会泄漏（消息循环阶段必须走下面的 select! 收尾）。
+    let (mut reader, mut writer): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = if let Some(rx) = shutdown.as_mut() {
+        tokio::select! {
+            r = connect_control_transport(&config) => r?,
+            () = wait_shutdown(rx) => return Ok(()),
+        }
+    } else {
+        connect_control_transport(&config).await?
     };
 
     // Get hostname for client name
@@ -1100,14 +1166,28 @@ async fn run_client_inner(
     // Start heartbeat task
     let heartbeat_task = tokio::spawn(start_heartbeat(sender));
 
-    let result = process_control_messages(
-        &mut reader,
-        state.clone(),
-        remote_bridge.clone(),
-        update_bridge.clone(),
-        Some(write_dead_rx),
-    )
-    .await;
+    let result = if let Some(rx) = shutdown.as_mut() {
+        tokio::select! {
+            r = process_control_messages(
+                &mut reader,
+                state.clone(),
+                remote_bridge.clone(),
+                update_bridge.clone(),
+                Some(write_dead_rx),
+            ) => r,
+            // 停止信号：按「通道正常关闭」收尾（下面的清理逻辑照常执行）。
+            () = wait_shutdown(rx) => Ok(()),
+        }
+    } else {
+        process_control_messages(
+            &mut reader,
+            state.clone(),
+            remote_bridge.clone(),
+            update_bridge.clone(),
+            Some(write_dead_rx),
+        )
+        .await
+    };
     // 确定性清理：立即停掉心跳与写任务（不再等 channel drop 的间接时序），
     // 并中止全部隧道 reader 任务、清空连接表，避免重连后旧任务/旧 socket 累积。
     heartbeat_task.abort();
@@ -1148,7 +1228,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
-            agent_pty_port: crate::pty::DEFAULT_PTY_PORT,
+            agent_pty_port: rust_tunnel_common::DEFAULT_PTY_PORT,
             log: "info".to_string(),
         };
         let (sender, _) = mpsc::channel(32);

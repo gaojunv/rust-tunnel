@@ -9,12 +9,16 @@ license = "MIT OR Apache-2.0"
 workspace = true
 
 [dependencies]
-rust-tunnel-common = { path = "../common" }
+# 本 crate 不使用 common 的 SQLite / 出站 HTTP 工厂；关掉默认 feature，让无头
+# 控制器（`crates/controller-core`）不必为它们付出构建代价。
+rust-tunnel-common = { path = "../common", default-features = false }
 rust-tunnel-rustdesk = { path = "../rustdesk" }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 # `FramedRead::next` / `FramedWrite::send` 需要 StreamExt / SinkExt，故为生产依赖。
-futures-util = "0.3"
+# `sink` feature 必须显式打开：它不在 futures-util 的默认 feature 里，而完整工作区
+# 里恰好由别的 crate（axum/hyper 链路）打开；无头控制器的最小依赖图没有那个来源。
+futures-util = { version = "0.3", features = ["sink"] }
 bytes = "1.0"
 bincode = "1.3"
 serde = { version = "1.0", features = ["derive"] }

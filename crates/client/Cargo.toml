@@ -44,7 +44,10 @@ name = "rust-tunnel-client"
 path = "src/bin/client.rs"
 
 [features]
-default = ["code-outline"]
+default = ["code-outline", "pty"]
+# 交互式 PTY 回环服务：桌面 CLI 的 `--agent` 终端用。无头控制器（Android）关闭它，
+# 避免把 `portable-pty`（ConPTY/Unix pty）拖进移动端构建。
+pty = ["dep:portable-pty"]
 code-outline = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
@@ -55,13 +58,15 @@ code-outline = [
 ]
 
 [dependencies]
-rust-tunnel-common = { path = "../common" }
+# 无头控制器（`crates/controller-core`）以 `default-features = false` 依赖本 crate，
+# 故 common 的 SQLite/reqwest 也必须可关：本 crate 自己不用它们。
+rust-tunnel-common = { path = "../common", default-features = false }
 bincode.workspace = true
 clap.workspace = true
 figment.workspace = true
 gethostname.workspace = true
 hex.workspace = true
-portable-pty.workspace = true
+portable-pty = { workspace = true, optional = true }
 rand.workspace = true
 anyhow.workspace = true
 serde.workspace = true

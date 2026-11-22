@@ -1,0 +1,18 @@
+[package]
+name = "rust-tunnel-android-video"
+version = "0.1.0"
+edition = "2021"
+description = "Android MediaCodec H.264/H.265 hardware decoding for the rust-tunnel controller"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+name = "rust_tunnel_android_video"
+path = "src/lib.rs"
+
+[dependencies]
+# 只依赖引擎 crate（trait / 帧类型 / 错误）。本 crate 不依赖 remote 之外的任何东西，
+# 因此可以直接被 Android 宿主（controller-core / JNI）注入为解码器工厂。
+rust-tunnel-remote = { path = "../remote" }

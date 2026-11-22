@@ -8,6 +8,16 @@ license = "MIT OR Apache-2.0"
 [lints]
 workspace = true
 
+[features]
+# 默认开启，桌面/服务端行为与从前逐字节一致。无头（Android 控制器）只依赖
+# `rust-tunnel-client`/`rust-tunnel-remote` 时用 `default-features = false`，
+# 可避免把 SQLite 与 reqwest 整条 TLS 栈拖进移动端构建。
+default = ["sqlx", "http-client"]
+# `TunnelError::Database` 变体（服务端/持久化用）。
+sqlx = ["dep:sqlx"]
+# 统一出站 HTTP 客户端工厂（LLM 网关、RAG embedder 等用）。
+http-client = ["dep:reqwest"]
+
 [dependencies]
 aes-gcm.workspace = true
 base64.workspace = true
@@ -17,9 +27,9 @@ rcgen.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rustls-pemfile.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 serde.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

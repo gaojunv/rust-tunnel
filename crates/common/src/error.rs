@@ -11,7 +11,8 @@ pub enum TunnelError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
 
-    /// 数据库错误。
+    /// 数据库错误（`sqlx` feature；服务端/持久化专用）。
+    #[cfg(feature = "sqlx")]
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -113,6 +114,7 @@ mod tests {
         assert!(err_result.is_err());
     }
 
+    #[cfg(feature = "sqlx")]
     #[test]
     fn test_database_error_conversion() {
         // Create a sqlx error via a failed connection
@@ -167,9 +169,8 @@ mod tests {
     #[test]
     fn test_all_error_variants_display() {
         // Verify all variants produce non-empty display output
-        let variants: Vec<TunnelError> = vec![
+        let mut variants: Vec<TunnelError> = vec![
             TunnelError::Io(std::io::Error::other("io")),
-            TunnelError::Database(sqlx::Error::Io(std::io::Error::other("db"))),
             TunnelError::Protocol("proto".into()),
             TunnelError::ConnectionClosed,
             TunnelError::Timeout,
@@ -178,6 +179,10 @@ mod tests {
             TunnelError::Tls("tls".into()),
             TunnelError::TrojanAuthFailed(vec![1, 2, 3]),
         ];
+        #[cfg(feature = "sqlx")]
+        variants.push(TunnelError::Database(sqlx::Error::Io(std::io::Error::other(
+            "db",
+        ))));
 
         for err in variants {
             let display = format!("{err}");

@@ -15,7 +15,8 @@ pub mod llm_proxy;
 pub mod logs;
 /// 隧道代理：本地目标拨号与双向转发
 pub mod proxy;
-/// PTY 服务：回环端口上的交互式 shell
+/// PTY 服务：回环端口上的交互式 shell（`pty` feature；无头控制器关闭）。
+#[cfg(feature = "pty")]
 pub mod pty;
 /// 长生命周期进程管理：spawn/stdin/stdout 桥接
 pub mod spawn;
