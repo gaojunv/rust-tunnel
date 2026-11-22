@@ -89,6 +89,28 @@ fn roundtrip(codec: rust_tunnel_mac_video::CodecKind) -> bool {
     let mut decode_ms = Vec::with_capacity(FRAMES as usize);
     let mut decoded_frames = 0u32;
     let mut keyframes = 0u32;
+    // 真机排障用：`RT_PROBE_DUMP_PREFIX` 设置时，把实际写给控制端的帧原样落盘
+    // （4 字节大端长度前缀 + Annex B；不改任何编码参数）。
+    use std::io::Write as _;
+    let dump_prefix = std::env::var("RT_PROBE_DUMP_PREFIX").ok();
+    let extension = match codec {
+        rust_tunnel_mac_video::CodecKind::H264 => "h264",
+        rust_tunnel_mac_video::CodecKind::H265 => "h265",
+    };
+    let mut dump = dump_prefix.as_deref().and_then(|prefix| {
+        let path = format!("{prefix}.{extension}");
+        match std::fs::File::create(&path) {
+            Ok(file) => {
+                println!("码流 dump: {path}");
+                Some(file)
+            }
+            Err(err) => {
+                println!("无法创建码流 dump {path}: {err}");
+                None
+            }
+        }
+    });
+    let mut first_keyframe_dumped = false;
     for index in 0..FRAMES {
         let frame = synthetic_frame(index);
         let started = Instant::now();
@@ -100,6 +122,27 @@ fn roundtrip(codec: rust_tunnel_mac_video::CodecKind) -> bool {
             }
         };
         encode_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        if let Some(prefix) = dump_prefix.as_deref() {
+            let mut dump_failed = false;
+            if let Some(file) = dump.as_mut() {
+                if let Err(err) = file.write_all(&packet.data) {
+                    println!("写入码流 dump 失败: {err}");
+                    dump_failed = true;
+                }
+            }
+            if dump_failed {
+                dump = None;
+            }
+            // 首个关键帧单独一份，便于直接喂给解码器/工具单独验证参数集与 IDR。
+            if packet.keyframe && !first_keyframe_dumped {
+                first_keyframe_dumped = true;
+                let path = format!("{prefix}.first-keyframe.{extension}");
+                match std::fs::write(&path, &packet.data) {
+                    Ok(()) => println!("首个关键帧 dump: {path}"),
+                    Err(err) => println!("无法写入首个关键帧 {path}: {err}"),
+                }
+            }
+        }
         if packet.keyframe {
             keyframes = keyframes.saturating_add(1);
         }

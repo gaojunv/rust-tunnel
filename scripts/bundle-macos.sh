@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# 组装 RustTunnel.app（ad-hoc 签名，不含公证）。
+# 组装 RustTunnel.app（ad-hoc 或稳定身份签名，不含公证）。
 # 用法: VERSION=v0.8.0 GUI_BIN=target/.../rust-tunnel-client-gui scripts/bundle-macos.sh
+# 本地开发可加 SKIP_DMG=1 跳过 dmg；稳定签名用 MACOS_SIGN_IDENTITY=<身份名>。
 # 只出 arm64（macOS x86_64 已放弃：shiguredo_libvpx 无该 target 的预编译）。
 VERSION="${VERSION:-${GITHUB_REF_NAME:-v0.0.0}}"
 GUI_BIN="${GUI_BIN:-target/aarch64-apple-darwin/release/rust-tunnel-client-gui}"
@@ -30,10 +31,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>RustTunnel</string>
   <key>CFBundleDisplayName</key><string>Rust Tunnel</string>
   <key>CFBundleVersion</key><string>${VERSION#v}</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>rust-tunnel-client-gui</string>
   <key>CFBundleIconFile</key><string>icon</string>
   <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
@@ -42,7 +45,33 @@ PLIST
 echo "APPL????" > "$APP/Contents/PkgInfo"
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign -s - --deep --force "$APP" || true
+  if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+    echo "使用签名身份：$MACOS_SIGN_IDENTITY"
+    codesign --force --deep --sign "$MACOS_SIGN_IDENTITY" "$APP"
+  else
+    cat >&2 <<'WARN'
+============================================================
+⚠️  使用 ad-hoc 签名（codesign -s -）
+    ad-hoc 的 cdhash 每次重建都会变化，TCC 里已授予的权限
+    可能失效或需要重新授权。
+    要跨重建保留授权，请提供稳定签名身份：
+      security find-identity -v -p codesigning   # 选一个身份
+      MACOS_SIGN_IDENTITY="<身份名>" scripts/bundle-macos.sh
+    或在 Keychain Access 创建 Code Signing 自签证书后设置它。
+============================================================
+WARN
+    codesign -s - --deep --force "$APP"
+  fi
+  codesign --verify --deep --strict "$APP"
+  echo "--- codesign -dv ---"
+  # `head` 提前关闭管道会让 codesign 收到 SIGPIPE；`set -o pipefail` 下必须兜住。
+  codesign -dv --verbose=4 "$APP" 2>&1 | head -15 || true
+fi
+
+if [ -n "${SKIP_DMG:-}" ]; then
+  echo "SKIP_DMG 已设置，跳过 dmg 生成"
+  echo "bundle done: $APP"
+  exit 0
 fi
 
 # 产出 dmg（若 create-dmg/hdiutil 可用）

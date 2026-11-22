@@ -1661,7 +1661,7 @@ fn log_wgpu_adapters(path: &std::path::Path) {
     }
 }
 
-/// 非 Windows 平台没有 wgpu 回退，不需要枚举 adapter。
+/// 启动日志里的 `renderer: Wgpu` 已能确认 macOS 上的选择；这里只在 Windows 枚举 adapter。
 #[cfg(not(target_os = "windows"))]
 fn log_wgpu_adapters(_path: &std::path::Path) {}
 
@@ -1691,13 +1691,14 @@ fn relaunch_with_renderer(value: &str) -> bool {
 
 /// 选择 eframe 渲染器。
 ///
-/// - Windows 上**默认 wgpu**（DX12）：NV12 着色器上屏需要它，且它比 Glow 更能覆盖老驱动 /
+/// - Windows 与 **macOS** 上默认 wgpu：NV12 着色器上屏需要它（Media Foundation 与
+///   VideoToolbox 的 H.264/H.265 解码输出都是 NV12），且它比 Glow 更能覆盖老驱动 /
 ///   虚拟机 / 远程桌面（后者没有可用 GL 配置）。
-/// - 非 Windows 仍默认 Glow（现状不变）。
-/// - `RUST_TUNNEL_RENDERER=glow|wgpu` 显式覆盖；wgpu 只在 Windows 上被采纳。
+/// - Linux 及其它平台仍默认 Glow。
+/// - `RUST_TUNNEL_RENDERER=glow|wgpu` 显式覆盖；wgpu 只在 Windows/macOS 上被采纳。
 fn select_renderer() -> eframe::Renderer {
     let requested = std::env::var("RUST_TUNNEL_RENDERER").ok();
-    if cfg!(target_os = "windows") {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
         match requested.as_deref() {
             Some("glow") => eframe::Renderer::Glow,
             _ => eframe::Renderer::Wgpu,
@@ -1903,7 +1904,7 @@ fn run_app(log_path: Option<&std::path::Path>) -> anyhow::Result<()> {
 
     if let Err(err) = result {
         let message = err.to_string();
-        if cfg!(target_os = "windows") {
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
             // 默认 wgpu 失败（个别老驱动/虚拟机）→ 用 Glow 重试一次。仅当用户没显式指定
             // renderer 时这么做，避免覆盖用户的选择。
             if matches!(renderer, eframe::Renderer::Wgpu) && renderer_env.is_none() {

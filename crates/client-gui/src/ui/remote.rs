@@ -202,7 +202,10 @@ fn show_permissions(ui: &mut Ui) {
                         .size(12.0)
                         .color(p.text_weak),
                 );
-                if widgets::button(ui, "去授权", None, ButtonKind::Secondary).clicked() {
+                if widgets::button(ui, "请求授权", None, ButtonKind::Secondary).clicked() {
+                    remote::request_permission(PermissionKind::ScreenCapture);
+                }
+                if widgets::button(ui, "打开系统设置", None, ButtonKind::Secondary).clicked() {
                     remote::open_permission_settings(PermissionKind::ScreenCapture);
                 }
             });
@@ -214,15 +217,21 @@ fn show_permissions(ui: &mut Ui) {
                         .size(12.0)
                         .color(p.text_weak),
                 );
-                if widgets::button(ui, "去授权", None, ButtonKind::Secondary).clicked() {
+                if widgets::button(ui, "请求授权", None, ButtonKind::Secondary).clicked() {
+                    remote::request_permission(PermissionKind::Accessibility);
+                }
+                if widgets::button(ui, "打开系统设置", None, ButtonKind::Secondary).clicked() {
                     remote::open_permission_settings(PermissionKind::Accessibility);
                 }
             });
         }
         ui.label(
-            RichText::new("授权后需重启本应用方可生效。")
-                .size(12.0)
-                .color(p.text_weak),
+            RichText::new(
+                "点击「请求授权」后系统会弹授权框；若之前拒绝过，请在系统设置里打开开关。\
+                 授权后需重启本应用方可生效。",
+            )
+            .size(12.0)
+            .color(p.text_weak),
         );
     });
 }

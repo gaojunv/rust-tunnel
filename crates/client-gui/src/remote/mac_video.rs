@@ -260,8 +260,10 @@ impl VideoEncoderApi for VtEncoderAdapter {
             .to_owned(),
             name: info.name,
             adapter: String::new(),
-            // 阶段 A 的输入是 CPU RGBA，不是 GPU 纹理。
-            gpu_input: false,
+            // VideoToolbox 直接接受 `CVPixelBuffer`（`encode_pixel_buffer`），采集侧
+            // 传进来的 `MacGpuFrame` 正是 SCK 的 GPU 缓冲；这里与 NVENC 同为能力位，
+            // 表示「编码器能吃 GPU 纹理」，不是「本帧一定来自 GPU」。
+            gpu_input: true,
         }
     }
 }

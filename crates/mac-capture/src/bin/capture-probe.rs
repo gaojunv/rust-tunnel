@@ -82,11 +82,18 @@ mod macos {
             return;
         }
         for display in &displays {
+            // DisplayInfo 是**逻辑点**（控制端输入映射用），采集流仍按物理像素。
+            let coords = match rust_tunnel_mac_capture::display_physical_size(display.id) {
+                Some((width, height)) => format!(
+                    "逻辑 {}x{} / 物理 {}x{}",
+                    display.width, display.height, width, height
+                ),
+                None => format!("逻辑 {}x{}（物理尺寸不可用）", display.width, display.height),
+            };
             println!(
-                "显示器 {} · {}x{} 物理像素 · {}",
+                "显示器 {} · {} · {}",
                 display.id,
-                display.width,
-                display.height,
+                coords,
                 if display.primary {
                     "主显示器"
                 } else {

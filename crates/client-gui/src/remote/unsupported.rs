@@ -21,6 +21,11 @@ pub fn permissions() -> super::Permissions {
 /// 无对应设置面板。
 pub fn open_settings(_kind: super::PermissionKind) {}
 
+/// 该平台不支持远程控制，无法请求权限。
+pub fn request_permission(_kind: super::PermissionKind) -> bool {
+    false
+}
+
 /// 构造平台实现三件套（实际不可用）。
 #[must_use]
 pub fn screen_and_input(_mode: super::PlatformMode) -> super::PlatformHandles {

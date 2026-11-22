@@ -174,9 +174,59 @@ cargo clippy -p rust-tunnel-client-gui --target aarch64-apple-darwin \
 
 已有 `macos::permissions()` 探测；新增能力必须沿用同一套 UI 提示与设置跳转，不能静默失败。
 
+**授权只能由用户在系统设置里完成**：系统没有脚本一键授权（`tccutil` 只支持 reset，
+TCC.db 受 SIP 保护，PPPC 不能预授 Screen Recording，见 `MACOS-UNATTENDED.md` §1.4）。
+
+- 用 `scripts/bundle-macos.sh` 打包成固定 bundle id（`com.rust-tunnel.client`）的 `.app`：
+  程序会**自动出现在**「屏幕录制」/「辅助功能」列表里，用户只需拨开关。本地开发：
+  ```bash
+  GUI_BIN=target/debug/rust-tunnel-client-gui VERSION=v0.28.0 SKIP_DMG=1 \
+    bash scripts/bundle-macos.sh
+  open dist/RustTunnel.app
+  ```
+- 界面上的「请求授权」按钮会触发系统弹窗（屏幕录制走 `CGRequestScreenCaptureAccess`，
+  辅助功能走 `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt`）；
+  之前拒绝过时系统不会重复弹，需用旁边的「打开系统设置」手动打开。
+- 本地开发也可以把权限授给启动它的终端（responsible process），之后重建二进制不用
+  重新选择——但这是 TCC 对 responsible process 的归属，不是 `.app` 身份。
+- 跨重建保留授权需要稳定签名身份：ad-hoc 签名的 cdhash 每次都变，TCC 记录会失效；
+  用 `security find-identity -v -p codesigning` 选一个身份后设置
+  `MACOS_SIGN_IDENTITY="<身份名>"`（打包脚本会用它签名）。
+
 ## 5. 版本与发布
 
 - 数据面协议不变（v12），0.27.x 与新版本可互控。
 - 功能完成时把 `crates/client` / `client-gui` / `win-platform` / `win-service` 同步抬到
   0.28.0，并让 `v0.28.0` 与 `gui-v0.28.0` 指向同一版本。
 - 服务端 `MIN_REMOTE_CLIENT_VERSION` 无需变动（macOS 能力不影响控制面门控）。
+
+### GitHub CI 签名（自签 + Secrets）
+
+`release-client-gui.yml` 的 `build-gui-macos` 支持用本机自签证书签名发布产物：
+
+- 需要的 3 个仓库 secrets：`MACOS_SIGN_P12_BASE64`（p12 的 base64）、
+  `MACOS_SIGN_P12_PASSWORD`（p12 密码）、`MACOS_SIGN_IDENTITY`（身份名，本项目是
+  `RustTunnel Local Signing`）。
+- 本机导出（用强密码）：
+
+  ```bash
+  # 从登录钥匙串导出身份（会提示输入 p12 密码）
+  security export -t identities -f pkcs12 \
+    -k "$HOME/Library/Keychains/login.keychain-db" -o /tmp/rusttunnel-signing.p12
+  base64 -i /tmp/rusttunnel-signing.p12 | tr -d '\n' | pbcopy
+  ```
+
+  也可以从已有的 p12 用 `openssl pkcs12 -in old.p12 -nodes` 转出后重新加密。
+- workflow 行为：有 secret 时导入临时钥匙串，签名 **`.app` 和裸二进制**；没有 secret
+  时回退 ad-hoc（本地/无 secret 仓库不受影响）。
+- **自更新 caveat**：macOS GUI 自更新是把下载的裸二进制 rename 进
+  `.app/Contents/MacOS/`，所以裸二进制必须用同一证书签，**并且显式传
+  `--identifier com.rust-tunnel.client`**——否则 `codesign` 默认拿文件名当 identifier，
+  与 `.app` 的 designated requirement（`identifier "com.rust-tunnel.client"`）对不上，
+  更新后 TCC 授权仍会失效。替换后 bundle 封印（`_CodeSignature/CodeResources`）也会
+  失效，`codesign --verify --deep` 会报错，但 TCC 按主执行文件签名匹配；更干净的做法是
+  以后改成整包 `.app` 更新。
+- 安全：p12 是私钥，只放 repo secret（或被保护环境的 secret），绝不提交；自签只适合
+  内部/尝鲜，公开分发建议 Developer ID + 公证。
+- DR 稳定性：`identifier "com.rust-tunnel.client" and certificate leaf =
+  H"8f8c776aa8b36141a5b9876097436bf4e632dddb"`，同一证书重建不会失效。

@@ -10,6 +10,8 @@
 /// 平台标识。
 pub const NAME: &str = "macos";
 
+use objc2_core_foundation::{CFBoolean, CFDictionary, CFString};
+
 // CoreGraphics / ApplicationServices 的 C 接口（xcap/enigo 已链接这两个 framework，
 // 此处仅为读取权限状态）。`Boolean` 在 C 里是 `unsigned char`，`CGPreflight...` 返回
 // C `bool`（1 字节），两者都用 `u8` 承接再判非零，避免 Rust `bool` 的 ABI 假设。
@@ -25,6 +27,10 @@ extern "C" {
 extern "C" {
     /// 本进程是否受信任使用辅助功能（`Boolean`，非零为真）。
     fn AXIsProcessTrusted() -> u8;
+    /// 询问辅助功能授权；`options` 里带 `kAXTrustedCheckOptionPrompt` 时会弹系统框。
+    fn AXIsProcessTrustedWithOptions(options: &CFDictionary) -> u8;
+    /// 选项字典的键：值为 `true` 时请求系统弹「辅助功能」授权框。
+    static kAXTrustedCheckOptionPrompt: Option<&'static CFString>;
 }
 
 /// 探测 macOS 权限。
@@ -48,6 +54,32 @@ pub fn permissions() -> super::Permissions {
 pub fn request_screen_capture() -> bool {
     // SAFETY: 无参数、无副作用（只触发系统授权流程并返回当前状态）。
     unsafe { CGRequestScreenCaptureAccess() != 0 }
+}
+
+/// 请求辅助功能权限；返回调用后是否已授权（弹窗是异步的）。
+#[must_use]
+pub fn request_accessibility() -> bool {
+    // SAFETY: 常量由 ApplicationServices 导出；字典只在本调用期间存活，调用只读。
+    let Some(key) = (unsafe { kAXTrustedCheckOptionPrompt }) else {
+        // 框架没有导出常量时不能 panic：退回只查询当前信任状态（不弹窗）。
+        tracing::warn!("ApplicationServices 未导出 kAXTrustedCheckOptionPrompt，无法弹出授权框");
+        // SAFETY: 无参数、只读的状态查询。
+        return unsafe { AXIsProcessTrusted() != 0 };
+    };
+    let value = CFBoolean::new(true);
+    let options = CFDictionary::from_slices(&[key], &[value]);
+    let dict: &CFDictionary<CFString, CFBoolean> = &options;
+    let base: &CFDictionary = dict.as_ref();
+    // SAFETY: `base` 是合法 CFDictionary，调用只读取它。
+    unsafe { AXIsProcessTrustedWithOptions(base) != 0 }
+}
+
+/// 请求某一类权限（macOS 会弹系统授权框）。
+pub fn request_permission(kind: super::PermissionKind) -> bool {
+    match kind {
+        super::PermissionKind::ScreenCapture => request_screen_capture(),
+        super::PermissionKind::Accessibility => request_accessibility(),
+    }
 }
 
 /// 打开对应的「系统设置 → 隐私与安全性」面板。

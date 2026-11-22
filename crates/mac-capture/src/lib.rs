@@ -112,22 +112,36 @@ pub struct CapturedGpuFrame {
     pub changed_permille: u16,
 }
 
-/// 一台显示器的元信息（与 `remote::screen::DisplayInfo` 形状一致，由适配器逐字段搬运）。
+/// 显示器元信息（与 `remote::screen::DisplayInfo` 形状一致，由适配器逐字段搬运）。
 ///
 /// `id` 是 CoreGraphics 的 `CGDirectDisplayID`：采集（`SCDisplay.displayID`）与
 /// 输入注入（`CGEvent` 的显示器坐标）共用同一个编号体系。
+///
+/// **`width`/`height` 是 macOS 全局逻辑点尺寸（points），不是物理像素**：
+/// 控制端用它们把窗口坐标映射成远端坐标，而 enigo / `CGEvent` 的绝对坐标单位就是
+/// 点（4K 屏是 1920×1080 点，物理面板是 3840×2160 像素）。采集与编码仍使用
+/// [`display_physical_size`] 的物理像素，两者不能混用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayInfo {
     /// 平台显示器编号（`CGDirectDisplayID`）。
     pub id: u32,
-    /// 宽度（**物理像素**，Retina 下是点数 × `backingScaleFactor`）。
+    /// 宽度（**逻辑点**，不是物理像素）。
     pub width: u32,
-    /// 高度（物理像素）。
+    /// 高度（逻辑点）。
     pub height: u32,
     /// 显示器名称（SCK 不提供名称，这里是 `显示器 <id>`）。
     pub name: String,
     /// 是否为主显示器（`CGDisplayIsMain`）。
     pub primary: bool,
+}
+
+/// 显示器的**物理像素**尺寸（采集/编码用；与 [`DisplayInfo`] 的逻辑点尺寸不同）。
+///
+/// 供探针/排障同时打印两套尺寸；采集流本身由 `MacCapture` 内部使用同一函数。
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn display_physical_size(display_id: u32) -> Option<(u32, u32)> {
+    sck::physical_size(display_id)
 }
 
 /// 一帧采集结果（未编码）。

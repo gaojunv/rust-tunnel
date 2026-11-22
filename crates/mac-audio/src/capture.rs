@@ -36,9 +36,10 @@ use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatLinearPCM, AudioBuffer, AudioBufferList,
     AudioStreamBasicDescription,
 };
+use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
     kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-    CMAudioFormatDescriptionGetStreamBasicDescription, CMSampleBuffer, CMTime,
+    CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMSampleBuffer, CMTime,
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
@@ -684,8 +685,12 @@ fn sample_buffer_to_pending(
     let mut storage = vec![0_u64; size_needed.div_ceil(size_of::<u64>())];
     let storage_bytes = storage.len().saturating_mul(size_of::<u64>());
     let list = storage.as_mut_ptr().cast::<AudioBufferList>();
-    // SAFETY: `storage` 至少有 `size_needed` 字节且 8 字节对齐；block buffer 传 null
-    // 表示不额外持有——`sample_buffer` 在本回调期间由 SCK 持有，数据指针仍然有效。
+    // `block_buffer_out` 必须给非空指针：macOS 27 上传 NULL 会直接返回
+    // `kCMSampleBufferError_RequiredParameterMissing (-12731)`，哪怕 bufferList 与
+    // size 都正确。返回的 block buffer 是 +1 引用，且 AudioBufferList 的 `mData`
+    // 指向它的内存——必须在拷贝完成前保活，否则会悬垂。
+    let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
+    // SAFETY: `storage` 至少有 `size_needed` 字节且 8 字节对齐；`block` 由调用方接管。
     let status = unsafe {
         sample_buffer.audio_buffer_list_with_retained_block_buffer(
             &raw mut size_needed,
@@ -694,7 +699,7 @@ fn sample_buffer_to_pending(
             None,
             None,
             kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            std::ptr::null_mut(),
+            &raw mut block,
         )
     };
     if status != 0 {
@@ -702,6 +707,8 @@ fn sample_buffer_to_pending(
             "取 SCK 音频缓冲失败：OSStatus {status}"
         )));
     }
+    // SAFETY: 成功时 `block` 是 +1 引用；`CFRetained` 在函数结束时释放。
+    let _block = std::ptr::NonNull::new(block).map(|ptr| unsafe { CFRetained::from_raw(ptr) });
     // SAFETY: 上面的调用已按 `size_needed` 填好 AudioBufferList。
     let buffer_count = usize::try_from(unsafe { (*list).mNumberBuffers }).unwrap_or(0);
     if buffer_count == 0 {

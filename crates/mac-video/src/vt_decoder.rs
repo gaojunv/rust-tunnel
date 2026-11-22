@@ -225,7 +225,10 @@ impl VtDecoder {
         if data.is_empty() {
             return Ok(None);
         }
-        let units = annexb::nal_units(data);
+        // 线上契约是「4 字节大端长度前缀 + Annex B」；同时兼容旧版裸 Annex B。
+        // 必须显式剥前缀再扫起始码：长度前缀本身可能含 `00 00 01`，裸扫会误判。
+        let payload = annexb::length_prefixed_payload(data).unwrap_or(data);
+        let units = annexb::nal_units(payload);
         if units.is_empty() {
             return Err(MacVideoError::Decode(
                 "码流里没有任何 Annex B NAL".to_owned(),
@@ -252,7 +255,7 @@ impl VtDecoder {
             self.stored_sets = incoming.iter().map(|unit| unit.to_vec()).collect();
         }
         // 只把切片 NAL 写成 AVCC（参数集已在格式描述里）。
-        let mut avcc = Vec::with_capacity(data.len());
+        let mut avcc = Vec::with_capacity(payload.len());
         for unit in &units {
             if annexb::nal_type(codec, unit).is_some_and(|nal| codec.is_parameter_set(nal)) {
                 continue;

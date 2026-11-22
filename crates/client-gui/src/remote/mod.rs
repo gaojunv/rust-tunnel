@@ -191,6 +191,11 @@ pub fn open_permission_settings(kind: PermissionKind) {
     platform::open_settings(kind);
 }
 
+/// 请求某类权限（macOS 会弹系统授权框；其它平台无此模型，恒 `true`）。
+pub fn request_permission(kind: PermissionKind) -> bool {
+    platform::request_permission(kind)
+}
+
 /// 请求「屏幕录制」授权（macOS；可能弹一次系统框，已授予时直接返回 `true`）。
 ///
 /// 登录窗口 agent 在没有权限时调用它——虽然那个会话里通常没人能点确认，
@@ -3155,8 +3160,27 @@ fn nv12_to_color_image(
     }
 }
 
-/// 非 Windows 平台不会收到 NV12（VP9 恒为 RGBA），保留一个安全分支让编译通过。
-#[cfg(not(target_os = "windows"))]
+/// macOS：VideoToolbox 的 H.264/H.265 解码输出是 NV12；Glow 回退时用
+/// `mac-video` 的 BT.709 limited CPU 转换，避免整帧被丢弃。
+#[cfg(target_os = "macos")]
+fn nv12_to_color_image(
+    nv12: &DecodedNv12,
+    width: u32,
+    height: u32,
+    pixel_w: usize,
+    pixel_h: usize,
+) -> Option<egui::ColorImage> {
+    match rust_tunnel_mac_video::color::nv12_limited_to_rgba(&nv12.y, &nv12.uv, width, height) {
+        Ok(rgba) => Some(egui::ColorImage::from_rgba_unmultiplied([pixel_w, pixel_h], &rgba)),
+        Err(err) => {
+            tracing::warn!(error = %err, "NV12→RGBA 转换失败，丢弃该帧");
+            None
+        }
+    }
+}
+
+/// 其余平台不会收到 NV12（VP9 恒为 RGBA），保留一个安全分支让编译通过。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn nv12_to_color_image(
     _nv12: &DecodedNv12,
     _width: u32,

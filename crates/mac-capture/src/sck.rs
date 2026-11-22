@@ -48,10 +48,13 @@ use block2::{DynBlock, RcBlock};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2::{define_class, msg_send, AnyThread, ClassType, DefinedClass};
 use objc2_app_kit::NSCursor;
 use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
-use objc2_core_graphics::{CGDisplayIsMain, CGDisplayPixelsHigh, CGDisplayPixelsWide};
+use objc2_core_graphics::{
+    CGDisplayCopyDisplayMode, CGDisplayIsMain, CGDisplayMode, CGDisplayPixelsHigh,
+    CGDisplayPixelsWide,
+};
 use objc2_core_media::{CMGetAttachment, CMSampleBuffer, CMTime};
 use objc2_core_video::{
     kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferGetBaseAddress,
@@ -697,18 +700,31 @@ impl MacCapture {
     )]
     pub fn cursor_shape(&self) -> Option<CursorShape> {
         let current = NSCursor::currentSystemCursor()?;
-        let candidates: [(CursorShape, Retained<NSCursor>); 9] = [
-            (CursorShape::Arrow, NSCursor::arrowCursor()),
-            (CursorShape::IBeam, NSCursor::IBeamCursor()),
-            (CursorShape::Hand, NSCursor::pointingHandCursor()),
-            (CursorShape::Crosshair, NSCursor::crosshairCursor()),
-            (CursorShape::No, NSCursor::operationNotAllowedCursor()),
-            (CursorShape::SizeNS, NSCursor::rowResizeCursor()),
-            (CursorShape::SizeWE, NSCursor::columnResizeCursor()),
-            (CursorShape::Hand, NSCursor::openHandCursor()),
-            (CursorShape::Hand, NSCursor::closedHandCursor()),
+        // 候选光标用动态消息发送取对象：objc2 生成的 `NSCursor::arrowCursor()`
+        // 等在无 AppKit 初始化/无 WindowServer 的进程里会返回 NULL 并 panic，
+        // 而可空返回 `Option<Retained<NSCursor>>` 会把 nil 折成 None。光标形状
+        // 只是可选遥测，读不到就按「未知」处理，不能让采集循环崩溃。
+        let candidates = [
+            (CursorShape::Arrow, objc2::sel!(arrowCursor)),
+            (CursorShape::IBeam, objc2::sel!(IBeamCursor)),
+            (CursorShape::Hand, objc2::sel!(pointingHandCursor)),
+            (CursorShape::Crosshair, objc2::sel!(crosshairCursor)),
+            (CursorShape::No, objc2::sel!(operationNotAllowedCursor)),
+            (CursorShape::SizeNS, objc2::sel!(rowResizeCursor)),
+            (CursorShape::SizeWE, objc2::sel!(columnResizeCursor)),
+            (CursorShape::Hand, objc2::sel!(openHandCursor)),
+            (CursorShape::Hand, objc2::sel!(closedHandCursor)),
         ];
-        for (shape, candidate) in candidates {
+        for (shape, sel) in candidates {
+            use objc2::runtime::MessageReceiver;
+            // SAFETY: 这些 NSCursor 类方法都无参数、返回对象；sel 来自 sel! 字面量。
+            // 返回的是 +0（autoreleased）对象，故用 `Retained::retain` 而不是
+            // `from_raw`；NULL 会被折成 `None`，不 panic。
+            let ptr: *mut NSCursor = unsafe { NSCursor::class().send_message(sel, ()) };
+            // SAFETY: 指针由上面的消息发送返回，可能是 NULL（retain 会折成 None）。
+            let Some(candidate) = (unsafe { Retained::retain(ptr) }) else {
+                continue;
+            };
             if *current == *candidate {
                 return Some(shape);
             }
@@ -904,7 +920,9 @@ impl MacCapture {
 
     /// 确保当前显示器的采集线程在跑；需要时重建（带退避）。
     fn ensure_worker(&mut self, display: u32) -> MacCaptureResult<()> {
-        let mut restart = false;
+        // 首次采集必须建流：worker 为 None 时不能走「无需重启」的提前返回，
+        // 否则随后的 `shared()` 会报「采集线程不存在」。
+        let mut restart = self.worker.is_none();
         let mut failure_message = None;
         if let Some(worker) = self.worker.as_ref() {
             if worker.display != display {
@@ -1180,8 +1198,19 @@ fn scaled_points(points: isize, scale: f64) -> u32 {
     }
 }
 
-/// 显示器的物理像素尺寸（`CGDisplayPixels*`；Retina 下是点数 × 缩放比）。
-fn physical_size(display_id: u32) -> Option<(u32, u32)> {
+/// 显示器的物理像素尺寸（采集配置与几何复查用，**不是**给控制端做输入映射的尺寸）。
+///
+/// `CGDisplayPixelsWide/High` 返回的是**点**尺寸（Retina/HiDPI 下会是 1920×1080，
+/// 而面板实际是 3840×2160），所以优先取当前显示模式的 `pixelWidth/pixelHeight`；
+/// 模式不可用时再回退到点尺寸。
+pub(crate) fn physical_size(display_id: u32) -> Option<(u32, u32)> {
+    if let Some(mode) = CGDisplayCopyDisplayMode(display_id) {
+        let width = CGDisplayMode::pixel_width(Some(&mode));
+        let height = CGDisplayMode::pixel_height(Some(&mode));
+        if width != 0 && height != 0 {
+            return Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?));
+        }
+    }
     let width = CGDisplayPixelsWide(display_id);
     let height = CGDisplayPixelsHigh(display_id);
     if width == 0 || height == 0 {
@@ -1262,15 +1291,23 @@ fn list_displays() -> MacCaptureResult<Vec<DisplayInfo>> {
     for display in &displays {
         // SAFETY: `SCDisplay` 由 SCK 持有，两个查询都只读。
         let id = unsafe { display.displayID() };
-        let (width, height) = physical_size(id).unwrap_or_else(|| {
-            // 退化：SCK 的点尺寸（Retina 下会偏小，但没有更准的信息）。
-            let w = unsafe { display.width() };
-            let h = unsafe { display.height() };
+        // 两套坐标系数值不同，用途也不同：
+        // - **采集/编码**用 [`physical_size`]（当前显示模式的 `pixelWidth/Height`，
+        //   4K 屏是 3840×2160），`build_configuration` / 几何复查都用它；
+        // - [`DisplayInfo`] 是发给控制端做「窗口 → 远端坐标」映射的，必须是 **macOS
+        //   全局逻辑点**（enigo / `CGEvent` 绝对坐标的单位，同一块 4K 屏是 1920×1080
+        //   点）。这里若报物理像素，控制端会按 3840 发坐标、被控端按点注入，光标就会
+        //   放大/偏移。
+        let (point_w, point_h) = unsafe { (display.width(), display.height()) };
+        let (width, height) = if point_w > 0 && point_h > 0 {
             (
-                u32::try_from(w.max(1)).unwrap_or(1),
-                u32::try_from(h.max(1)).unwrap_or(1),
+                u32::try_from(point_w).unwrap_or(1),
+                u32::try_from(point_h).unwrap_or(1),
             )
-        });
+        } else {
+            // 退化：SCK 没给出点尺寸时只能用物理像素兜底（至少不为 0）。
+            physical_size(id).unwrap_or((1, 1))
+        };
         // SAFETY: `CGDisplayIsMain` 只读全局显示配置（objc2 里是安全函数）。
         let primary = CGDisplayIsMain(id);
         out.push(DisplayInfo {

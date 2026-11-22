@@ -20,6 +20,23 @@ pub fn is_annex_b(data: &[u8]) -> bool {
     data.starts_with(&START_CODE) || data.starts_with(&[0, 0, 0, 1])
 }
 
+/// 如果 `data` 以「4 字节大端长度前缀」开头且前缀正好覆盖剩余字节，返回前缀后的载荷；
+/// 否则返回 `None`（调用方按旧的裸 Annex B 处理）。
+///
+/// 线上契约与 `win-video` 一致：一帧 = `u32 BE payload_len` + Annex B 码流。
+/// **必须显式剥前缀**再扫描起始码：裸 Annex B 的前缀 `00 00 00 01` 在 [`nal_units`]
+/// 里会被当成普通字节扫描，而长度前缀本身可能包含 `00 00 01`（例如长度
+/// `0x00000105`），不剥就会误判成起始码。
+#[must_use]
+pub fn length_prefixed_payload(data: &[u8]) -> Option<&[u8]> {
+    let header = data.get(..4)?;
+    let length = usize::try_from(u32::from_be_bytes([
+        header[0], header[1], header[2], header[3],
+    ]))
+    .ok()?;
+    (length == data.len().checked_sub(4)?).then(|| data.get(4..).unwrap_or_default())
+}
+
 /// 扫描出每个起始码之后的 NAL 起点（索引指向 NAL 的首字节）。
 ///
 /// 4 字节起始码 `00 00 00 01` 会被识别成「偏移 1 处的 3 字节起始码」，多出的那个 `0`
@@ -308,5 +325,48 @@ mod tests {
         let hevc_idr = [0, 0, 0, 1, (19 << 1) | 1, 0x01];
         assert!(has_keyframe(CodecKind::H265, &hevc_idr));
         assert!(!has_keyframe(CodecKind::H264, &hevc_idr));
+    }
+
+    /// 4 字节大端长度前缀 + Annex B：剥出载荷。
+    #[test]
+    fn length_prefix_is_stripped() {
+        let annex_b = [0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x65, 0xCC];
+        let mut framed = u32::try_from(annex_b.len()).unwrap().to_be_bytes().to_vec();
+        framed.extend_from_slice(&annex_b);
+        assert_eq!(length_prefixed_payload(&framed), Some(annex_b.as_slice()));
+    }
+
+    /// 裸 Annex B 没有长度前缀，helper 必须返回 `None`（调用方按旧格式处理）。
+    #[test]
+    fn bare_annex_b_is_not_length_prefixed() {
+        let annex_b = [0, 0, 0, 1, 0x67, 0xAA];
+        assert_eq!(length_prefixed_payload(&annex_b), None);
+    }
+
+    /// 前缀声明的长度与实际剩余字节不符时不得剥离。
+    #[test]
+    fn mismatched_prefix_length_is_rejected() {
+        let mut framed = 7_u32.to_be_bytes().to_vec();
+        framed.extend_from_slice(&[0, 0, 0, 1, 0x67, 0xAA]);
+        assert_eq!(length_prefixed_payload(&framed), None);
+        let mut short = 0_u32.to_be_bytes().to_vec();
+        short.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(length_prefixed_payload(&short), None);
+    }
+
+    /// 长度前缀本身含 `00 00 01`（0x00000105）时，裸扫描会误判起始码；
+    /// helper 必须按长度剥掉，不能靠起始码猜边界。
+    #[test]
+    fn prefix_containing_start_code_is_not_mistaken_for_nal() {
+        let payload_len = 0x0000_0105_usize;
+        let mut payload = vec![0_u8; payload_len];
+        payload[..4].copy_from_slice(&[0, 0, 0, 1]);
+        payload[4] = 0x65;
+        let mut framed = u32::try_from(payload_len).unwrap().to_be_bytes().to_vec();
+        framed.extend_from_slice(&payload);
+        // 前缀字节是 00 00 01 05，裸看确实像 3 字节起始码。
+        assert!(is_annex_b(&framed));
+        assert_eq!(length_prefixed_payload(&framed), Some(payload.as_slice()));
+        assert_eq!(length_prefixed_payload(&framed).map(<[u8]>::len), Some(payload_len));
     }
 }

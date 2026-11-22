@@ -21,6 +21,11 @@ pub fn permissions() -> super::Permissions {
 /// Linux 无统一的隐私面板跳转，空操作。
 pub fn open_settings(_kind: super::PermissionKind) {}
 
+/// Linux 无法统一请求运行期授权，视为已授予（失败由会话错误提示）。
+pub fn request_permission(_kind: super::PermissionKind) -> bool {
+    true
+}
+
 /// 构造平台实现三件套（Linux 上 `--instance` 不可用，`mode` 一律走 GUI 那套）。
 #[must_use]
 pub fn screen_and_input(_mode: super::PlatformMode) -> super::PlatformHandles {

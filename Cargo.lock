@@ -8569,6 +8569,7 @@ dependencies = [
  "muda 0.15.3",
  "naga",
  "notify-rust",
+ "objc2-core-foundation",
  "objc2-core-video",
  "raw-window-handle",
  "rust-tunnel-client",

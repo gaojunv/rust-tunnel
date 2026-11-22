@@ -11,8 +11,8 @@
 //!   尺寸/格式与编码配置一致时**直接提交、零拷贝**；否则经 `VTPixelTransferSession`
 //!   在 GPU 上缩放并转成 `420v`（BT.709 limited）。
 //!
-//! 编码输出是 AVCC，本模块转成 Annex B 后返回；关键帧额外从 `CMVideoFormatDescription`
-//! 取参数集前置。
+//! 编码输出是 AVCC，本模块转成 Annex B、补上 4 字节大端长度前缀后返回；关键帧额外从
+//! `CMVideoFormatDescription` 取参数集前置。
 //!
 //! # 会话属性（低延迟）
 //!
@@ -183,7 +183,8 @@ pub struct EncoderInfo {
 /// 一次编码的输出。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedPacket {
-    /// Annex B 码流（关键帧已前置参数集）。
+    /// 4 字节大端长度前缀 + Annex B 码流（关键帧已前置参数集），与 `win-video` /
+    /// 数据面契约一致。
     pub data: Vec<u8>,
     /// 本帧是否关键帧（IDR / IRAP）。
     pub keyframe: bool,
@@ -196,7 +197,7 @@ pub struct EncodedPacket {
 /// 回调线程产出的原始结果（参数集已前置）。
 #[derive(Debug, Clone)]
 struct EncodedOutput {
-    /// Annex B 码流。
+    /// 4 字节大端长度前缀 + Annex B 码流。
     data: Vec<u8>,
     /// 是否关键帧。
     keyframe: bool,
@@ -798,7 +799,8 @@ unsafe extern "C-unwind" fn compression_output_callback(
     shared.ready.notify_all();
 }
 
-/// 把编码输出的 `CMSampleBuffer`（AVCC）转成 Annex B，关键帧前置参数集。
+/// 把编码输出的 `CMSampleBuffer`（AVCC）转成 Annex B、前置关键帧参数集，
+/// 最后补上 4 字节大端长度前缀（数据面契约）。
 fn build_output(codec: CodecKind, sample: &CMSampleBuffer) -> MacVideoResult<EncodedOutput> {
     let data_buffer = unsafe { sample.data_buffer() }
         .ok_or_else(|| MacVideoError::Encode("输出样本没有 CMBlockBuffer".to_owned()))?;
@@ -832,7 +834,17 @@ fn build_output(codec: CodecKind, sample: &CMSampleBuffer) -> MacVideoResult<Enc
             data = annexb::prepend_parameter_sets(&sets, &data);
         }
     }
-    Ok(EncodedOutput { data, keyframe })
+    // 与 win-video / 数据面契约一致：每帧 = `u32 BE payload_len` + Annex B。
+    // `keyframe` 已在**未加前缀**的 Annex B 上判定，不受影响。
+    let payload_len = u32::try_from(data.len())
+        .map_err(|_| MacVideoError::Encode("编码帧超过 4 GiB".to_owned()))?;
+    let mut framed = Vec::with_capacity(4 + data.len());
+    framed.extend_from_slice(&payload_len.to_be_bytes());
+    framed.extend_from_slice(&data);
+    Ok(EncodedOutput {
+        data: framed,
+        keyframe,
+    })
 }
 
 /// AVCC → Annex B（薄包装，保持回调里的错误信息带上下文）。

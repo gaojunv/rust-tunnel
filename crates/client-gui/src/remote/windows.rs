@@ -21,6 +21,11 @@ pub fn permissions() -> super::Permissions {
 /// Windows 无对应隐私面板，空操作。
 pub fn open_settings(_kind: super::PermissionKind) {}
 
+/// Windows 没有运行时授权模型，请求视为已授予。
+pub fn request_permission(_kind: super::PermissionKind) -> bool {
+    true
+}
+
 /// 构造平台实现三件套。
 ///
 /// - [`super::PlatformMode::Gui`]：用户会话里的老路径（`xcap` + `enigo` + `arboard`），
