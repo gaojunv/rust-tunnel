@@ -8417,6 +8417,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-android-jni"
+version = "0.1.0"
+dependencies = [
+ "glow",
+ "jni 0.21.1",
+ "khronos-egl",
+ "libloading 0.8.9",
+ "ndk",
+ "rust-tunnel-android-video",
+ "rust-tunnel-common",
+ "rust-tunnel-controller-core",
+ "rust-tunnel-remote",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rust-tunnel-android-video"
+version = "0.1.0"
+dependencies = [
+ "rust-tunnel-remote",
+]
+
+[[package]]
 name = "rust-tunnel-client"
 version = "0.27.0"
 dependencies = [
@@ -8511,6 +8538,18 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rust-tunnel-controller-core"
+version = "0.1.0"
+dependencies = [
+ "rust-tunnel-client",
+ "rust-tunnel-common",
+ "rust-tunnel-remote",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

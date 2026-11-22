@@ -78,6 +78,88 @@ libvpx をソースからビルドする場合は `source-build` feature を有�
 cargo build --features source-build
 ```
 
+### Android（本仓库新增，2026-11）
+
+> 本节是本仓库 vendor 化之后新增的说明，上游 shiguredo/libvpx-rs 没有 Android 支持。
+
+**为什么必须源码构建**：上游只在 GitHub Releases 发布 linux / macOS / Windows 六种
+组合的预编译包，**没有任何 Android 产物**。因此本仓库的 `build.rs` 对
+`target_os = "android"` 恒走源码构建（`should_use_prebuilt()` 直接返回 false），
+依赖方（`crates/remote`）**不需要**打开 `source-build` feature——桌面目标的 feature
+集合因此与改动前完全一致。
+
+**支持的 target**
+
+| Rust target | ABI | libvpx `--target=` | 状态 |
+|---|---|---|---|
+| `aarch64-linux-android` | arm64-v8a | `arm64-android-gcc` | 必须支持 |
+| `armv7-linux-androideabi` | armeabi-v7a | `armv7-android-gcc` | 可选 |
+| `x86_64-linux-android` | x86_64（模拟器） | `x86_64-android-gcc` | 必须支持 |
+| `i686-linux-android` | x86（模拟器） | `x86-android-gcc` | 顺带支持 |
+
+**前置条件**
+
+- Android NDK（r23+；按 `toolchains/llvm/prebuilt/<host>/bin` 的通用布局实现。
+  本机没有 NDK，未实际编译，见文末「未验证项」）
+- `git`（构建期 clone libvpx `v1.16.0`）、`make`
+- `rustup component add llvm-tools`（符号改写用 llvm-nm / llvm-objcopy）
+- ARM 目标：`perl`（`build/make/ads2gas.pl` 把 ARM 汇编转成 GAS 语法）
+- x86_64 / x86 目标：host 上的 `nasm` 或 `yasm`（libvpx 的 x86 汇编是 NASM 语法，
+  NDK 只带 clang/llvm，不含汇编器）
+- NDK / 工程路径**不要含空格**（MSYS2 下 make 展开未加引号的 `$(CC)` 会断）
+- Windows 上交叉编译必须在 **MSYS2 / Git Bash** 里运行（libvpx 的 `configure` 是
+  POSIX shell 脚本，`build.rs` 会经 `sh` 启动它；`make` 也要在 PATH 上）
+
+**推荐命令（cargo-ndk，不需要 gradle）**
+
+```bash
+export ANDROID_NDK_HOME=/path/to/android-ndk
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk
+
+# arm64-v8a + x86_64 模拟器；--platform 21 是 API level（默认值）
+# 注意：cargo-ndk 4.x 的短选项是大写 -P，小写 -p 会被当成 cargo 的 --package
+cargo ndk -t arm64-v8a -t x86_64 --platform 21 build -p rust-tunnel-remote
+
+# 可选：armv7
+rustup target add armv7-linux-androideabi
+cargo ndk -t armeabi-v7a --platform 21 build -p rust-tunnel-remote
+```
+
+完整脚本见仓库根目录 `scripts/build-android-libvpx.sh`。
+
+**工具链注入方式**（`build.rs` 的实现口径）
+
+1. 优先读 cargo-ndk（与 `cc` crate 同一套命名）注入的
+   `CC_<target-triple>` / `CXX_<target-triple>` / `AR_<target-triple>` /
+   `CFLAGS_<target-triple>`（连字符原样与下划线两种写法都认，另外认 `TARGET_CC` 等）。
+2. 只设置 `ANDROID_NDK_HOME` 时，从
+   `<ndk>/toolchains/llvm/prebuilt/<host>/bin` 取 `clang` / `clang++` / `llvm-ar`，
+   并补 `--target=<clang-triple><api>`（API 取 `ANDROID_PLATFORM` /
+   `CARGO_NDK_PLATFORM`，缺省 21；**不要**用 `CARGO_NDK_ANDROID_PLATFORM`——cargo-ndk
+   实际把 ABI 名（`arm64-v8a`）写进了那个变量，取数字会得到非法的 API level）。
+3. 两者都没有时 `panic!`，错误信息会列出缺少的变量名和可复制的 `cargo ndk` 命令。
+
+注意 libvpx 1.16 的 configure **不认** `CC_<libvpx-target>`（如
+`CC_arm64-android-gcc`）：`build/make/configure.sh` 的 `setup_gnu_toolchain` 只读
+普通的 `CC`/`CXX`/`AR`/`AS`/`LD`/`STRIP`，而带连字符的变量名在 POSIX shell 里根本
+无法用 `$VAR` 展开。这层映射在 `build.rs` 里完成。
+
+**构建参数**：`--target=<libvpx target>`、`--disable-shared`、
+`--enable-vp9-highbitdepth`（4:4:4 profile 1 的前提，不能删）、
+`--disable-examples --disable-tools --disable-unit-tests --disable-docs`
+（Android 只要静态库，避免交叉链接）。
+
+**产物与链接**：仍然安装到 `<build>/lib/libvpx.a`，下游照旧
+`cargo:rustc-link-lib=static=vpx`；ARM 汇编由 clang 驱动（NDK r24 起没有独立 GNU as，
+`build.rs` 显式设置 `AS=<clang>`）。libvpx 是纯 C，不依赖 libc++/libstdc++，也不需要
+额外的 `-lstdc++`/`-lc++_static`；pthread / libm 由 bionic 的 libc 提供。
+
+**未验证项**：本仓库开发机没有 Android SDK/NDK，Android 路径只做了代码与参数层面的
+实现（对照 libvpx v1.16.0 的 `configure` 源码核对）。首次真机构建时请重点确认：
+`perl`/`nasm` 前置、符号改写后的 `libvpx.a` 能被 NDK 链接、以及 armv7 的
+`armv7a-linux-androideabi` 目标 flag 是否被 clang 接受。
+
 ### docs.rs 向けビルド
 
 libvpx がない環境では、docs.rs 向けのドキュメント生成のみ可能です。

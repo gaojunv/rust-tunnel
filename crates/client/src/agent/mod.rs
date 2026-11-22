@@ -1,6 +1,8 @@
 //! Agent executor: executes `AgentCommand`s received over the control channel,
 //! sandboxed to the workspace root directory.
 
+// 结构解析依赖 tree-sitter（`code-outline` feature）；无头控制器把它关掉。
+#[cfg(feature = "code-outline")]
 pub(crate) mod code_outline;
 
 use std::path::{Path, PathBuf};
@@ -872,6 +874,7 @@ pub async fn handle_exec_request(
             },
             Err(e) => AgentResult::Error { message: e },
         },
+        #[cfg(feature = "code-outline")]
         AgentCommand::CodeOutline { path } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => {
@@ -894,6 +897,11 @@ pub async fn handle_exec_request(
             },
             Err(e) => AgentResult::Error { message: e },
         },
+        #[cfg(not(feature = "code-outline"))]
+        AgentCommand::CodeOutline { .. } => AgentResult::Error {
+            message: "code_outline 不可用：本构建未启用 `code-outline` feature".to_owned(),
+        },
+        #[cfg(feature = "code-outline")]
         AgentCommand::ReadSymbol { path, name } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => {
@@ -914,6 +922,10 @@ pub async fn handle_exec_request(
                 },
             },
             Err(e) => AgentResult::Error { message: e },
+        },
+        #[cfg(not(feature = "code-outline"))]
+        AgentCommand::ReadSymbol { .. } => AgentResult::Error {
+            message: "read_symbol 不可用：本构建未启用 `code-outline` feature".to_owned(),
         },
         AgentCommand::EditFile {
             path,
@@ -1134,9 +1146,11 @@ const DEFAULT_READ_LIMIT: u64 = 2000;
 
 /// code_outline/read_symbol 宿主模式读文件的大小上限：结构解析不需要整读巨型
 /// 文件，超限截断并在结果中标注（符号可能不完整）。
+#[cfg(feature = "code-outline")]
 const MAX_PARSE_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// 宿主模式限额读文件（返回 lossy 内容 + 是否截断），供 tree-sitter 解析使用。
+#[cfg(feature = "code-outline")]
 async fn read_file_capped(abs: &Path, cap: usize) -> Result<(String, bool), String> {
     use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(abs)
